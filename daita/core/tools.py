@@ -194,7 +194,13 @@ def _extract_parameters_from_function(func: Callable) -> Dict[str, Any]:
             schema = {"type": "string"}
 
         # Get description from docstring or use generic
-        description = param_descriptions.get(param_name, f"Parameter: {param_name}")
+        description = param_descriptions.get(param_name)
+        if description is None:
+            logger.warning(
+                f"No docstring description found for parameter '{param_name}' "
+                f"in {func.__qualname__}. Add an Args: section to the docstring."
+            )
+            description = f"Parameter: {param_name}"
         schema["description"] = description
 
         properties[param_name] = schema
@@ -368,19 +374,6 @@ class AgentTool:
             "name": self.name,
             "description": self.description,
             "input_schema": self.parameters  # Already in correct JSON Schema format
-        }
-
-    def to_llm_function(self) -> Dict[str, Any]:
-        """
-        Generic LLM function format (works for most providers).
-
-        For provider-specific formats, use to_openai_function() or to_anthropic_tool().
-        This format is used for prompt-based tool calling.
-        """
-        return {
-            "name": self.name,
-            "description": self.description,
-            "parameters": self.parameters  # Already in correct JSON Schema format
         }
 
     def to_prompt_description(self) -> str:

@@ -432,6 +432,76 @@ def _extract_decision_metadata(result, extract_confidence: bool, extract_reasoni
 
 # Helper functions for common decision patterns
 
+async def record_decision(
+    decision_point: str,
+    decision_type: DecisionType,
+    result: Any,
+    confidence: float,
+    reasoning_items: List[str],
+    factors: Optional[Dict[str, Any]] = None,
+    factor_prefix: str = "",
+    alternatives: Optional[List[str]] = None,
+    result_key: str = "result",
+    agent_id: Optional[str] = None,
+    stream_callback: Optional[Callable[[DecisionEvent], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Record a decision point with confidence, reasoning, and optional factors.
+
+    This is the single entry point for all decision recording. The three legacy
+    helpers (record_classification_decision, record_analysis_decision,
+    record_recommendation_decision) are thin aliases over this function.
+
+    Args:
+        decision_point: Identifier for the decision (e.g. "sentiment_analysis")
+        decision_type: DecisionType enum value (CLASSIFICATION, ANALYSIS, RECOMMENDATION)
+        result: The decision output (str, dict, or any serializable value)
+        confidence: Confidence score between 0.0 and 1.0
+        reasoning_items: List of reasoning strings explaining the decision
+        factors: Optional dict of named factors to record (e.g. feature weights, risk levels)
+        factor_prefix: Optional prefix applied to each factor key (e.g. "weight_", "risk_")
+        alternatives: Optional list of alternatives considered
+        result_key: Key name used for the result in the returned dict (default: "result")
+        agent_id: Optional agent ID for tracing context
+        stream_callback: Optional callback for streaming decision events
+
+    Usage:
+        # Classification
+        result = await record_decision(
+            "sentiment_analysis", DecisionType.CLASSIFICATION,
+            result="positive", confidence=0.87,
+            reasoning_items=["Strong positive word sentiment", "Context supports positive tone"],
+            factors={"word_sentiment": 0.6, "context_analysis": 0.4}, factor_prefix="weight_",
+            alternatives=["neutral", "negative"],
+        )
+
+        # Recommendation
+        result = await record_decision(
+            "investment_advice", DecisionType.RECOMMENDATION,
+            result="buy", confidence=0.78,
+            reasoning_items=["Strong fundamentals", "Market conditions favorable"],
+            factors={"market_volatility": "medium", "liquidity": "high"}, factor_prefix="risk_",
+            alternatives=["hold", "sell"],
+        )
+    """
+    async with record_decision_point(decision_point, decision_type, agent_id, stream_callback) as decision:
+        decision.set_confidence(confidence)
+        for item in reasoning_items:
+            decision.add_reasoning(item)
+        if alternatives:
+            for alt in alternatives:
+                decision.add_alternative(alt)
+        if factors:
+            for key, value in factors.items():
+                decision.set_factor(f"{factor_prefix}{key}", value)
+        return {
+            result_key: result,
+            "confidence": confidence,
+            "decision_summary": decision.get_summary(),
+        }
+
+
+# Backward-compatible aliases — prefer record_decision() for new code.
 async def record_classification_decision(
     decision_point: str,
     classification_result: str,
@@ -440,40 +510,17 @@ async def record_classification_decision(
     alternatives_considered: Optional[List[str]] = None,
     feature_weights: Optional[Dict[str, float]] = None,
     agent_id: Optional[str] = None,
-    stream_callback: Optional[Callable[[DecisionEvent], None]] = None
+    stream_callback: Optional[Callable[[DecisionEvent], None]] = None,
 ) -> Dict[str, Any]:
-    """
-    Helper for recording classification decisions.
-    
-    Usage:
-        result = await record_classification_decision(
-            "sentiment_analysis",
-            classification_result="positive",
-            confidence=0.87,
-            features_used=["word_sentiment", "context_analysis"],
-            alternatives_considered=["neutral", "negative"],
-            feature_weights={"word_sentiment": 0.6, "context_analysis": 0.4}
-        )
-    """
-    async with record_decision_point(decision_point, DecisionType.CLASSIFICATION, agent_id, stream_callback) as decision:
-        decision.set_confidence(confidence)
-        
-        for feature in features_used:
-            decision.add_reasoning(f"Feature used: {feature}")
-        
-        if alternatives_considered:
-            for alt in alternatives_considered:
-                decision.add_alternative(alt)
-        
-        if feature_weights:
-            for feature, weight in feature_weights.items():
-                decision.set_factor(f"weight_{feature}", weight)
-        
-        return {
-            "classification": classification_result,
-            "confidence": confidence,
-            "decision_summary": decision.get_summary()
-        }
+    """Alias for record_decision() with DecisionType.CLASSIFICATION."""
+    return await record_decision(
+        decision_point, DecisionType.CLASSIFICATION, classification_result, confidence,
+        reasoning_items=[f"Feature used: {f}" for f in features_used],
+        factors=feature_weights, factor_prefix="weight_",
+        alternatives=alternatives_considered, result_key="classification",
+        agent_id=agent_id, stream_callback=stream_callback,
+    )
+
 
 async def record_analysis_decision(
     decision_point: str,
@@ -482,35 +529,17 @@ async def record_analysis_decision(
     key_insights: List[str],
     data_quality_factors: Optional[Dict[str, float]] = None,
     agent_id: Optional[str] = None,
-    stream_callback: Optional[Callable[[DecisionEvent], None]] = None
+    stream_callback: Optional[Callable[[DecisionEvent], None]] = None,
 ) -> Dict[str, Any]:
-    """
-    Helper for recording analysis decisions.
-    
-    Usage:
-        result = await record_analysis_decision(
-            "financial_analysis",
-            analysis_result={"trend": "upward", "volatility": "low"},
-            confidence=0.91,
-            key_insights=["Strong growth pattern", "Low risk indicators"],
-            data_quality_factors={"completeness": 0.95, "accuracy": 0.88}
-        )
-    """
-    async with record_decision_point(decision_point, DecisionType.ANALYSIS, agent_id, stream_callback) as decision:
-        decision.set_confidence(confidence)
-        
-        for insight in key_insights:
-            decision.add_reasoning(insight)
-        
-        if data_quality_factors:
-            for factor, value in data_quality_factors.items():
-                decision.set_factor(factor, value)
-        
-        return {
-            "analysis": analysis_result,
-            "confidence": confidence,
-            "decision_summary": decision.get_summary()
-        }
+    """Alias for record_decision() with DecisionType.ANALYSIS."""
+    return await record_decision(
+        decision_point, DecisionType.ANALYSIS, analysis_result, confidence,
+        reasoning_items=key_insights,
+        factors=data_quality_factors,
+        result_key="analysis",
+        agent_id=agent_id, stream_callback=stream_callback,
+    )
+
 
 async def record_recommendation_decision(
     decision_point: str,
@@ -520,40 +549,16 @@ async def record_recommendation_decision(
     alternatives_considered: Optional[List[str]] = None,
     risk_factors: Optional[Dict[str, str]] = None,
     agent_id: Optional[str] = None,
-    stream_callback: Optional[Callable[[DecisionEvent], None]] = None
+    stream_callback: Optional[Callable[[DecisionEvent], None]] = None,
 ) -> Dict[str, Any]:
-    """
-    Helper for recording recommendation decisions.
-    
-    Usage:
-        result = await record_recommendation_decision(
-            "investment_advice",
-            recommendation="buy",
-            confidence=0.78,
-            rationale=["Strong fundamentals", "Market conditions favorable"],
-            alternatives_considered=["hold", "sell"],
-            risk_factors={"market_volatility": "medium", "liquidity": "high"}
-        )
-    """
-    async with record_decision_point(decision_point, DecisionType.RECOMMENDATION, agent_id, stream_callback) as decision:
-        decision.set_confidence(confidence)
-        
-        for reason in rationale:
-            decision.add_reasoning(reason)
-        
-        if alternatives_considered:
-            for alt in alternatives_considered:
-                decision.add_alternative(alt)
-        
-        if risk_factors:
-            for risk, level in risk_factors.items():
-                decision.set_factor(f"risk_{risk}", level)
-        
-        return {
-            "recommendation": recommendation,
-            "confidence": confidence,
-            "decision_summary": decision.get_summary()
-        }
+    """Alias for record_decision() with DecisionType.RECOMMENDATION."""
+    return await record_decision(
+        decision_point, DecisionType.RECOMMENDATION, recommendation, confidence,
+        reasoning_items=rationale,
+        factors=risk_factors, factor_prefix="risk_",
+        alternatives=alternatives_considered, result_key="recommendation",
+        agent_id=agent_id, stream_callback=stream_callback,
+    )
 
 # Utility functions for decision analysis
 
