@@ -1,0 +1,76 @@
+# Daita Framework Dependencies for AWS Lambda Layer
+# Complete dependencies based on original requirements.txt
+# Excludes development/server packages not needed in Lambda runtime
+
+# === CORE FRAMEWORK DEPENDENCIES ===
+# Configuration and data validation
+pydantic==2.11.4
+PyYAML==6.0.2
+python-dotenv==1.1.0
+typing-extensions>=4.0.0
+
+# === AI PROVIDER SDKS ===
+# OpenAI (used by OpenAI and Grok providers)
+openai==1.77.0
+
+# Anthropic Claude
+anthropic>=0.25.0
+
+# Google Gemini (new package)
+google-genai>=0.3.0
+
+# === HTTP AND NETWORKING ===
+aiohttp==3.11.18
+aiofiles==24.1.0
+certifi==2025.4.26
+urllib3>=1.26.0
+
+# === DATABASE LIBRARIES ===
+SQLAlchemy==2.0.40
+psycopg2-binary==2.9.10
+asyncpg==0.30.0
+aiomysql==0.2.0
+aiosqlite==0.21.0
+
+# === DATA SCIENCE AND ML ===
+pandas==2.2.3
+numpy==2.2.5
+scipy==1.15.2
+scikit_learn==1.6.1
+statsmodels==0.14.4
+transformers==4.51.3
+nltk==3.9.1
+
+# === FILE PROCESSING ===
+openpyxl==3.1.5
+lxml==5.4.0
+beautifulsoup4==4.13.4
+
+# === UTILITIES ===
+click==8.1.8
+fuzzywuzzy==0.18.0
+jsonpath_ng==1.7.0
+networkx==3.4.2
+pyprojroot==0.3.0
+PyJWT==2.10.1
+python-multipart==0.0.20
+setuptools==80.3.1
+
+# === AWS SDK ===
+boto3==1.38.8
+
+# === SYSTEM UTILITIES ===
+psutil==7.0.0
+
+# === MCP (Model Context Protocol) ===
+mcp>=1.0.0
+
+# === WEB SEARCH ===
+tavily-python>=0.3.0
+
+# === DEVELOPMENT DEPENDENCIES (commented out for Lambda) ===
+# The following are excluded from Lambda layer as they're not needed:
+# fastapi==0.115.12          # Web server not needed in Lambda
+# uvicorn==0.34.2            # ASGI server not needed in Lambda  
+# pytest==8.3.5             # Testing framework not needed in Lambda
+# pytest_asyncio==0.26.0    # Testing utilities not needed in Lambda
