@@ -5,7 +5,7 @@
 Daita Agents gives you a clean, minimal API for autonomous tool-calling agents that work with any LLM provider — OpenAI, Anthropic, Gemini, Grok, and more. Zero-configuration tracing, pluggable data sources, and a composable workflow system for multi-agent pipelines.
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
 [![CI](https://github.com/daita-tech/daita-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/daita-tech/daita-agents/actions)
 
 ---
