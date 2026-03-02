@@ -341,7 +341,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
         return [
             AgentTool(
                 name="find_documents",
-                description="Find documents in a MongoDB collection. Returns matching documents as a list.",
+                description="Find documents in a MongoDB collection. Returns matches.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -368,7 +368,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
             ),
             AgentTool(
                 name="insert_document",
-                description="Insert a single document into a MongoDB collection. Returns the inserted document ID.",
+                description="Insert a document into a MongoDB collection. Returns the inserted ID.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -391,7 +391,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
             ),
             AgentTool(
                 name="update_documents",
-                description="Update documents in a MongoDB collection. Returns the count of matched and modified documents.",
+                description="Update MongoDB documents. Returns matched and modified counts.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -418,7 +418,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
             ),
             AgentTool(
                 name="delete_documents",
-                description="Delete documents from a MongoDB collection. Returns the count of deleted documents.",
+                description="Delete MongoDB documents by filter. Returns deleted count.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -441,17 +441,37 @@ class MongoDBPlugin(BaseDatabasePlugin):
             ),
             AgentTool(
                 name="list_collections",
-                description="List all collections in the MongoDB database",
-                parameters={
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                },
+                description="List all collections in the MongoDB database.",
+                parameters={"type": "object", "properties": {}, "required": []},
                 handler=self._tool_list_collections,
                 category="database",
                 source="plugin",
                 plugin_name="MongoDB",
                 timeout_seconds=30
+            ),
+            AgentTool(
+                name="mongodb_aggregate",
+                description="Run a MongoDB aggregation pipeline for grouping, counting, or transformations.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "collection": {
+                            "type": "string",
+                            "description": "Collection name"
+                        },
+                        "pipeline": {
+                            "type": "array",
+                            "description": "Aggregation pipeline stages (e.g., [{\"$match\": {...}}, {\"$group\": {...}}])",
+                            "items": {"type": "object"}
+                        }
+                    },
+                    "required": ["collection", "pipeline"]
+                },
+                handler=self._tool_aggregate,
+                category="database",
+                source="plugin",
+                plugin_name="MongoDB",
+                timeout_seconds=60
             )
         ]
 
@@ -522,6 +542,19 @@ class MongoDBPlugin(BaseDatabasePlugin):
             "success": True,
             "collections": collections,
             "count": len(collections)
+        }
+
+    async def _tool_aggregate(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for mongodb_aggregate"""
+        collection = args.get("collection")
+        pipeline = args.get("pipeline")
+
+        results = await self.aggregate(collection, pipeline)
+
+        return {
+            "success": True,
+            "results": results,
+            "count": len(results)
         }
 
 

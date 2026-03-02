@@ -1,22 +1,22 @@
 """
-Updated BaseAgent with Unified Tracing Integration
+BaseAgent — Infrastructure base class for all Daita agents.
 
-This replaces the old BaseAgent to use the new unified tracing system.
-All operations are automatically traced without user configuration.
+Provides the shared foundation that Agent and any custom agent subclass
+builds on. Does not contain LLM or tool-calling logic; that lives in Agent.
 
-Key Changes:
-- Removed old metrics system completely
-- Integrated automatic tracing for all operations  
-- Added decision tracing for retry logic
-- Automatic agent lifecycle tracing
-- Zero configuration required
+Responsibilities:
+- Agent identity: ID generation, name, lifecycle state
+- Automatic tracing: every operation is traced via TraceManager
+- Retry infrastructure: _retry_with_tracing() shared by all subclasses
+- Reliability features: opt-in backpressure and task queue management
+- Decision tracing: retry decisions recorded with confidence scores
+- Health and metrics: real-time stats from the trace system
 """
 
 import asyncio
 import logging
 import uuid
 import random
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
@@ -163,156 +163,21 @@ class BaseAgent(AgentABC):
         **kwargs
     ) -> Dict[str, Any]:
         """
-        INTERNAL: Process a task with reliability features and automatic tracing.
+        INTERNAL: Override in subclasses to handle tasks.
 
-        This is the internal infrastructure layer that provides:
-        - Retry logic with decision tracing
-        - Reliability features (backpressure, task tracking)
-        - Automatic tracing (AGENT_EXECUTION spans)
-        - Performance tracking
-        - Structured error handling
-
-        Users should NOT call this directly. Use public APIs:
-        - run() / run_detailed() for direct execution
-        - receive_message() for workflow integration
-        - on_webhook() for webhook triggers
-        - on_schedule() for scheduled tasks
-
-        Args:
-            task: Internal task identifier
-            data: Input data
-            context: Execution context with metadata
-            **kwargs: Additional arguments
-
-        Returns:
-            Task results with automatic tracing metadata
+        Agent overrides this to route through run_detailed().
+        Custom BaseAgent subclasses can override this directly.
+        Workflow and scaling infrastructure call this as a fallback
+        when receive_message() is not available.
         """
-        # Build full context
-        full_context = {
+        return {
+            'result': f'Task received: {task}',
+            'task': task,
             'agent_id': self.agent_id,
             'agent_name': self.name,
-            'agent_type': self.agent_type.value,
-            'task': task,
-            'retry_enabled': self.config.retry_enabled,
-            'reliability_enabled': self.enable_reliability,
-            **(context or {}),
-            **kwargs
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
-        
-        # Handle reliability features if enabled
-        if self.enable_reliability:
-            return await self._process_with_reliability(task, data, full_context)
-        else:
-            return await self._process_without_reliability(task, data, full_context)
-    
-    async def _process_with_reliability(
-        self,
-        task: str,
-        data: Any,
-        context: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Process task with full reliability features."""
-        # Track processing time
-        start_time = time.time()
 
-        # Check backpressure first
-        if self.backpressure_controller and not await self.backpressure_controller.acquire_processing_slot():
-            raise BackpressureError(
-                "Unable to acquire processing slot",
-                agent_id=self.agent_id,
-                queue_size=self.backpressure_controller.task_queue.qsize()
-            )
-
-        # Create task in task manager
-        task_id = None
-        if self.task_manager:
-            task_id = await self.task_manager.create_task(
-                agent_id=self.agent_id,
-                task_type=task,
-                data=data,
-                context=context
-            )
-            context['task_id'] = task_id
-            # Update task status to running
-            await self.task_manager.update_status(task_id, TaskStatus.RUNNING)
-
-        try:
-            # Automatically trace the entire operation
-            async with self.trace_manager.span(
-                operation_name=f"agent_process_{task}",
-                trace_type=TraceType.AGENT_EXECUTION,
-                agent_id=self.agent_id,
-                input_data=data,
-                agent_name=self.name,
-                task=task,
-                task_id=task_id,
-                retry_enabled=str(self.config.retry_enabled),
-                reliability_enabled="true"
-            ) as span_id:
-
-                # Execute with or without retry logic
-                if self.config.retry_enabled:
-                    result = await self._process_with_retry(span_id, task, data, context)
-                else:
-                    result = await self._process_fail_fast(span_id, task, data, context)
-
-                # Add processing time to result
-                processing_time_ms = (time.time() - start_time) * 1000
-                if isinstance(result, dict):
-                    result['processing_time_ms'] = processing_time_ms
-
-                # Update task status to completed
-                if task_id and self.task_manager:
-                    await self.task_manager.update_status(task_id, TaskStatus.COMPLETED)
-
-                return result
-        
-        except Exception as e:
-            # Update task status to failed
-            if task_id and self.task_manager:
-                await self.task_manager.update_status(task_id, TaskStatus.FAILED, error=str(e))
-            raise
-        
-        finally:
-            # Always release the processing slot
-            if self.backpressure_controller:
-                self.backpressure_controller.release_processing_slot()
-    
-    async def _process_without_reliability(
-        self,
-        task: str,
-        data: Any,
-        context: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Process task without reliability features (original behavior)."""
-        # Track processing time
-        start_time = time.time()
-
-        # Automatically trace the entire operation
-        async with self.trace_manager.span(
-            operation_name=f"agent_process_{task}",
-            trace_type=TraceType.AGENT_EXECUTION,
-            agent_id=self.agent_id,
-            input_data=data,
-            agent_name=self.name,
-            task=task,
-            retry_enabled=str(self.config.retry_enabled),
-            reliability_enabled="false"
-        ) as span_id:
-
-            # Execute with or without retry logic
-            if self.config.retry_enabled:
-                result = await self._process_with_retry(span_id, task, data, context)
-            else:
-                result = await self._process_fail_fast(span_id, task, data, context)
-
-            # Add processing time to result
-            processing_time_ms = (time.time() - start_time) * 1000
-            if isinstance(result, dict):
-                result['processing_time_ms'] = processing_time_ms
-
-            return result
-    
     async def _retry_with_tracing(
         self,
         execute_fn: Any,
@@ -366,70 +231,6 @@ class BaseAgent(AgentABC):
 
         raise last_exception or Exception("Unknown error in retry loop")
 
-    async def _process_with_retry(
-        self,
-        parent_span_id: str,
-        task: str,
-        data: Any,
-        context: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Process task with retry logic using the shared retry scaffold."""
-        async def execute(attempt: int, max_attempts: int) -> Dict[str, Any]:
-            attempt_context = {
-                **context,
-                'attempt_number': attempt,
-                'max_attempts': max_attempts,
-                'is_retry': attempt > 1
-            }
-            result = await self._process_once(task, data, attempt_context, attempt, max_attempts)
-            return self._format_success_response(result, attempt_context, attempt, max_attempts)
-
-        try:
-            return await self._retry_with_tracing(execute, "retry_attempt", parent_span_id)
-        except Exception as e:
-            max_attempts = self.config.retry_policy.max_retries + 1
-            return self._format_error_response(e, context, max_attempts, max_attempts)
-    
-    async def _process_fail_fast(
-        self,
-        span_id: str,
-        task: str,
-        data: Any,
-        context: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Process task in fail-fast mode with error tracing."""
-        try:
-            result = await self._process_once(task, data, context, attempt=1, max_attempts=1)
-            return self._format_success_response(result, context, 1, 1)
-        except Exception as e:
-            logger.error(f"Error in agent {self.name} (fail-fast mode): {str(e)}")
-            return self._format_error_response(e, context, 1, 1)
-    
-    async def _process_once(
-        self,
-        task: str,
-        data: Any,
-        context: Dict[str, Any],
-        attempt: int,
-        max_attempts: int
-    ) -> Dict[str, Any]:
-        """
-        Execute the task once without retry logic.
-        
-        Subclasses should override this method for their specific behavior.
-        The automatic tracing happens at higher levels.
-        """
-        # Default implementation for base agent
-        return {
-            'message': f'Agent {self.name} processed task "{task}"',
-            'task': task,
-            'data': data,
-            'agent_id': self.agent_id,
-            'agent_name': self.name,
-            'attempt': attempt,
-            'timestamp': datetime.now(timezone.utc).isoformat()
-        }
-    
     async def _should_retry_error_with_tracing(
         self, 
         error: Exception, 

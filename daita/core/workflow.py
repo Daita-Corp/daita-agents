@@ -1091,7 +1091,7 @@ class Workflow:
         for agent_name, agent in self.agents.items():
             agent_health = {
                 'name': agent_name,
-                'has_process': hasattr(agent, 'process'),
+                'has_receive_message': hasattr(agent, 'receive_message'),
                 'running': self.status == WorkflowStatus.RUNNING
             }
 
@@ -1104,8 +1104,8 @@ class Workflow:
 
             health['agents'][agent_name] = agent_health
 
-            if not agent_health['has_process']:
-                health['issues'].append(f"Agent '{agent_name}' has no process method")
+            if not agent_health['has_receive_message']:
+                health['issues'].append(f"Agent '{agent_name}' has no receive_message method")
                 health['healthy'] = False
 
         # Check subscriptions for potential memory leaks

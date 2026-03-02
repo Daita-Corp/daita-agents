@@ -6,13 +6,14 @@ Simple REST API client - no over-engineering.
 import logging
 import asyncio
 from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from .base import BasePlugin
 
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
 
-class RESTPlugin:
+class RESTPlugin(BasePlugin):
     """
     Simple REST API plugin for agents.
     
@@ -447,6 +448,29 @@ class RESTPlugin:
                 timeout_seconds=60
             ),
             AgentTool(
+                name="http_patch",
+                description="Make an HTTP PATCH request to the REST API endpoint. Use for partial resource updates.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "endpoint": {
+                            "type": "string",
+                            "description": "API endpoint path (without base URL)"
+                        },
+                        "data": {
+                            "type": "object",
+                            "description": "JSON data to send in the request body"
+                        }
+                    },
+                    "required": ["endpoint", "data"]
+                },
+                handler=self._tool_patch,
+                category="api",
+                source="plugin",
+                plugin_name="REST",
+                timeout_seconds=60
+            ),
+            AgentTool(
                 name="http_delete",
                 description="Make an HTTP DELETE request to the REST API endpoint. Use for deleting resources.",
                 parameters={
@@ -503,6 +527,19 @@ class RESTPlugin:
         data = args.get("data")
 
         result = await self.put(endpoint, json_data=data)
+
+        return {
+            "success": True,
+            "data": result,
+            "endpoint": endpoint
+        }
+
+    async def _tool_patch(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for http_patch"""
+        endpoint = args.get("endpoint")
+        data = args.get("data")
+
+        result = await self.patch(endpoint, json_data=data)
 
         return {
             "success": True,

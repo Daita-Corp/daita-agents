@@ -3,7 +3,9 @@ PostgreSQL plugin for Daita Agents.
 
 Simple database connection and querying - no over-engineering.
 """
+import asyncio
 import logging
+import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from .base_db import BaseDatabasePlugin
 
@@ -222,6 +224,16 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         results = await self.query(sql)
         return [row['table_name'] for row in results]
 
+    async def describe(self, table: str) -> List[Dict[str, Any]]:
+        """Get table column information."""
+        sql = """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_name = $1
+            ORDER BY ordinal_position
+        """
+        return await self.query(sql, [table])
+
     async def vector_search(
         self,
         table: str,
@@ -434,18 +446,27 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
 
         return [
             AgentTool(
-                name="query_database",
-                description="Execute a SQL SELECT query on the PostgreSQL database and return results as a list of dictionaries",
+                name="postgres_query",
+                description="Run a SELECT query on PostgreSQL. Use limit and columns to avoid oversized responses.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "SQL SELECT query with $1, $2, etc. placeholders for parameters"
+                            "description": "SQL SELECT query with $1, $2, etc. placeholders"
                         },
                         "params": {
                             "type": "array",
-                            "description": "Optional list of parameter values for query placeholders",
+                            "description": "Optional parameter values for placeholders",
+                            "items": {"type": "string"}
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max rows to return (default: 50)"
+                        },
+                        "columns": {
+                            "type": "array",
+                            "description": "Specific columns to return (returns all if omitted)",
                             "items": {"type": "string"}
                         }
                     },
@@ -458,13 +479,9 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 timeout_seconds=60
             ),
             AgentTool(
-                name="list_tables",
-                description="List all tables in the PostgreSQL database",
-                parameters={
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                },
+                name="postgres_list_tables",
+                description="List all tables in the PostgreSQL database.",
+                parameters={"type": "object", "properties": {}, "required": []},
                 handler=self._tool_list_tables,
                 category="database",
                 source="plugin",
@@ -472,14 +489,14 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 timeout_seconds=30
             ),
             AgentTool(
-                name="get_table_schema",
-                description="Get column information (name, data type, nullable) for a specific table in PostgreSQL",
+                name="postgres_get_schema",
+                description="Get column info (name, type, nullable) for a PostgreSQL table.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "table_name": {
                             "type": "string",
-                            "description": "Name of the table to inspect"
+                            "description": "Table name to inspect"
                         }
                     },
                     "required": ["table_name"]
@@ -491,18 +508,18 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 timeout_seconds=30
             ),
             AgentTool(
-                name="execute_sql",
-                description="Execute an INSERT, UPDATE, or DELETE SQL statement on PostgreSQL. Returns the number of affected rows.",
+                name="postgres_execute",
+                description="Execute INSERT, UPDATE, or DELETE on PostgreSQL. Returns affected row count.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "SQL statement to execute (INSERT, UPDATE, or DELETE)"
+                            "description": "SQL statement (INSERT, UPDATE, or DELETE)"
                         },
                         "params": {
                             "type": "array",
-                            "description": "Optional list of parameter values for statement placeholders",
+                            "description": "Optional parameter values",
                             "items": {"type": "string"}
                         }
                     },
@@ -513,6 +530,26 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 source="plugin",
                 plugin_name="PostgreSQL",
                 timeout_seconds=60
+            ),
+            AgentTool(
+                name="postgres_inspect",
+                description="List all tables and their column schemas in one call. Use instead of calling postgres_list_tables then postgres_get_schema for each table.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "tables": {
+                            "type": "array",
+                            "description": "Filter to specific tables (returns all if omitted)",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": []
+                },
+                handler=self._tool_inspect,
+                category="database",
+                source="plugin",
+                plugin_name="PostgreSQL",
+                timeout_seconds=30
             ),
             AgentTool(
                 name="vector_search",
@@ -597,9 +634,21 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         ]
 
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for query_database"""
+        """Tool handler for postgres_query"""
         sql = args.get("sql")
         params = args.get("params")
+        limit = args.get("limit", 50)
+        columns = args.get("columns")
+
+        # Apply column projection and limit at SQL level
+        if columns:
+            safe_cols = ", ".join(
+                f'"{c}"' for c in columns
+                if re.match(r'^[A-Za-z0-9_]+$', c)
+            )
+            if safe_cols:
+                sql = f"SELECT {safe_cols} FROM ({sql}) _pg_q"
+        sql = f"{sql} LIMIT {int(limit)}"
 
         results = await self.query(sql, params)
 
@@ -610,7 +659,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         }
 
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for list_tables"""
+        """Tool handler for postgres_list_tables"""
         tables = await self.tables()
 
         return {
@@ -620,17 +669,9 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         }
 
     async def _tool_get_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for get_table_schema"""
+        """Tool handler for postgres_get_schema"""
         table_name = args.get("table_name")
-
-        schema_query = """
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_name = $1
-            ORDER BY ordinal_position
-        """
-
-        columns = await self.query(schema_query, [table_name])
+        columns = await self.describe(table_name)
 
         return {
             "success": True,
@@ -640,7 +681,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         }
 
     async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for execute_sql"""
+        """Tool handler for postgres_execute"""
         sql = args.get("sql")
         params = args.get("params")
 
@@ -649,6 +690,21 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         return {
             "success": True,
             "affected_rows": affected_rows
+        }
+
+    async def _tool_inspect(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for postgres_inspect — fetch all table schemas in parallel."""
+        filter_tables = args.get("tables")
+
+        all_tables = await self.tables()
+        targets = [t for t in all_tables if t in filter_tables] if filter_tables else all_tables
+
+        schemas = await asyncio.gather(*[self.describe(t) for t in targets])
+
+        return {
+            "success": True,
+            "tables": [{"name": t, "columns": s} for t, s in zip(targets, schemas)],
+            "count": len(targets)
         }
 
     async def _tool_vector_search(self, args: Dict[str, Any]) -> Dict[str, Any]:

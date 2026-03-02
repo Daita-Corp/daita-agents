@@ -5,16 +5,17 @@ Provides common connection management, error handling, and context manager
 support for all database plugins in the Daita framework.
 """
 import logging
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from ..core.exceptions import PluginError, ConnectionError as DaitaConnectionError, ValidationError
+from .base import BasePlugin
 
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
 
-class BaseDatabasePlugin(ABC):
+class BaseDatabasePlugin(BasePlugin):
     """
     Base class for all database plugins with common connection management.
     
@@ -134,22 +135,6 @@ class BaseDatabasePlugin(ABC):
                 context={"plugin": self.__class__.__name__, "operation": operation}
             ) from error
     
-    def get_tools(self) -> List['AgentTool']:
-        """
-        Get agent-usable tools from this database plugin.
-
-        Override in subclasses to expose database operations as LLM tools.
-
-        Returns:
-            List of AgentTool instances
-        """
-        return []
-
-    @property
-    def has_tools(self) -> bool:
-        """Check if plugin exposes any tools"""
-        return len(self.get_tools()) > 0
-
     @property
     def info(self) -> Dict[str, Any]:
         """

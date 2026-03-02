@@ -4,8 +4,10 @@ Snowflake plugin for Daita Agents.
 Provides Snowflake data warehouse connection and querying capabilities.
 Supports key-pair authentication, warehouse management, and stage operations.
 """
+import asyncio
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from .base_db import BaseDatabasePlugin
 
@@ -242,8 +244,11 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 config['password'] = self.password
                 logger.debug("Using password authentication")
 
-            # Create connection
-            self._connection = snowflake.connector.connect(**config)
+            # Create connection (synchronous — wrap in executor to avoid blocking event loop)
+            loop = asyncio.get_running_loop()
+            self._connection = await loop.run_in_executor(
+                None, lambda: snowflake.connector.connect(**config)
+            )
 
             logger.info(f"Connected to Snowflake: {self.account}/{self.database_name}.{self.schema} (warehouse: {self.warehouse})")
 
@@ -266,12 +271,52 @@ class SnowflakePlugin(BaseDatabasePlugin):
         """
         if self._connection:
             try:
-                self._connection.close()
+                loop = asyncio.get_running_loop()
+                conn = self._connection
                 self._connection = None
+                await loop.run_in_executor(None, conn.close)
                 logger.info("Disconnected from Snowflake")
             except Exception as e:
                 logger.warning(f"Error during disconnect: {str(e)}")
                 self._connection = None
+
+    def _run_query(self, sql: str, params=None) -> List[Dict[str, Any]]:
+        """Synchronous query execution — called via run_in_executor."""
+        cursor = self._connection.cursor()
+        try:
+            cursor.execute(sql, params) if params else cursor.execute(sql)
+            rows = cursor.fetchall()
+            if not rows:
+                return []
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+        finally:
+            cursor.close()
+
+    def _run_execute(self, sql: str, params=None) -> int:
+        """Synchronous execute — called via run_in_executor."""
+        cursor = self._connection.cursor()
+        try:
+            cursor.execute(sql, params) if params else cursor.execute(sql)
+            rowcount = cursor.rowcount
+            self._connection.commit()
+            return rowcount
+        finally:
+            cursor.close()
+
+    def _run_show(self, sql: str, name_col: Optional[str] = None) -> List:
+        """Synchronous SHOW command — called via run_in_executor."""
+        cursor = self._connection.cursor()
+        try:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            if name_col:
+                idx = columns.index(name_col)
+                return [row[idx] for row in rows]
+            return [dict(zip(columns, row)) for row in rows]
+        finally:
+            cursor.close()
 
     async def query(self, sql: str, params: Optional[List] = None) -> List[Dict[str, Any]]:
         """
@@ -286,31 +331,11 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
         Example:
             results = await db.query("SELECT * FROM users WHERE age > %s", [25])
-            results = await db.query("SELECT * FROM users WHERE age > %(min_age)s", {"min_age": 25})
         """
         if self._connection is None:
             await self.connect()
-
-        cursor = self._connection.cursor()
-
-        try:
-            if params:
-                cursor.execute(sql, params)
-            else:
-                cursor.execute(sql)
-
-            rows = cursor.fetchall()
-
-            # Handle empty result set
-            if not rows:
-                return []
-
-            # Convert to list of dictionaries
-            columns = [desc[0] for desc in cursor.description]
-            return [dict(zip(columns, row)) for row in rows]
-
-        finally:
-            cursor.close()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._run_query, sql, params)
 
     async def execute(self, sql: str, params: Optional[List] = None) -> int:
         """
@@ -322,27 +347,11 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
         Returns:
             Number of affected rows
-
-        Example:
-            affected = await db.execute("INSERT INTO users (name, age) VALUES (%s, %s)", ["Alice", 30])
         """
         if self._connection is None:
             await self.connect()
-
-        cursor = self._connection.cursor()
-
-        try:
-            if params:
-                cursor.execute(sql, params)
-            else:
-                cursor.execute(sql)
-
-            rowcount = cursor.rowcount
-            self._connection.commit()
-            return rowcount
-
-        finally:
-            cursor.close()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._run_execute, sql, params)
 
     async def tables(self, schema: Optional[str] = None) -> List[str]:
         """
@@ -356,46 +365,16 @@ class SnowflakePlugin(BaseDatabasePlugin):
         """
         if self._connection is None:
             await self.connect()
-
-        cursor = self._connection.cursor()
-
-        try:
-            if schema:
-                cursor.execute(f"SHOW TABLES IN SCHEMA {schema}")
-            else:
-                cursor.execute("SHOW TABLES")
-
-            rows = cursor.fetchall()
-            # SHOW TABLES returns multiple columns, table name is in 'name' column (index varies)
-            # Fetch as dictionaries to be safe
-            columns = [desc[0] for desc in cursor.description]
-            name_idx = columns.index('name')
-            return [row[name_idx] for row in rows]
-
-        finally:
-            cursor.close()
+        sql = f"SHOW TABLES IN SCHEMA {schema}" if schema else "SHOW TABLES"
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._run_show, sql, 'name')
 
     async def schemas(self) -> List[str]:
-        """
-        List all schemas in the database.
-
-        Returns:
-            List of schema names
-        """
+        """List all schemas in the database."""
         if self._connection is None:
             await self.connect()
-
-        cursor = self._connection.cursor()
-
-        try:
-            cursor.execute("SHOW SCHEMAS")
-            rows = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            name_idx = columns.index('name')
-            return [row[name_idx] for row in rows]
-
-        finally:
-            cursor.close()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._run_show, "SHOW SCHEMAS", 'name')
 
     async def describe(self, table: str) -> List[Dict[str, Any]]:
         """
@@ -406,88 +385,42 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
         Returns:
             List of column details with name, type, nullable, default, etc.
-
-        Example:
-            columns = await db.describe("users")
-            for col in columns:
-                print(f"{col['name']}: {col['type']}")
         """
         if self._connection is None:
             await self.connect()
-
-        cursor = self._connection.cursor()
-
-        try:
-            cursor.execute(f"DESCRIBE TABLE {table}")
-            rows = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            return [dict(zip(columns, row)) for row in rows]
-
-        finally:
-            cursor.close()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._run_show, f"DESCRIBE TABLE {table}", None)
 
     async def databases(self) -> List[str]:
-        """
-        List all accessible databases.
-
-        Returns:
-            List of database names
-        """
+        """List all accessible databases."""
         if self._connection is None:
             await self.connect()
-
-        cursor = self._connection.cursor()
-
-        try:
-            cursor.execute("SHOW DATABASES")
-            rows = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            name_idx = columns.index('name')
-            return [row[name_idx] for row in rows]
-
-        finally:
-            cursor.close()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._run_show, "SHOW DATABASES", 'name')
 
     async def list_warehouses(self) -> List[Dict[str, Any]]:
-        """
-        List all available warehouses.
-
-        Returns:
-            List of warehouse details with name, state, size, etc.
-        """
+        """List all available warehouses."""
         if self._connection is None:
             await self.connect()
-
-        cursor = self._connection.cursor()
-
-        try:
-            cursor.execute("SHOW WAREHOUSES")
-            rows = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            return [dict(zip(columns, row)) for row in rows]
-
-        finally:
-            cursor.close()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._run_show, "SHOW WAREHOUSES", None)
 
     async def switch_warehouse(self, warehouse: str) -> None:
-        """
-        Switch to a different warehouse.
-
-        Args:
-            warehouse: Warehouse name to switch to
-        """
+        """Switch to a different warehouse."""
         if self._connection is None:
             await self.connect()
 
-        cursor = self._connection.cursor()
+        def _switch():
+            cursor = self._connection.cursor()
+            try:
+                cursor.execute(f"USE WAREHOUSE {warehouse}")
+            finally:
+                cursor.close()
 
-        try:
-            cursor.execute(f"USE WAREHOUSE {warehouse}")
-            self.warehouse = warehouse
-            logger.info(f"Switched to warehouse: {warehouse}")
-
-        finally:
-            cursor.close()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _switch)
+        self.warehouse = warehouse
+        logger.info(f"Switched to warehouse: {warehouse}")
 
     async def get_current_warehouse(self) -> Dict[str, Any]:
         """
@@ -560,93 +493,37 @@ class SnowflakePlugin(BaseDatabasePlugin):
         return await self.query(sql)
 
     async def list_stages(self) -> List[Dict[str, Any]]:
-        """
-        List all stages (internal and external).
-
-        Returns:
-            List of stage details
-        """
+        """List all stages (internal and external)."""
         if self._connection is None:
             await self.connect()
-
-        cursor = self._connection.cursor()
-
-        try:
-            cursor.execute("SHOW STAGES")
-            rows = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            return [dict(zip(columns, row)) for row in rows]
-
-        finally:
-            cursor.close()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._run_show, "SHOW STAGES", None)
 
     async def put_file(self, local_path: str, stage_path: str, overwrite: bool = False) -> Dict[str, Any]:
-        """
-        Upload file to Snowflake stage.
-
-        Args:
-            local_path: Local file path
-            stage_path: Stage location (e.g., "@my_stage/path/")
-            overwrite: Whether to overwrite existing files
-
-        Returns:
-            Dictionary with upload results
-        """
+        """Upload file to Snowflake stage."""
         if self._connection is None:
             await self.connect()
 
-        cursor = self._connection.cursor()
-
-        try:
+        def _put():
             overwrite_str = "OVERWRITE = TRUE" if overwrite else ""
             sql = f"PUT 'file://{local_path}' {stage_path} {overwrite_str}"
-            cursor.execute(sql)
+            results = self._run_query(sql)
+            return {"success": True, "files_uploaded": len(results), "details": results}
 
-            rows = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            results = [dict(zip(columns, row)) for row in rows]
-
-            return {
-                "success": True,
-                "files_uploaded": len(results),
-                "details": results
-            }
-
-        finally:
-            cursor.close()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _put)
 
     async def get_file(self, stage_path: str, local_path: str) -> Dict[str, Any]:
-        """
-        Download file from Snowflake stage.
-
-        Args:
-            stage_path: Stage file location (e.g., "@my_stage/path/file.csv")
-            local_path: Local directory to download to
-
-        Returns:
-            Dictionary with download results
-        """
+        """Download file from Snowflake stage."""
         if self._connection is None:
             await self.connect()
 
-        cursor = self._connection.cursor()
+        def _get():
+            results = self._run_query(f"GET {stage_path} 'file://{local_path}'")
+            return {"success": True, "files_downloaded": len(results), "details": results}
 
-        try:
-            sql = f"GET {stage_path} 'file://{local_path}'"
-            cursor.execute(sql)
-
-            rows = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            results = [dict(zip(columns, row)) for row in rows]
-
-            return {
-                "success": True,
-                "files_downloaded": len(results),
-                "details": results
-            }
-
-        finally:
-            cursor.close()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _get)
 
     async def load_from_stage(
         self,
@@ -656,27 +533,12 @@ class SnowflakePlugin(BaseDatabasePlugin):
         pattern: Optional[str] = None,
         on_error: str = "ABORT_STATEMENT"
     ) -> Dict[str, Any]:
-        """
-        Load data from stage into table.
-
-        Args:
-            table: Target table name
-            stage: Stage location (e.g., "@my_stage/path/")
-            file_format: File format name or type (default: "CSV")
-            pattern: File pattern to match (e.g., r".*\\.csv")
-            on_error: Error handling: ABORT_STATEMENT, CONTINUE, SKIP_FILE
-
-        Returns:
-            Dictionary with load results
-        """
+        """Load data from stage into table."""
         if self._connection is None:
             await self.connect()
 
-        cursor = self._connection.cursor()
-
-        try:
+        def _load():
             pattern_clause = f"PATTERN = '{pattern}'" if pattern else ""
-
             sql = f"""
             COPY INTO {table}
             FROM {stage}
@@ -684,25 +546,12 @@ class SnowflakePlugin(BaseDatabasePlugin):
             {pattern_clause}
             ON_ERROR = {on_error}
             """
-
-            cursor.execute(sql)
-
-            rows = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            results = [dict(zip(columns, row)) for row in rows]
-
-            # Calculate summary
+            results = self._run_query(sql)
             rows_loaded = sum(row.get('rows_loaded', 0) or 0 for row in results)
+            return {"success": True, "rows_loaded": rows_loaded, "files_processed": len(results), "details": results}
 
-            return {
-                "success": True,
-                "rows_loaded": rows_loaded,
-                "files_processed": len(results),
-                "details": results
-            }
-
-        finally:
-            cursor.close()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _load)
 
     async def create_stage(
         self,
@@ -711,50 +560,25 @@ class SnowflakePlugin(BaseDatabasePlugin):
         storage_integration: Optional[str] = None,
         credentials: Optional[Dict[str, str]] = None
     ) -> None:
-        """
-        Create a new stage (internal or external).
-
-        Args:
-            name: Stage name
-            url: External URL (e.g., "s3://bucket/path/") for external stages
-            storage_integration: Storage integration name for cloud storage
-            credentials: Cloud credentials (e.g., {"AWS_KEY_ID": "...", "AWS_SECRET_KEY": "..."})
-
-        Example:
-            # Internal stage
-            await db.create_stage("my_internal_stage")
-
-            # External S3 stage
-            await db.create_stage(
-                "my_s3_stage",
-                url="s3://my-bucket/data/",
-                credentials={"AWS_KEY_ID": "...", "AWS_SECRET_KEY": "..."}
-            )
-        """
+        """Create a new stage (internal or external)."""
         if self._connection is None:
             await self.connect()
 
-        cursor = self._connection.cursor()
-
-        try:
+        def _create():
             if url:
-                # External stage
                 sql = f"CREATE STAGE IF NOT EXISTS {name} URL = '{url}'"
-
                 if storage_integration:
                     sql += f" STORAGE_INTEGRATION = {storage_integration}"
                 elif credentials:
                     creds_str = " ".join([f"{k} = '{v}'" for k, v in credentials.items()])
                     sql += f" CREDENTIALS = ({creds_str})"
             else:
-                # Internal stage
                 sql = f"CREATE STAGE IF NOT EXISTS {name}"
-
-            cursor.execute(sql)
+            self._run_execute(sql)
             logger.info(f"Created stage: {name}")
 
-        finally:
-            cursor.close()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _create)
 
     def get_tools(self) -> List['AgentTool']:
         """
@@ -767,18 +591,27 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
         return [
             AgentTool(
-                name="query_database",
-                description="Execute a SQL SELECT query on Snowflake and return results as a list of dictionaries",
+                name="snowflake_query",
+                description="Run a SELECT query on Snowflake. Use limit and columns to avoid oversized responses.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "SQL SELECT query with %s placeholders for parameters"
+                            "description": "SQL SELECT query with %s placeholders"
                         },
                         "params": {
                             "type": "array",
-                            "description": "Optional list of parameter values for query placeholders",
+                            "description": "Optional parameter values",
+                            "items": {"type": "string"}
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max rows to return (default: 50)"
+                        },
+                        "columns": {
+                            "type": "array",
+                            "description": "Specific columns to return (returns all if omitted)",
                             "items": {"type": "string"}
                         }
                     },
@@ -791,18 +624,18 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 timeout_seconds=60
             ),
             AgentTool(
-                name="execute_sql",
-                description="Execute a SQL INSERT, UPDATE, or DELETE statement on Snowflake and return the number of affected rows",
+                name="snowflake_execute",
+                description="Execute INSERT, UPDATE, or DELETE on Snowflake. Returns affected row count.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "SQL statement with %s placeholders for parameters"
+                            "description": "SQL statement (INSERT, UPDATE, or DELETE)"
                         },
                         "params": {
                             "type": "array",
-                            "description": "Optional list of parameter values for statement placeholders",
+                            "description": "Optional parameter values",
                             "items": {"type": "string"}
                         }
                     },
@@ -815,14 +648,14 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 timeout_seconds=60
             ),
             AgentTool(
-                name="list_tables",
-                description="List all tables in the Snowflake database or a specific schema",
+                name="snowflake_list_tables",
+                description="List all tables in the Snowflake database or a specific schema.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "schema": {
                             "type": "string",
-                            "description": "Optional schema name to list tables from (defaults to current schema)"
+                            "description": "Optional schema name (defaults to current schema)"
                         }
                     },
                     "required": []
@@ -835,12 +668,8 @@ class SnowflakePlugin(BaseDatabasePlugin):
             ),
             AgentTool(
                 name="list_schemas",
-                description="List all schemas in the Snowflake database",
-                parameters={
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                },
+                description="List all schemas in the Snowflake database.",
+                parameters={"type": "object", "properties": {}, "required": []},
                 handler=self._tool_list_schemas,
                 category="database",
                 source="plugin",
@@ -848,8 +677,8 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 timeout_seconds=30
             ),
             AgentTool(
-                name="get_table_schema",
-                description="Get detailed column information for a Snowflake table including column names, types, and constraints",
+                name="snowflake_get_schema",
+                description="Get column info for a Snowflake table including names, types, and constraints.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -861,6 +690,26 @@ class SnowflakePlugin(BaseDatabasePlugin):
                     "required": ["table"]
                 },
                 handler=self._tool_get_table_schema,
+                category="database",
+                source="plugin",
+                plugin_name="Snowflake",
+                timeout_seconds=30
+            ),
+            AgentTool(
+                name="snowflake_inspect",
+                description="List all tables and their column schemas in one call. Use instead of calling snowflake_list_tables then snowflake_get_schema for each table.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "tables": {
+                            "type": "array",
+                            "description": "Filter to specific tables (returns all if omitted)",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": []
+                },
+                handler=self._tool_inspect,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
@@ -1025,9 +874,20 @@ class SnowflakePlugin(BaseDatabasePlugin):
     # Tool handler methods
 
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for query_database"""
+        """Tool handler for snowflake_query"""
         sql = args.get("sql")
         params = args.get("params")
+        limit = args.get("limit", 50)
+        columns = args.get("columns")
+
+        if columns:
+            safe_cols = ", ".join(
+                f'"{c}"' for c in columns
+                if re.match(r'^[A-Za-z0-9_]+$', c)
+            )
+            if safe_cols:
+                sql = f"SELECT {safe_cols} FROM ({sql}) _sf_q"
+        sql = f"{sql} LIMIT {int(limit)}"
 
         results = await self.query(sql, params)
 
@@ -1038,7 +898,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         }
 
     async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for execute_sql"""
+        """Tool handler for snowflake_execute"""
         sql = args.get("sql")
         params = args.get("params")
 
@@ -1050,7 +910,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         }
 
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for list_tables"""
+        """Tool handler for snowflake_list_tables"""
         schema = args.get("schema")
 
         tables = await self.tables(schema)
@@ -1072,7 +932,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         }
 
     async def _tool_get_table_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for get_table_schema"""
+        """Tool handler for snowflake_get_schema"""
         table = args.get("table")
 
         columns = await self.describe(table)
@@ -1082,6 +942,21 @@ class SnowflakePlugin(BaseDatabasePlugin):
             "table": table,
             "columns": columns,
             "column_count": len(columns)
+        }
+
+    async def _tool_inspect(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_inspect — fetch all table schemas in parallel."""
+        filter_tables = args.get("tables")
+
+        all_tables = await self.tables()
+        targets = [t for t in all_tables if t in filter_tables] if filter_tables else all_tables
+
+        schemas = await asyncio.gather(*[self.describe(t) for t in targets])
+
+        return {
+            "success": True,
+            "tables": [{"name": t, "columns": s} for t, s in zip(targets, schemas)],
+            "count": len(targets)
         }
 
     async def _tool_list_warehouses(self, args: Dict[str, Any]) -> Dict[str, Any]:

@@ -3,8 +3,9 @@ Pinecone vector database plugin for Daita Agents.
 
 Managed cloud vector database with serverless and pod-based deployment options.
 """
+import asyncio
 import logging
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 from .base_vector import BaseVectorPlugin
 
 if TYPE_CHECKING:
@@ -26,6 +27,7 @@ class PineconePlugin(BaseVectorPlugin):
         index: str,
         namespace: str = "",
         host: Optional[str] = None,
+        embedding_fn: Optional[Callable] = None,
         **kwargs
     ):
         """
@@ -36,6 +38,8 @@ class PineconePlugin(BaseVectorPlugin):
             index: Index name to use
             namespace: Optional namespace for multi-tenancy
             host: Optional host URL for serverless Pinecone
+            embedding_fn: Optional callable that converts text to a vector.
+                          Enables passing `text` instead of `vector` to search tools.
             **kwargs: Additional Pinecone configuration
         """
         self.api_key = api_key
@@ -43,6 +47,7 @@ class PineconePlugin(BaseVectorPlugin):
         self.namespace = namespace
         self.host = host
         self._index = None
+        self._embedding_fn = embedding_fn
 
         super().__init__(
             api_key=api_key,
@@ -272,7 +277,7 @@ class PineconePlugin(BaseVectorPlugin):
         return [
             AgentTool(
                 name="pinecone_search",
-                description="Search for similar vectors in Pinecone using semantic similarity. Returns top matching results with scores.",
+                description="Search Pinecone for similar vectors. Provide 'vector' (float array) or 'text' (auto-embedded).",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -280,6 +285,10 @@ class PineconePlugin(BaseVectorPlugin):
                             "type": "array",
                             "description": "Query vector as array of floats",
                             "items": {"type": "number"}
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Query text (auto-embedded via configured embedding_fn; use instead of vector)"
                         },
                         "top_k": {
                             "type": "integer",
@@ -294,7 +303,7 @@ class PineconePlugin(BaseVectorPlugin):
                             "description": "Optional namespace to search within"
                         }
                     },
-                    "required": ["vector"]
+                    "required": []
                 },
                 handler=self._tool_search,
                 category="vector_db",
@@ -304,7 +313,7 @@ class PineconePlugin(BaseVectorPlugin):
             ),
             AgentTool(
                 name="pinecone_upsert",
-                description="Insert or update vectors in Pinecone with metadata. Creates new vectors or updates existing ones.",
+                description="Insert or update Pinecone vectors with metadata.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -341,7 +350,7 @@ class PineconePlugin(BaseVectorPlugin):
             ),
             AgentTool(
                 name="pinecone_delete",
-                description="Delete vectors from Pinecone by ID or filter. Can delete specific vectors or all vectors in a namespace.",
+                description="Delete Pinecone vectors by ID, filter, or entire namespace.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -373,7 +382,7 @@ class PineconePlugin(BaseVectorPlugin):
             ),
             AgentTool(
                 name="pinecone_stats",
-                description="Get Pinecone index statistics including dimension, vector count, and namespace information.",
+                description="Get Pinecone index stats: dimension, vector count, and namespaces.",
                 parameters={
                     "type": "object",
                     "properties": {},
@@ -390,9 +399,18 @@ class PineconePlugin(BaseVectorPlugin):
     async def _tool_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for pinecone_search"""
         vector = args.get("vector")
+        text = args.get("text")
         top_k = args.get("top_k", 10)
         filter = args.get("filter")
         namespace = args.get("namespace")
+
+        if vector is None:
+            if not self._embedding_fn:
+                raise ValueError(
+                    "Provide 'vector' (float array) or configure embedding_fn in the constructor"
+                )
+            result = self._embedding_fn(text)
+            vector = await result if asyncio.iscoroutine(result) else result
 
         matches = await self.query(
             vector=vector,

@@ -8,13 +8,14 @@ import json
 import asyncio
 from typing import Any, Dict, List, Optional, Union, Tuple, TYPE_CHECKING
 from datetime import datetime
+from .base import BasePlugin
 
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
 
-class ElasticsearchPlugin:
+class ElasticsearchPlugin(BasePlugin):
     """
     Simple Elasticsearch plugin for agents.
     
@@ -714,7 +715,7 @@ class ElasticsearchPlugin:
         return [
             AgentTool(
                 name="search_elasticsearch",
-                description="Search documents in Elasticsearch index using query DSL. Returns matching documents with scores.",
+                description="Search an Elasticsearch index using query DSL.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -724,11 +725,11 @@ class ElasticsearchPlugin:
                         },
                         "query": {
                             "type": "object",
-                            "description": "Elasticsearch query DSL object (e.g., {\"match\": {\"field\": \"value\"}})"
+                            "description": "Elasticsearch query DSL object"
                         },
                         "size": {
                             "type": "integer",
-                            "description": "Number of results to return (default: 100)"
+                            "description": "Number of results to return (default: 50)"
                         }
                     },
                     "required": ["index", "query"]
@@ -741,13 +742,13 @@ class ElasticsearchPlugin:
             ),
             AgentTool(
                 name="index_document",
-                description="Index a single document into Elasticsearch. Creates or updates a document in the specified index.",
+                description="Index a single document into an Elasticsearch index.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "index": {
                             "type": "string",
-                            "description": "Index name where document will be stored"
+                            "description": "Index name"
                         },
                         "document": {
                             "type": "object",
@@ -768,18 +769,164 @@ class ElasticsearchPlugin:
             ),
             AgentTool(
                 name="get_index_mapping",
-                description="Get the mapping (schema) for an Elasticsearch index to understand its structure",
+                description="Get the field mapping (schema) for an Elasticsearch index.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "index": {
                             "type": "string",
-                            "description": "Index name to get mapping for"
+                            "description": "Index name"
                         }
                     },
                     "required": ["index"]
                 },
                 handler=self._tool_get_mapping,
+                category="search",
+                source="plugin",
+                plugin_name="Elasticsearch",
+                timeout_seconds=30
+            ),
+            AgentTool(
+                name="bulk_index_documents",
+                description="Bulk index multiple documents into Elasticsearch. Primary path for batch ingestion.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "index": {
+                            "type": "string",
+                            "description": "Index name"
+                        },
+                        "documents": {
+                            "type": "array",
+                            "description": "List of document objects to index",
+                            "items": {"type": "object"}
+                        },
+                        "batch_size": {
+                            "type": "integer",
+                            "description": "Documents per batch (default: 1000)"
+                        }
+                    },
+                    "required": ["index", "documents"]
+                },
+                handler=self._tool_bulk_index,
+                category="search",
+                source="plugin",
+                plugin_name="Elasticsearch",
+                timeout_seconds=120
+            ),
+            AgentTool(
+                name="delete_es_document",
+                description="Delete a document from Elasticsearch by ID.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "index": {
+                            "type": "string",
+                            "description": "Index name"
+                        },
+                        "doc_id": {
+                            "type": "string",
+                            "description": "Document ID to delete"
+                        }
+                    },
+                    "required": ["index", "doc_id"]
+                },
+                handler=self._tool_delete_document,
+                category="search",
+                source="plugin",
+                plugin_name="Elasticsearch",
+                timeout_seconds=30
+            ),
+            AgentTool(
+                name="create_es_index",
+                description="Create an Elasticsearch index with optional mapping and settings.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "index": {
+                            "type": "string",
+                            "description": "Index name to create"
+                        },
+                        "mapping": {
+                            "type": "object",
+                            "description": "Index mapping (e.g., {\"properties\": {\"timestamp\": {\"type\": \"date\"}}})"
+                        },
+                        "settings": {
+                            "type": "object",
+                            "description": "Index settings (e.g., {\"number_of_shards\": 1})"
+                        }
+                    },
+                    "required": ["index"]
+                },
+                handler=self._tool_create_index,
+                category="search",
+                source="plugin",
+                plugin_name="Elasticsearch",
+                timeout_seconds=30
+            ),
+            AgentTool(
+                name="search_agent_logs",
+                description="Search agent execution logs in Elasticsearch with filtering by agent ID, status, and time range.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "index": {
+                            "type": "string",
+                            "description": "Index name for agent logs"
+                        },
+                        "agent_id": {
+                            "type": "string",
+                            "description": "Filter by agent ID"
+                        },
+                        "status": {
+                            "type": "string",
+                            "description": "Filter by execution status (e.g., success, error)"
+                        },
+                        "size": {
+                            "type": "integer",
+                            "description": "Max results to return (default: 50)"
+                        }
+                    },
+                    "required": ["index"]
+                },
+                handler=self._tool_search_agent_logs,
+                category="search",
+                source="plugin",
+                plugin_name="Elasticsearch",
+                timeout_seconds=60
+            ),
+            AgentTool(
+                name="analyze_es_performance",
+                description="Analyze performance metrics in Elasticsearch using aggregations (stats, percentiles).",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "index": {
+                            "type": "string",
+                            "description": "Index name"
+                        },
+                        "metric_field": {
+                            "type": "string",
+                            "description": "Numeric field to analyze (default: duration_ms)"
+                        },
+                        "group_by": {
+                            "type": "string",
+                            "description": "Optional field to group results by (e.g., agent_id)"
+                        }
+                    },
+                    "required": ["index"]
+                },
+                handler=self._tool_analyze_performance,
+                category="search",
+                source="plugin",
+                plugin_name="Elasticsearch",
+                timeout_seconds=60
+            ),
+            AgentTool(
+                name="get_es_cluster_health",
+                description="Get Elasticsearch cluster health status and shard metrics.",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=self._tool_cluster_health,
                 category="search",
                 source="plugin",
                 plugin_name="Elasticsearch",
@@ -791,7 +938,7 @@ class ElasticsearchPlugin:
         """Tool handler for search_elasticsearch"""
         index = args.get("index")
         query = args.get("query")
-        size = args.get("size", 100)
+        size = args.get("size", 50)
 
         results = await self.search(index=index, query=query, size=size)
 
@@ -809,11 +956,7 @@ class ElasticsearchPlugin:
         document = args.get("document")
         doc_id = args.get("doc_id")
 
-        result = await self.index_document(
-            index=index,
-            document=document,
-            doc_id=doc_id
-        )
+        result = await self.index_document(index=index, document=document, doc_id=doc_id)
 
         return {
             "success": True,
@@ -833,6 +976,92 @@ class ElasticsearchPlugin:
             "success": True,
             "index": index,
             "mapping": mapping
+        }
+
+    async def _tool_bulk_index(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for bulk_index_documents"""
+        index = args.get("index")
+        documents = args.get("documents")
+        batch_size = args.get("batch_size", 1000)
+
+        result = await self.bulk_index(index=index, documents=documents, batch_size=batch_size)
+
+        return {
+            "success": True,
+            "indexed": result["indexed"],
+            "errors": result["errors"],
+            "total": result["total"],
+            "took_ms": result["took"]
+        }
+
+    async def _tool_delete_document(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for delete_es_document"""
+        index = args.get("index")
+        doc_id = args.get("doc_id")
+
+        result = await self.delete_document(index=index, doc_id=doc_id)
+
+        return {
+            "success": True,
+            "id": result["id"],
+            "deleted": result["deleted"]
+        }
+
+    async def _tool_create_index(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for create_es_index"""
+        index = args.get("index")
+        mapping = args.get("mapping")
+        settings = args.get("settings")
+
+        result = await self.create_index(index=index, mapping=mapping, settings=settings)
+
+        return {
+            "success": True,
+            "acknowledged": result["acknowledged"],
+            "index": result["index"]
+        }
+
+    async def _tool_search_agent_logs(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for search_agent_logs"""
+        index = args.get("index")
+        agent_id = args.get("agent_id")
+        status = args.get("status")
+        size = args.get("size", 50)
+
+        results = await self.search_agent_logs(
+            index=index, agent_id=agent_id, status=status, size=size
+        )
+
+        return {
+            "success": True,
+            "documents": results["hits"]["documents"],
+            "total": results["hits"]["total"]["value"],
+            "took_ms": results["took"]
+        }
+
+    async def _tool_analyze_performance(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for analyze_es_performance"""
+        index = args.get("index")
+        metric_field = args.get("metric_field", "duration_ms")
+        group_by = args.get("group_by")
+
+        results = await self.analyze_performance(
+            index=index, metric_field=metric_field, group_by=group_by
+        )
+
+        return {
+            "success": True,
+            "aggregations": results.get("aggregations", {}),
+            "took_ms": results["took"]
+        }
+
+    async def _tool_cluster_health(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for get_es_cluster_health"""
+        health = await self.get_cluster_health()
+
+        return {
+            "success": True,
+            **health
         }
 
     # Context manager support
