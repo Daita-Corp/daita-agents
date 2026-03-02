@@ -1,0 +1,256 @@
+"""
+Unit tests for daita/llm/base.py (BaseLLMProvider shared logic).
+
+Uses MockLLMProvider as the concrete implementation since BaseLLMProvider
+is abstract. Tests cover shared behaviour that every provider inherits.
+"""
+
+import asyncio
+from typing import Dict, Any
+
+import pytest
+
+from daita.core.tools import AgentTool
+from daita.llm.mock import MockLLMProvider
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+def _make_provider(**kwargs) -> MockLLMProvider:
+    return MockLLMProvider(delay=0, **kwargs)
+
+
+def _make_tool(name: str, return_value: Any = "result"):
+    async def h(args):
+        return return_value
+
+    return AgentTool(
+        name=name,
+        description=f"Tool {name}",
+        parameters={
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+        handler=h,
+    )
+
+
+def _make_slow_tool(name: str, sleep: float = 10.0):
+    async def h(args):
+        await asyncio.sleep(sleep)
+        return "never"
+
+    return AgentTool(
+        name=name,
+        description="Slow",
+        parameters={},
+        handler=h,
+        timeout_seconds=0.01,
+    )
+
+
+# ===========================================================================
+# _merge_params
+# ===========================================================================
+
+class TestMergeParams:
+    def test_no_overrides_returns_defaults(self):
+        p = _make_provider()
+        merged = p._merge_params({})
+        assert "temperature" in merged
+        assert "max_tokens" in merged
+
+    def test_override_replaces_default(self):
+        p = _make_provider()
+        merged = p._merge_params({"temperature": 0.0})
+        assert merged["temperature"] == 0.0
+
+    def test_new_key_added(self):
+        p = _make_provider()
+        merged = p._merge_params({"custom_key": "value"})
+        assert merged["custom_key"] == "value"
+
+    def test_original_defaults_unchanged(self):
+        p = _make_provider()
+        original_temp = p.default_params["temperature"]
+        p._merge_params({"temperature": 0.0})
+        assert p.default_params["temperature"] == original_temp
+
+
+# ===========================================================================
+# _estimate_cost
+# ===========================================================================
+
+class TestEstimateCost:
+    def test_zero_tokens_returns_none(self):
+        p = _make_provider()
+        assert p._estimate_cost({"total_tokens": 0}) is None
+
+    def test_positive_tokens_returns_positive_float(self):
+        p = _make_provider()
+        cost = p._estimate_cost({"total_tokens": 1000})
+        assert isinstance(cost, float)
+        assert cost > 0.0
+
+    def test_cost_scales_with_tokens(self):
+        p = _make_provider()
+        cost_1k = p._estimate_cost({"total_tokens": 1000})
+        cost_2k = p._estimate_cost({"total_tokens": 2000})
+        assert cost_2k == pytest.approx(cost_1k * 2, rel=1e-6)
+
+
+# ===========================================================================
+# _convert_tools_to_format
+# ===========================================================================
+
+class TestConvertToolsToFormat:
+    def test_returns_openai_function_format(self):
+        p = _make_provider()
+        t = _make_tool("search")
+        result = p._convert_tools_to_format([t])
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["type"] == "function"
+        assert result[0]["function"]["name"] == "search"
+
+    def test_multiple_tools_converted(self):
+        p = _make_provider()
+        result = p._convert_tools_to_format([_make_tool("a"), _make_tool("b")])
+        assert len(result) == 2
+
+
+# ===========================================================================
+# _update_accumulated_metrics
+# ===========================================================================
+
+class TestAccumulatedMetrics:
+    def test_tokens_accumulate_across_calls(self):
+        p = _make_provider()
+        p._update_accumulated_metrics({"total_tokens": 100, "prompt_tokens": 60, "completion_tokens": 40})
+        p._update_accumulated_metrics({"total_tokens": 200, "prompt_tokens": 120, "completion_tokens": 80})
+        acc = p.get_accumulated_tokens()
+        assert acc["total_tokens"] == 300
+        assert acc["prompt_tokens"] == 180
+        assert acc["completion_tokens"] == 120
+
+    def test_cost_accumulates_across_calls(self):
+        p = _make_provider()
+        p._update_accumulated_metrics({"total_tokens": 1000})
+        p._update_accumulated_metrics({"total_tokens": 1000})
+        assert p.get_accumulated_cost() > 0.0
+
+    def test_explicit_cost_overrides_estimate(self):
+        p = _make_provider()
+        p._update_accumulated_metrics({"total_tokens": 1000}, cost=9.99)
+        assert p.get_accumulated_cost() == pytest.approx(9.99)
+
+
+# ===========================================================================
+# get_token_stats
+# ===========================================================================
+
+class TestGetTokenStats:
+    def test_stats_structure_with_agent_id(self):
+        p = _make_provider()
+        p.set_agent_id("test-agent-123")
+        stats = p.get_token_stats()
+        for key in ("total_tokens", "prompt_tokens", "completion_tokens", "estimated_cost"):
+            assert key in stats
+
+    def test_stats_without_agent_id_returns_zeros(self):
+        p = _make_provider()
+        # No agent_id set → fallback path
+        stats = p.get_token_stats()
+        assert stats["total_calls"] == 0
+        assert stats["total_tokens"] == 0
+
+
+# ===========================================================================
+# set_agent_id
+# ===========================================================================
+
+class TestSetAgentId:
+    def test_stores_agent_id(self):
+        p = _make_provider()
+        p.set_agent_id("abc-123")
+        assert p.agent_id == "abc-123"
+
+
+# ===========================================================================
+# _execute_tool_call
+# ===========================================================================
+
+class TestExecuteToolCall:
+    async def test_finds_and_executes_tool(self):
+        p = _make_provider()
+        t = _make_tool("calc", return_value=42)
+        result = await p._execute_tool_call(
+            tool_call={"name": "calc", "arguments": {}},
+            tools=[t],
+        )
+        assert result == 42
+
+    async def test_unknown_tool_returns_error_dict(self):
+        p = _make_provider()
+        result = await p._execute_tool_call(
+            tool_call={"name": "ghost", "arguments": {}},
+            tools=[],
+        )
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "not found" in result["error"]
+
+    async def test_tool_timeout_returns_error_dict(self):
+        p = _make_provider()
+        t = _make_slow_tool("slow")
+        result = await p._execute_tool_call(
+            tool_call={"name": "slow", "arguments": {}},
+            tools=[t],
+        )
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "timed out" in result["error"]
+
+    async def test_tool_exception_returns_error_dict(self):
+        async def h(args):
+            raise RuntimeError("unexpected failure")
+
+        t = AgentTool(name="broken", description="Broken", parameters={}, handler=h)
+        p = _make_provider()
+        result = await p._execute_tool_call(
+            tool_call={"name": "broken", "arguments": {}},
+            tools=[t],
+        )
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "failed" in result["error"]
+
+
+# ===========================================================================
+# provider.info property
+# ===========================================================================
+
+class TestProviderInfo:
+    def test_info_has_required_keys(self):
+        p = _make_provider()
+        info = p.info
+        for key in ("provider", "model", "agent_id", "config", "default_params", "tracing_enabled"):
+            assert key in info
+
+    def test_info_excludes_api_key(self):
+        p = MockLLMProvider(delay=0)
+        info = p.info
+        # No key containing 'key' should appear in config
+        for k in info.get("config", {}):
+            assert "key" not in k.lower()
+
+    def test_tracing_enabled_is_true(self):
+        p = _make_provider()
+        assert p.info["tracing_enabled"] is True
+
+    def test_model_name_alias(self):
+        p = MockLLMProvider(model="test-model-1", delay=0)
+        assert p.model_name == "test-model-1"

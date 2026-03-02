@@ -185,7 +185,6 @@ class MockLLMProvider(BaseLLMProvider):
             yield LLMChunk(
                 type="text",
                 content=char,
-                index=i
             )
 
     def _get_last_token_usage(self) -> Dict[str, int]:

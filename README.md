@@ -6,7 +6,6 @@ Daita Agents gives you a clean, minimal API for autonomous tool-calling agents t
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
-[![CI](https://github.com/daita-tech/daita-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/daita-tech/daita-agents/actions)
 
 ---
 
@@ -113,36 +112,39 @@ result = await agent.run("What's my preference?")
 
 ## Plugins
 
-| Plugin         | Description                              |
-|----------------|------------------------------------------|
-| `postgresql`   | Query and write PostgreSQL               |
-| `mysql`        | Query and write MySQL                    |
-| `mongodb`      | Query MongoDB collections                |
-| `rest`         | Call REST APIs                           |
-| `s3`           | Read/write S3 objects                    |
-| `slack`        | Send Slack messages                      |
-| `elasticsearch`| Search Elasticsearch indices             |
-| `neo4j`        | Graph queries via Neo4j                  |
-| `memory`       | Persistent agent memory                  |
-| `websearch`    | Web search via Tavily                    |
-| `email`        | Send email via SMTP/Gmail                |
-| `snowflake`    | Query Snowflake data warehouse           |
+| Plugin          | Description                    |
+| --------------- | ------------------------------ |
+| `postgresql`    | Query and write PostgreSQL     |
+| `mysql`         | Query and write MySQL          |
+| `mongodb`       | Query MongoDB collections      |
+| `rest`          | Call REST APIs                 |
+| `s3`            | Read/write S3 objects          |
+| `slack`         | Send Slack messages            |
+| `elasticsearch` | Search Elasticsearch indices   |
+| `neo4j`         | Graph queries via Neo4j        |
+| `memory`        | Persistent agent memory        |
+| `websearch`     | Web search via Tavily          |
+| `email`         | Send email via SMTP/Gmail      |
+| `snowflake`     | Query Snowflake data warehouse |
 
 ---
 
 ## Installation
 
 ### Core (OpenAI only)
+
 ```bash
 pip install daita-agents
 ```
 
 ### Recommended (common providers + tools)
+
 ```bash
 pip install "daita-agents[recommended]"
 ```
 
 ### All providers
+
 ```bash
 pip install "daita-agents[all]"
 ```
@@ -165,4 +167,4 @@ Apache 2.0 — see [LICENSE](LICENSE).
 
 ---
 
-*Built by [Daita](https://daita-tech.io)*
+_Built by [Daita](https://daita-tech.io)_
