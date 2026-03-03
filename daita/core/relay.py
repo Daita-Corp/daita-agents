@@ -32,17 +32,16 @@ import logging
 import random
 import time
 import uuid
-from typing import Dict, Any, Optional, List, Callable, Union
+from typing import Dict, Any, Optional, List, Callable
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-import weakref
 
 try:
-    from ..core.exceptions import DaitaError, AcknowledgmentTimeoutError
+    from ..core.exceptions import DaitaError
 except ImportError:
     # Fallback for direct execution or testing
-    from core.exceptions import DaitaError, AcknowledgmentTimeoutError
+    from core.exceptions import DaitaError
 
 logger = logging.getLogger(__name__)
 

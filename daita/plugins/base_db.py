@@ -6,12 +6,10 @@ support for all database plugins in the Daita framework.
 """
 import logging
 from abc import abstractmethod
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict
 from ..core.exceptions import PluginError, ConnectionError as DaitaConnectionError, ValidationError
 from .base import BasePlugin
 
-if TYPE_CHECKING:
-    from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
 

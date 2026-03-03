@@ -15,7 +15,6 @@ from email import encoders
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 from datetime import datetime
-import base64
 from .base import BasePlugin
 
 if TYPE_CHECKING:

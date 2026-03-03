@@ -8,7 +8,7 @@ import os
 import asyncio
 import aiohttp
 import ssl
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from ...config.settings import settings
 
 

@@ -4,8 +4,6 @@ Shows project and deployment status like git status.
 """
 import json
 import yaml
-from pathlib import Path
-from datetime import datetime
 from ..utils import find_project_root
 
 

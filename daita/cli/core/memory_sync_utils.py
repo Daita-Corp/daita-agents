@@ -7,7 +7,6 @@ Used internally by deployment process - not a CLI command.
 
 import json
 import sqlite3
-import os
 from pathlib import Path
 from datetime import datetime
 from typing import Optional

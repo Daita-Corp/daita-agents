@@ -70,7 +70,7 @@ class S3Plugin(BasePlugin):
 
         try:
             import boto3
-            from botocore.exceptions import ClientError, NoCredentialsError
+            from botocore.exceptions import ClientError
 
             def _create_client():
                 session_kwargs = {'region_name': self.region}
@@ -103,7 +103,7 @@ class S3Plugin(BasePlugin):
                     raise RuntimeError(f"S3 connection error: {e}")
 
         except ImportError:
-            raise RuntimeError("boto3 not installed. Run: pip install boto3")
+            raise ImportError("boto3 not installed. Install with: pip install 'daita-agents[aws]'")
         except RuntimeError:
             raise
         except Exception as e:
@@ -239,7 +239,7 @@ class S3Plugin(BasePlugin):
                     
                     return df
                 except ImportError:
-                    raise RuntimeError("pandas not installed. Run: pip install pandas")
+                    raise ImportError("pandas not installed. Install with: pip install 'daita-agents[data]'")
             else:
                 return content
                 

@@ -4,7 +4,7 @@ Core interfaces for Daita Agents.
 Defines the essential contracts that components must implement.
 """
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional
 
 class AgentABC(ABC):
     """Abstract base interface for all agents. Use Agent or BaseAgent for concrete implementations."""

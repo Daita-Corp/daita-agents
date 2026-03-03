@@ -4,7 +4,7 @@ MongoDB plugin for Daita Agents.
 Simple MongoDB connection and querying - no over-engineering.
 """
 import logging
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from .base_db import BaseDatabasePlugin
 
 if TYPE_CHECKING:
@@ -98,7 +98,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
             logger.info(f"Connected to MongoDB database '{self.database_name}'")
         except ImportError:
             self._handle_connection_error(
-                ImportError("motor not installed. Run: pip install motor"),
+                ImportError("motor not installed. Install with: pip install 'daita-agents[mongodb]'"),
                 "connection"
             )
         except Exception as e:

@@ -95,7 +95,7 @@ class MySQLPlugin(BaseDatabasePlugin):
             logger.info("Connected to MySQL")
         except ImportError:
             self._handle_connection_error(
-                ImportError("aiomysql not installed. Run: pip install aiomysql"),
+                ImportError("aiomysql not installed. Install with: pip install 'daita-agents[mysql]'"),
                 "connection"
             )
         except Exception as e:

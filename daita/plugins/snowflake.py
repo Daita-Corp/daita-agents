@@ -256,7 +256,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
             self._handle_connection_error(
                 ImportError(
                     "snowflake-connector-python not installed. "
-                    "Install with: pip install snowflake-connector-python"
+                    "Install with: pip install 'daita-agents[snowflake]'"
                 ),
                 "connection"
             )

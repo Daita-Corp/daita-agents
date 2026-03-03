@@ -32,12 +32,16 @@ def check_cli_dependencies():
     missing = []
     
     try:
-        import yaml
+        import importlib.util
+        if importlib.util.find_spec("yaml") is None:
+            raise ImportError
     except ImportError:
         missing.append("PyYAML")
-    
+
     try:
-        import watchdog
+        import importlib.util as _ilu
+        if _ilu.find_spec("watchdog") is None:
+            raise ImportError
     except ImportError:
         missing.append("watchdog")
     
@@ -88,7 +92,6 @@ __version__ = "0.1.1"
 
 def _check_first_time_usage():
     """Check if this is the user's first time using the CLI and show welcome banner."""
-    import os
     from pathlib import Path
     
     # Create a marker file in user's home directory

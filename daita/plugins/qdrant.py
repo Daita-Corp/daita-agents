@@ -74,7 +74,7 @@ class QdrantPlugin(BaseVectorPlugin):
 
         except ImportError:
             self._handle_connection_error(
-                ImportError("qdrant-client not installed. Run: pip install qdrant-client"),
+                ImportError("qdrant-client not installed. Install with: pip install 'daita-agents[qdrant]'"),
                 "connection"
             )
         except Exception as e:

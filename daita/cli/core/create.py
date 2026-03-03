@@ -2,8 +2,6 @@
 Simple component creation for Daita CLI.
 Creates basic agents and workflows with proper path handling.
 """
-import os
-from pathlib import Path
 from ..utils import find_project_root
 
 def create_from_template(template, name=None, variant=None, verbose=False):

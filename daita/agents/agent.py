@@ -5,10 +5,8 @@ Provides autonomous tool-calling, multi-provider LLM support, plugin integration
 and zero-configuration tracing. Use Agent for most use cases; subclass BaseAgent
 for full control over the execution loop.
 """
-import asyncio
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, date
@@ -18,11 +16,8 @@ from typing import Dict, Any, Optional, List, Union, Callable
 
 from ..config.base import AgentConfig, AgentType
 from ..core.interfaces import LLMProvider
-from ..core.exceptions import (
-    DaitaError, AgentError, LLMError, PluginError,
-    ValidationError, InvalidDataError, NotFoundError
-)
-from ..core.tracing import TraceStatus, TraceType
+from ..core.exceptions import AgentError
+from ..core.tracing import TraceType
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)

@@ -40,7 +40,7 @@ Usage with Database Plugins:
 import logging
 import functools
 import re
-from typing import Any, Dict, List, Optional, Union, Callable, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Callable, TYPE_CHECKING
 from datetime import datetime, timezone
 
 from .base import BasePlugin

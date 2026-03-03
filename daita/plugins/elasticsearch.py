@@ -4,9 +4,7 @@ Elasticsearch plugin for Daita Agents.
 Simple Elasticsearch search and indexing - no over-engineering.
 """
 import logging
-import json
-import asyncio
-from typing import Any, Dict, List, Optional, Union, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 from datetime import datetime
 from .base import BasePlugin
 
@@ -139,7 +137,7 @@ class ElasticsearchPlugin(BasePlugin):
                 raise RuntimeError(f"Failed to connect to Elasticsearch: {e}")
                 
         except ImportError:
-            raise RuntimeError("elasticsearch not installed. Run: pip install elasticsearch")
+            raise ImportError("elasticsearch not installed. Install with: pip install 'daita-agents[elasticsearch]'")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize Elasticsearch client: {e}")
     

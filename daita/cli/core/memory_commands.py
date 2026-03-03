@@ -6,14 +6,14 @@ formatted output and comprehensive error handling.
 """
 
 import boto3
-import click
+
 import asyncio
 import aiohttp
 import ssl
 import os
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List
 
 
 async def show_memory_status(project: Optional[str] = None, verbose: bool = False):

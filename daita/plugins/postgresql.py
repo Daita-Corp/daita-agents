@@ -90,7 +90,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             logger.info("Connected to PostgreSQL")
         except ImportError:
             self._handle_connection_error(
-                ImportError("asyncpg not installed. Run: pip install asyncpg"),
+                ImportError("asyncpg not installed. Install with: pip install 'daita-agents[postgresql]'"),
                 "connection"
             )
         except Exception as e:

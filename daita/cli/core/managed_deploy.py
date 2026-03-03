@@ -6,15 +6,11 @@ Users only need DAITA_API_KEY, not AWS credentials.
 """
 import os
 import yaml
-import json
-import tarfile
 import tempfile
-import asyncio
 import aiohttp
 import aiofiles
 import ssl
 from pathlib import Path
-from datetime import datetime
 from ..utils import find_project_root
 from .import_detector import ImportDetector
 from ...config.settings import settings
@@ -286,8 +282,6 @@ async def _upload_with_progress(
     verbose: bool
 ) -> dict:
     """Upload with progress tracking for large packages."""
-    import sys
-    
     package_size = package_path.stat().st_size
     uploaded_size = 0
     
@@ -547,7 +541,6 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
 '''
     
     # Add bootstrap handler to package
-    import io
     handler_bytes = bootstrap_handler_content.encode('utf-8')
     zipf.writestr('lambda_handler.py', handler_bytes)
 

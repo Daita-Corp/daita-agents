@@ -74,7 +74,7 @@ class PineconePlugin(BaseVectorPlugin):
             logger.info(f"Connected to Pinecone index '{self.index_name}'")
         except ImportError:
             self._handle_connection_error(
-                ImportError("pinecone not installed. Run: pip install pinecone"),
+                ImportError("pinecone not installed. Install with: pip install 'daita-agents[pinecone]'"),
                 "connection"
             )
         except Exception as e:

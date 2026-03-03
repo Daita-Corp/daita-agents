@@ -18,15 +18,15 @@ import logging
 import uuid
 import random
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
-from ..config.base import AgentConfig, AgentType, RetryStrategy, RetryPolicy
+from ..config.base import AgentConfig, RetryStrategy
 from ..core.interfaces import AgentABC, LLMProvider
-from ..core.exceptions import DaitaError, AgentError, LLMError, BackpressureError, TaskTimeoutError
-from ..core.tracing import get_trace_manager, TraceType, TraceStatus
+
+from ..core.tracing import get_trace_manager, TraceType
 from ..core.decision_tracing import record_decision_point, DecisionType
 from ..core.reliability import (
-    TaskManager, get_global_task_manager, TaskStatus, 
+    get_global_task_manager, TaskStatus,
     BackpressureController
 )
 
@@ -248,10 +248,7 @@ class BaseAgent(AgentABC):
         async with record_decision_point("retry_decision", DecisionType.VALIDATION, self.agent_id) as decision:
             
             # Import here to avoid circular imports
-            from ..core.exceptions import (
-                TransientError, RetryableError, PermanentError,
-                classify_exception
-            )
+            from ..core.exceptions import classify_exception
             
             # Classify the error
             error_class = classify_exception(error)

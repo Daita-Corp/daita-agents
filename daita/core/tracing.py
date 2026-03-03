@@ -181,7 +181,9 @@ class DashboardReporter:
         """Check if aiohttp is available (cached result)."""
         if self._aiohttp_available is None:
             try:
-                import aiohttp
+                import importlib.util
+                if importlib.util.find_spec("aiohttp") is None:
+                    raise ImportError("aiohttp not found")
                 self._aiohttp_available = True
                 logger.debug("aiohttp available for dashboard reporting")
             except ImportError:

@@ -92,7 +92,7 @@ class ChromaPlugin(BaseVectorPlugin):
             logger.info(f"Connected to ChromaDB in {self.mode} mode")
         except ImportError:
             self._handle_connection_error(
-                ImportError("chromadb not installed. Run: pip install chromadb"),
+                ImportError("chromadb not installed. Install with: pip install 'daita-agents[chromadb]'"),
                 "connection"
             )
         except Exception as e:

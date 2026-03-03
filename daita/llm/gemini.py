@@ -57,7 +57,7 @@ class GeminiProvider(BaseLLMProvider):
                 logger.debug("Gemini client initialized with google.genai")
             except ImportError:
                 raise LLMError(
-                    "Google Genai package not installed. Install with: pip install google-genai"
+                    "Google Genai package not installed. Install with: pip install 'daita-agents[google]'"
                 )
         return self._client
 

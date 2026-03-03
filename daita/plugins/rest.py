@@ -4,8 +4,7 @@ REST API plugin for Daita Agents.
 Simple REST API client - no over-engineering.
 """
 import logging
-import asyncio
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from .base import BasePlugin
 
 if TYPE_CHECKING:
@@ -83,7 +82,7 @@ class RESTPlugin(BasePlugin):
             
             logger.info(f"Connected to REST API: {self.base_url}")
         except ImportError:
-            raise RuntimeError("aiohttp not installed. Run: pip install aiohttp")
+            raise ImportError("aiohttp not found. It is a core dependency — reinstall with: pip install daita-agents")
     
     async def disconnect(self):
         """Close HTTP session."""

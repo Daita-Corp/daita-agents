@@ -2,11 +2,9 @@
 Simple project initialization for Daita CLI.
 Creates minimal, universal project template like create-react-app.
 """
-import os
 import yaml
 from pathlib import Path
 from datetime import datetime
-from ..utils import find_project_root
 
 async def initialize_project(project_name=None, project_type='basic', template=None, force=False, verbose=False):
     """Initialize a new Daita project with minimal template."""

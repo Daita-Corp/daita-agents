@@ -61,7 +61,6 @@ from .exceptions import (
 
 # Core interfaces - Define contracts for framework components
 from .interfaces import (
-    AgentABC,
     LLMProvider,
     DatabaseBackend,
 )

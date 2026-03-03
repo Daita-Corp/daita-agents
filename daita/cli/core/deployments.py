@@ -4,8 +4,6 @@ Deployment management commands for Daita CLI.
 Provides commands to list and manage deployments.
 """
 import os
-import json
-import asyncio
 from pathlib import Path
 from datetime import datetime
 from typing import Optional

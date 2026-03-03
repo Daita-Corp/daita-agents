@@ -6,8 +6,7 @@ Simple Slack messaging and collaboration - no over-engineering.
 import logging
 import os
 import json
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
-from pathlib import Path
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from datetime import datetime
 from .base import BasePlugin
 
@@ -88,7 +87,7 @@ class SlackPlugin(BasePlugin):
                     raise RuntimeError(f"Slack authentication failed: {e.response['error']}")
                     
         except ImportError:
-            raise RuntimeError("slack-sdk not installed. Run: pip install slack-sdk")
+            raise ImportError("slack-sdk not installed. Install with: pip install 'daita-agents[slack]'")
         except Exception as e:
             raise RuntimeError(f"Failed to connect to Slack: {e}")
     

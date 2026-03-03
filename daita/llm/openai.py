@@ -53,7 +53,7 @@ class OpenAIProvider(BaseLLMProvider):
                 logger.debug("OpenAI client initialized")
             except ImportError:
                 raise LLMError(
-                    "OpenAI package not installed. Install with: pip install openai"
+                    "openai package not found. It is a core dependency — reinstall with: pip install daita-agents"
                 )
         return self._client
     

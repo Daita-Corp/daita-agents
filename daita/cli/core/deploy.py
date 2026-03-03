@@ -181,7 +181,6 @@ def _extract_workflow_configs(config: dict) -> list:
 
 def _generate_deployment_id(project_name: str, environment: str) -> str:
     """Generate a unique deployment ID."""
-    import hashlib
     import uuid
     
     # Create a deterministic but unique ID
