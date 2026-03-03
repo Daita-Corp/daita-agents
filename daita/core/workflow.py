@@ -258,7 +258,6 @@ class Workflow:
         Configure reliability features for this workflow.
 
         Args:
-            preset: Predefined configuration preset ("basic", "production", "enterprise")
             acknowledgments: Enable message acknowledgments
             task_tracking: Enable task lifecycle tracking
             backpressure_control: Enable backpressure control
@@ -266,41 +265,11 @@ class Workflow:
         Returns:
             Self for method chaining
         """
-        # Handle presets
-        if preset == "basic":
-            config = ReliabilityConfig(
-                acknowledgments=True,
-                task_tracking=True,
-                backpressure_control=True
-            )
-        elif preset == "production":
-            config = ReliabilityConfig(
-                acknowledgments=True,
-                task_tracking=True,
-                backpressure_control=True
-            )
-        elif preset == "enterprise":
-            config = ReliabilityConfig(
-                acknowledgments=True,
-                task_tracking=True,
-                backpressure_control=True
-            )
-        else:
-            # Default configuration or use provided values
-            config = ReliabilityConfig(
-                acknowledgments=acknowledgments if acknowledgments is not None else True,
-                task_tracking=task_tracking if task_tracking is not None else True,
-                backpressure_control=backpressure_control if backpressure_control is not None else True
-            )
-        
-        # Override individual settings if provided
-        if acknowledgments is not None:
-            config.acknowledgments = acknowledgments
-        if task_tracking is not None:
-            config.task_tracking = task_tracking
-        if backpressure_control is not None:
-            config.backpressure_control = backpressure_control
-        
+        config = ReliabilityConfig(
+            acknowledgments=acknowledgments if acknowledgments is not None else True,
+            task_tracking=task_tracking if task_tracking is not None else True,
+            backpressure_control=backpressure_control if backpressure_control is not None else True
+        )
         self.reliability_config = config
         self._reliability_enabled = True
         
@@ -887,18 +856,6 @@ class Workflow:
         except Exception as e:
             logger.warning(f"Failed to get recent communication: {e}")
             return []
-    
-    def get_communication_log(self, count: int = 20) -> List[Dict[str, Any]]:
-        """
-        Get workflow communication log (alias for get_recent_communication).
-        
-        Args:
-            count: Maximum number of communication events to return
-            
-        Returns:
-            List of recent workflow communication events
-        """
-        return self.get_recent_communication(limit=count)
     
     def get_workflow_stats(self) -> Dict[str, Any]:
         """Get workflow statistics from the unified tracing system."""

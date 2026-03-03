@@ -429,10 +429,6 @@ class BaseAgent(AgentABC):
         """Get recent operations for this agent from unified tracing."""
         return self.trace_manager.get_recent_operations(agent_id=self.agent_id, limit=limit)
     
-    def get_trace_stats(self) -> Dict[str, Any]:
-        """Get comprehensive tracing statistics for this agent."""
-        return self.trace_manager.get_agent_metrics(self.agent_id)
-    
     def get_recent_decisions(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent decision traces for this agent."""
         from ..core.decision_tracing import get_recent_decisions

@@ -907,13 +907,6 @@ class Agent(BaseAgent):
 
         return result
 
-    async def call_mcp_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
-        """Manually call an MCP tool by name with arguments."""
-        if not self.mcp_registry:
-            raise RuntimeError("No MCP servers configured. Add mcp parameter to Agent.")
-
-        return await self.mcp_registry.call_tool(tool_name, arguments)
-
     # User customization methods
 
     def add_plugin(self, plugin: Any):
