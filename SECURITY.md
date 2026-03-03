@@ -4,7 +4,7 @@
 
 If you discover a security vulnerability in daita-agents, please **do not** open a public GitHub issue.
 
-Instead, report it privately by emailing **security@daita-tech.io** with:
+Instead, report it privately by emailing **support@daita-tech.io** with:
 
 - A description of the vulnerability and its potential impact
 - Steps to reproduce or a proof-of-concept

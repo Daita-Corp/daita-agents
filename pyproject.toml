@@ -264,19 +264,8 @@ dev = [
 [project.scripts]
 daita = "daita.cli.main:main"
 
-# Package discovery with security exclusions
 [tool.setuptools.packages.find]
-# Only include the daita package and its subpackages
 include = ["daita*"]
-# Exclude internal cloud operations (not distributed to customers)
-exclude = [
-    "daita.api*",                    # Internal API server
-    "daita.cloud*",                  # All internal cloud operations
-    "daita.examples*",               # Example files (still have SDK references)
-    "alephagents*",                  # Other top-level packages
-    "data_ingestion*", 
-    "data_ingestion_api*"
-]
 
 
 [tool.pytest.ini_options]
