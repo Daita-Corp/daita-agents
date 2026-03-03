@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.env
+.venv
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# API keys
+.env.local
+
+# Agent memory
+.daita/memory/
+
+# User data (don't commit customer CSVs)
+data/*.csv
+!data/sample_sales.csv

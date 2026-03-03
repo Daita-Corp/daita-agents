@@ -1,0 +1,96 @@
+date,product,category,region,units_sold,unit_price,revenue,customer_id
+2024-01-05,Laptop,Electronics,North,3,1200.00,3600.00,CUST-042
+2024-01-08,Monitor,Electronics,West,5,349.99,1749.95,CUST-017
+2024-01-10,Keyboard,Peripherals,South,12,79.99,959.88,CUST-083
+2024-01-14,Mouse,Peripherals,East,20,39.99,799.80,CUST-011
+2024-01-17,Headset,Peripherals,North,8,119.99,959.92,CUST-055
+2024-01-22,Desk Chair,Furniture,West,2,449.99,899.98,CUST-029
+2024-01-25,Webcam,Peripherals,South,15,89.99,1349.85,CUST-067
+2024-01-28,Laptop,Electronics,East,1,1200.00,1200.00,CUST-091
+2024-02-03,Monitor,Electronics,North,4,349.99,1399.96,CUST-033
+2024-02-06,Keyboard,Peripherals,West,18,79.99,1439.82,CUST-074
+2024-02-09,Mouse,Peripherals,North,25,39.99,999.75,CUST-008
+2024-02-12,Laptop,Electronics,South,2,1200.00,2400.00,CUST-049
+2024-02-15,Desk Chair,Furniture,East,3,449.99,1349.97,CUST-062
+2024-02-19,Headset,Peripherals,West,10,119.99,1199.90,CUST-021
+2024-02-22,Webcam,Peripherals,North,9,89.99,809.91,CUST-088
+2024-02-26,Monitor,Electronics,South,7,349.99,2449.93,CUST-036
+2024-03-04,Laptop,Electronics,West,4,1200.00,4800.00,CUST-015
+2024-03-07,Keyboard,Peripherals,East,22,79.99,1759.78,CUST-057
+2024-03-11,Mouse,Peripherals,South,30,39.99,1199.70,CUST-002
+2024-03-14,Desk Chair,Furniture,North,1,449.99,449.99,CUST-079
+2024-03-18,Headset,Peripherals,East,14,119.99,1679.86,CUST-044
+2024-03-21,Webcam,Peripherals,West,11,89.99,989.89,CUST-066
+2024-03-25,Laptop,Electronics,North,2,1200.00,2400.00,CUST-031
+2024-03-28,Monitor,Electronics,East,6,349.99,2099.94,CUST-053
+2024-04-02,Keyboard,Peripherals,North,16,79.99,1279.84,CUST-018
+2024-04-05,Mouse,Peripherals,West,22,39.99,879.78,CUST-095
+2024-04-09,Laptop,Electronics,South,3,1200.00,3600.00,CUST-040
+2024-04-12,Desk Chair,Furniture,West,4,449.99,1799.96,CUST-072
+2024-04-16,Headset,Peripherals,South,6,119.99,719.94,CUST-026
+2024-04-19,Webcam,Peripherals,East,13,89.99,1169.87,CUST-084
+2024-04-23,Monitor,Electronics,North,3,349.99,1049.97,CUST-009
+2024-04-26,Laptop,Electronics,West,5,1200.00,6000.00,CUST-061
+2024-05-02,Keyboard,Peripherals,South,20,79.99,1599.80,CUST-037
+2024-05-07,Mouse,Peripherals,North,18,39.99,719.82,CUST-013
+2024-05-10,Desk Chair,Furniture,East,2,449.99,899.98,CUST-048
+2024-05-14,Headset,Peripherals,West,11,119.99,1319.89,CUST-070
+2024-05-17,Webcam,Peripherals,North,7,89.99,629.93,CUST-022
+2024-05-21,Laptop,Electronics,East,2,1200.00,2400.00,CUST-086
+2024-05-24,Monitor,Electronics,West,8,349.99,2799.92,CUST-034
+2024-05-28,Keyboard,Peripherals,East,14,79.99,1119.86,CUST-059
+2024-06-03,Mouse,Peripherals,West,28,39.99,1119.72,CUST-005
+2024-06-06,Laptop,Electronics,North,4,1200.00,4800.00,CUST-077
+2024-06-10,Desk Chair,Furniture,South,3,449.99,1349.97,CUST-043
+2024-06-13,Headset,Peripherals,East,9,119.99,1079.91,CUST-019
+2024-06-17,Webcam,Peripherals,South,16,89.99,1439.84,CUST-092
+2024-06-20,Monitor,Electronics,East,5,349.99,1749.95,CUST-028
+2024-06-24,Laptop,Electronics,South,3,1200.00,3600.00,CUST-051
+2024-06-27,Keyboard,Peripherals,West,24,79.99,1919.76,CUST-064
+2024-07-03,Mouse,Peripherals,South,35,39.99,1399.65,CUST-010
+2024-07-08,Desk Chair,Furniture,North,2,449.99,899.98,CUST-038
+2024-07-11,Headset,Peripherals,North,13,119.99,1559.87,CUST-081
+2024-07-15,Laptop,Electronics,West,6,1200.00,7200.00,CUST-046
+2024-07-18,Webcam,Peripherals,West,10,89.99,899.90,CUST-003
+2024-07-22,Monitor,Electronics,South,9,349.99,3149.91,CUST-073
+2024-07-25,Keyboard,Peripherals,North,19,79.99,1519.81,CUST-027
+2024-07-29,Mouse,Peripherals,East,23,39.99,919.77,CUST-089
+2024-08-05,Laptop,Electronics,East,3,1200.00,3600.00,CUST-016
+2024-08-08,Desk Chair,Furniture,West,5,449.99,2249.95,CUST-058
+2024-08-12,Headset,Peripherals,South,8,119.99,959.92,CUST-032
+2024-08-15,Webcam,Peripherals,East,12,89.99,1079.88,CUST-076
+2024-08-19,Monitor,Electronics,North,6,349.99,2099.94,CUST-014
+2024-08-22,Laptop,Electronics,South,4,1200.00,4800.00,CUST-069
+2024-08-26,Keyboard,Peripherals,South,17,79.99,1359.83,CUST-041
+2024-09-03,Mouse,Peripherals,West,26,39.99,1039.74,CUST-006
+2024-09-06,Desk Chair,Furniture,East,3,449.99,1349.97,CUST-082
+2024-09-10,Headset,Peripherals,West,12,119.99,1439.88,CUST-024
+2024-09-13,Laptop,Electronics,North,5,1200.00,6000.00,CUST-094
+2024-09-17,Webcam,Peripherals,North,8,89.99,719.92,CUST-047
+2024-09-20,Monitor,Electronics,West,7,349.99,2449.93,CUST-035
+2024-09-24,Keyboard,Peripherals,East,21,79.99,1679.79,CUST-063
+2024-09-27,Mouse,Peripherals,North,20,39.99,799.80,CUST-007
+2024-10-04,Laptop,Electronics,West,7,1200.00,8400.00,CUST-020
+2024-10-08,Desk Chair,Furniture,South,4,449.99,1799.96,CUST-056
+2024-10-11,Headset,Peripherals,East,10,119.99,1199.90,CUST-030
+2024-10-15,Webcam,Peripherals,South,14,89.99,1259.86,CUST-078
+2024-10-18,Monitor,Electronics,East,8,349.99,2799.92,CUST-039
+2024-10-22,Laptop,Electronics,South,3,1200.00,3600.00,CUST-087
+2024-10-25,Keyboard,Peripherals,West,25,79.99,1999.75,CUST-050
+2024-10-29,Mouse,Peripherals,South,32,39.99,1279.68,CUST-012
+2024-11-04,Desk Chair,Furniture,North,3,449.99,1349.97,CUST-075
+2024-11-07,Headset,Peripherals,South,15,119.99,1799.85,CUST-023
+2024-11-11,Laptop,Electronics,East,4,1200.00,4800.00,CUST-090
+2024-11-14,Webcam,Peripherals,West,18,89.99,1619.82,CUST-004
+2024-11-18,Monitor,Electronics,South,10,349.99,3499.90,CUST-045
+2024-11-21,Keyboard,Peripherals,North,23,79.99,1839.77,CUST-068
+2024-11-25,Mouse,Peripherals,East,28,39.99,1119.72,CUST-001
+2024-11-28,Laptop,Electronics,North,6,1200.00,7200.00,CUST-085
+2024-12-03,Desk Chair,Furniture,West,6,449.99,2699.94,CUST-025
+2024-12-06,Headset,Peripherals,West,14,119.99,1679.86,CUST-093
+2024-12-10,Laptop,Electronics,West,8,1200.00,9600.00,CUST-052
+2024-12-13,Webcam,Peripherals,East,11,89.99,989.89,CUST-071
+2024-12-17,Monitor,Electronics,North,9,349.99,3149.91,CUST-060
+2024-12-20,Keyboard,Peripherals,South,28,79.99,2239.72,CUST-080
+2024-12-24,Mouse,Peripherals,West,40,39.99,1599.60,CUST-016
+2024-12-27,Laptop,Electronics,South,5,1200.00,6000.00,CUST-037
