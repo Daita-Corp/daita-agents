@@ -134,21 +134,14 @@ async def calculate_stats(data: list) -> dict:
 
 def create_agent():
     """Create the data processing agent."""
-    agent = Agent(
+    return Agent(
         name="Data Processor",
         model="gpt-4o-mini",
-        prompt="You are a data analyst. Help users analyze and process data."
+        prompt="You are a data analyst. Help users analyze and process data.",
+        tools=[calculate_stats],
+        # Add plugins as needed, e.g.:
+        # plugins=[postgresql(host="localhost", database="mydb", user="user", password="pass")]
     )
-
-    # Register data processing tools
-    agent.register_tool(calculate_stats)
-
-    # Add database plugin (optional - uncomment to use)
-    # from daita.plugins import postgresql
-    # db = postgresql(host="localhost", database="mydb", user="user", password="pass")
-    # agent = Agent(name="Data Processor", tools=[db])
-
-    return agent
 
 if __name__ == "__main__":
     import asyncio

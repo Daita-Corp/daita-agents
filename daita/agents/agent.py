@@ -930,14 +930,6 @@ class Agent(BaseAgent):
         self.tool_sources.append(plugin)
         logger.debug(f"Added plugin: {plugin.__class__.__name__}")
 
-    def register_tool(self, tool: AgentTool) -> None:
-        """Register a single tool manually."""
-        self.tool_registry.register(tool)
-
-    def register_tools(self, tools: List[AgentTool]) -> None:
-        """Register multiple tools manually."""
-        self.tool_registry.register_many(tools)
-
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
         """Execute a tool by name with arguments."""
         await self._setup_tools()

@@ -6,7 +6,7 @@ Covers:
   - Agent ID and name assignment
   - Lazy LLM initialisation
   - configure_defaults()
-  - add_plugin() / register_tool() / register_tools()
+  - add_plugin()
   - health property structure
   - get_token_usage() structure
 """
@@ -179,25 +179,24 @@ class TestPluginAndToolManagement:
         plugin = MinimalPlugin()
         agent.add_plugin(plugin)  # Should not raise
 
-    def test_register_tool_increases_count(self, mock_llm):
-        agent = Agent(name="X", llm_provider=mock_llm)
-        t = make_tool("my_tool")
-        agent.register_tool(t)
+    async def test_tool_increases_count(self, mock_llm):
+        agent = Agent(name="X", llm_provider=mock_llm, tools=[make_tool("my_tool")])
+        await agent._setup_tools()
         assert agent.tool_registry.tool_count == 1
 
-    def test_register_tools_adds_multiple(self, mock_llm):
-        agent = Agent(name="X", llm_provider=mock_llm)
-        agent.register_tools([make_tool("t1"), make_tool("t2")])
+    async def test_multiple_tools_added(self, mock_llm):
+        agent = Agent(name="X", llm_provider=mock_llm, tools=[make_tool("t1"), make_tool("t2")])
+        await agent._setup_tools()
         assert agent.tool_registry.tool_count == 2
 
-    def test_tool_names_reflects_registry(self, mock_llm):
-        agent = Agent(name="X", llm_provider=mock_llm)
-        agent.register_tool(make_tool("alpha"))
+    async def test_tool_names_reflects_registry(self, mock_llm):
+        agent = Agent(name="X", llm_provider=mock_llm, tools=[make_tool("alpha")])
+        await agent._setup_tools()
         assert "alpha" in agent.tool_names
 
-    def test_available_tools_returns_list(self, mock_llm):
-        agent = Agent(name="X", llm_provider=mock_llm)
-        agent.register_tool(make_tool("beta"))
+    async def test_available_tools_returns_list(self, mock_llm):
+        agent = Agent(name="X", llm_provider=mock_llm, tools=[make_tool("beta")])
+        await agent._setup_tools()
         tools = agent.available_tools
         assert isinstance(tools, list)
         assert tools[0].name == "beta"
@@ -213,9 +212,10 @@ class TestHealthProperty:
         for key in ("id", "name", "type", "running", "metrics", "tools", "relay", "llm"):
             assert key in h, f"Missing key: {key}"
 
-    def test_health_tools_count_matches_registry(self, basic_agent, simple_tool):
-        basic_agent.register_tool(simple_tool)
-        assert basic_agent.health["tools"]["count"] == 1
+    async def test_health_tools_count_matches_registry(self, mock_llm, simple_tool):
+        agent = Agent(name="TestAgent", llm_provider=mock_llm, tools=[simple_tool])
+        await agent._setup_tools()
+        assert agent.health["tools"]["count"] == 1
 
     def test_health_relay_disabled_by_default(self, mock_llm):
         agent = Agent(name="X", llm_provider=mock_llm)

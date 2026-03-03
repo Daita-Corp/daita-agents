@@ -150,6 +150,4 @@ def basic_agent(mock_llm):
 @pytest.fixture
 def agent_with_tools(mock_llm, simple_tool):
     """Agent with mock LLM and the simple 'add' tool registered."""
-    agent = Agent(name="ToolAgent", llm_provider=mock_llm)
-    agent.register_tool(simple_tool)
-    return agent
+    return Agent(name="ToolAgent", llm_provider=mock_llm, tools=[simple_tool])

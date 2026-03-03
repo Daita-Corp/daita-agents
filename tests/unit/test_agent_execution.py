@@ -34,11 +34,7 @@ from tests.conftest import SequentialMockLLM
 def _make_agent(responses: List[Any], tools=None) -> Agent:
     """Create an Agent with a SequentialMockLLM loaded with the given responses."""
     llm = SequentialMockLLM(response_sequence=responses)
-    agent = Agent(name="ExecAgent", llm_provider=llm)
-    if tools:
-        for t in tools:
-            agent.register_tool(t)
-    return agent
+    return Agent(name="ExecAgent", llm_provider=llm, tools=tools or [])
 
 
 def _add_tool():
@@ -219,8 +215,7 @@ class TestToolCallingLoop:
                 "The answer is 5.",
             ]
         )
-        agent = Agent(name="T", llm_provider=llm)
-        agent.register_tool(tool)
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
 
         await agent.run("add 2 and 3")
         assert len(call_log) == 1
@@ -239,8 +234,7 @@ class TestToolCallingLoop:
                 "Done.",
             ]
         )
-        agent = Agent(name="T", llm_provider=llm)
-        agent.register_tool(tool)
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
 
         result = await agent.run_detailed("add 1 and 1")
         assert len(result["tool_calls"]) == 1
@@ -259,8 +253,7 @@ class TestToolCallingLoop:
                 "Final answer.",
             ]
         )
-        agent = Agent(name="T", llm_provider=llm)
-        agent.register_tool(tool)
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
         result = await agent.run_detailed("go")
         # 1 iteration for tool call + 1 iteration for final answer = 2
         assert result["iterations"] == 2
@@ -296,8 +289,7 @@ class TestJsonSerialiser:
                 "Done.",
             ]
         )
-        agent = Agent(name="T", llm_provider=llm)
-        agent.register_tool(tool)
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
         # If serialisation fails this will raise; we just need it not to.
         await agent.run("go")
 
