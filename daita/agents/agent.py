@@ -12,7 +12,10 @@ from dataclasses import dataclass
 from datetime import datetime, date
 from decimal import Decimal
 from uuid import UUID
-from typing import Dict, Any, Optional, List, Union, Callable
+from typing import TYPE_CHECKING, Dict, Any, Optional, List, Union, Callable
+
+if TYPE_CHECKING:
+    from .conversation import ConversationHistory
 
 from ..config.base import AgentConfig, AgentType
 from ..core.interfaces import LLMProvider
@@ -374,10 +377,11 @@ class Agent(BaseAgent):
         tools: Optional[List[Union[str, AgentTool]]] = None,
         max_iterations: int = 5,
         on_event: Optional[Callable] = None,
+        history: Optional["ConversationHistory"] = None,
         **kwargs
     ) -> str:
         """Execute instruction with autonomous tool calling, returns final answer string."""
-        result = await self._run_traced(prompt, tools, max_iterations, on_event, **kwargs)
+        result = await self._run_traced(prompt, tools, max_iterations, on_event, history=history, **kwargs)
         return result['result']
 
     async def run_detailed(
@@ -386,10 +390,11 @@ class Agent(BaseAgent):
         tools: Optional[List[Union[str, AgentTool]]] = None,
         max_iterations: int = 5,
         on_event: Optional[Callable] = None,
+        history: Optional["ConversationHistory"] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """Like run() but returns full execution details: result, tool_calls, iterations, tokens, cost, time."""
-        return await self._run_traced(prompt, tools, max_iterations, on_event, **kwargs)
+        return await self._run_traced(prompt, tools, max_iterations, on_event, history=history, **kwargs)
 
     async def _run_traced(
         self,
@@ -397,6 +402,7 @@ class Agent(BaseAgent):
         tools: Optional[List[Union[str, AgentTool]]],
         max_iterations: int,
         on_event: Optional[Callable],
+        history: Optional["ConversationHistory"] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """Internal: Execute with automatic tracing and optional event streaming."""
@@ -413,6 +419,11 @@ class Agent(BaseAgent):
             max_iterations=max_iterations,
             entry_point="run"  # Distinguishes from _process() calls
         ):
+            # Resolve history workspace and extract prior messages before branching
+            if history is not None:
+                history._set_workspace(self.agent_id)
+                kwargs['initial_messages'] = history.messages
+
             # Execute with or without retry based on configuration
             if self.config.retry_enabled:
                 result = await self._execute_autonomous_with_retry(
@@ -452,6 +463,10 @@ class Agent(BaseAgent):
                         )
                     except Exception as e:
                         logger.warning(f"Auto-logging failed: {e}")
+
+            # Append completed turn to conversation history
+            if history is not None:
+                await history.add_turn(prompt, result.get('result', ''))
 
             return result
 
@@ -706,6 +721,7 @@ class Agent(BaseAgent):
         tools: Optional[List[Union[str, 'AgentTool']]],
         max_iterations: int,
         on_event: Optional[Callable],
+        initial_messages: Optional[List[Dict]] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """Unified autonomous execution path for both streaming and non-streaming."""
@@ -746,6 +762,10 @@ class Agent(BaseAgent):
 
         if system_parts:
             conversation.append({"role": "system", "content": "\n\n".join(system_parts)})
+
+        # Inject prior conversation turns between system message and current prompt
+        if initial_messages:
+            conversation.extend(initial_messages)
 
         conversation.append({"role": "user", "content": prompt})
         tools_called = []

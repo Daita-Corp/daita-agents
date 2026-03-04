@@ -26,6 +26,7 @@ __version__ = "0.8.0"
 # ---------------------------------------------------------------------------
 from .agents.agent import Agent
 from .agents.base import BaseAgent
+from .agents.conversation import ConversationHistory
 
 from .core.tools import tool, AgentTool, ToolRegistry
 
@@ -83,6 +84,7 @@ __all__ = [
     # Primary interfaces
     "Agent",
     "BaseAgent",
+    "ConversationHistory",
     "Workflow",
     "RelayManager",
     # Tool system
