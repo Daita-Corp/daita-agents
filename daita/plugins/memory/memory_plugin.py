@@ -95,24 +95,26 @@ class MemoryPlugin(BasePlugin):
         runtime = os.getenv('DAITA_RUNTIME', 'local')
 
         if runtime == 'lambda':
-            try:
-                from .supabase_backend import SupabaseMemoryBackend
-            except ImportError:
+            backend_module = os.getenv('DAITA_MEMORY_BACKEND_MODULE')
+            backend_class_name = os.getenv('DAITA_MEMORY_BACKEND_CLASS')
+
+            if not backend_module or not backend_class_name:
                 raise RuntimeError(
-                    "Cloud memory (Supabase backend) is a Daita Cloud platform feature "
-                    "and is not available in the open-source SDK. "
-                    "See https://daita-tech.io for managed cloud deployment."
+                    "Cloud memory is a Daita Cloud platform feature and is not available "
+                    "in the open-source SDK. See https://daita-tech.io for managed deployment."
                 )
+
+            import importlib
+            mod = importlib.import_module(backend_module)
+            BackendClass = getattr(mod, backend_class_name)
 
             org_id = os.getenv('DAITA_ORG_ID') or os.getenv('DAITA_ORGANIZATION_ID')
             project_name = os.getenv('DAITA_PROJECT_NAME')
 
             if not org_id or not project_name:
-                raise RuntimeError(
-                    "Missing DAITA_ORG_ID and DAITA_PROJECT_NAME for cloud memory."
-                )
+                raise RuntimeError("Missing DAITA_ORG_ID and DAITA_PROJECT_NAME for cloud memory.")
 
-            self.backend = SupabaseMemoryBackend(
+            self.backend = BackendClass(
                 org_id=org_id,
                 project_name=project_name,
                 workspace=workspace,
@@ -121,8 +123,8 @@ class MemoryPlugin(BasePlugin):
                 embedding_provider=self.embedding_provider,
                 embedding_model=self.embedding_model
             )
-            self.environment = "cloud_supabase"
-            print(f"Memory: cloud Supabase pgvector, {self.scope}-scoped, workspace='{workspace}'")
+            self.environment = "cloud"
+            print(f"Memory: cloud backend, {self.scope}-scoped, workspace='{workspace}'")
         else:
             from .local_backend import LocalMemoryBackend
 
@@ -135,17 +137,21 @@ class MemoryPlugin(BasePlugin):
             )
             self.environment = "local"
 
-        try:
-            from .cloud_curator import CloudMemoryCurator
-            self.curator = CloudMemoryCurator(
+        curator_module = os.getenv('DAITA_MEMORY_CURATOR_MODULE')
+        curator_class_name = os.getenv('DAITA_MEMORY_CURATOR_CLASS')
+        if curator_module and curator_class_name:
+            import importlib
+            mod = importlib.import_module(curator_module)
+            CuratorClass = getattr(mod, curator_class_name)
+            self.curator = CuratorClass(
                 backend=self.backend,
                 agent_id=agent_id,
                 llm_provider=self.curation_provider,
                 llm_model=self.curation_model,
                 api_key=self.curation_api_key
             )
-        except ImportError:
-            self.curator = None  # Memory curation is a Daita Cloud platform feature
+        else:
+            self.curator = None
 
         if self.environment == "local":
             scope_label = f"{self.scope}-scoped"

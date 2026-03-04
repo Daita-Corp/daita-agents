@@ -13,7 +13,7 @@ import ssl
 from pathlib import Path
 from ..utils import find_project_root
 from .import_detector import ImportDetector
-from ...config.settings import settings
+from daita.config.settings import settings
 
 
 def _extract_framework_version(project_root: Path) -> str:

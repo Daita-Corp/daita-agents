@@ -68,8 +68,6 @@ recommended = [
 # Memory plugin - persistent semantic memory for agents
 memory = [
     "openai>=1.0.0",             # Embeddings (text-embedding-3-small)
-    "boto3>=1.38.0",             # S3 backend for cloud memory
-    "supabase>=2.3.0",           # Supabase pgvector backend for cloud deployments
 ]
 
 # Data-focused agents (analysis, ETL, reporting)

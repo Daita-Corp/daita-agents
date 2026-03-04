@@ -86,8 +86,7 @@ class ContradictionChecker:
     Checks whether a new fact conflicts with existing high-importance memories.
 
     Only fires when importance >= threshold (default 0.7) to limit LLM overhead.
-    Uses the same mini-LLM pattern as CloudMemoryCurator._check_supersedes():
-    one call at temperature=0.0, max_tokens=120.
+    Uses a single LLM call at temperature=0.0, max_tokens=120.
     """
 
     def __init__(self, llm, recall_fn, importance_threshold: float = 0.7):
