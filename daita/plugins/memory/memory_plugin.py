@@ -494,18 +494,22 @@ class MemoryPlugin(BasePlugin):
         if hasattr(self.backend, 'flush'):
             await self.backend.flush()
 
-        if self.auto_curate == "on_stop" and self.curator is not None:
-            result = await self.curate()
-            if result.success:
-                msg = f"Memory curated: +{result.facts_added} new"
-                if result.memories_updated > 0:
-                    msg += f", ~{result.memories_updated} updated"
-                if result.memories_pruned > 0:
-                    msg += f", -{result.memories_pruned} pruned"
-                if getattr(result, 'existing_memories', 0) > 0:
-                    msg += f" ({result.existing_memories} stored by agent)"
-                msg += f", ${result.cost_usd:.4f}"
-                print(msg)
+        if self.auto_curate == "on_stop":
+            if self.curator is not None:
+                result = await self.curate()
+                if result.success:
+                    msg = f"Memory curated: +{result.facts_added} new"
+                    if result.memories_updated > 0:
+                        msg += f", ~{result.memories_updated} updated"
+                    if result.memories_pruned > 0:
+                        msg += f", -{result.memories_pruned} pruned"
+                    if getattr(result, 'existing_memories', 0) > 0:
+                        msg += f" ({result.existing_memories} stored by agent)"
+                    msg += f", ${result.cost_usd:.4f}"
+                    print(msg)
+            elif hasattr(self.backend, 'regenerate_memory_md'):
+                path = await self.backend.regenerate_memory_md()
+                print(f"Memory summary written to: {path}")
 
     def get_pending_metrics(self) -> dict:
         if self.backend is None:

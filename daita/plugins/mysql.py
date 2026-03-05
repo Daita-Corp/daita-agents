@@ -7,6 +7,7 @@ import asyncio
 import logging
 import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from urllib.parse import urlparse, quote
 from .base_db import BaseDatabasePlugin
 
 if TYPE_CHECKING:
@@ -45,8 +46,6 @@ class MySQLPlugin(BaseDatabasePlugin):
         """
         if connection_string:
             self.connection_string = connection_string
-            # Parse connection string to extract parameters
-            from urllib.parse import urlparse
             parsed = urlparse(connection_string)
             self.host = parsed.hostname or host
             self.port = parsed.port or port
@@ -54,7 +53,7 @@ class MySQLPlugin(BaseDatabasePlugin):
             self.password = parsed.password or password
             self.db = parsed.path.lstrip('/') if parsed.path else database
         else:
-            self.connection_string = f"mysql://{username}:{password}@{host}:{port}/{database}"
+            self.connection_string = f"mysql://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}/{database}"
             self.host = host
             self.port = port
             self.user = username

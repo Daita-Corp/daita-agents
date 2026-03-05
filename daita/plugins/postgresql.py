@@ -7,6 +7,7 @@ import asyncio
 import logging
 import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from urllib.parse import quote
 from .base_db import BaseDatabasePlugin
 
 if TYPE_CHECKING:
@@ -54,9 +55,9 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         else:
             # Build connection string - handle empty password case
             if password:
-                self.connection_string = f"postgresql://{effective_username}:{password}@{host}:{port}/{database}"
+                self.connection_string = f"postgresql://{quote(effective_username, safe='')}:{quote(password, safe='')}@{host}:{port}/{database}"
             else:
-                self.connection_string = f"postgresql://{effective_username}@{host}:{port}/{database}"
+                self.connection_string = f"postgresql://{quote(effective_username, safe='')}@{host}:{port}/{database}"
         
         # PostgreSQL-specific pool configuration
         self.pool_config = {

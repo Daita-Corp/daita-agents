@@ -5,6 +5,7 @@ Simple MongoDB connection and querying - no over-engineering.
 """
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from urllib.parse import urlparse, quote
 from .base_db import BaseDatabasePlugin
 
 if TYPE_CHECKING:
@@ -43,13 +44,14 @@ class MongoDBPlugin(BaseDatabasePlugin):
         """
         if connection_string:
             self.connection_string = connection_string
+            parsed = urlparse(connection_string)
+            self.database_name = parsed.path.lstrip('/') if parsed.path else database
         else:
+            self.database_name = database
             if username and password:
-                self.connection_string = f"mongodb://{username}:{password}@{host}:{port}/{database}"
+                self.connection_string = f"mongodb://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}/{database}"
             else:
                 self.connection_string = f"mongodb://{host}:{port}/{database}"
-        
-        self.database_name = database
         
         self.client_config = {
             'maxPoolSize': kwargs.get('max_pool_size', 10),
