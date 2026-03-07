@@ -11,9 +11,8 @@ import aiohttp
 import aiofiles
 import ssl
 from pathlib import Path
-from ..utils import find_project_root
+from ..utils import find_project_root, get_api_endpoint, _CLI_VERSION
 from .import_detector import ImportDetector
-from daita.config.settings import settings
 
 
 def _extract_framework_version(project_root: Path) -> str:
@@ -114,6 +113,9 @@ async def deploy_to_managed_environment(environment='production', force=False, d
         show_upgrade_message()
         return
     
+    # Warn about .env only when secrets haven't been migrated yet
+    await _warn_env_if_no_secrets(project_root, api_key)
+
     # Create deployment package
     package_path = _create_deployment_package(project_root, config, verbose)
     
@@ -195,16 +197,6 @@ async def deploy_to_managed_environment(environment='production', force=False, d
         if package_path.exists():
             os.unlink(package_path)
 
-def _get_secure_api_endpoint() -> str:
-    """Get validated API endpoint with security checks."""
-    # Use production API endpoint (can be overridden via environment)
-    endpoint = os.getenv("DAITA_API_ENDPOINT") or "https://api.daita-tech.io"
-    
-    try:
-        return settings.validate_endpoint(endpoint)
-    except ValueError as e:
-        raise ValueError(f"Invalid API endpoint configuration: {e}")
-
 async def _upload_package_to_api(
     package_path: Path,
     project_name: str,
@@ -214,7 +206,7 @@ async def _upload_package_to_api(
 ) -> dict:
     """Upload deployment package to Daita API with progress tracking."""
     
-    api_endpoint = _get_secure_api_endpoint()
+    api_endpoint = get_api_endpoint()
     package_size = package_path.stat().st_size
     
     if verbose:
@@ -223,7 +215,7 @@ async def _upload_package_to_api(
     
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "User-Agent": "Daita-CLI/1.0.0"
+        "User-Agent": f"Daita-CLI/{_CLI_VERSION}"
     }
     
     # Create secure SSL context
@@ -370,7 +362,7 @@ async def _deploy_package_via_api(
 ) -> dict:
     """Deploy uploaded package via Daita API."""
 
-    api_endpoint = _get_secure_api_endpoint()
+    api_endpoint = get_api_endpoint()
 
     if verbose:
         print(f"    Deploying with framework version {framework_version}...")
@@ -378,7 +370,7 @@ async def _deploy_package_via_api(
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "User-Agent": "Daita-CLI/1.0.0"
+        "User-Agent": f"Daita-CLI/{_CLI_VERSION}"
     }
     
     # Create secure SSL context
@@ -470,13 +462,6 @@ def _create_deployment_package(project_root: Path, config: dict, verbose: bool =
         if requirements_file.exists():
             zipf.write(requirements_file, 'requirements.txt')
 
-        # Add .env file for user's API keys (even though it's in .gitignore)
-        env_file = project_root / '.env'
-        if env_file.exists():
-            zipf.write(env_file, '.env')
-            if verbose:
-                print(f"   Added .env file to package")
-
         # Add minimal bootstrap handler (framework loaded from layers)
         _add_bootstrap_handler(zipf)
 
@@ -547,8 +532,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
 def _add_directory_to_zip(zipf, source_dir: Path, archive_name: str):
     """Add directory to zip recursively."""
     for file_path in source_dir.rglob('*'):
-        # Include .env files even though they start with '.'
-        if file_path.is_file() and (not file_path.name.startswith('.') or file_path.name == '.env'):
+        if file_path.is_file() and not file_path.name.startswith('.'):
             relative_path = file_path.relative_to(source_dir)
             archive_path = f"{archive_name}/{relative_path}"
             zipf.write(file_path, archive_path)
@@ -793,98 +777,165 @@ async def _handle_memory_sync_on_deploy(
     """
     Handle memory sync during deployment.
 
-    Automatically syncs local memory to cloud if:
-    - Local memory exists
-    - Cloud memory doesn't exist (first deployment)
-
-    Skips sync if cloud memory already exists (preserves production memory).
+    Syncs local memory workspaces to cloud via the backend API on first deploy
+    (when cloud memory is empty). Preserves existing cloud memory on subsequent
+    deploys. Uses POST /api/v1/memory/sync — no direct S3 access required.
     """
-    import boto3
+    import json
     import click
 
-    # Check if local memory exists
     local_memory_dir = project_root / '.daita' / 'memory' / 'workspaces'
     if not local_memory_dir.exists():
-        return  # No local memory, nothing to do
+        return
 
     workspaces = [d.name for d in local_memory_dir.iterdir() if d.is_dir()]
     if not workspaces:
-        return  # No workspaces, nothing to do
-
-    # Get organization ID from API key
-    try:
-        org_id = await _get_org_id_from_api()
-        if not org_id:
-            if verbose:
-                print("\n    Memory sync skipped: Cannot determine organization ID")
-            return
-    except Exception as e:
-        if verbose:
-            print(f"\n    Memory sync skipped: {e}")
         return
 
-    # Check if cloud memory exists for any workspace
+    api_key = os.getenv('DAITA_API_KEY')
+    if not api_key:
+        return
+
+    api_endpoint = get_api_endpoint()
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": f"Daita-CLI/{_CLI_VERSION}"
+    }
+
     try:
-        s3 = boto3.client('s3')
-        bucket = f"daita-memory-{os.getenv('AWS_REGION', 'us-east-1')}"
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            # Check cloud status to avoid overwriting existing memory
+            status_url = f"{api_endpoint}/api/v1/memory/status"
+            async with session.get(
+                status_url,
+                headers=headers,
+                params={"project": project_name},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("workspaces"):
+                        print(f"\n Memory: Cloud memory detected - preserving production memory")
+                        print(f"          (Local memory is for testing only and will not be synced)")
+                        return
+                elif resp.status not in (404, 422):
+                    if verbose:
+                        print(f"\n    Memory sync skipped: status check returned {resp.status}")
+                    return
 
-        cloud_has_memory = False
-        for workspace in workspaces:
-            prefix = f"orgs/{org_id}/projects/{project_name}/workspaces/{workspace}/"
-            try:
-                response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
-                if response.get('Contents'):
-                    cloud_has_memory = True
-                    break
-            except Exception:
-                pass
+            # Cloud is empty - offer to sync
+            print(f"\n Memory: Local memory detected ({len(workspaces)} workspace(s))")
+            print(f"          Cloud memory is empty. Sync local memory to cloud")
+            print(f"          as initial production memory?")
 
-        if cloud_has_memory:
-            # Cloud memory exists - skip sync
-            print(f"\n Memory: Cloud memory detected - preserving production memory")
-            print(f"          (Local memory is for testing only and will not be synced)")
-            return
+            answer = click.prompt(
+                "\n          Sync local → cloud",
+                type=click.Choice(['y', 'n'], case_sensitive=False),
+                default='y'
+            )
+            if answer.lower() != 'y':
+                print(f"          Skipped - cloud will start with empty memory\n")
+                return
 
-        # Cloud is empty - offer to sync local as initial setup
-        print(f"\n Memory: Local memory detected ({len(workspaces)} workspace(s))")
-        print(f"          Cloud memory is empty. Sync local memory to cloud")
-        print(f"          as initial production memory?")
-
-        response = click.prompt("\n          Sync local → cloud",
-                               type=click.Choice(['y', 'n'], case_sensitive=False),
-                               default='y')
-
-        if response.lower() == 'y':
             print(f"\n          Syncing memory to cloud...")
-
-            # Import sync functions
-            from .memory_sync_utils import sync_workspace_to_s3
-
             synced_count = 0
+
             for workspace in workspaces:
+                ws_dir = local_memory_dir / workspace
+
+                # Read MEMORY.md
+                memory_md = ""
+                memory_path = ws_dir / 'MEMORY.md'
+                if memory_path.exists():
+                    memory_md = memory_path.read_text(encoding='utf-8')
+
+                # Read vectors.json
+                vectors = {}
+                vectors_path = ws_dir / 'vectors.json'
+                if vectors_path.exists():
+                    try:
+                        vectors = json.loads(vectors_path.read_text(encoding='utf-8'))
+                    except Exception:
+                        pass
+
+                # Read daily logs
+                logs = []
+                logs_dir = ws_dir / 'logs'
+                if logs_dir.exists():
+                    for log_file in sorted(logs_dir.glob('*.md')):
+                        logs.append({
+                            "date": log_file.stem,
+                            "content": log_file.read_text(encoding='utf-8')
+                        })
+
+                payload = {
+                    "workspace": workspace,
+                    "memory_md": memory_md,
+                    "vectors": vectors,
+                    "logs": logs
+                }
+
                 try:
-                    sync_workspace_to_s3(
-                        workspace=workspace,
-                        org_id=org_id,
-                        project_name=project_name,
-                        s3_client=s3,
-                        bucket=bucket,
-                        local_memory_dir=local_memory_dir
-                    )
-                    synced_count += 1
+                    sync_url = f"{api_endpoint}/api/v1/memory/sync"
+                    async with session.post(
+                        sync_url,
+                        headers=headers,
+                        params={"project": project_name},
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    ) as resp:
+                        if resp.status == 200:
+                            synced_count += 1
+                        elif verbose:
+                            print(f"          Warning: Failed to sync {workspace}: HTTP {resp.status}")
                 except Exception as e:
                     if verbose:
                         print(f"          Warning: Failed to sync {workspace}: {e}")
 
-            print(f"          ✓ Synced {synced_count}/{len(workspaces)} workspace(s) to cloud\n")
-        else:
-            print(f"          Skipped - cloud will start with empty memory\n")
+            print(f"          Synced {synced_count}/{len(workspaces)} workspace(s) to cloud\n")
 
     except Exception as e:
         if verbose:
             print(f"\n    Memory sync error: {e}")
         # Don't fail deployment on memory sync errors
         return
+
+
+async def _warn_env_if_no_secrets(project_root: Path, api_key: str) -> None:
+    """
+    Show the .env migration message only when a .env file exists AND the org
+    has no secrets stored yet. Silent on subsequent deploys once secrets are set.
+    """
+    env_file = project_root / '.env'
+    if not env_file.exists():
+        return
+
+    try:
+        import aiohttp
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": f"Daita-CLI/{_CLI_VERSION}"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{get_api_endpoint()}/api/v1/secrets",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("keys"):
+                        return  # secrets already stored — stay silent
+    except Exception:
+        pass  # network failure: show the warning to be safe
+
+    print("")
+    print("   Your project has a .env file.")
+    print("   Secrets are no longer included in deployment packages.")
+    print("   Run 'daita secrets import .env' to store them securely in the cloud.")
+    print("")
 
 
 async def _get_org_id_from_api() -> str:
@@ -895,11 +946,11 @@ async def _get_org_id_from_api() -> str:
     if not api_key:
         return None
 
-    api_endpoint = _get_secure_api_endpoint()
+    api_endpoint = get_api_endpoint()
 
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "User-Agent": "Daita-CLI/1.0.0"
+        "User-Agent": f"Daita-CLI/{_CLI_VERSION}"
     }
 
     try:

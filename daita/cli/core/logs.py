@@ -5,7 +5,7 @@ Shows deployment history and logs like git log from cloud API.
 import os
 import aiohttp
 from datetime import datetime
-from ..utils import find_project_root
+from ..utils import find_project_root, get_api_endpoint, _CLI_VERSION
 
 
 async def show_deployment_logs(environment=None, limit=10, follow=False, verbose=False):
@@ -187,11 +187,11 @@ async def _load_cloud_deployments(environment=None, limit=10):
        else:
            current_project = None
 
-       api_endpoint = os.getenv('DAITA_API_ENDPOINT', 'https://api.daita-tech.io')
+       api_endpoint = get_api_endpoint()
 
        headers = {
            "Authorization": f"Bearer {api_key}",
-           "User-Agent": "Daita-CLI/1.0.0"
+           "User-Agent": f"Daita-CLI/{_CLI_VERSION}"
        }
 
        async with aiohttp.ClientSession() as session:
