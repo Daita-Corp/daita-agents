@@ -9,7 +9,7 @@ Quick start:
         return f"Sunny in {city}"
 
     agent = Agent(name="weather", tools=[get_weather])
-    result = agent.run("What's the weather in Tokyo?")
+    result = await agent.run("What's the weather in Tokyo?")
 
 Key components:
 - Agent / BaseAgent      — Build single or custom agents
@@ -19,7 +19,7 @@ Key components:
 - AgentConfig           — Configure retry policies, LLM settings, and more
 """
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 # ---------------------------------------------------------------------------
 # Core — what 95% of users need
@@ -68,11 +68,6 @@ from .core.exceptions import (
 from .llm.factory import create_llm_provider
 
 # ---------------------------------------------------------------------------
-# Programmatic execution (via daita-client package)
-# ---------------------------------------------------------------------------
-from .execution import DaitaClient, ExecutionResult, ExecutionError
-
-# ---------------------------------------------------------------------------
 # Advanced — reliability, scaling, tracing (importable from submodules too)
 # ---------------------------------------------------------------------------
 # from daita.core.reliability import TaskManager, CircuitBreaker, BackpressureController
@@ -119,10 +114,6 @@ __all__ = [
     "ValidationError",
     # LLM
     "create_llm_provider",
-    # Execution
-    "DaitaClient",
-    "ExecutionResult",
-    "ExecutionError",
     # Version
     "__version__",
 ]

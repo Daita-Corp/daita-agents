@@ -58,7 +58,7 @@ Open a [GitHub Issue](https://github.com/daita-tech/daita-agents/issues) with th
 1. Subclass `BaseLLMProvider` from `daita.llm.base`
 2. Implement `_generate_impl()` and `_stream_impl()`
 3. Add it to `daita/llm/factory.py`
-4. Add tests in `tests/llm/`
+4. Add tests in `tests/unit/`
 
 ### Adding a New Plugin
 

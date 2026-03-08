@@ -485,6 +485,8 @@ class ToolRegistry:
                 f"Overwriting (old source: {self._tool_map[tool.name].source}, "
                 f"new source: {tool.source})"
             )
+            # Replace in-place in the list to avoid duplicates
+            self.tools = [t for t in self.tools if t.name != tool.name]
 
         self.tools.append(tool)
         self._tool_map[tool.name] = tool

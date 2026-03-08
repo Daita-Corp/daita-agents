@@ -54,20 +54,14 @@ class FocusedTool:
                 # Convert FocusConfig to format apply_focus expects
                 focus_param = self._focus
                 if isinstance(self._focus, FocusConfig):
-                    # Convert FocusConfig to dict/str/list format
+                    # Convert FocusConfig to format apply_focus expects
                     if self._focus.type == "column":
-                        focus_param = self._focus.columns or []
-                    elif self._focus.type == "jsonpath":
-                        focus_param = self._focus.path
-                    elif self._focus.type == "xpath":
-                        focus_param = self._focus.path
-                    elif self._focus.type == "css":
-                        focus_param = self._focus.selector
-                    elif self._focus.type == "regex":
-                        focus_param = self._focus.pattern
+                        focus_param = self._focus.include or []
+                    elif self._focus.type in ("jsonpath", "xpath", "css", "regex"):
+                        # paths holds the selector/pattern list; use first entry or the list
+                        focus_param = self._focus.paths or []
                     else:
-                        # For other types, convert to dict
-                        focus_param = self._focus.dict()
+                        focus_param = self._focus.model_dump(exclude_none=True)
 
                 focused_result = apply_focus(result, focus_param)
                 logger.debug(

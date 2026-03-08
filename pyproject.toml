@@ -24,8 +24,6 @@ classifiers = [
 # CORE - Everything needed for a working agent out of the box
 # Philosophy: Users should be able to `pip install daita-agents` and immediately run an agent
 dependencies = [
-    # Client SDK - standalone package for programmatic agent execution
-    "daita-client>=0.1.0",
     # Framework essentials
     "pydantic>=2.0.0",        # Configuration models
     "aiohttp>=3.8.0",         # HTTP client for internal framework operations

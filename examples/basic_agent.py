@@ -35,7 +35,7 @@ async def main():
         llm_provider="openai",
         model="gpt-4o-mini",
         tools=[get_weather, calculate],
-        system_prompt="You are a helpful assistant. Use tools when appropriate.",
+        prompt="You are a helpful assistant. Use tools when appropriate.",
     )
 
     result = await agent.run("What's the weather in Tokyo, and what is 42 * 7?")

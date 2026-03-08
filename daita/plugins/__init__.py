@@ -255,6 +255,14 @@ class PluginAccess:
         """Create Orchestrator plugin for multi-agent coordination."""
         return orchestrator(**kwargs)
 
+    def memory(self, **kwargs) -> MemoryPlugin:
+        """Create Memory plugin for persistent semantic memory."""
+        return MemoryPlugin(**kwargs)
+
+    def mcp(self, **kwargs):
+        """Access MCP plugin module for Model Context Protocol integration."""
+        return mcp
+
 # Export everything needed
 __all__ = [
     # Plugin classes

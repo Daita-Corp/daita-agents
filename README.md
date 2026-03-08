@@ -38,7 +38,7 @@ asyncio.run(main())
 
 - **Multi-provider LLM support** — OpenAI, Anthropic, Gemini, Grok (or bring your own)
 - **Autonomous tool calling** — agents plan and execute multi-step tool chains without manual orchestration
-- **Streaming** — real time token-by-token output with `stream=True`
+- **Streaming** — real-time token-by-token output via `on_event` callback
 - **Plugin ecosystem** — PostgreSQL, MySQL, MongoDB, REST APIs, S3, Slack, Elasticsearch, Neo4j, and more
 - **Memory** — persistent agent memory with local or custom backends
 - **Workflows** — connect multiple agents into pipelines via relay channels
@@ -52,62 +52,89 @@ asyncio.run(main())
 ### Tool-calling agent with a database
 
 ```python
+import asyncio
 from daita import Agent
 from daita.plugins import postgresql
 
-agent = Agent(
-    name="Sales Analyst",
-    llm_provider="openai",
-    model="gpt-4o",
-)
+async def main():
+    agent = Agent(
+        name="Sales Analyst",
+        llm_provider="openai",
+        model="gpt-4o",
+    )
 
-agent.add_plugin(postgresql(
-    host="localhost",
-    database="sales_db",
-    user="analyst",
-    password="secret",
-))
+    agent.add_plugin(postgresql(
+        host="localhost",
+        database="sales_db",
+        user="analyst",
+        password="secret",
+    ))
 
-result = await agent.run("What were the top 5 products by revenue last quarter?")
+    result = await agent.run("What were the top 5 products by revenue last quarter?")
+    print(result)
+
+asyncio.run(main())
 ```
 
 ### Streaming output
 
 ```python
-async for chunk in agent.generate("Explain transformer attention mechanisms", stream=True):
-    print(chunk.content, end="", flush=True)
+import asyncio
+from daita import Agent
+from daita.core.streaming import EventType
+
+async def main():
+    agent = Agent(name="assistant", llm_provider="openai", model="gpt-4o")
+
+    def on_event(event):
+        if event.type == EventType.THINKING:
+            print(event.content, end="", flush=True)
+
+    await agent.run("Explain transformer attention mechanisms", on_event=on_event)
+    print()
+
+asyncio.run(main())
 ```
 
 ### Multi-agent workflow
 
 ```python
+import asyncio
 from daita import Agent, Workflow
 
-fetcher  = Agent(name="Data Fetcher",  llm_provider="openai", model="gpt-4o")
-analyzer = Agent(name="Analyzer",      llm_provider="openai", model="gpt-4o")
+async def main():
+    fetcher  = Agent(name="Data Fetcher",  llm_provider="openai", model="gpt-4o")
+    analyzer = Agent(name="Analyzer",      llm_provider="openai", model="gpt-4o")
 
-workflow = Workflow("Sales Pipeline")
-workflow.add_agent("fetcher",  fetcher)
-workflow.add_agent("analyzer", analyzer)
-workflow.connect("fetcher", "raw_data", "analyzer")
+    workflow = Workflow("Sales Pipeline")
+    workflow.add_agent("fetcher",  fetcher)
+    workflow.add_agent("analyzer", analyzer)
+    workflow.connect("fetcher", "raw_data", "analyzer")
 
-await workflow.start()
-await workflow.inject_data("fetcher", {"query": "Q3 sales"}, task="fetch")
-await workflow.stop()
+    await workflow.start()
+    await workflow.inject_data("fetcher", {"query": "Q3 sales"}, task="fetch")
+    await workflow.stop()
+
+asyncio.run(main())
 ```
 
 ### Memory-enabled agent
 
 ```python
+import asyncio
 from daita import Agent
 from daita.plugins.memory import MemoryPlugin
 
-agent = Agent(name="Assistant", llm_provider="anthropic", model="claude-sonnet-4-6")
-agent.add_plugin(MemoryPlugin())
+async def main():
+    agent = Agent(name="Assistant", llm_provider="anthropic", model="claude-sonnet-4-6")
+    agent.add_plugin(MemoryPlugin())
 
-# Memory persists across calls
-await agent.run("My name is Alex and I prefer concise answers.")
-result = await agent.run("What's my preference?")
+    # Memory persists across calls
+    await agent.run("My name is Alex and I prefer concise answers.")
+    result = await agent.run("What's my preference?")
+    print(result)
+
+asyncio.run(main())
 ```
 
 ## Plugins
