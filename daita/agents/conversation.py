@@ -12,6 +12,7 @@ Usage:
 
 import json
 import logging
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -53,7 +54,7 @@ class ConversationHistory:
 
     def __init__(
         self,
-        session_id: str,
+        session_id: Optional[str] = None,
         workspace: Optional[str] = None,
         max_turns: Optional[int] = None,
         max_tokens: Optional[int] = None,
@@ -66,6 +67,7 @@ class ConversationHistory:
 
         Args:
             session_id: Unique identifier for this conversation session.
+                Auto-generated as a UUID if not provided.
             workspace: Storage namespace, usually the agent name. If omitted,
                 the agent derives it automatically on the first run() call.
                 Required for load() and save() without a prior run().
@@ -81,7 +83,7 @@ class ConversationHistory:
                 daita-project.yaml; "global" stores under ~/.daita/.
             base_dir: Override path resolution entirely — useful in tests.
         """
-        self.session_id = session_id
+        self.session_id = session_id or str(uuid.uuid4())
         self.workspace = workspace
         self.max_turns = max_turns
         self.max_tokens = max_tokens
