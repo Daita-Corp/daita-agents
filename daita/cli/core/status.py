@@ -4,9 +4,7 @@ Shows project and deployment status like git status.
 """
 import json
 import yaml
-from pathlib import Path
-from datetime import datetime
-from ..utils import find_project_root
+from ..utils import find_project_root, get_api_endpoint, _CLI_VERSION
 
 
 async def show_project_status(environment=None, verbose=False):
@@ -177,11 +175,11 @@ async def _show_cloud_deployments_status(verbose):
 
    try:
        api_key = os.getenv('DAITA_API_KEY')
-       api_endpoint = os.getenv('DAITA_API_ENDPOINT', 'https://api.daita-tech.io')
+       api_endpoint = get_api_endpoint()
 
        headers = {
            "Authorization": f"Bearer {api_key}",
-           "User-Agent": "Daita-CLI/1.0.0"
+           "User-Agent": f"Daita-CLI/{_CLI_VERSION}"
        }
 
        async with aiohttp.ClientSession() as session:
@@ -263,11 +261,11 @@ async def _show_cloud_environment_status(environment, verbose):
 
    try:
        api_key = os.getenv('DAITA_API_KEY')
-       api_endpoint = os.getenv('DAITA_API_ENDPOINT', 'https://api.daita-tech.io')
+       api_endpoint = get_api_endpoint()
 
        headers = {
            "Authorization": f"Bearer {api_key}",
-           "User-Agent": "Daita-CLI/1.0.0"
+           "User-Agent": f"Daita-CLI/{_CLI_VERSION}"
        }
 
        async with aiohttp.ClientSession() as session:

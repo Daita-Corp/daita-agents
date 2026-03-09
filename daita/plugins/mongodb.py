@@ -4,7 +4,8 @@ MongoDB plugin for Daita Agents.
 Simple MongoDB connection and querying - no over-engineering.
 """
 import logging
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from urllib.parse import urlparse, quote
 from .base_db import BaseDatabasePlugin
 
 if TYPE_CHECKING:
@@ -43,13 +44,14 @@ class MongoDBPlugin(BaseDatabasePlugin):
         """
         if connection_string:
             self.connection_string = connection_string
+            parsed = urlparse(connection_string)
+            self.database_name = parsed.path.lstrip('/') if parsed.path else database
         else:
+            self.database_name = database
             if username and password:
-                self.connection_string = f"mongodb://{username}:{password}@{host}:{port}/{database}"
+                self.connection_string = f"mongodb://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}/{database}"
             else:
                 self.connection_string = f"mongodb://{host}:{port}/{database}"
-        
-        self.database_name = database
         
         self.client_config = {
             'maxPoolSize': kwargs.get('max_pool_size', 10),
@@ -98,7 +100,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
             logger.info(f"Connected to MongoDB database '{self.database_name}'")
         except ImportError:
             self._handle_connection_error(
-                ImportError("motor not installed. Run: pip install motor"),
+                ImportError("motor not installed. Install with: pip install 'daita-agents[mongodb]'"),
                 "connection"
             )
         except Exception as e:
@@ -341,7 +343,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
         return [
             AgentTool(
                 name="find_documents",
-                description="Find documents in a MongoDB collection. Returns matching documents as a list.",
+                description="Find documents in a MongoDB collection. Returns matches.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -368,7 +370,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
             ),
             AgentTool(
                 name="insert_document",
-                description="Insert a single document into a MongoDB collection. Returns the inserted document ID.",
+                description="Insert a document into a MongoDB collection. Returns the inserted ID.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -391,7 +393,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
             ),
             AgentTool(
                 name="update_documents",
-                description="Update documents in a MongoDB collection. Returns the count of matched and modified documents.",
+                description="Update MongoDB documents. Returns matched and modified counts.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -418,7 +420,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
             ),
             AgentTool(
                 name="delete_documents",
-                description="Delete documents from a MongoDB collection. Returns the count of deleted documents.",
+                description="Delete MongoDB documents by filter. Returns deleted count.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -441,17 +443,37 @@ class MongoDBPlugin(BaseDatabasePlugin):
             ),
             AgentTool(
                 name="list_collections",
-                description="List all collections in the MongoDB database",
-                parameters={
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                },
+                description="List all collections in the MongoDB database.",
+                parameters={"type": "object", "properties": {}, "required": []},
                 handler=self._tool_list_collections,
                 category="database",
                 source="plugin",
                 plugin_name="MongoDB",
                 timeout_seconds=30
+            ),
+            AgentTool(
+                name="mongodb_aggregate",
+                description="Run a MongoDB aggregation pipeline for grouping, counting, or transformations.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "collection": {
+                            "type": "string",
+                            "description": "Collection name"
+                        },
+                        "pipeline": {
+                            "type": "array",
+                            "description": "Aggregation pipeline stages (e.g., [{\"$match\": {...}}, {\"$group\": {...}}])",
+                            "items": {"type": "object"}
+                        }
+                    },
+                    "required": ["collection", "pipeline"]
+                },
+                handler=self._tool_aggregate,
+                category="database",
+                source="plugin",
+                plugin_name="MongoDB",
+                timeout_seconds=60
             )
         ]
 
@@ -522,6 +544,19 @@ class MongoDBPlugin(BaseDatabasePlugin):
             "success": True,
             "collections": collections,
             "count": len(collections)
+        }
+
+    async def _tool_aggregate(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for mongodb_aggregate"""
+        collection = args.get("collection")
+        pipeline = args.get("pipeline")
+
+        results = await self.aggregate(collection, pipeline)
+
+        return {
+            "success": True,
+            "results": results,
+            "count": len(results)
         }
 
 

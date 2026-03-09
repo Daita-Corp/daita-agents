@@ -6,16 +6,16 @@ Simple Slack messaging and collaboration - no over-engineering.
 import logging
 import os
 import json
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
-from pathlib import Path
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from datetime import datetime
+from .base import BasePlugin
 
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
 
-class SlackPlugin:
+class SlackPlugin(BasePlugin):
     """
     Simple Slack plugin for agents.
     
@@ -25,39 +25,32 @@ class SlackPlugin:
     def __init__(
         self,
         token: str,
-        bot_user_oauth_token: Optional[str] = None,
-        app_token: Optional[str] = None,
         default_channel: Optional[str] = None,
         **kwargs
     ):
         """
         Initialize Slack connection.
-        
+
         Args:
             token: Slack bot token (xoxb-...)
-            bot_user_oauth_token: Bot user OAuth token (optional, for extended permissions)
-            app_token: App-level token (optional, for Socket Mode)
             default_channel: Default channel for messages (optional)
             **kwargs: Additional Slack client parameters
         """
         if not token or not token.strip():
             raise ValueError("Slack token cannot be empty")
-        
+
         if not token.startswith(('xoxb-', 'xoxp-')):
             raise ValueError("Invalid Slack token format. Expected bot token (xoxb-) or user token (xoxp-)")
-        
+
         self.token = token
-        self.bot_user_oauth_token = bot_user_oauth_token
-        self.app_token = app_token
         self.default_channel = default_channel
-        
+
         # Store additional config
         self.config = kwargs
-        
+
         self._client = None
         self._user_info = None
-        self._channels_cache = {}
-        
+
         logger.debug(f"Slack plugin configured with token: {token[:12]}...")
     
     async def connect(self):
@@ -94,7 +87,7 @@ class SlackPlugin:
                     raise RuntimeError(f"Slack authentication failed: {e.response['error']}")
                     
         except ImportError:
-            raise RuntimeError("slack-sdk not installed. Run: pip install slack-sdk")
+            raise ImportError("slack-sdk not installed. Install with: pip install 'daita-agents[slack]'")
         except Exception as e:
             raise RuntimeError(f"Failed to connect to Slack: {e}")
     
@@ -104,7 +97,6 @@ class SlackPlugin:
             # Slack SDK client doesn't need explicit closing
             self._client = None
             self._user_info = None
-            self._channels_cache = {}
             logger.info("Disconnected from Slack")
     
     async def send_message(
@@ -451,9 +443,6 @@ class SlackPlugin:
                 }
                 formatted_channels.append(formatted_channel)
             
-            # Update cache
-            self._channels_cache = {ch['name']: ch['id'] for ch in formatted_channels}
-            
             logger.info(f"Retrieved {len(formatted_channels)} channels")
             return formatted_channels
             
@@ -606,18 +595,20 @@ class SlackPlugin:
         return [
             AgentTool(
                 name="send_slack_message",
-                description="Send a message to a Slack channel. Use for notifications, alerts, or sharing information with team channels.",
+                description="Send a message to a Slack channel or user.",
                 parameters={
-                    "channel": {
-                        "type": "string",
-                        "description": "Channel name (e.g., #general, #alerts) or channel ID",
-                        "required": True
+                    "type": "object",
+                    "properties": {
+                        "channel": {
+                            "type": "string",
+                            "description": "Channel name (e.g., #general) or channel ID"
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Message text to send"
+                        }
                     },
-                    "text": {
-                        "type": "string",
-                        "description": "Message text to send",
-                        "required": True
-                    }
+                    "required": ["channel", "text"]
                 },
                 handler=self._tool_send_message,
                 category="communication",
@@ -627,23 +618,24 @@ class SlackPlugin:
             ),
             AgentTool(
                 name="send_slack_summary",
-                description="Send a formatted agent summary to Slack with results and metadata. Use for reporting agent execution results.",
+                description="Send a formatted agent results summary to a Slack channel.",
                 parameters={
-                    "channel": {
-                        "type": "string",
-                        "description": "Channel name or ID to send summary to",
-                        "required": True
+                    "type": "object",
+                    "properties": {
+                        "channel": {
+                            "type": "string",
+                            "description": "Channel name or ID"
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Summary text describing the results"
+                        },
+                        "results": {
+                            "type": "object",
+                            "description": "Optional results data to include"
+                        }
                     },
-                    "summary": {
-                        "type": "string",
-                        "description": "Summary text describing the results",
-                        "required": True
-                    },
-                    "results": {
-                        "type": "object",
-                        "description": "Results data to include in the summary",
-                        "required": False
-                    }
+                    "required": ["channel", "summary"]
                 },
                 handler=self._tool_send_summary,
                 category="communication",
@@ -653,8 +645,8 @@ class SlackPlugin:
             ),
             AgentTool(
                 name="list_slack_channels",
-                description="List all Slack channels the bot has access to",
-                parameters={},
+                description="List all Slack channels the bot has access to.",
+                parameters={"type": "object", "properties": {}, "required": []},
                 handler=self._tool_list_channels,
                 category="communication",
                 source="plugin",
@@ -724,6 +716,6 @@ class SlackPlugin:
         await self.disconnect()
 
 
-def slack(**kwargs) -> SlackPlugin:
+def slack(token: str, **kwargs) -> SlackPlugin:
     """Create Slack plugin with simplified interface."""
-    return SlackPlugin(**kwargs)
+    return SlackPlugin(token=token, **kwargs)

@@ -12,6 +12,23 @@ from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    import importlib.metadata
+    _CLI_VERSION = importlib.metadata.version('daita-agents')
+except Exception:
+    _CLI_VERSION = "unknown"
+
+
+def get_api_endpoint() -> str:
+    """Return the validated Daita API endpoint from environment or default."""
+    from daita.config.settings import settings
+    endpoint = os.getenv("DAITA_API_ENDPOINT") or "https://api.daita-tech.io"
+    try:
+        return settings.validate_endpoint(endpoint)
+    except ValueError as e:
+        raise ValueError(f"Invalid API endpoint configuration: {e}")
+
+
 # ======= Project Management =======
 
 def find_project_root(start_path: Optional[Path] = None) -> Optional[Path]:
@@ -502,8 +519,8 @@ Ready for production?
 
 # Cloud command definitions for enforcement
 CLOUD_COMMANDS = {
-    'push', 'status', 'logs', 'deployments', 'run', 
-    'executions', 'execution-logs'
+    'push', 'status', 'logs', 'deployments', 'run',
+    'executions', 'execution-logs', 'secrets', 'memory'
 }
 
 def is_cloud_command(command: str) -> bool:

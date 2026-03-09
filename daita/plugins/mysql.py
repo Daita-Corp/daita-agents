@@ -3,8 +3,11 @@ MySQL plugin for Daita Agents.
 
 Simple MySQL connection and querying - no over-engineering.
 """
+import asyncio
 import logging
+import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from urllib.parse import urlparse, quote
 from .base_db import BaseDatabasePlugin
 
 if TYPE_CHECKING:
@@ -15,10 +18,12 @@ logger = logging.getLogger(__name__)
 class MySQLPlugin(BaseDatabasePlugin):
     """
     MySQL plugin for agents with standardized connection management.
-    
+
     Inherits common database functionality from BaseDatabasePlugin.
     """
-    
+
+    sql_dialect = "mysql"
+
     def __init__(
         self,
         host: str = "localhost",
@@ -43,8 +48,6 @@ class MySQLPlugin(BaseDatabasePlugin):
         """
         if connection_string:
             self.connection_string = connection_string
-            # Parse connection string to extract parameters
-            from urllib.parse import urlparse
             parsed = urlparse(connection_string)
             self.host = parsed.hostname or host
             self.port = parsed.port or port
@@ -52,7 +55,7 @@ class MySQLPlugin(BaseDatabasePlugin):
             self.password = parsed.password or password
             self.db = parsed.path.lstrip('/') if parsed.path else database
         else:
-            self.connection_string = f"mysql://{username}:{password}@{host}:{port}/{database}"
+            self.connection_string = f"mysql://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}/{database}"
             self.host = host
             self.port = port
             self.user = username
@@ -93,7 +96,7 @@ class MySQLPlugin(BaseDatabasePlugin):
             logger.info("Connected to MySQL")
         except ImportError:
             self._handle_connection_error(
-                ImportError("aiomysql not installed. Run: pip install aiomysql"),
+                ImportError("aiomysql not installed. Install with: pip install 'daita-agents[mysql]'"),
                 "connection"
             )
         except Exception as e:
@@ -232,19 +235,32 @@ class MySQLPlugin(BaseDatabasePlugin):
 
         return [
             AgentTool(
-                name="query_database",
-                description="Execute a SQL SELECT query on the MySQL database and return results as a list of dictionaries",
+                name="mysql_query",
+                description="Run a SELECT query on MySQL. Use limit and columns to avoid oversized responses.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "SQL SELECT query with %s placeholders for parameters"
+                            "description": "SQL SELECT query with %s placeholders"
                         },
                         "params": {
                             "type": "array",
-                            "description": "Optional list of parameter values for query placeholders",
+                            "description": "Optional parameter values",
                             "items": {"type": "string"}
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max rows to return (default: 50)"
+                        },
+                        "columns": {
+                            "type": "array",
+                            "description": "Specific columns to return (returns all if omitted)",
+                            "items": {"type": "string"}
+                        },
+                        "focus": {
+                            "type": "string",
+                            "description": "Focus DSL to filter/project at the database level, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\""
                         }
                     },
                     "required": ["sql"]
@@ -256,13 +272,9 @@ class MySQLPlugin(BaseDatabasePlugin):
                 timeout_seconds=60
             ),
             AgentTool(
-                name="list_tables",
-                description="List all tables in the MySQL database",
-                parameters={
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                },
+                name="mysql_list_tables",
+                description="List all tables in the MySQL database.",
+                parameters={"type": "object", "properties": {}, "required": []},
                 handler=self._tool_list_tables,
                 category="database",
                 source="plugin",
@@ -270,14 +282,14 @@ class MySQLPlugin(BaseDatabasePlugin):
                 timeout_seconds=30
             ),
             AgentTool(
-                name="get_table_schema",
-                description="Get column information (name, data type, nullable) for a specific table in MySQL",
+                name="mysql_get_schema",
+                description="Get column info (name, type, nullable) for a MySQL table.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "table_name": {
                             "type": "string",
-                            "description": "Name of the table to inspect"
+                            "description": "Table name to inspect"
                         }
                     },
                     "required": ["table_name"]
@@ -289,18 +301,18 @@ class MySQLPlugin(BaseDatabasePlugin):
                 timeout_seconds=30
             ),
             AgentTool(
-                name="execute_sql",
-                description="Execute an INSERT, UPDATE, or DELETE SQL statement on MySQL. Returns the number of affected rows.",
+                name="mysql_execute",
+                description="Execute INSERT, UPDATE, or DELETE on MySQL. Returns affected row count.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "SQL statement to execute (INSERT, UPDATE, or DELETE)"
+                            "description": "SQL statement (INSERT, UPDATE, or DELETE)"
                         },
                         "params": {
                             "type": "array",
-                            "description": "Optional list of parameter values for statement placeholders",
+                            "description": "Optional parameter values",
                             "items": {"type": "string"}
                         }
                     },
@@ -311,15 +323,49 @@ class MySQLPlugin(BaseDatabasePlugin):
                 source="plugin",
                 plugin_name="MySQL",
                 timeout_seconds=60
+            ),
+            AgentTool(
+                name="mysql_inspect",
+                description="List all tables and their column schemas in one call. Use instead of calling mysql_list_tables then mysql_get_schema for each table.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "tables": {
+                            "type": "array",
+                            "description": "Filter to specific tables (returns all if omitted)",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": []
+                },
+                handler=self._tool_inspect,
+                category="database",
+                source="plugin",
+                plugin_name="MySQL",
+                timeout_seconds=30
             )
         ]
 
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for query_database"""
+        """Tool handler for mysql_query"""
         sql = args.get("sql")
-        params = args.get("params")
+        params = args.get("params") or []
+        focus_dsl = args.get("focus")
 
-        results = await self.query(sql, params)
+        if focus_dsl:
+            results = await self._run_focus_query(sql, params, focus_dsl)
+        else:
+            limit = args.get("limit", 50)
+            columns = args.get("columns")
+            if columns:
+                safe_cols = ", ".join(
+                    f"`{c}`" for c in columns
+                    if re.match(r'^[A-Za-z0-9_]+$', c)
+                )
+                if safe_cols:
+                    sql = f"SELECT {safe_cols} FROM ({sql}) _mysql_q"
+            sql = f"{sql} LIMIT {int(limit)}"
+            results = await self.query(sql, params or None)
 
         return {
             "success": True,
@@ -328,7 +374,7 @@ class MySQLPlugin(BaseDatabasePlugin):
         }
 
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for list_tables"""
+        """Tool handler for mysql_list_tables"""
         tables = await self.tables()
 
         return {
@@ -338,9 +384,8 @@ class MySQLPlugin(BaseDatabasePlugin):
         }
 
     async def _tool_get_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for get_table_schema"""
+        """Tool handler for mysql_get_schema"""
         table_name = args.get("table_name")
-
         columns = await self.describe(table_name)
 
         return {
@@ -351,7 +396,7 @@ class MySQLPlugin(BaseDatabasePlugin):
         }
 
     async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for execute_sql"""
+        """Tool handler for mysql_execute"""
         sql = args.get("sql")
         params = args.get("params")
 
@@ -360,6 +405,21 @@ class MySQLPlugin(BaseDatabasePlugin):
         return {
             "success": True,
             "affected_rows": affected_rows
+        }
+
+    async def _tool_inspect(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for mysql_inspect — fetch all table schemas in parallel."""
+        filter_tables = args.get("tables")
+
+        all_tables = await self.tables()
+        targets = [t for t in all_tables if t in filter_tables] if filter_tables else all_tables
+
+        schemas = await asyncio.gather(*[self.describe(t) for t in targets])
+
+        return {
+            "success": True,
+            "tables": [{"name": t, "columns": s} for t, s in zip(targets, schemas)],
+            "count": len(targets)
         }
 
 

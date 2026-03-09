@@ -139,13 +139,13 @@ class WebSearchPlugin(BasePlugin):
             logger.info("Connected to Tavily Search API")
         except ImportError as e:
             if "tavily" in str(e):
-                raise RuntimeError(
-                    "tavily-python not installed. Run: pip install tavily-python"
-                )
+                raise ImportError(
+                    "tavily-python not installed. Install with: pip install 'daita-agents[websearch]'"
+                ) from e
             elif "aiohttp" in str(e):
-                raise RuntimeError(
-                    "aiohttp not installed. Run: pip install aiohttp"
-                )
+                raise ImportError(
+                    "aiohttp not installed. It is a core dependency — reinstall with: pip install 'daita-agents'"
+                ) from e
             else:
                 raise
 

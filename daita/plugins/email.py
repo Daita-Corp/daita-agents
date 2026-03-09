@@ -4,6 +4,7 @@ Email plugin for Daita Agents.
 Universal email integration supporting IMAP/SMTP protocols for reading and sending emails.
 Works with Gmail, Outlook, Yahoo, and any email provider supporting standard protocols.
 """
+import asyncio
 import logging
 import os
 import email as email_lib
@@ -14,7 +15,7 @@ from email import encoders
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 from datetime import datetime
-import base64
+from .base import BasePlugin
 
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
@@ -55,7 +56,7 @@ EMAIL_PROVIDERS = {
 }
 
 
-class EmailPlugin:
+class EmailPlugin(BasePlugin):
     """
     Universal email plugin for agents supporting IMAP/SMTP protocols.
 
@@ -155,18 +156,24 @@ class EmailPlugin:
             import imaplib
             import smtplib
 
-            # Connect to IMAP
-            logger.debug(f"Connecting to IMAP server: {self.imap_host}:{self.imap_port}")
-            self._imap = imaplib.IMAP4_SSL(self.imap_host, self.imap_port)
-            self._imap.login(self.email_address, self.password)
+            imap_host, imap_port = self.imap_host, self.imap_port
+            smtp_host, smtp_port = self.smtp_host, self.smtp_port
+            email_address, password, use_tls = self.email_address, self.password, self.use_tls
 
-            # Connect to SMTP
-            logger.debug(f"Connecting to SMTP server: {self.smtp_host}:{self.smtp_port}")
-            self._smtp = smtplib.SMTP(self.smtp_host, self.smtp_port)
-            if self.use_tls:
-                self._smtp.starttls()
-            self._smtp.login(self.email_address, self.password)
+            def _connect():
+                logger.debug(f"Connecting to IMAP server: {imap_host}:{imap_port}")
+                imap = imaplib.IMAP4_SSL(imap_host, imap_port)
+                imap.login(email_address, password)
 
+                logger.debug(f"Connecting to SMTP server: {smtp_host}:{smtp_port}")
+                smtp = smtplib.SMTP(smtp_host, smtp_port)
+                if use_tls:
+                    smtp.starttls()
+                smtp.login(email_address, password)
+                return imap, smtp
+
+            loop = asyncio.get_running_loop()
+            self._imap, self._smtp = await loop.run_in_executor(None, _connect)
             logger.info(f"Connected to email account: {self.email_address}")
 
         except ImportError:
@@ -199,19 +206,23 @@ class EmailPlugin:
 
     async def disconnect(self):
         """Disconnect from email server."""
+        loop = asyncio.get_running_loop()
+
         if self._imap:
+            imap = self._imap
+            self._imap = None
             try:
-                self._imap.logout()
+                await loop.run_in_executor(None, imap.logout)
             except Exception as e:
                 logger.warning(f"Error closing IMAP connection: {e}")
-            self._imap = None
 
         if self._smtp:
+            smtp = self._smtp
+            self._smtp = None
             try:
-                self._smtp.quit()
+                await loop.run_in_executor(None, smtp.quit)
             except Exception as e:
                 logger.warning(f"Error closing SMTP connection: {e}")
-            self._smtp = None
 
         logger.info("Disconnected from email server")
 
@@ -241,58 +252,56 @@ class EmailPlugin:
             await self.connect()
 
         try:
-            # Select folder
-            self._imap.select(folder, readonly=True)
+            imap = self._imap
 
-            # Build search criteria
-            if search_criteria:
-                criteria = search_criteria
-            elif unread_only:
-                criteria = "UNSEEN"
-            else:
-                criteria = "ALL"
+            def _list():
+                imap.select(folder, readonly=True)
 
-            # Search for emails
-            status, messages = self._imap.search(None, criteria)
-            if status != "OK":
-                raise RuntimeError(f"Failed to search emails: {status}")
+                if search_criteria:
+                    criteria = search_criteria
+                elif unread_only:
+                    criteria = "UNSEEN"
+                else:
+                    criteria = "ALL"
 
-            email_ids = messages[0].split()
-
-            # Get latest emails (reverse order)
-            email_ids = email_ids[-limit:] if len(email_ids) > limit else email_ids
-            email_ids = list(reversed(email_ids))
-
-            emails = []
-            for email_id in email_ids:
-                # Fetch email metadata
-                status, msg_data = self._imap.fetch(email_id, "(RFC822.HEADER)")
+                status, messages = imap.search(None, criteria)
                 if status != "OK":
-                    continue
+                    raise RuntimeError(f"Failed to search emails: {status}")
 
-                # Parse email header
-                raw_email = msg_data[0][1]
-                msg = email_lib.message_from_bytes(raw_email)
+                email_ids = messages[0].split()
+                email_ids = email_ids[-limit:] if len(email_ids) > limit else email_ids
+                email_ids = list(reversed(email_ids))
 
-                # Extract metadata
-                email_info = {
-                    "id": email_id.decode(),
-                    "subject": msg.get("Subject", ""),
-                    "from": msg.get("From", ""),
-                    "to": msg.get("To", ""),
-                    "date": msg.get("Date", ""),
-                    "has_attachments": False
-                }
+                emails = []
+                for email_id in email_ids:
+                    status, msg_data = imap.fetch(email_id, "(RFC822.HEADER)")
+                    if status != "OK":
+                        continue
 
-                # Parse date
-                if email_info["date"]:
-                    try:
-                        email_info["date_parsed"] = parsedate_to_datetime(email_info["date"]).isoformat()
-                    except Exception:
-                        email_info["date_parsed"] = None
+                    raw_email = msg_data[0][1]
+                    msg = email_lib.message_from_bytes(raw_email)
 
-                emails.append(email_info)
+                    email_info = {
+                        "id": email_id.decode(),
+                        "subject": msg.get("Subject", ""),
+                        "from": msg.get("From", ""),
+                        "to": msg.get("To", ""),
+                        "date": msg.get("Date", ""),
+                        "has_attachments": False
+                    }
 
+                    if email_info["date"]:
+                        try:
+                            email_info["date_parsed"] = parsedate_to_datetime(email_info["date"]).isoformat()
+                        except Exception:
+                            email_info["date_parsed"] = None
+
+                    emails.append(email_info)
+
+                return emails
+
+            loop = asyncio.get_running_loop()
+            emails = await loop.run_in_executor(None, _list)
             logger.info(f"Listed {len(emails)} emails from {folder}")
             return emails
 
@@ -324,76 +333,72 @@ class EmailPlugin:
             await self.connect()
 
         try:
-            # Select folder
-            readonly = not mark_as_read
-            self._imap.select(folder, readonly=readonly)
+            imap = self._imap
 
-            # Fetch email
-            status, msg_data = self._imap.fetch(email_id.encode(), "(RFC822)")
-            if status != "OK":
-                raise RuntimeError(f"Failed to fetch email: {status}")
+            def _read():
+                readonly = not mark_as_read
+                imap.select(folder, readonly=readonly)
 
-            # Parse email
-            raw_email = msg_data[0][1]
-            msg = email_lib.message_from_bytes(raw_email)
+                status, msg_data = imap.fetch(email_id.encode(), "(RFC822)")
+                if status != "OK":
+                    raise RuntimeError(f"Failed to fetch email: {status}")
 
-            # Extract body
-            body = ""
-            body_html = ""
-            attachments = []
+                raw_email = msg_data[0][1]
+                msg = email_lib.message_from_bytes(raw_email)
 
-            if msg.is_multipart():
-                for part in msg.walk():
-                    content_type = part.get_content_type()
-                    content_disposition = str(part.get("Content-Disposition", ""))
+                body = ""
+                body_html = ""
+                attachments = []
 
-                    # Extract body
-                    if content_type == "text/plain" and "attachment" not in content_disposition:
-                        body = part.get_payload(decode=True).decode(errors="ignore")
-                    elif content_type == "text/html" and "attachment" not in content_disposition:
-                        body_html = part.get_payload(decode=True).decode(errors="ignore")
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        content_type = part.get_content_type()
+                        content_disposition = str(part.get("Content-Disposition", ""))
 
-                    # Extract attachments
-                    elif "attachment" in content_disposition:
-                        filename = part.get_filename()
-                        if filename:
-                            attachments.append({
-                                "filename": filename,
-                                "content_type": content_type,
-                                "size": len(part.get_payload(decode=True))
-                            })
-            else:
-                # Single part message
-                content_type = msg.get_content_type()
-                if content_type == "text/plain":
-                    body = msg.get_payload(decode=True).decode(errors="ignore")
-                elif content_type == "text/html":
-                    body_html = msg.get_payload(decode=True).decode(errors="ignore")
+                        if content_type == "text/plain" and "attachment" not in content_disposition:
+                            body = part.get_payload(decode=True).decode(errors="ignore")
+                        elif content_type == "text/html" and "attachment" not in content_disposition:
+                            body_html = part.get_payload(decode=True).decode(errors="ignore")
+                        elif "attachment" in content_disposition:
+                            filename = part.get_filename()
+                            if filename:
+                                attachments.append({
+                                    "filename": filename,
+                                    "content_type": content_type,
+                                    "size": len(part.get_payload(decode=True))
+                                })
+                else:
+                    content_type = msg.get_content_type()
+                    if content_type == "text/plain":
+                        body = msg.get_payload(decode=True).decode(errors="ignore")
+                    elif content_type == "text/html":
+                        body_html = msg.get_payload(decode=True).decode(errors="ignore")
 
-            # Build response
-            email_data = {
-                "id": email_id,
-                "subject": msg.get("Subject", ""),
-                "from": msg.get("From", ""),
-                "to": msg.get("To", ""),
-                "cc": msg.get("Cc", ""),
-                "date": msg.get("Date", ""),
-                "body": body,
-                "body_html": body_html,
-                "attachments": attachments
-            }
+                email_data = {
+                    "id": email_id,
+                    "subject": msg.get("Subject", ""),
+                    "from": msg.get("From", ""),
+                    "to": msg.get("To", ""),
+                    "cc": msg.get("Cc", ""),
+                    "date": msg.get("Date", ""),
+                    "body": body,
+                    "body_html": body_html,
+                    "attachments": attachments
+                }
 
-            # Parse date
-            if email_data["date"]:
-                try:
-                    email_data["date_parsed"] = parsedate_to_datetime(email_data["date"]).isoformat()
-                except Exception:
-                    email_data["date_parsed"] = None
+                if email_data["date"]:
+                    try:
+                        email_data["date_parsed"] = parsedate_to_datetime(email_data["date"]).isoformat()
+                    except Exception:
+                        email_data["date_parsed"] = None
 
-            # Mark as read if requested
-            if mark_as_read:
-                self._imap.store(email_id.encode(), "+FLAGS", "\\Seen")
+                if mark_as_read:
+                    imap.store(email_id.encode(), "+FLAGS", "\\Seen")
 
+                return email_data
+
+            loop = asyncio.get_running_loop()
+            email_data = await loop.run_in_executor(None, _read)
             logger.info(f"Read email: {email_data['subject']}")
             return email_data
 
@@ -488,8 +493,12 @@ class EmailPlugin:
                     )
                     msg.attach(part)
 
-            # Send email
-            self._smtp.sendmail(self.email_address, recipients, msg.as_string())
+            # Send email (synchronous — wrapped in executor)
+            msg_str = msg.as_string()
+            smtp = self._smtp
+            sender = self.email_address
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: smtp.sendmail(sender, recipients, msg_str))
 
             result = {
                 "success": True,
@@ -600,14 +609,16 @@ class EmailPlugin:
             await self.connect()
 
         try:
-            self._imap.select(folder, readonly=False)
+            imap = self._imap
 
-            # Mark for deletion
-            self._imap.store(email_id.encode(), "+FLAGS", "\\Deleted")
+            def _delete():
+                imap.select(folder, readonly=False)
+                imap.store(email_id.encode(), "+FLAGS", "\\Deleted")
+                if permanent:
+                    imap.expunge()
 
-            # Permanently delete if requested
-            if permanent:
-                self._imap.expunge()
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _delete)
 
             logger.info(f"Deleted email: {email_id}")
             return {

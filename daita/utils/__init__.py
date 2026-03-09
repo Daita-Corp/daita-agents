@@ -8,7 +8,7 @@ is now handled automatically by the unified tracing system in daita.core.tracing
 LLM providers automatically track tokens without any manual setup required.
 
 For token and performance statistics, use:
-- agent.get_trace_stats() - Get comprehensive stats for a specific agent
+- agent.health['metrics'] - Get comprehensive stats for a specific agent
 - trace_manager.get_agent_metrics(agent_id) - Get metrics via trace manager
 - trace_manager.get_global_metrics() - Get system-wide metrics
 """

@@ -9,10 +9,9 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 import logging
-import time
 import asyncio
 
-from ..core.tracing import get_trace_manager, TraceType, TraceStatus
+from ..core.tracing import get_trace_manager, TraceType
 from ..core.interfaces import LLMProvider
 
 logger = logging.getLogger(__name__)
@@ -119,8 +118,6 @@ class BaseLLMProvider(LLMProvider, ABC):
                 elif chunk.type == "tool_call_complete":
                     execute_tool(chunk.tool_name, chunk.tool_args)
         """
-        from typing import Union, List, Dict, Any, AsyncIterator
-
         # Normalize messages
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]

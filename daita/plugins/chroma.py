@@ -3,8 +3,9 @@ ChromaDB vector database plugin for Daita Agents.
 
 Embeddable vector database supporting local, persistent, and client-server modes.
 """
+import asyncio
 import logging
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 from .base_vector import BaseVectorPlugin
 
 if TYPE_CHECKING:
@@ -29,6 +30,7 @@ class ChromaPlugin(BaseVectorPlugin):
         host: Optional[str] = None,
         port: int = 8000,
         collection: str = "default",
+        embedding_fn: Optional[Callable] = None,
         **kwargs
     ):
         """
@@ -39,6 +41,8 @@ class ChromaPlugin(BaseVectorPlugin):
             host: Optional host for remote Chroma server
             port: Port for remote Chroma server (default: 8000)
             collection: Collection name to use
+            embedding_fn: Optional callable that converts text to a vector.
+                          Enables passing `text` instead of `vector` to search tools.
             **kwargs: Additional Chroma configuration
         """
         self.path = path
@@ -46,6 +50,7 @@ class ChromaPlugin(BaseVectorPlugin):
         self.port = port
         self.collection_name = collection
         self._collection = None
+        self._embedding_fn = embedding_fn
 
         # Determine mode
         if path:
@@ -60,7 +65,7 @@ class ChromaPlugin(BaseVectorPlugin):
             host=host,
             port=port,
             collection=collection,
-            **kwargs
+            **kwargs  # embedding_fn is not forwarded
         )
 
         logger.debug(f"ChromaDB plugin configured in {self.mode} mode, collection '{collection}'")
@@ -87,7 +92,7 @@ class ChromaPlugin(BaseVectorPlugin):
             logger.info(f"Connected to ChromaDB in {self.mode} mode")
         except ImportError:
             self._handle_connection_error(
-                ImportError("chromadb not installed. Run: pip install chromadb"),
+                ImportError("chromadb not installed. Install with: pip install 'daita-agents[chromadb]'"),
                 "connection"
             )
         except Exception as e:
@@ -307,7 +312,7 @@ class ChromaPlugin(BaseVectorPlugin):
         return [
             AgentTool(
                 name="chroma_search",
-                description="Search for similar vectors in ChromaDB using semantic similarity. Returns top matching results with scores.",
+                description="Search ChromaDB for similar vectors. Provide 'vector' (float array) or 'text' (auto-embedded).",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -315,6 +320,10 @@ class ChromaPlugin(BaseVectorPlugin):
                             "type": "array",
                             "description": "Query vector as array of floats",
                             "items": {"type": "number"}
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Query text (auto-embedded via configured embedding_fn; use instead of vector)"
                         },
                         "top_k": {
                             "type": "integer",
@@ -325,7 +334,7 @@ class ChromaPlugin(BaseVectorPlugin):
                             "description": "Chroma where filter (e.g., {\"category\": \"tech\"})"
                         }
                     },
-                    "required": ["vector"]
+                    "required": []
                 },
                 handler=self._tool_search,
                 category="vector_db",
@@ -414,8 +423,17 @@ class ChromaPlugin(BaseVectorPlugin):
     async def _tool_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for chroma_search"""
         vector = args.get("vector")
+        text = args.get("text")
         top_k = args.get("top_k", 10)
         filter = args.get("filter")
+
+        if vector is None:
+            if not self._embedding_fn:
+                raise ValueError(
+                    "Provide 'vector' (float array) or configure embedding_fn in the constructor"
+                )
+            result = self._embedding_fn(text)
+            vector = await result if asyncio.iscoroutine(result) else result
 
         matches = await self.query(
             vector=vector,

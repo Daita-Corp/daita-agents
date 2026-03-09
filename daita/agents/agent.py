@@ -5,24 +5,22 @@ Provides autonomous tool-calling, multi-provider LLM support, plugin integration
 and zero-configuration tracing. Use Agent for most use cases; subclass BaseAgent
 for full control over the execution loop.
 """
-import asyncio
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, date
 from decimal import Decimal
 from uuid import UUID
-from typing import Dict, Any, Optional, List, Union, Callable
+from typing import TYPE_CHECKING, Dict, Any, Optional, List, Union, Callable
+
+if TYPE_CHECKING:
+    from .conversation import ConversationHistory
 
 from ..config.base import AgentConfig, AgentType
 from ..core.interfaces import LLMProvider
-from ..core.exceptions import (
-    DaitaError, AgentError, LLMError, PluginError,
-    ValidationError, InvalidDataError, NotFoundError
-)
-from ..core.tracing import TraceStatus, TraceType
+from ..core.exceptions import AgentError
+from ..core.tracing import TraceType
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -35,61 +33,45 @@ from ..core.tools import AgentTool, ToolRegistry
 
 
 class FocusedTool:
-    """Wrapper that applies focus filtering to tool results before they reach the LLM."""
+    """Wrapper that applies a Focus DSL expression to tool results before they reach the LLM."""
 
-    def __init__(self, tool: AgentTool, focus_config):
-        """Wrap tool with focus filtering."""
+    def __init__(self, tool: AgentTool, focus: str):
         self._tool = tool
-        self._focus = focus_config
+        self._focus = focus
 
     async def handler(self, arguments: Dict[str, Any]) -> Any:
-        """Execute tool handler and apply focus filtering to result."""
-        # Execute original tool handler
+        # If the tool natively accepts a focus DSL (e.g. SQL plugin tools), inject
+        # it into the args so pushdown happens at the source — no Python filtering needed.
+        tool_props = self._tool.parameters.get("properties", {})
+        if "focus" in tool_props:
+            return await self._tool.handler({**arguments, "focus": self._focus})
+
         result = await self._tool.handler(arguments)
-
-        # Apply focus to result (if applicable)
-        if self._focus and result is not None:
-            try:
-                from ..core.focus import apply_focus
-                from ..config.base import FocusConfig
-
-                # Convert FocusConfig to format apply_focus expects
-                focus_param = self._focus
-                if isinstance(self._focus, FocusConfig):
-                    # Convert FocusConfig to dict/str/list format
-                    if self._focus.type == "column":
-                        focus_param = self._focus.columns or []
-                    elif self._focus.type == "jsonpath":
-                        focus_param = self._focus.path
-                    elif self._focus.type == "xpath":
-                        focus_param = self._focus.path
-                    elif self._focus.type == "css":
-                        focus_param = self._focus.selector
-                    elif self._focus.type == "regex":
-                        focus_param = self._focus.pattern
-                    else:
-                        # For other types, convert to dict
-                        focus_param = self._focus.dict()
-
-                focused_result = apply_focus(result, focus_param)
-                logger.debug(
-                    f"Applied focus to {self.name} result: "
-                    f"{type(result).__name__} -> {type(focused_result).__name__}"
-                )
-                return focused_result
-            except Exception as e:
-                logger.warning(f"Focus application failed for {self.name}: {e}")
-                # Return original result if focus fails
-                return result
-
-        return result
+        if result is None:
+            return result
+        try:
+            from ..core.focus import apply_focus
+            # Plugin tools wrap results in {"rows": [...], "row_count": N, ...}.
+            # Apply focus to the rows list, not the wrapper dict, then put it back.
+            if isinstance(result, dict) and isinstance(result.get("rows"), list):
+                focused = apply_focus(result["rows"], self._focus)
+                n = len(focused) if isinstance(focused, list) else 1
+                logger.debug(f"Focus applied to {self.name} rows: {result['row_count']} -> {n}")
+                return {**result, "rows": focused, "row_count": n}
+            focused = apply_focus(result, self._focus)
+            logger.debug(
+                f"Focus applied to {self.name}: {type(result).__name__} -> {type(focused).__name__}"
+            )
+            return focused
+        except Exception as e:
+            logger.warning(f"Focus application failed for {self.name}: {e}")
+            return result
 
     def __getattr__(self, name):
-        """Delegate all other attributes to the wrapped tool."""
         return getattr(self._tool, name)
 
     def __repr__(self):
-        return f"FocusedTool({self._tool.name}, focus={self._focus})"
+        return f"FocusedTool({self._tool.name}, focus={self._focus!r})"
 
 
 @dataclass
@@ -116,6 +98,17 @@ class LLMResult:
         else:
             logger.warning(f"Unexpected response type: {type(response)}")
             return cls(text=str(response), tool_calls=[])
+
+
+def _resolve_tool_focus(
+    agent_focus: Optional[Union[str, Dict[str, str]]],
+    t: 'AgentTool',
+) -> Optional[str]:
+    """Return the effective focus DSL for a single tool, applying precedence rules."""
+    tool_default = getattr(t, 'focus', None)
+    if isinstance(agent_focus, dict):
+        return agent_focus.get(t.name) or tool_default
+    return agent_focus or tool_default
 
 
 class Agent(BaseAgent):
@@ -147,7 +140,7 @@ class Agent(BaseAgent):
         config: Optional[AgentConfig] = None,
         agent_id: Optional[str] = None,
         prompt: Optional[Union[str, Dict[str, str]]] = None,
-        focus: Optional[Union[List[str], str, Dict[str, Any]]] = None,
+        focus: Optional[Union[str, Dict[str, str]]] = None,
         relay: Optional[str] = None,  # Relay channel name used by the workflow engine to route output
         mcp: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
         display_reasoning: bool = False,
@@ -203,6 +196,7 @@ class Agent(BaseAgent):
         self.tool_registry = ToolRegistry()
         self.tool_sources = kwargs.get('tools', [])  # Plugins, AgentTool instances, or callables
         self._tools_setup = False
+        self._focus_default_warned: set = set()  # tracks @tool focus defaults already logged
 
         # Tool call history tracking for operations metadata
         self._tool_call_history = []
@@ -379,10 +373,11 @@ class Agent(BaseAgent):
         tools: Optional[List[Union[str, AgentTool]]] = None,
         max_iterations: int = 5,
         on_event: Optional[Callable] = None,
+        history: Optional["ConversationHistory"] = None,
         **kwargs
     ) -> str:
         """Execute instruction with autonomous tool calling, returns final answer string."""
-        result = await self._run_traced(prompt, tools, max_iterations, on_event, **kwargs)
+        result = await self._run_traced(prompt, tools, max_iterations, on_event, history=history, **kwargs)
         return result['result']
 
     async def run_detailed(
@@ -391,10 +386,11 @@ class Agent(BaseAgent):
         tools: Optional[List[Union[str, AgentTool]]] = None,
         max_iterations: int = 5,
         on_event: Optional[Callable] = None,
+        history: Optional["ConversationHistory"] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """Like run() but returns full execution details: result, tool_calls, iterations, tokens, cost, time."""
-        return await self._run_traced(prompt, tools, max_iterations, on_event, **kwargs)
+        return await self._run_traced(prompt, tools, max_iterations, on_event, history=history, **kwargs)
 
     async def _run_traced(
         self,
@@ -402,6 +398,7 @@ class Agent(BaseAgent):
         tools: Optional[List[Union[str, AgentTool]]],
         max_iterations: int,
         on_event: Optional[Callable],
+        history: Optional["ConversationHistory"] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """Internal: Execute with automatic tracing and optional event streaming."""
@@ -418,6 +415,11 @@ class Agent(BaseAgent):
             max_iterations=max_iterations,
             entry_point="run"  # Distinguishes from _process() calls
         ):
+            # Resolve history workspace and extract prior messages before branching
+            if history is not None:
+                history._set_workspace(self.agent_id)
+                kwargs['initial_messages'] = history.messages
+
             # Execute with or without retry based on configuration
             if self.config.retry_enabled:
                 result = await self._execute_autonomous_with_retry(
@@ -458,6 +460,10 @@ class Agent(BaseAgent):
                     except Exception as e:
                         logger.warning(f"Auto-logging failed: {e}")
 
+            # Append completed turn to conversation history
+            if history is not None:
+                await history.add_turn(prompt, result.get('result', ''))
+
             return result
 
     def _resolve_tools(self, tools: Optional[List[Union[str, AgentTool]]]) -> List[AgentTool]:
@@ -490,23 +496,38 @@ class Agent(BaseAgent):
         self,
         tools: Optional[List[Union[str, 'AgentTool']]]
     ) -> List['AgentTool']:
-        """Resolve tools and wrap with FocusedTool if focus configured."""
-        # Ensure tools are set up from plugin sources
-        await self._setup_tools()
+        """Resolve tools and wrap with FocusedTool using the focus precedence chain.
 
+        Precedence (highest → lowest):
+            1. Agent dict focus  — Agent(focus={"tool_name": "..."})
+            2. Agent string focus — Agent(focus="...")
+            3. @tool default      — @tool(focus="..."), warned on first use
+            4. No focus           — result passes through unmodified
+        """
+        await self._setup_tools()
         resolved_tools = self._resolve_tools(tools)
 
-        if self.default_focus and resolved_tools:
-            resolved_tools = [
-                FocusedTool(tool, self.default_focus)
-                for tool in resolved_tools
-            ]
-            logger.debug(
-                f"Wrapped {len(resolved_tools)} tools with focus filter: "
-                f"{self.default_focus}"
-            )
+        result = []
+        for t in resolved_tools:
+            effective = _resolve_tool_focus(self.default_focus, t)
 
-        return resolved_tools
+            if effective:
+                # Warn once when the only active focus is the @tool-level default
+                if effective == getattr(t, 'focus', None) and not self.default_focus:
+                    if t.name not in self._focus_default_warned:
+                        logger.warning(
+                            f"Tool '{t.name}' has a built-in focus default: {effective!r}. "
+                            f"Applied automatically. To be explicit, set "
+                            f"Agent(focus={{'{t.name}': '...'}})"
+                        )
+                        self._focus_default_warned.add(t.name)
+                else:
+                    logger.debug(f"Focus applied to '{t.name}': {effective!r}")
+                result.append(FocusedTool(t, effective))
+            else:
+                result.append(t)
+
+        return result
 
     async def _stream_llm_turn(
         self,
@@ -711,6 +732,7 @@ class Agent(BaseAgent):
         tools: Optional[List[Union[str, 'AgentTool']]],
         max_iterations: int,
         on_event: Optional[Callable],
+        initial_messages: Optional[List[Dict]] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """Unified autonomous execution path for both streaming and non-streaming."""
@@ -751,6 +773,10 @@ class Agent(BaseAgent):
 
         if system_parts:
             conversation.append({"role": "system", "content": "\n\n".join(system_parts)})
+
+        # Inject prior conversation turns between system message and current prompt
+        if initial_messages:
+            conversation.extend(initial_messages)
 
         conversation.append({"role": "user", "content": prompt})
         tools_called = []
@@ -912,13 +938,6 @@ class Agent(BaseAgent):
 
         return result
 
-    async def call_mcp_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
-        """Manually call an MCP tool by name with arguments."""
-        if not self.mcp_registry:
-            raise RuntimeError("No MCP servers configured. Add mcp parameter to Agent.")
-
-        return await self.mcp_registry.call_tool(tool_name, arguments)
-
     # User customization methods
 
     def add_plugin(self, plugin: Any):
@@ -934,14 +953,6 @@ class Agent(BaseAgent):
 
         self.tool_sources.append(plugin)
         logger.debug(f"Added plugin: {plugin.__class__.__name__}")
-
-    def register_tool(self, tool: AgentTool) -> None:
-        """Register a single tool manually."""
-        self.tool_registry.register(tool)
-
-    def register_tools(self, tools: List[AgentTool]) -> None:
-        """Register multiple tools manually."""
-        self.tool_registry.register_many(tools)
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
         """Execute a tool by name with arguments."""

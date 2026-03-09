@@ -1,0 +1,12 @@
+name: csv-data-analyst
+version: 1.0.0
+description: Natural language data analysis for CSV files
+created_at: '2026-03-02T00:00:00'
+
+agents:
+  - name: csv_analyst
+    description: Answers natural language questions about CSV data using pandas tools
+    file: agents/csv_analyst.py
+    enabled: true
+
+workflows: []

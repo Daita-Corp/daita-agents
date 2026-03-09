@@ -15,7 +15,7 @@ from typing import Dict, Any, Optional
 import aiohttp
 import click
 import yaml
-from ..utils import find_project_root
+from ..utils import find_project_root, get_api_endpoint, _CLI_VERSION
 
 # ---------------------------------------------------------------------------
 # Terminal / spinner helpers
@@ -83,15 +83,37 @@ async def run_remote_execution(
 
     # Get API credentials
     api_key = os.getenv('DAITA_API_KEY')
-    api_base = os.getenv('DAITA_API_BASE') or os.getenv('DAITA_API_ENDPOINT') or 'https://api.daita-tech.io'
+    api_base = get_api_endpoint()
 
     if not api_key:
         click.echo(" DAITA_API_KEY not found", err=True)
         click.echo("   Get your API key from daita-tech.io", err=True)
         click.echo("   Set it with: export DAITA_API_KEY='your-key-here'", err=True)
-        click.echo("   Or add it to your project's .env file", err=True)
         return False
-    
+
+    # Non-blocking warning if no cloud secrets are configured
+    try:
+        async with aiohttp.ClientSession() as _check_session:
+            async with _check_session.get(
+                f"{api_base}/api/v1/secrets",
+                headers={
+                    'Authorization': f'Bearer {api_key}',
+                    'User-Agent': f'Daita-CLI/{_CLI_VERSION}',
+                },
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as _resp:
+                if _resp.status == 200:
+                    _data = await _resp.json()
+                    if not _data.get('keys'):
+                        click.echo(
+                            "  Warning: No cloud secrets configured. If your agent needs API keys, run:",
+                            err=True,
+                        )
+                        click.echo("    daita secrets import .env", err=True)
+                        click.echo("", err=True)
+    except Exception:
+        pass  # Never block execution on secrets check failure
+
     # Prepare input data
     input_data = {}
     if data_file:
@@ -117,9 +139,8 @@ async def run_remote_execution(
         "timeout_seconds": timeout,
         "execution_source": "cli",
         "source_metadata": {
-            "cli_version": "1.0.0",
+            "cli_version": _CLI_VERSION,
             "command": f"daita run {target_name}",
-            "working_directory": str(Path.cwd())
         }
     }
     
@@ -154,16 +175,17 @@ async def run_remote_execution(
     headers = {
         'Authorization': f'Bearer {api_key}',
         'Content-Type': 'application/json',
-        'User-Agent': 'Daita-CLI/1.0.0'
+        'User-Agent': f'Daita-CLI/{_CLI_VERSION}'
     }
-    
+
     try:
         async with aiohttp.ClientSession() as session:
             # Submit execution request
             async with session.post(
                 f"{api_base}/api/v1/executions/execute",
                 headers=headers,
-                json=request_data
+                json=request_data,
+                timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 
                 if response.status != 200:
@@ -434,12 +456,12 @@ async def list_remote_executions(
     """List recent executions with filtering."""
     
     api_key = os.getenv('DAITA_API_KEY')
-    api_base = os.getenv('DAITA_API_BASE') or os.getenv('DAITA_API_ENDPOINT') or 'https://api.daita-tech.io'
-    
+    api_base = get_api_endpoint()
+
     if not api_key:
         click.echo(" DAITA_API_KEY not found", err=True)
         return False
-    
+
     # Build query parameters
     params = {'limit': limit}
     if status:
@@ -451,9 +473,9 @@ async def list_remote_executions(
     
     headers = {
         'Authorization': f'Bearer {api_key}',
-        'User-Agent': 'Daita-CLI/1.0.0'
+        'User-Agent': f'Daita-CLI/{_CLI_VERSION}'
     }
-    
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -550,17 +572,17 @@ async def get_execution_logs(
     """Get logs for a specific execution."""
     
     api_key = os.getenv('DAITA_API_KEY')
-    api_base = os.getenv('DAITA_API_BASE') or os.getenv('DAITA_API_ENDPOINT') or 'https://api.daita-tech.io'
-    
+    api_base = get_api_endpoint()
+
     if not api_key:
         click.echo(" DAITA_API_KEY not found", err=True)
         return False
-    
+
     headers = {
         'Authorization': f'Bearer {api_key}',
-        'User-Agent': 'Daita-CLI/1.0.0'
+        'User-Agent': f'Daita-CLI/{_CLI_VERSION}'
     }
-    
+
     try:
         async with aiohttp.ClientSession() as session:
             if follow:
@@ -599,100 +621,6 @@ async def get_execution_logs(
     except Exception as e:
         click.echo(f" Error: {e}", err=True)
         return False
-
-
-async def _resolve_agent_id(agent_name: str, environment: str, api_key: str, api_base: str) -> Optional[str]:
-    """
-    Resolve agent name to deployed agent ID.
-    
-    This function queries the deployments API to find the actual agent ID
-    that corresponds to the simple agent name provided by the user.
-    
-    Args:
-        agent_name: Simple agent name (e.g., "sentiment_analyzer")
-        environment: Target environment (e.g., "staging", "production")
-        api_key: DAITA API key for authentication
-        api_base: API base URL
-        
-    Returns:
-        Agent ID if found, None otherwise
-    """
-    try:
-        # Get current project name to filter deployments
-        project_root = find_project_root()
-        project_name = None
-        if project_root:
-            try:
-                import yaml
-                config_file = project_root / 'daita-project.yaml'
-                if config_file.exists():
-                    with open(config_file, 'r') as f:
-                        config = yaml.safe_load(f)
-                        project_name = config.get('name')
-            except:
-                pass
-        
-        headers = {
-            'Authorization': f'Bearer {api_key}',
-            'Content-Type': 'application/json',
-            'User-Agent': 'Daita-CLI/1.0.0'
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            # Query deployments API to find matching agent
-            url = f"{api_base}/api/v1/deployments"
-            params = {
-                'environment': environment,
-                'status': 'active'
-            }
-            
-            # Add project filter if available
-            if project_name:
-                params['project_name'] = project_name
-            
-            async with session.get(url, headers=headers, params=params) as response:
-                if response.status == 200:
-                    deployments = await response.json()
-                    
-                    # Debug logging
-                    click.echo(f" DEBUG: Found {len(deployments)} deployments for project '{project_name}' in {environment}", err=True)
-                    
-                    # Search through deployments for matching agent
-                    for deployment in deployments:
-                        agents_config = deployment.get('agents_config', [])
-                        for agent_config in agents_config:
-                            # Extract agent file name from agent_id 
-                            # Format: {org_id}_{project_name}_{agent_file_name}
-                            agent_id = agent_config.get('agent_id', '')
-                            agent_file_name = ''
-                            
-                            if agent_id and project_name:
-                                # Try to extract agent name by removing org_id and project_name prefix
-                                # Expected format: "1_{project_name}_{agent_name}" where project_name may contain hyphens
-                                # Strategy: look for pattern that starts with "1_{project_name}_"
-                                prefix = f"1_{project_name}_"
-                                if agent_id.startswith(prefix):
-                                    # Extract everything after the prefix
-                                    agent_file_name = agent_id[len(prefix):]
-                            
-                            # Match by multiple criteria:
-                            display_name = agent_config.get('agent_name', '')
-                            
-                            if (agent_name == agent_file_name or
-                                agent_name == display_name or
-                                agent_name.replace('_', ' ').title() == display_name or
-                                agent_name.replace('_', '').lower() == display_name.replace(' ', '').lower()):
-                                return agent_config.get('agent_id')
-                    
-                    return None
-                else:
-                    # If API call fails, return None to let execution try with original name
-                    click.echo(f" DEBUG: Deployments API returned status {response.status}", err=True)
-                    return None
-                    
-    except Exception:
-        # If resolution fails, return None to let execution try with original name
-        return None
 
 
 def validate_agent_exists(target_name: str, target_type: str = "agent") -> Optional[dict]:

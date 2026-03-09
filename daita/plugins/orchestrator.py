@@ -18,6 +18,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _routing_not_executable(*args, **kwargs):
+    raise RuntimeError("Routing tools are for LLM selection only, not direct execution")
+
+
 class OrchestratorPlugin(BasePlugin):
     """
     Plugin for multi-agent orchestration and coordination.
@@ -212,7 +216,7 @@ class OrchestratorPlugin(BasePlugin):
                     },
                     "required": []
                 },
-                handler=lambda **kwargs: None,  # Dummy handler (routing tools aren't executed)
+                handler=_routing_not_executable,
                 category="routing",
                 source="orchestrator",
                 plugin_name="Orchestrator"
@@ -394,7 +398,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         return [
             AgentTool(
                 name="find_agent",
-                description="Find the best agent for a task using natural language description. Returns the agent ID.",
+                description="Find the best agent for a task by natural language description.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -479,7 +483,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             ),
             AgentTool(
                 name="run_parallel",
-                description="Execute multiple tasks across agents in parallel. Tasks can be strings (auto-routed) or objects with optional agent_id",
+                description="Execute tasks across agents in parallel, with auto-routing support.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -511,7 +515,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             ),
             AgentTool(
                 name="run_sequential",
-                description="Execute tasks in sequence, passing results between agents. Tasks can be strings (auto-routed) or objects with optional agent_id",
+                description="Execute tasks sequentially, chaining results between agents.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -543,7 +547,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             ),
             AgentTool(
                 name="create_workflow",
-                description="Define a new workflow as a DAG of steps with dependencies. Agent ID is optional and will be auto-routed if omitted",
+                description="Define a workflow DAG of steps with dependencies and optional auto-routing.",
                 parameters={
                     "type": "object",
                     "properties": {

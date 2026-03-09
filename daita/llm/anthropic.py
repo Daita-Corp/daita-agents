@@ -60,7 +60,7 @@ class AnthropicProvider(BaseLLMProvider):
                 logger.debug(f"Anthropic client initialized with {timeout_seconds}s timeout")
             except ImportError:
                 raise LLMError(
-                    "Anthropic package not installed. Install with: pip install anthropic"
+                    "Anthropic package not installed. Install with: pip install 'daita-agents[anthropic]'"
                 )
         return self._client
 

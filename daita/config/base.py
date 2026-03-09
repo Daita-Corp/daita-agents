@@ -18,15 +18,6 @@ class AgentType(str, Enum):
     STANDARD = "standard"
     # Additional agent types can be added here
 
-class FocusType(str, Enum):
-    """Types of focus selectors."""
-    COLUMN = "column"
-    JSONPATH = "jsonpath"
-    XPATH = "xpath"
-    CSS_SELECTOR = "css"
-    REGEX = "regex"
-    SEMANTIC = "semantic"
-
 class RetryStrategy(str, Enum):
     """Retry strategy types - unified from core/reliability.py."""
     FIXED = "fixed"
@@ -36,14 +27,6 @@ class RetryStrategy(str, Enum):
     EXPONENTIAL_BACKOFF = "exponential"
     FIXED_DELAY = "fixed"
     IMMEDIATE = "fixed"
-
-class FocusConfig(YamlSerializableMixin, BaseModel):
-    """Configuration for focus parameter."""
-    type: Optional[FocusType] = None
-    include: Optional[Union[List[str], str]] = None
-    exclude: Optional[Union[List[str], str]] = None
-    paths: Optional[List[str]] = None
-    description: Optional[str] = None
 
 class RetryPolicy(YamlSerializableMixin, BaseModel):
     """Unified retry configuration compatible with core/reliability.py."""
@@ -105,7 +88,6 @@ class RetryPolicy(YamlSerializableMixin, BaseModel):
         **kwargs
     ):
         """Execute function with retry policy."""
-        from typing import Callable, Any
         last_error = None
         
         for attempt in range(self.max_retries + 1):

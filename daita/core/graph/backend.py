@@ -8,7 +8,6 @@ The backend is chosen automatically based on runtime environment:
 Developers never call auto_select_backend() directly. LineagePlugin calls it
 during initialize() if no backend was provided at construction time.
 """
-import os
 from typing import List, Optional, Protocol, runtime_checkable
 
 import networkx as nx

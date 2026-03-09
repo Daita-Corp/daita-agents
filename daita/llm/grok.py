@@ -58,7 +58,7 @@ class GrokProvider(BaseLLMProvider):
                 logger.debug("Grok client initialized")
             except ImportError:
                 raise LLMError(
-                    "OpenAI package not installed. Install with: pip install openai"
+                    "openai package not found. It is a core dependency — reinstall with: pip install daita-agents"
                 )
         return self._client
     
@@ -135,8 +135,6 @@ class GrokProvider(BaseLLMProvider):
             - If no tools or LLM returns text: str
             - If LLM wants to call tools: {"tool_calls": [...]}
         """
-        import json
-
         try:
             # Build API call params
             api_params = {
@@ -207,7 +205,6 @@ class GrokProvider(BaseLLMProvider):
             LLMChunk objects with type "text" or "tool_call_complete"
         """
         from ..core.streaming import LLMChunk
-        import json
 
         try:
             # Build API call params

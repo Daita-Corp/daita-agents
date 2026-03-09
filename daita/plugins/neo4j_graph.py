@@ -108,7 +108,7 @@ class Neo4jPlugin(BasePlugin):
             logger.info(f"Connected to Neo4j at {self._uri}")
         except ImportError:
             raise ImportError(
-                "neo4j driver not installed. Run: pip install neo4j"
+                "neo4j driver not installed. Install with: pip install 'daita-agents[neo4j]'"
             )
         except Exception as e:
             logger.error(f"Failed to connect to Neo4j: {e}")

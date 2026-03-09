@@ -30,8 +30,7 @@ MCP Protocol:
 
 import asyncio
 import logging
-import json
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -181,7 +180,7 @@ class MCPServer:
 
         except ImportError as e:
             error_msg = (
-                "MCP SDK not installed. Install with: pip install mcp\n"
+                "MCP SDK not installed. Install with: pip install 'daita-agents[mcp]'\n"
                 "Official SDK: https://github.com/modelcontextprotocol/python-sdk"
             )
             logger.error(error_msg)

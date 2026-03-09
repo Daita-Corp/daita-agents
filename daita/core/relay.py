@@ -32,17 +32,16 @@ import logging
 import random
 import time
 import uuid
-from typing import Dict, Any, Optional, List, Callable, Union
+from typing import Dict, Any, Optional, List, Callable
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-import weakref
 
 try:
-    from ..core.exceptions import DaitaError, AcknowledgmentTimeoutError
+    from ..core.exceptions import DaitaError
 except ImportError:
     # Fallback for direct execution or testing
-    from core.exceptions import DaitaError, AcknowledgmentTimeoutError
+    from core.exceptions import DaitaError
 
 logger = logging.getLogger(__name__)
 
@@ -159,44 +158,27 @@ class RelayManager:
             'upstream_agent': publisher or agent_response.get('agent_name'),
             'upstream_agent_id': agent_response.get('agent_id'),
             'timestamp': agent_response.get('timestamp', time.time()),
+            'status': agent_response.get('status', 'unknown'),
         }
 
-        # Extract processing metrics if available
-        if 'processing_time_ms' in agent_response:
-            metadata['processing_time_ms'] = agent_response['processing_time_ms']
+        # Simple passthrough fields
+        for field in ('processing_time_ms', 'token_usage', 'record_count', 'error_count', 'retry_info'):
+            if field in agent_response:
+                metadata[field] = agent_response[field]
 
-        # Extract token usage if available
-        if 'token_usage' in agent_response:
-            metadata['token_usage'] = agent_response['token_usage']
-
-        # Extract confidence score if available
+        # Normalize confidence score (two possible source keys)
         if 'confidence_score' in agent_response:
             metadata['confidence_score'] = agent_response['confidence_score']
         elif 'confidence' in agent_response:
             metadata['confidence_score'] = agent_response['confidence']
 
-        # Extract record count if available
-        if 'record_count' in agent_response:
-            metadata['record_count'] = agent_response['record_count']
-
-        # Extract error information if available
-        if 'error_count' in agent_response:
-            metadata['error_count'] = agent_response['error_count']
-
-        # Extract correlation ID for distributed tracing
+        # Resolve correlation ID: direct field → nested context → new UUID
         if 'correlation_id' in agent_response:
             metadata['correlation_id'] = agent_response['correlation_id']
         elif 'context' in agent_response and isinstance(agent_response['context'], dict):
             metadata['correlation_id'] = agent_response['context'].get('correlation_id', str(uuid.uuid4()))
         else:
             metadata['correlation_id'] = str(uuid.uuid4())
-
-        # Extract retry information if available
-        if 'retry_info' in agent_response:
-            metadata['retry_info'] = agent_response['retry_info']
-
-        # Extract status (success/error)
-        metadata['status'] = agent_response.get('status', 'unknown')
 
         return metadata
     

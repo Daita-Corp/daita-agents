@@ -305,7 +305,7 @@ class ValidationError(PermanentError):
 
 class InvalidDataError(PermanentError):
     """Exception for invalid or malformed data."""
-    
+
     def __init__(self, message: str = "Invalid data format", data_type: str = None, expected_format: str = None, context: dict = None):
         context = context or {}
         if data_type:
@@ -315,6 +315,13 @@ class InvalidDataError(PermanentError):
         super().__init__(message, context)
         self.data_type = data_type
         self.expected_format = expected_format
+
+
+class FocusDSLError(PermanentError):
+    """Exception for Focus DSL parse or execution errors."""
+
+    def __init__(self, message: str = "Focus DSL error", context: dict = None):
+        super().__init__(message, context)
 
 class NotFoundError(PermanentError):
     """Exception for missing resources."""

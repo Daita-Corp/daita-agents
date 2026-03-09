@@ -5,7 +5,7 @@ Simplified settings system focused on essential configuration.
 """
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, List, ClassVar
+from typing import Optional
 from pydantic import BaseModel
 from dotenv import load_dotenv
 

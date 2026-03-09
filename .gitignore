@@ -212,3 +212,6 @@ __marimo__/
 
 # Build artifacts
 *.zip
+
+#Claude Code
+*.claude

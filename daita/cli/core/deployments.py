@@ -4,12 +4,10 @@ Deployment management commands for Daita CLI.
 Provides commands to list and manage deployments.
 """
 import os
-import json
-import asyncio
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
-from ..utils import find_project_root
+from ..utils import find_project_root, get_api_endpoint, _CLI_VERSION
 
 async def list_deployments(project_name: Optional[str] = None, environment: Optional[str] = None, limit: int = 10):
     """List deployment history from managed cloud API."""
@@ -33,11 +31,11 @@ async def list_deployments(project_name: Optional[str] = None, environment: Opti
                     project_name = config.get('name', 'unknown')
 
         # Get API endpoint
-        api_endpoint = os.getenv('DAITA_API_ENDPOINT', 'https://api.daita-tech.io')
+        api_endpoint = get_api_endpoint()
 
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "User-Agent": "Daita-CLI/1.0.0"
+            "User-Agent": f"Daita-CLI/{_CLI_VERSION}"
         }
 
         # Build query parameters
@@ -242,11 +240,11 @@ async def delete_deployment(deployment_id: str, force: bool = False):
                 return
 
         # Get API endpoint
-        api_endpoint = os.getenv('DAITA_API_ENDPOINT', 'https://api.daita-tech.io')
+        api_endpoint = get_api_endpoint()
 
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "User-Agent": "Daita-CLI/1.0.0"
+            "User-Agent": f"Daita-CLI/{_CLI_VERSION}"
         }
 
         async with aiohttp.ClientSession() as session:

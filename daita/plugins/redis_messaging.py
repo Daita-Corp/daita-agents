@@ -31,7 +31,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Dict, Any, Optional, List, Callable, Union
+from typing import Dict, Any, Optional, List, Callable
 import weakref
 
 logger = logging.getLogger(__name__)
@@ -94,7 +94,7 @@ class RedisMessagingPlugin:
         except ImportError:
             raise ImportError(
                 "redis package required for RedisMessagingPlugin. "
-                "Install with: pip install redis"
+                "Install with: pip install 'daita-agents[redis]'"
             )
         
         # Create connection pool

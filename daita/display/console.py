@@ -5,8 +5,6 @@ Provides simple, clean console display of agent decision-making during developme
 """
 
 import sys
-from typing import Optional
-
 from ..core.decision_tracing import DecisionEvent, DecisionEventType
 
 

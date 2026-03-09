@@ -109,7 +109,6 @@ def quick_status() -> dict:
     Returns:
         Dictionary with project status information
     """
-    import asyncio
     from .utils import find_project_root
     
     project_root = find_project_root()

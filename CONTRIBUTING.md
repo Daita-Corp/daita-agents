@@ -15,7 +15,10 @@ Thank you for your interest in contributing! This guide covers everything you ne
 git clone https://github.com/daita-tech/daita-agents.git
 cd daita-agents
 pip install -e ".[dev]"
+pre-commit install
 ```
+
+The last step installs the git hook that automatically formats your code with `black` before every commit.
 
 ### Running Tests
 
@@ -55,7 +58,7 @@ Open a [GitHub Issue](https://github.com/daita-tech/daita-agents/issues) with th
 1. Subclass `BaseLLMProvider` from `daita.llm.base`
 2. Implement `_generate_impl()` and `_stream_impl()`
 3. Add it to `daita/llm/factory.py`
-4. Add tests in `tests/llm/`
+4. Add tests in `tests/unit/`
 
 ### Adding a New Plugin
 
@@ -66,7 +69,7 @@ Open a [GitHub Issue](https://github.com/daita-tech/daita-agents/issues) with th
 
 ## Code Style
 
-- Format with `black` and `isort`
+- Formatting is enforced by `black` via the pre-commit hook — just commit and it runs automatically
 - Type hints on all public functions
 - Docstrings on all public classes and methods
 

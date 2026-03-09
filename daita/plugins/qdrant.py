@@ -3,8 +3,9 @@ Qdrant vector database plugin for Daita Agents.
 
 Self-hosted vector database with advanced filtering and high performance.
 """
+import asyncio
 import logging
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 from .base_vector import BaseVectorPlugin
 
 if TYPE_CHECKING:
@@ -26,6 +27,7 @@ class QdrantPlugin(BaseVectorPlugin):
         url: str = "http://localhost:6333",
         api_key: Optional[str] = None,
         collection: str = "default",
+        embedding_fn: Optional[Callable] = None,
         **kwargs
     ):
         """
@@ -35,17 +37,20 @@ class QdrantPlugin(BaseVectorPlugin):
             url: Qdrant server URL (default: http://localhost:6333)
             api_key: Optional API key for authentication
             collection: Collection name to use
+            embedding_fn: Optional callable that converts text to a vector.
+                          Enables passing `text` instead of `vector` to search tools.
             **kwargs: Additional Qdrant configuration
         """
         self.url = url
         self.api_key = api_key
         self.collection_name = collection
+        self._embedding_fn = embedding_fn
 
         super().__init__(
             url=url,
             api_key=api_key,
             collection=collection,
-            **kwargs
+            **kwargs  # embedding_fn is not forwarded
         )
 
         logger.debug(f"Qdrant plugin configured for {url}, collection '{collection}'")
@@ -69,7 +74,7 @@ class QdrantPlugin(BaseVectorPlugin):
 
         except ImportError:
             self._handle_connection_error(
-                ImportError("qdrant-client not installed. Run: pip install qdrant-client"),
+                ImportError("qdrant-client not installed. Install with: pip install 'daita-agents[qdrant]'"),
                 "connection"
             )
         except Exception as e:
@@ -380,7 +385,7 @@ class QdrantPlugin(BaseVectorPlugin):
         return [
             AgentTool(
                 name="qdrant_search",
-                description="Search for similar vectors in Qdrant using semantic similarity. Returns top matching results with scores.",
+                description="Search Qdrant for similar vectors. Provide 'vector' (float array) or 'text' (auto-embedded).",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -388,6 +393,10 @@ class QdrantPlugin(BaseVectorPlugin):
                             "type": "array",
                             "description": "Query vector as array of floats",
                             "items": {"type": "number"}
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Query text (auto-embedded via configured embedding_fn; use instead of vector)"
                         },
                         "top_k": {
                             "type": "integer",
@@ -398,7 +407,7 @@ class QdrantPlugin(BaseVectorPlugin):
                             "description": "Simple filter dict (e.g., {\"category\": \"tech\"})"
                         }
                     },
-                    "required": ["vector"]
+                    "required": []
                 },
                 handler=self._tool_search,
                 category="vector_db",
@@ -465,7 +474,7 @@ class QdrantPlugin(BaseVectorPlugin):
             ),
             AgentTool(
                 name="qdrant_create_collection",
-                description="Create a new collection in Qdrant with specified vector size and distance metric.",
+                description="Create a Qdrant collection with specified vector size and distance metric.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -495,8 +504,17 @@ class QdrantPlugin(BaseVectorPlugin):
     async def _tool_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for qdrant_search"""
         vector = args.get("vector")
+        text = args.get("text")
         top_k = args.get("top_k", 10)
         filter = args.get("filter")
+
+        if vector is None:
+            if not self._embedding_fn:
+                raise ValueError(
+                    "Provide 'vector' (float array) or configure embedding_fn in the constructor"
+                )
+            result = self._embedding_fn(text)
+            vector = await result if asyncio.iscoroutine(result) else result
 
         matches = await self.query(
             vector=vector,

@@ -9,7 +9,7 @@ Quick start:
         return f"Sunny in {city}"
 
     agent = Agent(name="weather", tools=[get_weather])
-    result = agent.run("What's the weather in Tokyo?")
+    result = await agent.run("What's the weather in Tokyo?")
 
 Key components:
 - Agent / BaseAgent      — Build single or custom agents
@@ -19,13 +19,14 @@ Key components:
 - AgentConfig           — Configure retry policies, LLM settings, and more
 """
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 # ---------------------------------------------------------------------------
 # Core — what 95% of users need
 # ---------------------------------------------------------------------------
 from .agents.agent import Agent
 from .agents.base import BaseAgent
+from .agents.conversation import ConversationHistory
 
 from .core.tools import tool, AgentTool, ToolRegistry
 
@@ -44,6 +45,11 @@ from .plugins.redis_messaging import redis_messaging
 from .config.base import AgentConfig, RetryPolicy, RetryStrategy
 
 # ---------------------------------------------------------------------------
+# Focus DSL — pre-filter tool results before the LLM sees them
+# ---------------------------------------------------------------------------
+from .core.focus import apply_focus
+
+# ---------------------------------------------------------------------------
 # Exceptions — for error handling in user code
 # ---------------------------------------------------------------------------
 from .core.exceptions import (
@@ -59,17 +65,13 @@ from .core.exceptions import (
     RateLimitError,
     AuthenticationError,
     ValidationError,
+    FocusDSLError,
 )
 
 # ---------------------------------------------------------------------------
 # LLM factory — for explicit provider construction
 # ---------------------------------------------------------------------------
 from .llm.factory import create_llm_provider
-
-# ---------------------------------------------------------------------------
-# Programmatic execution (via daita-client package)
-# ---------------------------------------------------------------------------
-from .execution import DaitaClient, ExecutionResult, ExecutionError
 
 # ---------------------------------------------------------------------------
 # Advanced — reliability, scaling, tracing (importable from submodules too)
@@ -83,6 +85,7 @@ __all__ = [
     # Primary interfaces
     "Agent",
     "BaseAgent",
+    "ConversationHistory",
     "Workflow",
     "RelayManager",
     # Tool system
@@ -102,6 +105,8 @@ __all__ = [
     "AgentConfig",
     "RetryPolicy",
     "RetryStrategy",
+    # Focus DSL
+    "apply_focus",
     # Exceptions
     "DaitaError",
     "AgentError",
@@ -115,12 +120,9 @@ __all__ = [
     "RateLimitError",
     "AuthenticationError",
     "ValidationError",
+    "FocusDSLError",
     # LLM
     "create_llm_provider",
-    # Execution
-    "DaitaClient",
-    "ExecutionResult",
-    "ExecutionError",
     # Version
     "__version__",
 ]

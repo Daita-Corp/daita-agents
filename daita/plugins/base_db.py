@@ -5,29 +5,31 @@ Provides common connection management, error handling, and context manager
 support for all database plugins in the Daita framework.
 """
 import logging
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from abc import abstractmethod
+from typing import Any, Dict
 from ..core.exceptions import PluginError, ConnectionError as DaitaConnectionError, ValidationError
+from .base import BasePlugin
 
-if TYPE_CHECKING:
-    from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
 
-class BaseDatabasePlugin(ABC):
+class BaseDatabasePlugin(BasePlugin):
     """
     Base class for all database plugins with common connection management.
-    
+
     This class provides:
     - Standardized connection/disconnection lifecycle
     - Context manager support for automatic cleanup
     - Common error handling patterns
     - Consistent configuration patterns
-    
+
     Database-specific plugins should inherit from this class and implement
     the abstract methods for their specific database requirements.
     """
-    
+
+    # Subclasses set this to their dialect: "postgresql", "mysql", "snowflake", "sqlite"
+    sql_dialect: str = "standard"
+
     def __init__(self, **kwargs):
         """
         Initialize base database plugin.
@@ -134,21 +136,23 @@ class BaseDatabasePlugin(ABC):
                 context={"plugin": self.__class__.__name__, "operation": operation}
             ) from error
     
-    def get_tools(self) -> List['AgentTool']:
+    async def _run_focus_query(self, sql: str, params: list, focus_dsl: str) -> list:
         """
-        Get agent-usable tools from this database plugin.
+        Parse *focus_dsl*, push as many clauses as possible into SQL, execute,
+        then let the Python evaluator handle any remainder.
 
-        Override in subclasses to expose database operations as LLM tools.
-
-        Returns:
-            List of AgentTool instances
+        This is the single integration point for focus in all SQL plugins.
         """
-        return []
+        from ..core.focus import parse as _parse
+        from ..core.focus.backends.sql import compile_focus_to_sql
+        from ..core.focus.evaluator import evaluate_remaining
 
-    @property
-    def has_tools(self) -> bool:
-        """Check if plugin exposes any tools"""
-        return len(self.get_tools()) > 0
+        fq = _parse(focus_dsl)
+        mod_sql, extra_params, applied = compile_focus_to_sql(
+            sql, fq, dialect=self.sql_dialect, param_offset=len(params)
+        )
+        rows = await self.query(mod_sql, params + extra_params or None)
+        return evaluate_remaining(rows, fq, applied)
 
     @property
     def info(self) -> Dict[str, Any]:

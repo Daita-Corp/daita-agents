@@ -1170,7 +1170,6 @@ class CatalogPlugin(BasePlugin):
         Returns {"removed": [list of removed keys]}
         """
         import json
-        import os
         from datetime import datetime, timezone
         from pathlib import Path
 

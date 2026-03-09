@@ -8,19 +8,8 @@ import os
 import asyncio
 import aiohttp
 import ssl
-from typing import Dict, Any, Optional
-from ...config.settings import settings
-
-
-def _get_secure_api_endpoint() -> str:
-    """Get validated API endpoint with security checks."""
-    # Use production API endpoint (can be overridden via environment)
-    endpoint = os.getenv("DAITA_API_ENDPOINT") or "https://api.daita-tech.io"
-
-    try:
-        return settings.validate_endpoint(endpoint)
-    except ValueError as e:
-        raise ValueError(f"Invalid API endpoint configuration: {e}")
+from typing import Dict, Any
+from ..utils import get_api_endpoint, _CLI_VERSION
 
 
 async def list_webhooks(api_key_only: bool = False, verbose: bool = False) -> bool:
@@ -44,7 +33,7 @@ async def list_webhooks(api_key_only: bool = False, verbose: bool = False) -> bo
 
     try:
         # Get secure API endpoint
-        api_endpoint = _get_secure_api_endpoint()
+        api_endpoint = get_api_endpoint()
         url = f"{api_endpoint}/api/v1/webhooks/list"
 
         if api_key_only:
@@ -53,7 +42,7 @@ async def list_webhooks(api_key_only: bool = False, verbose: bool = False) -> bo
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "Daita-CLI/1.0.0"
+            "User-Agent": f"Daita-CLI/{_CLI_VERSION}"
         }
 
         # Create secure SSL context

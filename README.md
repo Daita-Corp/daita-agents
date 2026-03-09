@@ -5,8 +5,8 @@
 Daita Agents gives you a clean, minimal API for autonomous tool-calling agents that work with any LLM provider — OpenAI, Anthropic, Gemini, Grok, and more. Zero-configuration tracing, pluggable data sources, and a composable workflow system for multi-agent pipelines.
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org)
-[![CI](https://github.com/daita-tech/daita-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/daita-tech/daita-agents/actions)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
+[![PyPI](https://img.shields.io/badge/pypi-daita--agents-orange)](https://pypi.org/project/daita-agents/)
 
 ---
 
@@ -18,16 +18,22 @@ pip install daita-agents
 
 ```python
 import asyncio
-from daita import Agent
+from daita import Agent, tool
+
+@tool
+def get_weather(city: str) -> str:
+    """Get current weather for a city."""
+    return f"Sunny, 72°F in {city}"
 
 async def main():
     agent = Agent(
-        name="Analyst",
+        name="assistant",
         llm_provider="openai",
         model="gpt-4o",
+        tools=[get_weather],
     )
 
-    result = await agent.run("Summarize the key trends in Q3 sales data.")
+    result = await agent.run("What's the weather in Tokyo?")
     print(result)
 
 asyncio.run(main())
@@ -39,119 +45,281 @@ asyncio.run(main())
 
 - **Multi-provider LLM support** — OpenAI, Anthropic, Gemini, Grok (or bring your own)
 - **Autonomous tool calling** — agents plan and execute multi-step tool chains without manual orchestration
-- **Streaming** — real time token-by-token output with `stream=True`
-- **Plugin ecosystem** — PostgreSQL, MySQL, MongoDB, REST APIs, S3, Slack, Elasticsearch, Neo4j, and more
+- **`@tool` decorator** — turn any Python function into an LLM-callable tool in one line
+- **Streaming** — real-time event-based output via `on_event` callback
+- **Plugin ecosystem** — PostgreSQL, MySQL, MongoDB, S3, Slack, Elasticsearch, Pinecone, ChromaDB, Neo4j, MCP, and more
 - **Memory** — persistent agent memory with local or custom backends
 - **Workflows** — connect multiple agents into pipelines via relay channels
 - **Zero-config tracing** — every LLM call and tool execution is automatically traced (tokens, latency, cost)
 - **Retry & reliability** — configurable exponential backoff with permanent-error detection
+- **Focus DSL** — pre-filter tool results before the LLM sees them, reducing token usage
 
 ---
 
 ## Examples
 
+### Custom tools with `@tool`
+
+```python
+import asyncio
+from daita import Agent, tool
+
+@tool
+def search_products(query: str, max_results: int = 5) -> list:
+    """Search the product catalog.
+
+    Args:
+        query: Search terms
+        max_results: Maximum number of results to return
+    """
+    # your real implementation here
+    return [{"name": "Widget A", "price": 9.99}]
+
+@tool
+def calculate_discount(price: float, pct: float) -> float:
+    """Calculate a discounted price."""
+    return round(price * (1 - pct / 100), 2)
+
+async def main():
+    agent = Agent(
+        name="Shopping Assistant",
+        llm_provider="openai",
+        model="gpt-4o",
+        tools=[search_products, calculate_discount],
+    )
+
+    result = await agent.run("Find me a widget and apply a 15% discount.")
+    print(result)
+
+asyncio.run(main())
+```
+
 ### Tool-calling agent with a database
 
 ```python
+import asyncio
 from daita import Agent
 from daita.plugins import postgresql
 
-agent = Agent(
-    name="Sales Analyst",
-    llm_provider="openai",
-    model="gpt-4o",
-)
+async def main():
+    agent = Agent(
+        name="Sales Analyst",
+        llm_provider="openai",
+        model="gpt-4o",
+    )
 
-agent.add_plugin(postgresql(
-    host="localhost",
-    database="sales_db",
-    user="analyst",
-    password="secret",
-))
+    agent.add_plugin(postgresql(
+        host="localhost",
+        database="sales_db",
+        user="analyst",
+        password="secret",
+    ))
 
-result = await agent.run("What were the top 5 products by revenue last quarter?")
+    result = await agent.run("What were the top 5 products by revenue last quarter?")
+    print(result)
+
+asyncio.run(main())
 ```
 
 ### Streaming output
 
 ```python
-async for chunk in agent.generate("Explain transformer attention mechanisms", stream=True):
-    print(chunk.content, end="", flush=True)
+import asyncio
+from daita import Agent
+from daita.core.streaming import EventType
+
+async def main():
+    agent = Agent(name="assistant", llm_provider="openai", model="gpt-4o")
+
+    def on_event(event):
+        if event.type == EventType.THINKING:
+            print(event.content, end="", flush=True)
+        elif event.type == EventType.TOOL_CALL:
+            print(f"\n[calling {event.tool_name}]")
+        elif event.type == EventType.COMPLETE:
+            print(f"\n\nDone. Tokens used: {event.token_usage}")
+
+    await agent.run("Explain transformer attention mechanisms", on_event=on_event)
+
+asyncio.run(main())
 ```
 
 ### Multi-agent workflow
 
 ```python
+import asyncio
 from daita import Agent, Workflow
 
-fetcher  = Agent(name="Data Fetcher",  llm_provider="openai", model="gpt-4o")
-analyzer = Agent(name="Analyzer",      llm_provider="openai", model="gpt-4o")
+async def main():
+    fetcher  = Agent(name="Data Fetcher",  llm_provider="openai", model="gpt-4o")
+    analyzer = Agent(name="Analyzer",      llm_provider="openai", model="gpt-4o")
 
-workflow = Workflow("Sales Pipeline")
-workflow.add_agent("fetcher",  fetcher)
-workflow.add_agent("analyzer", analyzer)
-workflow.connect("fetcher", "raw_data", "analyzer")
+    workflow = Workflow("Sales Pipeline")
+    workflow.add_agent("fetcher",  fetcher)
+    workflow.add_agent("analyzer", analyzer)
+    workflow.connect("fetcher", "raw_data", "analyzer")
 
-await workflow.start()
-await workflow.inject_data("fetcher", {"query": "Q3 sales"}, task="fetch")
-await workflow.stop()
+    await workflow.start()
+    await workflow.inject_data("fetcher", {"query": "Q3 sales"}, task="fetch")
+    await workflow.stop()
+
+asyncio.run(main())
 ```
 
 ### Memory-enabled agent
 
 ```python
+import asyncio
 from daita import Agent
 from daita.plugins.memory import MemoryPlugin
 
-agent = Agent(name="Assistant", llm_provider="anthropic", model="claude-sonnet-4-6")
-agent.add_plugin(MemoryPlugin())
+async def main():
+    agent = Agent(name="Assistant", llm_provider="anthropic", model="claude-sonnet-4-6")
+    agent.add_plugin(MemoryPlugin())
 
-# Memory persists across calls
-await agent.run("My name is Alex and I prefer concise answers.")
-result = await agent.run("What's my preference?")
+    # Memory persists across calls
+    await agent.run("My name is Alex and I prefer concise answers.")
+    result = await agent.run("What's my preference?")
+    print(result)
+
+asyncio.run(main())
 ```
+
+### Vector database search
+
+```python
+import asyncio
+from daita import Agent
+from daita.plugins import chroma
+
+async def main():
+    agent = Agent(name="Knowledge Assistant", llm_provider="openai", model="gpt-4o")
+
+    agent.add_plugin(chroma(
+        path="./vectors",
+        collection="docs",
+    ))
+
+    result = await agent.run("What do our docs say about authentication?")
+    print(result)
+
+asyncio.run(main())
+```
+
+### MCP (Model Context Protocol) integration
+
+```python
+import asyncio
+from daita import Agent
+from daita.plugins import mcp
+
+async def main():
+    agent = Agent(
+        name="File Analyst",
+        llm_provider="openai",
+        model="gpt-4o",
+        mcp=mcp.server(command="uvx", args=["mcp-server-filesystem", "/data"]),
+    )
+
+    result = await agent.run("Read report.csv and summarize the totals.")
+    print(result)
+
+asyncio.run(main())
+```
+
+---
 
 ## Plugins
 
-| Plugin         | Description                              |
-|----------------|------------------------------------------|
-| `postgresql`   | Query and write PostgreSQL               |
-| `mysql`        | Query and write MySQL                    |
-| `mongodb`      | Query MongoDB collections                |
-| `rest`         | Call REST APIs                           |
-| `s3`           | Read/write S3 objects                    |
-| `slack`        | Send Slack messages                      |
-| `elasticsearch`| Search Elasticsearch indices             |
-| `neo4j`        | Graph queries via Neo4j                  |
-| `memory`       | Persistent agent memory                  |
-| `websearch`    | Web search via Tavily                    |
-| `email`        | Send email via SMTP/Gmail                |
-| `snowflake`    | Query Snowflake data warehouse           |
+### Databases
+
+| Plugin          | Description                    | Extra              |
+| --------------- | ------------------------------ | ------------------ |
+| `postgresql`    | Query and write PostgreSQL     | `[postgresql]`     |
+| `mysql`         | Query and write MySQL          | `[mysql]`          |
+| `mongodb`       | Query MongoDB collections      | `[mongodb]`        |
+| `snowflake`     | Query Snowflake data warehouse | `[snowflake]`      |
+| `elasticsearch` | Search Elasticsearch indices   | `[elasticsearch]`  |
+
+### Vector Databases
+
+| Plugin     | Description                      | Extra        |
+| ---------- | -------------------------------- | ------------ |
+| `chroma`   | Local/embedded vector search     | `[chromadb]` |
+| `pinecone` | Managed cloud vector search      | `[pinecone]` |
+| `qdrant`   | Self-hosted vector search        | `[qdrant]`   |
+
+### Integrations & Cloud
+
+| Plugin            | Description                      | Extra          |
+| ----------------- | -------------------------------- | -------------- |
+| `rest`            | Call REST APIs                   | *(included)*   |
+| `s3`              | Read/write S3 objects            | `[aws]`        |
+| `slack`           | Send Slack messages              | `[slack]`      |
+| `email`           | Send/receive email (SMTP/IMAP)   | *(included)*   |
+| `websearch`       | AI-optimized web search (Tavily) | `[websearch]`  |
+| `mcp`             | Model Context Protocol servers   | `[mcp]`        |
+| `redis_messaging` | Redis pub/sub messaging          | `[redis]`      |
+| `neo4j`           | Graph database (Cypher queries)  | `[neo4j]`      |
+
+### Knowledge & Orchestration
+
+| Plugin         | Description                               |
+| -------------- | ----------------------------------------- |
+| `memory`       | Persistent semantic agent memory          |
+| `catalog`      | Schema discovery and metadata management  |
+| `lineage`      | Data lineage tracking and impact analysis |
+| `orchestrator` | Multi-agent coordination and task routing |
 
 ---
 
 ## Installation
 
-### Core (OpenAI only)
+### Core (OpenAI included)
+
 ```bash
 pip install daita-agents
 ```
 
-### Recommended (common providers + tools)
+### Add LLM providers
+
 ```bash
-pip install "daita-agents[recommended]"
+pip install "daita-agents[anthropic]"   # Claude
+pip install "daita-agents[google]"      # Gemini
+pip install "daita-agents[llm-all]"     # All LLM providers
 ```
 
-### All providers
+### Add database plugins
+
 ```bash
-pip install "daita-agents[all]"
+pip install "daita-agents[postgresql]"
+pip install "daita-agents[mysql]"
+pip install "daita-agents[mongodb]"
+pip install "daita-agents[databases]"   # All traditional databases
+```
+
+### Add vector database plugins
+
+```bash
+pip install "daita-agents[chromadb]"
+pip install "daita-agents[pinecone]"
+pip install "daita-agents[qdrant]"
+pip install "daita-agents[vectordb]"    # All vector databases
+```
+
+### Bundles
+
+```bash
+pip install "daita-agents[recommended]"  # Anthropic + pandas + beautifulsoup4
+pip install "daita-agents[complete]"     # Most features, no heavy packages
+pip install "daita-agents[all]"          # Everything (large install)
 ```
 
 ---
 
 ## Documentation
 
-See the [`examples/`](examples/) directory for full working examples.
+See the [`examples/`](examples/) directory for full working examples, or the [documentation](https://docs.daita-tech.io).
 
 ---
 
@@ -165,4 +333,4 @@ Apache 2.0 — see [LICENSE](LICENSE).
 
 ---
 
-*Built by [Daita](https://daita-tech.io)*
+_Built by [Daita](https://daita-tech.io)_
