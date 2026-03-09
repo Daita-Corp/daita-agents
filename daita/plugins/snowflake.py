@@ -63,6 +63,8 @@ class SnowflakePlugin(BaseDatabasePlugin):
         )
     """
 
+    sql_dialect = "snowflake"
+
     def __init__(
         self,
         account: Optional[str] = None,
@@ -613,6 +615,10 @@ class SnowflakePlugin(BaseDatabasePlugin):
                             "type": "array",
                             "description": "Specific columns to return (returns all if omitted)",
                             "items": {"type": "string"}
+                        },
+                        "focus": {
+                            "type": "string",
+                            "description": "Focus DSL to filter/project at the database level, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\""
                         }
                     },
                     "required": ["sql"]
@@ -876,20 +882,23 @@ class SnowflakePlugin(BaseDatabasePlugin):
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for snowflake_query"""
         sql = args.get("sql")
-        params = args.get("params")
-        limit = args.get("limit", 50)
-        columns = args.get("columns")
+        params = args.get("params") or []
+        focus_dsl = args.get("focus")
 
-        if columns:
-            safe_cols = ", ".join(
-                f'"{c}"' for c in columns
-                if re.match(r'^[A-Za-z0-9_]+$', c)
-            )
-            if safe_cols:
-                sql = f"SELECT {safe_cols} FROM ({sql}) _sf_q"
-        sql = f"{sql} LIMIT {int(limit)}"
-
-        results = await self.query(sql, params)
+        if focus_dsl:
+            results = await self._run_focus_query(sql, params, focus_dsl)
+        else:
+            limit = args.get("limit", 50)
+            columns = args.get("columns")
+            if columns:
+                safe_cols = ", ".join(
+                    f'"{c}"' for c in columns
+                    if re.match(r'^[A-Za-z0-9_]+$', c)
+                )
+                if safe_cols:
+                    sql = f"SELECT {safe_cols} FROM ({sql}) _sf_q"
+            sql = f"{sql} LIMIT {int(limit)}"
+            results = await self.query(sql, params or None)
 
         return {
             "success": True,

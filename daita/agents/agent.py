@@ -40,11 +40,24 @@ class FocusedTool:
         self._focus = focus
 
     async def handler(self, arguments: Dict[str, Any]) -> Any:
+        # If the tool natively accepts a focus DSL (e.g. SQL plugin tools), inject
+        # it into the args so pushdown happens at the source — no Python filtering needed.
+        tool_props = self._tool.parameters.get("properties", {})
+        if "focus" in tool_props:
+            return await self._tool.handler({**arguments, "focus": self._focus})
+
         result = await self._tool.handler(arguments)
         if result is None:
             return result
         try:
             from ..core.focus import apply_focus
+            # Plugin tools wrap results in {"rows": [...], "row_count": N, ...}.
+            # Apply focus to the rows list, not the wrapper dict, then put it back.
+            if isinstance(result, dict) and isinstance(result.get("rows"), list):
+                focused = apply_focus(result["rows"], self._focus)
+                n = len(focused) if isinstance(focused, list) else 1
+                logger.debug(f"Focus applied to {self.name} rows: {result['row_count']} -> {n}")
+                return {**result, "rows": focused, "row_count": n}
             focused = apply_focus(result, self._focus)
             logger.debug(
                 f"Focus applied to {self.name}: {type(result).__name__} -> {type(focused).__name__}"

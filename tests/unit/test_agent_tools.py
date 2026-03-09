@@ -1,12 +1,12 @@
 """
 Unit tests for tool registration and resolution on Agent
 (daita/agents/agent.py — _resolve_tools, call_tool, available_tools, tool_names,
-and plugin tool setup).
+FocusedTool, and plugin tool setup).
 """
 
 import pytest
 
-from daita.agents.agent import Agent
+from daita.agents.agent import Agent, FocusedTool
 from daita.core.tools import AgentTool
 from daita.llm.mock import MockLLMProvider
 
@@ -159,3 +159,161 @@ class TestPluginToolSetup:
         count_after_second = agent.tool_registry.tool_count
 
         assert count_after_first == count_after_second
+
+
+# ===========================================================================
+# FocusedTool — focus routing and result handling
+# ===========================================================================
+
+def _make_tool(name: str, returns, parameters: dict | None = None):
+    """Create an AgentTool whose handler returns a fixed value."""
+    async def h(args):
+        return returns
+    return AgentTool(
+        name=name,
+        description=f"Tool {name}",
+        parameters=parameters or {"type": "object", "properties": {}, "required": []},
+        handler=h,
+    )
+
+
+def _make_focused(tool: AgentTool, focus: str) -> FocusedTool:
+    return FocusedTool(tool, focus)
+
+
+class TestFocusedToolHandler:
+    """
+    Verify FocusedTool routes correctly across three cases:
+      1. Tool schema has 'focus' property → inject DSL into args, skip Python apply_focus.
+      2. Tool returns {"rows": [...]} wrapper → focus applied to rows only, wrapper preserved.
+      3. Tool returns raw list/dict → existing Python apply_focus behaviour unchanged.
+    """
+
+    async def test_pushdown_route_injects_focus_into_args(self):
+        """
+        A tool that declares 'focus' in its schema (SQL plugin style) should
+        receive the focus DSL as an arg and return its result directly —
+        no Python apply_focus layer on top.
+        """
+        received_args = {}
+
+        async def capturing_handler(args):
+            received_args.update(args)
+            # Simulate SQL pushdown: already returns focused data
+            return {"success": True, "rows": [{"id": 1, "status": "active"}], "row_count": 1}
+
+        tool = AgentTool(
+            name="postgres_query",
+            description="SQL query",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "sql":   {"type": "string"},
+                    "focus": {"type": "string"},
+                },
+                "required": ["sql"],
+            },
+            handler=capturing_handler,
+        )
+        focused = FocusedTool(tool, "status == 'active' | SELECT id, status")
+
+        result = await focused.handler({"sql": "SELECT * FROM t"})
+
+        # focus was injected into the args the handler received
+        assert received_args.get("focus") == "status == 'active' | SELECT id, status"
+        # result passed through unmodified (pushdown already applied)
+        assert result["rows"] == [{"id": 1, "status": "active"}]
+
+    async def test_rows_wrapper_focus_applied_to_rows_not_wrapper(self):
+        """
+        A tool returning {"rows": [...], "row_count": N} without a 'focus'
+        schema property should have focus applied to result["rows"], not the
+        whole dict — fixing the silent data-destruction bug.
+        """
+        rows = [
+            {"id": 1, "status": "active",   "amount": 100},
+            {"id": 2, "status": "inactive", "amount": 200},
+            {"id": 3, "status": "active",   "amount": 300},
+        ]
+        tool = _make_tool(
+            "my_db_tool",
+            returns={"success": True, "rows": rows, "row_count": 3},
+        )
+        focused = FocusedTool(tool, "status == 'active'")
+
+        result = await focused.handler({})
+
+        # Wrapper preserved
+        assert result["success"] is True
+        assert "row_count" in result
+        # Focus applied to rows, not the wrapper dict
+        assert result["row_count"] == 2
+        assert all(r["status"] == "active" for r in result["rows"])
+        assert {r["id"] for r in result["rows"]} == {1, 3}
+
+    async def test_rows_wrapper_select_projection(self):
+        """SELECT projection through the rows wrapper strips unwanted columns."""
+        rows = [
+            {"id": 1, "name": "Alice", "email": "a@example.com", "score": 90},
+            {"id": 2, "name": "Bob",   "email": "b@example.com", "score": 70},
+        ]
+        tool = _make_tool("my_tool", returns={"success": True, "rows": rows, "row_count": 2})
+        focused = FocusedTool(tool, "SELECT id, name")
+
+        result = await focused.handler({})
+
+        assert result["row_count"] == 2
+        for row in result["rows"]:
+            assert set(row.keys()) == {"id", "name"}, f"Unexpected keys: {row.keys()}"
+
+    async def test_rows_wrapper_row_count_updated(self):
+        """row_count in the wrapper must reflect rows after focus, not before."""
+        rows = [{"status": "active"}] * 3 + [{"status": "inactive"}] * 7
+        tool = _make_tool("t", returns={"success": True, "rows": rows, "row_count": 10})
+        focused = FocusedTool(tool, "status == 'active'")
+
+        result = await focused.handler({})
+
+        assert result["row_count"] == 3
+        assert len(result["rows"]) == 3
+
+    async def test_raw_list_unchanged_behaviour(self):
+        """Tools returning a plain list still go through standard apply_focus."""
+        rows = [
+            {"x": 1, "keep": True},
+            {"x": 2, "keep": False},
+            {"x": 3, "keep": True},
+        ]
+        tool = _make_tool("raw_tool", returns=rows)
+        focused = FocusedTool(tool, "keep == True")
+
+        result = await focused.handler({})
+
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert all(r["keep"] is True for r in result)
+
+    async def test_none_result_passthrough(self):
+        """None returned by handler should pass through without error."""
+        tool = _make_tool("null_tool", returns=None)
+        focused = FocusedTool(tool, "x > 0")
+
+        result = await focused.handler({})
+
+        assert result is None
+
+    async def test_filter_on_wrapper_dict_no_longer_destroys_data(self):
+        """
+        Regression: before the fix, apply_focus on {"success": True, "rows": [...]}
+        would treat the whole dict as one row, fail the filter, and return {}.
+        Verify that no longer happens.
+        """
+        rows = [{"status": "completed", "amount": 500}]
+        tool = _make_tool("t", returns={"success": True, "rows": rows, "row_count": 1})
+        focused = FocusedTool(tool, "status == 'completed'")
+
+        result = await focused.handler({})
+
+        # Must NOT return empty — the filter matches the row inside rows
+        assert result != {}
+        assert result["rows"] == [{"status": "completed", "amount": 500}]

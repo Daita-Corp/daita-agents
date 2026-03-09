@@ -16,17 +16,20 @@ logger = logging.getLogger(__name__)
 class BaseDatabasePlugin(BasePlugin):
     """
     Base class for all database plugins with common connection management.
-    
+
     This class provides:
     - Standardized connection/disconnection lifecycle
     - Context manager support for automatic cleanup
     - Common error handling patterns
     - Consistent configuration patterns
-    
+
     Database-specific plugins should inherit from this class and implement
     the abstract methods for their specific database requirements.
     """
-    
+
+    # Subclasses set this to their dialect: "postgresql", "mysql", "snowflake", "sqlite"
+    sql_dialect: str = "standard"
+
     def __init__(self, **kwargs):
         """
         Initialize base database plugin.
@@ -133,6 +136,24 @@ class BaseDatabasePlugin(BasePlugin):
                 context={"plugin": self.__class__.__name__, "operation": operation}
             ) from error
     
+    async def _run_focus_query(self, sql: str, params: list, focus_dsl: str) -> list:
+        """
+        Parse *focus_dsl*, push as many clauses as possible into SQL, execute,
+        then let the Python evaluator handle any remainder.
+
+        This is the single integration point for focus in all SQL plugins.
+        """
+        from ..core.focus import parse as _parse
+        from ..core.focus.backends.sql import compile_focus_to_sql
+        from ..core.focus.evaluator import evaluate_remaining
+
+        fq = _parse(focus_dsl)
+        mod_sql, extra_params, applied = compile_focus_to_sql(
+            sql, fq, dialect=self.sql_dialect, param_offset=len(params)
+        )
+        rows = await self.query(mod_sql, params + extra_params or None)
+        return evaluate_remaining(rows, fq, applied)
+
     @property
     def info(self) -> Dict[str, Any]:
         """
