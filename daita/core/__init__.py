@@ -65,8 +65,8 @@ from .interfaces import (
     DatabaseBackend,
 )
 
-# Focus system - For data filtering and selection
-from .focus import apply_focus
+# Focus system - DSL-based data filtering before LLM sees results
+from .focus import apply_focus, FocusQuery, parse as parse_focus, register_backend, FocusDSLError
 
 # Unified Tracing System - Automatic observability for all operations
 from .tracing import (
@@ -194,6 +194,10 @@ __all__ = [
     
     # Focus system
     "apply_focus",
+    "FocusQuery",
+    "parse_focus",
+    "register_backend",
+    "FocusDSLError",
     
     # === Unified Tracing System ===
     # Main tracing interface

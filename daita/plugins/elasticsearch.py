@@ -153,7 +153,7 @@ class ElasticsearchPlugin(BasePlugin):
         self,
         index: str,
         query: Optional[Dict[str, Any]] = None,
-        focus: Optional[List[str]] = None,
+        focus: Optional[str] = None,
         size: int = 100,
         from_: int = 0,
         sort: Optional[List[Dict[str, Any]]] = None,
@@ -163,23 +163,26 @@ class ElasticsearchPlugin(BasePlugin):
     ) -> Dict[str, Any]:
         """
         Search documents in Elasticsearch.
-        
+
         Args:
             index: Index name or pattern
             query: Elasticsearch query DSL (defaults to match_all)
-            focus: List of fields to return (source filtering)
+            focus: Focus DSL expression. SELECT fields are pushed down to ES _source
+                   filtering natively; remaining clauses are applied post-fetch.
+                   Example: "SELECT timestamp, message | LIMIT 50"
             size: Number of documents to return
             from_: Starting offset for pagination
             sort: Sort configuration
             aggregations: Aggregations to compute
             scroll: Scroll context keepalive time
             **kwargs: Additional search parameters
-            
+
         Returns:
             Search results with hits, aggregations, and metadata
-            
+
         Example:
-            results = await es.search("logs", {"match": {"level": "ERROR"}}, focus=["timestamp", "message"])
+            results = await es.search("logs", {"match": {"level": "ERROR"}},
+                                      focus="SELECT timestamp, message | LIMIT 50")
         """
         if self._client is None:
             await self.connect()
@@ -196,9 +199,12 @@ class ElasticsearchPlugin(BasePlugin):
                 "from": from_
             }
             
-            # Apply focus system (source filtering)
+            # Push SELECT fields down to ES native _source filtering
             if focus:
-                search_body["_source"] = focus
+                from ..core.focus import parse as parse_focus
+                _fq = parse_focus(focus)
+                if _fq.select:
+                    search_body["_source"] = _fq.select
             
             # Add sort if specified
             if sort:
@@ -223,21 +229,31 @@ class ElasticsearchPlugin(BasePlugin):
             response = await self._client.search(**search_params)
             
             # Format response
+            documents = [hit["_source"] for hit in response["hits"]["hits"]]
+
+            # Apply remaining focus clauses (filter, order, limit) post-fetch
+            if focus:
+                from ..core.focus import apply_focus, parse as parse_focus
+                _fq = parse_focus(focus)
+                # SELECT was already pushed to _source — skip it in post-fetch pass
+                _fq.select = None
+                documents = apply_focus(documents, _fq)
+
             result = {
                 "hits": {
                     "total": response["hits"]["total"],
                     "max_score": response["hits"].get("max_score"),
-                    "documents": [hit["_source"] for hit in response["hits"]["hits"]]
+                    "documents": documents,
                 },
                 "took": response["took"],
                 "timed_out": response["timed_out"],
-                "_scroll_id": response.get("_scroll_id")
+                "_scroll_id": response.get("_scroll_id"),
             }
-            
+
             # Add aggregations if present
             if "aggregations" in response:
                 result["aggregations"] = response["aggregations"]
-            
+
             logger.info(f"Search completed: {result['hits']['total']['value']} hits in {result['took']}ms")
             return result
             
@@ -520,7 +536,7 @@ class ElasticsearchPlugin(BasePlugin):
         agent_id: Optional[str] = None,
         status: Optional[str] = None,
         time_range: Optional[Dict[str, str]] = None,
-        focus: Optional[List[str]] = None,
+        focus: Optional[str] = None,
         size: int = 100
     ) -> Dict[str, Any]:
         """
@@ -560,7 +576,7 @@ class ElasticsearchPlugin(BasePlugin):
         
         # Default focus for agent logs
         if focus is None:
-            focus = ["timestamp", "agent_id", "status", "duration_ms", "message", "error"]
+            focus = "SELECT timestamp, agent_id, status, duration_ms, message, error"
         
         # Sort by timestamp descending
         sort = [{"timestamp": {"order": "desc"}}]
@@ -613,7 +629,7 @@ class ElasticsearchPlugin(BasePlugin):
         metric_field: str = "duration_ms",
         group_by: Optional[str] = None,
         time_range: Optional[Dict[str, str]] = None,
-        focus: Optional[List[str]] = None
+        focus: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Analyze agent performance with aggregations.

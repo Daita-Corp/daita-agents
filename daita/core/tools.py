@@ -243,6 +243,7 @@ def tool(
     description: Optional[str] = None,
     timeout_seconds: Optional[int] = None,
     category: Optional[str] = None,
+    focus: Optional[str] = None,
     **kwargs
 ) -> Union['AgentTool', Callable]:
     """
@@ -258,9 +259,9 @@ def tool(
             return a + b
 
     Usage with options:
-        @tool(timeout_seconds=30, category="math")
-        async def calculator(a: int, b: int) -> int:
-            return a + b
+        @tool(timeout_seconds=30, category="math", focus="SELECT name, price | LIMIT 100")
+        async def get_products() -> list:
+            return await db.fetch_all()
 
     Usage as function:
         calc_tool = tool(calculator)
@@ -272,6 +273,8 @@ def tool(
         description: Tool description (defaults to docstring first line)
         timeout_seconds: Execution timeout in seconds
         category: Tool category for organization
+        focus: Focus DSL expression applied to this tool's results by default.
+               Can be overridden per-agent via Agent(focus={...}).
         **kwargs: Additional AgentTool fields
 
     Returns:
@@ -290,6 +293,7 @@ def tool(
             handler=handler,
             timeout_seconds=timeout_seconds,
             category=category,
+            focus=focus,
             source="custom",
             **kwargs
         )
@@ -340,6 +344,10 @@ class AgentTool:
 
     # Safety features
     timeout_seconds: Optional[int] = None  # Execution timeout
+
+    # Focus DSL — applied to this tool's results before the LLM sees them.
+    # Can be overridden per-agent via Agent(focus={"tool_name": "..."}).
+    focus: Optional[str] = None
 
     def to_openai_function(self) -> Dict[str, Any]:
         """

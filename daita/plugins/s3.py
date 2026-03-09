@@ -118,39 +118,39 @@ class S3Plugin(BasePlugin):
             logger.info("Disconnected from S3")
     
     async def list_objects(
-        self, 
+        self,
         prefix: str = "",
         max_keys: int = 1000,
-        focus: Optional[List[str]] = None
+        focus: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         List objects in the S3 bucket.
-        
+
         Args:
             prefix: Object key prefix filter
             max_keys: Maximum number of objects to return
-            focus: List of object attributes to focus on
-            
+            focus: Focus DSL expression (e.g. "SELECT Key, Size" or "Size > 1000 | SELECT Key, Size")
+
         Returns:
             List of object metadata dictionaries
-            
+
         Example:
-            objects = await s3.list_objects(prefix="data/", focus=["Key", "Size"])
+            objects = await s3.list_objects(prefix="data/", focus="SELECT Key, Size")
         """
         if self._client is None:
             await self.connect()
-        
+
         try:
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
                 lambda: self._client.list_objects_v2(Bucket=self.bucket, Prefix=prefix, MaxKeys=max_keys)
             )
-
             objects = response.get('Contents', [])
 
             if focus:
-                return [{key: obj.get(key) for key in focus if key in obj} for obj in objects]
+                from ..core.focus import apply_focus
+                return apply_focus(objects, focus)
 
             return objects
 
@@ -159,22 +159,23 @@ class S3Plugin(BasePlugin):
             raise RuntimeError(f"S3 list_objects failed: {e}")
     
     async def get_object(
-        self, 
-        key: str, 
+        self,
+        key: str,
         format: str = "auto",
-        focus: Optional[List[str]] = None
+        focus: Optional[str] = None
     ) -> Union[bytes, str, Dict[str, Any], Any]:
         """
         Get an object from S3 with automatic format detection.
-        
+
         Args:
             key: S3 object key
             format: Format type ('auto', 'bytes', 'text', 'json', 'csv', 'pandas')
-            focus: List of columns to focus on (for pandas/csv)
-            
+            focus: Focus DSL expression applied after loading
+                   (e.g. "price > 100 | SELECT name, price | LIMIT 500")
+
         Returns:
             Object data in requested format
-            
+
         Example:
             data = await s3.get_object("reports/monthly.csv", format="pandas")
         """
@@ -205,20 +206,14 @@ class S3Plugin(BasePlugin):
                 content_str = content.decode('utf-8')
                 reader = csv.DictReader(io.StringIO(content_str))
                 rows = list(reader)
-                
-                # Apply focus system
                 if focus:
-                    filtered_rows = []
-                    for row in rows:
-                        filtered_row = {col: row.get(col) for col in focus if col in row}
-                        filtered_rows.append(filtered_row)
-                    return filtered_rows
+                    from ..core.focus import apply_focus
+                    return apply_focus(rows, focus)
                 return rows
             elif format == "pandas":
                 try:
                     import pandas as pd
-                    
-                    # Detect file type for pandas
+
                     if key.endswith('.csv'):
                         df = pd.read_csv(io.BytesIO(content))
                     elif key.endswith('.json'):
@@ -228,15 +223,11 @@ class S3Plugin(BasePlugin):
                     elif key.endswith('.xlsx'):
                         df = pd.read_excel(io.BytesIO(content))
                     else:
-                        # Try CSV as default
                         df = pd.read_csv(io.BytesIO(content))
-                    
-                    # Apply focus system
+
                     if focus:
-                        available_cols = [col for col in focus if col in df.columns]
-                        if available_cols:
-                            df = df[available_cols]
-                    
+                        from ..core.focus import apply_focus
+                        return apply_focus(df, focus)
                     return df
                 except ImportError:
                     raise ImportError("pandas not installed. Install with: pip install 'daita-agents[data]'")

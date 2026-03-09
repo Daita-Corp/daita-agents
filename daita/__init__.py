@@ -45,6 +45,11 @@ from .plugins.redis_messaging import redis_messaging
 from .config.base import AgentConfig, RetryPolicy, RetryStrategy
 
 # ---------------------------------------------------------------------------
+# Focus DSL — pre-filter tool results before the LLM sees them
+# ---------------------------------------------------------------------------
+from .core.focus import apply_focus
+
+# ---------------------------------------------------------------------------
 # Exceptions — for error handling in user code
 # ---------------------------------------------------------------------------
 from .core.exceptions import (
@@ -60,6 +65,7 @@ from .core.exceptions import (
     RateLimitError,
     AuthenticationError,
     ValidationError,
+    FocusDSLError,
 )
 
 # ---------------------------------------------------------------------------
@@ -99,6 +105,8 @@ __all__ = [
     "AgentConfig",
     "RetryPolicy",
     "RetryStrategy",
+    # Focus DSL
+    "apply_focus",
     # Exceptions
     "DaitaError",
     "AgentError",
@@ -112,6 +120,7 @@ __all__ = [
     "RateLimitError",
     "AuthenticationError",
     "ValidationError",
+    "FocusDSLError",
     # LLM
     "create_llm_provider",
     # Version

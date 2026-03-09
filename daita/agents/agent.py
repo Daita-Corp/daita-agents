@@ -33,55 +33,32 @@ from ..core.tools import AgentTool, ToolRegistry
 
 
 class FocusedTool:
-    """Wrapper that applies focus filtering to tool results before they reach the LLM."""
+    """Wrapper that applies a Focus DSL expression to tool results before they reach the LLM."""
 
-    def __init__(self, tool: AgentTool, focus_config):
-        """Wrap tool with focus filtering."""
+    def __init__(self, tool: AgentTool, focus: str):
         self._tool = tool
-        self._focus = focus_config
+        self._focus = focus
 
     async def handler(self, arguments: Dict[str, Any]) -> Any:
-        """Execute tool handler and apply focus filtering to result."""
-        # Execute original tool handler
         result = await self._tool.handler(arguments)
-
-        # Apply focus to result (if applicable)
-        if self._focus and result is not None:
-            try:
-                from ..core.focus import apply_focus
-                from ..config.base import FocusConfig
-
-                # Convert FocusConfig to format apply_focus expects
-                focus_param = self._focus
-                if isinstance(self._focus, FocusConfig):
-                    # Convert FocusConfig to format apply_focus expects
-                    if self._focus.type == "column":
-                        focus_param = self._focus.include or []
-                    elif self._focus.type in ("jsonpath", "xpath", "css", "regex"):
-                        # paths holds the selector/pattern list; use first entry or the list
-                        focus_param = self._focus.paths or []
-                    else:
-                        focus_param = self._focus.model_dump(exclude_none=True)
-
-                focused_result = apply_focus(result, focus_param)
-                logger.debug(
-                    f"Applied focus to {self.name} result: "
-                    f"{type(result).__name__} -> {type(focused_result).__name__}"
-                )
-                return focused_result
-            except Exception as e:
-                logger.warning(f"Focus application failed for {self.name}: {e}")
-                # Return original result if focus fails
-                return result
-
-        return result
+        if result is None:
+            return result
+        try:
+            from ..core.focus import apply_focus
+            focused = apply_focus(result, self._focus)
+            logger.debug(
+                f"Focus applied to {self.name}: {type(result).__name__} -> {type(focused).__name__}"
+            )
+            return focused
+        except Exception as e:
+            logger.warning(f"Focus application failed for {self.name}: {e}")
+            return result
 
     def __getattr__(self, name):
-        """Delegate all other attributes to the wrapped tool."""
         return getattr(self._tool, name)
 
     def __repr__(self):
-        return f"FocusedTool({self._tool.name}, focus={self._focus})"
+        return f"FocusedTool({self._tool.name}, focus={self._focus!r})"
 
 
 @dataclass
@@ -108,6 +85,17 @@ class LLMResult:
         else:
             logger.warning(f"Unexpected response type: {type(response)}")
             return cls(text=str(response), tool_calls=[])
+
+
+def _resolve_tool_focus(
+    agent_focus: Optional[Union[str, Dict[str, str]]],
+    t: 'AgentTool',
+) -> Optional[str]:
+    """Return the effective focus DSL for a single tool, applying precedence rules."""
+    tool_default = getattr(t, 'focus', None)
+    if isinstance(agent_focus, dict):
+        return agent_focus.get(t.name) or tool_default
+    return agent_focus or tool_default
 
 
 class Agent(BaseAgent):
@@ -139,7 +127,7 @@ class Agent(BaseAgent):
         config: Optional[AgentConfig] = None,
         agent_id: Optional[str] = None,
         prompt: Optional[Union[str, Dict[str, str]]] = None,
-        focus: Optional[Union[List[str], str, Dict[str, Any]]] = None,
+        focus: Optional[Union[str, Dict[str, str]]] = None,
         relay: Optional[str] = None,  # Relay channel name used by the workflow engine to route output
         mcp: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
         display_reasoning: bool = False,
@@ -195,6 +183,7 @@ class Agent(BaseAgent):
         self.tool_registry = ToolRegistry()
         self.tool_sources = kwargs.get('tools', [])  # Plugins, AgentTool instances, or callables
         self._tools_setup = False
+        self._focus_default_warned: set = set()  # tracks @tool focus defaults already logged
 
         # Tool call history tracking for operations metadata
         self._tool_call_history = []
@@ -494,23 +483,38 @@ class Agent(BaseAgent):
         self,
         tools: Optional[List[Union[str, 'AgentTool']]]
     ) -> List['AgentTool']:
-        """Resolve tools and wrap with FocusedTool if focus configured."""
-        # Ensure tools are set up from plugin sources
-        await self._setup_tools()
+        """Resolve tools and wrap with FocusedTool using the focus precedence chain.
 
+        Precedence (highest → lowest):
+            1. Agent dict focus  — Agent(focus={"tool_name": "..."})
+            2. Agent string focus — Agent(focus="...")
+            3. @tool default      — @tool(focus="..."), warned on first use
+            4. No focus           — result passes through unmodified
+        """
+        await self._setup_tools()
         resolved_tools = self._resolve_tools(tools)
 
-        if self.default_focus and resolved_tools:
-            resolved_tools = [
-                FocusedTool(tool, self.default_focus)
-                for tool in resolved_tools
-            ]
-            logger.debug(
-                f"Wrapped {len(resolved_tools)} tools with focus filter: "
-                f"{self.default_focus}"
-            )
+        result = []
+        for t in resolved_tools:
+            effective = _resolve_tool_focus(self.default_focus, t)
 
-        return resolved_tools
+            if effective:
+                # Warn once when the only active focus is the @tool-level default
+                if effective == getattr(t, 'focus', None) and not self.default_focus:
+                    if t.name not in self._focus_default_warned:
+                        logger.warning(
+                            f"Tool '{t.name}' has a built-in focus default: {effective!r}. "
+                            f"Applied automatically. To be explicit, set "
+                            f"Agent(focus={{'{t.name}': '...'}})"
+                        )
+                        self._focus_default_warned.add(t.name)
+                else:
+                    logger.debug(f"Focus applied to '{t.name}': {effective!r}")
+                result.append(FocusedTool(t, effective))
+            else:
+                result.append(t)
+
+        return result
 
     async def _stream_llm_turn(
         self,
