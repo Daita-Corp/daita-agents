@@ -1,0 +1,19 @@
+# CODEOWNERS
+# Every pull request requires approval from at least one owner.
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default — all files require owner approval
+* @jendala @pablo-prieto
+
+# Core framework
+daita/core/         @jendala @pablo-prieto
+daita/agents/       @jendala @pablo-prieto
+daita/llm/          @jendala @pablo-prieto
+daita/config/       @jendala @pablo-prieto
+
+# Plugins
+daita/plugins/      @jendala @pablo-prieto
+
+# CI and repo configuration — extra scrutiny
+.github/            @jendala @pablo-prieto
+pyproject.toml      @jendala @pablo-prieto
