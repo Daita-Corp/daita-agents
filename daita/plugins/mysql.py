@@ -3,6 +3,7 @@ MySQL plugin for Daita Agents.
 
 Simple MySQL connection and querying - no over-engineering.
 """
+
 import asyncio
 import logging
 import re
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
     from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
+
 
 class MySQLPlugin(BaseDatabasePlugin):
     """
@@ -32,14 +34,14 @@ class MySQLPlugin(BaseDatabasePlugin):
         username: str = "",
         password: str = "",
         connection_string: Optional[str] = None,
-        **kwargs
+        **kwargs,
     ):
         """
         Initialize MySQL connection.
-        
+
         Args:
             host: Database host
-            port: Database port  
+            port: Database port
             database: Database name
             username: Username
             password: Password
@@ -53,7 +55,7 @@ class MySQLPlugin(BaseDatabasePlugin):
             self.port = parsed.port or port
             self.user = parsed.username or username
             self.password = parsed.password or password
-            self.db = parsed.path.lstrip('/') if parsed.path else database
+            self.db = parsed.path.lstrip("/") if parsed.path else database
         else:
             self.connection_string = f"mysql://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}/{database}"
             self.host = host
@@ -61,47 +63,53 @@ class MySQLPlugin(BaseDatabasePlugin):
             self.user = username
             self.password = password
             self.db = database
-        
+
         self.pool_config = {
-            'minsize': kwargs.get('min_size', 1),
-            'maxsize': kwargs.get('max_size', 10),
-            'charset': kwargs.get('charset', 'utf8mb4'),
-            'autocommit': kwargs.get('autocommit', True),
+            "minsize": kwargs.get("min_size", 1),
+            "maxsize": kwargs.get("max_size", 10),
+            "charset": kwargs.get("charset", "utf8mb4"),
+            "autocommit": kwargs.get("autocommit", True),
         }
-        
+
         # Initialize base class with all config
         super().__init__(
-            host=host, port=port, database=database, 
-            username=username, connection_string=connection_string,
-            **kwargs
+            host=host,
+            port=port,
+            database=database,
+            username=username,
+            connection_string=connection_string,
+            **kwargs,
         )
-        
+
         logger.debug(f"MySQL plugin configured for {host}:{port}/{database}")
-    
+
     async def connect(self):
         """Connect to MySQL database."""
         if self._pool is not None:
             return  # Already connected
-        
+
         try:
             import aiomysql
+
             self._pool = await aiomysql.create_pool(
                 host=self.host,
                 port=self.port,
                 user=self.user,
                 password=self.password,
                 db=self.db,
-                **self.pool_config
+                **self.pool_config,
             )
             logger.info("Connected to MySQL")
         except ImportError:
             self._handle_connection_error(
-                ImportError("aiomysql not installed. Install with: pip install 'daita-agents[mysql]'"),
-                "connection"
+                ImportError(
+                    "aiomysql not installed. Install with: pip install 'daita-agents[mysql]'"
+                ),
+                "connection",
             )
         except Exception as e:
             self._handle_connection_error(e, "connection")
-    
+
     async def disconnect(self):
         """Disconnect from the database."""
         if self._pool:
@@ -109,93 +117,95 @@ class MySQLPlugin(BaseDatabasePlugin):
             await self._pool.wait_closed()
             self._pool = None
             logger.info("Disconnected from MySQL")
-    
-    async def query(self, sql: str, params: Optional[List] = None) -> List[Dict[str, Any]]:
+
+    async def query(
+        self, sql: str, params: Optional[List] = None
+    ) -> List[Dict[str, Any]]:
         """
         Run a SELECT query and return results.
-        
+
         Args:
             sql: SQL query with %s placeholders
             params: List of parameters for the query
-            
+
         Returns:
             List of rows as dictionaries
-            
+
         Example:
             results = await db.query("SELECT * FROM users WHERE age > %s", [25])
         """
         # Only auto-connect if pool is None - allows manual mocking
         if self._pool is None:
             await self.connect()
-        
+
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 if params:
                     await cursor.execute(sql, params)
                 else:
                     await cursor.execute(sql)
-                
+
                 rows = await cursor.fetchall()
                 columns = [desc[0] for desc in cursor.description]
-                
+
                 return [dict(zip(columns, row)) for row in rows]
-    
+
     async def execute(self, sql: str, params: Optional[List] = None) -> int:
         """
         Execute INSERT/UPDATE/DELETE and return affected rows.
-        
+
         Args:
             sql: SQL statement
             params: List of parameters
-            
+
         Returns:
             Number of affected rows
         """
         # Only auto-connect if pool is None - allows manual mocking
         if self._pool is None:
             await self.connect()
-        
+
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 if params:
                     await cursor.execute(sql, params)
                 else:
                     await cursor.execute(sql)
-                
+
                 return cursor.rowcount
-    
+
     async def insert_many(self, table: str, data: List[Dict[str, Any]]) -> int:
         """
         Bulk insert data into a table.
-        
+
         Args:
             table: Table name
             data: List of dictionaries to insert
-            
+
         Returns:
             Number of rows inserted
         """
         if not data:
             return 0
-        
+
         # Only auto-connect if pool is None - allows manual mocking
         if self._pool is None:
             await self.connect()
-        
+
         # Get columns from first row
         columns = list(data[0].keys())
-        placeholders = ', '.join(['%s'] * len(columns))
-        
+        placeholders = ", ".join(["%s"] * len(columns))
+
         sql = f"INSERT INTO {table} (`{'`, `'.join(columns)}`) VALUES ({placeholders})"
-        
+
         # Convert to list of tuples for executemany
         rows = [tuple(row[col] for col in columns) for row in data]
-        
+
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.executemany(sql, rows)
                 return cursor.rowcount
-    
+
     async def tables(self) -> List[str]:
         """List all tables in the database."""
         sql = """
@@ -206,12 +216,12 @@ class MySQLPlugin(BaseDatabasePlugin):
         ORDER BY TABLE_NAME
         """
         results = await self.query(sql)
-        return [row['table_name'] for row in results]
-    
+        return [row["table_name"] for row in results]
+
     async def describe(self, table: str) -> List[Dict[str, Any]]:
         """Get table schema information."""
         sql = """
-        SELECT 
+        SELECT
             COLUMN_NAME as column_name,
             DATA_TYPE as data_type,
             IS_NULLABLE as is_nullable,
@@ -224,7 +234,7 @@ class MySQLPlugin(BaseDatabasePlugin):
         """
         return await self.query(sql, [table])
 
-    def get_tools(self) -> List['AgentTool']:
+    def get_tools(self) -> List["AgentTool"]:
         """
         Expose MySQL operations as agent tools.
 
@@ -242,34 +252,34 @@ class MySQLPlugin(BaseDatabasePlugin):
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "SQL SELECT query with %s placeholders"
+                            "description": "SQL SELECT query with %s placeholders",
                         },
                         "params": {
                             "type": "array",
                             "description": "Optional parameter values",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Max rows to return (default: 50)"
+                            "description": "Max rows to return (default: 50)",
                         },
                         "columns": {
                             "type": "array",
                             "description": "Specific columns to return (returns all if omitted)",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         },
                         "focus": {
                             "type": "string",
-                            "description": "Focus DSL to filter/project at the database level, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\""
-                        }
+                            "description": "Focus DSL to filter/project at the database level, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\"",
+                        },
                     },
-                    "required": ["sql"]
+                    "required": ["sql"],
                 },
                 handler=self._tool_query,
                 category="database",
                 source="plugin",
                 plugin_name="MySQL",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="mysql_list_tables",
@@ -279,7 +289,7 @@ class MySQLPlugin(BaseDatabasePlugin):
                 category="database",
                 source="plugin",
                 plugin_name="MySQL",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="mysql_get_schema",
@@ -289,16 +299,16 @@ class MySQLPlugin(BaseDatabasePlugin):
                     "properties": {
                         "table_name": {
                             "type": "string",
-                            "description": "Table name to inspect"
+                            "description": "Table name to inspect",
                         }
                     },
-                    "required": ["table_name"]
+                    "required": ["table_name"],
                 },
                 handler=self._tool_get_schema,
                 category="database",
                 source="plugin",
                 plugin_name="MySQL",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="mysql_execute",
@@ -308,21 +318,21 @@ class MySQLPlugin(BaseDatabasePlugin):
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "SQL statement (INSERT, UPDATE, or DELETE)"
+                            "description": "SQL statement (INSERT, UPDATE, or DELETE)",
                         },
                         "params": {
                             "type": "array",
                             "description": "Optional parameter values",
-                            "items": {"type": "string"}
-                        }
+                            "items": {"type": "string"},
+                        },
                     },
-                    "required": ["sql"]
+                    "required": ["sql"],
                 },
                 handler=self._tool_execute,
                 category="database",
                 source="plugin",
                 plugin_name="MySQL",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="mysql_inspect",
@@ -333,17 +343,17 @@ class MySQLPlugin(BaseDatabasePlugin):
                         "tables": {
                             "type": "array",
                             "description": "Filter to specific tables (returns all if omitted)",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         }
                     },
-                    "required": []
+                    "required": [],
                 },
                 handler=self._tool_inspect,
                 category="database",
                 source="plugin",
                 plugin_name="MySQL",
-                timeout_seconds=30
-            )
+                timeout_seconds=30,
+            ),
         ]
 
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -359,29 +369,20 @@ class MySQLPlugin(BaseDatabasePlugin):
             columns = args.get("columns")
             if columns:
                 safe_cols = ", ".join(
-                    f"`{c}`" for c in columns
-                    if re.match(r'^[A-Za-z0-9_]+$', c)
+                    f"`{c}`" for c in columns if re.match(r"^[A-Za-z0-9_]+$", c)
                 )
                 if safe_cols:
                     sql = f"SELECT {safe_cols} FROM ({sql}) _mysql_q"
             sql = f"{sql} LIMIT {int(limit)}"
             results = await self.query(sql, params or None)
 
-        return {
-            "success": True,
-            "rows": results,
-            "row_count": len(results)
-        }
+        return {"success": True, "rows": results, "row_count": len(results)}
 
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mysql_list_tables"""
         tables = await self.tables()
 
-        return {
-            "success": True,
-            "tables": tables,
-            "count": len(tables)
-        }
+        return {"success": True, "tables": tables, "count": len(tables)}
 
     async def _tool_get_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mysql_get_schema"""
@@ -392,7 +393,7 @@ class MySQLPlugin(BaseDatabasePlugin):
             "success": True,
             "table": table_name,
             "columns": columns,
-            "column_count": len(columns)
+            "column_count": len(columns),
         }
 
     async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -402,24 +403,25 @@ class MySQLPlugin(BaseDatabasePlugin):
 
         affected_rows = await self.execute(sql, params)
 
-        return {
-            "success": True,
-            "affected_rows": affected_rows
-        }
+        return {"success": True, "affected_rows": affected_rows}
 
     async def _tool_inspect(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mysql_inspect — fetch all table schemas in parallel."""
         filter_tables = args.get("tables")
 
         all_tables = await self.tables()
-        targets = [t for t in all_tables if t in filter_tables] if filter_tables else all_tables
+        targets = (
+            [t for t in all_tables if t in filter_tables]
+            if filter_tables
+            else all_tables
+        )
 
         schemas = await asyncio.gather(*[self.describe(t) for t in targets])
 
         return {
             "success": True,
             "tables": [{"name": t, "columns": s} for t, s in zip(targets, schemas)],
-            "count": len(targets)
+            "count": len(targets),
         }
 
 

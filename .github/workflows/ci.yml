@@ -43,4 +43,4 @@ jobs:
 
       - name: Run tests
         run: |
-          pytest tests/ -m "not requires_llm and not requires_db" -q --tb=short
+          pytest tests/ -m "not requires_llm and not requires_db"

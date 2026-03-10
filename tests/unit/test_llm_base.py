@@ -13,10 +13,10 @@ import pytest
 from daita.core.tools import AgentTool
 from daita.llm.mock import MockLLMProvider
 
-
 # ===========================================================================
 # Helpers
 # ===========================================================================
+
 
 def _make_provider(**kwargs) -> MockLLMProvider:
     return MockLLMProvider(delay=0, **kwargs)
@@ -56,6 +56,7 @@ def _make_slow_tool(name: str, sleep: float = 10.0):
 # _merge_params
 # ===========================================================================
 
+
 class TestMergeParams:
     def test_no_overrides_returns_defaults(self):
         p = _make_provider()
@@ -84,6 +85,7 @@ class TestMergeParams:
 # _estimate_cost
 # ===========================================================================
 
+
 class TestEstimateCost:
     def test_zero_tokens_returns_none(self):
         p = _make_provider()
@@ -106,6 +108,7 @@ class TestEstimateCost:
 # _convert_tools_to_format
 # ===========================================================================
 
+
 class TestConvertToolsToFormat:
     def test_returns_openai_function_format(self):
         p = _make_provider()
@@ -126,11 +129,16 @@ class TestConvertToolsToFormat:
 # _update_accumulated_metrics
 # ===========================================================================
 
+
 class TestAccumulatedMetrics:
     def test_tokens_accumulate_across_calls(self):
         p = _make_provider()
-        p._update_accumulated_metrics({"total_tokens": 100, "prompt_tokens": 60, "completion_tokens": 40})
-        p._update_accumulated_metrics({"total_tokens": 200, "prompt_tokens": 120, "completion_tokens": 80})
+        p._update_accumulated_metrics(
+            {"total_tokens": 100, "prompt_tokens": 60, "completion_tokens": 40}
+        )
+        p._update_accumulated_metrics(
+            {"total_tokens": 200, "prompt_tokens": 120, "completion_tokens": 80}
+        )
         acc = p.get_accumulated_tokens()
         assert acc["total_tokens"] == 300
         assert acc["prompt_tokens"] == 180
@@ -152,12 +160,18 @@ class TestAccumulatedMetrics:
 # get_token_stats
 # ===========================================================================
 
+
 class TestGetTokenStats:
     def test_stats_structure_with_agent_id(self):
         p = _make_provider()
         p.set_agent_id("test-agent-123")
         stats = p.get_token_stats()
-        for key in ("total_tokens", "prompt_tokens", "completion_tokens", "estimated_cost"):
+        for key in (
+            "total_tokens",
+            "prompt_tokens",
+            "completion_tokens",
+            "estimated_cost",
+        ):
             assert key in stats
 
     def test_stats_without_agent_id_returns_zeros(self):
@@ -172,6 +186,7 @@ class TestGetTokenStats:
 # set_agent_id
 # ===========================================================================
 
+
 class TestSetAgentId:
     def test_stores_agent_id(self):
         p = _make_provider()
@@ -182,6 +197,7 @@ class TestSetAgentId:
 # ===========================================================================
 # _execute_tool_call
 # ===========================================================================
+
 
 class TestExecuteToolCall:
     async def test_finds_and_executes_tool(self):
@@ -233,11 +249,19 @@ class TestExecuteToolCall:
 # provider.info property
 # ===========================================================================
 
+
 class TestProviderInfo:
     def test_info_has_required_keys(self):
         p = _make_provider()
         info = p.info
-        for key in ("provider", "model", "agent_id", "config", "default_params", "tracing_enabled"):
+        for key in (
+            "provider",
+            "model",
+            "agent_id",
+            "config",
+            "default_params",
+            "tracing_enabled",
+        ):
             assert key in info
 
     def test_info_excludes_api_key(self):

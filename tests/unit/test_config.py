@@ -14,10 +14,10 @@ from pydantic import ValidationError as PydanticValidationError
 
 from daita.config.base import AgentConfig, AgentType, RetryPolicy, RetryStrategy
 
-
 # ===========================================================================
 # RetryPolicy — defaults and validation
 # ===========================================================================
+
 
 class TestRetryPolicyDefaults:
     def test_default_max_retries(self):
@@ -49,6 +49,7 @@ class TestRetryPolicyDefaults:
 # RetryPolicy — delay calculations
 # ===========================================================================
 
+
 class TestRetryPolicyDelayCalculations:
     def test_fixed_strategy_returns_base_delay(self):
         policy = RetryPolicy(strategy=RetryStrategy.FIXED, base_delay=2.0, jitter=False)
@@ -56,7 +57,9 @@ class TestRetryPolicyDelayCalculations:
             assert policy.calculate_delay(attempt) == pytest.approx(2.0)
 
     def test_linear_strategy_scales_with_attempt(self):
-        policy = RetryPolicy(strategy=RetryStrategy.LINEAR, base_delay=1.0, jitter=False)
+        policy = RetryPolicy(
+            strategy=RetryStrategy.LINEAR, base_delay=1.0, jitter=False
+        )
         assert policy.calculate_delay(1) == pytest.approx(1.0)
         assert policy.calculate_delay(2) == pytest.approx(2.0)
         assert policy.calculate_delay(3) == pytest.approx(3.0)
@@ -96,6 +99,7 @@ class TestRetryPolicyDelayCalculations:
 # ===========================================================================
 # RetryPolicy — execute_with_retry
 # ===========================================================================
+
 
 class TestRetryPolicyExecuteWithRetry:
     async def test_success_on_first_call(self):
@@ -153,6 +157,7 @@ class TestRetryPolicyExecuteWithRetry:
 # ===========================================================================
 # AgentConfig
 # ===========================================================================
+
 
 class TestAgentConfig:
     def test_name_required(self):

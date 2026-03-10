@@ -11,7 +11,19 @@ and native function calling (OpenAI, Anthropic, etc).
 """
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Any, List, Optional, Awaitable, Union, Literal, get_origin, get_args, get_type_hints
+from typing import (
+    Callable,
+    Dict,
+    Any,
+    List,
+    Optional,
+    Awaitable,
+    Union,
+    Literal,
+    get_origin,
+    get_args,
+    get_type_hints,
+)
 import asyncio
 import inspect
 import logging
@@ -39,9 +51,9 @@ def _parse_docstring_params(func: Callable) -> Dict[str, str]:
 
     # Find Args: section
     args_match = re.search(
-        r'Args?:(.*?)(?=Returns?:|Raises?:|Example:|Notes?:|$)',
+        r"Args?:(.*?)(?=Returns?:|Raises?:|Example:|Notes?:|$)",
         docstring,
-        re.DOTALL | re.IGNORECASE
+        re.DOTALL | re.IGNORECASE,
     )
 
     if not args_match:
@@ -52,12 +64,12 @@ def _parse_docstring_params(func: Callable) -> Dict[str, str]:
 
     # Match parameter entries: "    param_name: description" or "    param_name (type): description"
     for match in re.finditer(
-        r'^\s+(\w+)(?:\s*\([^)]+\))?\s*:\s*(.+?)(?=^\s+\w+\s*(?:\([^)]+\))?\s*:|$)',
+        r"^\s+(\w+)(?:\s*\([^)]+\))?\s*:\s*(.+?)(?=^\s+\w+\s*(?:\([^)]+\))?\s*:|$)",
         args_section,
-        re.MULTILINE | re.DOTALL
+        re.MULTILINE | re.DOTALL,
     ):
         param_name = match.group(1)
-        description = ' '.join(match.group(2).split())  # Clean up whitespace
+        description = " ".join(match.group(2).split())  # Clean up whitespace
         descriptions[param_name] = description
 
     return descriptions
@@ -94,9 +106,7 @@ def _type_hint_to_json_schema(hint: Any) -> Dict[str, Any]:
             return _type_hint_to_json_schema(non_none_args[0])
         else:
             # Union[A, B, ...] - use anyOf
-            return {
-                "anyOf": [_type_hint_to_json_schema(arg) for arg in non_none_args]
-            }
+            return {"anyOf": [_type_hint_to_json_schema(arg) for arg in non_none_args]}
 
     # Handle Literal types
     if origin is Literal:
@@ -107,13 +117,10 @@ def _type_hint_to_json_schema(hint: Any) -> Dict[str, Any]:
             "int": "integer",
             "float": "number",
             "str": "string",
-            "bool": "boolean"
+            "bool": "boolean",
         }.get(val_type, "string")
 
-        return {
-            "type": schema_type,
-            "enum": list(args)
-        }
+        return {"type": schema_type, "enum": list(args)}
 
     # Handle List types
     if origin is list or origin is List:
@@ -133,7 +140,7 @@ def _type_hint_to_json_schema(hint: Any) -> Dict[str, Any]:
         str: "string",
         bool: "boolean",
         list: "array",
-        dict: "object"
+        dict: "object",
     }
 
     if hint in basic_type_map:
@@ -173,7 +180,7 @@ def _extract_parameters_from_function(func: Callable) -> Dict[str, Any]:
     param_descriptions = _parse_docstring_params(func)
 
     for param_name, param in sig.parameters.items():
-        if param_name in ('self', 'cls'):
+        if param_name in ("self", "cls"):
             continue
 
         # Get type hint for this parameter
@@ -210,11 +217,7 @@ def _extract_parameters_from_function(func: Callable) -> Dict[str, Any]:
         if not has_default and not is_optional:
             required.append(param_name)
 
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": required
-    }
+    return {"type": "object", "properties": properties, "required": required}
 
 
 def _make_async_handler(func: Callable) -> Callable[[Dict[str, Any]], Awaitable[Any]]:
@@ -228,11 +231,15 @@ def _make_async_handler(func: Callable) -> Callable[[Dict[str, Any]], Awaitable[
         Async handler that accepts Dict[str, Any] and returns result
     """
     if asyncio.iscoroutinefunction(func):
+
         async def handler(args: Dict[str, Any]) -> Any:
             return await func(**args)
+
     else:
+
         async def handler(args: Dict[str, Any]) -> Any:
             return func(**args)
+
     return handler
 
 
@@ -244,8 +251,8 @@ def tool(
     timeout_seconds: Optional[int] = None,
     category: Optional[str] = None,
     focus: Optional[str] = None,
-    **kwargs
-) -> Union['AgentTool', Callable]:
+    **kwargs,
+) -> Union["AgentTool", Callable]:
     """
     Convert a function into an AgentTool.
     Works as both decorator and function call.
@@ -280,9 +287,12 @@ def tool(
     Returns:
         AgentTool instance or decorator function
     """
-    def create_tool(f: Callable) -> 'AgentTool':
+
+    def create_tool(f: Callable) -> "AgentTool":
         tool_name = name or f.__name__
-        tool_description = description or (f.__doc__ or f"Execute {tool_name}").strip().split('\n')[0]
+        tool_description = (
+            description or (f.__doc__ or f"Execute {tool_name}").strip().split("\n")[0]
+        )
         tool_parameters = _extract_parameters_from_function(f)
         handler = _make_async_handler(f)
 
@@ -295,7 +305,7 @@ def tool(
             category=category,
             focus=focus,
             source="custom",
-            **kwargs
+            **kwargs,
         )
 
     # Used as @tool (no parentheses)
@@ -364,8 +374,8 @@ class AgentTool:
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters  # Already in correct JSON Schema format
-            }
+                "parameters": self.parameters,  # Already in correct JSON Schema format
+            },
         }
 
     def to_anthropic_tool(self) -> Dict[str, Any]:
@@ -381,7 +391,7 @@ class AgentTool:
         return {
             "name": self.name,
             "description": self.description,
-            "input_schema": self.parameters  # Already in correct JSON Schema format
+            "input_schema": self.parameters,  # Already in correct JSON Schema format
         }
 
     def to_prompt_description(self) -> str:
@@ -429,8 +439,7 @@ class AgentTool:
         if self.timeout_seconds:
             try:
                 result = await asyncio.wait_for(
-                    self.handler(arguments),
-                    timeout=self.timeout_seconds
+                    self.handler(arguments), timeout=self.timeout_seconds
                 )
                 return result
             except asyncio.TimeoutError:
@@ -442,7 +451,7 @@ class AgentTool:
             return await self.handler(arguments)
 
     @classmethod
-    def from_mcp_tool(cls, mcp_tool, mcp_registry) -> 'AgentTool':
+    def from_mcp_tool(cls, mcp_tool, mcp_registry) -> "AgentTool":
         """
         Create AgentTool from an MCP tool.
 
@@ -453,6 +462,7 @@ class AgentTool:
         Returns:
             AgentTool instance that wraps the MCP tool
         """
+
         # Create handler that routes to MCP registry
         async def mcp_handler(arguments: Dict[str, Any]) -> Any:
             return await mcp_registry.call_tool(mcp_tool.name, arguments)
@@ -463,7 +473,7 @@ class AgentTool:
             parameters=mcp_tool.input_schema.get("properties", {}),
             handler=mcp_handler,
             source="mcp",
-            category="mcp"
+            category="mcp",
         )
 
 

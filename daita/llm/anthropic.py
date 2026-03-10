@@ -1,6 +1,7 @@
 """
 Anthropic LLM provider implementation with integrated tracing.
 """
+
 import os
 import logging
 from typing import Dict, Any, Optional
@@ -10,18 +11,19 @@ from .base import BaseLLMProvider
 
 logger = logging.getLogger(__name__)
 
+
 class AnthropicProvider(BaseLLMProvider):
     """Anthropic LLM provider implementation with automatic call tracing."""
-    
+
     def __init__(
         self,
         model: str = "claude-3-sonnet-20240229",
         api_key: Optional[str] = None,
-        **kwargs
+        **kwargs,
     ):
         """
         Initialize Anthropic provider.
-        
+
         Args:
             model: Anthropic model name
             api_key: Anthropic API key
@@ -29,17 +31,15 @@ class AnthropicProvider(BaseLLMProvider):
         """
         # Get API key from parameter or environment
         api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        
+
         super().__init__(model=model, api_key=api_key, **kwargs)
-        
+
         # Anthropic-specific default parameters
-        self.default_params.update({
-            'timeout': kwargs.get('timeout', 60)
-        })
-        
+        self.default_params.update({"timeout": kwargs.get("timeout", 60)})
+
         # Lazy-load Anthropic client
         self._client = None
-    
+
     @property
     def client(self):
         """Lazy-load Anthropic client."""
@@ -47,17 +47,22 @@ class AnthropicProvider(BaseLLMProvider):
             try:
                 import anthropic
                 from anthropic import Timeout
+
                 self._validate_api_key()
 
                 # Get timeout from default params (set during __init__)
-                timeout_seconds = self.default_params.get('timeout', 60)
+                timeout_seconds = self.default_params.get("timeout", 60)
 
                 # Create client with extended timeout
                 self._client = anthropic.AsyncAnthropic(
                     api_key=self.api_key,
-                    timeout=Timeout(timeout_seconds, read=timeout_seconds, write=10.0, connect=5.0)
+                    timeout=Timeout(
+                        timeout_seconds, read=timeout_seconds, write=10.0, connect=5.0
+                    ),
                 )
-                logger.debug(f"Anthropic client initialized with {timeout_seconds}s timeout")
+                logger.debug(
+                    f"Anthropic client initialized with {timeout_seconds}s timeout"
+                )
             except ImportError:
                 raise LLMError(
                     "Anthropic package not installed. Install with: pip install 'daita-agents[anthropic]'"
@@ -68,7 +73,7 @@ class AnthropicProvider(BaseLLMProvider):
         self,
         messages: list[Dict[str, Any]],
         tools: Optional[list[Dict[str, Any]]],
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         """
         Build API parameters for Anthropic API call.
@@ -92,10 +97,10 @@ class AnthropicProvider(BaseLLMProvider):
 
         api_params = {
             "model": self.model,
-            "max_tokens": kwargs.get('max_tokens', 2048),
-            "temperature": kwargs.get('temperature'),
+            "max_tokens": kwargs.get("max_tokens", 2048),
+            "temperature": kwargs.get("temperature"),
             "messages": self._convert_messages_to_anthropic(filtered_messages),
-            "timeout": kwargs.get('timeout')
+            "timeout": kwargs.get("timeout"),
         }
 
         # Add system message if present
@@ -112,7 +117,7 @@ class AnthropicProvider(BaseLLMProvider):
         self,
         messages: list[Dict[str, Any]],
         tools: Optional[list[Dict[str, Any]]],
-        **kwargs
+        **kwargs,
     ):
         """
         Anthropic non-streaming with optional tools.
@@ -139,21 +144,19 @@ class AnthropicProvider(BaseLLMProvider):
             # Update accumulated metrics for cost tracking
             if response.usage:
                 token_usage = {
-                    'total_tokens': response.usage.input_tokens + response.usage.output_tokens,
-                    'prompt_tokens': response.usage.input_tokens,
-                    'completion_tokens': response.usage.output_tokens
+                    "total_tokens": response.usage.input_tokens
+                    + response.usage.output_tokens,
+                    "prompt_tokens": response.usage.input_tokens,
+                    "completion_tokens": response.usage.output_tokens,
                 }
                 self._update_accumulated_metrics(token_usage)
 
             # Check response content
             # First pass: collect all tool_use blocks (takes priority over text)
             tool_calls = [
-                {
-                    "id": b.id,
-                    "name": b.name,
-                    "arguments": b.input
-                }
-                for b in response.content if b.type == "tool_use"
+                {"id": b.id, "name": b.name, "arguments": b.input}
+                for b in response.content
+                if b.type == "tool_use"
             ]
 
             # If tools were called, return them (takes priority)
@@ -175,7 +178,7 @@ class AnthropicProvider(BaseLLMProvider):
         self,
         messages: list[Dict[str, Any]],
         tools: Optional[list[Dict[str, Any]]],
-        **kwargs
+        **kwargs,
     ):
         """
         Anthropic streaming with optional tools.
@@ -201,14 +204,12 @@ class AnthropicProvider(BaseLLMProvider):
                 async for event in stream:
                     # Text content deltas
                     if event.type == "content_block_delta":
-                        if hasattr(event.delta, 'text'):
+                        if hasattr(event.delta, "text"):
                             yield LLMChunk(
-                                type="text",
-                                content=event.delta.text,
-                                model=self.model
+                                type="text", content=event.delta.text, model=self.model
                             )
                         # Accumulate tool input deltas
-                        elif hasattr(event.delta, 'partial_json') and current_tool_use:
+                        elif hasattr(event.delta, "partial_json") and current_tool_use:
                             # Anthropic streams tool arguments as partial JSON
                             if "partial_json" not in current_tool_use:
                                 current_tool_use["partial_json"] = ""
@@ -221,7 +222,7 @@ class AnthropicProvider(BaseLLMProvider):
                                 "id": event.content_block.id,
                                 "name": event.content_block.name,
                                 "input": {},  # Will be populated from stream or final message
-                                "partial_json": ""
+                                "partial_json": "",
                             }
 
                     # Tool use complete
@@ -229,9 +230,12 @@ class AnthropicProvider(BaseLLMProvider):
                         if current_tool_use:
                             # Parse accumulated JSON or use the input
                             import json
+
                             if current_tool_use.get("partial_json"):
                                 try:
-                                    tool_args = json.loads(current_tool_use["partial_json"])
+                                    tool_args = json.loads(
+                                        current_tool_use["partial_json"]
+                                    )
                                 except json.JSONDecodeError:
                                     tool_args = current_tool_use.get("input", {})
                             else:
@@ -242,20 +246,21 @@ class AnthropicProvider(BaseLLMProvider):
                                 tool_name=current_tool_use["name"],
                                 tool_args=tool_args,
                                 tool_call_id=current_tool_use["id"],
-                                model=self.model
+                                model=self.model,
                             )
                             current_tool_use = None
 
                     # Message stop - get usage
                     elif event.type == "message_stop":
                         final_message = await stream.get_final_message()
-                        if hasattr(final_message, 'usage'):
+                        if hasattr(final_message, "usage"):
                             self._last_usage = final_message.usage
                             # Update accumulated metrics for cost tracking
                             token_usage = {
-                                'total_tokens': final_message.usage.input_tokens + final_message.usage.output_tokens,
-                                'prompt_tokens': final_message.usage.input_tokens,
-                                'completion_tokens': final_message.usage.output_tokens
+                                "total_tokens": final_message.usage.input_tokens
+                                + final_message.usage.output_tokens,
+                                "prompt_tokens": final_message.usage.input_tokens,
+                                "completion_tokens": final_message.usage.output_tokens,
                             }
                             self._update_accumulated_metrics(token_usage)
 
@@ -263,36 +268,36 @@ class AnthropicProvider(BaseLLMProvider):
             logger.error(f"Anthropic streaming failed: {str(e)}")
             raise LLMError(f"Anthropic streaming failed: {str(e)}")
 
-    async def generate_with_system(self, prompt: str, system_message: str, **kwargs) -> str:
+    async def generate_with_system(
+        self, prompt: str, system_message: str, **kwargs
+    ) -> str:
         """
         Generate text with a system message using Anthropic's system parameter.
-        
-        Note: This method bypasses automatic tracing since it's not part of the 
+
+        Note: This method bypasses automatic tracing since it's not part of the
         base interface. If you want tracing for system messages, call the base
         generate() method with a formatted prompt instead.
-        
+
         Args:
             prompt: User prompt
             system_message: System message to set context
             **kwargs: Optional parameters
-            
+
         Returns:
             Generated text
         """
         try:
             # Merge parameters
             params = self._merge_params(kwargs)
-            
+
             # Make API call with system parameter
             response = await self.client.messages.create(
                 model=self.model,
-                max_tokens=params.get('max_tokens'),
-                temperature=params.get('temperature'),
+                max_tokens=params.get("max_tokens"),
+                temperature=params.get("temperature"),
                 system=system_message,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-                timeout=params.get('timeout')
+                messages=[{"role": "user", "content": prompt}],
+                timeout=params.get("timeout"),
             )
 
             # Store usage for potential token extraction
@@ -301,40 +306,43 @@ class AnthropicProvider(BaseLLMProvider):
             # Update accumulated metrics for cost tracking
             if response.usage:
                 token_usage = {
-                    'total_tokens': response.usage.input_tokens + response.usage.output_tokens,
-                    'prompt_tokens': response.usage.input_tokens,
-                    'completion_tokens': response.usage.output_tokens
+                    "total_tokens": response.usage.input_tokens
+                    + response.usage.output_tokens,
+                    "prompt_tokens": response.usage.input_tokens,
+                    "completion_tokens": response.usage.output_tokens,
                 }
                 self._update_accumulated_metrics(token_usage)
 
             return response.content[0].text
-            
+
         except Exception as e:
             logger.error(f"Anthropic generation with system message failed: {str(e)}")
             raise LLMError(f"Anthropic generation failed: {str(e)}")
-    
+
     def _get_last_token_usage(self) -> Dict[str, int]:
         """
         Override base class method to handle Anthropic's token format.
-        
+
         Anthropic uses input_tokens and output_tokens format, different from OpenAI.
         """
         if self._last_usage:
             # Anthropic format: input_tokens + output_tokens
-            input_tokens = getattr(self._last_usage, 'input_tokens', 0)
-            output_tokens = getattr(self._last_usage, 'output_tokens', 0)
+            input_tokens = getattr(self._last_usage, "input_tokens", 0)
+            output_tokens = getattr(self._last_usage, "output_tokens", 0)
             total_tokens = input_tokens + output_tokens
-            
+
             return {
-                'total_tokens': total_tokens,
-                'prompt_tokens': input_tokens,  # Map input_tokens to prompt_tokens
-                'completion_tokens': output_tokens  # Map output_tokens to completion_tokens
+                "total_tokens": total_tokens,
+                "prompt_tokens": input_tokens,  # Map input_tokens to prompt_tokens
+                "completion_tokens": output_tokens,  # Map output_tokens to completion_tokens
             }
-        
+
         # Fallback to base class estimation
         return super()._get_last_token_usage()
 
-    def _convert_tools_to_format(self, tools: list['AgentTool']) -> list[Dict[str, Any]]:
+    def _convert_tools_to_format(
+        self, tools: list["AgentTool"]
+    ) -> list[Dict[str, Any]]:
         """
         Convert AgentTool list to Anthropic tool format.
 
@@ -343,8 +351,7 @@ class AnthropicProvider(BaseLLMProvider):
         return [tool.to_anthropic_tool() for tool in tools]
 
     def _convert_messages_to_anthropic(
-        self,
-        messages: list[Dict[str, Any]]
+        self, messages: list[Dict[str, Any]]
     ) -> list[Dict[str, Any]]:
         """
         Convert OpenAI-style messages to Anthropic format.
@@ -356,30 +363,33 @@ class AnthropicProvider(BaseLLMProvider):
         for msg in messages:
             if msg["role"] == "tool":
                 # Tool result - convert to Anthropic format
-                anthropic_messages.append({
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": msg["tool_call_id"],
-                            "content": msg["content"]
-                        }
-                    ]
-                })
+                anthropic_messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": msg["tool_call_id"],
+                                "content": msg["content"],
+                            }
+                        ],
+                    }
+                )
             elif msg["role"] == "assistant" and msg.get("tool_calls"):
                 # Assistant with tool calls (already in flat format)
                 content_blocks = []
                 for tc in msg["tool_calls"]:
-                    content_blocks.append({
-                        "type": "tool_use",
-                        "id": tc["id"],
-                        "name": tc["name"],
-                        "input": tc["arguments"]
-                    })
-                anthropic_messages.append({
-                    "role": "assistant",
-                    "content": content_blocks
-                })
+                    content_blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["name"],
+                            "input": tc["arguments"],
+                        }
+                    )
+                anthropic_messages.append(
+                    {"role": "assistant", "content": content_blocks}
+                )
             else:
                 # Regular message
                 anthropic_messages.append(msg)
@@ -390,8 +400,5 @@ class AnthropicProvider(BaseLLMProvider):
     def info(self) -> Dict[str, Any]:
         """Get information about the Anthropic provider."""
         base_info = super().info
-        base_info.update({
-            'provider_name': 'Anthropic',
-            'api_compatible': 'Anthropic'
-        })
+        base_info.update({"provider_name": "Anthropic", "api_compatible": "Anthropic"})
         return base_info

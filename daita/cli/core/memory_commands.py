@@ -17,7 +17,7 @@ from ..utils import get_api_endpoint, _CLI_VERSION
 
 
 def _get_api_headers() -> dict:
-    api_key = os.getenv('DAITA_API_KEY')
+    api_key = os.getenv("DAITA_API_KEY")
     if not api_key:
         raise ValueError(
             "DAITA_API_KEY not set.\n"
@@ -82,7 +82,7 @@ async def show_memory_status(project: Optional[str] = None, verbose: bool = Fals
                 url,
                 headers=headers,
                 params=params,
-                timeout=aiohttp.ClientTimeout(total=15)
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status == 401:
                     raise ValueError(
@@ -94,7 +94,9 @@ async def show_memory_status(project: Optional[str] = None, verbose: bool = Fals
                     raise ValueError("project parameter is required.")
                 if resp.status != 200:
                     error = await resp.text()
-                    raise ValueError(f"API request failed (HTTP {resp.status}): {error}")
+                    raise ValueError(
+                        f"API request failed (HTTP {resp.status}): {error}"
+                    )
 
                 data = await resp.json()
 
@@ -157,6 +159,7 @@ async def show_memory_status(project: Optional[str] = None, verbose: bool = Fals
         print(f" Error: {e}")
         if verbose:
             import traceback
+
             traceback.print_exc()
         print("")
 
@@ -166,7 +169,7 @@ async def show_workspace_memory(
     full: bool = False,
     limit: int = 50,
     project: Optional[str] = None,
-    verbose: bool = False
+    verbose: bool = False,
 ):
     """
     Show workspace memory contents from cloud.
@@ -189,7 +192,7 @@ async def show_workspace_memory(
                 url,
                 headers=headers,
                 params=params,
-                timeout=aiohttp.ClientTimeout(total=15)
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status == 401:
                     raise ValueError(
@@ -205,7 +208,9 @@ async def show_workspace_memory(
                     return
                 if resp.status != 200:
                     error = await resp.text()
-                    raise ValueError(f"API request failed (HTTP {resp.status}): {error}")
+                    raise ValueError(
+                        f"API request failed (HTTP {resp.status}): {error}"
+                    )
 
                 data = await resp.json()
 
@@ -232,7 +237,9 @@ async def show_workspace_memory(
                     if entries_shown >= limit:
                         remaining = total_entries - entries_shown
                         if remaining > 0:
-                            print(f"... and {remaining} more entries (use --limit to see more)")
+                            print(
+                                f"... and {remaining} more entries (use --limit to see more)"
+                            )
                         break
                     print(f"## {section_name}")
                     for fact in facts:
@@ -273,12 +280,14 @@ async def show_workspace_memory(
                 print("\u2501" * 60)
                 print("")
 
-                dl_url_endpoint = f"{api_endpoint}/api/v1/memory/workspaces/{workspace}/download"
+                dl_url_endpoint = (
+                    f"{api_endpoint}/api/v1/memory/workspaces/{workspace}/download"
+                )
                 async with session.get(
                     dl_url_endpoint,
                     headers=headers,
                     params={"project": project},
-                    timeout=aiohttp.ClientTimeout(total=15)
+                    timeout=aiohttp.ClientTimeout(total=15),
                 ) as dl_resp:
                     if dl_resp.status != 200:
                         print(" Could not generate download URL")
@@ -288,15 +297,14 @@ async def show_workspace_memory(
                     download_url = dl_data.get("download_url")
 
                 if download_url:
-                    export_dir = Path('./memory-exports') / workspace
+                    export_dir = Path("./memory-exports") / workspace
                     export_dir.mkdir(parents=True, exist_ok=True)
-                    zip_path = export_dir / 'memory-export.zip'
+                    zip_path = export_dir / "memory-export.zip"
 
                     # Download the presigned URL (no auth headers needed)
                     async with aiohttp.ClientSession() as plain_session:
                         async with plain_session.get(
-                            download_url,
-                            timeout=aiohttp.ClientTimeout(total=60)
+                            download_url, timeout=aiohttp.ClientTimeout(total=60)
                         ) as zip_resp:
                             if zip_resp.status == 200:
                                 zip_path.write_bytes(await zip_resp.read())
@@ -324,6 +332,7 @@ async def show_workspace_memory(
         print(f" Error: {e}")
         if verbose:
             import traceback
+
             traceback.print_exc()
         print("")
 
@@ -331,11 +340,11 @@ async def show_workspace_memory(
 def _parse_memory_sections(content: str) -> Dict[str, List[str]]:
     sections: Dict[str, List[str]] = {}
     current_section = "General"
-    for line in content.split('\n'):
-        if line.startswith('## '):
+    for line in content.split("\n"):
+        if line.startswith("## "):
             current_section = line[3:].strip()
             if current_section not in sections:
                 sections[current_section] = []
-        elif line.strip().startswith(('•', '*', '-')) and len(line.strip()) > 2:
+        elif line.strip().startswith(("•", "*", "-")) and len(line.strip()) > 2:
             sections.setdefault(current_section, []).append(line.strip())
     return sections

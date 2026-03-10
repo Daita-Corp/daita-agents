@@ -21,6 +21,7 @@ from pathlib import Path
 # Load .env if present
 try:
     from dotenv import load_dotenv
+
     env_path = Path(__file__).parent / ".env"
     load_dotenv(dotenv_path=env_path if env_path.exists() else None)
 except ImportError:
@@ -51,7 +52,11 @@ async def ask(agent, question: str, csv_path: str) -> str:
     """Send one question to the agent and return the answer."""
     full_question = f"File: {csv_path}\n\n{question}"
     result = await agent.run_detailed(full_question)
-    return result.get("result", ""), result.get("processing_time_ms", 0), result.get("cost", 0)
+    return (
+        result.get("result", ""),
+        result.get("processing_time_ms", 0),
+        result.get("cost", 0),
+    )
 
 
 async def run_demo(csv_path: str):

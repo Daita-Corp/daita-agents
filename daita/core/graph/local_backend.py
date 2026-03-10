@@ -8,6 +8,7 @@ on first write.
 Not suitable for concurrent writes from multiple processes. This is acceptable
 for local development. Use DynamoGraphBackend in production (when available).
 """
+
 import asyncio
 import json
 import logging
@@ -61,9 +62,13 @@ class LocalGraphBackend:
                 data = json.load(f)
             # directed=True, multigraph=True ensures correct type even when
             # loading legacy files that were saved as DiGraph (multigraph=false).
-            self._graph = nx.node_link_graph(data, directed=True, multigraph=True, edges="links")
+            self._graph = nx.node_link_graph(
+                data, directed=True, multigraph=True, edges="links"
+            )
         except (json.JSONDecodeError, KeyError) as exc:
-            logger.warning(f"Could not load graph from {self._graph_path}: {exc}. Starting fresh.")
+            logger.warning(
+                f"Could not load graph from {self._graph_path}: {exc}. Starting fresh."
+            )
             self._graph = nx.MultiDiGraph()
         return self._graph
 
@@ -82,7 +87,9 @@ class LocalGraphBackend:
                 existing = graph.nodes[node.node_id].get("data", {})
                 incoming = node.model_dump()
                 # Preserve created_at from first registration
-                incoming["created_at"] = existing.get("created_at", incoming["created_at"])
+                incoming["created_at"] = existing.get(
+                    "created_at", incoming["created_at"]
+                )
                 # Preserve health_score and tags unless the incoming node explicitly sets them
                 if node.health_score is None:
                     incoming["health_score"] = existing.get("health_score")
@@ -118,7 +125,9 @@ class LocalGraphBackend:
             # the same node pair are stored as distinct edges, not overwritten.
             key = edge.edge_id
 
-            existing_data = graph.get_edge_data(edge.from_node_id, edge.to_node_id, key=key)
+            existing_data = graph.get_edge_data(
+                edge.from_node_id, edge.to_node_id, key=key
+            )
             if existing_data is not None:
                 existing = existing_data.get("data", {})
                 # Preserve the original registration timestamp
@@ -129,7 +138,9 @@ class LocalGraphBackend:
                 incoming["properties"] = merged_props
                 graph.edges[edge.from_node_id, edge.to_node_id, key]["data"] = incoming
             else:
-                graph.add_edge(edge.from_node_id, edge.to_node_id, key=key, data=incoming)
+                graph.add_edge(
+                    edge.from_node_id, edge.to_node_id, key=key, data=incoming
+                )
 
             self._dirty = True
             logger.debug(f"Graph: upserted edge {edge.edge_id}")
@@ -219,11 +230,15 @@ class LocalGraphBackend:
             # keys=True is required for MultiDiGraph to get the per-edge key.
             for u, v, key, edge_data in list(graph.edges(keys=True, data=True)):
                 raw = edge_data.get("data", {})
-                last_seen_raw = raw.get("timestamp")  # edges use timestamp, not last_seen
+                last_seen_raw = raw.get(
+                    "timestamp"
+                )  # edges use timestamp, not last_seen
                 if last_seen_raw is None:
                     continue
                 try:
-                    ts = datetime.fromisoformat(str(last_seen_raw).replace("Z", "+00:00"))
+                    ts = datetime.fromisoformat(
+                        str(last_seen_raw).replace("Z", "+00:00")
+                    )
                     if ts.timestamp() < cutoff:
                         eid = raw.get("edge_id", f"{u}:{v}")
                         removed_edges.append(eid)
@@ -243,14 +258,20 @@ class LocalGraphBackend:
                 if last_seen_raw is None:
                     continue
                 try:
-                    ts = datetime.fromisoformat(str(last_seen_raw).replace("Z", "+00:00"))
+                    ts = datetime.fromisoformat(
+                        str(last_seen_raw).replace("Z", "+00:00")
+                    )
                     if ts.timestamp() < cutoff:
-                        for u, v, key, edata in list(graph.edges(node_id, keys=True, data=True)):
+                        for u, v, key, edata in list(
+                            graph.edges(node_id, keys=True, data=True)
+                        ):
                             eid = edata.get("data", {}).get("edge_id", f"{u}:{v}")
                             if eid not in removed_edge_ids:
                                 removed_edges.append(eid)
                                 removed_edge_ids.add(eid)
-                        for u, v, key, edata in list(graph.in_edges(node_id, keys=True, data=True)):
+                        for u, v, key, edata in list(
+                            graph.in_edges(node_id, keys=True, data=True)
+                        ):
                             eid = edata.get("data", {}).get("edge_id", f"{u}:{v}")
                             if eid not in removed_edge_ids:
                                 removed_edges.append(eid)

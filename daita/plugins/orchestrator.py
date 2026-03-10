@@ -4,6 +4,7 @@ OrchestratorPlugin for multi-agent coordination and task routing.
 Provides tools for finding capable agents, routing tasks, and executing
 workflows across multiple agents.
 """
+
 import logging
 import time
 from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
@@ -39,7 +40,7 @@ class OrchestratorPlugin(BasePlugin):
 
     def __init__(
         self,
-        agents: Optional[Dict[str, 'Agent']] = None,
+        agents: Optional[Dict[str, "Agent"]] = None,
         graph_store: Optional[Any] = None,
         organization_id: Optional[int] = None,
         llm_provider: Optional[Any] = None,
@@ -47,7 +48,7 @@ class OrchestratorPlugin(BasePlugin):
         routing_api_key: Optional[str] = None,
         enable_llm_routing: bool = True,
         routing_cache_ttl: int = 300,
-        max_description_length: int = 500
+        max_description_length: int = 500,
     ):
         """
         Initialize OrchestratorPlugin.
@@ -83,7 +84,9 @@ class OrchestratorPlugin(BasePlugin):
         self._routing_cache = {}
 
         # Capability registry (in-memory)
-        self._capabilities = {}  # agent_id -> {capabilities, entity_types, performance, description}
+        self._capabilities = (
+            {}
+        )  # agent_id -> {capabilities, entity_types, performance, description}
 
         # Workflow definitions
         self._workflows = {}  # workflow_id -> workflow definition
@@ -92,9 +95,11 @@ class OrchestratorPlugin(BasePlugin):
         if self._agents:
             self._auto_register_agents(self._agents)
 
-        logger.debug(f"OrchestratorPlugin initialized (agents: {len(self._agents)}, llm_routing: {enable_llm_routing}, graph_store: {graph_store is not None})")
+        logger.debug(
+            f"OrchestratorPlugin initialized (agents: {len(self._agents)}, llm_routing: {enable_llm_routing}, graph_store: {graph_store is not None})"
+        )
 
-    def _auto_register_agents(self, agents: Dict[str, 'Agent']) -> None:
+    def _auto_register_agents(self, agents: Dict[str, "Agent"]) -> None:
         """
         Auto-register agents using their prompts and tools as capability metadata.
 
@@ -104,17 +109,17 @@ class OrchestratorPlugin(BasePlugin):
         for agent_id, agent in agents.items():
             # Extract capabilities from agent's tools
             capabilities = []
-            if hasattr(agent, 'tool_registry') and agent.tool_registry:
+            if hasattr(agent, "tool_registry") and agent.tool_registry:
                 capabilities = list(agent.tool_registry.tool_names)
 
             # Extract description from agent's prompt
             description = ""
-            if hasattr(agent, 'prompt') and agent.prompt:
+            if hasattr(agent, "prompt") and agent.prompt:
                 prompt = agent.prompt
                 # Handle dict prompts (extract system message)
                 if isinstance(prompt, dict):
-                    prompt = prompt.get('system', str(prompt))
-                description = str(prompt)[:self._max_description_length]
+                    prompt = prompt.get("system", str(prompt))
+                description = str(prompt)[: self._max_description_length]
 
             # Register in capabilities dict
             self._capabilities[agent_id] = {
@@ -125,7 +130,7 @@ class OrchestratorPlugin(BasePlugin):
                 "total_executions": 0,
                 "successful_executions": 0,
                 "total_time_ms": 0,
-                "auto_registered": True
+                "auto_registered": True,
             }
 
         logger.info(f"Auto-registered {len(agents)} agents with LLM-based routing")
@@ -147,14 +152,14 @@ class OrchestratorPlugin(BasePlugin):
             from ..config.settings import settings
 
             # If LLM provider is already an instance, use it
-            if hasattr(self._llm_provider_config, 'generate'):
+            if hasattr(self._llm_provider_config, "generate"):
                 self._routing_llm = self._llm_provider_config
                 logger.debug("Using provided LLM instance for routing")
                 return
 
             # Otherwise create a new provider
-            provider = self._llm_provider_config or 'openai'
-            model = self._routing_model or 'gpt-4o-mini'
+            provider = self._llm_provider_config or "openai"
+            model = self._routing_model or "gpt-4o-mini"
 
             # Get API key from settings if not provided
             api_key = self._routing_api_key
@@ -173,15 +178,17 @@ class OrchestratorPlugin(BasePlugin):
                 provider=provider,
                 model=model,
                 api_key=api_key,
-                agent_id=f"orchestrator_router_{id(self)}"
+                agent_id=f"orchestrator_router_{id(self)}",
             )
             logger.debug(f"Initialized routing LLM: {provider}/{model}")
 
         except Exception as e:
-            logger.warning(f"Failed to initialize routing LLM: {e}. Falling back to capability matching.")
+            logger.warning(
+                f"Failed to initialize routing LLM: {e}. Falling back to capability matching."
+            )
             self._routing_llm = None
 
-    def _build_agent_routing_tools(self) -> List['AgentTool']:
+    def _build_agent_routing_tools(self) -> List["AgentTool"]:
         """
         Convert registered agents to AgentTool objects for routing.
 
@@ -211,15 +218,15 @@ class OrchestratorPlugin(BasePlugin):
                     "properties": {
                         "reasoning": {
                             "type": "string",
-                            "description": "Brief explanation of why this agent is suitable for the task"
+                            "description": "Brief explanation of why this agent is suitable for the task",
                         }
                     },
-                    "required": []
+                    "required": [],
                 },
                 handler=_routing_not_executable,
                 category="routing",
                 source="orchestrator",
-                plugin_name="Orchestrator"
+                plugin_name="Orchestrator",
             )
             tools.append(tool)
 
@@ -243,9 +250,7 @@ class OrchestratorPlugin(BasePlugin):
         # Check we have agents
         if not self._agents:
             raise RoutingError(
-                "No agents registered in orchestrator",
-                task=task,
-                available_agents=[]
+                "No agents registered in orchestrator", task=task, available_agents=[]
             )
 
         # Single agent optimization
@@ -256,9 +261,11 @@ class OrchestratorPlugin(BasePlugin):
         cache_key = f"task:{task[:100]}"  # Use first 100 chars as key
         if cache_key in self._routing_cache:
             cached = self._routing_cache[cache_key]
-            if time.time() - cached['timestamp'] < self._routing_cache_ttl:
-                logger.debug(f"Cache hit for routing: {task[:50]}... -> {cached['agent_id']}")
-                return cached['agent_id']
+            if time.time() - cached["timestamp"] < self._routing_cache_ttl:
+                logger.debug(
+                    f"Cache hit for routing: {task[:50]}... -> {cached['agent_id']}"
+                )
+                return cached["agent_id"]
 
         # Lazy init routing LLM
         if not self._routing_llm_initialized:
@@ -283,14 +290,17 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
 
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Route this task to the best agent: {task}"}
+                {
+                    "role": "user",
+                    "content": f"Route this task to the best agent: {task}",
+                },
             ]
 
             # Use proper generate() API - provider handles tool format conversion automatically
             response = await self._routing_llm.generate(
                 messages=messages,
                 tools=routing_tools,  # AgentTool objects, converted by provider
-                temperature=0.0  # Deterministic routing
+                temperature=0.0,  # Deterministic routing
             )
 
             # Extract agent_id from tool call
@@ -301,13 +311,15 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                     tool_call = tool_calls[0]
                     tool_name = tool_call.get("name", "")
                     if tool_name.startswith("route_to_"):
-                        agent_id = tool_name[len("route_to_"):]
+                        agent_id = tool_name[len("route_to_") :]
 
                         # Cache result
                         self._routing_cache[cache_key] = {
-                            'agent_id': agent_id,
-                            'timestamp': time.time(),
-                            'reasoning': tool_call.get("arguments", {}).get("reasoning", "")
+                            "agent_id": agent_id,
+                            "timestamp": time.time(),
+                            "reasoning": tool_call.get("arguments", {}).get(
+                                "reasoning", ""
+                            ),
                         }
 
                         logger.debug(f"LLM routing: {task[:50]}... -> {agent_id}")
@@ -338,9 +350,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
 
         if not self._agents:
             raise RoutingError(
-                "No agents available for routing",
-                task=task,
-                available_agents=[]
+                "No agents available for routing", task=task, available_agents=[]
             )
 
         # Score agents based on keyword matching
@@ -352,7 +362,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             agent_info = self._capabilities.get(agent_id, {})
 
             # Match agent name
-            agent_name_words = agent_id.lower().replace('_', ' ').split()
+            agent_name_words = agent_id.lower().replace("_", " ").split()
             for word in agent_name_words:
                 if word in task_lower:
                     score += 10
@@ -360,7 +370,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             # Match capabilities
             capabilities = agent_info.get("capabilities", [])
             for cap in capabilities:
-                cap_words = cap.lower().replace('_', ' ').split()
+                cap_words = cap.lower().replace("_", " ").split()
                 for word in cap_words:
                     if word in task_lower:
                         score += 5
@@ -378,15 +388,19 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         if not scores:
             # No match found - use first agent with warning
             first_agent = list(self._agents.keys())[0]
-            logger.warning(f"No keyword matches for task: {task[:100]}. Using first agent: {first_agent}")
+            logger.warning(
+                f"No keyword matches for task: {task[:100]}. Using first agent: {first_agent}"
+            )
             return first_agent
 
         # Return highest scoring agent
         best_agent = max(scores, key=scores.get)
-        logger.debug(f"Legacy routing: {task[:50]}... -> {best_agent} (score: {scores[best_agent]})")
+        logger.debug(
+            f"Legacy routing: {task[:50]}... -> {best_agent} (score: {scores[best_agent]})"
+        )
         return best_agent
 
-    def get_tools(self) -> List['AgentTool']:
+    def get_tools(self) -> List["AgentTool"]:
         """
         Expose orchestration operations as agent tools.
 
@@ -404,16 +418,16 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                     "properties": {
                         "task": {
                             "type": "string",
-                            "description": "Natural language description of the task (e.g., 'analyze Q4 revenue data', 'generate executive summary')"
+                            "description": "Natural language description of the task (e.g., 'analyze Q4 revenue data', 'generate executive summary')",
                         }
                     },
-                    "required": ["task"]
+                    "required": ["task"],
                 },
                 handler=self._tool_find_agent,
                 category="orchestration",
                 source="plugin",
                 plugin_name="Orchestrator",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="get_performance",
@@ -423,20 +437,20 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                     "properties": {
                         "agent_id": {
                             "type": "string",
-                            "description": "Agent ID or name"
+                            "description": "Agent ID or name",
                         },
                         "time_range_days": {
                             "type": "integer",
-                            "description": "Look back period in days (default: 30)"
-                        }
+                            "description": "Look back period in days (default: 30)",
+                        },
                     },
-                    "required": ["agent_id"]
+                    "required": ["agent_id"],
                 },
                 handler=self._tool_get_performance,
                 category="orchestration",
                 source="plugin",
                 plugin_name="Orchestrator",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="get_capabilities",
@@ -446,16 +460,16 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                     "properties": {
                         "agent_id": {
                             "type": "string",
-                            "description": "Agent ID or name"
+                            "description": "Agent ID or name",
                         }
                     },
-                    "required": ["agent_id"]
+                    "required": ["agent_id"],
                 },
                 handler=self._tool_get_capabilities,
                 category="orchestration",
                 source="plugin",
                 plugin_name="Orchestrator",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="route_task",
@@ -465,21 +479,21 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                     "properties": {
                         "task": {
                             "type": "string",
-                            "description": "Task description or prompt"
+                            "description": "Task description or prompt",
                         },
                         "required_capabilities": {
                             "type": "array",
                             "description": "Optional required capabilities filter",
-                            "items": {"type": "string"}
-                        }
+                            "items": {"type": "string"},
+                        },
                     },
-                    "required": ["task"]
+                    "required": ["task"],
                 },
                 handler=self._tool_route_task,
                 category="orchestration",
                 source="plugin",
                 plugin_name="Orchestrator",
-                timeout_seconds=300
+                timeout_seconds=300,
             ),
             AgentTool(
                 name="run_parallel",
@@ -489,29 +503,35 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                     "properties": {
                         "tasks": {
                             "type": "array",
-                            "description": "List of tasks - each can be a string (auto-routed) or {\"task\": \"...\", \"agent_id\": \"...\"} (explicit)",
+                            "description": 'List of tasks - each can be a string (auto-routed) or {"task": "...", "agent_id": "..."} (explicit)',
                             "items": {
                                 "oneOf": [
                                     {"type": "string"},
                                     {
                                         "type": "object",
                                         "properties": {
-                                            "task": {"type": "string", "description": "Task description"},
-                                            "agent_id": {"type": "string", "description": "Optional explicit agent ID (auto-routed if omitted)"}
+                                            "task": {
+                                                "type": "string",
+                                                "description": "Task description",
+                                            },
+                                            "agent_id": {
+                                                "type": "string",
+                                                "description": "Optional explicit agent ID (auto-routed if omitted)",
+                                            },
                                         },
-                                        "required": ["task"]
-                                    }
+                                        "required": ["task"],
+                                    },
                                 ]
-                            }
+                            },
                         }
                     },
-                    "required": ["tasks"]
+                    "required": ["tasks"],
                 },
                 handler=self._tool_run_parallel,
                 category="orchestration",
                 source="plugin",
                 plugin_name="Orchestrator",
-                timeout_seconds=300
+                timeout_seconds=300,
             ),
             AgentTool(
                 name="run_sequential",
@@ -521,29 +541,35 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                     "properties": {
                         "tasks": {
                             "type": "array",
-                            "description": "List of tasks - each can be a string (auto-routed) or {\"task\": \"...\", \"agent_id\": \"...\"} (explicit)",
+                            "description": 'List of tasks - each can be a string (auto-routed) or {"task": "...", "agent_id": "..."} (explicit)',
                             "items": {
                                 "oneOf": [
                                     {"type": "string"},
                                     {
                                         "type": "object",
                                         "properties": {
-                                            "task": {"type": "string", "description": "Task description"},
-                                            "agent_id": {"type": "string", "description": "Optional explicit agent ID (auto-routed if omitted)"}
+                                            "task": {
+                                                "type": "string",
+                                                "description": "Task description",
+                                            },
+                                            "agent_id": {
+                                                "type": "string",
+                                                "description": "Optional explicit agent ID (auto-routed if omitted)",
+                                            },
                                         },
-                                        "required": ["task"]
-                                    }
+                                        "required": ["task"],
+                                    },
                                 ]
-                            }
+                            },
                         }
                     },
-                    "required": ["tasks"]
+                    "required": ["tasks"],
                 },
                 handler=self._tool_run_sequential,
                 category="orchestration",
                 source="plugin",
                 plugin_name="Orchestrator",
-                timeout_seconds=300
+                timeout_seconds=300,
             ),
             AgentTool(
                 name="create_workflow",
@@ -551,36 +577,42 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                 parameters={
                     "type": "object",
                     "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Workflow name"
-                        },
+                        "name": {"type": "string", "description": "Workflow name"},
                         "steps": {
                             "type": "array",
                             "description": "List of workflow steps",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "step_id": {"type": "string", "description": "Unique step identifier"},
-                                    "agent_id": {"type": "string", "description": "Optional explicit agent ID (auto-routed if omitted)"},
-                                    "task": {"type": "string", "description": "Task description"},
+                                    "step_id": {
+                                        "type": "string",
+                                        "description": "Unique step identifier",
+                                    },
+                                    "agent_id": {
+                                        "type": "string",
+                                        "description": "Optional explicit agent ID (auto-routed if omitted)",
+                                    },
+                                    "task": {
+                                        "type": "string",
+                                        "description": "Task description",
+                                    },
                                     "depends_on": {
                                         "type": "array",
                                         "items": {"type": "string"},
-                                        "description": "List of step IDs this step depends on"
-                                    }
+                                        "description": "List of step IDs this step depends on",
+                                    },
                                 },
-                                "required": ["step_id", "task"]
-                            }
-                        }
+                                "required": ["step_id", "task"],
+                            },
+                        },
                     },
-                    "required": ["name", "steps"]
+                    "required": ["name", "steps"],
                 },
                 handler=self._tool_create_workflow,
                 category="orchestration",
                 source="plugin",
                 plugin_name="Orchestrator",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="run_workflow",
@@ -590,29 +622,29 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                     "properties": {
                         "workflow_id": {
                             "type": "string",
-                            "description": "Workflow ID or name"
+                            "description": "Workflow ID or name",
                         },
                         "input_data": {
                             "type": "object",
-                            "description": "Input data for the workflow"
-                        }
+                            "description": "Input data for the workflow",
+                        },
                     },
-                    "required": ["workflow_id"]
+                    "required": ["workflow_id"],
                 },
                 handler=self._tool_run_workflow,
                 category="orchestration",
                 source="plugin",
                 plugin_name="Orchestrator",
-                timeout_seconds=600
-            )
+                timeout_seconds=600,
+            ),
         ]
 
     def register_agent(
         self,
-        agent: 'Agent',
+        agent: "Agent",
         agent_id: Optional[str] = None,
         capabilities: Optional[List[str]] = None,
-        entity_types: Optional[List[str]] = None
+        entity_types: Optional[List[str]] = None,
     ) -> None:
         """
         Register an agent in the orchestrator.
@@ -632,7 +664,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             "registered_at": datetime.utcnow().isoformat(),
             "total_executions": 0,
             "successful_executions": 0,
-            "total_time_ms": 0
+            "total_time_ms": 0,
         }
 
         logger.info(f"Registered agent: {agent_id}")
@@ -646,13 +678,10 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             return {
                 "success": True,
                 "agent_id": agent_id,
-                "message": f"Selected agent: {agent_id}"
+                "message": f"Selected agent: {agent_id}",
             }
         except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            return {"success": False, "error": str(e)}
 
     async def find_agent(self, task: str) -> str:
         """
@@ -678,9 +707,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         return result
 
     async def get_performance(
-        self,
-        agent_id: str,
-        time_range_days: int = 30
+        self, agent_id: str, time_range_days: int = 30
     ) -> Dict[str, Any]:
         """
         Get performance metrics for an agent.
@@ -693,10 +720,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             Performance metrics
         """
         if agent_id not in self._capabilities:
-            return {
-                "success": False,
-                "error": f"Agent not found: {agent_id}"
-            }
+            return {"success": False, "error": f"Agent not found: {agent_id}"}
 
         agent_info = self._capabilities[agent_id]
         total = agent_info.get("total_executions", 0)
@@ -715,7 +739,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             "successful_executions": agent_info.get("successful_executions", 0),
             "success_rate_percent": round(success_rate, 2),
             "avg_execution_time_ms": round(avg_time, 2),
-            "time_range_days": time_range_days
+            "time_range_days": time_range_days,
         }
 
     async def _tool_get_capabilities(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -736,10 +760,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             Agent capabilities
         """
         if agent_id not in self._capabilities:
-            return {
-                "success": False,
-                "error": f"Agent not found: {agent_id}"
-            }
+            return {"success": False, "error": f"Agent not found: {agent_id}"}
 
         agent_info = self._capabilities[agent_id]
 
@@ -748,10 +769,12 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             "agent_id": agent_id,
             "capabilities": agent_info.get("capabilities", []),
             "entity_types": agent_info.get("entity_types", []),
-            "registered_at": agent_info.get("registered_at")
+            "registered_at": agent_info.get("registered_at"),
         }
 
-    async def _normalize_task(self, task_input: Union[str, Dict[str, Any]]) -> Dict[str, str]:
+    async def _normalize_task(
+        self, task_input: Union[str, Dict[str, Any]]
+    ) -> Dict[str, str]:
         """
         Normalize task input to dict format with task and agent_id.
 
@@ -773,7 +796,10 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         if isinstance(task_input, dict):
             # Explicit agent_id - use as-is (override)
             if "agent_id" in task_input:
-                return {"task": task_input.get("task", ""), "agent_id": task_input["agent_id"]}
+                return {
+                    "task": task_input.get("task", ""),
+                    "agent_id": task_input["agent_id"],
+                }
 
             # Dict without agent_id - auto-route
             task = task_input.get("task", str(task_input))
@@ -781,7 +807,9 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             return {"task": task, "agent_id": agent_id}
 
         # Invalid input type
-        raise ValueError(f"Invalid task input type: {type(task_input)}. Expected str or dict.")
+        raise ValueError(
+            f"Invalid task input type: {type(task_input)}. Expected str or dict."
+        )
 
     async def _tool_route_task(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for route_task"""
@@ -806,7 +834,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         if agent_id not in self._agents:
             return {
                 "success": False,
-                "error": f"Agent found but not available: {agent_id}"
+                "error": f"Agent found but not available: {agent_id}",
             }
 
         agent = self._agents[agent_id]
@@ -816,7 +844,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             start_time = datetime.utcnow()
 
             # Check if agent has run method
-            if hasattr(agent, 'run'):
+            if hasattr(agent, "run"):
                 result = await agent.run(task)
             else:
                 result = "Agent executed (no run method available)"
@@ -833,18 +861,14 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                 "success": True,
                 "agent_id": agent_id,
                 "result": result,
-                "execution_time_ms": round(execution_time, 2)
+                "execution_time_ms": round(execution_time, 2),
             }
 
         except Exception as e:
             # Update metrics
             self._capabilities[agent_id]["total_executions"] += 1
 
-            return {
-                "success": False,
-                "agent_id": agent_id,
-                "error": str(e)
-            }
+            return {"success": False, "agent_id": agent_id, "error": str(e)}
 
     async def _tool_run_parallel(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for run_parallel"""
@@ -853,7 +877,9 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         result = await self.run_parallel(tasks)
         return result
 
-    async def run_parallel(self, tasks: List[Union[str, Dict[str, str]]]) -> Dict[str, Any]:
+    async def run_parallel(
+        self, tasks: List[Union[str, Dict[str, str]]]
+    ) -> Dict[str, Any]:
         """
         Execute multiple tasks in parallel with auto-routing support.
 
@@ -868,26 +894,42 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         import asyncio
 
         # Normalize all tasks (auto-route if needed)
-        normalized_tasks = await asyncio.gather(*[self._normalize_task(t) for t in tasks])
+        normalized_tasks = await asyncio.gather(
+            *[self._normalize_task(t) for t in tasks]
+        )
 
         async def execute_task(task_info):
             agent_id = task_info["agent_id"]
             task = task_info["task"]
 
             if agent_id not in self._agents:
-                return {"success": False, "error": f"Agent not found: {agent_id}", "task": task}
+                return {
+                    "success": False,
+                    "error": f"Agent not found: {agent_id}",
+                    "task": task,
+                }
 
             agent = self._agents[agent_id]
 
             try:
-                if hasattr(agent, 'run'):
+                if hasattr(agent, "run"):
                     result = await agent.run(task)
                 else:
                     result = "Agent executed"
 
-                return {"success": True, "agent_id": agent_id, "result": result, "task": task}
+                return {
+                    "success": True,
+                    "agent_id": agent_id,
+                    "result": result,
+                    "task": task,
+                }
             except Exception as e:
-                return {"success": False, "agent_id": agent_id, "error": str(e), "task": task}
+                return {
+                    "success": False,
+                    "agent_id": agent_id,
+                    "error": str(e),
+                    "task": task,
+                }
 
         # Execute all tasks concurrently
         results = await asyncio.gather(*[execute_task(t) for t in normalized_tasks])
@@ -898,7 +940,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             "success": True,
             "total_tasks": len(tasks),
             "successful_tasks": successful,
-            "results": results
+            "results": results,
         }
 
     async def _tool_run_sequential(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -908,7 +950,9 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         result = await self.run_sequential(tasks)
         return result
 
-    async def run_sequential(self, tasks: List[Union[str, Dict[str, str]]]) -> Dict[str, Any]:
+    async def run_sequential(
+        self, tasks: List[Union[str, Dict[str, str]]]
+    ) -> Dict[str, Any]:
         """
         Execute tasks in sequence with auto-routing support.
 
@@ -934,22 +978,42 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                 task = f"{task}\n\nContext from previous step: {previous_result}"
 
             if agent_id not in self._agents:
-                results.append({"success": False, "error": f"Agent not found: {agent_id}", "task": task})
+                results.append(
+                    {
+                        "success": False,
+                        "error": f"Agent not found: {agent_id}",
+                        "task": task,
+                    }
+                )
                 break
 
             agent = self._agents[agent_id]
 
             try:
-                if hasattr(agent, 'run'):
+                if hasattr(agent, "run"):
                     result = await agent.run(task)
                 else:
                     result = "Agent executed"
 
-                results.append({"success": True, "agent_id": agent_id, "result": result, "task": task})
+                results.append(
+                    {
+                        "success": True,
+                        "agent_id": agent_id,
+                        "result": result,
+                        "task": task,
+                    }
+                )
                 previous_result = result
 
             except Exception as e:
-                results.append({"success": False, "agent_id": agent_id, "error": str(e), "task": task})
+                results.append(
+                    {
+                        "success": False,
+                        "agent_id": agent_id,
+                        "error": str(e),
+                        "task": task,
+                    }
+                )
                 break
 
         successful = sum(1 for r in results if r.get("success"))
@@ -960,7 +1024,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             "completed_tasks": len(results),
             "successful_tasks": successful,
             "results": results,
-            "final_result": previous_result if results else None
+            "final_result": previous_result if results else None,
         }
 
     async def _tool_create_workflow(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -972,9 +1036,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         return result
 
     async def create_workflow(
-        self,
-        name: str,
-        steps: List[Dict[str, Any]]
+        self, name: str, steps: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """
         Create a workflow DAG.
@@ -989,16 +1051,12 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         workflow = {
             "name": name,
             "steps": steps,
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": datetime.utcnow().isoformat(),
         }
 
         self._workflows[name] = workflow
 
-        return {
-            "success": True,
-            "workflow_id": name,
-            "steps_count": len(steps)
-        }
+        return {"success": True, "workflow_id": name, "steps_count": len(steps)}
 
     async def _tool_run_workflow(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for run_workflow"""
@@ -1009,9 +1067,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         return result
 
     async def run_workflow(
-        self,
-        workflow_id: str,
-        input_data: Optional[Dict[str, Any]] = None
+        self, workflow_id: str, input_data: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Execute a workflow DAG.
@@ -1024,10 +1080,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             Workflow execution results
         """
         if workflow_id not in self._workflows:
-            return {
-                "success": False,
-                "error": f"Workflow not found: {workflow_id}"
-            }
+            return {"success": False, "error": f"Workflow not found: {workflow_id}"}
 
         workflow = self._workflows[workflow_id]
         steps = workflow["steps"]
@@ -1061,22 +1114,24 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
 
                     # Add dependency results to task context
                     if depends_on:
-                        context = "\n".join([
-                            f"Result from {dep}: {step_results.get(dep)}"
-                            for dep in depends_on
-                        ])
+                        context = "\n".join(
+                            [
+                                f"Result from {dep}: {step_results.get(dep)}"
+                                for dep in depends_on
+                            ]
+                        )
                         task = f"{task}\n\nContext:\n{context}"
 
                     if agent_id not in self._agents:
                         return {
                             "success": False,
-                            "error": f"Agent not found for step {step_id}: {agent_id}"
+                            "error": f"Agent not found for step {step_id}: {agent_id}",
                         }
 
                     agent = self._agents[agent_id]
 
                     try:
-                        if hasattr(agent, 'run'):
+                        if hasattr(agent, "run"):
                             result = await agent.run(task)
                         else:
                             result = "Agent executed"
@@ -1090,14 +1145,14 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                             "success": False,
                             "error": f"Step {step_id} failed: {str(e)}",
                             "completed_steps": list(completed_steps),
-                            "step_results": step_results
+                            "step_results": step_results,
                         }
 
             if not executed_any:
                 return {
                     "success": False,
                     "error": "Workflow has circular dependencies or unreachable steps",
-                    "completed_steps": list(completed_steps)
+                    "completed_steps": list(completed_steps),
                 }
 
         return {
@@ -1105,7 +1160,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             "workflow_id": workflow_id,
             "total_steps": len(steps),
             "completed_steps": len(completed_steps),
-            "step_results": step_results
+            "step_results": step_results,
         }
 
 

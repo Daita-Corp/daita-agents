@@ -4,6 +4,7 @@ Snowflake plugin for Daita Agents.
 Provides Snowflake data warehouse connection and querying capabilities.
 Supports key-pair authentication, warehouse management, and stage operations.
 """
+
 import asyncio
 import logging
 import os
@@ -78,7 +79,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         private_key_path: Optional[str] = None,
         private_key_passphrase: Optional[str] = None,
         timeout: int = 300,
-        **kwargs
+        **kwargs,
     ):
         """
         Initialize Snowflake connection.
@@ -110,50 +111,82 @@ class SnowflakePlugin(BaseDatabasePlugin):
             SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: Private key passphrase
         """
         # Load from environment variables with fallbacks
-        self.account = account if account is not None else os.getenv("SNOWFLAKE_ACCOUNT")
-        self.warehouse = warehouse if warehouse is not None else os.getenv("SNOWFLAKE_WAREHOUSE")
-        self.database_name = database if database is not None else os.getenv("SNOWFLAKE_DATABASE")
-        self.schema = schema if schema != "PUBLIC" else os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC")
+        self.account = (
+            account if account is not None else os.getenv("SNOWFLAKE_ACCOUNT")
+        )
+        self.warehouse = (
+            warehouse if warehouse is not None else os.getenv("SNOWFLAKE_WAREHOUSE")
+        )
+        self.database_name = (
+            database if database is not None else os.getenv("SNOWFLAKE_DATABASE")
+        )
+        self.schema = (
+            schema if schema != "PUBLIC" else os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC")
+        )
         self.user = user if user is not None else os.getenv("SNOWFLAKE_USER")
-        self.password = password if password is not None else os.getenv("SNOWFLAKE_PASSWORD")
+        self.password = (
+            password if password is not None else os.getenv("SNOWFLAKE_PASSWORD")
+        )
         self.role = role if role is not None else os.getenv("SNOWFLAKE_ROLE")
-        self.authenticator = authenticator if authenticator is not None else os.getenv("SNOWFLAKE_AUTHENTICATOR")
-        self.private_key_path = private_key_path if private_key_path is not None else os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
-        self.private_key_passphrase = private_key_passphrase if private_key_passphrase is not None else os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+        self.authenticator = (
+            authenticator
+            if authenticator is not None
+            else os.getenv("SNOWFLAKE_AUTHENTICATOR")
+        )
+        self.private_key_path = (
+            private_key_path
+            if private_key_path is not None
+            else os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
+        )
+        self.private_key_passphrase = (
+            private_key_passphrase
+            if private_key_passphrase is not None
+            else os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+        )
         self.timeout = timeout
 
         # Validate required parameters
         if not self.account:
-            raise ValueError("Snowflake account is required. Provide 'account' parameter or set SNOWFLAKE_ACCOUNT environment variable.")
+            raise ValueError(
+                "Snowflake account is required. Provide 'account' parameter or set SNOWFLAKE_ACCOUNT environment variable."
+            )
         if not self.user:
-            raise ValueError("Snowflake user is required. Provide 'user' parameter or set SNOWFLAKE_USER environment variable.")
+            raise ValueError(
+                "Snowflake user is required. Provide 'user' parameter or set SNOWFLAKE_USER environment variable."
+            )
         if not self.warehouse:
-            raise ValueError("Snowflake warehouse is required. Provide 'warehouse' parameter or set SNOWFLAKE_WAREHOUSE environment variable.")
+            raise ValueError(
+                "Snowflake warehouse is required. Provide 'warehouse' parameter or set SNOWFLAKE_WAREHOUSE environment variable."
+            )
         if not self.database_name:
-            raise ValueError("Snowflake database is required. Provide 'database' parameter or set SNOWFLAKE_DATABASE environment variable.")
+            raise ValueError(
+                "Snowflake database is required. Provide 'database' parameter or set SNOWFLAKE_DATABASE environment variable."
+            )
 
         # Validate authentication credentials
         if not self.password and not self.private_key_path and not self.authenticator:
-            raise ValueError("Authentication required: provide either 'password', 'private_key_path', or 'authenticator' parameter.")
+            raise ValueError(
+                "Authentication required: provide either 'password', 'private_key_path', or 'authenticator' parameter."
+            )
 
         # Build connection configuration
         self.connection_config = {
-            'account': self.account,
-            'warehouse': self.warehouse,
-            'database': self.database_name,
-            'schema': self.schema,
-            'user': self.user,
-            'network_timeout': timeout,
-            'login_timeout': 60,
+            "account": self.account,
+            "warehouse": self.warehouse,
+            "database": self.database_name,
+            "schema": self.schema,
+            "user": self.user,
+            "network_timeout": timeout,
+            "login_timeout": 60,
         }
 
         # Add role if specified
         if self.role:
-            self.connection_config['role'] = self.role
+            self.connection_config["role"] = self.role
 
         # Add authenticator if specified
         if self.authenticator:
-            self.connection_config['authenticator'] = self.authenticator
+            self.connection_config["authenticator"] = self.authenticator
 
         # Add authentication (handled in connect method)
         self._use_key_pair = bool(self.private_key_path)
@@ -166,18 +199,20 @@ class SnowflakePlugin(BaseDatabasePlugin):
             schema=self.schema,
             user=self.user,
             role=self.role,
-            **kwargs
+            **kwargs,
         )
 
         # Determine auth method for logging
         if self._use_key_pair:
-            auth_method = 'key-pair'
+            auth_method = "key-pair"
         elif self.authenticator:
             auth_method = self.authenticator
         else:
-            auth_method = 'password'
+            auth_method = "password"
 
-        logger.debug(f"Snowflake plugin configured for {self.account}/{self.database_name} (auth: {auth_method})")
+        logger.debug(
+            f"Snowflake plugin configured for {self.account}/{self.database_name} (auth: {auth_method})"
+        )
 
     def _load_private_key(self):
         """Load and decode private key for key-pair authentication."""
@@ -185,23 +220,25 @@ class SnowflakePlugin(BaseDatabasePlugin):
             from cryptography.hazmat.backends import default_backend
             from cryptography.hazmat.primitives import serialization
 
-            with open(self.private_key_path, 'rb') as key_file:
+            with open(self.private_key_path, "rb") as key_file:
                 private_key_data = key_file.read()
 
             # Load private key with optional passphrase
-            passphrase = self.private_key_passphrase.encode() if self.private_key_passphrase else None
+            passphrase = (
+                self.private_key_passphrase.encode()
+                if self.private_key_passphrase
+                else None
+            )
 
             private_key = serialization.load_pem_private_key(
-                private_key_data,
-                password=passphrase,
-                backend=default_backend()
+                private_key_data, password=passphrase, backend=default_backend()
             )
 
             # Get private key bytes in DER format
             private_key_bytes = private_key.private_bytes(
                 encoding=serialization.Encoding.DER,
                 format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption()
+                encryption_algorithm=serialization.NoEncryption(),
             )
 
             return private_key_bytes
@@ -212,7 +249,9 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 "Install with: pip install 'snowflake-connector-python[secure-local-storage]'"
             )
         except FileNotFoundError:
-            raise FileNotFoundError(f"Private key file not found: {self.private_key_path}")
+            raise FileNotFoundError(
+                f"Private key file not found: {self.private_key_path}"
+            )
         except Exception as e:
             raise ValueError(f"Failed to load private key: {str(e)}")
 
@@ -235,7 +274,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
             if self._use_key_pair:
                 # Use key-pair authentication
                 private_key_bytes = self._load_private_key()
-                config['private_key'] = private_key_bytes
+                config["private_key"] = private_key_bytes
                 logger.debug("Using key-pair authentication")
             elif self.authenticator:
                 # Use authenticator (e.g., externalbrowser)
@@ -243,7 +282,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 logger.debug(f"Using {self.authenticator} authentication")
             else:
                 # Use password authentication
-                config['password'] = self.password
+                config["password"] = self.password
                 logger.debug("Using password authentication")
 
             # Create connection (synchronous — wrap in executor to avoid blocking event loop)
@@ -252,7 +291,9 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 None, lambda: snowflake.connector.connect(**config)
             )
 
-            logger.info(f"Connected to Snowflake: {self.account}/{self.database_name}.{self.schema} (warehouse: {self.warehouse})")
+            logger.info(
+                f"Connected to Snowflake: {self.account}/{self.database_name}.{self.schema} (warehouse: {self.warehouse})"
+            )
 
         except ImportError:
             self._handle_connection_error(
@@ -260,7 +301,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
                     "snowflake-connector-python not installed. "
                     "Install with: pip install 'daita-agents[snowflake]'"
                 ),
-                "connection"
+                "connection",
             )
         except Exception as e:
             self._handle_connection_error(e, "connection")
@@ -320,7 +361,9 @@ class SnowflakePlugin(BaseDatabasePlugin):
         finally:
             cursor.close()
 
-    async def query(self, sql: str, params: Optional[List] = None) -> List[Dict[str, Any]]:
+    async def query(
+        self, sql: str, params: Optional[List] = None
+    ) -> List[Dict[str, Any]]:
         """
         Run a SELECT query and return results.
 
@@ -369,14 +412,14 @@ class SnowflakePlugin(BaseDatabasePlugin):
             await self.connect()
         sql = f"SHOW TABLES IN SCHEMA {schema}" if schema else "SHOW TABLES"
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._run_show, sql, 'name')
+        return await loop.run_in_executor(None, self._run_show, sql, "name")
 
     async def schemas(self) -> List[str]:
         """List all schemas in the database."""
         if self._connection is None:
             await self.connect()
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._run_show, "SHOW SCHEMAS", 'name')
+        return await loop.run_in_executor(None, self._run_show, "SHOW SCHEMAS", "name")
 
     async def describe(self, table: str) -> List[Dict[str, Any]]:
         """
@@ -391,14 +434,18 @@ class SnowflakePlugin(BaseDatabasePlugin):
         if self._connection is None:
             await self.connect()
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._run_show, f"DESCRIBE TABLE {table}", None)
+        return await loop.run_in_executor(
+            None, self._run_show, f"DESCRIBE TABLE {table}", None
+        )
 
     async def databases(self) -> List[str]:
         """List all accessible databases."""
         if self._connection is None:
             await self.connect()
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._run_show, "SHOW DATABASES", 'name')
+        return await loop.run_in_executor(
+            None, self._run_show, "SHOW DATABASES", "name"
+        )
 
     async def list_warehouses(self) -> List[Dict[str, Any]]:
         """List all available warehouses."""
@@ -467,7 +514,9 @@ class SnowflakePlugin(BaseDatabasePlugin):
         """
         return await self.query(sql)
 
-    async def get_warehouse_usage(self, warehouse: Optional[str] = None, days: int = 7) -> List[Dict[str, Any]]:
+    async def get_warehouse_usage(
+        self, warehouse: Optional[str] = None, days: int = 7
+    ) -> List[Dict[str, Any]]:
         """
         Get warehouse credit usage.
 
@@ -501,7 +550,9 @@ class SnowflakePlugin(BaseDatabasePlugin):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._run_show, "SHOW STAGES", None)
 
-    async def put_file(self, local_path: str, stage_path: str, overwrite: bool = False) -> Dict[str, Any]:
+    async def put_file(
+        self, local_path: str, stage_path: str, overwrite: bool = False
+    ) -> Dict[str, Any]:
         """Upload file to Snowflake stage."""
         if self._connection is None:
             await self.connect()
@@ -522,7 +573,11 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
         def _get():
             results = self._run_query(f"GET {stage_path} 'file://{local_path}'")
-            return {"success": True, "files_downloaded": len(results), "details": results}
+            return {
+                "success": True,
+                "files_downloaded": len(results),
+                "details": results,
+            }
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _get)
@@ -533,7 +588,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         stage: str,
         file_format: str = "CSV",
         pattern: Optional[str] = None,
-        on_error: str = "ABORT_STATEMENT"
+        on_error: str = "ABORT_STATEMENT",
     ) -> Dict[str, Any]:
         """Load data from stage into table."""
         if self._connection is None:
@@ -549,8 +604,13 @@ class SnowflakePlugin(BaseDatabasePlugin):
             ON_ERROR = {on_error}
             """
             results = self._run_query(sql)
-            rows_loaded = sum(row.get('rows_loaded', 0) or 0 for row in results)
-            return {"success": True, "rows_loaded": rows_loaded, "files_processed": len(results), "details": results}
+            rows_loaded = sum(row.get("rows_loaded", 0) or 0 for row in results)
+            return {
+                "success": True,
+                "rows_loaded": rows_loaded,
+                "files_processed": len(results),
+                "details": results,
+            }
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _load)
@@ -560,7 +620,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         name: str,
         url: Optional[str] = None,
         storage_integration: Optional[str] = None,
-        credentials: Optional[Dict[str, str]] = None
+        credentials: Optional[Dict[str, str]] = None,
     ) -> None:
         """Create a new stage (internal or external)."""
         if self._connection is None:
@@ -572,7 +632,9 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 if storage_integration:
                     sql += f" STORAGE_INTEGRATION = {storage_integration}"
                 elif credentials:
-                    creds_str = " ".join([f"{k} = '{v}'" for k, v in credentials.items()])
+                    creds_str = " ".join(
+                        [f"{k} = '{v}'" for k, v in credentials.items()]
+                    )
                     sql += f" CREDENTIALS = ({creds_str})"
             else:
                 sql = f"CREATE STAGE IF NOT EXISTS {name}"
@@ -582,7 +644,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _create)
 
-    def get_tools(self) -> List['AgentTool']:
+    def get_tools(self) -> List["AgentTool"]:
         """
         Expose Snowflake operations as agent tools.
 
@@ -600,34 +662,34 @@ class SnowflakePlugin(BaseDatabasePlugin):
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "SQL SELECT query with %s placeholders"
+                            "description": "SQL SELECT query with %s placeholders",
                         },
                         "params": {
                             "type": "array",
                             "description": "Optional parameter values",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Max rows to return (default: 50)"
+                            "description": "Max rows to return (default: 50)",
                         },
                         "columns": {
                             "type": "array",
                             "description": "Specific columns to return (returns all if omitted)",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         },
                         "focus": {
                             "type": "string",
-                            "description": "Focus DSL to filter/project at the database level, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\""
-                        }
+                            "description": "Focus DSL to filter/project at the database level, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\"",
+                        },
                     },
-                    "required": ["sql"]
+                    "required": ["sql"],
                 },
                 handler=self._tool_query,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="snowflake_execute",
@@ -637,21 +699,21 @@ class SnowflakePlugin(BaseDatabasePlugin):
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "SQL statement (INSERT, UPDATE, or DELETE)"
+                            "description": "SQL statement (INSERT, UPDATE, or DELETE)",
                         },
                         "params": {
                             "type": "array",
                             "description": "Optional parameter values",
-                            "items": {"type": "string"}
-                        }
+                            "items": {"type": "string"},
+                        },
                     },
-                    "required": ["sql"]
+                    "required": ["sql"],
                 },
                 handler=self._tool_execute,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="snowflake_list_tables",
@@ -661,16 +723,16 @@ class SnowflakePlugin(BaseDatabasePlugin):
                     "properties": {
                         "schema": {
                             "type": "string",
-                            "description": "Optional schema name (defaults to current schema)"
+                            "description": "Optional schema name (defaults to current schema)",
                         }
                     },
-                    "required": []
+                    "required": [],
                 },
                 handler=self._tool_list_tables,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="list_schemas",
@@ -680,7 +742,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="snowflake_get_schema",
@@ -690,16 +752,16 @@ class SnowflakePlugin(BaseDatabasePlugin):
                     "properties": {
                         "table": {
                             "type": "string",
-                            "description": "Table name (optionally schema-qualified like 'schema.table')"
+                            "description": "Table name (optionally schema-qualified like 'schema.table')",
                         }
                     },
-                    "required": ["table"]
+                    "required": ["table"],
                 },
                 handler=self._tool_get_table_schema,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="snowflake_inspect",
@@ -710,30 +772,26 @@ class SnowflakePlugin(BaseDatabasePlugin):
                         "tables": {
                             "type": "array",
                             "description": "Filter to specific tables (returns all if omitted)",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         }
                     },
-                    "required": []
+                    "required": [],
                 },
                 handler=self._tool_inspect,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="list_warehouses",
                 description="List all available Snowflake compute warehouses with their status and configuration",
-                parameters={
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                },
+                parameters={"type": "object", "properties": {}, "required": []},
                 handler=self._tool_list_warehouses,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="switch_warehouse",
@@ -743,16 +801,16 @@ class SnowflakePlugin(BaseDatabasePlugin):
                     "properties": {
                         "warehouse": {
                             "type": "string",
-                            "description": "Name of the warehouse to switch to"
+                            "description": "Name of the warehouse to switch to",
                         }
                     },
-                    "required": ["warehouse"]
+                    "required": ["warehouse"],
                 },
                 handler=self._tool_switch_warehouse,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="get_query_history",
@@ -763,30 +821,26 @@ class SnowflakePlugin(BaseDatabasePlugin):
                         "limit": {
                             "type": "integer",
                             "description": "Maximum number of queries to return (default: 100)",
-                            "default": 100
+                            "default": 100,
                         }
                     },
-                    "required": []
+                    "required": [],
                 },
                 handler=self._tool_get_query_history,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=45
+                timeout_seconds=45,
             ),
             AgentTool(
                 name="list_stages",
                 description="List all Snowflake stages (internal and external) for data loading",
-                parameters={
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                },
+                parameters={"type": "object", "properties": {}, "required": []},
                 handler=self._tool_list_stages,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="upload_to_stage",
@@ -796,25 +850,25 @@ class SnowflakePlugin(BaseDatabasePlugin):
                     "properties": {
                         "local_path": {
                             "type": "string",
-                            "description": "Local file path to upload"
+                            "description": "Local file path to upload",
                         },
                         "stage_path": {
                             "type": "string",
-                            "description": "Stage location (e.g., '@my_stage/path/')"
+                            "description": "Stage location (e.g., '@my_stage/path/')",
                         },
                         "overwrite": {
                             "type": "boolean",
                             "description": "Whether to overwrite existing files (default: false)",
-                            "default": False
-                        }
+                            "default": False,
+                        },
                     },
-                    "required": ["local_path", "stage_path"]
+                    "required": ["local_path", "stage_path"],
                 },
                 handler=self._tool_upload_to_stage,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=120
+                timeout_seconds=120,
             ),
             AgentTool(
                 name="load_from_stage",
@@ -822,31 +876,28 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 parameters={
                     "type": "object",
                     "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Target table name"
-                        },
+                        "table": {"type": "string", "description": "Target table name"},
                         "stage": {
                             "type": "string",
-                            "description": "Stage location (e.g., '@my_stage/path/')"
+                            "description": "Stage location (e.g., '@my_stage/path/')",
                         },
                         "file_format": {
                             "type": "string",
                             "description": "File format type (default: CSV)",
-                            "default": "CSV"
+                            "default": "CSV",
                         },
                         "pattern": {
                             "type": "string",
-                            "description": "Optional file pattern to match (e.g., '.*\\.csv')"
-                        }
+                            "description": "Optional file pattern to match (e.g., '.*\\.csv')",
+                        },
                     },
-                    "required": ["table", "stage"]
+                    "required": ["table", "stage"],
                 },
                 handler=self._tool_load_from_stage,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=180
+                timeout_seconds=180,
             ),
             AgentTool(
                 name="create_stage",
@@ -854,26 +905,23 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 parameters={
                     "type": "object",
                     "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Stage name"
-                        },
+                        "name": {"type": "string", "description": "Stage name"},
                         "url": {
                             "type": "string",
-                            "description": "External URL for external stages (e.g., 's3://bucket/path/')"
+                            "description": "External URL for external stages (e.g., 's3://bucket/path/')",
                         },
                         "storage_integration": {
                             "type": "string",
-                            "description": "Storage integration name for cloud storage"
-                        }
+                            "description": "Storage integration name for cloud storage",
+                        },
                     },
-                    "required": ["name"]
+                    "required": ["name"],
                 },
                 handler=self._tool_create_stage,
                 category="database",
                 source="plugin",
                 plugin_name="Snowflake",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
         ]
 
@@ -892,19 +940,14 @@ class SnowflakePlugin(BaseDatabasePlugin):
             columns = args.get("columns")
             if columns:
                 safe_cols = ", ".join(
-                    f'"{c}"' for c in columns
-                    if re.match(r'^[A-Za-z0-9_]+$', c)
+                    f'"{c}"' for c in columns if re.match(r"^[A-Za-z0-9_]+$", c)
                 )
                 if safe_cols:
                     sql = f"SELECT {safe_cols} FROM ({sql}) _sf_q"
             sql = f"{sql} LIMIT {int(limit)}"
             results = await self.query(sql, params or None)
 
-        return {
-            "success": True,
-            "rows": results,
-            "row_count": len(results)
-        }
+        return {"success": True, "rows": results, "row_count": len(results)}
 
     async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for snowflake_execute"""
@@ -913,10 +956,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
         affected_rows = await self.execute(sql, params)
 
-        return {
-            "success": True,
-            "affected_rows": affected_rows
-        }
+        return {"success": True, "affected_rows": affected_rows}
 
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for snowflake_list_tables"""
@@ -924,21 +964,13 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
         tables = await self.tables(schema)
 
-        return {
-            "success": True,
-            "tables": tables,
-            "count": len(tables)
-        }
+        return {"success": True, "tables": tables, "count": len(tables)}
 
     async def _tool_list_schemas(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for list_schemas"""
         schemas = await self.schemas()
 
-        return {
-            "success": True,
-            "schemas": schemas,
-            "count": len(schemas)
-        }
+        return {"success": True, "schemas": schemas, "count": len(schemas)}
 
     async def _tool_get_table_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for snowflake_get_schema"""
@@ -950,7 +982,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
             "success": True,
             "table": table,
             "columns": columns,
-            "column_count": len(columns)
+            "column_count": len(columns),
         }
 
     async def _tool_inspect(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -958,25 +990,25 @@ class SnowflakePlugin(BaseDatabasePlugin):
         filter_tables = args.get("tables")
 
         all_tables = await self.tables()
-        targets = [t for t in all_tables if t in filter_tables] if filter_tables else all_tables
+        targets = (
+            [t for t in all_tables if t in filter_tables]
+            if filter_tables
+            else all_tables
+        )
 
         schemas = await asyncio.gather(*[self.describe(t) for t in targets])
 
         return {
             "success": True,
             "tables": [{"name": t, "columns": s} for t, s in zip(targets, schemas)],
-            "count": len(targets)
+            "count": len(targets),
         }
 
     async def _tool_list_warehouses(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for list_warehouses"""
         warehouses = await self.list_warehouses()
 
-        return {
-            "success": True,
-            "warehouses": warehouses,
-            "count": len(warehouses)
-        }
+        return {"success": True, "warehouses": warehouses, "count": len(warehouses)}
 
     async def _tool_switch_warehouse(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for switch_warehouse"""
@@ -987,7 +1019,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         return {
             "success": True,
             "message": f"Switched to warehouse: {warehouse}",
-            "warehouse": warehouse
+            "warehouse": warehouse,
         }
 
     async def _tool_get_query_history(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -996,21 +1028,13 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
         history = await self.query_history(limit)
 
-        return {
-            "success": True,
-            "queries": history,
-            "count": len(history)
-        }
+        return {"success": True, "queries": history, "count": len(history)}
 
     async def _tool_list_stages(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for list_stages"""
         stages = await self.list_stages()
 
-        return {
-            "success": True,
-            "stages": stages,
-            "count": len(stages)
-        }
+        return {"success": True, "stages": stages, "count": len(stages)}
 
     async def _tool_upload_to_stage(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for upload_to_stage"""
@@ -1041,11 +1065,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
         await self.create_stage(name, url, storage_integration)
 
-        return {
-            "success": True,
-            "message": f"Created stage: {name}",
-            "stage": name
-        }
+        return {"success": True, "message": f"Created stage: {name}", "stage": name}
 
 
 def snowflake(**kwargs) -> SnowflakePlugin:

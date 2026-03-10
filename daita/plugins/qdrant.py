@@ -3,6 +3,7 @@ Qdrant vector database plugin for Daita Agents.
 
 Self-hosted vector database with advanced filtering and high performance.
 """
+
 import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
@@ -28,7 +29,7 @@ class QdrantPlugin(BaseVectorPlugin):
         api_key: Optional[str] = None,
         collection: str = "default",
         embedding_fn: Optional[Callable] = None,
-        **kwargs
+        **kwargs,
     ):
         """
         Initialize Qdrant connection.
@@ -50,7 +51,7 @@ class QdrantPlugin(BaseVectorPlugin):
             url=url,
             api_key=api_key,
             collection=collection,
-            **kwargs  # embedding_fn is not forwarded
+            **kwargs,  # embedding_fn is not forwarded
         )
 
         logger.debug(f"Qdrant plugin configured for {url}, collection '{collection}'")
@@ -70,12 +71,16 @@ class QdrantPlugin(BaseVectorPlugin):
                 self._client.get_collection(self.collection_name)
                 logger.info(f"Connected to Qdrant collection '{self.collection_name}'")
             except Exception:
-                logger.warning(f"Collection '{self.collection_name}' does not exist. Create it with create_collection()")
+                logger.warning(
+                    f"Collection '{self.collection_name}' does not exist. Create it with create_collection()"
+                )
 
         except ImportError:
             self._handle_connection_error(
-                ImportError("qdrant-client not installed. Install with: pip install 'daita-agents[qdrant]'"),
-                "connection"
+                ImportError(
+                    "qdrant-client not installed. Install with: pip install 'daita-agents[qdrant]'"
+                ),
+                "connection",
             )
         except Exception as e:
             self._handle_connection_error(e, "connection")
@@ -103,9 +108,7 @@ class QdrantPlugin(BaseVectorPlugin):
         for key, value in filter_dict.items():
             if key.startswith("$"):
                 continue  # Skip operators for now
-            conditions.append(
-                FieldCondition(key=key, match=MatchValue(value=value))
-            )
+            conditions.append(FieldCondition(key=key, match=MatchValue(value=value)))
 
         return Filter(must=conditions) if conditions else None
 
@@ -113,7 +116,7 @@ class QdrantPlugin(BaseVectorPlugin):
         self,
         ids: List[str],
         vectors: List[List[float]],
-        metadata: Optional[List[Dict]] = None
+        metadata: Optional[List[Dict]] = None,
     ) -> Dict[str, Any]:
         """
         Insert or update vectors in Qdrant.
@@ -145,15 +148,16 @@ class QdrantPlugin(BaseVectorPlugin):
 
         # Upsert points
         result = self._client.upsert(
-            collection_name=self.collection_name,
-            points=points
+            collection_name=self.collection_name, points=points
         )
 
         return {
             "success": True,
             "upserted_count": len(ids),
-            "operation_id": result.operation_id if hasattr(result, 'operation_id') else None,
-            "collection": self.collection_name
+            "operation_id": (
+                result.operation_id if hasattr(result, "operation_id") else None
+            ),
+            "collection": self.collection_name,
         }
 
     async def query(
@@ -162,7 +166,7 @@ class QdrantPlugin(BaseVectorPlugin):
         top_k: int = 10,
         filter: Optional[Dict] = None,
         with_payload: bool = True,
-        with_vectors: bool = False
+        with_vectors: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Search for similar vectors in Qdrant.
@@ -189,22 +193,25 @@ class QdrantPlugin(BaseVectorPlugin):
             limit=top_k,
             query_filter=qdrant_filter,
             with_payload=with_payload,
-            with_vectors=with_vectors
+            with_vectors=with_vectors,
         ).points
 
         # Convert to list of dicts
         matches = []
         for result in results:
             # Get original ID from payload if it exists
-            original_id = result.payload.get("_original_id", result.id) if result.payload else result.id
+            original_id = (
+                result.payload.get("_original_id", result.id)
+                if result.payload
+                else result.id
+            )
 
-            match = {
-                "id": original_id,
-                "score": result.score
-            }
+            match = {"id": original_id, "score": result.score}
             if with_payload and result.payload:
                 # Remove internal fields from payload
-                payload = {k: v for k, v in result.payload.items() if not k.startswith("_")}
+                payload = {
+                    k: v for k, v in result.payload.items() if not k.startswith("_")
+                }
                 match["payload"] = payload
             if with_vectors and result.vector:
                 match["vector"] = result.vector
@@ -213,9 +220,7 @@ class QdrantPlugin(BaseVectorPlugin):
         return matches
 
     async def delete(
-        self,
-        ids: Optional[List[str]] = None,
-        filter: Optional[Dict] = None
+        self, ids: Optional[List[str]] = None, filter: Optional[Dict] = None
     ) -> Dict[str, Any]:
         """
         Delete vectors from Qdrant.
@@ -232,42 +237,39 @@ class QdrantPlugin(BaseVectorPlugin):
 
         if ids:
             import uuid
+
             # Convert string IDs to UUIDs
             id_uuids = [str(uuid.uuid5(uuid.NAMESPACE_DNS, id)) for id in ids]
 
             result = self._client.delete(
-                collection_name=self.collection_name,
-                points_selector=id_uuids
+                collection_name=self.collection_name, points_selector=id_uuids
             )
             return {
                 "success": True,
                 "deleted_count": len(ids),
-                "operation_id": result.operation_id if hasattr(result, 'operation_id') else None,
-                "collection": self.collection_name
+                "operation_id": (
+                    result.operation_id if hasattr(result, "operation_id") else None
+                ),
+                "collection": self.collection_name,
             }
         elif filter:
             qdrant_filter = self._dict_to_filter(filter)
             result = self._client.delete(
-                collection_name=self.collection_name,
-                points_selector=qdrant_filter
+                collection_name=self.collection_name, points_selector=qdrant_filter
             )
             return {
                 "success": True,
                 "deleted": "by_filter",
-                "operation_id": result.operation_id if hasattr(result, 'operation_id') else None,
-                "collection": self.collection_name
+                "operation_id": (
+                    result.operation_id if hasattr(result, "operation_id") else None
+                ),
+                "collection": self.collection_name,
             }
         else:
-            return {
-                "success": False,
-                "error": "Must provide ids or filter"
-            }
+            return {"success": False, "error": "Must provide ids or filter"}
 
     async def fetch(
-        self,
-        ids: List[str],
-        with_payload: bool = True,
-        with_vectors: bool = True
+        self, ids: List[str], with_payload: bool = True, with_vectors: bool = True
     ) -> List[Dict[str, Any]]:
         """
         Fetch vectors by ID from Qdrant.
@@ -284,6 +286,7 @@ class QdrantPlugin(BaseVectorPlugin):
             await self.connect()
 
         import uuid
+
         # Convert string IDs to UUIDs
         id_uuids = [str(uuid.uuid5(uuid.NAMESPACE_DNS, id)) for id in ids]
 
@@ -291,19 +294,25 @@ class QdrantPlugin(BaseVectorPlugin):
             collection_name=self.collection_name,
             ids=id_uuids,
             with_payload=with_payload,
-            with_vectors=with_vectors
+            with_vectors=with_vectors,
         )
 
         # Convert to list of dicts
         vectors = []
         for result in results:
             # Get original ID from payload if it exists
-            original_id = result.payload.get("_original_id", result.id) if result.payload else result.id
+            original_id = (
+                result.payload.get("_original_id", result.id)
+                if result.payload
+                else result.id
+            )
 
             vector = {"id": original_id}
             if with_payload and result.payload:
                 # Remove internal fields from payload
-                payload = {k: v for k, v in result.payload.items() if not k.startswith("_")}
+                payload = {
+                    k: v for k, v in result.payload.items() if not k.startswith("_")
+                }
                 vector["payload"] = payload
             if with_vectors and result.vector:
                 vector["vector"] = result.vector
@@ -312,10 +321,7 @@ class QdrantPlugin(BaseVectorPlugin):
         return vectors
 
     async def create_collection(
-        self,
-        name: str,
-        vector_size: int,
-        distance: str = "Cosine"
+        self, name: str, vector_size: int, distance: str = "Cosine"
     ) -> Dict[str, Any]:
         """
         Create a new collection in Qdrant (Qdrant-specific).
@@ -337,7 +343,7 @@ class QdrantPlugin(BaseVectorPlugin):
         distance_map = {
             "Cosine": Distance.COSINE,
             "Euclid": Distance.EUCLID,
-            "Dot": Distance.DOT
+            "Dot": Distance.DOT,
         }
 
         distance_metric = distance_map.get(distance, Distance.COSINE)
@@ -345,20 +351,16 @@ class QdrantPlugin(BaseVectorPlugin):
         try:
             self._client.create_collection(
                 collection_name=name,
-                vectors_config=VectorParams(size=vector_size, distance=distance_metric)
+                vectors_config=VectorParams(size=vector_size, distance=distance_metric),
             )
             return {
                 "success": True,
                 "collection": name,
                 "vector_size": vector_size,
-                "distance": distance
+                "distance": distance,
             }
         except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "collection": name
-            }
+            return {"success": False, "error": str(e), "collection": name}
 
     async def list_collections(self) -> List[str]:
         """
@@ -373,7 +375,7 @@ class QdrantPlugin(BaseVectorPlugin):
         collections = self._client.get_collections()
         return [col.name for col in collections.collections]
 
-    def get_tools(self) -> List['AgentTool']:
+    def get_tools(self) -> List["AgentTool"]:
         """
         Expose Qdrant operations as agent tools.
 
@@ -392,28 +394,28 @@ class QdrantPlugin(BaseVectorPlugin):
                         "vector": {
                             "type": "array",
                             "description": "Query vector as array of floats",
-                            "items": {"type": "number"}
+                            "items": {"type": "number"},
                         },
                         "text": {
                             "type": "string",
-                            "description": "Query text (auto-embedded via configured embedding_fn; use instead of vector)"
+                            "description": "Query text (auto-embedded via configured embedding_fn; use instead of vector)",
                         },
                         "top_k": {
                             "type": "integer",
-                            "description": "Maximum number of results to return (default: 10)"
+                            "description": "Maximum number of results to return (default: 10)",
                         },
                         "filter": {
                             "type": "object",
-                            "description": "Simple filter dict (e.g., {\"category\": \"tech\"})"
-                        }
+                            "description": 'Simple filter dict (e.g., {"category": "tech"})',
+                        },
                     },
-                    "required": []
+                    "required": [],
                 },
                 handler=self._tool_search,
                 category="vector_db",
                 source="plugin",
                 plugin_name="Qdrant",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="qdrant_upsert",
@@ -424,29 +426,26 @@ class QdrantPlugin(BaseVectorPlugin):
                         "ids": {
                             "type": "array",
                             "description": "List of unique vector IDs",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         },
                         "vectors": {
                             "type": "array",
                             "description": "List of vectors (each vector is an array of floats)",
-                            "items": {
-                                "type": "array",
-                                "items": {"type": "number"}
-                            }
+                            "items": {"type": "array", "items": {"type": "number"}},
                         },
                         "metadata": {
                             "type": "array",
                             "description": "Optional list of metadata (payload) objects",
-                            "items": {"type": "object"}
-                        }
+                            "items": {"type": "object"},
+                        },
                     },
-                    "required": ["ids", "vectors"]
+                    "required": ["ids", "vectors"],
                 },
                 handler=self._tool_upsert,
                 category="vector_db",
                 source="plugin",
                 plugin_name="Qdrant",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="qdrant_delete",
@@ -457,20 +456,20 @@ class QdrantPlugin(BaseVectorPlugin):
                         "ids": {
                             "type": "array",
                             "description": "List of vector IDs to delete",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         },
                         "filter": {
                             "type": "object",
-                            "description": "Simple filter dict for deletion"
-                        }
+                            "description": "Simple filter dict for deletion",
+                        },
                     },
-                    "required": []
+                    "required": [],
                 },
                 handler=self._tool_delete,
                 category="vector_db",
                 source="plugin",
                 plugin_name="Qdrant",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="qdrant_create_collection",
@@ -478,27 +477,24 @@ class QdrantPlugin(BaseVectorPlugin):
                 parameters={
                     "type": "object",
                     "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Collection name"
-                        },
+                        "name": {"type": "string", "description": "Collection name"},
                         "vector_size": {
                             "type": "integer",
-                            "description": "Dimension of vectors"
+                            "description": "Dimension of vectors",
                         },
                         "distance": {
                             "type": "string",
-                            "description": "Distance metric: 'Cosine', 'Euclid', or 'Dot' (default: 'Cosine')"
-                        }
+                            "description": "Distance metric: 'Cosine', 'Euclid', or 'Dot' (default: 'Cosine')",
+                        },
                     },
-                    "required": ["name", "vector_size"]
+                    "required": ["name", "vector_size"],
                 },
                 handler=self._tool_create_collection,
                 category="vector_db",
                 source="plugin",
                 plugin_name="Qdrant",
-                timeout_seconds=30
-            )
+                timeout_seconds=30,
+            ),
         ]
 
     async def _tool_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -516,17 +512,9 @@ class QdrantPlugin(BaseVectorPlugin):
             result = self._embedding_fn(text)
             vector = await result if asyncio.iscoroutine(result) else result
 
-        matches = await self.query(
-            vector=vector,
-            top_k=top_k,
-            filter=filter
-        )
+        matches = await self.query(vector=vector, top_k=top_k, filter=filter)
 
-        return {
-            "success": True,
-            "matches": matches,
-            "count": len(matches)
-        }
+        return {"success": True, "matches": matches, "count": len(matches)}
 
     async def _tool_upsert(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for qdrant_upsert"""
@@ -534,11 +522,7 @@ class QdrantPlugin(BaseVectorPlugin):
         vectors = args.get("vectors")
         metadata = args.get("metadata")
 
-        result = await self.upsert(
-            ids=ids,
-            vectors=vectors,
-            metadata=metadata
-        )
+        result = await self.upsert(ids=ids, vectors=vectors, metadata=metadata)
 
         return result
 
@@ -557,9 +541,7 @@ class QdrantPlugin(BaseVectorPlugin):
         distance = args.get("distance", "Cosine")
 
         result = await self.create_collection(
-            name=name,
-            vector_size=vector_size,
-            distance=distance
+            name=name, vector_size=vector_size, distance=distance
         )
 
         return result

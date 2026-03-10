@@ -90,7 +90,7 @@ class WebSearchPlugin(BasePlugin):
         include_answer: bool = True,
         include_raw_content: bool = False,
         max_page_length: int = 10000,
-        **kwargs
+        **kwargs,
     ):
         """Initialize WebSearch plugin with Tavily configuration."""
         # Get API key from parameter or environment variable
@@ -105,7 +105,9 @@ class WebSearchPlugin(BasePlugin):
 
         # Validate search depth
         if search_depth not in ["basic", "advanced"]:
-            raise ValueError(f"search_depth must be 'basic' or 'advanced', got: {search_depth}")
+            raise ValueError(
+                f"search_depth must be 'basic' or 'advanced', got: {search_depth}"
+            )
 
         # Store configuration
         self._max_results = max_results
@@ -118,7 +120,9 @@ class WebSearchPlugin(BasePlugin):
         self._client = None
         self._session = None  # For fetch_page
 
-        logger.info(f"WebSearchPlugin initialized (depth: {search_depth}, max_results: {max_results})")
+        logger.info(
+            f"WebSearchPlugin initialized (depth: {search_depth}, max_results: {max_results})"
+        )
 
     async def connect(self):
         """Initialize Tavily client and HTTP session."""
@@ -134,6 +138,7 @@ class WebSearchPlugin(BasePlugin):
 
             # Initialize aiohttp session for fetch_page
             import aiohttp
+
             self._session = aiohttp.ClientSession()
 
             logger.info("Connected to Tavily Search API")
@@ -171,7 +176,7 @@ class WebSearchPlugin(BasePlugin):
         self,
         query: str,
         max_results: Optional[int] = None,
-        include_answer: Optional[bool] = None
+        include_answer: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
         Search the web using Tavily's AI-optimized search.
@@ -188,7 +193,9 @@ class WebSearchPlugin(BasePlugin):
             await self.connect()
 
         max_results = max_results if max_results is not None else self._max_results
-        include_answer = include_answer if include_answer is not None else self._include_answer
+        include_answer = (
+            include_answer if include_answer is not None else self._include_answer
+        )
 
         try:
             # Call Tavily search API
@@ -197,26 +204,28 @@ class WebSearchPlugin(BasePlugin):
                 max_results=max_results,
                 search_depth=self._search_depth,
                 include_answer=include_answer,
-                include_raw_content=self._include_raw_content
+                include_raw_content=self._include_raw_content,
             )
 
             # Extract results
             results = []
             for item in response.get("results", []):
-                results.append({
-                    "title": item.get("title", ""),
-                    "url": item.get("url", ""),
-                    "content": item.get("content", ""),
-                    "score": item.get("score", 0.0),
-                    "published_date": item.get("published_date")
-                })
+                results.append(
+                    {
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "content": item.get("content", ""),
+                        "score": item.get("score", 0.0),
+                        "published_date": item.get("published_date"),
+                    }
+                )
 
             return {
                 "success": True,
                 "query": query,
                 "answer": response.get("answer", ""),
                 "results": results,
-                "count": len(results)
+                "count": len(results),
             }
 
         except Exception as e:
@@ -224,10 +233,7 @@ class WebSearchPlugin(BasePlugin):
             raise self._handle_search_error(e)
 
     async def search_news(
-        self,
-        query: str,
-        days: int = 7,
-        max_results: Optional[int] = None
+        self, query: str, days: int = 7, max_results: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Search for recent news articles.
@@ -252,25 +258,27 @@ class WebSearchPlugin(BasePlugin):
                 topic="news",
                 days=days,
                 max_results=max_results,
-                search_depth=self._search_depth
+                search_depth=self._search_depth,
             )
 
             # Extract results
             results = []
             for item in response.get("results", []):
-                results.append({
-                    "title": item.get("title", ""),
-                    "url": item.get("url", ""),
-                    "content": item.get("content", ""),
-                    "score": item.get("score", 0.0),
-                    "published_date": item.get("published_date")
-                })
+                results.append(
+                    {
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "content": item.get("content", ""),
+                        "score": item.get("score", 0.0),
+                        "published_date": item.get("published_date"),
+                    }
+                )
 
             return {
                 "success": True,
                 "query": query,
                 "results": results,
-                "count": len(results)
+                "count": len(results),
             }
 
         except Exception as e:
@@ -301,6 +309,7 @@ class WebSearchPlugin(BasePlugin):
 
             # Parse HTML and extract text
             from bs4 import BeautifulSoup
+
             soup = BeautifulSoup(html, "lxml")
 
             # Remove script and style elements
@@ -318,14 +327,14 @@ class WebSearchPlugin(BasePlugin):
             # Truncate if needed
             truncated = len(text) > self._max_page_length
             if truncated:
-                text = text[:self._max_page_length]
+                text = text[: self._max_page_length]
 
             return {
                 "success": True,
                 "url": url,
                 "content": text,
                 "length": len(text),
-                "truncated": truncated
+                "truncated": truncated,
             }
 
         except Exception as e:
@@ -337,52 +346,49 @@ class WebSearchPlugin(BasePlugin):
         error_msg = str(e).lower()
 
         # Rate limiting (429)
-        if "rate limit" in error_msg or "429" in error_msg or "too many requests" in error_msg:
+        if (
+            "rate limit" in error_msg
+            or "429" in error_msg
+            or "too many requests" in error_msg
+        ):
             return RateLimitError(
                 message=f"Tavily API rate limit exceeded: {e}",
-                retry_after=60  # Assume 1 minute
+                retry_after=60,  # Assume 1 minute
             )
 
         # Authentication errors (401, 403)
-        if "unauthorized" in error_msg or "401" in error_msg or "invalid api key" in error_msg:
+        if (
+            "unauthorized" in error_msg
+            or "401" in error_msg
+            or "invalid api key" in error_msg
+        ):
             return AuthenticationError(
                 message=f"Invalid Tavily API key. Get one at https://tavily.com: {e}"
             )
 
         if "forbidden" in error_msg or "403" in error_msg:
-            return PermanentError(
-                message=f"Tavily API access forbidden: {e}"
-            )
+            return PermanentError(message=f"Tavily API access forbidden: {e}")
 
         # Bad requests (400)
         if "bad request" in error_msg or "400" in error_msg:
-            return PermanentError(
-                message=f"Invalid search query: {e}"
-            )
+            return PermanentError(message=f"Invalid search query: {e}")
 
         # Timeout errors
         if "timeout" in error_msg or "timed out" in error_msg:
             return TimeoutError(
-                message=f"Tavily API request timed out: {e}",
-                timeout_duration=30
+                message=f"Tavily API request timed out: {e}", timeout_duration=30
             )
 
         # Connection errors
         if "connection" in error_msg or "network" in error_msg:
-            return DaitaConnectionError(
-                message=f"Connection to Tavily API failed: {e}"
-            )
+            return DaitaConnectionError(message=f"Connection to Tavily API failed: {e}")
 
         # Service unavailable (503)
         if "503" in error_msg or "unavailable" in error_msg:
-            return TransientError(
-                message=f"Tavily API temporarily unavailable: {e}"
-            )
+            return TransientError(message=f"Tavily API temporarily unavailable: {e}")
 
         # Default to retryable error
-        return RetryableError(
-            message=f"Tavily search error: {e}"
-        )
+        return RetryableError(message=f"Tavily search error: {e}")
 
     def _handle_fetch_error(self, e: Exception, url: str) -> Exception:
         """Convert fetch_page errors to DAITA error hierarchy."""
@@ -391,31 +397,22 @@ class WebSearchPlugin(BasePlugin):
         # Timeout errors
         if "timeout" in error_msg or "timed out" in error_msg:
             return TimeoutError(
-                message=f"Timeout fetching {url}: {e}",
-                timeout_duration=30
+                message=f"Timeout fetching {url}: {e}", timeout_duration=30
             )
 
         # Connection errors
         if "connection" in error_msg or "cannot connect" in error_msg:
-            return DaitaConnectionError(
-                message=f"Connection failed for {url}: {e}"
-            )
+            return DaitaConnectionError(message=f"Connection failed for {url}: {e}")
 
         # HTTP errors
         if "404" in error_msg:
-            return PermanentError(
-                message=f"URL not found: {url}"
-            )
+            return PermanentError(message=f"URL not found: {url}")
 
         if "403" in error_msg or "forbidden" in error_msg:
-            return PermanentError(
-                message=f"Access forbidden for {url}: {e}"
-            )
+            return PermanentError(message=f"Access forbidden for {url}: {e}")
 
         # Default to retryable error
-        return RetryableError(
-            message=f"Failed to fetch {url}: {e}"
-        )
+        return RetryableError(message=f"Failed to fetch {url}: {e}")
 
     # Tool handlers
     async def _tool_search_web(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -439,7 +436,7 @@ class WebSearchPlugin(BasePlugin):
         url = args.get("url")
         return await self.fetch_page(url)
 
-    def get_tools(self) -> List['AgentTool']:
+    def get_tools(self) -> List["AgentTool"]:
         """Expose web search operations as agent tools."""
         from ..core.tools import AgentTool
 
@@ -457,26 +454,25 @@ class WebSearchPlugin(BasePlugin):
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search query (e.g., 'Python async best practices', 'what is quantum computing')"
+                            "description": "Search query (e.g., 'Python async best practices', 'what is quantum computing')",
                         },
                         "max_results": {
                             "type": "integer",
-                            "description": f"Number of results to return (optional, default: {self._max_results})"
+                            "description": f"Number of results to return (optional, default: {self._max_results})",
                         },
                         "include_answer": {
                             "type": "boolean",
-                            "description": f"Include AI-extracted direct answer (optional, default: {self._include_answer})"
-                        }
+                            "description": f"Include AI-extracted direct answer (optional, default: {self._include_answer})",
+                        },
                     },
-                    "required": ["query"]
+                    "required": ["query"],
                 },
                 handler=self._tool_search_web,
                 category="search",
                 source="plugin",
                 plugin_name="WebSearch",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
-
             AgentTool(
                 name="search_news",
                 description=(
@@ -489,26 +485,25 @@ class WebSearchPlugin(BasePlugin):
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "News search query (e.g., 'AI developments', 'Tesla earnings')"
+                            "description": "News search query (e.g., 'AI developments', 'Tesla earnings')",
                         },
                         "days": {
                             "type": "integer",
-                            "description": "How many days back to search (optional, default: 7)"
+                            "description": "How many days back to search (optional, default: 7)",
                         },
                         "max_results": {
                             "type": "integer",
-                            "description": f"Number of results to return (optional, default: {self._max_results})"
-                        }
+                            "description": f"Number of results to return (optional, default: {self._max_results})",
+                        },
                     },
-                    "required": ["query"]
+                    "required": ["query"],
                 },
                 handler=self._tool_search_news,
                 category="search",
                 source="plugin",
                 plugin_name="WebSearch",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
-
             AgentTool(
                 name="fetch_page",
                 description=(
@@ -521,17 +516,17 @@ class WebSearchPlugin(BasePlugin):
                     "properties": {
                         "url": {
                             "type": "string",
-                            "description": "URL to fetch (must be a valid HTTP/HTTPS URL)"
+                            "description": "URL to fetch (must be a valid HTTP/HTTPS URL)",
                         }
                     },
-                    "required": ["url"]
+                    "required": ["url"],
                 },
                 handler=self._tool_fetch_page,
                 category="search",
                 source="plugin",
                 plugin_name="WebSearch",
-                timeout_seconds=30
-            )
+                timeout_seconds=30,
+            ),
         ]
 
 

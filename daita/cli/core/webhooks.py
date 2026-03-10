@@ -4,6 +4,7 @@ Webhook CLI commands for listing and managing webhook configurations.
 Provides user-friendly access to webhook URLs and configurations
 with organization-level security and optional API key filtering.
 """
+
 import os
 import asyncio
 import aiohttp
@@ -42,7 +43,7 @@ async def list_webhooks(api_key_only: bool = False, verbose: bool = False) -> bo
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": f"Daita-CLI/{_CLI_VERSION}"
+            "User-Agent": f"Daita-CLI/{_CLI_VERSION}",
         }
 
         # Create secure SSL context
@@ -67,7 +68,9 @@ async def list_webhooks(api_key_only: bool = False, verbose: bool = False) -> bo
                     return False
                 elif response.status == 404:
                     print(" No webhook configurations found.")
-                    print("   Deploy a project with webhook configurations using 'daita push'")
+                    print(
+                        "   Deploy a project with webhook configurations using 'daita push'"
+                    )
                     return True
                 else:
                     error_text = await response.text()
@@ -88,6 +91,7 @@ async def list_webhooks(api_key_only: bool = False, verbose: bool = False) -> bo
         print(f" Error fetching webhooks: {str(e)}")
         if verbose:
             import traceback
+
             traceback.print_exc()
         return False
 
@@ -157,5 +161,5 @@ async def _display_webhooks(data: Dict[str, Any], verbose: bool = False) -> None
     print("🔧 Example:")
     print("   curl -X POST '<webhook-url>' \\")
     print("        -H 'Content-Type: application/json' \\")
-    print("        -d '{\"your\": \"payload\"}'")
+    print('        -d \'{"your": "payload"}\'')
     print("")

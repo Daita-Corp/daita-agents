@@ -71,6 +71,6 @@ tavily-python>=0.3.0
 # === DEVELOPMENT DEPENDENCIES (commented out for Lambda) ===
 # The following are excluded from Lambda layer as they're not needed:
 # fastapi==0.115.12          # Web server not needed in Lambda
-# uvicorn==0.34.2            # ASGI server not needed in Lambda  
+# uvicorn==0.34.2            # ASGI server not needed in Lambda
 # pytest==8.3.5             # Testing framework not needed in Lambda
 # pytest_asyncio==0.26.0    # Testing utilities not needed in Lambda

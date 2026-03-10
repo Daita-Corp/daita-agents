@@ -15,11 +15,11 @@ from typing import Optional
 
 from ..utils import get_api_endpoint, _CLI_VERSION
 
-_KEY_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]{0,127}$')
+_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 
 
 def _get_headers() -> dict:
-    api_key = os.getenv('DAITA_API_KEY')
+    api_key = os.getenv("DAITA_API_KEY")
     if not api_key:
         raise ValueError(
             "DAITA_API_KEY not set.\n"
@@ -65,7 +65,7 @@ async def set_secret(key: str, value: str, verbose: bool = False) -> bool:
                 url,
                 headers=headers,
                 json={"key": key, "value": value},
-                timeout=aiohttp.ClientTimeout(total=15)
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status == 401:
                     print(" Invalid API key or authentication failed.")
@@ -95,6 +95,7 @@ async def set_secret(key: str, value: str, verbose: bool = False) -> bool:
         print(f" Error: {e}")
         if verbose:
             import traceback
+
             traceback.print_exc()
         return False
 
@@ -108,9 +109,7 @@ async def list_secrets(verbose: bool = False) -> bool:
         async with _make_session() as session:
             url = f"{api_endpoint}/api/v1/secrets"
             async with session.get(
-                url,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15)
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 401:
                     print(" Invalid API key or authentication failed.")
@@ -146,6 +145,7 @@ async def list_secrets(verbose: bool = False) -> bool:
         print(f" Error: {e}")
         if verbose:
             import traceback
+
             traceback.print_exc()
         return False
 
@@ -160,9 +160,7 @@ async def remove_secret(key: str, verbose: bool = False) -> bool:
         async with _make_session() as session:
             url = f"{api_endpoint}/api/v1/secrets/{key}"
             async with session.delete(
-                url,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15)
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 401:
                     print(" Invalid API key or authentication failed.")
@@ -191,6 +189,7 @@ async def remove_secret(key: str, verbose: bool = False) -> bool:
         print(f" Error: {e}")
         if verbose:
             import traceback
+
             traceback.print_exc()
         return False
 
@@ -209,14 +208,14 @@ async def import_env(env_file: str, verbose: bool = False) -> bool:
 
     pairs = []
     skipped = []
-    with open(env_path, 'r') as f:
+    with open(env_path, "r") as f:
         for raw_line in f:
             line = raw_line.strip()
-            if not line or line.startswith('#'):
+            if not line or line.startswith("#"):
                 continue
-            if '=' not in line:
+            if "=" not in line:
                 continue
-            key, _, value = line.partition('=')
+            key, _, value = line.partition("=")
             key = key.strip()
             value = value.strip().strip('"').strip("'")
             if not key or not value:

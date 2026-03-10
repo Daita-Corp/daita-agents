@@ -8,24 +8,145 @@ detecting exact phrase matches in content.
 import re
 from typing import List, Set
 
-
 # Common stop words to exclude from keyword extraction
 STOP_WORDS: Set[str] = {
-    'a', 'about', 'above', 'after', 'again', 'against', 'all', 'am', 'an', 'and',
-    'any', 'are', 'as', 'at', 'be', 'because', 'been', 'before', 'being', 'below',
-    'between', 'both', 'but', 'by', 'can', 'did', 'do', 'does', 'doing', 'don',
-    'down', 'during', 'each', 'few', 'for', 'from', 'further', 'had', 'has', 'have',
-    'having', 'he', 'her', 'here', 'hers', 'herself', 'him', 'himself', 'his', 'how',
-    'i', 'if', 'in', 'into', 'is', 'it', 'its', 'itself', 'just', 'me', 'might',
-    'more', 'most', 'must', 'my', 'myself', 'no', 'nor', 'not', 'now', 'of', 'off',
-    'on', 'once', 'only', 'or', 'other', 'our', 'ours', 'ourselves', 'out', 'over',
-    'own', 's', 'same', 'she', 'should', 'so', 'some', 'such', 't', 'than', 'that',
-    'the', 'their', 'theirs', 'them', 'themselves', 'then', 'there', 'these', 'they',
-    'this', 'those', 'through', 'to', 'too', 'under', 'until', 'up', 'very', 'was',
-    'we', 'were', 'what', 'when', 'where', 'which', 'while', 'who', 'whom', 'why',
-    'will', 'with', 'you', 'your', 'yours', 'yourself', 'yourselves',
+    "a",
+    "about",
+    "above",
+    "after",
+    "again",
+    "against",
+    "all",
+    "am",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
+    "be",
+    "because",
+    "been",
+    "before",
+    "being",
+    "below",
+    "between",
+    "both",
+    "but",
+    "by",
+    "can",
+    "did",
+    "do",
+    "does",
+    "doing",
+    "don",
+    "down",
+    "during",
+    "each",
+    "few",
+    "for",
+    "from",
+    "further",
+    "had",
+    "has",
+    "have",
+    "having",
+    "he",
+    "her",
+    "here",
+    "hers",
+    "herself",
+    "him",
+    "himself",
+    "his",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "itself",
+    "just",
+    "me",
+    "might",
+    "more",
+    "most",
+    "must",
+    "my",
+    "myself",
+    "no",
+    "nor",
+    "not",
+    "now",
+    "of",
+    "off",
+    "on",
+    "once",
+    "only",
+    "or",
+    "other",
+    "our",
+    "ours",
+    "ourselves",
+    "out",
+    "over",
+    "own",
+    "s",
+    "same",
+    "she",
+    "should",
+    "so",
+    "some",
+    "such",
+    "t",
+    "than",
+    "that",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "through",
+    "to",
+    "too",
+    "under",
+    "until",
+    "up",
+    "very",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "why",
+    "will",
+    "with",
+    "you",
+    "your",
+    "yours",
+    "yourself",
+    "yourselves",
     # Question words (common in queries)
-    'tell', 'remember', 'recall', 'find', 'show', 'get', 'give'
+    "tell",
+    "remember",
+    "recall",
+    "find",
+    "show",
+    "get",
+    "give",
 }
 
 
@@ -46,7 +167,7 @@ def normalize_text(text: str) -> str:
     text = text.lower()
 
     # Collapse multiple spaces to single space
-    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r"\s+", " ", text)
 
     # Strip leading/trailing whitespace
     text = text.strip()
@@ -74,13 +195,13 @@ def extract_keywords(query: str) -> List[str]:
 
     # First pass: find version numbers with special regex
     # Matches: 0.7.0, v2.1, 2.0.0, version 1.2, etc.
-    version_pattern = r'\b(?:v(?:ersion)?\s*)?(\d+\.\d+(?:\.\d+)?(?:-[a-z0-9]+)?)\b'
+    version_pattern = r"\b(?:v(?:ersion)?\s*)?(\d+\.\d+(?:\.\d+)?(?:-[a-z0-9]+)?)\b"
     versions = re.findall(version_pattern, query, re.IGNORECASE)
     keywords.extend(versions)
 
     # Second pass: tokenize and filter
     # Split on whitespace and common punctuation (but preserve dots in versions)
-    tokens = re.findall(r'\b[\w.-]+\b', query)
+    tokens = re.findall(r"\b[\w.-]+\b", query)
 
     for token in tokens:
         token_lower = token.lower()
@@ -131,12 +252,12 @@ def contains_exact_phrase(query: str, content: str) -> bool:
 
     # Extract potential phrases (2+ consecutive words)
     # Split on punctuation but keep words together
-    query_tokens = re.findall(r'\b[\w.-]+\b', query_norm)
+    query_tokens = re.findall(r"\b[\w.-]+\b", query_norm)
 
     # Generate all 2-word, 3-word, and 4-word phrases
     for phrase_len in [4, 3, 2]:  # Check longer phrases first
         for i in range(len(query_tokens) - phrase_len + 1):
-            phrase = ' '.join(query_tokens[i:i + phrase_len])
+            phrase = " ".join(query_tokens[i : i + phrase_len])
 
             # Skip if phrase is mostly stop words
             phrase_words = phrase.split()
@@ -169,12 +290,12 @@ def get_exact_phrases(query: str, content: str) -> List[str]:
     query_norm = normalize_text(query)
     content_norm = normalize_text(content)
 
-    query_tokens = re.findall(r'\b[\w.-]+\b', query_norm)
+    query_tokens = re.findall(r"\b[\w.-]+\b", query_norm)
 
     # Generate all 2-word, 3-word, and 4-word phrases
     for phrase_len in [4, 3, 2]:
         for i in range(len(query_tokens) - phrase_len + 1):
-            phrase = ' '.join(query_tokens[i:i + phrase_len])
+            phrase = " ".join(query_tokens[i : i + phrase_len])
 
             # Skip if phrase is mostly stop words
             phrase_words = phrase.split()
@@ -206,32 +327,32 @@ def clean_memory_content(text: str) -> str:
     """
     # Common LLM prefixes to strip (case-insensitive)
     prefixes = [
-        r'^today i learned that\s*',
-        r'^today i learned\s*',
-        r'^i learned that\s*',
-        r'^i learned\s*',
-        r'^i discovered that\s*',
-        r'^i discovered\s*',
-        r'^note that\s*',
-        r'^it\'?s important to (?:note|remember) that\s*',
-        r'^it\'?s important to (?:note|remember)\s*',
-        r'^remember that\s*',
-        r'^(?:please )?(?:note|remember):\s*',
-        r'^the user (?:said|mentioned|told me) that\s*',
-        r'^the user (?:said|mentioned|told me)\s*',
-        r'^user preference:\s*',
-        r'^key (?:point|insight|learning):\s*',
-        r'^important:\s*',
+        r"^today i learned that\s*",
+        r"^today i learned\s*",
+        r"^i learned that\s*",
+        r"^i learned\s*",
+        r"^i discovered that\s*",
+        r"^i discovered\s*",
+        r"^note that\s*",
+        r"^it\'?s important to (?:note|remember) that\s*",
+        r"^it\'?s important to (?:note|remember)\s*",
+        r"^remember that\s*",
+        r"^(?:please )?(?:note|remember):\s*",
+        r"^the user (?:said|mentioned|told me) that\s*",
+        r"^the user (?:said|mentioned|told me)\s*",
+        r"^user preference:\s*",
+        r"^key (?:point|insight|learning):\s*",
+        r"^important:\s*",
     ]
 
     cleaned = text.strip()
 
     # Try each prefix pattern
     for pattern in prefixes:
-        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
 
     # Remove leading punctuation artifacts (colons, dashes)
-    cleaned = re.sub(r'^[\s:,-]+', '', cleaned)
+    cleaned = re.sub(r"^[\s:,-]+", "", cleaned)
 
     # Capitalize first letter if needed
     if cleaned and cleaned[0].islower():

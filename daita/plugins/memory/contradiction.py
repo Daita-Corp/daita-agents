@@ -179,12 +179,14 @@ class ContradictionChecker:
             )
             # Strip markdown code fences if the model wraps its JSON output
             raw = response.strip()
-            fence_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', raw, re.DOTALL)
+            fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
             if fence_match:
                 raw = fence_match.group(1).strip()
             data = json.loads(raw)
             self._last_reason = data.get("reason", "")
             return data.get("result", "NO_CONFLICT").upper()
         except Exception as e:
-            logger.debug("Contradiction check failed: %s — defaulting to no_conflict", e)
+            logger.debug(
+                "Contradiction check failed: %s — defaulting to no_conflict", e
+            )
             return "NO_CONFLICT"

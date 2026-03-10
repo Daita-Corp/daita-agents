@@ -25,7 +25,6 @@ import pytest
 
 from daita import Agent, ConversationHistory
 
-
 # ---------------------------------------------------------------------------
 # Shared fixture
 # ---------------------------------------------------------------------------
@@ -47,6 +46,7 @@ def _agent() -> Agent:
 # 1. New conversation auto-generates a valid UUID session_id
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.requires_llm
 async def test_new_conversation_generates_uuid_session_id(tmp_path):
     """ConversationHistory() with no session_id should create a valid UUID."""
@@ -61,6 +61,7 @@ async def test_new_conversation_generates_uuid_session_id(tmp_path):
 # ---------------------------------------------------------------------------
 # 2. UUID is used as the session file name on disk
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.requires_llm
 async def test_uuid_persisted_as_session_file(tmp_path):
@@ -82,6 +83,7 @@ async def test_uuid_persisted_as_session_file(tmp_path):
 # 3. Multi-turn memory: agent recalls earlier context in the same session
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.requires_llm
 async def test_agent_recalls_name_within_session(tmp_path):
     """Agent should remember a name provided in an earlier turn of the same session."""
@@ -94,14 +96,15 @@ async def test_agent_recalls_name_within_session(tmp_path):
         history=history,
     )
 
-    assert "jordan" in response.lower(), (
-        f"Expected agent to recall 'Jordan', got: {response!r}"
-    )
+    assert (
+        "jordan" in response.lower()
+    ), f"Expected agent to recall 'Jordan', got: {response!r}"
 
 
 # ---------------------------------------------------------------------------
 # 4. Resume: load() restores session, agent recalls prior context
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.requires_llm
 async def test_resume_conversation_recalls_prior_context(tmp_path):
@@ -134,14 +137,15 @@ async def test_resume_conversation_recalls_prior_context(tmp_path):
         history=resumed,
     )
 
-    assert "indigo" in response.lower(), (
-        f"Expected agent to recall 'indigo' after resume, got: {response!r}"
-    )
+    assert (
+        "indigo" in response.lower()
+    ), f"Expected agent to recall 'indigo' after resume, got: {response!r}"
 
 
 # ---------------------------------------------------------------------------
 # 5. Multiple independent conversations stay isolated
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.requires_llm
 async def test_two_conversations_stay_independent(tmp_path):
@@ -177,6 +181,7 @@ async def test_two_conversations_stay_independent(tmp_path):
 # 6. clear() breaks in-memory context — agent no longer recalls prior turns
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.requires_llm
 async def test_clear_breaks_context(tmp_path):
     """After clear(), the agent should have no memory of what was said before."""
@@ -196,14 +201,15 @@ async def test_clear_breaks_context(tmp_path):
         history=history,
     )
 
-    assert "zephyr" not in response.lower(), (
-        f"Agent should not recall ZEPHYR after clear(), got: {response!r}"
-    )
+    assert (
+        "zephyr" not in response.lower()
+    ), f"Agent should not recall ZEPHYR after clear(), got: {response!r}"
 
 
 # ---------------------------------------------------------------------------
 # 7. auto_save writes file after every turn without manual save()
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.requires_llm
 async def test_auto_save_writes_after_each_turn(tmp_path):
@@ -220,7 +226,9 @@ async def test_auto_save_writes_after_each_turn(tmp_path):
 
     await agent.run("Hello. Just say hi back.", history=history)
 
-    assert history.session_path.exists(), "File should exist after first turn with auto_save=True"
+    assert (
+        history.session_path.exists()
+    ), "File should exist after first turn with auto_save=True"
     assert history.turn_count == 1
 
     await agent.run("And again. Just say hi.", history=history)
@@ -228,6 +236,7 @@ async def test_auto_save_writes_after_each_turn(tmp_path):
     assert history.turn_count == 2
     # File should reflect the latest state
     import json
+
     saved = json.loads(history.session_path.read_text())
     assert len(saved) == 4  # 2 turns × 2 messages each
 
@@ -235,6 +244,7 @@ async def test_auto_save_writes_after_each_turn(tmp_path):
 # ---------------------------------------------------------------------------
 # 8. session_id is stable across the lifetime of a ConversationHistory object
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.requires_llm
 async def test_session_id_stable_across_turns(tmp_path):

@@ -26,10 +26,10 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "a": {"type": "number", "description": "First number"},
-                    "b": {"type": "number", "description": "Second number"}
+                    "b": {"type": "number", "description": "Second number"},
                 },
-                "required": ["a", "b"]
-            }
+                "required": ["a", "b"],
+            },
         ),
         Tool(
             name="subtract",
@@ -38,10 +38,10 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "a": {"type": "number", "description": "First number"},
-                    "b": {"type": "number", "description": "Second number"}
+                    "b": {"type": "number", "description": "Second number"},
                 },
-                "required": ["a", "b"]
-            }
+                "required": ["a", "b"],
+            },
         ),
         Tool(
             name="multiply",
@@ -50,10 +50,10 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "a": {"type": "number", "description": "First number"},
-                    "b": {"type": "number", "description": "Second number"}
+                    "b": {"type": "number", "description": "Second number"},
                 },
-                "required": ["a", "b"]
-            }
+                "required": ["a", "b"],
+            },
         ),
         Tool(
             name="divide",
@@ -62,10 +62,10 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "a": {"type": "number", "description": "Numerator"},
-                    "b": {"type": "number", "description": "Denominator"}
+                    "b": {"type": "number", "description": "Denominator"},
                 },
-                "required": ["a", "b"]
-            }
+                "required": ["a", "b"],
+            },
         ),
         Tool(
             name="power",
@@ -74,10 +74,10 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "base": {"type": "number", "description": "Base number"},
-                    "exponent": {"type": "number", "description": "Exponent"}
+                    "exponent": {"type": "number", "description": "Exponent"},
                 },
-                "required": ["base", "exponent"]
-            }
+                "required": ["base", "exponent"],
+            },
         ),
     ]
 
@@ -112,11 +112,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 async def main():
     """Run the calculator MCP server"""
     async with stdio_server() as (read_stream, write_stream):
-        await app.run(
-            read_stream,
-            write_stream,
-            app.create_initialization_options()
-        )
+        await app.run(read_stream, write_stream, app.create_initialization_options())
 
 
 if __name__ == "__main__":

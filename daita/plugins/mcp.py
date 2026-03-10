@@ -53,7 +53,7 @@ class MCPTool:
         return {
             "name": self.name,
             "description": self.description,
-            "parameters": self.input_schema
+            "parameters": self.input_schema,
         }
 
 
@@ -70,7 +70,7 @@ class MCPServer:
         command: str,
         args: Optional[List[str]] = None,
         env: Optional[Dict[str, str]] = None,
-        server_name: Optional[str] = None
+        server_name: Optional[str] = None,
     ):
         """
         Initialize MCP server configuration.
@@ -93,7 +93,9 @@ class MCPServer:
         self._tools: List[MCPTool] = []
         self._connected = False
         self._stdio_context_task = None  # Background task keeping context alive
-        self._session_lock = asyncio.Lock()  # Protects session access from concurrent calls
+        self._session_lock = (
+            asyncio.Lock()
+        )  # Protects session access from concurrent calls
 
     async def _maintain_connection(self, server_params):
         """
@@ -119,7 +121,9 @@ class MCPServer:
 
                     # Mark as connected
                     self._connected = True
-                    logger.info(f"Connected to MCP server {self.server_name}: {len(self._tools)} tools available")
+                    logger.info(
+                        f"Connected to MCP server {self.server_name}: {len(self._tools)} tools available"
+                    )
 
                     # Keep connection alive until disconnect is called
                     while self._connected:
@@ -152,9 +156,7 @@ class MCPServer:
 
             # Create server parameters
             server_params = StdioServerParameters(
-                command=self.command,
-                args=self.args,
-                env=self.env if self.env else None
+                command=self.command, args=self.args, env=self.env if self.env else None
             )
 
             logger.info(f"Connecting to MCP server: {self.server_name}")
@@ -203,7 +205,9 @@ class MCPServer:
                 mcp_tool = MCPTool(
                     name=tool.name,
                     description=tool.description or f"Tool: {tool.name}",
-                    input_schema=tool.inputSchema if hasattr(tool, 'inputSchema') else {}
+                    input_schema=(
+                        tool.inputSchema if hasattr(tool, "inputSchema") else {}
+                    ),
                 )
                 self._tools.append(mcp_tool)
                 pass
@@ -230,7 +234,9 @@ class MCPServer:
                     try:
                         await asyncio.wait_for(self._stdio_context_task, timeout=2.0)
                     except asyncio.TimeoutError:
-                        logger.warning(f"MCP disconnect timeout for {self.server_name}, cancelling task")
+                        logger.warning(
+                            f"MCP disconnect timeout for {self.server_name}, cancelling task"
+                        )
                         self._stdio_context_task.cancel()
                         try:
                             await self._stdio_context_task
@@ -254,7 +260,9 @@ class MCPServer:
             RuntimeError: If not connected to server
         """
         if not self._connected:
-            raise RuntimeError(f"MCP server {self.server_name} not connected. Call connect() first.")
+            raise RuntimeError(
+                f"MCP server {self.server_name} not connected. Call connect() first."
+            )
 
         return self._tools.copy()
 
@@ -292,12 +300,12 @@ class MCPServer:
                 result = await self._session.call_tool(tool_name, arguments=arguments)
 
                 # Extract content from result
-                if hasattr(result, 'content'):
+                if hasattr(result, "content"):
                     # MCP returns content as a list of content items
                     if isinstance(result.content, list) and len(result.content) > 0:
                         first_content = result.content[0]
                         # Text content
-                        if hasattr(first_content, 'text'):
+                        if hasattr(first_content, "text"):
                             return first_content.text
                         # Other content types
                         return str(first_content)
@@ -306,7 +314,9 @@ class MCPServer:
                 return result
 
             except Exception as e:
-                error_msg = f"MCP tool call failed: {tool_name} on {self.server_name}: {str(e)}"
+                error_msg = (
+                    f"MCP tool call failed: {tool_name} on {self.server_name}: {str(e)}"
+                )
                 logger.error(error_msg)
                 raise Exception(error_msg) from e
 
@@ -407,7 +417,9 @@ class MCPToolRegistry:
             try:
                 await server.disconnect()
             except Exception as e:
-                logger.warning(f"Error disconnecting from {server.server_name}: {str(e)}")
+                logger.warning(
+                    f"Error disconnecting from {server.server_name}: {str(e)}"
+                )
 
         self.servers.clear()
         self._tool_server_map.clear()
@@ -428,7 +440,7 @@ def server(
     command: str,
     args: Optional[List[str]] = None,
     env: Optional[Dict[str, str]] = None,
-    name: Optional[str] = None
+    name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create MCP server configuration.
@@ -463,18 +475,8 @@ def server(
         )
         ```
     """
-    return {
-        "command": command,
-        "args": args or [],
-        "env": env or {},
-        "name": name
-    }
+    return {"command": command, "args": args or [], "env": env or {}, "name": name}
 
 
 # Export public API
-__all__ = [
-    "MCPServer",
-    "MCPTool",
-    "MCPToolRegistry",
-    "server"
-]
+__all__ = ["MCPServer", "MCPTool", "MCPToolRegistry", "server"]

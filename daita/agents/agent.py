@@ -5,6 +5,7 @@ Provides autonomous tool-calling, multi-provider LLM support, plugin integration
 and zero-configuration tracing. Use Agent for most use cases; subclass BaseAgent
 for full control over the execution loop.
 """
+
 import json
 import logging
 import time
@@ -51,12 +52,15 @@ class FocusedTool:
             return result
         try:
             from ..core.focus import apply_focus
+
             # Plugin tools wrap results in {"rows": [...], "row_count": N, ...}.
             # Apply focus to the rows list, not the wrapper dict, then put it back.
             if isinstance(result, dict) and isinstance(result.get("rows"), list):
                 focused = apply_focus(result["rows"], self._focus)
                 n = len(focused) if isinstance(focused, list) else 1
-                logger.debug(f"Focus applied to {self.name} rows: {result['row_count']} -> {n}")
+                logger.debug(
+                    f"Focus applied to {self.name} rows: {result['row_count']} -> {n}"
+                )
                 return {**result, "rows": focused, "row_count": n}
             focused = apply_focus(result, self._focus)
             logger.debug(
@@ -77,23 +81,24 @@ class FocusedTool:
 @dataclass
 class LLMResult:
     """Unified LLM response format for both streaming and non-streaming."""
+
     text: str
     tool_calls: List[Dict[str, Any]]
 
     @classmethod
-    def from_stream(cls, thinking_text: str, tool_calls: List[Dict]) -> 'LLMResult':
+    def from_stream(cls, thinking_text: str, tool_calls: List[Dict]) -> "LLMResult":
         """Create LLMResult from streaming chunks."""
         return cls(text=thinking_text, tool_calls=tool_calls)
 
     @classmethod
-    def from_response(cls, response: Any) -> 'LLMResult':
+    def from_response(cls, response: Any) -> "LLMResult":
         """Create LLMResult from non-streaming response."""
         if isinstance(response, str):
             return cls(text=response, tool_calls=[])
         elif isinstance(response, dict):
             return cls(
-                text=response.get('content', ''),
-                tool_calls=response.get('tool_calls', [])
+                text=response.get("content", ""),
+                tool_calls=response.get("tool_calls", []),
             )
         else:
             logger.warning(f"Unexpected response type: {type(response)}")
@@ -102,10 +107,10 @@ class LLMResult:
 
 def _resolve_tool_focus(
     agent_focus: Optional[Union[str, Dict[str, str]]],
-    t: 'AgentTool',
+    t: "AgentTool",
 ) -> Optional[str]:
     """Return the effective focus DSL for a single tool, applying precedence rules."""
-    tool_default = getattr(t, 'focus', None)
+    tool_default = getattr(t, "focus", None)
     if isinstance(agent_focus, dict):
         return agent_focus.get(t.name) or tool_default
     return agent_focus or tool_default
@@ -113,11 +118,11 @@ def _resolve_tool_focus(
 
 class Agent(BaseAgent):
     """DAITA's primary agent with autonomous tool-calling and LLM-driven task execution."""
-    
+
     # Class-level defaults for smart constructor
     _default_llm_provider = "openai"
     _default_model = "gpt-4"
-    _ALLOWED_DEFAULTS = frozenset({'llm_provider', 'model'})
+    _ALLOWED_DEFAULTS = frozenset({"llm_provider", "model"})
 
     @classmethod
     def configure_defaults(cls, **kwargs):
@@ -129,7 +134,7 @@ class Agent(BaseAgent):
                 f"Allowed: {cls._ALLOWED_DEFAULTS}"
             )
         for key, value in kwargs.items():
-            setattr(cls, f'_default_{key}', value)
+            setattr(cls, f"_default_{key}", value)
 
     def __init__(
         self,
@@ -141,10 +146,12 @@ class Agent(BaseAgent):
         agent_id: Optional[str] = None,
         prompt: Optional[Union[str, Dict[str, str]]] = None,
         focus: Optional[Union[str, Dict[str, str]]] = None,
-        relay: Optional[str] = None,  # Relay channel name used by the workflow engine to route output
+        relay: Optional[
+            str
+        ] = None,  # Relay channel name used by the workflow engine to route output
         mcp: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
         display_reasoning: bool = False,
-        **kwargs
+        **kwargs,
     ):
         """Initialize Agent with smart constructor auto-configuration."""
         # Store LLM provider config for lazy initialization
@@ -154,8 +161,15 @@ class Agent(BaseAgent):
             self._llm_model = model or self._default_model
             self._llm_api_key = api_key
             # Exclude known Agent-level kwargs that are not LLM provider parameters
-            _non_llm_keys = {'tools', 'enable_reliability', 'max_concurrent_tasks', 'max_queue_size'}
-            self._llm_kwargs = {k: v for k, v in kwargs.items() if k not in _non_llm_keys}
+            _non_llm_keys = {
+                "tools",
+                "enable_reliability",
+                "max_concurrent_tasks",
+                "max_queue_size",
+            }
+            self._llm_kwargs = {
+                k: v for k, v in kwargs.items() if k not in _non_llm_keys
+            }
             self._llm = None
             self._llm_initialized = False
             llm_provider_to_pass = None
@@ -172,31 +186,33 @@ class Agent(BaseAgent):
         # Create default config if none provided
         if config is None:
             config = AgentConfig(
-                name=name or "Agent",
-                type=AgentType.STANDARD,
-                **kwargs
+                name=name or "Agent", type=AgentType.STANDARD, **kwargs
             )
 
         # Initialize base agent (which handles automatic tracing)
         super().__init__(config, llm_provider_to_pass, agent_id, name)
-        
+
         # Store customization options
         self.prompt = prompt
         self.default_focus = focus
         self.relay = relay
-        
+
         # Decision display setup
         self.display_reasoning = display_reasoning
         self._decision_display = None
-        
+
         if display_reasoning:
             self._setup_decision_display()
 
         # Tool management (unified system)
         self.tool_registry = ToolRegistry()
-        self.tool_sources = kwargs.get('tools', [])  # Plugins, AgentTool instances, or callables
+        self.tool_sources = kwargs.get(
+            "tools", []
+        )  # Plugins, AgentTool instances, or callables
         self._tools_setup = False
-        self._focus_default_warned: set = set()  # tracks @tool focus defaults already logged
+        self._focus_default_warned: set = (
+            set()
+        )  # tracks @tool focus defaults already logged
 
         # Tool call history tracking for operations metadata
         self._tool_call_history = []
@@ -227,14 +243,16 @@ class Agent(BaseAgent):
         """
         if self._llm is None and not self._llm_initialized:
             # Try to get API key
-            api_key = self._llm_api_key or settings.get_llm_api_key(self._llm_provider_name)
+            api_key = self._llm_api_key or settings.get_llm_api_key(
+                self._llm_provider_name
+            )
             if api_key:
                 self._llm = create_llm_provider(
                     provider=self._llm_provider_name,
                     model=self._llm_model,
                     api_key=api_key,
                     agent_id=self.agent_id,
-                    **self._llm_kwargs  # Pass through kwargs (includes timeout, etc.)
+                    **self._llm_kwargs,  # Pass through kwargs (includes timeout, etc.)
                 )
                 # Set agent_id for automatic LLM tracing
                 if self._llm:
@@ -249,7 +267,7 @@ class Agent(BaseAgent):
         if value is not None:
             self._llm_initialized = True
             # Only set agent_id if it's already initialized (after super().__init__())
-            if hasattr(self, 'agent_id'):
+            if hasattr(self, "agent_id"):
                 value.set_agent_id(self.agent_id)
 
     def _setup_decision_display(self):
@@ -260,14 +278,12 @@ class Agent(BaseAgent):
 
             # Create display
             self._decision_display = create_console_decision_display(
-                agent_name=self.name,
-                agent_id=self.agent_id
+                agent_name=self.name, agent_id=self.agent_id
             )
 
             # Register with decision streaming system
             register_agent_decision_stream(
-                agent_id=self.agent_id,
-                callback=self._decision_display.handle_event
+                agent_id=self.agent_id, callback=self._decision_display.handle_event
             )
 
             logger.debug(f"Decision display enabled for agent {self.name}")
@@ -290,7 +306,9 @@ class Agent(BaseAgent):
         try:
             from ..plugins.mcp import MCPServer, MCPToolRegistry
 
-            logger.info(f"Setting up {len(self._mcp_server_configs)} MCP server(s) for {self.name}")
+            logger.info(
+                f"Setting up {len(self._mcp_server_configs)} MCP server(s) for {self.name}"
+            )
 
             # Create registry
             self.mcp_registry = MCPToolRegistry()
@@ -301,7 +319,7 @@ class Agent(BaseAgent):
                     command=server_config.get("command"),
                     args=server_config.get("args", []),
                     env=server_config.get("env", {}),
-                    server_name=server_config.get("name")
+                    server_name=server_config.get("name"),
                 )
 
                 # Add to registry (automatically connects and discovers tools)
@@ -310,7 +328,9 @@ class Agent(BaseAgent):
             # Get all tools from registry
             self.mcp_tools = self.mcp_registry.get_all_tools()
 
-            logger.info(f"MCP setup complete: {self.mcp_registry.tool_count} tools from {self.mcp_registry.server_count} server(s)")
+            logger.info(
+                f"MCP setup complete: {self.mcp_registry.tool_count} tools from {self.mcp_registry.server_count} server(s)"
+            )
 
         except ImportError:
             logger.error(
@@ -343,7 +363,7 @@ class Agent(BaseAgent):
                 self.tool_registry.register(source)
                 logger.debug(f"Registered tool: {source.name}")
 
-            elif hasattr(source, 'get_tools'):
+            elif hasattr(source, "get_tools"):
                 # Plugin with get_tools() method
                 plugin_tools = source.get_tools()
                 if plugin_tools:
@@ -374,11 +394,13 @@ class Agent(BaseAgent):
         max_iterations: int = 5,
         on_event: Optional[Callable] = None,
         history: Optional["ConversationHistory"] = None,
-        **kwargs
+        **kwargs,
     ) -> str:
         """Execute instruction with autonomous tool calling, returns final answer string."""
-        result = await self._run_traced(prompt, tools, max_iterations, on_event, history=history, **kwargs)
-        return result['result']
+        result = await self._run_traced(
+            prompt, tools, max_iterations, on_event, history=history, **kwargs
+        )
+        return result["result"]
 
     async def run_detailed(
         self,
@@ -387,10 +409,12 @@ class Agent(BaseAgent):
         max_iterations: int = 5,
         on_event: Optional[Callable] = None,
         history: Optional["ConversationHistory"] = None,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         """Like run() but returns full execution details: result, tool_calls, iterations, tokens, cost, time."""
-        return await self._run_traced(prompt, tools, max_iterations, on_event, history=history, **kwargs)
+        return await self._run_traced(
+            prompt, tools, max_iterations, on_event, history=history, **kwargs
+        )
 
     async def _run_traced(
         self,
@@ -399,7 +423,7 @@ class Agent(BaseAgent):
         max_iterations: int,
         on_event: Optional[Callable],
         history: Optional["ConversationHistory"] = None,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         """Internal: Execute with automatic tracing and optional event streaming."""
         start_time = time.time()
@@ -413,12 +437,12 @@ class Agent(BaseAgent):
             prompt=prompt[:200],  # Truncate for storage
             tools_requested=tools,
             max_iterations=max_iterations,
-            entry_point="run"  # Distinguishes from _process() calls
+            entry_point="run",  # Distinguishes from _process() calls
         ):
             # Resolve history workspace and extract prior messages before branching
             if history is not None:
                 history._set_workspace(self.agent_id)
-                kwargs['initial_messages'] = history.messages
+                kwargs["initial_messages"] = history.messages
 
             # Execute with or without retry based on configuration
             if self.config.retry_enabled:
@@ -427,7 +451,7 @@ class Agent(BaseAgent):
                     tools=tools,
                     max_iterations=max_iterations,
                     on_event=on_event,
-                    **kwargs
+                    **kwargs,
                 )
             else:
                 result = await self._execute_autonomous(
@@ -435,38 +459,40 @@ class Agent(BaseAgent):
                     tools=tools,
                     max_iterations=max_iterations,
                     on_event=on_event,
-                    **kwargs
+                    **kwargs,
                 )
 
             # Enrich result with metadata
-            result['processing_time_ms'] = (time.time() - start_time) * 1000
-            result['agent_id'] = self.agent_id
-            result['agent_name'] = self.name
+            result["processing_time_ms"] = (time.time() - start_time) * 1000
+            result["agent_id"] = self.agent_id
+            result["agent_name"] = self.name
 
             # Auto-log to memory plugins if present
             for source in self.tool_sources:
-                if hasattr(source, '_auto_log'):
+                if hasattr(source, "_auto_log"):
                     try:
                         await source._auto_log(
                             user_input=prompt,
-                            agent_output=result.get('result', ''),
+                            agent_output=result.get("result", ""),
                             timestamp=datetime.now(),
                             source_metadata={
-                                'workflow': result.get('workflow_metadata'),
-                                'webhook': result.get('webhook_metadata'),
-                                'schedule': result.get('schedule_metadata')
-                            }
+                                "workflow": result.get("workflow_metadata"),
+                                "webhook": result.get("webhook_metadata"),
+                                "schedule": result.get("schedule_metadata"),
+                            },
                         )
                     except Exception as e:
                         logger.warning(f"Auto-logging failed: {e}")
 
             # Append completed turn to conversation history
             if history is not None:
-                await history.add_turn(prompt, result.get('result', ''))
+                await history.add_turn(prompt, result.get("result", ""))
 
             return result
 
-    def _resolve_tools(self, tools: Optional[List[Union[str, AgentTool]]]) -> List[AgentTool]:
+    def _resolve_tools(
+        self, tools: Optional[List[Union[str, AgentTool]]]
+    ) -> List[AgentTool]:
         """Resolve tool names to AgentTool instances. If None, returns all registered tools."""
         if tools is None:
             # Use all registered tools
@@ -490,12 +516,12 @@ class Agent(BaseAgent):
         """Emit event only if callback provided. Zero overhead when None."""
         if on_event:
             from ..core.streaming import AgentEvent
+
             on_event(AgentEvent(type=event_type, **kwargs))
 
     async def _prepare_tools_with_focus(
-        self,
-        tools: Optional[List[Union[str, 'AgentTool']]]
-    ) -> List['AgentTool']:
+        self, tools: Optional[List[Union[str, "AgentTool"]]]
+    ) -> List["AgentTool"]:
         """Resolve tools and wrap with FocusedTool using the focus precedence chain.
 
         Precedence (highest → lowest):
@@ -513,7 +539,7 @@ class Agent(BaseAgent):
 
             if effective:
                 # Warn once when the only active focus is the @tool-level default
-                if effective == getattr(t, 'focus', None) and not self.default_focus:
+                if effective == getattr(t, "focus", None) and not self.default_focus:
                     if t.name not in self._focus_default_warned:
                         logger.warning(
                             f"Tool '{t.name}' has a built-in focus default: {effective!r}. "
@@ -532,9 +558,9 @@ class Agent(BaseAgent):
     async def _stream_llm_turn(
         self,
         conversation: List[Dict],
-        tools: List['AgentTool'],
+        tools: List["AgentTool"],
         on_event: Callable,
-        **kwargs
+        **kwargs,
     ) -> LLMResult:
         """Execute streaming LLM turn with event emission."""
         from ..core.streaming import EventType
@@ -543,42 +569,35 @@ class Agent(BaseAgent):
         tool_calls = []
 
         async for chunk in await self.llm.generate(
-            messages=conversation,
-            tools=tools,
-            stream=True,
-            **kwargs
+            messages=conversation, tools=tools, stream=True, **kwargs
         ):
             if chunk.type == "text":
                 thinking_text += chunk.content
                 self._emit_event(on_event, EventType.THINKING, content=chunk.content)
 
             elif chunk.type == "tool_call_complete":
-                tool_calls.append({
-                    "id": chunk.tool_call_id,
-                    "name": chunk.tool_name,
-                    "arguments": chunk.tool_args
-                })
+                tool_calls.append(
+                    {
+                        "id": chunk.tool_call_id,
+                        "name": chunk.tool_name,
+                        "arguments": chunk.tool_args,
+                    }
+                )
                 self._emit_event(
                     on_event,
                     EventType.TOOL_CALL,
                     tool_name=chunk.tool_name,
-                    tool_args=chunk.tool_args
+                    tool_args=chunk.tool_args,
                 )
 
         return LLMResult.from_stream(thinking_text, tool_calls)
 
     async def _nonstream_llm_turn(
-        self,
-        conversation: List[Dict],
-        tools: List['AgentTool'],
-        **kwargs
+        self, conversation: List[Dict], tools: List["AgentTool"], **kwargs
     ) -> LLMResult:
         """Execute non-streaming LLM turn."""
         response = await self.llm.generate(
-            messages=conversation,
-            tools=tools,
-            stream=False,
-            **kwargs
+            messages=conversation, tools=tools, stream=False, **kwargs
         )
 
         return LLMResult.from_response(response)
@@ -586,8 +605,8 @@ class Agent(BaseAgent):
     async def _execute_and_track_tool(
         self,
         tool_call: Dict[str, Any],
-        tools: List['AgentTool'],
-        on_event: Optional[Callable]
+        tools: List["AgentTool"],
+        on_event: Optional[Callable],
     ) -> Dict[str, Any]:
         """Execute tool and emit result event."""
         from ..core.streaming import EventType
@@ -596,10 +615,7 @@ class Agent(BaseAgent):
         start_time = time.time()
 
         # Execute via LLM provider (handles focus filtering via FocusedTool.handler)
-        result = await self.llm._execute_tool_call(
-            tool_call=tool_call,
-            tools=tools
-        )
+        result = await self.llm._execute_tool_call(tool_call=tool_call, tools=tools)
 
         # Calculate duration
         duration_ms = int((time.time() - start_time) * 1000)
@@ -609,31 +625,26 @@ class Agent(BaseAgent):
             "name": tool_call["name"],
             "duration_ms": duration_ms,
             "input": tool_call.get("arguments"),
-            "output": result
+            "output": result,
         }
         self._tool_call_history.append(tool_call_record)
 
         # Emit result event
         self._emit_event(
-            on_event,
-            EventType.TOOL_RESULT,
-            tool_name=tool_call["name"],
-            result=result
+            on_event, EventType.TOOL_RESULT, tool_name=tool_call["name"], result=result
         )
 
         return {
             "tool": tool_call["name"],
             "arguments": tool_call["arguments"],
-            "result": result
+            "result": result,
         }
 
     def _append_tool_messages(
-        self,
-        conversation: List[Dict],
-        tool_calls: List[Dict],
-        results: List[Any]
+        self, conversation: List[Dict], tool_calls: List[Dict], results: List[Any]
     ):
         """Add tool calls and results to conversation history."""
+
         def json_serializer(obj):
             """
             Custom JSON serializer for types commonly returned by database plugins.
@@ -648,35 +659,36 @@ class Agent(BaseAgent):
             elif isinstance(obj, UUID):
                 return str(obj)
             elif isinstance(obj, bytes):
-                return obj.decode('utf-8', errors='replace')
-            elif hasattr(obj, 'to_dict') and callable(obj.to_dict):
+                return obj.decode("utf-8", errors="replace")
+            elif hasattr(obj, "to_dict") and callable(obj.to_dict):
                 return obj.to_dict()
-            elif hasattr(obj, '__dict__'):
+            elif hasattr(obj, "__dict__"):
                 # Exclude private/internal attributes to avoid leaking credentials or state
-                return {k: v for k, v in obj.__dict__.items() if not k.startswith('_')}
-            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+                return {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
+            raise TypeError(
+                f"Object of type {type(obj).__name__} is not JSON serializable"
+            )
 
         # Add assistant message with tool calls
-        conversation.append({
-            "role": "assistant",
-            "tool_calls": tool_calls
-        })
+        conversation.append({"role": "assistant", "tool_calls": tool_calls})
 
         # Add tool result messages
         for tool_call, result in zip(tool_calls, results):
-            conversation.append({
-                "role": "tool",
-                "tool_call_id": tool_call["id"],
-                "name": tool_call["name"],
-                "content": json.dumps(result["result"], default=json_serializer)
-            })
+            conversation.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "name": tool_call["name"],
+                    "content": json.dumps(result["result"], default=json_serializer),
+                }
+            )
 
     def _build_final_result(
         self,
         final_text: str,
         tools_called: List[Dict],
         iterations: int,
-        on_event: Optional[Callable]
+        on_event: Optional[Callable],
     ) -> Dict[str, Any]:
         """Build final result dictionary with metadata."""
         from ..core.streaming import EventType
@@ -688,7 +700,7 @@ class Agent(BaseAgent):
             "tool_calls": tools_called,
             "iterations": iterations,
             "tokens": token_stats,
-            "cost": token_stats.get("estimated_cost", 0.0)
+            "cost": token_stats.get("estimated_cost", 0.0),
         }
 
         # Emit completion event with all metadata
@@ -698,7 +710,7 @@ class Agent(BaseAgent):
             final_result=final_text,
             iterations=iterations,
             token_usage=token_stats,
-            cost=token_stats.get("estimated_cost", 0.0)
+            cost=token_stats.get("estimated_cost", 0.0),
         )
 
         return result
@@ -706,22 +718,23 @@ class Agent(BaseAgent):
     async def _execute_autonomous_with_retry(
         self,
         prompt: str,
-        tools: Optional[List[Union[str, 'AgentTool']]],
+        tools: Optional[List[Union[str, "AgentTool"]]],
         max_iterations: int,
         on_event: Optional[Callable],
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         """Execute autonomous tool calling with retry logic via the shared scaffold."""
+
         async def execute(attempt: int, max_attempts: int) -> Dict[str, Any]:
             result = await self._execute_autonomous(
                 prompt=prompt,
                 tools=tools,
                 max_iterations=max_iterations,
                 on_event=on_event,
-                **kwargs
+                **kwargs,
             )
             if attempt > 1:
-                result['retry_attempt'] = attempt
+                result["retry_attempt"] = attempt
             return result
 
         return await self._retry_with_tracing(execute, "autonomous_retry_attempt")
@@ -729,18 +742,18 @@ class Agent(BaseAgent):
     async def _execute_autonomous(
         self,
         prompt: str,
-        tools: Optional[List[Union[str, 'AgentTool']]],
+        tools: Optional[List[Union[str, "AgentTool"]]],
         max_iterations: int,
         on_event: Optional[Callable],
         initial_messages: Optional[List[Dict]] = None,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         """Unified autonomous execution path for both streaming and non-streaming."""
         from ..core.streaming import EventType
 
         # Check if LLM provider is available
         if self.llm is None:
-            provider_name = self._llm_provider_name or 'openai'
+            provider_name = self._llm_provider_name or "openai"
             raise AgentError(
                 f"Cannot execute: No API key found for '{provider_name}'. "
                 f"Set {provider_name.upper()}_API_KEY environment variable "
@@ -763,7 +776,7 @@ class Agent(BaseAgent):
 
         # Auto-inject relevant memories from any memory plugins
         for source in self.tool_sources:
-            if hasattr(source, 'on_before_run'):
+            if hasattr(source, "on_before_run"):
                 try:
                     context = await source.on_before_run(prompt)
                     if context:
@@ -772,7 +785,9 @@ class Agent(BaseAgent):
                     pass
 
         if system_parts:
-            conversation.append({"role": "system", "content": "\n\n".join(system_parts)})
+            conversation.append(
+                {"role": "system", "content": "\n\n".join(system_parts)}
+            )
 
         # Inject prior conversation turns between system message and current prompt
         if initial_messages:
@@ -788,7 +803,7 @@ class Agent(BaseAgent):
                 on_event,
                 EventType.ITERATION,
                 iteration=iteration + 1,
-                max_iterations=max_iterations
+                max_iterations=max_iterations,
             )
 
             # Get LLM response (streaming or non-streaming based on on_event)
@@ -813,17 +828,12 @@ class Agent(BaseAgent):
                     results.append(result)
 
                 # Add to conversation and continue loop
-                self._append_tool_messages(
-                    conversation, llm_result.tool_calls, results
-                )
+                self._append_tool_messages(conversation, llm_result.tool_calls, results)
                 continue
 
             # Final answer received
             return self._build_final_result(
-                llm_result.text,
-                tools_called,
-                iteration + 1,
-                on_event
+                llm_result.text, tools_called, iteration + 1, on_event
             )
 
         # Max iterations reached without final answer
@@ -840,7 +850,7 @@ class Agent(BaseAgent):
         task: str,
         data: Any = None,
         context: Optional[Dict[str, Any]] = None,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         """INTERNAL: Process task with data and context. Used by framework for workflow/lambda/system integration."""
         # Convert task/data to prompt
@@ -850,18 +860,15 @@ class Agent(BaseAgent):
             prompt = task
 
         # Use run_detailed as the core execution
-        result = await self.run_detailed(
-            prompt=prompt,
-            **kwargs
-        )
+        result = await self.run_detailed(prompt=prompt, **kwargs)
 
         # Merge context if provided (for internal tracking)
         if context:
-            result['context'] = {**result.get('context', {}), **context}
+            result["context"] = {**result.get("context", {}), **context}
 
         # Add legacy fields for backward compatibility with internal systems
-        result['task'] = task
-        result['status'] = 'success' if 'result' in result else 'error'
+        result["task"] = task
+        result["status"] = "success" if "result" in result else "error"
 
         return result
 
@@ -874,7 +881,7 @@ class Agent(BaseAgent):
         data: Any,
         source_agent: str,
         channel: str,
-        workflow_name: Optional[str] = None
+        workflow_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Handle workflow relay message from another agent. Called automatically by workflow system."""
         prompt = "A message has arrived from the workflow system. Process the input data below."
@@ -890,50 +897,47 @@ class Agent(BaseAgent):
         result = await self.run_detailed(prompt)
 
         # Add workflow metadata to result
-        result['workflow_metadata'] = {
-            'source_agent': source_agent,
-            'channel': channel,
-            'workflow': workflow_name,
-            'entry_point': 'receive_message'
+        result["workflow_metadata"] = {
+            "source_agent": source_agent,
+            "channel": channel,
+            "workflow": workflow_name,
+            "entry_point": "receive_message",
         }
 
         return result
 
     async def on_webhook(
-        self,
-        payload: Dict[str, Any],
-        webhook_config: Dict[str, Any]
+        self, payload: Dict[str, Any], webhook_config: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Handle webhook trigger from external service. Called automatically by webhook system.
 
         Note: `instructions` in webhook_config must be developer-controlled configuration,
         not end-user-supplied content, as it is passed directly to the LLM.
         """
-        instructions = str(webhook_config.get('instructions', 'Process webhook data'))[:2000]
+        instructions = str(webhook_config.get("instructions", "Process webhook data"))[
+            :2000
+        ]
 
         result = await self.run_detailed(instructions)
 
-        result['webhook_metadata'] = {
-            'webhook_id': webhook_config.get('webhook_id'),
-            'webhook_slug': webhook_config.get('webhook_slug'),
-            'entry_point': 'on_webhook'
+        result["webhook_metadata"] = {
+            "webhook_id": webhook_config.get("webhook_id"),
+            "webhook_slug": webhook_config.get("webhook_slug"),
+            "entry_point": "on_webhook",
         }
 
         return result
 
-    async def on_schedule(
-        self,
-        schedule_config: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def on_schedule(self, schedule_config: Dict[str, Any]) -> Dict[str, Any]:
         """Handle scheduled task execution (cron jobs). Called automatically by scheduler."""
-        task = schedule_config.get('task', 'Execute scheduled task')
+        task = schedule_config.get("task", "Execute scheduled task")
 
         result = await self.run_detailed(task)
 
-        result['schedule_metadata'] = {
-            'schedule_id': schedule_config.get('schedule_id'),
-            'cron': schedule_config.get('cron'),
-            'entry_point': 'on_schedule'
+        result["schedule_metadata"] = {
+            "schedule_id": schedule_config.get("schedule_id"),
+            "cron": schedule_config.get("cron"),
+            "entry_point": "on_schedule",
         }
 
         return result
@@ -948,7 +952,7 @@ class Agent(BaseAgent):
         Tools registered on next setup.
         """
         # Auto-inject agent context into plugin if it supports initialization
-        if hasattr(plugin, 'initialize') and callable(plugin.initialize):
+        if hasattr(plugin, "initialize") and callable(plugin.initialize):
             plugin.initialize(agent_id=self.agent_id)
 
         self.tool_sources.append(plugin)
@@ -973,7 +977,7 @@ class Agent(BaseAgent):
         """Stop agent and clean up all resources including MCP connections."""
         # Trigger auto-curation in memory plugins
         for source in self.tool_sources:
-            if hasattr(source, 'on_agent_stop'):
+            if hasattr(source, "on_agent_stop"):
                 try:
                     await source.on_agent_stop()
                 except Exception as e:
@@ -992,37 +996,40 @@ class Agent(BaseAgent):
 
     def get_token_usage(self) -> Dict[str, int]:
         """Get token usage statistics from automatic tracing."""
-        if not self.llm or not hasattr(self.llm, 'get_token_stats'):
+        if not self.llm or not hasattr(self.llm, "get_token_stats"):
             # Fallback for agents without LLM or tracing
             return {
-                'total_tokens': 0,
-                'prompt_tokens': 0,
-                'completion_tokens': 0,
-                'requests': 0
+                "total_tokens": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "requests": 0,
             }
 
         return self.llm.get_token_stats()
-    
+
     @property
     def health(self) -> Dict[str, Any]:
         """Enhanced health information for Agent."""
         base_health = super().health
 
         # Add Agent-specific health info
-        base_health.update({
-            'tools': {
-                'count': self.tool_registry.tool_count,
-                'setup': self._tools_setup,
-                'names': self.tool_registry.tool_names if self._tools_setup else []
-            },
-            'relay': {
-                'enabled': self.relay is not None,
-                'channel': self.relay
-            },
-            'llm': {
-                'available': self.llm is not None,
-                'provider': self.llm.provider_name if self.llm and hasattr(self.llm, 'provider_name') else None
+        base_health.update(
+            {
+                "tools": {
+                    "count": self.tool_registry.tool_count,
+                    "setup": self._tools_setup,
+                    "names": self.tool_registry.tool_names if self._tools_setup else [],
+                },
+                "relay": {"enabled": self.relay is not None, "channel": self.relay},
+                "llm": {
+                    "available": self.llm is not None,
+                    "provider": (
+                        self.llm.provider_name
+                        if self.llm and hasattr(self.llm, "provider_name")
+                        else None
+                    ),
+                },
             }
-        })
+        )
 
         return base_health

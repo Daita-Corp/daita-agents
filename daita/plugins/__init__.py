@@ -140,7 +140,7 @@ from .pinecone import PineconePlugin, pinecone
 from .chroma import ChromaPlugin, chroma
 from .qdrant import QdrantPlugin, qdrant
 
-# API plugins  
+# API plugins
 from .rest import RESTPlugin, rest
 
 # Cloud storage plugins
@@ -175,22 +175,23 @@ from .orchestrator import OrchestratorPlugin, orchestrator
 # Graph database plugins
 from .neo4j_graph import Neo4jPlugin, neo4j
 
+
 # Simple plugin access class for SDK
 class PluginAccess:
     """
     Simple plugin access for the SDK.
-    
+
     Provides clean interface: sdk.plugins.postgresql(...)
     """
-    
+
     def postgresql(self, **kwargs) -> PostgreSQLPlugin:
         """Create PostgreSQL plugin."""
         return postgresql(**kwargs)
-    
+
     def mysql(self, **kwargs) -> MySQLPlugin:
         """Create MySQL plugin."""
         return mysql(**kwargs)
-    
+
     def mongodb(self, **kwargs) -> MongoDBPlugin:
         """Create MongoDB plugin."""
         return mongodb(**kwargs)
@@ -214,11 +215,11 @@ class PluginAccess:
     def rest(self, **kwargs) -> RESTPlugin:
         """Create REST API plugin."""
         return rest(**kwargs)
-    
+
     def s3(self, **kwargs) -> S3Plugin:
         """Create S3 plugin."""
         return s3(**kwargs)
-    
+
     def slack(self, **kwargs) -> SlackPlugin:
         """Create Slack plugin."""
         return slack(**kwargs)
@@ -263,52 +264,50 @@ class PluginAccess:
         """Access MCP plugin module for Model Context Protocol integration."""
         return mcp
 
+
 # Export everything needed
 __all__ = [
     # Plugin classes
-    'PostgreSQLPlugin',
-    'MySQLPlugin',
-    'MongoDBPlugin',
-    'SnowflakePlugin',
-    'PineconePlugin',
-    'ChromaPlugin',
-    'QdrantPlugin',
-    'RESTPlugin',
-    'S3Plugin',
-    'SlackPlugin',
-    'EmailPlugin',
-    'ElasticsearchPlugin',
-    'WebSearchPlugin',
-    'RedisMessagingPlugin',
-    'CatalogPlugin',
-    'LineagePlugin',
-    'Neo4jPlugin',
-    'OrchestratorPlugin',
-    'MemoryPlugin',
-
+    "PostgreSQLPlugin",
+    "MySQLPlugin",
+    "MongoDBPlugin",
+    "SnowflakePlugin",
+    "PineconePlugin",
+    "ChromaPlugin",
+    "QdrantPlugin",
+    "RESTPlugin",
+    "S3Plugin",
+    "SlackPlugin",
+    "EmailPlugin",
+    "ElasticsearchPlugin",
+    "WebSearchPlugin",
+    "RedisMessagingPlugin",
+    "CatalogPlugin",
+    "LineagePlugin",
+    "Neo4jPlugin",
+    "OrchestratorPlugin",
+    "MemoryPlugin",
     # Factory functions
-    'postgresql',
-    'mysql',
-    'mongodb',
-    'snowflake',
-    'pinecone',
-    'chroma',
-    'qdrant',
-    'rest',
-    's3',
-    'slack',
-    'email',
-    'elasticsearch',
-    'websearch',
-    'redis_messaging',
-    'catalog',
-    'lineage',
-    'neo4j',
-    'orchestrator',
-
+    "postgresql",
+    "mysql",
+    "mongodb",
+    "snowflake",
+    "pinecone",
+    "chroma",
+    "qdrant",
+    "rest",
+    "s3",
+    "slack",
+    "email",
+    "elasticsearch",
+    "websearch",
+    "redis_messaging",
+    "catalog",
+    "lineage",
+    "neo4j",
+    "orchestrator",
     # MCP module
-    'mcp',
-
+    "mcp",
     # SDK access class
-    'PluginAccess',
+    "PluginAccess",
 ]

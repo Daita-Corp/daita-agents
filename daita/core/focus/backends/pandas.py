@@ -4,6 +4,7 @@ Pandas DataFrame backend.
 Native support for: filter (df.query), select (column projection),
 order_by (sort_values), limit (head), group_by + aggregates (groupby.agg).
 """
+
 from __future__ import annotations
 
 import logging
@@ -40,7 +41,9 @@ class PandasBackend(FocusBackend):
         if query.group_by and query.aggregates:
             try:
                 df = _native_groupby(df, query)
-                applied.update({"group_by", "aggregates", "select", "order_by", "limit"})
+                applied.update(
+                    {"group_by", "aggregates", "select", "order_by", "limit"}
+                )
                 return df, applied
             except Exception as e:
                 logger.debug(f"pandas groupby failed, using evaluator fallback: {e}")
@@ -88,14 +91,20 @@ def _native_groupby(df: Any, query: FocusQuery) -> Any:
         result = grouped.agg(**agg_spec)
     else:
         # COUNT(*) only
-        result = df.groupby(query.group_by).size().reset_index(name=count_star_alias or "count")
+        result = (
+            df.groupby(query.group_by)
+            .size()
+            .reset_index(name=count_star_alias or "count")
+        )
         count_star_alias = None  # already set
 
     if count_star_alias:
         result[count_star_alias] = df.groupby(query.group_by).size().values
 
     if query.order_by and query.order_by in result.columns:
-        result = result.sort_values(query.order_by, ascending=(query.order_dir == "ASC"))
+        result = result.sort_values(
+            query.order_by, ascending=(query.order_dir == "ASC")
+        )
 
     if query.limit is not None:
         result = result.head(query.limit)

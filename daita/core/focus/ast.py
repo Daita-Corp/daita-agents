@@ -1,6 +1,7 @@
 """
 FocusQuery — the intermediate representation produced by the DSL parser.
 """
+
 from __future__ import annotations
 
 import ast as pyast

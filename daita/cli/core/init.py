@@ -2,50 +2,59 @@
 Simple project initialization for Daita CLI.
 Creates minimal, universal project template like create-react-app.
 """
+
 import yaml
 from pathlib import Path
 from datetime import datetime
 
-async def initialize_project(project_name=None, project_type='basic', template=None, force=False, verbose=False):
+
+async def initialize_project(
+    project_name=None, project_type="basic", template=None, force=False, verbose=False
+):
     """Initialize a new Daita project with minimal template."""
-    
+
     # Get project name
     if not project_name:
         project_name = input("Project name: ").strip()
         if not project_name:
             project_name = Path.cwd().name
-    
+
     # Determine project directory
     project_dir = Path.cwd() / project_name
-    
+
     # Check if directory exists
     if project_dir.exists() and not force:
         if any(project_dir.iterdir()):  # Directory not empty
-            confirm = input(f"Directory '{project_name}' exists and is not empty. Continue? (y/N): ")
-            if confirm.lower() != 'y':
+            confirm = input(
+                f"Directory '{project_name}' exists and is not empty. Continue? (y/N): "
+            )
+            if confirm.lower() != "y":
                 print(" Initialization cancelled")
                 return
-    
+
     # Create project directory
     project_dir.mkdir(exist_ok=True)
-    
+
     print(f" Creating Daita project: {project_name}")
     print(f" Location: {project_dir}")
-    
+
     # Create minimal project structure
     _create_project_structure(project_dir, verbose)
     _create_project_config(project_dir, project_name, verbose)
     _create_starter_files(project_dir, project_name, verbose)
     _create_supporting_files(project_dir, project_name, verbose)
-    
+
     # Import freemium utilities
     try:
         from ..utils import get_freemium_success_message
+
         print("")
         print(get_freemium_success_message(project_name))
         print("")
         print(" Development setup:")
-        print(f"   export OPENAI_API_KEY=your_key_here    # Configure LLM or another provider")
+        print(
+            f"   export OPENAI_API_KEY=your_key_here    # Configure LLM or another provider"
+        )
         print(f"   pip install -r requirements.txt       # Install dependencies")
         print(f"   python agents/my_agent.py              # Test example agent")
     except ImportError:
@@ -60,54 +69,52 @@ async def initialize_project(project_name=None, project_type='basic', template=N
         print(f"   python agents/my_agent.py          # Test the example agent")
         print(f"   daita create agent new_agent       # Create a new agent")
         print(f"   daita test                         # Test all components")
-        print(f"   daita test --watch                 # Watch for changes while developing")
+        print(
+            f"   daita test --watch                 # Watch for changes while developing"
+        )
+
 
 def _create_project_structure(project_dir, verbose):
     """Create minimal directory structure."""
-    directories = [
-        '.daita',
-        'agents',
-        'workflows', 
-        'data',
-        'tests'
-    ]
-    
+    directories = [".daita", "agents", "workflows", "data", "tests"]
+
     for dir_name in directories:
         dir_path = project_dir / dir_name
         dir_path.mkdir(exist_ok=True)
-        
+
         # Create __init__.py for Python packages
-        if dir_name in ['agents', 'workflows', 'tests']:
-            init_file = dir_path / '__init__.py'
+        if dir_name in ["agents", "workflows", "tests"]:
+            init_file = dir_path / "__init__.py"
             init_file.write_text('"""Daita project components."""\n')
-        
+
         if verbose:
             print(f"    Created: {dir_name}/")
 
+
 def _create_project_config(project_dir, project_name, verbose):
     """Create minimal daita-project.yaml configuration."""
-    
-    config = {
-        'name': project_name,
-        'version': '1.0.0',
-        'description': f'A Daita AI agent project',
-        'created_at': datetime.utcnow().isoformat(),
 
+    config = {
+        "name": project_name,
+        "version": "1.0.0",
+        "description": f"A Daita AI agent project",
+        "created_at": datetime.utcnow().isoformat(),
         # Project components (will be populated as user creates them)
-        'agents': [],
-        'workflows': []
+        "agents": [],
+        "workflows": [],
     }
-    
-    config_file = project_dir / 'daita-project.yaml'
-    with open(config_file, 'w') as f:
+
+    config_file = project_dir / "daita-project.yaml"
+    with open(config_file, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-    
+
     if verbose:
         print(f"    Created: daita-project.yaml")
 
+
 def _create_starter_files(project_dir, project_name, verbose):
     """Create minimal starter agent and workflow files."""
-    
+
     # Simple data-focused starter agent
     starter_agent = '''"""
 My Agent - Data Processing Example
@@ -175,7 +182,7 @@ if __name__ == "__main__":
 
     asyncio.run(main())
 '''
-    
+
     # Simple data pipeline workflow
     starter_workflow = '''"""
 My Workflow - Data Pipeline
@@ -245,14 +252,15 @@ if __name__ == "__main__":
 
     asyncio.run(main())
 '''
-    
+
     # Write starter files
-    (project_dir / 'agents' / 'my_agent.py').write_text(starter_agent)
-    (project_dir / 'workflows' / 'my_workflow.py').write_text(starter_workflow)
-    
+    (project_dir / "agents" / "my_agent.py").write_text(starter_agent)
+    (project_dir / "workflows" / "my_workflow.py").write_text(starter_workflow)
+
     if verbose:
         print(f"    Created: agents/my_agent.py")
         print(f"    Created: workflows/my_workflow.py")
+
 
 def _create_supporting_files(project_dir, project_name, verbose):
     """Create supporting files (requirements, README, etc.)."""
@@ -260,14 +268,15 @@ def _create_supporting_files(project_dir, project_name, verbose):
     # Detect user's installed daita-agents version
     try:
         import importlib.metadata
-        user_version = importlib.metadata.version('daita-agents')
+
+        user_version = importlib.metadata.version("daita-agents")
         if verbose:
             print(f"    Detected daita-agents version: {user_version}")
     except Exception:
         user_version = "0.6.2"  # Default to current if detection fails
 
     # Minimal requirements.txt with exact user version
-    requirements = f'''# Daita Agents Framework
+    requirements = f"""# Daita Agents Framework
 daita-agents=={user_version}
 
 # LLM provider (choose one)
@@ -276,10 +285,10 @@ openai>=1.0.0
 # Development
 pytest>=7.0.0
 pytest-asyncio>=0.21.0
-'''
-    
+"""
+
     # Simple .gitignore
-    gitignore = '''# Python
+    gitignore = """# Python
 __pycache__/
 *.py[cod]
 *.so
@@ -306,10 +315,10 @@ venv/
 # Memory files (may contain sensitive data)
 # Remove this line if you want to commit agent memories to git
 .daita/memory/
-'''
-    
+"""
+
     # README with freemium messaging
-    readme = f'''# {project_name}
+    readme = f"""# {project_name}
 
 A Daita AI agent project.
 
@@ -391,8 +400,8 @@ daita logs                   # View execution logs
 
 -  [Get API Key](https://daita-tech.io) - Start your free trial
 -  [Documentation](https://docs.daita-tech.io)
-'''
-    
+"""
+
     # Simple test file for data processing
     test_file = '''"""
 Basic tests for data processing agents and workflows.
@@ -467,19 +476,18 @@ if __name__ == "__main__":
 
     asyncio.run(main())
 '''
-    
+
     # Write all supporting files
-    (project_dir / 'requirements.txt').write_text(requirements)
-    (project_dir / '.gitignore').write_text(gitignore)
-    (project_dir / 'README.md').write_text(readme)
-    (project_dir / 'tests' / 'test_basic.py').write_text(test_file)
-    
+    (project_dir / "requirements.txt").write_text(requirements)
+    (project_dir / ".gitignore").write_text(gitignore)
+    (project_dir / "README.md").write_text(readme)
+    (project_dir / "tests" / "test_basic.py").write_text(test_file)
+
     # Create empty data directory with placeholder
-    (project_dir / 'data' / '.gitkeep').write_text('')
-    
+    (project_dir / "data" / ".gitkeep").write_text("")
+
     if verbose:
         print(f"    Created: requirements.txt")
         print(f"    Created: .gitignore")
         print(f"    Created: README.md")
         print(f"    Created: tests/test_basic.py")
-

@@ -1,6 +1,7 @@
 """
 Mock LLM provider for testing with integrated tracing.
 """
+
 import asyncio
 import logging
 from typing import Dict, Any, Optional
@@ -9,19 +10,20 @@ from .base import BaseLLMProvider
 
 logger = logging.getLogger(__name__)
 
+
 class MockLLMProvider(BaseLLMProvider):
     """Mock LLM provider for testing purposes with automatic call tracing."""
-    
+
     def __init__(
         self,
         model: str = "mock-model",
         responses: Optional[Dict[str, str]] = None,
         delay: float = 0.1,
-        **kwargs
+        **kwargs,
     ):
         """
         Initialize mock provider.
-        
+
         Args:
             model: Mock model name
             responses: Dictionary mapping prompts to responses
@@ -29,24 +31,24 @@ class MockLLMProvider(BaseLLMProvider):
             **kwargs: Additional parameters
         """
         # Remove api_key from kwargs to avoid conflict, then pass it explicitly
-        kwargs.pop('api_key', None)  # Remove if exists
+        kwargs.pop("api_key", None)  # Remove if exists
         super().__init__(model=model, api_key="mock-key", **kwargs)
-        
+
         # Predefined responses
         self.responses = responses or {}
         self.delay = delay
-        
+
         # Default responses
         self.default_responses = {
             "default": "This is a mock response from the LLM.",
             "analyze": "Based on the data provided, here are the key insights: [mock analysis]",
             "summarize": "Summary: [mock summary of the content]",
-            "error": "This is an error response for testing."
+            "error": "This is an error response for testing.",
         }
-        
+
         # Track calls for testing
         self.call_history = []
-    
+
     async def _generate_impl(self, messages, tools=None, **kwargs):
         """
         Provider-specific implementation of mock text generation.
@@ -76,13 +78,15 @@ class MockLLMProvider(BaseLLMProvider):
             prompt = str(messages)
 
         # Record the call
-        self.call_history.append({
-            'prompt': prompt,
-            'messages': messages if isinstance(messages, list) else None,
-            'tools': tools,
-            'params': kwargs,
-            'timestamp': asyncio.get_event_loop().time()
-        })
+        self.call_history.append(
+            {
+                "prompt": prompt,
+                "messages": messages if isinstance(messages, list) else None,
+                "tools": tools,
+                "params": kwargs,
+                "timestamp": asyncio.get_event_loop().time(),
+            }
+        )
 
         # Simulate API delay
         if self.delay > 0:
@@ -92,7 +96,7 @@ class MockLLMProvider(BaseLLMProvider):
         if tools:
             return {
                 "content": f"Mock response for: {prompt[:50]}...",
-                "tool_calls": None
+                "tool_calls": None,
             }
 
         # Check for specific response
@@ -107,12 +111,9 @@ class MockLLMProvider(BaseLLMProvider):
 
         # Default response
         return f"Mock response for: {prompt[:50]}..."
-    
+
     async def _generate_with_tools_single(
-        self,
-        messages: list,
-        tools: list,
-        **kwargs
+        self, messages: list, tools: list, **kwargs
     ) -> dict:
         """
         Mock implementation of single LLM call with tools.
@@ -128,12 +129,14 @@ class MockLLMProvider(BaseLLMProvider):
                 break
 
         # Record the call
-        self.call_history.append({
-            'messages': messages,
-            'tools': tools,
-            'params': kwargs,
-            'timestamp': asyncio.get_event_loop().time()
-        })
+        self.call_history.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "params": kwargs,
+                "timestamp": asyncio.get_event_loop().time(),
+            }
+        )
 
         # Simulate API delay
         if self.delay > 0:
@@ -142,15 +145,10 @@ class MockLLMProvider(BaseLLMProvider):
         # Return final answer (no tool calls for basic mock)
         return {
             "content": f"Mock response for: {user_message[:50]}...",
-            "tool_calls": None
+            "tool_calls": None,
         }
 
-    async def _stream_impl(
-        self,
-        messages: list,
-        tools: list,
-        **kwargs
-    ):
+    async def _stream_impl(self, messages: list, tools: list, **kwargs):
         """
         Mock streaming implementation.
 
@@ -167,12 +165,14 @@ class MockLLMProvider(BaseLLMProvider):
                 break
 
         # Record the call
-        self.call_history.append({
-            'messages': messages,
-            'tools': tools,
-            'params': kwargs,
-            'timestamp': asyncio.get_event_loop().time()
-        })
+        self.call_history.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "params": kwargs,
+                "timestamp": asyncio.get_event_loop().time(),
+            }
+        )
 
         # Simulate streaming with delays
         mock_response = f"Mock response for: {user_message[:50]}..."
@@ -196,7 +196,7 @@ class MockLLMProvider(BaseLLMProvider):
         if self.call_history:
             # Get the last call to estimate tokens
             last_call = self.call_history[-1]
-            prompt = last_call.get('prompt', '')
+            prompt = last_call.get("prompt", "")
 
             # Mock realistic token counts
             estimated_prompt_tokens = max(5, len(prompt) // 4)  # Rough estimate
@@ -204,34 +204,36 @@ class MockLLMProvider(BaseLLMProvider):
             estimated_completion_tokens = max(10, estimated_prompt_tokens // 2)
 
             return {
-                'total_tokens': estimated_prompt_tokens + estimated_completion_tokens,
-                'prompt_tokens': estimated_prompt_tokens,
-                'completion_tokens': estimated_completion_tokens
+                "total_tokens": estimated_prompt_tokens + estimated_completion_tokens,
+                "prompt_tokens": estimated_prompt_tokens,
+                "completion_tokens": estimated_completion_tokens,
             }
 
         # Fallback to default
         return super()._get_last_token_usage()
-    
+
     def set_response(self, prompt: str, response: str) -> None:
         """Set a specific response for a prompt."""
         self.responses[prompt] = response
-    
+
     def clear_history(self) -> None:
         """Clear call history."""
         self.call_history.clear()
-    
+
     def get_last_call(self) -> Optional[Dict[str, Any]]:
         """Get the last call made to the provider."""
         return self.call_history[-1] if self.call_history else None
-    
+
     @property
     def info(self) -> Dict[str, Any]:
         """Get information about the mock provider."""
         base_info = super().info
-        base_info.update({
-            'provider_name': 'Mock LLM (Testing)',
-            'call_count': len(self.call_history),
-            'configured_responses': len(self.responses),
-            'delay_seconds': self.delay
-        })
+        base_info.update(
+            {
+                "provider_name": "Mock LLM (Testing)",
+                "call_count": len(self.call_history),
+                "configured_responses": len(self.responses),
+                "delay_seconds": self.delay,
+            }
+        )
         return base_info

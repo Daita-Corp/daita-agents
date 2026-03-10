@@ -14,10 +14,10 @@ from daita.agents.agent import Agent
 from daita.core.tools import AgentTool
 from daita.llm.mock import MockLLMProvider
 
-
 # ---------------------------------------------------------------------------
 # SequentialMockLLM
 # ---------------------------------------------------------------------------
+
 
 class SequentialMockLLM(MockLLMProvider):
     """
@@ -43,12 +43,14 @@ class SequentialMockLLM(MockLLMProvider):
         if self._call_index < len(self._response_sequence):
             response = self._response_sequence[self._call_index]
             self._call_index += 1
-            self.call_history.append({
-                "messages": messages,
-                "tools": tools,
-                "params": kwargs,
-                "timestamp": 0,
-            })
+            self.call_history.append(
+                {
+                    "messages": messages,
+                    "tools": tools,
+                    "params": kwargs,
+                    "timestamp": 0,
+                }
+            )
             return response
         # Sequence exhausted — plain final answer so the loop terminates.
         return "Final answer."
@@ -57,6 +59,7 @@ class SequentialMockLLM(MockLLMProvider):
 # ---------------------------------------------------------------------------
 # LLM fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def mock_llm():
@@ -92,6 +95,7 @@ def mock_llm_with_tool_call():
 # ---------------------------------------------------------------------------
 # Tool fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def simple_tool():
@@ -140,6 +144,7 @@ def async_tool():
 # ---------------------------------------------------------------------------
 # Agent fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def basic_agent(mock_llm):

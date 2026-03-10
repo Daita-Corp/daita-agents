@@ -29,7 +29,9 @@ class FileStorage:
         # Create directories
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
-    async def append_to_daily_log(self, content: str, category: Optional[str] = None) -> str:
+    async def append_to_daily_log(
+        self, content: str, category: Optional[str] = None
+    ) -> str:
         """
         Append to today's daily log file.
 
@@ -58,12 +60,14 @@ class FileStorage:
         entry += f"\n\n{content}\n"
 
         # Append to file
-        async with aiofiles.open(log_file, mode='a', encoding='utf-8') as f:
+        async with aiofiles.open(log_file, mode="a", encoding="utf-8") as f:
             await f.write(entry)
 
         return str(log_file)
 
-    async def append_to_long_term(self, content: str, section: Optional[str] = None) -> str:
+    async def append_to_long_term(
+        self, content: str, section: Optional[str] = None
+    ) -> str:
         """
         Append to long-term MEMORY.md file.
 
@@ -76,7 +80,7 @@ class FileStorage:
         """
         # Initialize memory file if it doesn't exist
         if not self.memory_file.exists():
-            async with aiofiles.open(self.memory_file, mode='w', encoding='utf-8') as f:
+            async with aiofiles.open(self.memory_file, mode="w", encoding="utf-8") as f:
                 await f.write("# Long-Term Memory\n\n")
 
         # Format entry with agent attribution
@@ -91,7 +95,7 @@ class FileStorage:
         entry += f"{content}\n"
 
         # Append to file
-        async with aiofiles.open(self.memory_file, mode='a', encoding='utf-8') as f:
+        async with aiofiles.open(self.memory_file, mode="a", encoding="utf-8") as f:
             await f.write(entry)
 
         return str(self.memory_file)
@@ -106,7 +110,7 @@ class FileStorage:
         Returns:
             File contents
         """
-        async with aiofiles.open(file_path, mode='r', encoding='utf-8') as f:
+        async with aiofiles.open(file_path, mode="r", encoding="utf-8") as f:
             return await f.read()
 
     async def list_files(self) -> List[Dict[str, Any]]:
@@ -121,21 +125,25 @@ class FileStorage:
         # Add MEMORY.md if exists
         if self.memory_file.exists():
             stat = self.memory_file.stat()
-            files.append({
-                'path': str(self.memory_file),
-                'type': 'long_term',
-                'size': stat.st_size,
-                'modified': datetime.fromtimestamp(stat.st_mtime).isoformat()
-            })
+            files.append(
+                {
+                    "path": str(self.memory_file),
+                    "type": "long_term",
+                    "size": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                }
+            )
 
         # Add all daily logs
         for log_file in sorted(self.logs_dir.glob("*.md")):
             stat = log_file.stat()
-            files.append({
-                'path': str(log_file),
-                'type': 'daily_log',
-                'size': stat.st_size,
-                'modified': datetime.fromtimestamp(stat.st_mtime).isoformat()
-            })
+            files.append(
+                {
+                    "path": str(log_file),
+                    "type": "daily_log",
+                    "size": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                }
+            )
 
         return files

@@ -20,25 +20,28 @@ from daita.config.base import AgentConfig, AgentType
 from daita.core.tools import AgentTool
 from daita.llm.mock import MockLLMProvider
 
-
 # ===========================================================================
 # Helpers
 # ===========================================================================
 
+
 def make_tool(name="tool_x"):
     async def h(args):
         return "ok"
+
     return AgentTool(name=name, description="Desc", parameters={}, handler=h)
 
 
 class MinimalPlugin:
     """Plugin with no tools and no initialize()."""
+
     def get_tools(self):
         return []
 
 
 class InitializablePlugin:
     """Plugin that stores the agent_id passed to initialize()."""
+
     def __init__(self):
         self.received_agent_id = None
 
@@ -51,9 +54,11 @@ class InitializablePlugin:
 
 class ToolProvidingPlugin:
     """Plugin that exposes two tools via get_tools()."""
+
     def get_tools(self):
         async def h(args):
             return "result"
+
         return [
             AgentTool(name="plugin_tool_1", description="T1", parameters={}, handler=h),
             AgentTool(name="plugin_tool_2", description="T2", parameters={}, handler=h),
@@ -63,6 +68,7 @@ class ToolProvidingPlugin:
 # ===========================================================================
 # ID and naming
 # ===========================================================================
+
 
 class TestAgentIdentity:
     def test_agent_id_generated_from_name(self, mock_llm):
@@ -91,6 +97,7 @@ class TestAgentIdentity:
 # ===========================================================================
 # Lazy LLM initialisation
 # ===========================================================================
+
 
 class TestLazyLLM:
     def test_llm_is_none_without_api_key(self):
@@ -129,6 +136,7 @@ class TestLazyLLM:
 # configure_defaults()
 # ===========================================================================
 
+
 class TestConfigureDefaults:
     def setup_method(self):
         # Snapshot class-level defaults so we can restore after each test
@@ -161,6 +169,7 @@ class TestConfigureDefaults:
 # Plugin and tool management
 # ===========================================================================
 
+
 class TestPluginAndToolManagement:
     def test_add_plugin_appends_to_sources(self, mock_llm):
         agent = Agent(name="X", llm_provider=mock_llm)
@@ -185,7 +194,9 @@ class TestPluginAndToolManagement:
         assert agent.tool_registry.tool_count == 1
 
     async def test_multiple_tools_added(self, mock_llm):
-        agent = Agent(name="X", llm_provider=mock_llm, tools=[make_tool("t1"), make_tool("t2")])
+        agent = Agent(
+            name="X", llm_provider=mock_llm, tools=[make_tool("t1"), make_tool("t2")]
+        )
         await agent._setup_tools()
         assert agent.tool_registry.tool_count == 2
 
@@ -206,10 +217,20 @@ class TestPluginAndToolManagement:
 # health property
 # ===========================================================================
 
+
 class TestHealthProperty:
     def test_health_has_required_keys(self, basic_agent):
         h = basic_agent.health
-        for key in ("id", "name", "type", "running", "metrics", "tools", "relay", "llm"):
+        for key in (
+            "id",
+            "name",
+            "type",
+            "running",
+            "metrics",
+            "tools",
+            "relay",
+            "llm",
+        ):
             assert key in h, f"Missing key: {key}"
 
     async def test_health_tools_count_matches_registry(self, mock_llm, simple_tool):
@@ -237,6 +258,7 @@ class TestHealthProperty:
 # ===========================================================================
 # get_token_usage()
 # ===========================================================================
+
 
 class TestGetTokenUsage:
     def test_returns_dict_with_expected_keys(self, basic_agent):

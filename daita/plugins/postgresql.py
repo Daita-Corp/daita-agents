@@ -3,6 +3,7 @@ PostgreSQL plugin for Daita Agents.
 
 Simple database connection and querying - no over-engineering.
 """
+
 import asyncio
 import logging
 import re
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
     from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
+
 
 class PostgreSQLPlugin(BaseDatabasePlugin):
     """
@@ -33,11 +35,11 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         user: Optional[str] = None,  # Add this
         password: str = "",
         connection_string: Optional[str] = None,
-        **kwargs
+        **kwargs,
     ):
         """
         Initialize PostgreSQL connection.
-        
+
         Args:
             host: Database host
             port: Database port
@@ -50,7 +52,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         """
         # Use 'user' parameter as alias for 'username' if provided
         effective_username = user if user is not None else username
-        
+
         # Build connection string
         if connection_string:
             self.connection_string = connection_string
@@ -60,24 +62,29 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 self.connection_string = f"postgresql://{quote(effective_username, safe='')}:{quote(password, safe='')}@{host}:{port}/{database}"
             else:
                 self.connection_string = f"postgresql://{quote(effective_username, safe='')}@{host}:{port}/{database}"
-        
+
         # PostgreSQL-specific pool configuration
         self.pool_config = {
-            'min_size': kwargs.get('min_size', 1),
-            'max_size': kwargs.get('max_size', 10),
-            'command_timeout': kwargs.get('command_timeout', 60),
-            'statement_cache_size': kwargs.get('statement_cache_size', 0),  # Set to 0 for pgbouncer compatibility
+            "min_size": kwargs.get("min_size", 1),
+            "max_size": kwargs.get("max_size", 10),
+            "command_timeout": kwargs.get("command_timeout", 60),
+            "statement_cache_size": kwargs.get(
+                "statement_cache_size", 0
+            ),  # Set to 0 for pgbouncer compatibility
         }
-        
+
         # Initialize base class with all config
         super().__init__(
-            host=host, port=port, database=database, 
-            username=effective_username, connection_string=connection_string,
-            **kwargs
+            host=host,
+            port=port,
+            database=database,
+            username=effective_username,
+            connection_string=connection_string,
+            **kwargs,
         )
-        
+
         logger.debug(f"PostgreSQL plugin configured for {host}:{port}/{database}")
-    
+
     async def connect(self):
         """Connect to PostgreSQL database."""
         if self._pool is not None:
@@ -85,16 +92,20 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
 
         try:
             import asyncpg
-            logger.debug(f"Connecting to PostgreSQL with connection string (password masked)")
+
+            logger.debug(
+                f"Connecting to PostgreSQL with connection string (password masked)"
+            )
             self._pool = await asyncpg.create_pool(
-                self.connection_string,
-                **self.pool_config
+                self.connection_string, **self.pool_config
             )
             logger.info("Connected to PostgreSQL")
         except ImportError:
             self._handle_connection_error(
-                ImportError("asyncpg not installed. Install with: pip install 'daita-agents[postgresql]'"),
-                "connection"
+                ImportError(
+                    "asyncpg not installed. Install with: pip install 'daita-agents[postgresql]'"
+                ),
+                "connection",
             )
         except Exception as e:
             # Enhance error message with troubleshooting tips
@@ -102,72 +113,90 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             troubleshooting = []
 
             if "role" in error_msg and "does not exist" in error_msg:
-                troubleshooting.append("Database user may not exist. Check POSTGRES_USER setting.")
-                troubleshooting.append("For Docker: ensure container started with correct POSTGRES_USER env var.")
+                troubleshooting.append(
+                    "Database user may not exist. Check POSTGRES_USER setting."
+                )
+                troubleshooting.append(
+                    "For Docker: ensure container started with correct POSTGRES_USER env var."
+                )
 
             if "database" in error_msg and "does not exist" in error_msg:
-                troubleshooting.append("Database does not exist. Check POSTGRES_DB setting.")
-                troubleshooting.append(f"For ankane/pgvector: default database is 'postgres', not custom names.")
-                troubleshooting.append("Create database first or connect to existing database.")
+                troubleshooting.append(
+                    "Database does not exist. Check POSTGRES_DB setting."
+                )
+                troubleshooting.append(
+                    f"For ankane/pgvector: default database is 'postgres', not custom names."
+                )
+                troubleshooting.append(
+                    "Create database first or connect to existing database."
+                )
 
             if "password authentication failed" in error_msg:
-                troubleshooting.append("Password authentication failed. Check POSTGRES_PASSWORD setting.")
-                troubleshooting.append("For Docker: ensure -e POSTGRES_PASSWORD=<pwd> was set when starting container.")
+                troubleshooting.append(
+                    "Password authentication failed. Check POSTGRES_PASSWORD setting."
+                )
+                troubleshooting.append(
+                    "For Docker: ensure -e POSTGRES_PASSWORD=<pwd> was set when starting container."
+                )
 
             if troubleshooting:
-                enhanced_error = f"{error_msg}\n\nTroubleshooting:\n" + "\n".join(f"  - {tip}" for tip in troubleshooting)
+                enhanced_error = f"{error_msg}\n\nTroubleshooting:\n" + "\n".join(
+                    f"  - {tip}" for tip in troubleshooting
+                )
                 logger.error(enhanced_error)
 
             self._handle_connection_error(e, "connection")
-    
+
     async def disconnect(self):
         """Disconnect from PostgreSQL database."""
         if self._pool:
             await self._pool.close()
             self._pool = None
             logger.info("Disconnected from PostgreSQL")
-    
-    async def query(self, sql: str, params: Optional[List] = None) -> List[Dict[str, Any]]:
+
+    async def query(
+        self, sql: str, params: Optional[List] = None
+    ) -> List[Dict[str, Any]]:
         """
         Run a SELECT query and return results.
-        
+
         Args:
             sql: SQL query with $1, $2, etc. placeholders
             params: List of parameters for the query
-            
+
         Returns:
             List of rows as dictionaries
-            
+
         Example:
             results = await db.query("SELECT * FROM users WHERE age > $1", [25])
         """
         # Only auto-connect if pool is None - allows manual mocking
         if self._pool is None:
             await self.connect()
-        
+
         async with self._pool.acquire() as conn:
             if params:
                 rows = await conn.fetch(sql, *params)
             else:
                 rows = await conn.fetch(sql)
-            
+
             return [dict(row) for row in rows]
-    
+
     async def execute(self, sql: str, params: Optional[List] = None) -> int:
         """
         Execute INSERT/UPDATE/DELETE and return affected rows.
-        
+
         Args:
             sql: SQL statement
             params: List of parameters
-            
+
         Returns:
             Number of affected rows
         """
         # Only auto-connect if pool is None - allows manual mocking
         if self._pool is None:
             await self.connect()
-        
+
         async with self._pool.acquire() as conn:
             if params:
                 result = await conn.execute(sql, *params)
@@ -183,39 +212,39 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                     # Command succeeded but doesn't return a count (e.g., CREATE EXTENSION)
                     return 0
             return 0
-    
+
     async def insert_many(self, table: str, data: List[Dict[str, Any]]) -> int:
         """
         Bulk insert data into a table.
-        
+
         Args:
             table: Table name
             data: List of dictionaries to insert
-            
+
         Returns:
             Number of rows inserted
         """
         if not data:
             return 0
-        
+
         # Only auto-connect if pool is None - allows manual mocking
         if self._pool is None:
             await self.connect()
-        
+
         # Get columns from first row
         columns = list(data[0].keys())
-        placeholders = ', '.join([f'${i+1}' for i in range(len(columns))])
-        
+        placeholders = ", ".join([f"${i+1}" for i in range(len(columns))])
+
         sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})"
-        
+
         # Convert to list of tuples for executemany
         rows = [[row[col] for col in columns] for row in data]
-        
+
         async with self._pool.acquire() as conn:
             await conn.executemany(sql, rows)
-        
+
         return len(data)
-    
+
     async def tables(self) -> List[str]:
         """List all tables in the database."""
         sql = """
@@ -225,7 +254,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         ORDER BY table_name
         """
         results = await self.query(sql)
-        return [row['table_name'] for row in results]
+        return [row["table_name"] for row in results]
 
     async def describe(self, table: str) -> List[Dict[str, Any]]:
         """Get table column information."""
@@ -245,7 +274,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         top_k: int = 10,
         filter: Optional[str] = None,
         select_columns: str = "*",
-        distance_type: str = "cosine"
+        distance_type: str = "cosine",
     ) -> List[Dict[str, Any]]:
         """
         Search for similar vectors using pgvector extension.
@@ -277,14 +306,12 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             await self.connect()
 
         # Distance operators: <=> (cosine), <-> (L2), <#> (inner product)
-        distance_ops = {
-            "cosine": "<=>",
-            "l2": "<->",
-            "inner_product": "<#>"
-        }
+        distance_ops = {"cosine": "<=>", "l2": "<->", "inner_product": "<#>"}
 
         if distance_type not in distance_ops:
-            raise ValueError(f"Invalid distance_type. Must be one of: {list(distance_ops.keys())}")
+            raise ValueError(
+                f"Invalid distance_type. Must be one of: {list(distance_ops.keys())}"
+            )
 
         operator = distance_ops[distance_type]
 
@@ -312,7 +339,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         vector_column: str,
         id: str,
         vector: List[float],
-        extra_columns: Optional[Dict[str, Any]] = None
+        extra_columns: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Insert or update a vector with ON CONFLICT handling.
@@ -376,7 +403,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         table: str,
         vector_column: str,
         index_type: str = "hnsw",
-        distance_type: str = "cosine"
+        distance_type: str = "cosine",
     ) -> Dict[str, Any]:
         """
         Create a vector index for faster similarity search.
@@ -406,11 +433,13 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         ops_map = {
             "cosine": "vector_cosine_ops",
             "l2": "vector_l2_ops",
-            "inner_product": "vector_ip_ops"
+            "inner_product": "vector_ip_ops",
         }
 
         if distance_type not in ops_map:
-            raise ValueError(f"Invalid distance_type. Must be one of: {list(ops_map.keys())}")
+            raise ValueError(
+                f"Invalid distance_type. Must be one of: {list(ops_map.keys())}"
+            )
 
         if index_type not in ["hnsw", "ivfflat"]:
             raise ValueError("Invalid index_type. Must be 'hnsw' or 'ivfflat'")
@@ -428,17 +457,17 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 "table": table,
                 "column": vector_column,
                 "index_type": index_type,
-                "distance_type": distance_type
+                "distance_type": distance_type,
             }
         except Exception as e:
             return {
                 "success": False,
                 "error": str(e),
                 "table": table,
-                "column": vector_column
+                "column": vector_column,
             }
 
-    def get_tools(self) -> List['AgentTool']:
+    def get_tools(self) -> List["AgentTool"]:
         """
         Expose PostgreSQL operations as agent tools.
 
@@ -456,34 +485,34 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "SQL SELECT query with $1, $2, etc. placeholders"
+                            "description": "SQL SELECT query with $1, $2, etc. placeholders",
                         },
                         "params": {
                             "type": "array",
                             "description": "Optional parameter values for placeholders",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Max rows to return (default: 50)"
+                            "description": "Max rows to return (default: 50)",
                         },
                         "columns": {
                             "type": "array",
                             "description": "Specific columns to return (returns all if omitted)",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         },
                         "focus": {
                             "type": "string",
-                            "description": "Focus DSL to filter/project at the database level, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\""
-                        }
+                            "description": "Focus DSL to filter/project at the database level, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\"",
+                        },
                     },
-                    "required": ["sql"]
+                    "required": ["sql"],
                 },
                 handler=self._tool_query,
                 category="database",
                 source="plugin",
                 plugin_name="PostgreSQL",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="postgres_list_tables",
@@ -493,7 +522,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 category="database",
                 source="plugin",
                 plugin_name="PostgreSQL",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="postgres_get_schema",
@@ -503,16 +532,16 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                     "properties": {
                         "table_name": {
                             "type": "string",
-                            "description": "Table name to inspect"
+                            "description": "Table name to inspect",
                         }
                     },
-                    "required": ["table_name"]
+                    "required": ["table_name"],
                 },
                 handler=self._tool_get_schema,
                 category="database",
                 source="plugin",
                 plugin_name="PostgreSQL",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="postgres_execute",
@@ -522,21 +551,21 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "SQL statement (INSERT, UPDATE, or DELETE)"
+                            "description": "SQL statement (INSERT, UPDATE, or DELETE)",
                         },
                         "params": {
                             "type": "array",
                             "description": "Optional parameter values",
-                            "items": {"type": "string"}
-                        }
+                            "items": {"type": "string"},
+                        },
                     },
-                    "required": ["sql"]
+                    "required": ["sql"],
                 },
                 handler=self._tool_execute,
                 category="database",
                 source="plugin",
                 plugin_name="PostgreSQL",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="postgres_inspect",
@@ -547,16 +576,16 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                         "tables": {
                             "type": "array",
                             "description": "Filter to specific tables (returns all if omitted)",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         }
                     },
-                    "required": []
+                    "required": [],
                 },
                 handler=self._tool_inspect,
                 category="database",
                 source="plugin",
                 plugin_name="PostgreSQL",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="vector_search",
@@ -566,37 +595,37 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                     "properties": {
                         "table": {
                             "type": "string",
-                            "description": "Table name containing vector data"
+                            "description": "Table name containing vector data",
                         },
                         "vector_column": {
                             "type": "string",
-                            "description": "Column name with vector embeddings"
+                            "description": "Column name with vector embeddings",
                         },
                         "query_vector": {
                             "type": "array",
                             "description": "Query vector as array of floats",
-                            "items": {"type": "number"}
+                            "items": {"type": "number"},
                         },
                         "top_k": {
                             "type": "integer",
-                            "description": "Maximum number of results to return (default: 10)"
+                            "description": "Maximum number of results to return (default: 10)",
                         },
                         "filter": {
                             "type": "string",
-                            "description": "Optional SQL WHERE clause for filtering (e.g., \"category = 'tech'\")"
+                            "description": "Optional SQL WHERE clause for filtering (e.g., \"category = 'tech'\")",
                         },
                         "distance_type": {
                             "type": "string",
-                            "description": "Distance metric: 'cosine', 'l2', or 'inner_product' (default: 'cosine')"
-                        }
+                            "description": "Distance metric: 'cosine', 'l2', or 'inner_product' (default: 'cosine')",
+                        },
                     },
-                    "required": ["table", "vector_column", "query_vector"]
+                    "required": ["table", "vector_column", "query_vector"],
                 },
                 handler=self._tool_vector_search,
                 category="database",
                 source="plugin",
                 plugin_name="PostgreSQL",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="vector_upsert",
@@ -604,40 +633,34 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 parameters={
                     "type": "object",
                     "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name"
-                        },
+                        "table": {"type": "string", "description": "Table name"},
                         "id_column": {
                             "type": "string",
-                            "description": "Primary key column name"
+                            "description": "Primary key column name",
                         },
                         "vector_column": {
                             "type": "string",
-                            "description": "Vector column name"
+                            "description": "Vector column name",
                         },
-                        "id": {
-                            "type": "string",
-                            "description": "ID value for the row"
-                        },
+                        "id": {"type": "string", "description": "ID value for the row"},
                         "vector": {
                             "type": "array",
                             "description": "Vector as array of floats",
-                            "items": {"type": "number"}
+                            "items": {"type": "number"},
                         },
                         "extra_columns": {
                             "type": "object",
-                            "description": "Optional additional columns to upsert as key-value pairs"
-                        }
+                            "description": "Optional additional columns to upsert as key-value pairs",
+                        },
                     },
-                    "required": ["table", "id_column", "vector_column", "id", "vector"]
+                    "required": ["table", "id_column", "vector_column", "id", "vector"],
                 },
                 handler=self._tool_vector_upsert,
                 category="database",
                 source="plugin",
                 plugin_name="PostgreSQL",
-                timeout_seconds=60
-            )
+                timeout_seconds=60,
+            ),
         ]
 
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -653,29 +676,20 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             columns = args.get("columns")
             if columns:
                 safe_cols = ", ".join(
-                    f'"{c}"' for c in columns
-                    if re.match(r'^[A-Za-z0-9_]+$', c)
+                    f'"{c}"' for c in columns if re.match(r"^[A-Za-z0-9_]+$", c)
                 )
                 if safe_cols:
                     sql = f"SELECT {safe_cols} FROM ({sql}) _pg_q"
             sql = f"{sql} LIMIT {int(limit)}"
             results = await self.query(sql, params or None)
 
-        return {
-            "success": True,
-            "rows": results,
-            "row_count": len(results)
-        }
+        return {"success": True, "rows": results, "row_count": len(results)}
 
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_list_tables"""
         tables = await self.tables()
 
-        return {
-            "success": True,
-            "tables": tables,
-            "count": len(tables)
-        }
+        return {"success": True, "tables": tables, "count": len(tables)}
 
     async def _tool_get_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_get_schema"""
@@ -686,7 +700,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             "success": True,
             "table": table_name,
             "columns": columns,
-            "column_count": len(columns)
+            "column_count": len(columns),
         }
 
     async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -696,24 +710,25 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
 
         affected_rows = await self.execute(sql, params)
 
-        return {
-            "success": True,
-            "affected_rows": affected_rows
-        }
+        return {"success": True, "affected_rows": affected_rows}
 
     async def _tool_inspect(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_inspect — fetch all table schemas in parallel."""
         filter_tables = args.get("tables")
 
         all_tables = await self.tables()
-        targets = [t for t in all_tables if t in filter_tables] if filter_tables else all_tables
+        targets = (
+            [t for t in all_tables if t in filter_tables]
+            if filter_tables
+            else all_tables
+        )
 
         schemas = await asyncio.gather(*[self.describe(t) for t in targets])
 
         return {
             "success": True,
             "tables": [{"name": t, "columns": s} for t, s in zip(targets, schemas)],
-            "count": len(targets)
+            "count": len(targets),
         }
 
     async def _tool_vector_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -731,14 +746,10 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             query_vector=query_vector,
             top_k=top_k,
             filter=filter,
-            distance_type=distance_type
+            distance_type=distance_type,
         )
 
-        return {
-            "success": True,
-            "results": results,
-            "count": len(results)
-        }
+        return {"success": True, "results": results, "count": len(results)}
 
     async def _tool_vector_upsert(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for vector_upsert"""
@@ -755,13 +766,11 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             vector_column=vector_column,
             id=id,
             vector=vector,
-            extra_columns=extra_columns
+            extra_columns=extra_columns,
         )
 
-        return {
-            "success": True,
-            "row": result
-        }
+        return {"success": True, "row": result}
+
 
 def postgresql(**kwargs) -> PostgreSQLPlugin:
     """Create PostgreSQL plugin with simplified interface."""
