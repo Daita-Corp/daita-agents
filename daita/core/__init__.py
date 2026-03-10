@@ -101,20 +101,6 @@ from .plugin_tracing import (
     TracedPlugin,
 )
 
-# Graph System - Agent-native graph storage for lineage and catalog
-from .graph import (
-    AgentGraphNode,
-    AgentGraphEdge,
-    NodeType,
-    EdgeType,
-    GraphBackend,
-    auto_select_backend,
-    LocalGraphBackend,
-    traverse,
-    impact_analysis,
-    find_paths,
-)
-
 # Decision Tracing System - Agent reasoning and confidence capture
 from .decision_tracing import (
     # Main decision tracing interfaces
@@ -223,17 +209,6 @@ __all__ = [
     # Advanced decision tracing
     "DecisionRecorder",
     "DecisionContext",
-    # === Graph System ===
-    "AgentGraphNode",
-    "AgentGraphEdge",
-    "NodeType",
-    "EdgeType",
-    "GraphBackend",
-    "auto_select_backend",
-    "LocalGraphBackend",
-    "traverse",
-    "impact_analysis",
-    "find_paths",
 ]
 
 # Core module metadata
