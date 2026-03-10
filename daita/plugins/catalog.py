@@ -4,6 +4,7 @@ CatalogPlugin for schema discovery and metadata management.
 Provides tools for discovering database schemas, API structures, and other
 organizational metadata across multiple platforms.
 """
+
 import ipaddress
 import logging
 import socket
@@ -38,7 +39,7 @@ class CatalogPlugin(BasePlugin):
         self,
         backend: Optional[Any] = None,
         organization_id: Optional[int] = None,
-        auto_persist: bool = False
+        auto_persist: bool = False,
     ):
         """
         Initialize CatalogPlugin.
@@ -54,14 +55,21 @@ class CatalogPlugin(BasePlugin):
         self._auto_persist = auto_persist
         self._agent_id: Optional[str] = None
 
-        logger.debug("CatalogPlugin initialized (backend: %s, auto_persist: %s)", backend is not None, auto_persist)
+        logger.debug(
+            "CatalogPlugin initialized (backend: %s, auto_persist: %s)",
+            backend is not None,
+            auto_persist,
+        )
 
     def initialize(self, agent_id: str) -> None:
         self._agent_id = agent_id
         if self._graph_backend is None:
             from daita.core.graph.backend import auto_select_backend
+
             self._graph_backend = auto_select_backend(graph_type="catalog")
-            logger.debug(f"CatalogPlugin: using graph backend {type(self._graph_backend).__name__}")
+            logger.debug(
+                f"CatalogPlugin: using graph backend {type(self._graph_backend).__name__}"
+            )
 
     @staticmethod
     def _redact_url(connection_string: str) -> str:
@@ -162,7 +170,7 @@ class CatalogPlugin(BasePlugin):
             return ctx
         return ssl.create_default_context()
 
-    def get_tools(self) -> List['AgentTool']:
+    def get_tools(self) -> List["AgentTool"]:
         """
         Expose schema discovery operations as agent tools.
 
@@ -180,28 +188,28 @@ class CatalogPlugin(BasePlugin):
                     "properties": {
                         "connection_string": {
                             "type": "string",
-                            "description": "PostgreSQL connection string (e.g., postgresql://user:pass@host:port/db)"
+                            "description": "PostgreSQL connection string (e.g., postgresql://user:pass@host:port/db)",
                         },
                         "schema": {
                             "type": "string",
-                            "description": "Schema name to introspect (default: 'public')"
+                            "description": "Schema name to introspect (default: 'public')",
                         },
                         "persist": {
                             "type": "boolean",
-                            "description": "Whether to persist schema to graph storage if available (default: auto_persist setting)"
+                            "description": "Whether to persist schema to graph storage if available (default: auto_persist setting)",
                         },
                         "ssl_mode": {
                             "type": "string",
-                            "description": "SSL mode: 'verify-full' (default, validates cert) or 'require' (encrypt only, for pgbouncer poolers)"
-                        }
+                            "description": "SSL mode: 'verify-full' (default, validates cert) or 'require' (encrypt only, for pgbouncer poolers)",
+                        },
                     },
-                    "required": ["connection_string"]
+                    "required": ["connection_string"],
                 },
                 handler=self._tool_discover_postgres,
                 category="catalog",
                 source="plugin",
                 plugin_name="Catalog",
-                timeout_seconds=120
+                timeout_seconds=120,
             ),
             AgentTool(
                 name="discover_mysql",
@@ -211,24 +219,24 @@ class CatalogPlugin(BasePlugin):
                     "properties": {
                         "connection_string": {
                             "type": "string",
-                            "description": "MySQL connection string (e.g., mysql://user:pass@host:port/db)"
+                            "description": "MySQL connection string (e.g., mysql://user:pass@host:port/db)",
                         },
                         "schema": {
                             "type": "string",
-                            "description": "Schema/database name to introspect"
+                            "description": "Schema/database name to introspect",
                         },
                         "persist": {
                             "type": "boolean",
-                            "description": "Whether to persist schema to graph storage if available"
-                        }
+                            "description": "Whether to persist schema to graph storage if available",
+                        },
                     },
-                    "required": ["connection_string"]
+                    "required": ["connection_string"],
                 },
                 handler=self._tool_discover_mysql,
                 category="catalog",
                 source="plugin",
                 plugin_name="Catalog",
-                timeout_seconds=120
+                timeout_seconds=120,
             ),
             AgentTool(
                 name="discover_mongodb",
@@ -238,28 +246,28 @@ class CatalogPlugin(BasePlugin):
                     "properties": {
                         "connection_string": {
                             "type": "string",
-                            "description": "MongoDB connection string (e.g., mongodb://user:pass@host:port/db)"
+                            "description": "MongoDB connection string (e.g., mongodb://user:pass@host:port/db)",
                         },
                         "database": {
                             "type": "string",
-                            "description": "Database name to introspect"
+                            "description": "Database name to introspect",
                         },
                         "sample_size": {
                             "type": "integer",
-                            "description": "Number of documents to sample per collection (default: 100)"
+                            "description": "Number of documents to sample per collection (default: 100)",
                         },
                         "persist": {
                             "type": "boolean",
-                            "description": "Whether to persist schema to graph storage if available"
-                        }
+                            "description": "Whether to persist schema to graph storage if available",
+                        },
                     },
-                    "required": ["connection_string", "database"]
+                    "required": ["connection_string", "database"],
                 },
                 handler=self._tool_discover_mongodb,
                 category="catalog",
                 source="plugin",
                 plugin_name="Catalog",
-                timeout_seconds=120
+                timeout_seconds=120,
             ),
             AgentTool(
                 name="discover_openapi",
@@ -269,24 +277,24 @@ class CatalogPlugin(BasePlugin):
                     "properties": {
                         "spec_url": {
                             "type": "string",
-                            "description": "URL to OpenAPI spec (JSON or YAML)"
+                            "description": "URL to OpenAPI spec (JSON or YAML)",
                         },
                         "service_name": {
                             "type": "string",
-                            "description": "Optional service name override"
+                            "description": "Optional service name override",
                         },
                         "persist": {
                             "type": "boolean",
-                            "description": "Whether to persist schema to graph storage if available"
-                        }
+                            "description": "Whether to persist schema to graph storage if available",
+                        },
                     },
-                    "required": ["spec_url"]
+                    "required": ["spec_url"],
                 },
                 handler=self._tool_discover_openapi,
                 category="catalog",
                 source="plugin",
                 plugin_name="Catalog",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="compare_schemas",
@@ -296,20 +304,20 @@ class CatalogPlugin(BasePlugin):
                     "properties": {
                         "schema_a": {
                             "type": "object",
-                            "description": "First schema (from discover_* tools)"
+                            "description": "First schema (from discover_* tools)",
                         },
                         "schema_b": {
                             "type": "object",
-                            "description": "Second schema to compare against"
-                        }
+                            "description": "Second schema to compare against",
+                        },
                     },
-                    "required": ["schema_a", "schema_b"]
+                    "required": ["schema_a", "schema_b"],
                 },
                 handler=self._tool_compare_schemas,
                 category="catalog",
                 source="plugin",
                 plugin_name="Catalog",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="export_diagram",
@@ -319,21 +327,21 @@ class CatalogPlugin(BasePlugin):
                     "properties": {
                         "schema": {
                             "type": "object",
-                            "description": "Schema object (from discover_* tools)"
+                            "description": "Schema object (from discover_* tools)",
                         },
                         "format": {
                             "type": "string",
-                            "description": "Output format: 'mermaid', 'dbdiagram', or 'json_schema' (default: 'mermaid')"
-                        }
+                            "description": "Output format: 'mermaid', 'dbdiagram', or 'json_schema' (default: 'mermaid')",
+                        },
                     },
-                    "required": ["schema"]
+                    "required": ["schema"],
                 },
                 handler=self._tool_export_diagram,
                 category="catalog",
                 source="plugin",
                 plugin_name="Catalog",
-                timeout_seconds=30
-            )
+                timeout_seconds=30,
+            ),
         ]
 
     async def _tool_discover_postgres(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -376,7 +384,11 @@ class CatalogPlugin(BasePlugin):
         """
         import asyncpg
 
-        logger.debug("discover_postgres: connecting to %s (ssl_mode=%s)", self._redact_url(connection_string), ssl_mode)
+        logger.debug(
+            "discover_postgres: connecting to %s (ssl_mode=%s)",
+            self._redact_url(connection_string),
+            ssl_mode,
+        )
         creds = self._parse_conn_url(connection_string)
         conn = await asyncpg.connect(
             host=creds["host"],
@@ -389,7 +401,8 @@ class CatalogPlugin(BasePlugin):
 
         try:
             # Get tables
-            tables = await conn.fetch("""
+            tables = await conn.fetch(
+                """
                 SELECT table_name,
                        pg_stat_user_tables.n_live_tup as row_count
                 FROM information_schema.tables
@@ -397,10 +410,13 @@ class CatalogPlugin(BasePlugin):
                     ON table_name = relname
                 WHERE table_schema = $1
                 AND table_type = 'BASE TABLE'
-            """, schema)
+            """,
+                schema,
+            )
 
             # Get columns
-            columns = await conn.fetch("""
+            columns = await conn.fetch(
+                """
                 SELECT
                     table_name,
                     column_name,
@@ -413,10 +429,13 @@ class CatalogPlugin(BasePlugin):
                 FROM information_schema.columns
                 WHERE table_schema = $1
                 ORDER BY table_name, ordinal_position
-            """, schema)
+            """,
+                schema,
+            )
 
             # Get primary keys
-            pkeys = await conn.fetch("""
+            pkeys = await conn.fetch(
+                """
                 SELECT
                     tc.table_name,
                     kcu.column_name
@@ -425,10 +444,13 @@ class CatalogPlugin(BasePlugin):
                     ON tc.constraint_name = kcu.constraint_name
                 WHERE tc.constraint_type = 'PRIMARY KEY'
                 AND tc.table_schema = $1
-            """, schema)
+            """,
+                schema,
+            )
 
             # Get foreign keys
-            fkeys = await conn.fetch("""
+            fkeys = await conn.fetch(
+                """
                 SELECT
                     tc.table_name as source_table,
                     kcu.column_name as source_column,
@@ -446,17 +468,22 @@ class CatalogPlugin(BasePlugin):
                     ON tc.constraint_name = rc.constraint_name
                 WHERE tc.constraint_type = 'FOREIGN KEY'
                 AND tc.table_schema = $1
-            """, schema)
+            """,
+                schema,
+            )
 
             # Get indexes
-            indexes = await conn.fetch("""
+            indexes = await conn.fetch(
+                """
                 SELECT
                     tablename,
                     indexname,
                     indexdef
                 FROM pg_indexes
                 WHERE schemaname = $1
-            """, schema)
+            """,
+                schema,
+            )
 
             # Build result
             result = {
@@ -468,7 +495,7 @@ class CatalogPlugin(BasePlugin):
                 "foreign_keys": [dict(row) for row in fkeys],
                 "indexes": [dict(row) for row in indexes],
                 "table_count": len(tables),
-                "column_count": len(columns)
+                "column_count": len(columns),
             }
 
             # Optionally persist to graph storage
@@ -501,9 +528,7 @@ class CatalogPlugin(BasePlugin):
         persist = args.get("persist", self._auto_persist)
 
         result = await self.discover_mysql(
-            connection_string=connection_string,
-            schema=schema,
-            persist=persist
+            connection_string=connection_string, schema=schema, persist=persist
         )
 
         return result
@@ -512,7 +537,7 @@ class CatalogPlugin(BasePlugin):
         self,
         connection_string: str,
         schema: Optional[str] = None,
-        persist: bool = False
+        persist: bool = False,
     ) -> Dict[str, Any]:
         """
         Discover MySQL/MariaDB database schema.
@@ -527,7 +552,9 @@ class CatalogPlugin(BasePlugin):
         """
         import aiomysql
 
-        logger.debug("discover_mysql: connecting to %s", self._redact_url(connection_string))
+        logger.debug(
+            "discover_mysql: connecting to %s", self._redact_url(connection_string)
+        )
         creds = self._parse_conn_url(connection_string)
         db_name = schema or creds["database"] or "mysql"
 
@@ -600,7 +627,7 @@ class CatalogPlugin(BasePlugin):
                 "columns": columns,
                 "foreign_keys": fkeys,
                 "table_count": len(tables),
-                "column_count": len(columns)
+                "column_count": len(columns),
             }
 
             # Optionally persist to graph storage
@@ -640,7 +667,7 @@ class CatalogPlugin(BasePlugin):
             connection_string=connection_string,
             database=database,
             sample_size=sample_size,
-            persist=persist
+            persist=persist,
         )
 
         return result
@@ -650,7 +677,7 @@ class CatalogPlugin(BasePlugin):
         connection_string: str,
         database: str,
         sample_size: int = 100,
-        persist: bool = False
+        persist: bool = False,
     ) -> Dict[str, Any]:
         """
         Discover MongoDB schema by sampling documents.
@@ -666,7 +693,9 @@ class CatalogPlugin(BasePlugin):
         """
         from motor.motor_asyncio import AsyncIOMotorClient
 
-        logger.debug("discover_mongodb: connecting to %s", self._redact_url(connection_string))
+        logger.debug(
+            "discover_mongodb: connecting to %s", self._redact_url(connection_string)
+        )
         client = AsyncIOMotorClient(connection_string)
         db = client[database]
 
@@ -691,7 +720,7 @@ class CatalogPlugin(BasePlugin):
                             fields[key] = {
                                 "field_name": key,
                                 "types": set(),
-                                "sample_count": 0
+                                "sample_count": 0,
                             }
                         fields[key]["types"].add(type(value).__name__)
                         fields[key]["sample_count"] += 1
@@ -700,19 +729,21 @@ class CatalogPlugin(BasePlugin):
                 for field in fields.values():
                     field["types"] = list(field["types"])
 
-                collections_schema.append({
-                    "collection_name": coll_name,
-                    "document_count": await collection.estimated_document_count(),
-                    "sampled_count": len(docs),
-                    "fields": list(fields.values())
-                })
+                collections_schema.append(
+                    {
+                        "collection_name": coll_name,
+                        "document_count": await collection.estimated_document_count(),
+                        "sampled_count": len(docs),
+                        "fields": list(fields.values()),
+                    }
+                )
 
             result = {
                 "database_type": "mongodb",
                 "database": database,
                 "collections": collections_schema,
                 "collection_count": len(collections_schema),
-                "sample_size": sample_size
+                "sample_size": sample_size,
             }
 
             # Optionally persist to graph storage
@@ -745,18 +776,13 @@ class CatalogPlugin(BasePlugin):
         persist = args.get("persist", self._auto_persist)
 
         result = await self.discover_openapi(
-            spec_url=spec_url,
-            service_name=service_name,
-            persist=persist
+            spec_url=spec_url, service_name=service_name, persist=persist
         )
 
         return result
 
     async def discover_openapi(
-        self,
-        spec_url: str,
-        service_name: Optional[str] = None,
-        persist: bool = False
+        self, spec_url: str, service_name: Optional[str] = None, persist: bool = False
     ) -> Dict[str, Any]:
         """
         Discover API structure from OpenAPI/Swagger spec.
@@ -800,15 +826,17 @@ class CatalogPlugin(BasePlugin):
                 if method.startswith("x-"):
                     continue
 
-                endpoints.append({
-                    "method": method.upper(),
-                    "path": path,
-                    "summary": details.get("summary", ""),
-                    "description": details.get("description", ""),
-                    "parameters": details.get("parameters", []),
-                    "request_body": details.get("requestBody", {}),
-                    "responses": details.get("responses", {})
-                })
+                endpoints.append(
+                    {
+                        "method": method.upper(),
+                        "path": path,
+                        "summary": details.get("summary", ""),
+                        "description": details.get("description", ""),
+                        "parameters": details.get("parameters", []),
+                        "request_body": details.get("requestBody", {}),
+                        "responses": details.get("responses", {}),
+                    }
+                )
 
         result = {
             "api_type": "openapi",
@@ -816,7 +844,7 @@ class CatalogPlugin(BasePlugin):
             "base_url": base_url,
             "version": spec.get("info", {}).get("version", "unknown"),
             "endpoints": endpoints,
-            "endpoint_count": len(endpoints)
+            "endpoint_count": len(endpoints),
         }
 
         # Optionally persist to graph storage
@@ -846,9 +874,7 @@ class CatalogPlugin(BasePlugin):
         return result
 
     async def compare_schemas(
-        self,
-        schema_a: Dict[str, Any],
-        schema_b: Dict[str, Any]
+        self, schema_a: Dict[str, Any], schema_b: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
         Compare two schemas to identify differences.
@@ -864,8 +890,12 @@ class CatalogPlugin(BasePlugin):
         db_type_a = schema_a.get("database_type", "")
         db_type_b = schema_b.get("database_type", "")
         if db_type_a == "mongodb" or db_type_b == "mongodb":
-            tables_a = {c["collection_name"]: c for c in schema_a.get("collections", [])}
-            tables_b = {c["collection_name"]: c for c in schema_b.get("collections", [])}
+            tables_a = {
+                c["collection_name"]: c for c in schema_a.get("collections", [])
+            }
+            tables_b = {
+                c["collection_name"]: c for c in schema_b.get("collections", [])
+            }
         else:
             tables_a = {t["table_name"]: t for t in schema_a.get("tables", [])}
             tables_b = {t["table_name"]: t for t in schema_b.get("tables", [])}
@@ -874,8 +904,12 @@ class CatalogPlugin(BasePlugin):
         removed_tables = [name for name in tables_a if name not in tables_b]
 
         # Compare columns
-        columns_a = {(c["table_name"], c["column_name"]): c for c in schema_a.get("columns", [])}
-        columns_b = {(c["table_name"], c["column_name"]): c for c in schema_b.get("columns", [])}
+        columns_a = {
+            (c["table_name"], c["column_name"]): c for c in schema_a.get("columns", [])
+        }
+        columns_b = {
+            (c["table_name"], c["column_name"]): c for c in schema_b.get("columns", [])
+        }
 
         added_columns = [key for key in columns_b if key not in columns_a]
         removed_columns = [key for key in columns_a if key not in columns_b]
@@ -884,23 +918,31 @@ class CatalogPlugin(BasePlugin):
         modified_columns = []
         for key in set(columns_a.keys()) & set(columns_b.keys()):
             if columns_a[key].get("data_type") != columns_b[key].get("data_type"):
-                modified_columns.append({
-                    "table": key[0],
-                    "column": key[1],
-                    "old_type": columns_a[key].get("data_type"),
-                    "new_type": columns_b[key].get("data_type")
-                })
+                modified_columns.append(
+                    {
+                        "table": key[0],
+                        "column": key[1],
+                        "old_type": columns_a[key].get("data_type"),
+                        "new_type": columns_b[key].get("data_type"),
+                    }
+                )
 
         return {
             "success": True,
             "comparison": {
                 "added_tables": added_tables,
                 "removed_tables": removed_tables,
-                "added_columns": [{"table": k[0], "column": k[1]} for k in added_columns],
-                "removed_columns": [{"table": k[0], "column": k[1]} for k in removed_columns],
+                "added_columns": [
+                    {"table": k[0], "column": k[1]} for k in added_columns
+                ],
+                "removed_columns": [
+                    {"table": k[0], "column": k[1]} for k in removed_columns
+                ],
                 "modified_columns": modified_columns,
-                "breaking_changes": len(removed_tables) + len(removed_columns) + len(modified_columns)
-            }
+                "breaking_changes": len(removed_tables)
+                + len(removed_columns)
+                + len(modified_columns),
+            },
         }
 
     async def _tool_export_diagram(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -913,9 +955,7 @@ class CatalogPlugin(BasePlugin):
         return result
 
     async def export_diagram(
-        self,
-        schema: Dict[str, Any],
-        format: str = "mermaid"
+        self, schema: Dict[str, Any], format: str = "mermaid"
     ) -> Dict[str, Any]:
         """
         Export schema as a visual diagram.
@@ -952,15 +992,11 @@ class CatalogPlugin(BasePlugin):
             for fk in schema.get("foreign_keys", []):
                 source = fk["source_table"]
                 target = fk["target_table"]
-                lines.append(f"    {source} ||--o{{ {target} : \"\"")
+                lines.append(f'    {source} ||--o{{ {target} : ""')
 
             diagram = "\n".join(lines)
 
-            return {
-                "success": True,
-                "format": "mermaid",
-                "diagram": diagram
-            }
+            return {"success": True, "format": "mermaid", "diagram": diagram}
 
         elif format == "json_schema":
             # Generate JSON Schema representation
@@ -968,34 +1004,36 @@ class CatalogPlugin(BasePlugin):
                 "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object",
                 "properties": {},
-                "required": []
+                "required": [],
             }
 
             # Add table schemas
             for table in schema.get("tables", []):
                 table_name = table["table_name"]
-                table_columns = [c for c in schema.get("columns", []) if c["table_name"] == table_name]
+                table_columns = [
+                    c
+                    for c in schema.get("columns", [])
+                    if c["table_name"] == table_name
+                ]
 
                 properties = {}
                 for col in table_columns:
-                    col_type = self._map_sql_to_json_type(col.get("data_type", "string"))
+                    col_type = self._map_sql_to_json_type(
+                        col.get("data_type", "string")
+                    )
                     properties[col["column_name"]] = {"type": col_type}
 
                 json_schema["properties"][table_name] = {
                     "type": "object",
-                    "properties": properties
+                    "properties": properties,
                 }
 
-            return {
-                "success": True,
-                "format": "json_schema",
-                "schema": json_schema
-            }
+            return {"success": True, "format": "json_schema", "schema": json_schema}
 
         else:
             return {
                 "success": False,
-                "error": f"Unsupported format: {format}. Use 'mermaid' or 'json_schema'"
+                "error": f"Unsupported format: {format}. Use 'mermaid' or 'json_schema'",
             }
 
     def _map_sql_to_json_type(self, sql_type: str) -> str:
@@ -1004,7 +1042,9 @@ class CatalogPlugin(BasePlugin):
 
         if any(t in sql_type for t in ["int", "serial", "bigint", "smallint"]):
             return "integer"
-        elif any(t in sql_type for t in ["float", "double", "decimal", "numeric", "real"]):
+        elif any(
+            t in sql_type for t in ["float", "double", "decimal", "numeric", "real"]
+        ):
             return "number"
         elif any(t in sql_type for t in ["bool", "boolean"]):
             return "boolean"
@@ -1036,8 +1076,8 @@ class CatalogPlugin(BasePlugin):
             logger.warning(
                 "Schema persistence skipped in Lambda (DynamoDB not yet implemented): "
                 "%s:%s",
-                schema.get('database_type', 'unknown'),
-                schema.get('schema', 'unknown'),
+                schema.get("database_type", "unknown"),
+                schema.get("schema", "unknown"),
             )
             return False
 

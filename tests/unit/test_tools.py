@@ -20,10 +20,10 @@ from daita.core.tools import (
     tool,
 )
 
-
 # ===========================================================================
 # _type_hint_to_json_schema — pure function, no I/O
 # ===========================================================================
+
 
 class TestTypeHintToJsonSchema:
     def test_int(self):
@@ -74,6 +74,7 @@ class TestTypeHintToJsonSchema:
     def test_unknown_type_falls_back_to_string(self):
         class Custom:
             pass
+
         schema = _type_hint_to_json_schema(Custom)
         assert schema == {"type": "string"}
 
@@ -81,6 +82,7 @@ class TestTypeHintToJsonSchema:
 # ===========================================================================
 # @tool decorator — schema extraction
 # ===========================================================================
+
 
 class TestToolDecoratorSchema:
     def test_basic_types_extracted(self):
@@ -287,6 +289,7 @@ class TestToolDecoratorSchema:
 # AgentTool — format conversion
 # ===========================================================================
 
+
 class TestAgentToolFormatConversion:
     @pytest.fixture
     def sample_tool(self):
@@ -373,6 +376,7 @@ class TestAgentToolFormatConversion:
 # ===========================================================================
 # AgentTool — execution
 # ===========================================================================
+
 
 class TestAgentToolExecution:
     async def test_execute_sync_handler(self):
@@ -463,6 +467,7 @@ class TestAgentToolExecution:
 # ===========================================================================
 # ToolRegistry
 # ===========================================================================
+
 
 class TestToolRegistry:
     @pytest.fixture

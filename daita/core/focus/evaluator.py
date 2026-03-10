@@ -4,6 +4,7 @@ natively by a backend. Works on any data that can be coerced to a list of dicts.
 
 Filter evaluation walks the Python AST directly; no eval() is used.
 """
+
 from __future__ import annotations
 
 import ast as pyast
@@ -14,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set
 from .ast import FocusQuery
 
 # ── Public entry point ────────────────────────────────────────────────────────
+
 
 def evaluate_remaining(data: Any, query: FocusQuery, applied: Set[str]) -> Any:
     """Apply any FocusQuery clauses not already handled natively by a backend."""
@@ -32,7 +34,10 @@ def evaluate_remaining(data: Any, query: FocusQuery, applied: Set[str]) -> Any:
         reverse = query.order_dir == "DESC"
         rows = sorted(
             rows,
-            key=lambda r: (_get_field(r, query.order_by) is None, _get_field(r, query.order_by)),
+            key=lambda r: (
+                _get_field(r, query.order_by) is None,
+                _get_field(r, query.order_by),
+            ),
             reverse=reverse,
         )
 
@@ -40,12 +45,15 @@ def evaluate_remaining(data: Any, query: FocusQuery, applied: Set[str]) -> Any:
         rows = rows[: query.limit]
 
     if "select" not in applied and (query.select or query.aggregates):
-        rows = [_project_row(r, query.select or [], query.aggregates or {}) for r in rows]
+        rows = [
+            _project_row(r, query.select or [], query.aggregates or {}) for r in rows
+        ]
 
     return _from_rows(rows, original)
 
 
 # ── Row coercion ──────────────────────────────────────────────────────────────
+
 
 def _to_rows(data: Any) -> List[Dict]:
     if isinstance(data, list):
@@ -61,6 +69,7 @@ def _from_rows(rows: List[Dict], original: Any) -> Any:
     if hasattr(original, "columns"):  # pandas DataFrame
         try:
             import pandas as pd
+
             return pd.DataFrame(rows)
         except ImportError:
             pass
@@ -72,6 +81,7 @@ def _from_rows(rows: List[Dict], original: Any) -> Any:
 
 
 # ── Field resolution ──────────────────────────────────────────────────────────
+
 
 def _get_field(row: Dict, field: str) -> Any:
     """Resolve a field name. Supports dot notation for nested dicts."""
@@ -88,6 +98,7 @@ def _get_field(row: Dict, field: str) -> Any:
 
 
 # ── Filter evaluation (AST walk — no eval) ───────────────────────────────────
+
 
 def _eval_filter(row: Dict, node: pyast.expr) -> bool:
     try:
@@ -143,14 +154,22 @@ def _flatten_attr(node: pyast.Attribute) -> Optional[List[str]]:
 
 def _apply_cmp(op: pyast.cmpop, left: Any, right: Any) -> bool:
     try:
-        if isinstance(op, pyast.Eq):    return left == right
-        if isinstance(op, pyast.NotEq): return left != right
-        if isinstance(op, pyast.Lt):    return left < right
-        if isinstance(op, pyast.LtE):   return left <= right
-        if isinstance(op, pyast.Gt):    return left > right
-        if isinstance(op, pyast.GtE):   return left >= right
-        if isinstance(op, pyast.In):    return left in (right or [])
-        if isinstance(op, pyast.NotIn): return left not in (right or [])
+        if isinstance(op, pyast.Eq):
+            return left == right
+        if isinstance(op, pyast.NotEq):
+            return left != right
+        if isinstance(op, pyast.Lt):
+            return left < right
+        if isinstance(op, pyast.LtE):
+            return left <= right
+        if isinstance(op, pyast.Gt):
+            return left > right
+        if isinstance(op, pyast.GtE):
+            return left >= right
+        if isinstance(op, pyast.In):
+            return left in (right or [])
+        if isinstance(op, pyast.NotIn):
+            return left not in (right or [])
     except TypeError:
         # Attempt lightweight coercion for mixed numeric/string comparisons
         try:
@@ -165,6 +184,7 @@ def _apply_cmp(op: pyast.cmpop, left: Any, right: Any) -> bool:
 
 
 # ── Projection ────────────────────────────────────────────────────────────────
+
 
 def _project_row(row: Dict, fields: List[str], aggregates: Dict[str, str]) -> Dict:
     result = {}
@@ -182,11 +202,14 @@ def _project_row(row: Dict, fields: List[str], aggregates: Dict[str, str]) -> Di
 # ── Group by + aggregates ─────────────────────────────────────────────────────
 
 _AGG_FUNCS = {
-    "SUM":   lambda vals: sum(v for v in vals if v is not None),
+    "SUM": lambda vals: sum(v for v in vals if v is not None),
     "COUNT": lambda vals: sum(1 for v in vals if v is not None),
-    "AVG":   lambda vals: (sum(v for v in vals if v is not None) / max(sum(1 for v in vals if v is not None), 1)),
-    "MIN":   lambda vals: min((v for v in vals if v is not None), default=None),
-    "MAX":   lambda vals: max((v for v in vals if v is not None), default=None),
+    "AVG": lambda vals: (
+        sum(v for v in vals if v is not None)
+        / max(sum(1 for v in vals if v is not None), 1)
+    ),
+    "MIN": lambda vals: min((v for v in vals if v is not None), default=None),
+    "MAX": lambda vals: max((v for v in vals if v is not None), default=None),
 }
 
 _AGG_EXPR_RE = re.compile(r"^(SUM|COUNT|AVG|MIN|MAX)\((\*|[\w.]+)\)$", re.IGNORECASE)
@@ -213,7 +236,11 @@ def _apply_group_by(rows: List[Dict], query: FocusQuery) -> List[Dict]:
             for alias, expr in query.aggregates.items():
                 func_name, field = _parse_agg_expr(expr)
                 func = _AGG_FUNCS[func_name]
-                vals = list(range(len(group_rows))) if field == "*" else [_get_field(r, field) for r in group_rows]
+                vals = (
+                    list(range(len(group_rows)))
+                    if field == "*"
+                    else [_get_field(r, field) for r in group_rows]
+                )
                 out[alias] = func(vals)
 
         result.append(out)
@@ -222,7 +249,10 @@ def _apply_group_by(rows: List[Dict], query: FocusQuery) -> List[Dict]:
         reverse = query.order_dir == "DESC"
         result = sorted(
             result,
-            key=lambda r: (_get_field(r, query.order_by) is None, _get_field(r, query.order_by)),
+            key=lambda r: (
+                _get_field(r, query.order_by) is None,
+                _get_field(r, query.order_by),
+            ),
             reverse=reverse,
         )
 

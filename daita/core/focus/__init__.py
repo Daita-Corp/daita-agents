@@ -13,6 +13,7 @@ Usage:
     # Aggregation
     result = apply_focus(data, "region == 'EU' | GROUP BY category | SELECT category, SUM(revenue) AS total")
 """
+
 from __future__ import annotations
 
 from typing import Any, Optional, Union
@@ -49,7 +50,7 @@ def apply_focus(data: Any, focus: Optional[Union[str, FocusQuery]]) -> Any:
     else:
         raise FocusDSLError(
             f"focus must be a DSL string or FocusQuery, got {type(focus).__name__}. "
-            "Example: focus=\"price > 100 | SELECT name, price | LIMIT 50\""
+            'Example: focus="price > 100 | SELECT name, price | LIMIT 50"'
         )
 
     backend = get_backend(data)

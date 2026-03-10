@@ -16,29 +16,25 @@ from ..core.interfaces import LLMProvider
 
 logger = logging.getLogger(__name__)
 
+
 class BaseLLMProvider(LLMProvider, ABC):
     """
     Base class for LLM providers with automatic call tracing.
-    
+
     Every LLM call is automatically traced with:
     - Provider and model details
     - Token usage and costs
     - Latency and performance
     - Input/output content (preview)
     - Error tracking
-    
+
     Users get full LLM observability without any configuration.
     """
-    
-    def __init__(
-        self,
-        model: str,
-        api_key: Optional[str] = None,
-        **kwargs
-    ):
+
+    def __init__(self, model: str, api_key: Optional[str] = None, **kwargs):
         """
         Initialize the LLM provider with automatic tracing.
-        
+
         Args:
             model: Model identifier
             api_key: API key for authentication
@@ -47,23 +43,23 @@ class BaseLLMProvider(LLMProvider, ABC):
         self.model = model
         self.api_key = api_key
         self.config = kwargs
-        
+
         # Default parameters
         self.default_params = {
-            'temperature': kwargs.get('temperature', 0.7),
-            'max_tokens': kwargs.get('max_tokens', 1000),
-            'top_p': kwargs.get('top_p', 1.0),
+            "temperature": kwargs.get("temperature", 0.7),
+            "max_tokens": kwargs.get("max_tokens", 1000),
+            "top_p": kwargs.get("top_p", 1.0),
         }
-        
+
         # Agent ID for tracing (set by agent)
-        self.agent_id = kwargs.get('agent_id')
-        
+        self.agent_id = kwargs.get("agent_id")
+
         # Get trace manager for automatic tracing
         self.trace_manager = get_trace_manager()
-        
+
         # Provider name for tracing
-        self.provider_name = self.__class__.__name__.replace('Provider', '').lower()
-        
+        self.provider_name = self.__class__.__name__.replace("Provider", "").lower()
+
         # Last usage for cost estimation
         self._last_usage = None
 
@@ -72,19 +68,21 @@ class BaseLLMProvider(LLMProvider, ABC):
 
         # Accumulated token tracking
         self._accumulated_tokens = {
-            'total_tokens': 0,
-            'prompt_tokens': 0,
-            'completion_tokens': 0
+            "total_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
         }
 
-        logger.debug(f"Initialized {self.__class__.__name__} with model {model} (automatic tracing enabled)")
-    
+        logger.debug(
+            f"Initialized {self.__class__.__name__} with model {model} (automatic tracing enabled)"
+        )
+
     async def generate(
         self,
         messages,
-        tools: Optional[List['AgentTool']] = None,
+        tools: Optional[List["AgentTool"]] = None,
         stream: bool = False,
-        **kwargs
+        **kwargs,
     ):
         """
         Unified LLM generation - handles everything.
@@ -135,13 +133,13 @@ class BaseLLMProvider(LLMProvider, ABC):
             return self._stream_impl(messages, tool_specs, **params)
         else:
             return await self._generate_impl(messages, tool_specs, **params)
-    
+
     @abstractmethod
     async def _generate_impl(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
-        **kwargs
+        **kwargs,
     ):
         """
         Provider-specific non-streaming implementation.
@@ -162,7 +160,7 @@ class BaseLLMProvider(LLMProvider, ABC):
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
-        **kwargs
+        **kwargs,
     ):
         """
         Provider-specific streaming implementation.
@@ -176,98 +174,97 @@ class BaseLLMProvider(LLMProvider, ABC):
             LLMChunk objects with type "text" or "tool_call_complete"
         """
         pass
-    
+
     def _get_last_token_usage(self) -> Dict[str, int]:
         """
         Get token usage from the last API call.
-        
+
         This should be overridden by each provider to return actual
         token usage from their last API response.
         """
         if self._last_usage:
             # Try to extract from stored usage object
-            if hasattr(self._last_usage, 'total_tokens'):
+            if hasattr(self._last_usage, "total_tokens"):
                 # OpenAI format
                 return {
-                    'total_tokens': getattr(self._last_usage, 'total_tokens', 0),
-                    'prompt_tokens': getattr(self._last_usage, 'prompt_tokens', 0),
-                    'completion_tokens': getattr(self._last_usage, 'completion_tokens', 0)
+                    "total_tokens": getattr(self._last_usage, "total_tokens", 0),
+                    "prompt_tokens": getattr(self._last_usage, "prompt_tokens", 0),
+                    "completion_tokens": getattr(
+                        self._last_usage, "completion_tokens", 0
+                    ),
                 }
-            elif hasattr(self._last_usage, 'input_tokens'):
+            elif hasattr(self._last_usage, "input_tokens"):
                 # Anthropic format
-                input_tokens = getattr(self._last_usage, 'input_tokens', 0)
-                output_tokens = getattr(self._last_usage, 'output_tokens', 0)
+                input_tokens = getattr(self._last_usage, "input_tokens", 0)
+                output_tokens = getattr(self._last_usage, "output_tokens", 0)
                 return {
-                    'total_tokens': input_tokens + output_tokens,
-                    'prompt_tokens': input_tokens,
-                    'completion_tokens': output_tokens
+                    "total_tokens": input_tokens + output_tokens,
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
                 }
-        
+
         # Default fallback
-        return {
-            'total_tokens': 0,
-            'prompt_tokens': 0,
-            'completion_tokens': 0
-        }
-    
+        return {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0}
+
     def _estimate_cost(self, token_usage: Dict[str, int]) -> Optional[float]:
         """
         Simple cost estimation for MVP.
-        
+
         Providers can override with specific pricing.
         """
-        total_tokens = token_usage.get('total_tokens', 0)
+        total_tokens = token_usage.get("total_tokens", 0)
         if total_tokens == 0:
             return None
-        
+
         # Generic estimation for MVP - providers should override
         cost_per_1k_tokens = 0.002  # $0.002 per 1K tokens
         return (total_tokens / 1000) * cost_per_1k_tokens
-    
+
     def _merge_params(self, override_params: Dict[str, Any]) -> Dict[str, Any]:
         """Merge default parameters with overrides."""
         params = self.default_params.copy()
         params.update(override_params)
         return params
-    
+
     def _validate_api_key(self) -> None:
         """Validate that API key is available."""
         if not self.api_key:
             raise ValueError(f"API key required for {self.__class__.__name__}")
-    
+
     def set_agent_id(self, agent_id: str):
         """
         Set the agent ID for tracing context.
-        
+
         This is called automatically by BaseAgent during initialization.
         """
         self.agent_id = agent_id
         logger.debug(f"Set agent ID {agent_id} for {self.provider_name} provider")
-    
+
     def get_recent_calls(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent LLM calls for this provider's agent from unified tracing."""
         if not self.agent_id:
             return []
-        
-        operations = self.trace_manager.get_recent_operations(agent_id=self.agent_id, limit=limit * 2)
-        
+
+        operations = self.trace_manager.get_recent_operations(
+            agent_id=self.agent_id, limit=limit * 2
+        )
+
         # Filter for LLM calls from this provider
         llm_calls = [
-            op for op in operations 
-            if (op.get('type') == 'llm_call' and 
-                op.get('metadata', {}).get('llm_provider') == self.provider_name)
+            op
+            for op in operations
+            if (
+                op.get("type") == "llm_call"
+                and op.get("metadata", {}).get("llm_provider") == self.provider_name
+            )
         ]
-        
+
         return llm_calls[:limit]
-    
+
     def get_token_stats(self) -> Dict[str, Any]:
         """Get token usage statistics from unified tracing."""
         if not self.agent_id:
-            return {
-                'total_calls': 0,
-                'total_tokens': 0,
-                'estimated_cost': 0.0
-            }
+            return {"total_calls": 0, "total_tokens": 0, "estimated_cost": 0.0}
 
         metrics = self.trace_manager.get_agent_metrics(self.agent_id)
 
@@ -275,17 +272,18 @@ class BaseLLMProvider(LLMProvider, ABC):
         accumulated = self._accumulated_tokens.copy()
 
         return {
-            'total_calls': metrics.get('total_operations', 0),  # All operations
-            'total_tokens': accumulated['total_tokens'],  # From ALL API calls
-            'prompt_tokens': accumulated['prompt_tokens'],
-            'completion_tokens': accumulated['completion_tokens'],
-            'estimated_cost': self._accumulated_cost,  # Accumulated cost across all calls
-            'success_rate': metrics.get('success_rate', 0),
-            'avg_latency_ms': metrics.get('avg_latency_ms', 0)
+            "total_calls": metrics.get("total_operations", 0),  # All operations
+            "total_tokens": accumulated["total_tokens"],  # From ALL API calls
+            "prompt_tokens": accumulated["prompt_tokens"],
+            "completion_tokens": accumulated["completion_tokens"],
+            "estimated_cost": self._accumulated_cost,  # Accumulated cost across all calls
+            "success_rate": metrics.get("success_rate", 0),
+            "avg_latency_ms": metrics.get("avg_latency_ms", 0),
         }
-    
 
-    def _convert_tools_to_format(self, tools: List['AgentTool']) -> List[Dict[str, Any]]:
+    def _convert_tools_to_format(
+        self, tools: List["AgentTool"]
+    ) -> List[Dict[str, Any]]:
         """
         Convert AgentTool list to provider-specific format.
 
@@ -295,9 +293,7 @@ class BaseLLMProvider(LLMProvider, ABC):
         return [tool.to_openai_function() for tool in tools]
 
     async def _execute_tool_call(
-        self,
-        tool_call: Dict[str, Any],
-        tools: List['AgentTool']
+        self, tool_call: Dict[str, Any], tools: List["AgentTool"]
     ) -> Any:
         """Execute a single tool call with timeout and error handling."""
         tool_name = tool_call["name"]
@@ -311,26 +307,26 @@ class BaseLLMProvider(LLMProvider, ABC):
         # Execute with timeout
         try:
             result = await asyncio.wait_for(
-                tool.handler(arguments),
-                timeout=tool.timeout_seconds
+                tool.handler(arguments), timeout=tool.timeout_seconds
             )
             return result
         except asyncio.TimeoutError:
-            return {"error": f"Tool '{tool_name}' timed out after {tool.timeout_seconds}s"}
+            return {
+                "error": f"Tool '{tool_name}' timed out after {tool.timeout_seconds}s"
+            }
         except Exception as e:
             return {"error": f"Tool '{tool_name}' failed: {str(e)}"}
-
 
     @property
     def info(self) -> Dict[str, Any]:
         """Get information about this LLM provider."""
         return {
-            'provider': self.provider_name,
-            'model': self.model,
-            'agent_id': self.agent_id,
-            'config': {k: v for k, v in self.config.items() if 'key' not in k.lower()},
-            'default_params': self.default_params,
-            'tracing_enabled': True
+            "provider": self.provider_name,
+            "model": self.model,
+            "agent_id": self.agent_id,
+            "config": {k: v for k, v in self.config.items() if "key" not in k.lower()},
+            "default_params": self.default_params,
+            "tracing_enabled": True,
         }
 
     @property
@@ -356,7 +352,9 @@ class BaseLLMProvider(LLMProvider, ABC):
         """
         return self._accumulated_tokens.copy()
 
-    def _update_accumulated_metrics(self, token_usage: Dict[str, int], cost: Optional[float] = None):
+    def _update_accumulated_metrics(
+        self, token_usage: Dict[str, int], cost: Optional[float] = None
+    ):
         """
         Update accumulated metrics after an LLM call.
 
@@ -365,9 +363,11 @@ class BaseLLMProvider(LLMProvider, ABC):
             cost: Estimated cost (if None, will be calculated)
         """
         # Update accumulated tokens
-        self._accumulated_tokens['total_tokens'] += token_usage.get('total_tokens', 0)
-        self._accumulated_tokens['prompt_tokens'] += token_usage.get('prompt_tokens', 0)
-        self._accumulated_tokens['completion_tokens'] += token_usage.get('completion_tokens', 0)
+        self._accumulated_tokens["total_tokens"] += token_usage.get("total_tokens", 0)
+        self._accumulated_tokens["prompt_tokens"] += token_usage.get("prompt_tokens", 0)
+        self._accumulated_tokens["completion_tokens"] += token_usage.get(
+            "completion_tokens", 0
+        )
 
         # Update accumulated cost
         if cost is None:
@@ -375,26 +375,27 @@ class BaseLLMProvider(LLMProvider, ABC):
         self._accumulated_cost += cost
 
 
-
 # Context manager for batch LLM operations
 @asynccontextmanager
-async def traced_llm_batch(llm_provider: BaseLLMProvider, batch_name: str = "llm_batch"):
+async def traced_llm_batch(
+    llm_provider: BaseLLMProvider, batch_name: str = "llm_batch"
+):
     """
     Context manager for tracing batch LLM operations.
-    
+
     Usage:
         async with traced_llm_batch(llm, "document_analysis"):
             summary = await llm.generate("Summarize: " + doc1)
             analysis = await llm.generate("Analyze: " + doc2)
     """
     trace_manager = get_trace_manager()
-    
+
     async with trace_manager.span(
         operation_name=f"llm_batch_{batch_name}",
         trace_type=TraceType.LLM_CALL,
         agent_id=llm_provider.agent_id,
         llm_provider=llm_provider.provider_name,
-        batch_operation=batch_name
+        batch_operation=batch_name,
     ):
         try:
             yield llm_provider
@@ -404,47 +405,49 @@ async def traced_llm_batch(llm_provider: BaseLLMProvider, batch_name: str = "llm
 
 
 # Utility functions
-def get_llm_traces(agent_id: Optional[str] = None, provider: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+def get_llm_traces(
+    agent_id: Optional[str] = None, provider: Optional[str] = None, limit: int = 20
+) -> List[Dict[str, Any]]:
     """Get recent LLM call traces from unified tracing."""
     trace_manager = get_trace_manager()
     operations = trace_manager.get_recent_operations(agent_id=agent_id, limit=limit * 2)
-    
+
     # Filter for LLM operations
-    llm_ops = [
-        op for op in operations 
-        if op.get('type') == 'llm_call'
-    ]
-    
+    llm_ops = [op for op in operations if op.get("type") == "llm_call"]
+
     # Filter by provider if specified
     if provider:
         llm_ops = [
-            op for op in llm_ops
-            if op.get('metadata', {}).get('llm_provider') == provider
+            op
+            for op in llm_ops
+            if op.get("metadata", {}).get("llm_provider") == provider
         ]
-    
+
     return llm_ops[:limit]
 
 
-def get_llm_stats(agent_id: Optional[str] = None, provider: Optional[str] = None) -> Dict[str, Any]:
+def get_llm_stats(
+    agent_id: Optional[str] = None, provider: Optional[str] = None
+) -> Dict[str, Any]:
     """Get LLM usage statistics from unified tracing."""
     traces = get_llm_traces(agent_id, provider, limit=50)
-    
+
     if not traces:
         return {"total_calls": 0, "success_rate": 0, "avg_latency_ms": 0}
-    
+
     total_calls = len(traces)
-    successful_calls = len([t for t in traces if t.get('status') == 'success'])
-    
+    successful_calls = len([t for t in traces if t.get("status") == "success"])
+
     # Calculate averages
-    latencies = [t.get('duration_ms', 0) for t in traces if t.get('duration_ms')]
+    latencies = [t.get("duration_ms", 0) for t in traces if t.get("duration_ms")]
     avg_latency = sum(latencies) / len(latencies) if latencies else 0
-    
+
     # Token aggregation (simplified for MVP)
     total_tokens = 0
     for trace in traces:
-        metadata = trace.get('metadata', {})
-        total_tokens += metadata.get('tokens_total', 0)
-    
+        metadata = trace.get("metadata", {})
+        total_tokens += metadata.get("tokens_total", 0)
+
     return {
         "total_calls": total_calls,
         "successful_calls": successful_calls,
@@ -453,7 +456,7 @@ def get_llm_stats(agent_id: Optional[str] = None, provider: Optional[str] = None
         "avg_latency_ms": avg_latency,
         "total_tokens": total_tokens,
         "agent_id": agent_id,
-        "provider": provider
+        "provider": provider,
     }
 
 
@@ -461,11 +464,9 @@ def get_llm_stats(agent_id: Optional[str] = None, provider: Optional[str] = None
 __all__ = [
     # Base class
     "BaseLLMProvider",
-    
     # Context managers
     "traced_llm_batch",
-    
     # Utility functions
     "get_llm_traces",
-    "get_llm_stats"
+    "get_llm_stats",
 ]

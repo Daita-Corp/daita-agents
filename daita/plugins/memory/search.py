@@ -36,7 +36,7 @@ class SQLiteVectorSearch:
         self,
         db_path: Path,
         embedding_provider: str = "openai",
-        embedding_model: str = "text-embedding-3-small"
+        embedding_model: str = "text-embedding-3-small",
     ):
         self.db_path = db_path
         self.embedding_provider = embedding_provider
@@ -45,12 +45,17 @@ class SQLiteVectorSearch:
 
         if embedding_provider == "openai":
             from openai import AsyncOpenAI
-            api_key = os.getenv('OPENAI_API_KEY')
+
+            api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
-                raise ValueError("OPENAI_API_KEY environment variable required for embeddings")
+                raise ValueError(
+                    "OPENAI_API_KEY environment variable required for embeddings"
+                )
             self.embedder = AsyncOpenAI(api_key=api_key)
         else:
-            raise NotImplementedError(f"Provider {embedding_provider} not yet supported")
+            raise NotImplementedError(
+                f"Provider {embedding_provider} not yet supported"
+            )
 
         self._init_database()
 
@@ -86,18 +91,14 @@ class SQLiteVectorSearch:
         if text in self._embed_cache:
             return self._embed_cache[text]
         response = await self.embedder.embeddings.create(
-            model=self.embedding_model,
-            input=text
+            model=self.embedding_model, input=text
         )
         embedding = response.data[0].embedding
         self._embed_cache[text] = embedding
         return embedding
 
     async def store_chunk(
-        self,
-        content: str,
-        metadata: MemoryMetadata,
-        chunk_id: Optional[str] = None
+        self, content: str, metadata: MemoryMetadata, chunk_id: Optional[str] = None
     ) -> str:
         """
         Store a single chunk directly into the vector DB.
@@ -133,15 +134,21 @@ class SQLiteVectorSearch:
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT INTO chunks (chunk_id, file_path, content, line_start, line_end, metadata)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (chunk_id, "memory://direct", content, 0, 0, metadata.to_json()))
+        """,
+            (chunk_id, "memory://direct", content, 0, 0, metadata.to_json()),
+        )
 
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT INTO embeddings (chunk_id, embedding)
             VALUES (?, ?)
-        """, (chunk_id, json.dumps(embedding)))
+        """,
+            (chunk_id, json.dumps(embedding)),
+        )
 
         conn.commit()
         conn.close()
@@ -151,7 +158,7 @@ class SQLiteVectorSearch:
         self,
         file_path: str,
         chunk_size: int = 400,
-        metadata: Optional[MemoryMetadata] = None
+        metadata: Optional[MemoryMetadata] = None,
     ):
         """
         Index a file by chunking and embedding. Incremental: skips unchanged chunks.
@@ -166,9 +173,7 @@ class SQLiteVectorSearch:
 
         if metadata is None:
             metadata = MemoryMetadata(
-                content=content[:100],
-                importance=0.5,
-                source='agent_inferred'
+                content=content[:100], importance=0.5, source="agent_inferred"
             )
 
         conn = sqlite3.connect(str(self.db_path))
@@ -180,7 +185,9 @@ class SQLiteVectorSearch:
             ).hexdigest()
 
             # Incremental: skip existing chunks
-            cursor.execute("SELECT chunk_id FROM chunks WHERE chunk_id = ?", (chunk_id,))
+            cursor.execute(
+                "SELECT chunk_id FROM chunks WHERE chunk_id = ?", (chunk_id,)
+            )
             if cursor.fetchone():
                 continue
 
@@ -192,18 +199,31 @@ class SQLiteVectorSearch:
                 source=metadata.source,
                 category=metadata.category,
                 created_at=metadata.created_at,
-                pinned=metadata.pinned
+                pinned=metadata.pinned,
             )
 
-            cursor.execute("""
+            cursor.execute(
+                """
                 INSERT INTO chunks (chunk_id, file_path, content, line_start, line_end, metadata)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (chunk_id, file_path, chunk.content, chunk.start_line, chunk.end_line, chunk_metadata.to_json()))
+            """,
+                (
+                    chunk_id,
+                    file_path,
+                    chunk.content,
+                    chunk.start_line,
+                    chunk.end_line,
+                    chunk_metadata.to_json(),
+                ),
+            )
 
-            cursor.execute("""
+            cursor.execute(
+                """
                 INSERT INTO embeddings (chunk_id, embedding)
                 VALUES (?, ?)
-            """, (chunk_id, json.dumps(embedding)))
+            """,
+                (chunk_id, json.dumps(embedding)),
+            )
 
         conn.commit()
         conn.close()
@@ -221,16 +241,20 @@ class SQLiteVectorSearch:
         now = datetime.now().isoformat()
 
         for chunk_id in chunk_ids:
-            cursor.execute("SELECT metadata FROM chunks WHERE chunk_id = ?", (chunk_id,))
+            cursor.execute(
+                "SELECT metadata FROM chunks WHERE chunk_id = ?", (chunk_id,)
+            )
             row = cursor.fetchone()
             if row and row[0]:
                 try:
                     metadata_dict = json.loads(row[0])
-                    metadata_dict['access_count'] = metadata_dict.get('access_count', 0) + 1
-                    metadata_dict['last_accessed'] = now
+                    metadata_dict["access_count"] = (
+                        metadata_dict.get("access_count", 0) + 1
+                    )
+                    metadata_dict["last_accessed"] = now
                     cursor.execute(
                         "UPDATE chunks SET metadata = ? WHERE chunk_id = ?",
-                        (json.dumps(metadata_dict), chunk_id)
+                        (json.dumps(metadata_dict), chunk_id),
                     )
                 except Exception:
                     pass
@@ -239,9 +263,7 @@ class SQLiteVectorSearch:
         conn.close()
 
     def _apply_score_adjustments(
-        self,
-        base_score: float,
-        metadata_dict: Optional[Dict]
+        self, base_score: float, metadata_dict: Optional[Dict]
     ) -> float:
         """
         Apply importance boost and temporal decay to a base relevance score.
@@ -253,13 +275,13 @@ class SQLiteVectorSearch:
             return base_score
 
         # Importance boost: range [-0.1, +0.1]
-        importance = metadata_dict.get('importance', 0.5)
+        importance = metadata_dict.get("importance", 0.5)
         importance_boost = (importance - 0.5) * 0.2
 
         # Temporal decay (pinned memories are exempt)
         decay = 1.0
-        if not metadata_dict.get('pinned', False):
-            created_at_str = metadata_dict.get('created_at')
+        if not metadata_dict.get("pinned", False):
+            created_at_str = metadata_dict.get("created_at")
             if created_at_str:
                 try:
                     created_at = datetime.fromisoformat(created_at_str)
@@ -275,7 +297,7 @@ class SQLiteVectorSearch:
         query: str,
         limit: int = 5,
         score_threshold: float = 0.7,
-        category: Optional[str] = None
+        category: Optional[str] = None,
     ) -> List[SearchResult]:
         """Semantic search with importance weighting and temporal decay."""
         query_embedding = await self.embed_text(query)
@@ -285,12 +307,15 @@ class SQLiteVectorSearch:
         cursor = conn.cursor()
 
         if category:
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT c.chunk_id, c.file_path, c.content, c.line_start, c.line_end, c.metadata, e.embedding
                 FROM chunks c
                 JOIN embeddings e ON c.chunk_id = e.chunk_id
                 WHERE json_extract(c.metadata, '$.category') = ?
-            """, (category,))
+            """,
+                (category,),
+            )
         else:
             cursor.execute("""
                 SELECT c.chunk_id, c.file_path, c.content, c.line_start, c.line_end, c.metadata, e.embedding
@@ -300,32 +325,48 @@ class SQLiteVectorSearch:
 
         results = []
         for row in cursor.fetchall():
-            chunk_id, file_path, content, line_start, line_end, metadata_json, embedding_json = row
+            (
+                chunk_id,
+                file_path,
+                content,
+                line_start,
+                line_end,
+                metadata_json,
+                embedding_json,
+            ) = row
 
             metadata_dict = None
             if metadata_json:
                 try:
                     metadata_dict = json.loads(metadata_json)
                 except json.JSONDecodeError:
-                    metadata_dict = {'importance': 0.5, 'source': 'agent_inferred', 'pinned': False}
+                    metadata_dict = {
+                        "importance": 0.5,
+                        "source": "agent_inferred",
+                        "pinned": False,
+                    }
 
             chunk_vec = np.array(json.loads(embedding_json))
             denom = np.linalg.norm(query_vec) * np.linalg.norm(chunk_vec)
-            similarity = float(np.dot(query_vec, chunk_vec) / denom) if denom > 0 else 0.0
+            similarity = (
+                float(np.dot(query_vec, chunk_vec) / denom) if denom > 0 else 0.0
+            )
 
             adjusted = self._apply_score_adjustments(similarity, metadata_dict)
 
             if adjusted >= score_threshold:
-                results.append(SearchResult(
-                    content=content,
-                    file_path=file_path,
-                    score=adjusted,
-                    line_start=line_start,
-                    line_end=line_end,
-                    chunk_id=chunk_id,
-                    metadata=metadata_dict,
-                    raw_semantic_score=similarity
-                ))
+                results.append(
+                    SearchResult(
+                        content=content,
+                        file_path=file_path,
+                        score=adjusted,
+                        line_start=line_start,
+                        line_end=line_end,
+                        chunk_id=chunk_id,
+                        metadata=metadata_dict,
+                        raw_semantic_score=similarity,
+                    )
+                )
 
         conn.close()
         results.sort(key=lambda x: x.score, reverse=True)

@@ -31,8 +31,8 @@ def _find_project_root(start_path: Optional[Path] = None) -> Optional[Path]:
 
 def _derive_workspace(agent_id: str) -> str:
     """Strip UUID suffix from agent_id: 'support_bot_a1b2c3ef' → 'support_bot'."""
-    if '_' in agent_id and len(agent_id) > 9:
-        return '_'.join(agent_id.split('_')[:-1])
+    if "_" in agent_id and len(agent_id) > 9:
+        return "_".join(agent_id.split("_")[:-1])
     return agent_id
 
 
@@ -127,9 +127,12 @@ class ConversationHistory:
         self._messages.append({"role": "user", "content": user_message})
         self._messages.append({"role": "assistant", "content": assistant_message})
         if self.max_turns is not None:
-            self._messages = self._messages[-(self.max_turns * 2):]
+            self._messages = self._messages[-(self.max_turns * 2) :]
         if self.max_tokens is not None:
-            while len(self._messages) >= 2 and _estimate_tokens(self._messages) > self.max_tokens:
+            while (
+                len(self._messages) >= 2
+                and _estimate_tokens(self._messages) > self.max_tokens
+            ):
                 self._messages = self._messages[2:]
         if self.auto_save:
             await self.save()
@@ -187,7 +190,9 @@ class ConversationHistory:
                 async with aiofiles.open(path) as f:
                     history._messages = json.loads(await f.read())
             except json.JSONDecodeError:
-                logger.warning("Corrupt session file at %s, starting with empty history", path)
+                logger.warning(
+                    "Corrupt session file at %s, starting with empty history", path
+                )
         return history
 
     def clear(self) -> None:

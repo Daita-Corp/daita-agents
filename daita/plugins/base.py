@@ -32,7 +32,7 @@ class BasePlugin(ABC):
         """
         pass  # Default: no initialization needed
 
-    def get_tools(self) -> List['AgentTool']:
+    def get_tools(self) -> List["AgentTool"]:
         """
         Get agent-usable tools from this plugin.
 

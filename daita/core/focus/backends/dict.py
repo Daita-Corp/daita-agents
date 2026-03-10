@@ -4,6 +4,7 @@ Dict / list-of-dicts backend.
 No native clause handling — the universal evaluator does all the work.
 This backend exists purely to claim ownership of dict and list[dict] data types.
 """
+
 from __future__ import annotations
 
 from typing import Any

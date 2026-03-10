@@ -4,14 +4,19 @@ Base class for database plugins.
 Provides common connection management, error handling, and context manager
 support for all database plugins in the Daita framework.
 """
+
 import logging
 from abc import abstractmethod
 from typing import Any, Dict
-from ..core.exceptions import PluginError, ConnectionError as DaitaConnectionError, ValidationError
+from ..core.exceptions import (
+    PluginError,
+    ConnectionError as DaitaConnectionError,
+    ValidationError,
+)
 from .base import BasePlugin
 
-
 logger = logging.getLogger(__name__)
+
 
 class BaseDatabasePlugin(BasePlugin):
     """
@@ -33,7 +38,7 @@ class BaseDatabasePlugin(BasePlugin):
     def __init__(self, **kwargs):
         """
         Initialize base database plugin.
-        
+
         Args:
             **kwargs: Database-specific configuration parameters
         """
@@ -42,84 +47,86 @@ class BaseDatabasePlugin(BasePlugin):
         self._pool = None
         self._client = None
         self._db = None
-        
+
         # Connection configuration
         self.config = kwargs
-        self.timeout = kwargs.get('timeout', 30)
-        self.max_retries = kwargs.get('max_retries', 3)
-        
-        logger.debug(f"{self.__class__.__name__} initialized with config keys: {list(kwargs.keys())}")
-    
+        self.timeout = kwargs.get("timeout", 30)
+        self.max_retries = kwargs.get("max_retries", 3)
+
+        logger.debug(
+            f"{self.__class__.__name__} initialized with config keys: {list(kwargs.keys())}"
+        )
+
     @abstractmethod
     async def connect(self) -> None:
         """
         Connect to the database.
-        
+
         This method must be implemented by each database plugin to handle
         the specific connection logic for that database type.
         """
         pass
-    
+
     @abstractmethod
     async def disconnect(self) -> None:
         """
         Disconnect from the database and clean up resources.
-        
+
         This method must be implemented by each database plugin to handle
         the specific disconnection and cleanup logic for that database type.
         """
         pass
-    
+
     @property
     def is_connected(self) -> bool:
         """
         Check if the database connection is active.
-        
+
         Returns:
             True if connected, False otherwise
         """
         return (
-            self._connection is not None or 
-            self._pool is not None or 
-            self._client is not None
+            self._connection is not None
+            or self._pool is not None
+            or self._client is not None
         )
-    
+
     async def __aenter__(self):
         """Async context manager entry - automatically connect."""
         await self.connect()
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit - automatically disconnect."""
         await self.disconnect()
-    
+
     def _validate_connection(self) -> None:
         """
         Validate that the database connection is available.
-        
+
         Raises:
             ValidationError: If not connected to database
         """
         if not self.is_connected:
             raise ValidationError(
                 f"{self.__class__.__name__} is not connected to database",
-                field="connection_state"
+                field="connection_state",
             )
-    
+
     def _handle_connection_error(self, error: Exception, operation: str) -> None:
         """
         Handle database connection errors with consistent logging.
-        
+
         Args:
             error: The exception that occurred
             operation: Description of the operation that failed
-            
+
         Raises:
             PluginError: Wrapped database error with context
         """
         error_msg = f"{self.__class__.__name__} {operation} failed: {str(error)}"
         logger.error(error_msg)
-        
+
         # Choose appropriate exception type based on the original error
         if isinstance(error, ImportError):
             # Missing dependency - permanent error
@@ -127,15 +134,15 @@ class BaseDatabasePlugin(BasePlugin):
                 error_msg,
                 plugin_name=self.__class__.__name__,
                 retry_hint="permanent",
-                context={"operation": operation, "original_error": str(error)}
+                context={"operation": operation, "original_error": str(error)},
             ) from error
         else:
             # Connection issues - typically transient
             raise DaitaConnectionError(
                 error_msg,
-                context={"plugin": self.__class__.__name__, "operation": operation}
+                context={"plugin": self.__class__.__name__, "operation": operation},
             ) from error
-    
+
     async def _run_focus_query(self, sql: str, params: list, focus_dsl: str) -> list:
         """
         Parse *focus_dsl*, push as many clauses as possible into SQL, execute,
@@ -163,9 +170,9 @@ class BaseDatabasePlugin(BasePlugin):
             Dictionary with plugin information
         """
         return {
-            'plugin_type': self.__class__.__name__,
-            'connected': self.is_connected,
-            'timeout': self.timeout,
-            'max_retries': self.max_retries,
-            'config_keys': list(self.config.keys())
+            "plugin_type": self.__class__.__name__,
+            "connected": self.is_connected,
+            "timeout": self.timeout,
+            "max_retries": self.max_retries,
+            "config_keys": list(self.config.keys()),
         }

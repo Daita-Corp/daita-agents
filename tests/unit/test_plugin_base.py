@@ -10,13 +10,14 @@ import pytest
 from daita.core.tools import AgentTool
 from daita.plugins.base import BasePlugin
 
-
 # ===========================================================================
 # Helpers — concrete subclasses
 # ===========================================================================
 
+
 class NoToolPlugin(BasePlugin):
     """Minimal plugin: does not override anything."""
+
     pass
 
 
@@ -65,6 +66,7 @@ class InitCapturingPlugin(BasePlugin):
 # BasePlugin defaults
 # ===========================================================================
 
+
 class TestBasePluginDefaults:
     def test_get_tools_returns_empty_list(self):
         plugin = NoToolPlugin()
@@ -87,6 +89,7 @@ class TestBasePluginDefaults:
 # ===========================================================================
 # Subclass with tools
 # ===========================================================================
+
 
 class TestPluginWithTools:
     def test_has_tools_true_when_get_tools_nonempty(self):
@@ -112,6 +115,7 @@ class TestPluginWithTools:
 # ===========================================================================
 # initialize() with agent_id
 # ===========================================================================
+
 
 class TestPluginInitialize:
     def test_initialize_receives_agent_id(self):

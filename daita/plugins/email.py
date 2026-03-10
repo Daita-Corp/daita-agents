@@ -4,6 +4,7 @@ Email plugin for Daita Agents.
 Universal email integration supporting IMAP/SMTP protocols for reading and sending emails.
 Works with Gmail, Outlook, Yahoo, and any email provider supporting standard protocols.
 """
+
 import asyncio
 import logging
 import os
@@ -30,29 +31,29 @@ EMAIL_PROVIDERS = {
         "imap_port": 993,
         "smtp_host": "smtp.gmail.com",
         "smtp_port": 587,
-        "use_tls": True
+        "use_tls": True,
     },
     "outlook": {
         "imap_host": "outlook.office365.com",
         "imap_port": 993,
         "smtp_host": "smtp.office365.com",
         "smtp_port": 587,
-        "use_tls": True
+        "use_tls": True,
     },
     "yahoo": {
         "imap_host": "imap.mail.yahoo.com",
         "imap_port": 993,
         "smtp_host": "smtp.mail.yahoo.com",
         "smtp_port": 587,
-        "use_tls": True
+        "use_tls": True,
     },
     "icloud": {
         "imap_host": "imap.mail.me.com",
         "imap_port": 993,
         "smtp_host": "smtp.mail.me.com",
         "smtp_port": 587,
-        "use_tls": True
-    }
+        "use_tls": True,
+    },
 }
 
 
@@ -74,7 +75,7 @@ class EmailPlugin(BasePlugin):
         smtp_host: Optional[str] = None,
         smtp_port: int = 587,
         use_tls: bool = True,
-        **kwargs
+        **kwargs,
     ):
         """
         Initialize email connection.
@@ -158,7 +159,11 @@ class EmailPlugin(BasePlugin):
 
             imap_host, imap_port = self.imap_host, self.imap_port
             smtp_host, smtp_port = self.smtp_host, self.smtp_port
-            email_address, password, use_tls = self.email_address, self.password, self.use_tls
+            email_address, password, use_tls = (
+                self.email_address,
+                self.password,
+                self.use_tls,
+            )
 
             def _connect():
                 logger.debug(f"Connecting to IMAP server: {imap_host}:{imap_port}")
@@ -231,7 +236,7 @@ class EmailPlugin(BasePlugin):
         folder: str = "INBOX",
         limit: int = 10,
         unread_only: bool = False,
-        search_criteria: Optional[str] = None
+        search_criteria: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         List emails from a folder.
@@ -287,12 +292,14 @@ class EmailPlugin(BasePlugin):
                         "from": msg.get("From", ""),
                         "to": msg.get("To", ""),
                         "date": msg.get("Date", ""),
-                        "has_attachments": False
+                        "has_attachments": False,
                     }
 
                     if email_info["date"]:
                         try:
-                            email_info["date_parsed"] = parsedate_to_datetime(email_info["date"]).isoformat()
+                            email_info["date_parsed"] = parsedate_to_datetime(
+                                email_info["date"]
+                            ).isoformat()
                         except Exception:
                             email_info["date_parsed"] = None
 
@@ -310,10 +317,7 @@ class EmailPlugin(BasePlugin):
             raise RuntimeError(f"Email list_emails failed: {e}")
 
     async def read_email(
-        self,
-        email_id: str,
-        folder: str = "INBOX",
-        mark_as_read: bool = False
+        self, email_id: str, folder: str = "INBOX", mark_as_read: bool = False
     ) -> Dict[str, Any]:
         """
         Read full email content by ID.
@@ -355,18 +359,28 @@ class EmailPlugin(BasePlugin):
                         content_type = part.get_content_type()
                         content_disposition = str(part.get("Content-Disposition", ""))
 
-                        if content_type == "text/plain" and "attachment" not in content_disposition:
+                        if (
+                            content_type == "text/plain"
+                            and "attachment" not in content_disposition
+                        ):
                             body = part.get_payload(decode=True).decode(errors="ignore")
-                        elif content_type == "text/html" and "attachment" not in content_disposition:
-                            body_html = part.get_payload(decode=True).decode(errors="ignore")
+                        elif (
+                            content_type == "text/html"
+                            and "attachment" not in content_disposition
+                        ):
+                            body_html = part.get_payload(decode=True).decode(
+                                errors="ignore"
+                            )
                         elif "attachment" in content_disposition:
                             filename = part.get_filename()
                             if filename:
-                                attachments.append({
-                                    "filename": filename,
-                                    "content_type": content_type,
-                                    "size": len(part.get_payload(decode=True))
-                                })
+                                attachments.append(
+                                    {
+                                        "filename": filename,
+                                        "content_type": content_type,
+                                        "size": len(part.get_payload(decode=True)),
+                                    }
+                                )
                 else:
                     content_type = msg.get_content_type()
                     if content_type == "text/plain":
@@ -383,12 +397,14 @@ class EmailPlugin(BasePlugin):
                     "date": msg.get("Date", ""),
                     "body": body,
                     "body_html": body_html,
-                    "attachments": attachments
+                    "attachments": attachments,
                 }
 
                 if email_data["date"]:
                     try:
-                        email_data["date_parsed"] = parsedate_to_datetime(email_data["date"]).isoformat()
+                        email_data["date_parsed"] = parsedate_to_datetime(
+                            email_data["date"]
+                        ).isoformat()
                     except Exception:
                         email_data["date_parsed"] = None
 
@@ -414,7 +430,7 @@ class EmailPlugin(BasePlugin):
         cc: Optional[Union[str, List[str]]] = None,
         bcc: Optional[Union[str, List[str]]] = None,
         html: bool = False,
-        attachments: Optional[List[str]] = None
+        attachments: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Send an email.
@@ -489,7 +505,7 @@ class EmailPlugin(BasePlugin):
                     encoders.encode_base64(part)
                     part.add_header(
                         "Content-Disposition",
-                        f"attachment; filename={os.path.basename(file_path)}"
+                        f"attachment; filename={os.path.basename(file_path)}",
                     )
                     msg.attach(part)
 
@@ -498,13 +514,15 @@ class EmailPlugin(BasePlugin):
             smtp = self._smtp
             sender = self.email_address
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: smtp.sendmail(sender, recipients, msg_str))
+            await loop.run_in_executor(
+                None, lambda: smtp.sendmail(sender, recipients, msg_str)
+            )
 
             result = {
                 "success": True,
                 "to": recipients,
                 "subject": subject,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
             }
 
             logger.info(f"Sent email to {recipients}: {subject}")
@@ -520,7 +538,7 @@ class EmailPlugin(BasePlugin):
         body: str,
         folder: str = "INBOX",
         html: bool = False,
-        attachments: Optional[List[str]] = None
+        attachments: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Reply to an email.
@@ -552,18 +570,11 @@ class EmailPlugin(BasePlugin):
 
         # Send reply
         return await self.send_email(
-            to=reply_to,
-            subject=subject,
-            body=body,
-            html=html,
-            attachments=attachments
+            to=reply_to, subject=subject, body=body, html=html, attachments=attachments
         )
 
     async def search_emails(
-        self,
-        query: str,
-        folder: str = "INBOX",
-        limit: int = 10
+        self, query: str, folder: str = "INBOX", limit: int = 10
     ) -> List[Dict[str, Any]]:
         """
         Search emails using IMAP search criteria.
@@ -579,17 +590,10 @@ class EmailPlugin(BasePlugin):
         Example:
             emails = await email.search_emails('FROM "boss@company.com"')
         """
-        return await self.list_emails(
-            folder=folder,
-            limit=limit,
-            search_criteria=query
-        )
+        return await self.list_emails(folder=folder, limit=limit, search_criteria=query)
 
     async def delete_email(
-        self,
-        email_id: str,
-        folder: str = "INBOX",
-        permanent: bool = False
+        self, email_id: str, folder: str = "INBOX", permanent: bool = False
     ) -> Dict[str, Any]:
         """
         Delete an email.
@@ -621,17 +625,13 @@ class EmailPlugin(BasePlugin):
             await loop.run_in_executor(None, _delete)
 
             logger.info(f"Deleted email: {email_id}")
-            return {
-                "success": True,
-                "email_id": email_id,
-                "permanent": permanent
-            }
+            return {"success": True, "email_id": email_id, "permanent": permanent}
 
         except Exception as e:
             logger.error(f"Failed to delete email: {e}")
             raise RuntimeError(f"Email delete_email failed: {e}")
 
-    def get_tools(self) -> List['AgentTool']:
+    def get_tools(self) -> List["AgentTool"]:
         """
         Expose email operations as agent tools.
 
@@ -649,24 +649,24 @@ class EmailPlugin(BasePlugin):
                     "properties": {
                         "folder": {
                             "type": "string",
-                            "description": "Email folder name (default: INBOX)"
+                            "description": "Email folder name (default: INBOX)",
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum number of emails to return (default: 10)"
+                            "description": "Maximum number of emails to return (default: 10)",
                         },
                         "unread_only": {
                             "type": "boolean",
-                            "description": "Only return unread emails (default: false)"
-                        }
+                            "description": "Only return unread emails (default: false)",
+                        },
                     },
-                    "required": []
+                    "required": [],
                 },
                 handler=self._tool_list_emails,
                 category="email",
                 source="plugin",
                 plugin_name="Email",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="read_email",
@@ -676,24 +676,24 @@ class EmailPlugin(BasePlugin):
                     "properties": {
                         "email_id": {
                             "type": "string",
-                            "description": "Email ID from list_emails"
+                            "description": "Email ID from list_emails",
                         },
                         "folder": {
                             "type": "string",
-                            "description": "Email folder name (default: INBOX)"
+                            "description": "Email folder name (default: INBOX)",
                         },
                         "mark_as_read": {
                             "type": "boolean",
-                            "description": "Mark email as read after fetching (default: false)"
-                        }
+                            "description": "Mark email as read after fetching (default: false)",
+                        },
                     },
-                    "required": ["email_id"]
+                    "required": ["email_id"],
                 },
                 handler=self._tool_read_email,
                 category="email",
                 source="plugin",
                 plugin_name="Email",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="send_email",
@@ -703,32 +703,29 @@ class EmailPlugin(BasePlugin):
                     "properties": {
                         "to": {
                             "type": "string",
-                            "description": "Recipient email address"
+                            "description": "Recipient email address",
                         },
                         "subject": {
                             "type": "string",
-                            "description": "Email subject line"
+                            "description": "Email subject line",
                         },
-                        "body": {
-                            "type": "string",
-                            "description": "Email body content"
-                        },
+                        "body": {"type": "string", "description": "Email body content"},
                         "html": {
                             "type": "boolean",
-                            "description": "Whether body is HTML formatted (default: false)"
+                            "description": "Whether body is HTML formatted (default: false)",
                         },
                         "cc": {
                             "type": "string",
-                            "description": "Optional CC recipient email address"
-                        }
+                            "description": "Optional CC recipient email address",
+                        },
                     },
-                    "required": ["to", "subject", "body"]
+                    "required": ["to", "subject", "body"],
                 },
                 handler=self._tool_send_email,
                 category="email",
                 source="plugin",
                 plugin_name="Email",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="reply_to_email",
@@ -738,24 +735,21 @@ class EmailPlugin(BasePlugin):
                     "properties": {
                         "email_id": {
                             "type": "string",
-                            "description": "ID of email to reply to"
+                            "description": "ID of email to reply to",
                         },
-                        "body": {
-                            "type": "string",
-                            "description": "Reply message body"
-                        },
+                        "body": {"type": "string", "description": "Reply message body"},
                         "html": {
                             "type": "boolean",
-                            "description": "Whether body is HTML formatted (default: false)"
-                        }
+                            "description": "Whether body is HTML formatted (default: false)",
+                        },
                     },
-                    "required": ["email_id", "body"]
+                    "required": ["email_id", "body"],
                 },
                 handler=self._tool_reply_to_email,
                 category="email",
                 source="plugin",
                 plugin_name="Email",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="search_emails",
@@ -765,21 +759,21 @@ class EmailPlugin(BasePlugin):
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "IMAP search query (e.g., 'FROM \"sender@example.com\"', 'SUBJECT \"meeting\"')"
+                            "description": "IMAP search query (e.g., 'FROM \"sender@example.com\"', 'SUBJECT \"meeting\"')",
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum number of results (default: 10)"
-                        }
+                            "description": "Maximum number of results (default: 10)",
+                        },
                     },
-                    "required": ["query"]
+                    "required": ["query"],
                 },
                 handler=self._tool_search_emails,
                 category="email",
                 source="plugin",
                 plugin_name="Email",
-                timeout_seconds=60
-            )
+                timeout_seconds=60,
+            ),
         ]
 
     async def _tool_list_emails(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -789,16 +783,10 @@ class EmailPlugin(BasePlugin):
         unread_only = args.get("unread_only", False)
 
         emails = await self.list_emails(
-            folder=folder,
-            limit=limit,
-            unread_only=unread_only
+            folder=folder, limit=limit, unread_only=unread_only
         )
 
-        return {
-            "success": True,
-            "emails": emails,
-            "count": len(emails)
-        }
+        return {"success": True, "emails": emails, "count": len(emails)}
 
     async def _tool_read_email(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for read_email"""
@@ -807,9 +795,7 @@ class EmailPlugin(BasePlugin):
         mark_as_read = args.get("mark_as_read", False)
 
         email_data = await self.read_email(
-            email_id=email_id,
-            folder=folder,
-            mark_as_read=mark_as_read
+            email_id=email_id, folder=folder, mark_as_read=mark_as_read
         )
 
         # Drop body_html — it duplicates body content with HTML markup and bloats the context.
@@ -823,10 +809,7 @@ class EmailPlugin(BasePlugin):
             safe_email["body_truncated"] = True
             safe_email["body_total_chars"] = len(body)
 
-        return {
-            "success": True,
-            "email": safe_email
-        }
+        return {"success": True, "email": safe_email}
 
     async def _tool_send_email(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for send_email"""
@@ -837,11 +820,7 @@ class EmailPlugin(BasePlugin):
         cc = args.get("cc")
 
         result = await self.send_email(
-            to=to,
-            subject=subject,
-            body=body,
-            html=html,
-            cc=cc
+            to=to, subject=subject, body=body, html=html, cc=cc
         )
 
         return result
@@ -852,11 +831,7 @@ class EmailPlugin(BasePlugin):
         body = args.get("body")
         html = args.get("html", False)
 
-        result = await self.reply_to_email(
-            email_id=email_id,
-            body=body,
-            html=html
-        )
+        result = await self.reply_to_email(email_id=email_id, body=body, html=html)
 
         return result
 
@@ -865,16 +840,9 @@ class EmailPlugin(BasePlugin):
         query = args.get("query")
         limit = args.get("limit", 10)
 
-        emails = await self.search_emails(
-            query=query,
-            limit=limit
-        )
+        emails = await self.search_emails(query=query, limit=limit)
 
-        return {
-            "success": True,
-            "emails": emails,
-            "count": len(emails)
-        }
+        return {"success": True, "emails": emails, "count": len(emails)}
 
     # Context manager support
     async def __aenter__(self):

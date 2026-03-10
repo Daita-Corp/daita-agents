@@ -11,6 +11,7 @@ Requires: OPENAI_API_KEY set in environment, or passed at run time.
 Run with:
     OPENAI_API_KEY=sk-... pytest tests/unit/test_focus_live_llm.py -v -s -m requires_llm
 """
+
 import json
 import os
 import pytest
@@ -19,115 +20,315 @@ from daita.agents.agent import Agent
 from daita.core.focus import apply_focus
 from daita.core.tools import AgentTool
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Realistic datasets (same as test_focus_real_world.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
 ORDERS = [
-    {"order_id": "ORD-001", "customer_id": "CUST-042", "customer_name": "Lena Fischer",
-     "email": "lena@example.com", "product": "Pro Plan", "category": "subscription",
-     "amount": 299.00, "status": "completed", "region": "EU",
-     "created_at": "2024-03-01T09:12:00Z", "updated_at": "2024-03-01T09:14:00Z",
-     "billing_address": {"street": "Musterstraße 1", "city": "Berlin", "zip": "10115"},
-     "payment_method": "credit_card", "refunded": False, "notes": None},
-
-    {"order_id": "ORD-002", "customer_id": "CUST-007", "customer_name": "James Park",
-     "email": "james@example.com", "product": "Starter Plan", "category": "subscription",
-     "amount": 49.00, "status": "completed", "region": "US",
-     "created_at": "2024-03-02T14:05:00Z", "updated_at": "2024-03-02T14:06:00Z",
-     "billing_address": {"street": "123 Main St", "city": "Austin", "zip": "73301"},
-     "payment_method": "paypal", "refunded": False, "notes": None},
-
-    {"order_id": "ORD-003", "customer_id": "CUST-099", "customer_name": "Sara Nkosi",
-     "email": "sara@example.com", "product": "Enterprise", "category": "subscription",
-     "amount": 999.00, "status": "refunded", "region": "EU",
-     "created_at": "2024-03-03T11:00:00Z", "updated_at": "2024-03-04T08:30:00Z",
-     "billing_address": {"street": "Rue de la Paix 5", "city": "Paris", "zip": "75001"},
-     "payment_method": "credit_card", "refunded": True, "notes": "Customer requested refund"},
-
-    {"order_id": "ORD-004", "customer_id": "CUST-011", "customer_name": "Hiroshi Tanaka",
-     "email": "hiroshi@example.com", "product": "Pro Plan", "category": "subscription",
-     "amount": 299.00, "status": "completed", "region": "APAC",
-     "created_at": "2024-03-04T02:45:00Z", "updated_at": "2024-03-04T02:46:00Z",
-     "billing_address": {"street": "Shibuya 1-1", "city": "Tokyo", "zip": "150-0001"},
-     "payment_method": "credit_card", "refunded": False, "notes": None},
-
-    {"order_id": "ORD-005", "customer_id": "CUST-055", "customer_name": "Maria Garcia",
-     "email": "maria@example.com", "product": "Starter Plan", "category": "subscription",
-     "amount": 49.00, "status": "pending", "region": "US",
-     "created_at": "2024-03-05T17:22:00Z", "updated_at": "2024-03-05T17:22:00Z",
-     "billing_address": {"street": "456 Oak Ave", "city": "Miami", "zip": "33101"},
-     "payment_method": "bank_transfer", "refunded": False, "notes": "Awaiting payment confirmation"},
+    {
+        "order_id": "ORD-001",
+        "customer_id": "CUST-042",
+        "customer_name": "Lena Fischer",
+        "email": "lena@example.com",
+        "product": "Pro Plan",
+        "category": "subscription",
+        "amount": 299.00,
+        "status": "completed",
+        "region": "EU",
+        "created_at": "2024-03-01T09:12:00Z",
+        "updated_at": "2024-03-01T09:14:00Z",
+        "billing_address": {
+            "street": "Musterstraße 1",
+            "city": "Berlin",
+            "zip": "10115",
+        },
+        "payment_method": "credit_card",
+        "refunded": False,
+        "notes": None,
+    },
+    {
+        "order_id": "ORD-002",
+        "customer_id": "CUST-007",
+        "customer_name": "James Park",
+        "email": "james@example.com",
+        "product": "Starter Plan",
+        "category": "subscription",
+        "amount": 49.00,
+        "status": "completed",
+        "region": "US",
+        "created_at": "2024-03-02T14:05:00Z",
+        "updated_at": "2024-03-02T14:06:00Z",
+        "billing_address": {"street": "123 Main St", "city": "Austin", "zip": "73301"},
+        "payment_method": "paypal",
+        "refunded": False,
+        "notes": None,
+    },
+    {
+        "order_id": "ORD-003",
+        "customer_id": "CUST-099",
+        "customer_name": "Sara Nkosi",
+        "email": "sara@example.com",
+        "product": "Enterprise",
+        "category": "subscription",
+        "amount": 999.00,
+        "status": "refunded",
+        "region": "EU",
+        "created_at": "2024-03-03T11:00:00Z",
+        "updated_at": "2024-03-04T08:30:00Z",
+        "billing_address": {
+            "street": "Rue de la Paix 5",
+            "city": "Paris",
+            "zip": "75001",
+        },
+        "payment_method": "credit_card",
+        "refunded": True,
+        "notes": "Customer requested refund",
+    },
+    {
+        "order_id": "ORD-004",
+        "customer_id": "CUST-011",
+        "customer_name": "Hiroshi Tanaka",
+        "email": "hiroshi@example.com",
+        "product": "Pro Plan",
+        "category": "subscription",
+        "amount": 299.00,
+        "status": "completed",
+        "region": "APAC",
+        "created_at": "2024-03-04T02:45:00Z",
+        "updated_at": "2024-03-04T02:46:00Z",
+        "billing_address": {
+            "street": "Shibuya 1-1",
+            "city": "Tokyo",
+            "zip": "150-0001",
+        },
+        "payment_method": "credit_card",
+        "refunded": False,
+        "notes": None,
+    },
+    {
+        "order_id": "ORD-005",
+        "customer_id": "CUST-055",
+        "customer_name": "Maria Garcia",
+        "email": "maria@example.com",
+        "product": "Starter Plan",
+        "category": "subscription",
+        "amount": 49.00,
+        "status": "pending",
+        "region": "US",
+        "created_at": "2024-03-05T17:22:00Z",
+        "updated_at": "2024-03-05T17:22:00Z",
+        "billing_address": {"street": "456 Oak Ave", "city": "Miami", "zip": "33101"},
+        "payment_method": "bank_transfer",
+        "refunded": False,
+        "notes": "Awaiting payment confirmation",
+    },
 ]
 
 API_LOGS = [
-    {"log_id": "L001", "timestamp": "2024-03-05T10:00:01Z", "service": "auth",
-     "level": "INFO", "status_code": 200, "latency_ms": 45, "user_id": "u123",
-     "endpoint": "/login", "method": "POST", "ip": "192.168.1.10",
-     "message": "Login successful", "trace_id": "t-aaa", "request_size_bytes": 128},
-
-    {"log_id": "L002", "timestamp": "2024-03-05T10:00:05Z", "service": "api",
-     "level": "ERROR", "status_code": 500, "latency_ms": 1200, "user_id": "u456",
-     "endpoint": "/data/export", "method": "GET", "ip": "10.0.0.5",
-     "message": "Timeout connecting to database", "trace_id": "t-bbb", "request_size_bytes": 64},
-
-    {"log_id": "L003", "timestamp": "2024-03-05T10:00:09Z", "service": "api",
-     "level": "INFO", "status_code": 200, "latency_ms": 88, "user_id": "u789",
-     "endpoint": "/reports", "method": "GET", "ip": "10.0.0.8",
-     "message": "Report generated", "trace_id": "t-ccc", "request_size_bytes": 32},
-
-    {"log_id": "L004", "timestamp": "2024-03-05T10:00:12Z", "service": "billing",
-     "level": "ERROR", "status_code": 402, "latency_ms": 230, "user_id": "u456",
-     "endpoint": "/charge", "method": "POST", "ip": "10.0.0.5",
-     "message": "Payment declined: insufficient funds", "trace_id": "t-ddd", "request_size_bytes": 256},
-
-    {"log_id": "L005", "timestamp": "2024-03-05T10:00:15Z", "service": "auth",
-     "level": "WARN", "status_code": 401, "latency_ms": 12, "user_id": None,
-     "endpoint": "/login", "method": "POST", "ip": "203.0.113.42",
-     "message": "Failed login attempt", "trace_id": "t-eee", "request_size_bytes": 96},
-
-    {"log_id": "L006", "timestamp": "2024-03-05T10:00:20Z", "service": "api",
-     "level": "INFO", "status_code": 200, "latency_ms": 55, "user_id": "u123",
-     "endpoint": "/dashboard", "method": "GET", "ip": "192.168.1.10",
-     "message": "Dashboard loaded", "trace_id": "t-fff", "request_size_bytes": 32},
-
-    {"log_id": "L007", "timestamp": "2024-03-05T10:00:25Z", "service": "api",
-     "level": "ERROR", "status_code": 503, "latency_ms": 5001, "user_id": "u321",
-     "endpoint": "/search", "method": "GET", "ip": "10.0.1.2",
-     "message": "Search service unavailable", "trace_id": "t-ggg", "request_size_bytes": 48},
+    {
+        "log_id": "L001",
+        "timestamp": "2024-03-05T10:00:01Z",
+        "service": "auth",
+        "level": "INFO",
+        "status_code": 200,
+        "latency_ms": 45,
+        "user_id": "u123",
+        "endpoint": "/login",
+        "method": "POST",
+        "ip": "192.168.1.10",
+        "message": "Login successful",
+        "trace_id": "t-aaa",
+        "request_size_bytes": 128,
+    },
+    {
+        "log_id": "L002",
+        "timestamp": "2024-03-05T10:00:05Z",
+        "service": "api",
+        "level": "ERROR",
+        "status_code": 500,
+        "latency_ms": 1200,
+        "user_id": "u456",
+        "endpoint": "/data/export",
+        "method": "GET",
+        "ip": "10.0.0.5",
+        "message": "Timeout connecting to database",
+        "trace_id": "t-bbb",
+        "request_size_bytes": 64,
+    },
+    {
+        "log_id": "L003",
+        "timestamp": "2024-03-05T10:00:09Z",
+        "service": "api",
+        "level": "INFO",
+        "status_code": 200,
+        "latency_ms": 88,
+        "user_id": "u789",
+        "endpoint": "/reports",
+        "method": "GET",
+        "ip": "10.0.0.8",
+        "message": "Report generated",
+        "trace_id": "t-ccc",
+        "request_size_bytes": 32,
+    },
+    {
+        "log_id": "L004",
+        "timestamp": "2024-03-05T10:00:12Z",
+        "service": "billing",
+        "level": "ERROR",
+        "status_code": 402,
+        "latency_ms": 230,
+        "user_id": "u456",
+        "endpoint": "/charge",
+        "method": "POST",
+        "ip": "10.0.0.5",
+        "message": "Payment declined: insufficient funds",
+        "trace_id": "t-ddd",
+        "request_size_bytes": 256,
+    },
+    {
+        "log_id": "L005",
+        "timestamp": "2024-03-05T10:00:15Z",
+        "service": "auth",
+        "level": "WARN",
+        "status_code": 401,
+        "latency_ms": 12,
+        "user_id": None,
+        "endpoint": "/login",
+        "method": "POST",
+        "ip": "203.0.113.42",
+        "message": "Failed login attempt",
+        "trace_id": "t-eee",
+        "request_size_bytes": 96,
+    },
+    {
+        "log_id": "L006",
+        "timestamp": "2024-03-05T10:00:20Z",
+        "service": "api",
+        "level": "INFO",
+        "status_code": 200,
+        "latency_ms": 55,
+        "user_id": "u123",
+        "endpoint": "/dashboard",
+        "method": "GET",
+        "ip": "192.168.1.10",
+        "message": "Dashboard loaded",
+        "trace_id": "t-fff",
+        "request_size_bytes": 32,
+    },
+    {
+        "log_id": "L007",
+        "timestamp": "2024-03-05T10:00:25Z",
+        "service": "api",
+        "level": "ERROR",
+        "status_code": 503,
+        "latency_ms": 5001,
+        "user_id": "u321",
+        "endpoint": "/search",
+        "method": "GET",
+        "ip": "10.0.1.2",
+        "message": "Search service unavailable",
+        "trace_id": "t-ggg",
+        "request_size_bytes": 48,
+    },
 ]
 
 TRANSACTIONS = [
-    {"txn_id": "T001", "account_id": "ACC-100", "amount": 42.50, "currency": "USD",
-     "type": "purchase", "merchant": "Amazon", "merchant_category": "retail",
-     "country": "US", "ts": "2024-03-05T08:10:00Z", "flagged": False,
-     "device_fingerprint": "fp-aaa", "ip": "1.2.3.4", "velocity_1h": 1, "card_present": True},
-
-    {"txn_id": "T002", "account_id": "ACC-100", "amount": 9850.00, "currency": "USD",
-     "type": "transfer", "merchant": None, "merchant_category": None,
-     "country": "RU", "ts": "2024-03-05T08:11:00Z", "flagged": True,
-     "device_fingerprint": "fp-zzz", "ip": "195.3.3.3", "velocity_1h": 12, "card_present": False},
-
-    {"txn_id": "T003", "account_id": "ACC-200", "amount": 15.00, "currency": "USD",
-     "type": "purchase", "merchant": "Starbucks", "merchant_category": "food",
-     "country": "US", "ts": "2024-03-05T09:00:00Z", "flagged": False,
-     "device_fingerprint": "fp-bbb", "ip": "5.6.7.8", "velocity_1h": 1, "card_present": True},
-
-    {"txn_id": "T004", "account_id": "ACC-200", "amount": 5200.00, "currency": "USD",
-     "type": "purchase", "merchant": "Electronics Plus", "merchant_category": "retail",
-     "country": "US", "ts": "2024-03-05T09:05:00Z", "flagged": True,
-     "device_fingerprint": "fp-bbb", "ip": "5.6.7.8", "velocity_1h": 8, "card_present": False},
-
-    {"txn_id": "T005", "account_id": "ACC-300", "amount": 2.99, "currency": "USD",
-     "type": "subscription", "merchant": "Netflix", "merchant_category": "streaming",
-     "country": "US", "ts": "2024-03-05T10:00:00Z", "flagged": False,
-     "device_fingerprint": "fp-ccc", "ip": "9.10.11.12", "velocity_1h": 1, "card_present": False},
-
-    {"txn_id": "T006", "account_id": "ACC-100", "amount": 1.00, "currency": "USD",
-     "type": "purchase", "merchant": "Test Merchant", "merchant_category": "other",
-     "country": "NG", "ts": "2024-03-05T08:15:00Z", "flagged": True,
-     "device_fingerprint": "fp-zzz", "ip": "195.3.3.3", "velocity_1h": 14, "card_present": False},
+    {
+        "txn_id": "T001",
+        "account_id": "ACC-100",
+        "amount": 42.50,
+        "currency": "USD",
+        "type": "purchase",
+        "merchant": "Amazon",
+        "merchant_category": "retail",
+        "country": "US",
+        "ts": "2024-03-05T08:10:00Z",
+        "flagged": False,
+        "device_fingerprint": "fp-aaa",
+        "ip": "1.2.3.4",
+        "velocity_1h": 1,
+        "card_present": True,
+    },
+    {
+        "txn_id": "T002",
+        "account_id": "ACC-100",
+        "amount": 9850.00,
+        "currency": "USD",
+        "type": "transfer",
+        "merchant": None,
+        "merchant_category": None,
+        "country": "RU",
+        "ts": "2024-03-05T08:11:00Z",
+        "flagged": True,
+        "device_fingerprint": "fp-zzz",
+        "ip": "195.3.3.3",
+        "velocity_1h": 12,
+        "card_present": False,
+    },
+    {
+        "txn_id": "T003",
+        "account_id": "ACC-200",
+        "amount": 15.00,
+        "currency": "USD",
+        "type": "purchase",
+        "merchant": "Starbucks",
+        "merchant_category": "food",
+        "country": "US",
+        "ts": "2024-03-05T09:00:00Z",
+        "flagged": False,
+        "device_fingerprint": "fp-bbb",
+        "ip": "5.6.7.8",
+        "velocity_1h": 1,
+        "card_present": True,
+    },
+    {
+        "txn_id": "T004",
+        "account_id": "ACC-200",
+        "amount": 5200.00,
+        "currency": "USD",
+        "type": "purchase",
+        "merchant": "Electronics Plus",
+        "merchant_category": "retail",
+        "country": "US",
+        "ts": "2024-03-05T09:05:00Z",
+        "flagged": True,
+        "device_fingerprint": "fp-bbb",
+        "ip": "5.6.7.8",
+        "velocity_1h": 8,
+        "card_present": False,
+    },
+    {
+        "txn_id": "T005",
+        "account_id": "ACC-300",
+        "amount": 2.99,
+        "currency": "USD",
+        "type": "subscription",
+        "merchant": "Netflix",
+        "merchant_category": "streaming",
+        "country": "US",
+        "ts": "2024-03-05T10:00:00Z",
+        "flagged": False,
+        "device_fingerprint": "fp-ccc",
+        "ip": "9.10.11.12",
+        "velocity_1h": 1,
+        "card_present": False,
+    },
+    {
+        "txn_id": "T006",
+        "account_id": "ACC-100",
+        "amount": 1.00,
+        "currency": "USD",
+        "type": "purchase",
+        "merchant": "Test Merchant",
+        "merchant_category": "other",
+        "country": "NG",
+        "ts": "2024-03-05T08:15:00Z",
+        "flagged": True,
+        "device_fingerprint": "fp-zzz",
+        "ip": "195.3.3.3",
+        "velocity_1h": 14,
+        "card_present": False,
+    },
 ]
 
 
@@ -135,12 +336,14 @@ TRANSACTIONS = [
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _token_estimate(data) -> int:
     return len(json.dumps(data, default=str)) // 4
 
 
 def _make_tool(name: str, description: str, data) -> AgentTool:
     """Return a no-arg tool that yields a fixed dataset."""
+
     async def _handler(_args):
         return data
 
@@ -167,6 +370,7 @@ def _make_agent(tool: AgentTool, focus: str | None = None) -> Agent:
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.requires_llm
 class TestFocusWithLiveOpenAI:
@@ -229,10 +433,10 @@ class TestFocusWithLiveOpenAI:
         measurably reduces the token count reported by the API.
         """
         tool_unfocused = _make_tool("get_orders", "Fetch all orders", ORDERS)
-        tool_focused   = _make_tool("get_orders", "Fetch all orders", ORDERS)
+        tool_focused = _make_tool("get_orders", "Fetch all orders", ORDERS)
 
         agent_no_focus = _make_agent(tool_unfocused, focus=None)
-        agent_focused  = _make_agent(
+        agent_focused = _make_agent(
             tool_focused,
             focus="SELECT order_id, product, amount, status, region",
         )
@@ -240,20 +444,24 @@ class TestFocusWithLiveOpenAI:
         question = "Using the get_orders tool, what is the total revenue from completed orders?"
 
         result_no_focus = await agent_no_focus.run_detailed(question)
-        result_focused  = await agent_focused.run_detailed(question)
+        result_focused = await agent_focused.run_detailed(question)
 
         tokens_no_focus = result_no_focus.get("tokens", {}).get("total_tokens", 0)
-        tokens_focused  = result_focused.get("tokens", {}).get("total_tokens", 0)
+        tokens_focused = result_focused.get("tokens", {}).get("total_tokens", 0)
 
-        raw_payload_tokens   = _token_estimate(ORDERS)
+        raw_payload_tokens = _token_estimate(ORDERS)
         focused_payload_tokens = _token_estimate(
             apply_focus(ORDERS, "SELECT order_id, product, amount, status, region")
         )
-        payload_reduction = round((1 - focused_payload_tokens / raw_payload_tokens) * 100, 1)
+        payload_reduction = round(
+            (1 - focused_payload_tokens / raw_payload_tokens) * 100, 1
+        )
 
         print(f"\n{'='*55}")
         print(f"  Payload tokens  (raw):    {raw_payload_tokens}")
-        print(f"  Payload tokens  (focused):{focused_payload_tokens}  (-{payload_reduction}%)")
+        print(
+            f"  Payload tokens  (focused):{focused_payload_tokens}  (-{payload_reduction}%)"
+        )
         print(f"  API total tokens (no focus): {tokens_no_focus}")
         print(f"  API total tokens (focused):  {tokens_focused}")
         if tokens_no_focus and tokens_focused:
@@ -362,7 +570,9 @@ class TestFocusWithLiveOpenAI:
         for result in (result_full, result_lean):
             answer = result["result"]
             assert "Pro Plan" in answer, f"Expected 'Pro Plan' in answer: {answer}"
-            assert "598" in answer or "598.00" in answer, f"Expected $598 in answer: {answer}"
+            assert (
+                "598" in answer or "598.00" in answer
+            ), f"Expected $598 in answer: {answer}"
 
         # Focused should cost fewer tokens
         assert tokens_lean < tokens_full

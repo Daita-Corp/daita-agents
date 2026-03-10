@@ -29,7 +29,7 @@ def chunk_markdown(content: str, max_chunk_size: int = 400) -> List[Chunk]:
     if not content or not content.strip():
         return []
 
-    lines = content.split('\n')
+    lines = content.split("\n")
     chunks = []
     current_chunk = []
     current_size = 0
@@ -41,13 +41,11 @@ def chunk_markdown(content: str, max_chunk_size: int = 400) -> List[Chunk]:
         # Check if adding this line would exceed max size
         if current_size + line_len > max_chunk_size and current_chunk:
             # Save current chunk
-            chunk_content = '\n'.join(current_chunk).strip()
+            chunk_content = "\n".join(current_chunk).strip()
             if chunk_content:
-                chunks.append(Chunk(
-                    content=chunk_content,
-                    start_line=start_line,
-                    end_line=i - 1
-                ))
+                chunks.append(
+                    Chunk(content=chunk_content, start_line=start_line, end_line=i - 1)
+                )
 
             # Start new chunk
             current_chunk = [line]
@@ -64,12 +62,10 @@ def chunk_markdown(content: str, max_chunk_size: int = 400) -> List[Chunk]:
 
     # Save final chunk
     if current_chunk:
-        chunk_content = '\n'.join(current_chunk).strip()
+        chunk_content = "\n".join(current_chunk).strip()
         if chunk_content:
-            chunks.append(Chunk(
-                content=chunk_content,
-                start_line=start_line,
-                end_line=len(lines)
-            ))
+            chunks.append(
+                Chunk(content=chunk_content, start_line=start_line, end_line=len(lines))
+            )
 
     return chunks

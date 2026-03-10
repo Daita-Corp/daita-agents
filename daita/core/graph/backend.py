@@ -8,6 +8,7 @@ The backend is chosen automatically based on runtime environment:
 Developers never call auto_select_backend() directly. LineagePlugin calls it
 during initialize() if no backend was provided at construction time.
 """
+
 from typing import List, Optional, Protocol, runtime_checkable
 
 import networkx as nx
@@ -86,4 +87,5 @@ def auto_select_backend(graph_type: str = "lineage") -> "GraphBackend":
     be added once the front-end visualization surface is ready.
     """
     from .local_backend import LocalGraphBackend
+
     return LocalGraphBackend(graph_type=graph_type)

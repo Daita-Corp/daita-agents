@@ -3,8 +3,10 @@ Core interfaces for Daita Agents.
 
 Defines the essential contracts that components must implement.
 """
+
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
+
 
 class AgentABC(ABC):
     """Abstract base interface for all agents. Use Agent or BaseAgent for concrete implementations."""
@@ -15,20 +17,21 @@ class AgentABC(ABC):
         task: str,
         data: Any = None,
         context: Optional[Dict[str, Any]] = None,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         """INTERNAL: Process a task with data and context."""
         pass
-    
+
     @abstractmethod
     async def start(self) -> None:
         """Start the agent."""
         pass
-    
+
     @abstractmethod
     async def stop(self) -> None:
         """Stop the agent."""
         pass
+
 
 class LLMProvider(ABC):
     """Interface for language model providers."""
@@ -48,20 +51,18 @@ class LLMProvider(ABC):
         """Set agent ID for tracing context. Override in custom providers."""
         pass
 
+
 class DatabaseBackend(ABC):
     """Interface for database operations."""
-    
+
     @abstractmethod
     async def connect(self) -> None:
         """Establish database connection."""
         pass
-    
+
     @abstractmethod
     async def execute_query(
-        self,
-        query: str,
-        params: Optional[Dict[str, Any]] = None
+        self, query: str, params: Optional[Dict[str, Any]] = None
     ) -> Any:
         """Execute database query."""
         pass
-

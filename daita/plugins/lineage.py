@@ -37,6 +37,7 @@ Usage with Database Plugins:
         return processed_df
     ```
 """
+
 import logging
 import functools
 import re
@@ -101,10 +102,13 @@ class LineagePlugin(BasePlugin):
         self._agent_id = agent_id
         if self._graph_backend is None:
             from daita.core.graph.backend import auto_select_backend
-            self._graph_backend = auto_select_backend(graph_type="lineage")
-            logger.debug(f"LineagePlugin: using graph backend {type(self._graph_backend).__name__}")
 
-    def get_tools(self) -> List['AgentTool']:
+            self._graph_backend = auto_select_backend(graph_type="lineage")
+            logger.debug(
+                f"LineagePlugin: using graph backend {type(self._graph_backend).__name__}"
+            )
+
+    def get_tools(self) -> List["AgentTool"]:
         """
         Expose lineage tracking operations as agent tools.
 
@@ -122,24 +126,24 @@ class LineagePlugin(BasePlugin):
                     "properties": {
                         "entity_id": {
                             "type": "string",
-                            "description": "ID of the entity to trace (e.g., 'table:users', 'api:orders')"
+                            "description": "ID of the entity to trace (e.g., 'table:users', 'api:orders')",
                         },
                         "direction": {
                             "type": "string",
-                            "description": "Direction to trace: 'upstream', 'downstream', or 'both' (default: 'both')"
+                            "description": "Direction to trace: 'upstream', 'downstream', or 'both' (default: 'both')",
                         },
                         "max_depth": {
                             "type": "integer",
-                            "description": "Maximum traversal depth (default: 5)"
-                        }
+                            "description": "Maximum traversal depth (default: 5)",
+                        },
                     },
-                    "required": ["entity_id"]
+                    "required": ["entity_id"],
                 },
                 handler=self._tool_trace_lineage,
                 category="lineage",
                 source="plugin",
                 plugin_name="Lineage",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="trace_upstream",
@@ -149,20 +153,20 @@ class LineagePlugin(BasePlugin):
                     "properties": {
                         "entity_id": {
                             "type": "string",
-                            "description": "ID of the entity"
+                            "description": "ID of the entity",
                         },
                         "max_depth": {
                             "type": "integer",
-                            "description": "Maximum traversal depth (default: 3)"
-                        }
+                            "description": "Maximum traversal depth (default: 3)",
+                        },
                     },
-                    "required": ["entity_id"]
+                    "required": ["entity_id"],
                 },
                 handler=self._tool_trace_upstream,
                 category="lineage",
                 source="plugin",
                 plugin_name="Lineage",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="trace_downstream",
@@ -172,20 +176,20 @@ class LineagePlugin(BasePlugin):
                     "properties": {
                         "entity_id": {
                             "type": "string",
-                            "description": "ID of the entity"
+                            "description": "ID of the entity",
                         },
                         "max_depth": {
                             "type": "integer",
-                            "description": "Maximum traversal depth (default: 3)"
-                        }
+                            "description": "Maximum traversal depth (default: 3)",
+                        },
                     },
-                    "required": ["entity_id"]
+                    "required": ["entity_id"],
                 },
                 handler=self._tool_trace_downstream,
                 category="lineage",
                 source="plugin",
                 plugin_name="Lineage",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="register_flow",
@@ -195,36 +199,36 @@ class LineagePlugin(BasePlugin):
                     "properties": {
                         "source_id": {
                             "type": "string",
-                            "description": "Source entity ID"
+                            "description": "Source entity ID",
                         },
                         "target_id": {
                             "type": "string",
-                            "description": "Target entity ID"
+                            "description": "Target entity ID",
                         },
                         "flow_type": {
                             "type": "string",
-                            "description": "Type of flow: 'FLOWS_TO', 'SYNCS_TO', 'TRIGGERS', 'TRANSFORMS' (default: 'FLOWS_TO')"
+                            "description": "Type of flow: 'FLOWS_TO', 'SYNCS_TO', 'TRIGGERS', 'TRANSFORMS' (default: 'FLOWS_TO')",
                         },
                         "transformation": {
                             "type": "string",
-                            "description": "Optional description of transformation applied"
+                            "description": "Optional description of transformation applied",
                         },
                         "schedule": {
                             "type": "string",
-                            "description": "Optional schedule pattern (e.g., '0 * * * *' for hourly)"
+                            "description": "Optional schedule pattern (e.g., '0 * * * *' for hourly)",
                         },
                         "metadata": {
                             "type": "object",
-                            "description": "Optional additional metadata"
-                        }
+                            "description": "Optional additional metadata",
+                        },
                     },
-                    "required": ["source_id", "target_id"]
+                    "required": ["source_id", "target_id"],
                 },
                 handler=self._tool_register_flow,
                 category="lineage",
                 source="plugin",
                 plugin_name="Lineage",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="register_pipeline",
@@ -232,10 +236,7 @@ class LineagePlugin(BasePlugin):
                 parameters={
                     "type": "object",
                     "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Pipeline name"
-                        },
+                        "name": {"type": "string", "description": "Pipeline name"},
                         "steps": {
                             "type": "array",
                             "description": "List of pipeline steps with source, target, and transformation",
@@ -244,22 +245,22 @@ class LineagePlugin(BasePlugin):
                                 "properties": {
                                     "source_id": {"type": "string"},
                                     "target_id": {"type": "string"},
-                                    "transformation": {"type": "string"}
-                                }
-                            }
+                                    "transformation": {"type": "string"},
+                                },
+                            },
                         },
                         "schedule": {
                             "type": "string",
-                            "description": "Optional pipeline schedule"
-                        }
+                            "description": "Optional pipeline schedule",
+                        },
                     },
-                    "required": ["name", "steps"]
+                    "required": ["name", "steps"],
                 },
                 handler=self._tool_register_pipeline,
                 category="lineage",
                 source="plugin",
                 plugin_name="Lineage",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="analyze_impact",
@@ -269,20 +270,20 @@ class LineagePlugin(BasePlugin):
                     "properties": {
                         "entity_id": {
                             "type": "string",
-                            "description": "Entity that will change"
+                            "description": "Entity that will change",
                         },
                         "change_type": {
                             "type": "string",
-                            "description": "Type of change: 'schema_change', 'deprecation', 'deletion', 'data_quality' (default: 'schema_change')"
-                        }
+                            "description": "Type of change: 'schema_change', 'deprecation', 'deletion', 'data_quality' (default: 'schema_change')",
+                        },
                     },
-                    "required": ["entity_id"]
+                    "required": ["entity_id"],
                 },
                 handler=self._tool_analyze_impact,
                 category="lineage",
                 source="plugin",
                 plugin_name="Lineage",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="export_lineage",
@@ -292,24 +293,24 @@ class LineagePlugin(BasePlugin):
                     "properties": {
                         "entity_id": {
                             "type": "string",
-                            "description": "Root entity for lineage diagram"
+                            "description": "Root entity for lineage diagram",
                         },
                         "format": {
                             "type": "string",
-                            "description": "Output format: 'mermaid' or 'dot' (default: 'mermaid')"
+                            "description": "Output format: 'mermaid' or 'dot' (default: 'mermaid')",
                         },
                         "direction": {
                             "type": "string",
-                            "description": "Direction: 'upstream', 'downstream', or 'both' (default: 'both')"
-                        }
+                            "description": "Direction: 'upstream', 'downstream', or 'both' (default: 'both')",
+                        },
                     },
-                    "required": ["entity_id"]
+                    "required": ["entity_id"],
                 },
                 handler=self._tool_export_lineage,
                 category="lineage",
                 source="plugin",
                 plugin_name="Lineage",
-                timeout_seconds=30
+                timeout_seconds=30,
             ),
             AgentTool(
                 name="prune_stale_lineage",
@@ -327,17 +328,17 @@ class LineagePlugin(BasePlugin):
                             "description": (
                                 "Entries not seen within this many hours are removed. "
                                 "Default: 48. Set to 0 to remove anything not touched in this run."
-                            )
+                            ),
                         }
                     },
-                    "required": []
+                    "required": [],
                 },
                 handler=self._tool_prune_stale,
                 category="lineage",
                 source="plugin",
                 plugin_name="Lineage",
-                timeout_seconds=30
-            )
+                timeout_seconds=30,
+            ),
         ]
 
     async def _tool_prune_stale(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -368,10 +369,7 @@ class LineagePlugin(BasePlugin):
         return result
 
     async def trace_lineage(
-        self,
-        entity_id: str,
-        direction: str = "both",
-        max_depth: int = 5
+        self, entity_id: str, direction: str = "both", max_depth: int = 5
     ) -> Dict[str, Any]:
         """
         Trace the full lineage of a data entity.
@@ -389,8 +387,11 @@ class LineagePlugin(BasePlugin):
         """
         if self._graph_backend:
             from daita.core.graph.algorithms import traverse
+
             graph = await self._graph_backend.load_graph()
-            result = traverse(graph, entity_id, direction=direction, max_depth=max_depth)
+            result = traverse(
+                graph, entity_id, direction=direction, max_depth=max_depth
+            )
             if direction == "both":
                 upstream = result.get("upstream", [])
                 downstream = result.get("downstream", [])
@@ -400,7 +401,11 @@ class LineagePlugin(BasePlugin):
             else:
                 upstream = []
                 downstream = result
-            lineage = {"entity_id": entity_id, "upstream": upstream, "downstream": downstream}
+            lineage = {
+                "entity_id": entity_id,
+                "upstream": upstream,
+                "downstream": downstream,
+            }
             return {
                 "success": True,
                 "lineage": lineage,
@@ -412,10 +417,14 @@ class LineagePlugin(BasePlugin):
         lineage = {"entity_id": entity_id, "upstream": [], "downstream": []}
 
         if direction in ["upstream", "both"]:
-            lineage["upstream"] = await self._trace_direction(entity_id, "upstream", max_depth)
+            lineage["upstream"] = await self._trace_direction(
+                entity_id, "upstream", max_depth
+            )
 
         if direction in ["downstream", "both"]:
-            lineage["downstream"] = await self._trace_direction(entity_id, "downstream", max_depth)
+            lineage["downstream"] = await self._trace_direction(
+                entity_id, "downstream", max_depth
+            )
 
         return {
             "success": True,
@@ -430,7 +439,7 @@ class LineagePlugin(BasePlugin):
         direction: str,
         max_depth: int,
         current_depth: int = 0,
-        visited: Optional[set] = None
+        visited: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         """
         Recursively trace lineage in a direction.
@@ -457,12 +466,14 @@ class LineagePlugin(BasePlugin):
         # Find connected flows
         for flow in self._flows:
             if direction == "upstream" and flow["target_id"] == entity_id:
-                results.append({
-                    "entity_id": flow["source_id"],
-                    "flow_type": flow["flow_type"],
-                    "transformation": flow.get("transformation"),
-                    "depth": current_depth + 1
-                })
+                results.append(
+                    {
+                        "entity_id": flow["source_id"],
+                        "flow_type": flow["flow_type"],
+                        "transformation": flow.get("transformation"),
+                        "depth": current_depth + 1,
+                    }
+                )
                 # Recursively trace upstream
                 nested = await self._trace_direction(
                     flow["source_id"], direction, max_depth, current_depth + 1, visited
@@ -470,12 +481,14 @@ class LineagePlugin(BasePlugin):
                 results.extend(nested)
 
             elif direction == "downstream" and flow["source_id"] == entity_id:
-                results.append({
-                    "entity_id": flow["target_id"],
-                    "flow_type": flow["flow_type"],
-                    "transformation": flow.get("transformation"),
-                    "depth": current_depth + 1
-                })
+                results.append(
+                    {
+                        "entity_id": flow["target_id"],
+                        "flow_type": flow["flow_type"],
+                        "transformation": flow.get("transformation"),
+                        "depth": current_depth + 1,
+                    }
+                )
                 # Recursively trace downstream
                 nested = await self._trace_direction(
                     flow["target_id"], direction, max_depth, current_depth + 1, visited
@@ -494,7 +507,7 @@ class LineagePlugin(BasePlugin):
             "success": True,
             "entity_id": entity_id,
             "upstream_sources": result["lineage"]["upstream"],
-            "count": len(result["lineage"]["upstream"])
+            "count": len(result["lineage"]["upstream"]),
         }
 
     async def _tool_trace_downstream(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -507,7 +520,7 @@ class LineagePlugin(BasePlugin):
             "success": True,
             "entity_id": entity_id,
             "downstream_consumers": result["lineage"]["downstream"],
-            "count": len(result["lineage"]["downstream"])
+            "count": len(result["lineage"]["downstream"]),
         }
 
     async def _tool_register_flow(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -531,7 +544,7 @@ class LineagePlugin(BasePlugin):
         flow_type: str = "FLOWS_TO",
         transformation: Optional[str] = None,
         schedule: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Register a data flow between two entities.
@@ -558,7 +571,7 @@ class LineagePlugin(BasePlugin):
             "transformation": transformation,
             "schedule": schedule,
             "metadata": metadata or {},
-            "registered_at": registered_at
+            "registered_at": registered_at,
         }
 
         # Only keep the in-memory list when there is no backend. When a backend
@@ -574,7 +587,7 @@ class LineagePlugin(BasePlugin):
             "success": True,
             "flow_id": flow_id,
             "source_id": source_id,
-            "target_id": target_id
+            "target_id": target_id,
         }
 
     async def _tool_register_pipeline(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -587,10 +600,7 @@ class LineagePlugin(BasePlugin):
         return result
 
     async def register_pipeline(
-        self,
-        name: str,
-        steps: List[Dict[str, str]],
-        schedule: Optional[str] = None
+        self, name: str, steps: List[Dict[str, str]], schedule: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Register a data pipeline as a sequence of steps.
@@ -607,7 +617,7 @@ class LineagePlugin(BasePlugin):
             "name": name,
             "steps": steps,
             "schedule": schedule,
-            "registered_at": datetime.now(timezone.utc).isoformat()
+            "registered_at": datetime.now(timezone.utc).isoformat(),
         }
 
         self._pipelines[name] = pipeline
@@ -619,14 +629,10 @@ class LineagePlugin(BasePlugin):
                 target_id=step["target_id"],
                 flow_type="PIPELINE_STEP",
                 transformation=step.get("transformation"),
-                metadata={"pipeline": name, "step_index": i}
+                metadata={"pipeline": name, "step_index": i},
             )
 
-        return {
-            "success": True,
-            "pipeline_name": name,
-            "steps_registered": len(steps)
-        }
+        return {"success": True, "pipeline_name": name, "steps_registered": len(steps)}
 
     async def _tool_analyze_impact(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for analyze_impact"""
@@ -637,9 +643,7 @@ class LineagePlugin(BasePlugin):
         return result
 
     async def analyze_impact(
-        self,
-        entity_id: str,
-        change_type: str = "schema_change"
+        self, entity_id: str, change_type: str = "schema_change"
     ) -> Dict[str, Any]:
         """
         Analyze impact of a change to an entity.
@@ -660,6 +664,7 @@ class LineagePlugin(BasePlugin):
         """
         if self._graph_backend:
             from daita.core.graph.algorithms import impact_analysis
+
             graph = await self._graph_backend.load_graph()
             result = impact_analysis(graph, entity_id)
 
@@ -676,11 +681,15 @@ class LineagePlugin(BasePlugin):
                 "total_affected_count": result["affected_count"],
                 "affected_entities": result["affected_nodes"],
                 "risk_level": result["risk_level"],
-                "recommendation": self._get_impact_recommendation(result["risk_level"], change_type),
+                "recommendation": self._get_impact_recommendation(
+                    result["risk_level"], change_type
+                ),
             }
 
         # In-memory fallback — no graph backend available
-        downstream_result = await self.trace_lineage(entity_id, "downstream", max_depth=10)
+        downstream_result = await self.trace_lineage(
+            entity_id, "downstream", max_depth=10
+        )
         downstream = downstream_result["lineage"]["downstream"]
 
         direct_impact = len([d for d in downstream if d.get("depth") == 1])
@@ -725,10 +734,7 @@ class LineagePlugin(BasePlugin):
         return result
 
     async def export_lineage(
-        self,
-        entity_id: str,
-        format: str = "mermaid",
-        direction: str = "both"
+        self, entity_id: str, format: str = "mermaid", direction: str = "both"
     ) -> Dict[str, Any]:
         """
         Export lineage diagram for visualization.
@@ -749,7 +755,9 @@ class LineagePlugin(BasePlugin):
             lines = ["graph LR"]
 
             # Add root node
-            lines.append(f"    {self._sanitize_id(entity_id)}[{self._mermaid_label(entity_id)}]")
+            lines.append(
+                f"    {self._sanitize_id(entity_id)}[{self._mermaid_label(entity_id)}]"
+            )
 
             # Add upstream connections
             for item in lineage["upstream"]:
@@ -771,11 +779,7 @@ class LineagePlugin(BasePlugin):
 
             diagram = "\n".join(lines)
 
-            return {
-                "success": True,
-                "format": "mermaid",
-                "diagram": diagram
-            }
+            return {"success": True, "format": "mermaid", "diagram": diagram}
 
         elif format == "dot":
             lines = ["digraph lineage {"]
@@ -795,16 +799,12 @@ class LineagePlugin(BasePlugin):
             lines.append("}")
             diagram = "\n".join(lines)
 
-            return {
-                "success": True,
-                "format": "dot",
-                "diagram": diagram
-            }
+            return {"success": True, "format": "dot", "diagram": diagram}
 
         else:
             return {
                 "success": False,
-                "error": f"Unsupported format: {format}. Use 'mermaid' or 'dot'"
+                "error": f"Unsupported format: {format}. Use 'mermaid' or 'dot'",
             }
 
     def _sanitize_id(self, entity_id: str) -> str:
@@ -841,31 +841,31 @@ class LineagePlugin(BasePlugin):
 
         # 2. Synonym map
         _SYNONYMS: Dict[str, "EdgeType"] = {
-            "transform":    EdgeType.TRANSFORMS,
-            "aggregate":    EdgeType.TRANSFORMS,
-            "aggregation":  EdgeType.TRANSFORMS,
-            "enrich":       EdgeType.TRANSFORMS,
-            "enrichment":   EdgeType.TRANSFORMS,
-            "flow":         EdgeType.TRANSFORMS,
-            "flows_to":     EdgeType.TRANSFORMS,
-            "etl":          EdgeType.TRANSFORMS,
-            "read":         EdgeType.READS,
-            "select":       EdgeType.READS,
-            "write":        EdgeType.WRITES,
-            "insert":       EdgeType.WRITES,
-            "upsert":       EdgeType.WRITES,
-            "load":         EdgeType.WRITES,
-            "sync":         EdgeType.SYNCS_TO,
-            "replicate":    EdgeType.SYNCS_TO,
-            "replication":  EdgeType.SYNCS_TO,
-            "model":        EdgeType.DERIVED_FROM,
-            "derive":       EdgeType.DERIVED_FROM,
-            "derived":      EdgeType.DERIVED_FROM,
-            "trigger":      EdgeType.TRIGGERS,
-            "call":         EdgeType.CALLS,
-            "invoke":       EdgeType.CALLS,
-            "produce":      EdgeType.PRODUCES,
-            "emit":         EdgeType.PRODUCES,
+            "transform": EdgeType.TRANSFORMS,
+            "aggregate": EdgeType.TRANSFORMS,
+            "aggregation": EdgeType.TRANSFORMS,
+            "enrich": EdgeType.TRANSFORMS,
+            "enrichment": EdgeType.TRANSFORMS,
+            "flow": EdgeType.TRANSFORMS,
+            "flows_to": EdgeType.TRANSFORMS,
+            "etl": EdgeType.TRANSFORMS,
+            "read": EdgeType.READS,
+            "select": EdgeType.READS,
+            "write": EdgeType.WRITES,
+            "insert": EdgeType.WRITES,
+            "upsert": EdgeType.WRITES,
+            "load": EdgeType.WRITES,
+            "sync": EdgeType.SYNCS_TO,
+            "replicate": EdgeType.SYNCS_TO,
+            "replication": EdgeType.SYNCS_TO,
+            "model": EdgeType.DERIVED_FROM,
+            "derive": EdgeType.DERIVED_FROM,
+            "derived": EdgeType.DERIVED_FROM,
+            "trigger": EdgeType.TRIGGERS,
+            "call": EdgeType.CALLS,
+            "invoke": EdgeType.CALLS,
+            "produce": EdgeType.PRODUCES,
+            "emit": EdgeType.PRODUCES,
         }
         resolved = _SYNONYMS.get(normalised)
         if resolved:
@@ -938,7 +938,9 @@ class LineagePlugin(BasePlugin):
             f"({source_id} --[{edge_type.value}]--> {target_id})"
         )
 
-    def parse_sql_lineage(self, sql: str, context_table: Optional[str] = None) -> Dict[str, Any]:
+    def parse_sql_lineage(
+        self, sql: str, context_table: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Parse SQL query to extract table dependencies automatically.
 
@@ -959,39 +961,41 @@ class LineagePlugin(BasePlugin):
         source_tables = set()
 
         # Find all FROM clauses
-        from_pattern = r'\bFROM\s+([a-zA-Z0-9_\.]+)'
+        from_pattern = r"\bFROM\s+([a-zA-Z0-9_\.]+)"
         for match in re.finditer(from_pattern, sql, _RI):
             source_tables.add(match.group(1))
 
         # Find all JOIN clauses
-        join_pattern = r'\bJOIN\s+([a-zA-Z0-9_\.]+)'
+        join_pattern = r"\bJOIN\s+([a-zA-Z0-9_\.]+)"
         for match in re.finditer(join_pattern, sql, _RI):
             source_tables.add(match.group(1))
 
         # Find tables in WITH (CTE) clauses
-        with_pattern = r'\bWITH\s+([a-zA-Z0-9_]+)\s+AS'
+        with_pattern = r"\bWITH\s+([a-zA-Z0-9_]+)\s+AS"
         cte_tables = set()
         for match in re.finditer(with_pattern, sql, _RI):
             cte_tables.add(match.group(1))
 
         # Remove CTEs from source tables (they're temporary)
-        source_tables = {t for t in source_tables if t.lower() not in {c.lower() for c in cte_tables}}
+        source_tables = {
+            t for t in source_tables if t.lower() not in {c.lower() for c in cte_tables}
+        }
 
         # Extract target tables
         target_tables = set()
 
         # INSERT INTO pattern
-        insert_pattern = r'\bINSERT\s+INTO\s+([a-zA-Z0-9_\.]+)'
+        insert_pattern = r"\bINSERT\s+INTO\s+([a-zA-Z0-9_\.]+)"
         for match in re.finditer(insert_pattern, sql, _RI):
             target_tables.add(match.group(1))
 
         # UPDATE pattern
-        update_pattern = r'\bUPDATE\s+([a-zA-Z0-9_\.]+)'
+        update_pattern = r"\bUPDATE\s+([a-zA-Z0-9_\.]+)"
         for match in re.finditer(update_pattern, sql, _RI):
             target_tables.add(match.group(1))
 
         # CREATE TABLE AS pattern
-        create_pattern = r'\bCREATE\s+(?:TEMP\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_\.]+)\s+AS'
+        create_pattern = r"\bCREATE\s+(?:TEMP\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_\.]+)\s+AS"
         for match in re.finditer(create_pattern, sql, _RI):
             target_tables.add(match.group(1))
 
@@ -1003,14 +1007,14 @@ class LineagePlugin(BasePlugin):
             "source_tables": list(source_tables),
             "target_tables": list(target_tables),
             "is_read_only": len(target_tables) == 0,
-            "cte_tables": list(cte_tables)
+            "cte_tables": list(cte_tables),
         }
 
     async def capture_sql_lineage(
         self,
         sql: str,
         context_table: Optional[str] = None,
-        transformation: Optional[str] = None
+        transformation: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Automatically capture lineage from SQL query execution.
@@ -1036,10 +1040,7 @@ class LineagePlugin(BasePlugin):
                     target_id=f"table:{target}",
                     flow_type="SQL_TRANSFORM",
                     transformation=transformation or f"SQL: {sql[:100]}",
-                    metadata={
-                        "sql_query": sql,
-                        "is_read_only": parsed["is_read_only"]
-                    }
+                    metadata={"sql_query": sql, "is_read_only": parsed["is_read_only"]},
                 )
                 flows_registered.append(flow_result["flow_id"])
 
@@ -1048,14 +1049,14 @@ class LineagePlugin(BasePlugin):
             "flows_registered": flows_registered,
             "source_tables": parsed["source_tables"],
             "target_tables": parsed["target_tables"],
-            "flow_count": len(flows_registered)
+            "flow_count": len(flows_registered),
         }
 
     def track(
         self,
         source: Optional[str] = None,
         target: Optional[str] = None,
-        transformation: Optional[str] = None
+        transformation: Optional[str] = None,
     ) -> Callable:
         """
         Decorator for automatic function-based lineage tracking.
@@ -1074,6 +1075,7 @@ class LineagePlugin(BasePlugin):
         Returns:
             Decorated function with automatic lineage capture
         """
+
         def decorator(func: Callable) -> Callable:
             import asyncio
 
@@ -1095,10 +1097,7 @@ class LineagePlugin(BasePlugin):
                     target_id=actual_target,
                     flow_type="FUNCTION_TRANSFORM",
                     transformation=actual_transformation,
-                    metadata={
-                        "function": func.__name__,
-                        "module": func.__module__
-                    }
+                    metadata={"function": func.__name__, "module": func.__module__},
                 )
 
                 return await func(*args, **kwargs)

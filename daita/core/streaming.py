@@ -4,6 +4,7 @@ Streaming event system for real-time agent execution updates.
 This module provides event types and data structures for streaming
 agent execution progress to UIs, APIs, or logging systems.
 """
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -12,12 +13,13 @@ from typing import Any, Optional, Dict
 
 class EventType(Enum):
     """Types of events emitted during agent execution."""
-    THINKING = "thinking"           # LLM reasoning/text output
-    TOOL_CALL = "tool_call"         # Tool about to be executed
-    TOOL_RESULT = "tool_result"     # Tool execution completed
-    ITERATION = "iteration"         # New iteration starting
-    COMPLETE = "complete"           # Execution finished
-    ERROR = "error"                 # Error occurred
+
+    THINKING = "thinking"  # LLM reasoning/text output
+    TOOL_CALL = "tool_call"  # Tool about to be executed
+    TOOL_RESULT = "tool_result"  # Tool execution completed
+    ITERATION = "iteration"  # New iteration starting
+    COMPLETE = "complete"  # Execution finished
+    ERROR = "error"  # Error occurred
 
 
 @dataclass
@@ -39,6 +41,7 @@ class AgentEvent:
             content="Analyzing the data..."
         )
     """
+
     type: EventType
     timestamp: datetime = field(default_factory=datetime.now)
 
@@ -69,10 +72,7 @@ class AgentEvent:
 
         Useful for sending over WebSocket or storing in database.
         """
-        data = {
-            "type": self.type.value,
-            "timestamp": self.timestamp.isoformat()
-        }
+        data = {"type": self.type.value, "timestamp": self.timestamp.isoformat()}
 
         # Add populated fields
         if self.content is not None:
@@ -108,6 +108,7 @@ class LLMChunk:
 
     LLM providers emit these chunks which get converted to AgentEvents.
     """
+
     type: str  # "text" or "tool_call_complete"
 
     # Text chunks

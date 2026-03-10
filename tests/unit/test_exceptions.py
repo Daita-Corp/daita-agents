@@ -31,10 +31,10 @@ from daita.core.exceptions import (
     create_contextual_error,
 )
 
-
 # ===========================================================================
 # Exception retry_hint correctness
 # ===========================================================================
+
 
 class TestRetryHints:
     def test_daita_error_default_hint(self):
@@ -98,6 +98,7 @@ class TestRetryHints:
 # is_* predicate methods
 # ===========================================================================
 
+
 class TestPredicateMethods:
     def test_is_transient_true_for_transient(self):
         assert TransientError("msg").is_transient() is True
@@ -131,6 +132,7 @@ class TestPredicateMethods:
 # ===========================================================================
 # classify_exception()
 # ===========================================================================
+
 
 class TestClassifyException:
     def test_classify_daita_transient(self):
@@ -170,6 +172,7 @@ class TestClassifyException:
 # ===========================================================================
 # create_contextual_error()
 # ===========================================================================
+
 
 class TestCreateContextualError:
     def test_wraps_value_error_as_permanent(self):

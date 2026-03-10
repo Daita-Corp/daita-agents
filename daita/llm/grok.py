@@ -1,6 +1,7 @@
 """
 Grok (xAI) LLM provider implementation with integrated tracing.
 """
+
 import os
 import logging
 from typing import Dict, Any, Optional, List
@@ -10,15 +11,11 @@ from .base import BaseLLMProvider
 
 logger = logging.getLogger(__name__)
 
+
 class GrokProvider(BaseLLMProvider):
     """Grok (xAI) LLM provider implementation with automatic call tracing."""
-    
-    def __init__(
-        self,
-        model: str = "grok-3",
-        api_key: Optional[str] = None,
-        **kwargs
-    ):
+
+    def __init__(self, model: str = "grok-3", api_key: Optional[str] = None, **kwargs):
         """
         Initialize Grok provider.
 
@@ -29,31 +26,33 @@ class GrokProvider(BaseLLMProvider):
         """
         # Get API key from parameter or environment
         api_key = api_key or os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY")
-        
+
         super().__init__(model=model, api_key=api_key, **kwargs)
-        
+
         # Grok-specific default parameters
-        self.default_params.update({
-            'stream': kwargs.get('stream', False),
-            'timeout': kwargs.get('timeout', 60)
-        })
-        
+        self.default_params.update(
+            {
+                "stream": kwargs.get("stream", False),
+                "timeout": kwargs.get("timeout", 60),
+            }
+        )
+
         # Base URL for xAI API
-        self.base_url = kwargs.get('base_url', 'https://api.x.ai/v1')
-        
+        self.base_url = kwargs.get("base_url", "https://api.x.ai/v1")
+
         # Lazy-load OpenAI client (Grok uses OpenAI-compatible API)
         self._client = None
-    
+
     @property
     def client(self):
         """Lazy-load OpenAI client configured for xAI."""
         if self._client is None:
             try:
                 import openai
+
                 self._validate_api_key()
                 self._client = openai.AsyncOpenAI(
-                    api_key=self.api_key,
-                    base_url=self.base_url
+                    api_key=self.api_key, base_url=self.base_url
                 )
                 logger.debug("Grok client initialized")
             except ImportError:
@@ -61,7 +60,7 @@ class GrokProvider(BaseLLMProvider):
                     "openai package not found. It is a core dependency — reinstall with: pip install daita-agents"
                 )
         return self._client
-    
+
     def _safe_parse_arguments(self, arguments_str: str) -> Dict[str, Any]:
         """
         Safely parse JSON arguments with error handling.
@@ -81,8 +80,7 @@ class GrokProvider(BaseLLMProvider):
             return {}
 
     def _convert_messages_to_openai(
-        self,
-        messages: List[Dict[str, Any]]
+        self, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """
         Convert universal flat format to OpenAI's nested format.
@@ -97,31 +95,35 @@ class GrokProvider(BaseLLMProvider):
                 # Convert flat format to OpenAI's nested format
                 converted_tool_calls = []
                 for tc in msg["tool_calls"]:
-                    converted_tool_calls.append({
-                        "id": tc.get("id", ""),
-                        "type": "function",
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": json.dumps(tc["arguments"]) if isinstance(tc["arguments"], dict) else tc["arguments"]
+                    converted_tool_calls.append(
+                        {
+                            "id": tc.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": (
+                                    json.dumps(tc["arguments"])
+                                    if isinstance(tc["arguments"], dict)
+                                    else tc["arguments"]
+                                ),
+                            },
                         }
-                    })
+                    )
 
-                openai_messages.append({
-                    "role": "assistant",
-                    "tool_calls": converted_tool_calls
-                })
+                openai_messages.append(
+                    {"role": "assistant", "tool_calls": converted_tool_calls}
+                )
             else:
                 # Pass through other messages unchanged
                 openai_messages.append(msg)
 
         return openai_messages
 
-
     async def _generate_impl(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
-        **kwargs
+        **kwargs,
     ):
         """
         Grok non-streaming with optional tools.
@@ -140,10 +142,10 @@ class GrokProvider(BaseLLMProvider):
             api_params = {
                 "model": self.model,
                 "messages": self._convert_messages_to_openai(messages),
-                "max_tokens": kwargs.get('max_tokens'),
-                "temperature": kwargs.get('temperature'),
-                "top_p": kwargs.get('top_p'),
-                "timeout": kwargs.get('timeout')
+                "max_tokens": kwargs.get("max_tokens"),
+                "temperature": kwargs.get("temperature"),
+                "top_p": kwargs.get("top_p"),
+                "timeout": kwargs.get("timeout"),
             }
 
             # Add tools if provided
@@ -160,9 +162,9 @@ class GrokProvider(BaseLLMProvider):
             # Update accumulated metrics for cost tracking
             if response.usage:
                 token_usage = {
-                    'total_tokens': response.usage.total_tokens,
-                    'prompt_tokens': response.usage.prompt_tokens,
-                    'completion_tokens': response.usage.completion_tokens
+                    "total_tokens": response.usage.total_tokens,
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
                 }
                 self._update_accumulated_metrics(token_usage)
 
@@ -175,7 +177,9 @@ class GrokProvider(BaseLLMProvider):
                         {
                             "id": tc.id,
                             "name": tc.function.name,
-                            "arguments": self._safe_parse_arguments(tc.function.arguments)
+                            "arguments": self._safe_parse_arguments(
+                                tc.function.arguments
+                            ),
                         }
                         for tc in message.tool_calls
                     ]
@@ -191,7 +195,7 @@ class GrokProvider(BaseLLMProvider):
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
-        **kwargs
+        **kwargs,
     ):
         """
         Grok streaming with optional tools.
@@ -211,10 +215,10 @@ class GrokProvider(BaseLLMProvider):
             api_params = {
                 "model": self.model,
                 "messages": self._convert_messages_to_openai(messages),
-                "max_tokens": kwargs.get('max_tokens'),
-                "temperature": kwargs.get('temperature'),
-                "top_p": kwargs.get('top_p'),
-                "timeout": kwargs.get('timeout'),
+                "max_tokens": kwargs.get("max_tokens"),
+                "temperature": kwargs.get("temperature"),
+                "top_p": kwargs.get("top_p"),
+                "timeout": kwargs.get("timeout"),
                 "stream": True,
             }
 
@@ -235,11 +239,7 @@ class GrokProvider(BaseLLMProvider):
 
                 # Stream text content
                 if delta.content:
-                    yield LLMChunk(
-                        type="text",
-                        content=delta.content,
-                        model=self.model
-                    )
+                    yield LLMChunk(type="text", content=delta.content, model=self.model)
 
                 # Handle tool calls (streamed as deltas)
                 if delta.tool_calls:
@@ -251,7 +251,7 @@ class GrokProvider(BaseLLMProvider):
                             tool_call_buffers[index] = {
                                 "id": "",
                                 "name": "",
-                                "arguments": ""
+                                "arguments": "",
                             }
 
                         # Accumulate partial data
@@ -260,7 +260,9 @@ class GrokProvider(BaseLLMProvider):
                         if tc_delta.function and tc_delta.function.name:
                             tool_call_buffers[index]["name"] = tc_delta.function.name
                         if tc_delta.function and tc_delta.function.arguments:
-                            tool_call_buffers[index]["arguments"] += tc_delta.function.arguments
+                            tool_call_buffers[index][
+                                "arguments"
+                            ] += tc_delta.function.arguments
 
                 # On stream end, emit complete tool calls
                 if choice.finish_reason == "tool_calls":
@@ -268,19 +270,21 @@ class GrokProvider(BaseLLMProvider):
                         yield LLMChunk(
                             type="tool_call_complete",
                             tool_name=tool_call["name"],
-                            tool_args=self._safe_parse_arguments(tool_call["arguments"]),
+                            tool_args=self._safe_parse_arguments(
+                                tool_call["arguments"]
+                            ),
                             tool_call_id=tool_call["id"],
-                            model=self.model
+                            model=self.model,
                         )
 
                 # Store usage if available
-                if hasattr(chunk, 'usage') and chunk.usage:
+                if hasattr(chunk, "usage") and chunk.usage:
                     self._last_usage = chunk.usage
                     # Update accumulated metrics for cost tracking
                     token_usage = {
-                        'total_tokens': chunk.usage.total_tokens,
-                        'prompt_tokens': chunk.usage.prompt_tokens,
-                        'completion_tokens': chunk.usage.completion_tokens
+                        "total_tokens": chunk.usage.total_tokens,
+                        "prompt_tokens": chunk.usage.prompt_tokens,
+                        "completion_tokens": chunk.usage.completion_tokens,
                     }
                     self._update_accumulated_metrics(token_usage)
 
@@ -292,9 +296,11 @@ class GrokProvider(BaseLLMProvider):
     def info(self) -> Dict[str, Any]:
         """Get information about the Grok provider."""
         base_info = super().info
-        base_info.update({
-            'base_url': self.base_url,
-            'provider_name': 'Grok (xAI)',
-            'api_compatible': 'OpenAI'
-        })
+        base_info.update(
+            {
+                "base_url": self.base_url,
+                "provider_name": "Grok (xAI)",
+                "api_compatible": "OpenAI",
+            }
+        )
         return base_info

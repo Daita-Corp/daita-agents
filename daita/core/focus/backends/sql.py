@@ -9,6 +9,7 @@ compile_focus_to_sql(base_query, fq, dialect, param_offset)
 
 Supported dialects: "postgresql", "mysql", "snowflake", "sqlite"
 """
+
 from __future__ import annotations
 
 import ast as pyast
@@ -21,15 +22,15 @@ from ..ast import FocusQuery
 
 _QUOTE = {
     "postgresql": '"',
-    "snowflake":  '"',
-    "sqlite":     '"',
-    "mysql":      "`",
-    "standard":   '"',
+    "snowflake": '"',
+    "sqlite": '"',
+    "mysql": "`",
+    "standard": '"',
 }
 
-_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_AGG = {"SUM", "COUNT", "AVG", "MIN", "MAX"}
-_AGG_EXPR_RE = re.compile(r'^(SUM|COUNT|AVG|MIN|MAX)\((\*|[\w]+)\)$', re.IGNORECASE)
+_AGG_EXPR_RE = re.compile(r"^(SUM|COUNT|AVG|MIN|MAX)\((\*|[\w]+)\)$", re.IGNORECASE)
 
 
 def _quote_id(name: str, dialect: str) -> str:
@@ -38,6 +39,7 @@ def _quote_id(name: str, dialect: str) -> str:
 
 
 # ── Filter AST → SQL compiler ──────────────────────────────────────────────────
+
 
 class _SQLFilterCompiler:
     """
@@ -112,12 +114,12 @@ class _SQLFilterCompiler:
             return None
 
         _OPS = {
-            pyast.Eq:    "=",
+            pyast.Eq: "=",
             pyast.NotEq: "!=",
-            pyast.Lt:    "<",
-            pyast.LtE:   "<=",
-            pyast.Gt:    ">",
-            pyast.GtE:   ">=",
+            pyast.Lt: "<",
+            pyast.LtE: "<=",
+            pyast.Gt: ">",
+            pyast.GtE: ">=",
         }
 
         parts = []
@@ -152,7 +154,9 @@ class _SQLFilterCompiler:
 
         return " AND ".join(parts)
 
-    def _in_clause(self, left: str, comparator: pyast.expr, negated: bool) -> Optional[str]:
+    def _in_clause(
+        self, left: str, comparator: pyast.expr, negated: bool
+    ) -> Optional[str]:
         if not isinstance(comparator, (pyast.List, pyast.Tuple)):
             return None
         placeholders = []
@@ -176,6 +180,7 @@ class _SQLFilterCompiler:
 
 
 # ── Public entry point ─────────────────────────────────────────────────────────
+
 
 def compile_focus_to_sql(
     base_query: str,
@@ -230,7 +235,9 @@ def compile_focus_to_sql(
                     func = m.group(1).upper()
                     col = m.group(2)
                     col_sql = "*" if col == "*" else _quote_id(col, dialect)
-                    agg_select_parts.append(f"{func}({col_sql}) AS {_quote_id(alias, dialect)}")
+                    agg_select_parts.append(
+                        f"{func}({col_sql}) AS {_quote_id(alias, dialect)}"
+                    )
                 if ok:
                     applied.update({"group_by", "aggregates"})
                 else:

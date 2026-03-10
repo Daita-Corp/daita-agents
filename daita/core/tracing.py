@@ -24,8 +24,10 @@ from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
+
 class TraceType(str, Enum):
     """Types of traces we capture."""
+
     AGENT_EXECUTION = "agent_execution"
     LLM_CALL = "llm_call"
     WORKFLOW_COMMUNICATION = "workflow_communication"
@@ -33,15 +35,19 @@ class TraceType(str, Enum):
     DECISION_TRACE = "decision_trace"
     TOOL_EXECUTION = "tool_execution"
 
+
 class TraceStatus(str, Enum):
     """Status of a trace span."""
+
     STARTED = "started"
     SUCCESS = "success"
     ERROR = "error"
 
+
 @dataclass
 class TraceSpan:
     """A single trace span - simplified for MVP."""
+
     span_id: str
     trace_id: str
     parent_span_id: Optional[str]
@@ -51,33 +57,33 @@ class TraceSpan:
     start_time: float
     end_time: Optional[float]
     status: TraceStatus
-    
+
     # Core data
     input_data: Any
     output_data: Any
     error_message: Optional[str]
-    
+
     # Performance
     duration_ms: Optional[float]
-    
+
     # Metadata - simple dict for flexibility
     metadata: Dict[str, Any]
-    
+
     # Environment context
     deployment_id: Optional[str]
     environment: str
-    
+
     def __post_init__(self):
         """Auto-populate deployment context."""
         if self.deployment_id is None:
             self.deployment_id = os.getenv("DAITA_DEPLOYMENT_ID")
         if not self.environment:
             self.environment = os.getenv("DAITA_ENVIRONMENT", "development")
-    
+
     @property
     def is_completed(self) -> bool:
         return self.end_time is not None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
@@ -96,9 +102,9 @@ class TraceSpan:
             "error": self.error_message,
             "metadata": self.metadata,
             "environment": self.environment,
-            "deployment_id": self.deployment_id
+            "deployment_id": self.deployment_id,
         }
-    
+
     def _create_preview(self, data: Any, max_length: int = 200) -> str:
         """Create a preview string for data."""
         if data is None:
@@ -107,21 +113,22 @@ class TraceSpan:
             if isinstance(data, str):
                 preview = data
             elif isinstance(data, dict):
-                preview = json.dumps(data, separators=(',', ':'))
+                preview = json.dumps(data, separators=(",", ":"))
             else:
                 preview = str(data)
-            
+
             if len(preview) > max_length:
                 return preview[:max_length] + "..."
             return preview
         except Exception:
             return f"<{type(data).__name__}>"
 
+
 # Module-level ContextVars — one per async task, correctly propagated across
 # await boundaries and isolated between concurrent tasks.
-_trace_id_var: ContextVar[Optional[str]] = ContextVar('daita_trace_id', default=None)
-_span_id_var: ContextVar[Optional[str]] = ContextVar('daita_span_id', default=None)
-_agent_id_var: ContextVar[Optional[str]] = ContextVar('daita_agent_id', default=None)
+_trace_id_var: ContextVar[Optional[str]] = ContextVar("daita_trace_id", default=None)
+_span_id_var: ContextVar[Optional[str]] = ContextVar("daita_span_id", default=None)
+_agent_id_var: ContextVar[Optional[str]] = ContextVar("daita_agent_id", default=None)
 
 
 class TraceContext:
@@ -140,7 +147,9 @@ class TraceContext:
         return _agent_id_var.get()
 
     @asynccontextmanager
-    async def span_context(self, trace_id: str, span_id: str, agent_id: Optional[str] = None):
+    async def span_context(
+        self, trace_id: str, span_id: str, agent_id: Optional[str] = None
+    ):
         """Context manager that scopes trace/span IDs to the current async task.
 
         Uses ContextVar.reset() tokens so nested spans correctly restore the
@@ -157,71 +166,78 @@ class TraceContext:
             if agent_token is not None:
                 _agent_id_var.reset(agent_token)
 
+
 class DashboardReporter:
     """Dashboard reporting with proper dependency management."""
-    
+
     def __init__(self):
         self.api_key = os.getenv("DAITA_API_KEY")
-        self.dashboard_url = os.getenv("DAITA_DASHBOARD_URL") or os.getenv("DAITA_DASHBOARD_API") or os.getenv("DAITA_DASHBOARD_API_OVERRIDE") or ""
+        self.dashboard_url = (
+            os.getenv("DAITA_DASHBOARD_URL")
+            or os.getenv("DAITA_DASHBOARD_API")
+            or os.getenv("DAITA_DASHBOARD_API_OVERRIDE")
+            or ""
+        )
         self.enabled = bool(self.api_key and self.dashboard_url)
         self.reports_sent = 0
         self.reports_failed = 0
         self._aiohttp_available = None
-        
+
         # Validate configuration
         if self.api_key and not self.dashboard_url:
             self.enabled = False
-        
+
         if self.enabled:
             logger.info(f"Dashboard reporting enabled (URL: {self.dashboard_url})")
         else:
             logger.debug("Dashboard reporting disabled (API key or URL not configured)")
-    
+
     def _check_aiohttp(self) -> bool:
         """Check if aiohttp is available (cached result)."""
         if self._aiohttp_available is None:
             try:
                 import importlib.util
+
                 if importlib.util.find_spec("aiohttp") is None:
                     raise ImportError("aiohttp not found")
                 self._aiohttp_available = True
                 logger.debug("aiohttp available for dashboard reporting")
             except ImportError:
                 self._aiohttp_available = False
-                logger.warning("aiohttp not available - dashboard reporting will be skipped")
+                logger.warning(
+                    "aiohttp not available - dashboard reporting will be skipped"
+                )
         return self._aiohttp_available
-    
+
     async def report_span(self, span: TraceSpan) -> bool:
         """Report a single span to dashboard with proper error handling."""
         if not self.enabled:
             return True
-            
+
         if not self._check_aiohttp():
             # Don't log this repeatedly
             return False
-        
+
         try:
             import aiohttp
-            
+
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
-                "User-Agent": "daita-agents/0.1.1"
+                "User-Agent": "daita-agents/0.1.1",
             }
-            
+
             payload = {
                 "spans": [span.to_dict()],
                 "environment": span.environment,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.utcnow().isoformat(),
             }
-            
+
             timeout = aiohttp.ClientTimeout(total=5)
-            
+
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
-                    f"{self.dashboard_url}/v1/traces",
-                    headers=headers,
-                    json=payload
+                    f"{self.dashboard_url}/v1/traces", headers=headers, json=payload
                 ) as response:
                     if response.status == 200:
                         self.reports_sent += 1
@@ -229,9 +245,11 @@ class DashboardReporter:
                         return True
                     else:
                         self.reports_failed += 1
-                        logger.warning(f"Dashboard API error: {response.status} - {await response.text()}")
+                        logger.warning(
+                            f"Dashboard API error: {response.status} - {await response.text()}"
+                        )
                         return False
-                        
+
         except asyncio.TimeoutError:
             self.reports_failed += 1
             logger.warning("Dashboard reporting timeout")
@@ -240,6 +258,7 @@ class DashboardReporter:
             self.reports_failed += 1
             logger.warning(f"Dashboard reporting failed: {e}")
             return False
+
 
 class TraceManager:
     """
@@ -265,14 +284,14 @@ class TraceManager:
         self._decision_stream_callbacks: Dict[str, List[Callable]] = {}
 
         logger.info("TraceManager initialized")
-    
+
     def start_span(
         self,
         operation_name: str,
         trace_type: TraceType,
         agent_id: Optional[str] = None,
         parent_span_id: Optional[str] = None,
-        **metadata
+        **metadata,
     ) -> str:
         """Start a new trace span."""
         try:
@@ -301,13 +320,13 @@ class TraceManager:
                 start_time=time.time(),
                 end_time=None,
                 status=TraceStatus.STARTED,
-                input_data=metadata.get('input_data'),
+                input_data=metadata.get("input_data"),
                 output_data=None,
                 error_message=None,
                 duration_ms=None,
                 metadata=metadata,
                 deployment_id=None,
-                environment=""
+                environment="",
             )
 
             self._active_spans[span_id] = span
@@ -318,14 +337,14 @@ class TraceManager:
         except Exception as e:
             logger.error(f"Failed to start span: {e}")
             return f"error_{uuid.uuid4().hex[:8]}"
-    
+
     def end_span(
         self,
         span_id: str,
         status: TraceStatus = TraceStatus.SUCCESS,
         output_data: Any = None,
         error_message: Optional[str] = None,
-        **metadata
+        **metadata,
     ) -> None:
         """End a trace span."""
         try:
@@ -351,38 +370,44 @@ class TraceManager:
 
             # Report to dashboard (fire and forget)
             task = asyncio.create_task(self.dashboard_reporter.report_span(span))
-            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            task.add_done_callback(
+                lambda t: t.exception() if not t.cancelled() else None
+            )
 
             logger.debug(f"Ended span {span_id} ({span.duration_ms:.1f}ms)")
 
         except Exception as e:
             logger.error(f"Failed to end span {span_id}: {e}")
             self._active_spans.pop(span_id, None)
-    
+
     def record_decision(
         self,
         span_id: str,
         confidence: float = 0.0,
         reasoning: Optional[List[str]] = None,
         alternatives: Optional[List[str]] = None,
-        **factors
+        **factors,
     ) -> None:
         """Record decision metadata for a span."""
         try:
             span = self._active_spans.get(span_id)
             if span:
-                span.metadata.update({
-                    "confidence_score": confidence,
-                    "reasoning_chain": reasoning or [],
-                    "alternatives": alternatives or [],
-                    "decision_factors": factors,
-                })
-                logger.debug(f"Recorded decision for span {span_id} (confidence: {confidence:.2f})")
+                span.metadata.update(
+                    {
+                        "confidence_score": confidence,
+                        "reasoning_chain": reasoning or [],
+                        "alternatives": alternatives or [],
+                        "decision_factors": factors,
+                    }
+                )
+                logger.debug(
+                    f"Recorded decision for span {span_id} (confidence: {confidence:.2f})"
+                )
             else:
                 logger.debug(f"Cannot record decision for unknown span: {span_id}")
         except Exception as e:
             logger.error(f"Failed to record decision for span {span_id}: {e}")
-    
+
     def record_llm_call(
         self,
         span_id: str,
@@ -390,45 +415,52 @@ class TraceManager:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,
-        **llm_metadata
+        **llm_metadata,
     ) -> None:
         """Record LLM call metadata for a span."""
         try:
             span = self._active_spans.get(span_id)
             if span:
-                span.metadata.update({
-                    "model": model,
-                    "tokens_prompt": prompt_tokens,
-                    "tokens_completion": completion_tokens,
-                    "tokens_total": total_tokens or (prompt_tokens + completion_tokens),
-                    **llm_metadata,
-                })
-                logger.debug(f"Recorded LLM call for span {span_id} ({total_tokens} tokens)")
+                span.metadata.update(
+                    {
+                        "model": model,
+                        "tokens_prompt": prompt_tokens,
+                        "tokens_completion": completion_tokens,
+                        "tokens_total": total_tokens
+                        or (prompt_tokens + completion_tokens),
+                        **llm_metadata,
+                    }
+                )
+                logger.debug(
+                    f"Recorded LLM call for span {span_id} ({total_tokens} tokens)"
+                )
             else:
                 logger.debug(f"Cannot record LLM call for unknown span: {span_id}")
         except Exception as e:
             logger.error(f"Failed to record LLM call for span {span_id}: {e}")
-    
+
     @asynccontextmanager
     async def span(
         self,
         operation_name: str,
         trace_type: TraceType,
         agent_id: Optional[str] = None,
-        **metadata
+        **metadata,
     ):
         """Context manager for automatic span lifecycle."""
         span_id = self.start_span(
             operation_name=operation_name,
             trace_type=trace_type,
             agent_id=agent_id,
-            **metadata
+            **metadata,
         )
 
         try:
             active = self._active_spans.get(span_id)
             if active:
-                async with self.trace_context.span_context(active.trace_id, span_id, agent_id):
+                async with self.trace_context.span_context(
+                    active.trace_id, span_id, agent_id
+                ):
                     yield span_id
             else:
                 yield span_id
@@ -438,28 +470,35 @@ class TraceManager:
         except Exception as e:
             self.end_span(span_id, TraceStatus.ERROR, error_message=str(e))
             raise
-    
+
     # Convenience methods for specific trace types
-    
-    async def decision_span(self, decision_point: str, agent_id: Optional[str] = None, **metadata):
+
+    async def decision_span(
+        self, decision_point: str, agent_id: Optional[str] = None, **metadata
+    ):
         """Context manager for decision tracing."""
-        metadata.update({
-            "decision_point": decision_point,
-            "trace_subtype": "decision"
-        })
-        return self.span(f"decision_{decision_point}", TraceType.DECISION_TRACE, agent_id, **metadata)
-    
-    async def tool_span(self, tool_name: str, operation: str, agent_id: Optional[str] = None, **metadata):
+        metadata.update({"decision_point": decision_point, "trace_subtype": "decision"})
+        return self.span(
+            f"decision_{decision_point}", TraceType.DECISION_TRACE, agent_id, **metadata
+        )
+
+    async def tool_span(
+        self, tool_name: str, operation: str, agent_id: Optional[str] = None, **metadata
+    ):
         """Context manager for tool execution tracing."""
-        metadata.update({
-            "tool_name": tool_name,
-            "tool_operation": operation
-        })
-        return self.span(f"tool_{tool_name}_{operation}", TraceType.TOOL_EXECUTION, agent_id, **metadata)
-    
+        metadata.update({"tool_name": tool_name, "tool_operation": operation})
+        return self.span(
+            f"tool_{tool_name}_{operation}",
+            TraceType.TOOL_EXECUTION,
+            agent_id,
+            **metadata,
+        )
+
     # Query methods
-    
-    def get_recent_operations(self, agent_id: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
+
+    def get_recent_operations(
+        self, agent_id: Optional[str] = None, limit: int = 10
+    ) -> List[Dict[str, Any]]:
         """Get recent completed operations, most recent first."""
         try:
             spans = list(self._completed_spans)
@@ -502,22 +541,28 @@ class TraceManager:
             logger.error(f"Error getting agent metrics: {e}")
             return {"total_operations": 0, "success_rate": 0}
 
-    def get_workflow_communications(self, workflow_name: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    def get_workflow_communications(
+        self, workflow_name: Optional[str] = None, limit: int = 20
+    ) -> List[Dict[str, Any]]:
         """Get workflow communication traces (agent-to-agent messages)."""
         try:
             comm_spans = [
-                s for s in self._completed_spans
+                s
+                for s in self._completed_spans
                 if s.trace_type == TraceType.WORKFLOW_COMMUNICATION
-                and (workflow_name is None or s.metadata.get('workflow_name') == workflow_name)
+                and (
+                    workflow_name is None
+                    or s.metadata.get("workflow_name") == workflow_name
+                )
             ]
             result = []
             for span in reversed(comm_spans[-limit:]):
                 comm_dict = span.to_dict()
-                comm_dict['from_agent'] = span.metadata.get('from_agent', 'unknown')
-                comm_dict['to_agent'] = span.metadata.get('to_agent', 'unknown')
-                comm_dict['channel'] = span.metadata.get('channel', 'unknown')
-                comm_dict['message_id'] = span.metadata.get('message_id')
-                comm_dict['success'] = span.status == TraceStatus.SUCCESS
+                comm_dict["from_agent"] = span.metadata.get("from_agent", "unknown")
+                comm_dict["to_agent"] = span.metadata.get("to_agent", "unknown")
+                comm_dict["channel"] = span.metadata.get("channel", "unknown")
+                comm_dict["message_id"] = span.metadata.get("message_id")
+                comm_dict["success"] = span.status == TraceStatus.SUCCESS
                 result.append(comm_dict)
             return result
         except Exception as e:
@@ -528,9 +573,10 @@ class TraceManager:
         """Get metrics for a specific workflow."""
         try:
             comm_spans = [
-                s for s in self._completed_spans
+                s
+                for s in self._completed_spans
                 if s.trace_type == TraceType.WORKFLOW_COMMUNICATION
-                and s.metadata.get('workflow_name') == workflow_name
+                and s.metadata.get("workflow_name") == workflow_name
             ]
             if not comm_spans:
                 return {"total_messages": 0, "success_rate": 0}
@@ -547,15 +593,19 @@ class TraceManager:
         except Exception as e:
             logger.error(f"Error getting workflow metrics: {e}")
             return {"total_messages": 0, "success_rate": 0}
-    
+
     # Streaming decision events support
-    
-    def register_decision_stream_callback(self, agent_id: str, callback: Callable) -> None:
+
+    def register_decision_stream_callback(
+        self, agent_id: str, callback: Callable
+    ) -> None:
         """Register a callback for streaming decision events for a specific agent."""
         self._decision_stream_callbacks.setdefault(agent_id, []).append(callback)
         logger.debug(f"Registered decision stream callback for agent {agent_id}")
 
-    def unregister_decision_stream_callback(self, agent_id: str, callback: Callable) -> None:
+    def unregister_decision_stream_callback(
+        self, agent_id: str, callback: Callable
+    ) -> None:
         """Unregister a decision stream callback for a specific agent."""
         callbacks = self._decision_stream_callbacks.get(agent_id)
         if callbacks:
@@ -567,7 +617,9 @@ class TraceManager:
                 del self._decision_stream_callbacks[agent_id]
         logger.debug(f"Unregistered decision stream callback for agent {agent_id}")
 
-    def emit_decision_event(self, agent_id: Optional[str], decision_event: 'DecisionEvent') -> None:
+    def emit_decision_event(
+        self, agent_id: Optional[str], decision_event: "DecisionEvent"
+    ) -> None:
         """Emit a decision event to all registered callbacks for the agent."""
         if not agent_id:
             return
@@ -576,11 +628,14 @@ class TraceManager:
             try:
                 callback(decision_event)
             except Exception as e:
-                logger.warning(f"Decision stream callback failed for agent {agent_id}: {e}")
+                logger.warning(
+                    f"Decision stream callback failed for agent {agent_id}: {e}"
+                )
 
     def get_streaming_agents(self) -> List[str]:
         """Get list of agents that have streaming callbacks registered."""
         return list(self._decision_stream_callbacks.keys())
+
 
 # Global singleton — initialized once on first access.
 _global_trace_manager: Optional[TraceManager] = None
@@ -593,10 +648,17 @@ def get_trace_manager() -> TraceManager:
         _global_trace_manager = TraceManager()
     return _global_trace_manager
 
+
 # Legacy compatibility functions (preserved for backward compatibility)
-def record_tokens(agent_id: str, total_tokens: int = 0, prompt_tokens: int = 0, completion_tokens: int = 0):
+def record_tokens(
+    agent_id: str,
+    total_tokens: int = 0,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+):
     """Legacy token recording - now handled automatically by LLM tracing."""
     pass
+
 
 def get_agent_tokens(agent_id: str) -> Dict[str, int]:
     """Legacy token retrieval."""
@@ -605,32 +667,44 @@ def get_agent_tokens(agent_id: str) -> Dict[str, int]:
         "total_tokens": 0,  # Legacy format not supported in simplified version
         "prompt_tokens": 0,
         "completion_tokens": 0,
-        "requests": metrics.get("total_operations", 0)
+        "requests": metrics.get("total_operations", 0),
     }
 
-def record_operation(agent_id: str, agent_name: str, task: str, input_data: Any, 
-                    output_data: Any, latency_ms: float, status: str = "success", **kwargs) -> str:
+
+def record_operation(
+    agent_id: str,
+    agent_name: str,
+    task: str,
+    input_data: Any,
+    output_data: Any,
+    latency_ms: float,
+    status: str = "success",
+    **kwargs,
+) -> str:
     """Legacy operation recording."""
     trace_manager = get_trace_manager()
-    
+
     span_id = trace_manager.start_span(
         operation_name=task,
         trace_type=TraceType.AGENT_EXECUTION,
         agent_id=agent_id,
         input_data=input_data,
-        agent_name=agent_name
+        agent_name=agent_name,
     )
-    
+
     trace_status = TraceStatus.SUCCESS if status == "success" else TraceStatus.ERROR
     trace_manager.end_span(
         span_id=span_id,
         status=trace_status,
         output_data=output_data,
-        error_message=kwargs.get("error_message")
+        error_message=kwargs.get("error_message"),
     )
-    
+
     return span_id
 
-def get_recent_operations(agent_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+
+def get_recent_operations(
+    agent_id: Optional[str] = None, limit: int = 50
+) -> List[Dict[str, Any]]:
     """Legacy function to get recent operations."""
     return get_trace_manager().get_recent_operations(agent_id, limit)

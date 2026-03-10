@@ -2,6 +2,7 @@
 Google Gemini LLM provider implementation with integrated tracing.
 Uses the new google.genai package (replaces deprecated google.generativeai).
 """
+
 import os
 import logging
 import asyncio
@@ -12,6 +13,7 @@ from .base import BaseLLMProvider
 
 logger = logging.getLogger(__name__)
 
+
 class GeminiProvider(BaseLLMProvider):
     """Google Gemini LLM provider implementation with automatic call tracing."""
 
@@ -19,7 +21,7 @@ class GeminiProvider(BaseLLMProvider):
         self,
         model: str = "gemini-2.0-flash-exp",
         api_key: Optional[str] = None,
-        **kwargs
+        **kwargs,
     ):
         """
         Initialize Gemini provider.
@@ -35,11 +37,13 @@ class GeminiProvider(BaseLLMProvider):
         super().__init__(model=model, api_key=api_key, **kwargs)
 
         # Gemini-specific default parameters
-        self.default_params.update({
-            'timeout': kwargs.get('timeout', 60),
-            'safety_settings': kwargs.get('safety_settings', None),
-            'generation_config': kwargs.get('generation_config', None)
-        })
+        self.default_params.update(
+            {
+                "timeout": kwargs.get("timeout", 60),
+                "safety_settings": kwargs.get("safety_settings", None),
+                "generation_config": kwargs.get("generation_config", None),
+            }
+        )
 
         # Lazy-load Gemini client
         self._client = None
@@ -50,6 +54,7 @@ class GeminiProvider(BaseLLMProvider):
         if self._client is None:
             try:
                 from google import genai
+
                 self._validate_api_key()
 
                 # Create client with API key
@@ -65,7 +70,7 @@ class GeminiProvider(BaseLLMProvider):
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
-        **kwargs
+        **kwargs,
     ):
         """
         Gemini non-streaming with optional tools.
@@ -87,16 +92,18 @@ class GeminiProvider(BaseLLMProvider):
 
             # Build generation config
             generation_config_params = {}
-            if kwargs.get('max_tokens'):
-                generation_config_params['max_output_tokens'] = kwargs['max_tokens']
-            if kwargs.get('temperature') is not None:
-                generation_config_params['temperature'] = kwargs['temperature']
-            if kwargs.get('top_p') is not None:
-                generation_config_params['top_p'] = kwargs['top_p']
+            if kwargs.get("max_tokens"):
+                generation_config_params["max_output_tokens"] = kwargs["max_tokens"]
+            if kwargs.get("temperature") is not None:
+                generation_config_params["temperature"] = kwargs["temperature"]
+            if kwargs.get("top_p") is not None:
+                generation_config_params["top_p"] = kwargs["top_p"]
 
-            generation_config = types.GenerateContentConfig(
-                **generation_config_params
-            ) if generation_config_params else None
+            generation_config = (
+                types.GenerateContentConfig(**generation_config_params)
+                if generation_config_params
+                else None
+            )
 
             # Prepare API call params
             api_params = {
@@ -110,22 +117,24 @@ class GeminiProvider(BaseLLMProvider):
             # Add tools if provided
             if tools:
                 gemini_tools = self._convert_tools_to_gemini_format(tools)
-                api_params["config"] = api_params.get("config") or types.GenerateContentConfig()
+                api_params["config"] = (
+                    api_params.get("config") or types.GenerateContentConfig()
+                )
                 api_params["config"].tools = gemini_tools
 
             # Generate response
             response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                **api_params
+                self.client.models.generate_content, **api_params
             )
 
             # Store usage metadata
-            if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            if hasattr(response, "usage_metadata") and response.usage_metadata:
                 self._last_usage = response.usage_metadata
                 token_usage = {
-                    'total_tokens': response.usage_metadata.total_token_count or 0,
-                    'prompt_tokens': response.usage_metadata.prompt_token_count or 0,
-                    'completion_tokens': response.usage_metadata.candidates_token_count or 0
+                    "total_tokens": response.usage_metadata.total_token_count or 0,
+                    "prompt_tokens": response.usage_metadata.prompt_token_count or 0,
+                    "completion_tokens": response.usage_metadata.candidates_token_count
+                    or 0,
                 }
                 self._update_accumulated_metrics(token_usage)
 
@@ -133,20 +142,22 @@ class GeminiProvider(BaseLLMProvider):
             tool_calls = []
             if response.candidates and response.candidates[0].content.parts:
                 for idx, part in enumerate(response.candidates[0].content.parts):
-                    if hasattr(part, 'function_call') and part.function_call:
+                    if hasattr(part, "function_call") and part.function_call:
                         fc = part.function_call
                         # Only collect tool calls with valid names
                         if fc.name:
                             # Convert args to dict
                             args_dict = {}
-                            if hasattr(fc, 'args') and fc.args:
+                            if hasattr(fc, "args") and fc.args:
                                 args_dict = dict(fc.args)
 
-                            tool_calls.append({
-                                "id": f"{fc.name}_{idx}_{id(fc)}",  # Unique ID using name + index + object id
-                                "name": fc.name,
-                                "arguments": args_dict
-                            })
+                            tool_calls.append(
+                                {
+                                    "id": f"{fc.name}_{idx}_{id(fc)}",  # Unique ID using name + index + object id
+                                    "name": fc.name,
+                                    "arguments": args_dict,
+                                }
+                            )
 
             # Return tool calls if any were found
             if tool_calls:
@@ -166,7 +177,7 @@ class GeminiProvider(BaseLLMProvider):
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
-        **kwargs
+        **kwargs,
     ):
         """
         Gemini streaming with optional tools.
@@ -188,16 +199,18 @@ class GeminiProvider(BaseLLMProvider):
 
             # Build generation config
             generation_config_params = {}
-            if kwargs.get('max_tokens'):
-                generation_config_params['max_output_tokens'] = kwargs['max_tokens']
-            if kwargs.get('temperature') is not None:
-                generation_config_params['temperature'] = kwargs['temperature']
-            if kwargs.get('top_p') is not None:
-                generation_config_params['top_p'] = kwargs['top_p']
+            if kwargs.get("max_tokens"):
+                generation_config_params["max_output_tokens"] = kwargs["max_tokens"]
+            if kwargs.get("temperature") is not None:
+                generation_config_params["temperature"] = kwargs["temperature"]
+            if kwargs.get("top_p") is not None:
+                generation_config_params["top_p"] = kwargs["top_p"]
 
-            generation_config = types.GenerateContentConfig(
-                **generation_config_params
-            ) if generation_config_params else None
+            generation_config = (
+                types.GenerateContentConfig(**generation_config_params)
+                if generation_config_params
+                else None
+            )
 
             # Prepare API call params
             api_params = {
@@ -211,31 +224,32 @@ class GeminiProvider(BaseLLMProvider):
             # Add tools if provided
             if tools:
                 gemini_tools = self._convert_tools_to_gemini_format(tools)
-                api_params["config"] = api_params.get("config") or types.GenerateContentConfig()
+                api_params["config"] = (
+                    api_params.get("config") or types.GenerateContentConfig()
+                )
                 api_params["config"].tools = gemini_tools
 
             # Stream response
             response_stream = await asyncio.to_thread(
-                self.client.models.generate_content_stream,
-                **api_params
+                self.client.models.generate_content_stream, **api_params
             )
 
             # Process stream chunks
             for chunk in response_stream:
                 # Text content
-                if hasattr(chunk, 'text') and chunk.text:
+                if hasattr(chunk, "text") and chunk.text:
                     yield LLMChunk(type="text", content=chunk.text, model=self.model)
 
                 # Function calls
                 if chunk.candidates and chunk.candidates[0].content.parts:
                     for idx, part in enumerate(chunk.candidates[0].content.parts):
-                        if hasattr(part, 'function_call') and part.function_call:
+                        if hasattr(part, "function_call") and part.function_call:
                             fc = part.function_call
                             # Only yield if function call has a valid name
                             if fc.name:
                                 # Convert args to dict
                                 args_dict = {}
-                                if hasattr(fc, 'args') and fc.args:
+                                if hasattr(fc, "args") and fc.args:
                                     args_dict = dict(fc.args)
 
                                 yield LLMChunk(
@@ -243,16 +257,17 @@ class GeminiProvider(BaseLLMProvider):
                                     tool_name=fc.name,
                                     tool_args=args_dict,
                                     tool_call_id=f"{fc.name}_{idx}_{id(fc)}",  # Unique ID
-                                    model=self.model
+                                    model=self.model,
                                 )
 
                 # Usage metadata (typically in last chunk)
-                if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
+                if hasattr(chunk, "usage_metadata") and chunk.usage_metadata:
                     self._last_usage = chunk.usage_metadata
                     token_usage = {
-                        'total_tokens': chunk.usage_metadata.total_token_count or 0,
-                        'prompt_tokens': chunk.usage_metadata.prompt_token_count or 0,
-                        'completion_tokens': chunk.usage_metadata.candidates_token_count or 0
+                        "total_tokens": chunk.usage_metadata.total_token_count or 0,
+                        "prompt_tokens": chunk.usage_metadata.prompt_token_count or 0,
+                        "completion_tokens": chunk.usage_metadata.candidates_token_count
+                        or 0,
                     }
                     self._update_accumulated_metrics(token_usage)
 
@@ -268,20 +283,24 @@ class GeminiProvider(BaseLLMProvider):
         """
         if self._last_usage:
             # Gemini format
-            prompt_tokens = getattr(self._last_usage, 'prompt_token_count', 0)
-            completion_tokens = getattr(self._last_usage, 'candidates_token_count', 0)
-            total_tokens = getattr(self._last_usage, 'total_token_count', prompt_tokens + completion_tokens)
+            prompt_tokens = getattr(self._last_usage, "prompt_token_count", 0)
+            completion_tokens = getattr(self._last_usage, "candidates_token_count", 0)
+            total_tokens = getattr(
+                self._last_usage, "total_token_count", prompt_tokens + completion_tokens
+            )
 
             return {
-                'total_tokens': total_tokens,
-                'prompt_tokens': prompt_tokens,
-                'completion_tokens': completion_tokens
+                "total_tokens": total_tokens,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
             }
 
         # Fallback to base class estimation
         return super()._get_last_token_usage()
 
-    def _convert_tools_to_format(self, tools: List['AgentTool']) -> List[Dict[str, Any]]:
+    def _convert_tools_to_format(
+        self, tools: List["AgentTool"]
+    ) -> List[Dict[str, Any]]:
         """
         Convert AgentTool list to Gemini function declaration format.
 
@@ -292,11 +311,13 @@ class GeminiProvider(BaseLLMProvider):
             openai_format = tool.to_openai_function()
 
             # Convert OpenAI format to Gemini dict format
-            gemini_tools.append({
-                "name": openai_format["function"]["name"],
-                "description": openai_format["function"]["description"],
-                "parameters": openai_format["function"]["parameters"]
-            })
+            gemini_tools.append(
+                {
+                    "name": openai_format["function"]["name"],
+                    "description": openai_format["function"]["description"],
+                    "parameters": openai_format["function"]["parameters"],
+                }
+            )
 
         return gemini_tools
 
@@ -318,17 +339,14 @@ class GeminiProvider(BaseLLMProvider):
             func_decl = types.FunctionDeclaration(
                 name=tool["name"],
                 description=tool.get("description", ""),
-                parameters=tool.get("parameters", {})
+                parameters=tool.get("parameters", {}),
             )
             function_declarations.append(func_decl)
 
         # Wrap in Tool object
         return [types.Tool(function_declarations=function_declarations)]
 
-    def _convert_messages_to_gemini(
-        self,
-        messages: List[Dict[str, Any]]
-    ) -> List[Any]:
+    def _convert_messages_to_gemini(self, messages: List[Dict[str, Any]]) -> List[Any]:
         """
         Convert universal flat format to Gemini's Content format.
 
@@ -342,10 +360,7 @@ class GeminiProvider(BaseLLMProvider):
         for msg in messages:
             if msg["role"] == "user":
                 gemini_contents.append(
-                    types.Content(
-                        role="user",
-                        parts=[types.Part(text=msg["content"])]
-                    )
+                    types.Content(role="user", parts=[types.Part(text=msg["content"])])
                 )
             elif msg["role"] == "assistant":
                 if msg.get("tool_calls"):
@@ -357,22 +372,19 @@ class GeminiProvider(BaseLLMProvider):
                             parts.append(
                                 types.Part(
                                     function_call=types.FunctionCall(
-                                        name=tc["name"],
-                                        args=tc["arguments"]
+                                        name=tc["name"], args=tc["arguments"]
                                     )
                                 )
                             )
                     # Only add message if we have valid tool calls
                     if parts:
-                        gemini_contents.append(
-                            types.Content(role="model", parts=parts)
-                        )
+                        gemini_contents.append(types.Content(role="model", parts=parts))
                 else:
                     # Regular assistant message
                     gemini_contents.append(
                         types.Content(
                             role="model",
-                            parts=[types.Part(text=msg.get("content", ""))]
+                            parts=[types.Part(text=msg.get("content", ""))],
                         )
                     )
             elif msg["role"] == "tool":
@@ -386,10 +398,10 @@ class GeminiProvider(BaseLLMProvider):
                                 types.Part(
                                     function_response=types.FunctionResponse(
                                         name=tool_name,
-                                        response={"result": msg["content"]}
+                                        response={"result": msg["content"]},
                                     )
                                 )
-                            ]
+                            ],
                         )
                     )
 
@@ -399,9 +411,11 @@ class GeminiProvider(BaseLLMProvider):
     def info(self) -> Dict[str, Any]:
         """Get information about the Gemini provider."""
         base_info = super().info
-        base_info.update({
-            'provider_name': 'Google Gemini',
-            'api_compatible': 'Google AI',
-            'package': 'google-genai'
-        })
+        base_info.update(
+            {
+                "provider_name": "Google Gemini",
+                "api_compatible": "Google AI",
+                "package": "google-genai",
+            }
+        )
         return base_info

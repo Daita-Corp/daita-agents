@@ -10,19 +10,21 @@ from daita.agents.agent import Agent, FocusedTool
 from daita.core.tools import AgentTool
 from daita.llm.mock import MockLLMProvider
 
-
 # ===========================================================================
 # Helpers
 # ===========================================================================
 
+
 def _tool(name: str):
     async def h(args):
         return f"result_from_{name}"
+
     return AgentTool(name=name, description=f"Tool {name}", parameters={}, handler=h)
 
 
 class TwoToolPlugin:
     """Plugin exposing two tools via get_tools()."""
+
     def get_tools(self):
         return [_tool("plugin_alpha"), _tool("plugin_beta")]
 
@@ -30,6 +32,7 @@ class TwoToolPlugin:
 # ===========================================================================
 # _resolve_tools
 # ===========================================================================
+
 
 class TestResolveTools:
     async def test_none_returns_all_registered(self, mock_llm):
@@ -69,6 +72,7 @@ class TestResolveTools:
 # call_tool
 # ===========================================================================
 
+
 class TestCallTool:
     async def test_call_tool_executes_handler(self, mock_llm):
         async def h(args):
@@ -98,6 +102,7 @@ class TestCallTool:
 # available_tools and tool_names
 # ===========================================================================
 
+
 class TestAvailableToolsAndNames:
     async def test_available_tools_returns_agent_tool_list(self, mock_llm):
         agent = Agent(name="X", llm_provider=mock_llm, tools=[_tool("ping")])
@@ -124,6 +129,7 @@ class TestAvailableToolsAndNames:
 # ===========================================================================
 # Plugin tool registration on first run
 # ===========================================================================
+
 
 class TestPluginToolSetup:
     async def test_plugin_tools_registered_on_setup(self, mock_llm):
@@ -165,10 +171,13 @@ class TestPluginToolSetup:
 # FocusedTool — focus routing and result handling
 # ===========================================================================
 
+
 def _make_tool(name: str, returns, parameters: dict | None = None):
     """Create an AgentTool whose handler returns a fixed value."""
+
     async def h(args):
         return returns
+
     return AgentTool(
         name=name,
         description=f"Tool {name}",
@@ -200,7 +209,11 @@ class TestFocusedToolHandler:
         async def capturing_handler(args):
             received_args.update(args)
             # Simulate SQL pushdown: already returns focused data
-            return {"success": True, "rows": [{"id": 1, "status": "active"}], "row_count": 1}
+            return {
+                "success": True,
+                "rows": [{"id": 1, "status": "active"}],
+                "row_count": 1,
+            }
 
         tool = AgentTool(
             name="postgres_query",
@@ -208,7 +221,7 @@ class TestFocusedToolHandler:
             parameters={
                 "type": "object",
                 "properties": {
-                    "sql":   {"type": "string"},
+                    "sql": {"type": "string"},
                     "focus": {"type": "string"},
                 },
                 "required": ["sql"],
@@ -231,9 +244,9 @@ class TestFocusedToolHandler:
         whole dict — fixing the silent data-destruction bug.
         """
         rows = [
-            {"id": 1, "status": "active",   "amount": 100},
+            {"id": 1, "status": "active", "amount": 100},
             {"id": 2, "status": "inactive", "amount": 200},
-            {"id": 3, "status": "active",   "amount": 300},
+            {"id": 3, "status": "active", "amount": 300},
         ]
         tool = _make_tool(
             "my_db_tool",
@@ -255,9 +268,11 @@ class TestFocusedToolHandler:
         """SELECT projection through the rows wrapper strips unwanted columns."""
         rows = [
             {"id": 1, "name": "Alice", "email": "a@example.com", "score": 90},
-            {"id": 2, "name": "Bob",   "email": "b@example.com", "score": 70},
+            {"id": 2, "name": "Bob", "email": "b@example.com", "score": 70},
         ]
-        tool = _make_tool("my_tool", returns={"success": True, "rows": rows, "row_count": 2})
+        tool = _make_tool(
+            "my_tool", returns={"success": True, "rows": rows, "row_count": 2}
+        )
         focused = FocusedTool(tool, "SELECT id, name")
 
         result = await focused.handler({})

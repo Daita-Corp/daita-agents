@@ -3,6 +3,7 @@ ChromaDB vector database plugin for Daita Agents.
 
 Embeddable vector database supporting local, persistent, and client-server modes.
 """
+
 import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
@@ -31,7 +32,7 @@ class ChromaPlugin(BaseVectorPlugin):
         port: int = 8000,
         collection: str = "default",
         embedding_fn: Optional[Callable] = None,
-        **kwargs
+        **kwargs,
     ):
         """
         Initialize ChromaDB connection.
@@ -65,10 +66,12 @@ class ChromaPlugin(BaseVectorPlugin):
             host=host,
             port=port,
             collection=collection,
-            **kwargs  # embedding_fn is not forwarded
+            **kwargs,  # embedding_fn is not forwarded
         )
 
-        logger.debug(f"ChromaDB plugin configured in {self.mode} mode, collection '{collection}'")
+        logger.debug(
+            f"ChromaDB plugin configured in {self.mode} mode, collection '{collection}'"
+        )
 
     async def connect(self):
         """Connect to ChromaDB."""
@@ -87,13 +90,17 @@ class ChromaPlugin(BaseVectorPlugin):
                 self._client = chromadb.Client()
 
             # Get or create collection
-            self._collection = self._client.get_or_create_collection(name=self.collection_name)
+            self._collection = self._client.get_or_create_collection(
+                name=self.collection_name
+            )
 
             logger.info(f"Connected to ChromaDB in {self.mode} mode")
         except ImportError:
             self._handle_connection_error(
-                ImportError("chromadb not installed. Install with: pip install 'daita-agents[chromadb]'"),
-                "connection"
+                ImportError(
+                    "chromadb not installed. Install with: pip install 'daita-agents[chromadb]'"
+                ),
+                "connection",
             )
         except Exception as e:
             self._handle_connection_error(e, "connection")
@@ -109,7 +116,7 @@ class ChromaPlugin(BaseVectorPlugin):
         ids: List[str],
         vectors: List[List[float]],
         metadata: Optional[List[Dict]] = None,
-        documents: Optional[List[str]] = None
+        documents: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Insert or update vectors in ChromaDB.
@@ -127,10 +134,7 @@ class ChromaPlugin(BaseVectorPlugin):
             await self.connect()
 
         # ChromaDB's add method handles both insert and update
-        kwargs = {
-            "ids": ids,
-            "embeddings": vectors
-        }
+        kwargs = {"ids": ids, "embeddings": vectors}
 
         if metadata:
             kwargs["metadatas"] = metadata
@@ -142,7 +146,7 @@ class ChromaPlugin(BaseVectorPlugin):
         return {
             "success": True,
             "upserted_count": len(ids),
-            "collection": self.collection_name
+            "collection": self.collection_name,
         }
 
     async def query(
@@ -150,7 +154,7 @@ class ChromaPlugin(BaseVectorPlugin):
         vector: List[float],
         top_k: int = 10,
         filter: Optional[Dict] = None,
-        include: Optional[List[str]] = None
+        include: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search for similar vectors in ChromaDB.
@@ -172,10 +176,7 @@ class ChromaPlugin(BaseVectorPlugin):
             include = ["metadatas", "documents", "distances"]
 
         result = self._collection.query(
-            query_embeddings=[vector],
-            n_results=top_k,
-            where=filter,
-            include=include
+            query_embeddings=[vector], n_results=top_k, where=filter, include=include
         )
 
         # Convert to list of dicts
@@ -184,13 +185,15 @@ class ChromaPlugin(BaseVectorPlugin):
         distances = result.get("distances", [[]])[0]
         metadatas = result.get("metadatas", [[]])[0]
         documents = result.get("documents", [[]])[0]
-        embeddings = result.get("embeddings", [[]])[0] if "embeddings" in include else None
+        embeddings = (
+            result.get("embeddings", [[]])[0] if "embeddings" in include else None
+        )
 
         for idx, id in enumerate(ids):
             match = {
                 "id": id,
                 "distance": distances[idx] if idx < len(distances) else None,
-                "score": 1 / (1 + distances[idx]) if idx < len(distances) else None
+                "score": 1 / (1 + distances[idx]) if idx < len(distances) else None,
             }
 
             if len(metadatas) > 0 and idx < len(metadatas):
@@ -205,9 +208,7 @@ class ChromaPlugin(BaseVectorPlugin):
         return matches
 
     async def delete(
-        self,
-        ids: Optional[List[str]] = None,
-        filter: Optional[Dict] = None
+        self, ids: Optional[List[str]] = None, filter: Optional[Dict] = None
     ) -> Dict[str, Any]:
         """
         Delete vectors from ChromaDB.
@@ -227,25 +228,20 @@ class ChromaPlugin(BaseVectorPlugin):
             return {
                 "success": True,
                 "deleted_count": len(ids),
-                "collection": self.collection_name
+                "collection": self.collection_name,
             }
         elif filter:
             self._collection.delete(where=filter)
             return {
                 "success": True,
                 "deleted": "by_filter",
-                "collection": self.collection_name
+                "collection": self.collection_name,
             }
         else:
-            return {
-                "success": False,
-                "error": "Must provide ids or filter"
-            }
+            return {"success": False, "error": "Must provide ids or filter"}
 
     async def fetch(
-        self,
-        ids: List[str],
-        include: Optional[List[str]] = None
+        self, ids: List[str], include: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
         """
         Fetch vectors by ID from ChromaDB.
@@ -300,7 +296,7 @@ class ChromaPlugin(BaseVectorPlugin):
         collections = self._client.list_collections()
         return [col.name for col in collections]
 
-    def get_tools(self) -> List['AgentTool']:
+    def get_tools(self) -> List["AgentTool"]:
         """
         Expose ChromaDB operations as agent tools.
 
@@ -319,28 +315,28 @@ class ChromaPlugin(BaseVectorPlugin):
                         "vector": {
                             "type": "array",
                             "description": "Query vector as array of floats",
-                            "items": {"type": "number"}
+                            "items": {"type": "number"},
                         },
                         "text": {
                             "type": "string",
-                            "description": "Query text (auto-embedded via configured embedding_fn; use instead of vector)"
+                            "description": "Query text (auto-embedded via configured embedding_fn; use instead of vector)",
                         },
                         "top_k": {
                             "type": "integer",
-                            "description": "Maximum number of results to return (default: 10)"
+                            "description": "Maximum number of results to return (default: 10)",
                         },
                         "filter": {
                             "type": "object",
-                            "description": "Chroma where filter (e.g., {\"category\": \"tech\"})"
-                        }
+                            "description": 'Chroma where filter (e.g., {"category": "tech"})',
+                        },
                     },
-                    "required": []
+                    "required": [],
                 },
                 handler=self._tool_search,
                 category="vector_db",
                 source="plugin",
                 plugin_name="ChromaDB",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="chroma_upsert",
@@ -351,34 +347,31 @@ class ChromaPlugin(BaseVectorPlugin):
                         "ids": {
                             "type": "array",
                             "description": "List of unique vector IDs",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         },
                         "vectors": {
                             "type": "array",
                             "description": "List of vectors (each vector is an array of floats)",
-                            "items": {
-                                "type": "array",
-                                "items": {"type": "number"}
-                            }
+                            "items": {"type": "array", "items": {"type": "number"}},
                         },
                         "metadata": {
                             "type": "array",
                             "description": "Optional list of metadata objects (one per vector)",
-                            "items": {"type": "object"}
+                            "items": {"type": "object"},
                         },
                         "documents": {
                             "type": "array",
                             "description": "Optional list of raw document texts",
-                            "items": {"type": "string"}
-                        }
+                            "items": {"type": "string"},
+                        },
                     },
-                    "required": ["ids", "vectors"]
+                    "required": ["ids", "vectors"],
                 },
                 handler=self._tool_upsert,
                 category="vector_db",
                 source="plugin",
                 plugin_name="ChromaDB",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="chroma_delete",
@@ -389,35 +382,31 @@ class ChromaPlugin(BaseVectorPlugin):
                         "ids": {
                             "type": "array",
                             "description": "List of vector IDs to delete",
-                            "items": {"type": "string"}
+                            "items": {"type": "string"},
                         },
                         "filter": {
                             "type": "object",
-                            "description": "Chroma where filter for deletion"
-                        }
+                            "description": "Chroma where filter for deletion",
+                        },
                     },
-                    "required": []
+                    "required": [],
                 },
                 handler=self._tool_delete,
                 category="vector_db",
                 source="plugin",
                 plugin_name="ChromaDB",
-                timeout_seconds=60
+                timeout_seconds=60,
             ),
             AgentTool(
                 name="chroma_collections",
                 description="List all collections in the ChromaDB database.",
-                parameters={
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                },
+                parameters={"type": "object", "properties": {}, "required": []},
                 handler=self._tool_collections,
                 category="vector_db",
                 source="plugin",
                 plugin_name="ChromaDB",
-                timeout_seconds=30
-            )
+                timeout_seconds=30,
+            ),
         ]
 
     async def _tool_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -435,17 +424,9 @@ class ChromaPlugin(BaseVectorPlugin):
             result = self._embedding_fn(text)
             vector = await result if asyncio.iscoroutine(result) else result
 
-        matches = await self.query(
-            vector=vector,
-            top_k=top_k,
-            filter=filter
-        )
+        matches = await self.query(vector=vector, top_k=top_k, filter=filter)
 
-        return {
-            "success": True,
-            "matches": matches,
-            "count": len(matches)
-        }
+        return {"success": True, "matches": matches, "count": len(matches)}
 
     async def _tool_upsert(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for chroma_upsert"""
@@ -455,10 +436,7 @@ class ChromaPlugin(BaseVectorPlugin):
         documents = args.get("documents")
 
         result = await self.upsert(
-            ids=ids,
-            vectors=vectors,
-            metadata=metadata,
-            documents=documents
+            ids=ids, vectors=vectors, metadata=metadata, documents=documents
         )
 
         return result
@@ -475,11 +453,7 @@ class ChromaPlugin(BaseVectorPlugin):
         """Tool handler for chroma_collections"""
         collections = await self.list_collections()
 
-        return {
-            "success": True,
-            "collections": collections,
-            "count": len(collections)
-        }
+        return {"success": True, "collections": collections, "count": len(collections)}
 
 
 def chroma(**kwargs) -> ChromaPlugin:

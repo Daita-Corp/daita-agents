@@ -26,10 +26,10 @@ from daita.llm.mock import MockLLMProvider
 
 from tests.conftest import SequentialMockLLM
 
-
 # ===========================================================================
 # Helpers
 # ===========================================================================
+
 
 def _make_agent(responses: List[Any], tools=None) -> Agent:
     """Create an Agent with a SequentialMockLLM loaded with the given responses."""
@@ -39,6 +39,7 @@ def _make_agent(responses: List[Any], tools=None) -> Agent:
 
 def _add_tool():
     """Return an 'add' AgentTool used in tool-calling tests."""
+
     async def h(args):
         return args["a"] + args["b"]
 
@@ -60,6 +61,7 @@ def _add_tool():
 # ===========================================================================
 # Basic execution results
 # ===========================================================================
+
 
 class TestBasicExecution:
     async def test_run_returns_string(self):
@@ -122,6 +124,7 @@ class TestBasicExecution:
 # System prompt injection
 # ===========================================================================
 
+
 class TestSystemPromptInjection:
     async def test_system_prompt_sent_in_conversation(self):
         llm = SequentialMockLLM(response_sequence=["Done."])
@@ -154,6 +157,7 @@ class TestSystemPromptInjection:
 # Max iterations
 # ===========================================================================
 
+
 class TestMaxIterations:
     async def test_max_iterations_raises_agent_error(self):
         # LLM always returns tool calls; no tool registered so the result
@@ -162,9 +166,7 @@ class TestMaxIterations:
         always_tool_call = [
             {
                 "content": "Calling tool...",
-                "tool_calls": [
-                    {"id": "tc", "name": "nonexistent", "arguments": {}}
-                ],
+                "tool_calls": [{"id": "tc", "name": "nonexistent", "arguments": {}}],
             }
         ] * 10  # more than max_iterations
 
@@ -181,6 +183,7 @@ class TestMaxIterations:
 # ===========================================================================
 # Tool calling loop
 # ===========================================================================
+
 
 class TestToolCallingLoop:
     async def test_tool_handler_is_called(self):
@@ -263,6 +266,7 @@ class TestToolCallingLoop:
 # JSON serialiser in _append_tool_messages
 # ===========================================================================
 
+
 class TestJsonSerialiser:
     """
     Tests for the custom json_serializer inside _append_tool_messages.
@@ -312,6 +316,7 @@ class TestJsonSerialiser:
 # ===========================================================================
 # on_event streaming callback
 # ===========================================================================
+
 
 class TestOnEventCallback:
     async def test_no_on_event_does_not_crash(self):

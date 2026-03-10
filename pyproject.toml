@@ -277,7 +277,7 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "asyncio: Async test marker",
     "unit: Unit tests - fast, isolated tests",
-    "integration: Integration tests - test component interactions", 
+    "integration: Integration tests - test component interactions",
     "performance: Performance tests - measure speed and resource usage",
     "slow: Slow tests - may take several seconds",
     "requires_llm: Tests that require LLM API keys",

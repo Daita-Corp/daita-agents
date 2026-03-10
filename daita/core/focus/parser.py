@@ -7,6 +7,7 @@ Syntax (pipe-delimited, all clauses optional):
 
 The filter clause is a Python boolean expression evaluated safely against each row.
 """
+
 from __future__ import annotations
 
 import ast as pyast
@@ -23,10 +24,10 @@ _AGG_RE = re.compile(
 )
 
 # Clause keyword prefixes (upper-cased for matching)
-_SELECT_PREFIX   = "SELECT"
-_ORDER_PREFIX    = "ORDER BY"
-_LIMIT_PREFIX    = "LIMIT"
-_GROUP_PREFIX    = "GROUP BY"
+_SELECT_PREFIX = "SELECT"
+_ORDER_PREFIX = "ORDER BY"
+_LIMIT_PREFIX = "LIMIT"
+_GROUP_PREFIX = "GROUP BY"
 
 
 def parse(dsl: str) -> FocusQuery:
@@ -54,6 +55,7 @@ def parse(dsl: str) -> FocusQuery:
 
 
 # ── Clause parsers ────────────────────────────────────────────────────────────
+
 
 def _parse_select(clause: str, query: FocusQuery) -> None:
     content = re.sub(r"^SELECT\s+", "", clause.strip(), flags=re.IGNORECASE).strip()
@@ -90,7 +92,9 @@ def _parse_order_by(clause: str, query: FocusQuery) -> None:
     if len(parts) > 1:
         direction = parts[1].upper()
         if direction not in ("ASC", "DESC"):
-            raise FocusDSLError(f"ORDER BY direction must be ASC or DESC, got '{parts[1]}'")
+            raise FocusDSLError(
+                f"ORDER BY direction must be ASC or DESC, got '{parts[1]}'"
+            )
         query.order_dir = direction
 
 
@@ -123,8 +127,6 @@ def _parse_filter(clause: str, query: FocusQuery) -> None:
     try:
         tree = pyast.parse(clause, mode="eval")
     except SyntaxError as e:
-        raise FocusDSLError(
-            f"Invalid filter expression '{clause}': {e.msg}"
-        ) from e
+        raise FocusDSLError(f"Invalid filter expression '{clause}': {e.msg}") from e
     query.filter_expr = clause
     query.filter_ast = tree.body

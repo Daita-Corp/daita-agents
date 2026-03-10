@@ -1,4 +1,5 @@
 """Abstract base for Focus backends."""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -18,6 +19,7 @@ class FocusBackend(ABC):
         """Apply the FocusQuery. Native clauses run first; evaluator handles the rest."""
         data, applied = self._native_apply(data, query)
         from ..evaluator import evaluate_remaining
+
         return evaluate_remaining(data, query, applied)
 
     def _native_apply(self, data: Any, query: FocusQuery) -> Tuple[Any, Set[str]]:

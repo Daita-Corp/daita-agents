@@ -17,7 +17,6 @@ from .base import (
     # Enums
     AgentType,
     RetryStrategy,
-
     # Configuration classes
     RetryPolicy,
     AgentConfig,
@@ -30,12 +29,10 @@ __all__ = [
     # Enums
     "AgentType",
     "RetryStrategy",
-
     # Configuration classes
     "RetryPolicy",
     "AgentConfig",
     "DaitaConfig",
-
     # Runtime settings
     "settings",
 ]

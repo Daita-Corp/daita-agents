@@ -3,6 +3,7 @@ Base class for vector database plugins.
 
 Provides minimal abstract interface for vector operations across different providers.
 """
+
 from abc import abstractmethod
 from typing import Any, Dict, List, Optional
 from .base_db import BaseDatabasePlugin
@@ -25,7 +26,7 @@ class BaseVectorPlugin(BaseDatabasePlugin):
         ids: List[str],
         vectors: List[List[float]],
         metadata: Optional[List[Dict]] = None,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         """
         Insert or update vectors with associated metadata.
@@ -47,7 +48,7 @@ class BaseVectorPlugin(BaseDatabasePlugin):
         vector: List[float],
         top_k: int = 10,
         filter: Optional[Any] = None,
-        **kwargs
+        **kwargs,
     ) -> List[Dict[str, Any]]:
         """
         Search for similar vectors.
@@ -65,10 +66,7 @@ class BaseVectorPlugin(BaseDatabasePlugin):
 
     @abstractmethod
     async def delete(
-        self,
-        ids: Optional[List[str]] = None,
-        filter: Optional[Any] = None,
-        **kwargs
+        self, ids: Optional[List[str]] = None, filter: Optional[Any] = None, **kwargs
     ) -> Dict[str, Any]:
         """
         Delete vectors by ID or filter.
@@ -84,11 +82,7 @@ class BaseVectorPlugin(BaseDatabasePlugin):
         pass
 
     @abstractmethod
-    async def fetch(
-        self,
-        ids: List[str],
-        **kwargs
-    ) -> List[Dict[str, Any]]:
+    async def fetch(self, ids: List[str], **kwargs) -> List[Dict[str, Any]]:
         """
         Fetch vectors by ID.
 

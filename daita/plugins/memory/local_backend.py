@@ -45,7 +45,7 @@ class LocalMemoryBackend:
         base_dir: Optional[Path] = None,
         embedding_provider: str = "openai",
         embedding_model: str = "text-embedding-3-small",
-        max_chunks: int = 2000
+        max_chunks: int = 2000,
     ):
         self.workspace = workspace
         self.agent_id = agent_id
@@ -56,7 +56,9 @@ class LocalMemoryBackend:
                 base_dir = Path.home() / ".daita" / "memory" / "workspaces"
             else:
                 project_root = _find_project_root()
-                base_dir = (project_root or Path.cwd()) / ".daita" / "memory" / "workspaces"
+                base_dir = (
+                    (project_root or Path.cwd()) / ".daita" / "memory" / "workspaces"
+                )
 
         self.workspace_dir = base_dir / workspace
         self.logs_dir = self.workspace_dir / "logs"
@@ -70,13 +72,15 @@ class LocalMemoryBackend:
 
         self.max_chunks = max_chunks
         self.storage = FileStorage(self.workspace_dir, agent_id=agent_id)
-        self.search = SQLiteVectorSearch(self.vector_db, embedding_provider, embedding_model)
+        self.search = SQLiteVectorSearch(
+            self.vector_db, embedding_provider, embedding_model
+        )
 
     async def remember(
         self,
         content: str,
         category: Optional[str] = None,
-        metadata: Optional[MemoryMetadata] = None
+        metadata: Optional[MemoryMetadata] = None,
     ) -> Dict[str, Any]:
         """
         Store a memory: appends to today's daily log and indexes in the vector DB.
@@ -90,8 +94,8 @@ class LocalMemoryBackend:
             metadata = MemoryMetadata(
                 content=content,
                 importance=0.5,
-                source='agent_inferred',
-                category=category
+                source="agent_inferred",
+                category=category,
             )
 
         chunk_id = await self.search.store_chunk(content, metadata)
@@ -100,14 +104,11 @@ class LocalMemoryBackend:
             "status": "success",
             "message": "Memory stored and indexed",
             "chunk_id": chunk_id,
-            "indexed": True
+            "indexed": True,
         }
 
     async def update_memory(
-        self,
-        query: str,
-        new_content: str,
-        importance: float = 0.5
+        self, query: str, new_content: str, importance: float = 0.5
     ) -> Dict[str, Any]:
         """
         Find memories matching query, delete them, and store updated content.
@@ -117,31 +118,41 @@ class LocalMemoryBackend:
 
         matches = await self.recall(query, limit=5, score_threshold=0.7)
         if not matches:
-            return {"status": "not_found", "updated": 0, "message": "No matching memories found"}
+            return {
+                "status": "not_found",
+                "updated": 0,
+                "message": "No matching memories found",
+            }
 
-        chunk_ids = [m['chunk_id'] for m in matches if m.get('chunk_id')]
+        chunk_ids = [m["chunk_id"] for m in matches if m.get("chunk_id")]
         if not chunk_ids:
-            return {"status": "not_found", "updated": 0, "message": "No matching memories with valid chunk IDs found"}
+            return {
+                "status": "not_found",
+                "updated": 0,
+                "message": "No matching memories with valid chunk IDs found",
+            }
 
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
-        placeholders = ','.join('?' * len(chunk_ids))
-        cursor.execute(f"DELETE FROM embeddings WHERE chunk_id IN ({placeholders})", chunk_ids)
-        cursor.execute(f"DELETE FROM chunks WHERE chunk_id IN ({placeholders})", chunk_ids)
+        placeholders = ",".join("?" * len(chunk_ids))
+        cursor.execute(
+            f"DELETE FROM embeddings WHERE chunk_id IN ({placeholders})", chunk_ids
+        )
+        cursor.execute(
+            f"DELETE FROM chunks WHERE chunk_id IN ({placeholders})", chunk_ids
+        )
         conn.commit()
         conn.close()
 
         metadata = MemoryMetadata(
-            content=new_content,
-            importance=importance,
-            source='agent_inferred'
+            content=new_content, importance=importance, source="agent_inferred"
         )
         await self.search.store_chunk(new_content, metadata)
 
         return {
             "status": "success",
             "updated": len(chunk_ids),
-            "message": f"Replaced {len(chunk_ids)} memories with updated content"
+            "message": f"Replaced {len(chunk_ids)} memories with updated content",
         }
 
     async def recall(
@@ -152,41 +163,65 @@ class LocalMemoryBackend:
         strategy: str = "hybrid",
         min_importance: Optional[float] = None,
         max_importance: Optional[float] = None,
-        category: Optional[str] = None
+        category: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search memories using hybrid semantic + keyword search.
         Results are importance-weighted and temporally decayed.
         """
         if strategy == "semantic":
-            results = await self._semantic_recall(query, limit, score_threshold, category)
+            results = await self._semantic_recall(
+                query, limit, score_threshold, category
+            )
         elif strategy == "keyword":
-            results = await self._keyword_recall(query, limit, score_threshold, category)
+            results = await self._keyword_recall(
+                query, limit, score_threshold, category
+            )
         else:
             results = await self._hybrid_recall(query, limit, score_threshold, category)
 
         if min_importance is not None or max_importance is not None:
-            results = self._filter_by_importance(results, min_importance, max_importance)
+            results = self._filter_by_importance(
+                results, min_importance, max_importance
+            )
 
         return results
 
-    async def _semantic_recall(self, query: str, limit: int, score_threshold: float, category: Optional[str] = None) -> List[Dict]:
-        results = await self.search.search(query, limit, score_threshold, category=category)
+    async def _semantic_recall(
+        self,
+        query: str,
+        limit: int,
+        score_threshold: float,
+        category: Optional[str] = None,
+    ) -> List[Dict]:
+        results = await self.search.search(
+            query, limit, score_threshold, category=category
+        )
         return [
             {
                 "content": r.content,
                 "file": r.file_path,
                 "score": r.score,
                 "relevance_score": r.score,
-                "raw_semantic_score": r.raw_semantic_score if r.raw_semantic_score is not None else r.score,
+                "raw_semantic_score": (
+                    r.raw_semantic_score
+                    if r.raw_semantic_score is not None
+                    else r.score
+                ),
                 "lines": f"{r.line_start}-{r.line_end}",
                 "chunk_id": r.chunk_id,
-                "metadata": r.metadata or {}
+                "metadata": r.metadata or {},
             }
             for r in results
         ]
 
-    async def _keyword_recall(self, query: str, limit: int, score_threshold: float, category: Optional[str] = None) -> List[Dict]:
+    async def _keyword_recall(
+        self,
+        query: str,
+        limit: int,
+        score_threshold: float,
+        category: Optional[str] = None,
+    ) -> List[Dict]:
         from .keyword_search import BM25Scorer
         from .text_utils import extract_keywords
         import sqlite3
@@ -199,10 +234,12 @@ class LocalMemoryBackend:
             cursor.execute(
                 "SELECT chunk_id, file_path, content, line_start, line_end, metadata FROM chunks"
                 " WHERE json_extract(metadata, '$.category') = ?",
-                (category,)
+                (category,),
             )
         else:
-            cursor.execute("SELECT chunk_id, file_path, content, line_start, line_end, metadata FROM chunks")
+            cursor.execute(
+                "SELECT chunk_id, file_path, content, line_start, line_end, metadata FROM chunks"
+            )
         chunks = cursor.fetchall()
         conn.close()
 
@@ -219,27 +256,41 @@ class LocalMemoryBackend:
                 try:
                     metadata_dict = json.loads(metadata_json)
                 except json.JSONDecodeError:
-                    metadata_dict = {'importance': 0.5, 'source': 'agent_inferred', 'pinned': False}
+                    metadata_dict = {
+                        "importance": 0.5,
+                        "source": "agent_inferred",
+                        "pinned": False,
+                    }
 
             raw_score = bm25.score(keywords, content)
             keyword_score = bm25.normalize_score(raw_score)
-            adjusted = self.search._apply_score_adjustments(keyword_score, metadata_dict)
+            adjusted = self.search._apply_score_adjustments(
+                keyword_score, metadata_dict
+            )
 
             if adjusted >= score_threshold:
-                results.append({
-                    "content": content,
-                    "file": file_path,
-                    "score": float(adjusted),
-                    "relevance_score": float(adjusted),
-                    "lines": f"{line_start}-{line_end}",
-                    "chunk_id": chunk_id,
-                    "metadata": metadata_dict
-                })
+                results.append(
+                    {
+                        "content": content,
+                        "file": file_path,
+                        "score": float(adjusted),
+                        "relevance_score": float(adjusted),
+                        "lines": f"{line_start}-{line_end}",
+                        "chunk_id": chunk_id,
+                        "metadata": metadata_dict,
+                    }
+                )
 
-        results.sort(key=lambda x: x['score'], reverse=True)
+        results.sort(key=lambda x: x["score"], reverse=True)
         return results[:limit]
 
-    async def _hybrid_recall(self, query: str, limit: int, score_threshold: float, category: Optional[str] = None) -> List[Dict]:
+    async def _hybrid_recall(
+        self,
+        query: str,
+        limit: int,
+        score_threshold: float,
+        category: Optional[str] = None,
+    ) -> List[Dict]:
         from .keyword_search import BM25Scorer
         from .text_utils import extract_keywords, contains_exact_phrase
         import sqlite3
@@ -250,12 +301,15 @@ class LocalMemoryBackend:
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
         if category:
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT c.chunk_id, c.file_path, c.content, c.line_start, c.line_end, c.metadata, e.embedding
                 FROM chunks c
                 JOIN embeddings e ON c.chunk_id = e.chunk_id
                 WHERE json_extract(c.metadata, '$.category') = ?
-            """, (category,))
+            """,
+                (category,),
+            )
         else:
             cursor.execute("""
                 SELECT c.chunk_id, c.file_path, c.content, c.line_start, c.line_end, c.metadata, e.embedding
@@ -274,57 +328,73 @@ class LocalMemoryBackend:
         query_vec = np.array(query_embedding)
 
         results = []
-        for chunk_id, file_path, content, line_start, line_end, metadata_json, embedding_json in chunks:
+        for (
+            chunk_id,
+            file_path,
+            content,
+            line_start,
+            line_end,
+            metadata_json,
+            embedding_json,
+        ) in chunks:
             metadata_dict = {}
             if metadata_json:
                 try:
                     metadata_dict = json.loads(metadata_json)
                 except json.JSONDecodeError:
-                    metadata_dict = {'importance': 0.5, 'source': 'agent_inferred', 'pinned': False}
+                    metadata_dict = {
+                        "importance": 0.5,
+                        "source": "agent_inferred",
+                        "pinned": False,
+                    }
 
             chunk_vec = np.array(json.loads(embedding_json))
             denom = np.linalg.norm(query_vec) * np.linalg.norm(chunk_vec)
-            semantic_score = float(np.dot(query_vec, chunk_vec) / denom) if denom > 0 else 0.0
+            semantic_score = (
+                float(np.dot(query_vec, chunk_vec) / denom) if denom > 0 else 0.0
+            )
 
             keyword_raw = bm25.score(keywords, content)
             keyword_score = bm25.normalize_score(keyword_raw)
 
             base_score = (0.6 * semantic_score) + (0.4 * keyword_score)
             phrase_bonus = 0.15 if contains_exact_phrase(query, content) else 0.0
-            consensus_bonus = 0.10 if semantic_score > 0.5 and keyword_score > 0.5 else 0.0
+            consensus_bonus = (
+                0.10 if semantic_score > 0.5 and keyword_score > 0.5 else 0.0
+            )
 
             raw_score = min(base_score + phrase_bonus + consensus_bonus, 1.0)
             adjusted = self.search._apply_score_adjustments(raw_score, metadata_dict)
 
             if adjusted >= score_threshold:
-                results.append({
-                    "content": content,
-                    "file": file_path,
-                    "score": float(adjusted),
-                    "relevance_score": float(adjusted),
-                    "raw_semantic_score": float(semantic_score),
-                    "lines": f"{line_start}-{line_end}",
-                    "chunk_id": chunk_id,
-                    "metadata": metadata_dict,
-                    "score_breakdown": {
-                        "semantic": float(semantic_score),
-                        "keyword": float(keyword_score),
-                        "phrase_bonus": float(phrase_bonus),
-                        "consensus_bonus": float(consensus_bonus)
+                results.append(
+                    {
+                        "content": content,
+                        "file": file_path,
+                        "score": float(adjusted),
+                        "relevance_score": float(adjusted),
+                        "raw_semantic_score": float(semantic_score),
+                        "lines": f"{line_start}-{line_end}",
+                        "chunk_id": chunk_id,
+                        "metadata": metadata_dict,
+                        "score_breakdown": {
+                            "semantic": float(semantic_score),
+                            "keyword": float(keyword_score),
+                            "phrase_bonus": float(phrase_bonus),
+                            "consensus_bonus": float(consensus_bonus),
+                        },
                     }
-                })
+                )
 
-        results.sort(key=lambda x: x['score'], reverse=True)
+        results.sort(key=lambda x: x["score"], reverse=True)
         return results[:limit]
 
     async def list_by_category(
-        self,
-        category: str,
-        min_importance: float = 0.0,
-        limit: int = 100
+        self, category: str, min_importance: float = 0.0, limit: int = 100
     ) -> List[Dict[str, Any]]:
         """Direct category dump — no embedding call, no semantic ranking."""
         import sqlite3
+
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
         cursor.execute(
@@ -334,7 +404,7 @@ class LocalMemoryBackend:
             "      OR json_extract(metadata, '$.importance') >= ?)"
             " ORDER BY json_extract(metadata, '$.importance') DESC"
             " LIMIT ?",
-            (category, min_importance, limit)
+            (category, min_importance, limit),
         )
         rows = cursor.fetchall()
         conn.close()
@@ -347,7 +417,9 @@ class LocalMemoryBackend:
                     metadata_dict = json.loads(metadata_json)
                 except Exception:
                     pass
-            results.append({"chunk_id": chunk_id, "content": content, "metadata": metadata_dict})
+            results.append(
+                {"chunk_id": chunk_id, "content": content, "metadata": metadata_dict}
+            )
         return results
 
     async def regenerate_memory_md(self, min_importance: float = 0.4) -> str:
@@ -362,7 +434,9 @@ class LocalMemoryBackend:
 
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
-        cursor.execute("SELECT content, metadata FROM chunks WHERE file_path = 'memory://direct' OR file_path LIKE '%MEMORY%'")
+        cursor.execute(
+            "SELECT content, metadata FROM chunks WHERE file_path = 'memory://direct' OR file_path LIKE '%MEMORY%'"
+        )
         rows = cursor.fetchall()
         conn.close()
 
@@ -372,11 +446,13 @@ class LocalMemoryBackend:
                 continue
             try:
                 m = json.loads(metadata_json)
-                importance = m.get('importance', 0.5)
+                importance = m.get("importance", 0.5)
                 if importance < min_importance:
                     continue
-                category = m.get('category') or 'General'
-                by_category.setdefault(category, []).append((importance, content.strip()))
+                category = m.get("category") or "General"
+                by_category.setdefault(category, []).append(
+                    (importance, content.strip())
+                )
             except Exception:
                 continue
 
@@ -387,14 +463,15 @@ class LocalMemoryBackend:
             for _importance, content in entries:
                 lines.append(f"- {content}\n")
 
-        async with aiofiles.open(self.memory_file, 'w', encoding='utf-8') as f:
-            await f.write(''.join(lines))
+        async with aiofiles.open(self.memory_file, "w", encoding="utf-8") as f:
+            await f.write("".join(lines))
 
         return str(self.memory_file)
 
     async def update_chunk_metadata(self, chunk_id: str, updates: dict):
         """Update metadata fields on a stored chunk."""
         import sqlite3
+
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
         cursor.execute("SELECT metadata FROM chunks WHERE chunk_id = ?", (chunk_id,))
@@ -405,7 +482,7 @@ class LocalMemoryBackend:
                 meta.update(updates)
                 cursor.execute(
                     "UPDATE chunks SET metadata = ? WHERE chunk_id = ?",
-                    (json.dumps(meta), chunk_id)
+                    (json.dumps(meta), chunk_id),
                 )
             except Exception:
                 pass
@@ -417,28 +494,34 @@ class LocalMemoryBackend:
         if not chunk_ids:
             return
         import sqlite3
+
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
-        placeholders = ','.join('?' * len(chunk_ids))
-        cursor.execute(f"DELETE FROM embeddings WHERE chunk_id IN ({placeholders})", chunk_ids)
-        cursor.execute(f"DELETE FROM chunks WHERE chunk_id IN ({placeholders})", chunk_ids)
+        placeholders = ",".join("?" * len(chunk_ids))
+        cursor.execute(
+            f"DELETE FROM embeddings WHERE chunk_id IN ({placeholders})", chunk_ids
+        )
+        cursor.execute(
+            f"DELETE FROM chunks WHERE chunk_id IN ({placeholders})", chunk_ids
+        )
         conn.commit()
         conn.close()
 
     async def read_memory_md(self) -> str:
         """Return MEMORY.md content."""
         if self.memory_file.exists():
-            async with aiofiles.open(self.memory_file, 'r', encoding='utf-8') as f:
+            async with aiofiles.open(self.memory_file, "r", encoding="utf-8") as f:
                 return await f.read()
         return "# Long-Term Memory\n\n(No memories yet)"
 
     async def read_today_log(self) -> str:
         """Return today's daily log content."""
         from datetime import date
+
         today = date.today().isoformat()
         today_log = self.logs_dir / f"{today}.md"
         if today_log.exists():
-            async with aiofiles.open(today_log, 'r', encoding='utf-8') as f:
+            async with aiofiles.open(today_log, "r", encoding="utf-8") as f:
                 return await f.read()
         return f"# Daily Log - {today}\n\n(No entries today)"
 
@@ -457,6 +540,7 @@ class LocalMemoryBackend:
         """
         import sqlite3
         import math
+
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM chunks")
@@ -465,7 +549,9 @@ class LocalMemoryBackend:
             conn.close()
             return
         excess = count - self.max_chunks
-        cursor.execute("SELECT chunk_id, metadata FROM chunks WHERE metadata IS NOT NULL")
+        cursor.execute(
+            "SELECT chunk_id, metadata FROM chunks WHERE metadata IS NOT NULL"
+        )
         rows = cursor.fetchall()
         conn.close()
 
@@ -477,10 +563,10 @@ class LocalMemoryBackend:
                 meta = json.loads(metadata_json)
             except Exception:
                 continue
-            if meta.get('pinned', False):
+            if meta.get("pinned", False):
                 continue
-            importance = float(meta.get('importance', 0.5))
-            access_count = int(meta.get('access_count', 0))
+            importance = float(meta.get("importance", 0.5))
+            access_count = int(meta.get("access_count", 0))
             score = importance * math.log1p(access_count)
             evict_candidates.append((score, chunk_id))
 
@@ -489,9 +575,13 @@ class LocalMemoryBackend:
         if to_evict:
             conn = sqlite3.connect(str(self.vector_db))
             cursor = conn.cursor()
-            placeholders = ','.join('?' * len(to_evict))
-            cursor.execute(f"DELETE FROM embeddings WHERE chunk_id IN ({placeholders})", to_evict)
-            cursor.execute(f"DELETE FROM chunks WHERE chunk_id IN ({placeholders})", to_evict)
+            placeholders = ",".join("?" * len(to_evict))
+            cursor.execute(
+                f"DELETE FROM embeddings WHERE chunk_id IN ({placeholders})", to_evict
+            )
+            cursor.execute(
+                f"DELETE FROM chunks WHERE chunk_id IN ({placeholders})", to_evict
+            )
             conn.commit()
             conn.close()
 
@@ -499,11 +589,11 @@ class LocalMemoryBackend:
     def _filter_by_importance(
         results: List[Dict],
         min_importance: Optional[float],
-        max_importance: Optional[float]
+        max_importance: Optional[float],
     ) -> List[Dict]:
         filtered = []
         for result in results:
-            importance = result.get('metadata', {}).get('importance', 0.5)
+            importance = result.get("metadata", {}).get("importance", 0.5)
             if min_importance is not None and importance < min_importance:
                 continue
             if max_importance is not None and importance > max_importance:

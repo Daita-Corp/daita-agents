@@ -10,10 +10,10 @@ import pytest
 from daita.core.streaming import LLMChunk
 from daita.llm.mock import MockLLMProvider
 
-
 # ===========================================================================
 # Helpers
 # ===========================================================================
+
 
 def _user_message(content: str):
     return [{"role": "user", "content": content}]
@@ -22,6 +22,7 @@ def _user_message(content: str):
 # ===========================================================================
 # Basic generation
 # ===========================================================================
+
 
 class TestMockGenerate:
     async def test_generate_returns_string_without_tools(self):
@@ -69,6 +70,7 @@ class TestMockGenerate:
 # Call history tracking
 # ===========================================================================
 
+
 class TestCallHistory:
     async def test_call_history_recorded_after_generate(self):
         mock = MockLLMProvider(delay=0)
@@ -103,6 +105,7 @@ class TestCallHistory:
 # Streaming
 # ===========================================================================
 
+
 class TestMockStream:
     async def test_stream_yields_llm_chunks(self):
         mock = MockLLMProvider(delay=0)
@@ -129,6 +132,7 @@ class TestMockStream:
 # Token usage
 # ===========================================================================
 
+
 class TestTokenUsage:
     async def test_token_usage_nonzero_after_call(self):
         mock = MockLLMProvider(delay=0)
@@ -142,6 +146,7 @@ class TestTokenUsage:
 # ===========================================================================
 # Info property
 # ===========================================================================
+
 
 class TestMockInfo:
     async def test_info_contains_call_count(self):

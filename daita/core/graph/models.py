@@ -4,6 +4,7 @@ Data models for the agent graph system.
 AgentGraphNode and AgentGraphEdge are agent-native graph primitives that carry
 provenance, confidence, and impact metadata not found in generic graph libraries.
 """
+
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional

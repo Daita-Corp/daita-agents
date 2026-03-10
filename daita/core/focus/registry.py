@@ -1,4 +1,5 @@
 """Backend registry — maps data types to the right FocusBackend."""
+
 from __future__ import annotations
 
 from typing import Any, List

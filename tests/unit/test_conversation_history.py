@@ -24,14 +24,18 @@ from typing import Any, List
 import pytest
 
 from daita.agents.agent import Agent
-from daita.agents.conversation import ConversationHistory, _derive_workspace, _estimate_tokens
+from daita.agents.conversation import (
+    ConversationHistory,
+    _derive_workspace,
+    _estimate_tokens,
+)
 
 from tests.conftest import SequentialMockLLM
-
 
 # ===========================================================================
 # Helpers
 # ===========================================================================
+
 
 def _make_agent(responses: List[Any]) -> Agent:
     llm = SequentialMockLLM(response_sequence=responses)
@@ -52,6 +56,7 @@ def _history(tmp_path: Path, **kwargs) -> ConversationHistory:
 # _derive_workspace helper
 # ===========================================================================
 
+
 class TestDeriveWorkspace:
     def test_strips_uuid_suffix(self):
         assert _derive_workspace("support_bot_a1b2c3ef") == "support_bot"
@@ -71,6 +76,7 @@ class TestDeriveWorkspace:
 # _estimate_tokens helper
 # ===========================================================================
 
+
 class TestEstimateTokens:
     def test_empty_returns_zero(self):
         assert _estimate_tokens([]) == 0
@@ -87,6 +93,7 @@ class TestEstimateTokens:
 # ===========================================================================
 # add_turn
 # ===========================================================================
+
 
 class TestAddTurn:
     async def test_appends_two_messages(self, tmp_path):
@@ -112,6 +119,7 @@ class TestAddTurn:
 # ===========================================================================
 # max_turns windowing
 # ===========================================================================
+
 
 class TestMaxTurns:
     async def test_windowing_drops_oldest(self, tmp_path):
@@ -141,12 +149,15 @@ class TestMaxTurns:
 # max_tokens windowing
 # ===========================================================================
 
+
 class TestMaxTokens:
     async def test_drops_oldest_when_over_budget(self, tmp_path):
         # Each turn ≈ 100 tokens (400 chars per message × 2 messages = 800 chars ÷ 4)
         long_content = "x" * 400
         h = _history(tmp_path, max_tokens=150)
-        await h.add_turn(long_content, long_content)  # ~200 tokens — over budget on its own
+        await h.add_turn(
+            long_content, long_content
+        )  # ~200 tokens — over budget on its own
         # After windowing: only the current turn, but it's still over 150.
         # Loop drops pairs until 0 messages remain (can't drop partial turns).
         # At that point len < 2 so the while exits — empty history is acceptable.
@@ -179,6 +190,7 @@ class TestMaxTokens:
 # messages property
 # ===========================================================================
 
+
 class TestMessagesProperty:
     async def test_returns_copy(self, tmp_path):
         h = _history(tmp_path)
@@ -195,6 +207,7 @@ class TestMessagesProperty:
 # ===========================================================================
 # clear()
 # ===========================================================================
+
 
 class TestClear:
     async def test_clear_empties_messages(self, tmp_path):
@@ -214,6 +227,7 @@ class TestClear:
 # ===========================================================================
 # save() / load()
 # ===========================================================================
+
 
 class TestSaveLoad:
     async def test_save_creates_file(self, tmp_path):
@@ -300,6 +314,7 @@ class TestSaveLoad:
 # auto_save
 # ===========================================================================
 
+
 class TestAutoSave:
     async def test_auto_save_true_writes_file(self, tmp_path):
         h = _history(tmp_path, auto_save=True)
@@ -316,6 +331,7 @@ class TestAutoSave:
 # _set_workspace()
 # ===========================================================================
 
+
 class TestSetWorkspace:
     def test_derives_workspace_when_not_set(self):
         h = ConversationHistory(session_id="s")
@@ -331,6 +347,7 @@ class TestSetWorkspace:
 # ===========================================================================
 # turn_count and session_path properties
 # ===========================================================================
+
 
 class TestProperties:
     def test_turn_count_zero_initially(self, tmp_path):
@@ -355,6 +372,7 @@ class TestProperties:
 # ===========================================================================
 # Agent integration tests
 # ===========================================================================
+
 
 class TestAgentIntegration:
     async def test_run_without_history_unchanged(self):
@@ -414,7 +432,9 @@ class TestAgentIntegration:
             response_sequence=[
                 {
                     "content": "Let me calculate.",
-                    "tool_calls": [{"id": "tc1", "name": "add", "arguments": {"a": 3, "b": 4}}],
+                    "tool_calls": [
+                        {"id": "tc1", "name": "add", "arguments": {"a": 3, "b": 4}}
+                    ],
                 },
                 "The answer is 7.",
             ]
@@ -440,7 +460,9 @@ class TestAgentIntegration:
         config = AgentConfig(
             name="retry_bot",
             retry_enabled=True,
-            retry_policy=RetryPolicy(max_attempts=2, strategy=RetryStrategy.FIXED, delay=0),
+            retry_policy=RetryPolicy(
+                max_attempts=2, strategy=RetryStrategy.FIXED, delay=0
+            ),
         )
         llm = SequentialMockLLM(response_sequence=["Remembered!"])
         agent = Agent(name="retry_bot", llm_provider=llm, config=config)

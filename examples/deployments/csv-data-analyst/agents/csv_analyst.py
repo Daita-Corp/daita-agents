@@ -14,6 +14,7 @@ import pandas as pd
 from daita import Agent
 from daita.core.tools import tool
 
+
 @tool
 async def load_csv(filepath: str) -> Dict[str, Any]:
     """
@@ -45,7 +46,9 @@ async def load_csv(filepath: str) -> Dict[str, Any]:
 
 
 @tool
-async def get_summary_stats(filepath: str, columns: Optional[List[str]] = None) -> Dict[str, Any]:
+async def get_summary_stats(
+    filepath: str, columns: Optional[List[str]] = None
+) -> Dict[str, Any]:
     """
     Get descriptive statistics (count, mean, min, max, std, quartiles) for numeric columns.
 
@@ -87,7 +90,9 @@ async def aggregate(
     """
     valid_functions = {"sum", "mean", "count", "min", "max"}
     if agg_function not in valid_functions:
-        return {"error": f"agg_function must be one of: {', '.join(sorted(valid_functions))}"}
+        return {
+            "error": f"agg_function must be one of: {', '.join(sorted(valid_functions))}"
+        }
 
     try:
         df = pd.read_csv(filepath)
@@ -250,7 +255,14 @@ Rules:
 - If a query fails, report the error and suggest a correction.
 - Keep answers concise: lead with the direct answer, then show supporting data.
 - Round currency to 2 decimal places and large numbers with commas for readability.""",
-        tools=[load_csv, get_summary_stats, aggregate, top_n, count_values, filter_and_summarise],
+        tools=[
+            load_csv,
+            get_summary_stats,
+            aggregate,
+            top_n,
+            count_values,
+            filter_and_summarise,
+        ],
     )
 
 

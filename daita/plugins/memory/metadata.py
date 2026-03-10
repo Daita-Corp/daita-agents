@@ -18,9 +18,10 @@ class MemoryMetadata:
     Enables filtering, sorting, and intelligent pruning based on
     importance, usage, and source.
     """
+
     content: str
     importance: float = 0.5
-    source: str = 'agent_inferred'
+    source: str = "agent_inferred"
     category: Optional[str] = None
     created_at: Optional[datetime] = None
     pinned: bool = False
@@ -43,19 +44,19 @@ class MemoryMetadata:
         data = asdict(self)
         # Convert datetime to ISO format
         if self.created_at:
-            data['created_at'] = self.created_at.isoformat()
+            data["created_at"] = self.created_at.isoformat()
         if self.last_accessed:
-            data['last_accessed'] = self.last_accessed.isoformat()
+            data["last_accessed"] = self.last_accessed.isoformat()
         return data
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'MemoryMetadata':
+    def from_dict(cls, data: Dict[str, Any]) -> "MemoryMetadata":
         """Create from dict with datetime parsing."""
         # Parse datetime strings
-        if 'created_at' in data and isinstance(data['created_at'], str):
-            data['created_at'] = datetime.fromisoformat(data['created_at'])
-        if 'last_accessed' in data and isinstance(data['last_accessed'], str):
-            data['last_accessed'] = datetime.fromisoformat(data['last_accessed'])
+        if "created_at" in data and isinstance(data["created_at"], str):
+            data["created_at"] = datetime.fromisoformat(data["created_at"])
+        if "last_accessed" in data and isinstance(data["last_accessed"], str):
+            data["last_accessed"] = datetime.fromisoformat(data["last_accessed"])
 
         return cls(**data)
 
@@ -64,7 +65,7 @@ class MemoryMetadata:
         return json.dumps(self.to_dict())
 
     @classmethod
-    def from_json(cls, json_str: str) -> 'MemoryMetadata':
+    def from_json(cls, json_str: str) -> "MemoryMetadata":
         """Deserialize from JSON string."""
         return cls.from_dict(json.loads(json_str))
 
@@ -73,7 +74,9 @@ class MemoryMetadata:
         self.access_count += 1
         self.last_accessed = datetime.now()
 
-    def should_prune(self, max_age_days: int = 90, min_importance_threshold: float = 0.3) -> bool:
+    def should_prune(
+        self, max_age_days: int = 90, min_importance_threshold: float = 0.3
+    ) -> bool:
         """
         Determine if this memory should be pruned.
 

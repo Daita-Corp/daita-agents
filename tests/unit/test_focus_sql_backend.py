@@ -5,12 +5,12 @@ Tests compile_focus_to_sql() as a pure function — no database connection requi
 Also verifies that evaluate_remaining() correctly skips clauses in the applied set,
 confirming the compiler output integrates cleanly with the Python fallback.
 """
+
 import pytest
 
 from daita.core.focus import parse
 from daita.core.focus.backends.sql import compile_focus_to_sql
 from daita.core.focus.evaluator import evaluate_remaining
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -23,6 +23,7 @@ def compile(dsl: str, dialect: str = "postgresql", param_offset: int = 0):
 
 
 # ── Filter pushdown ───────────────────────────────────────────────────────────
+
 
 def test_filter_equality_postgresql():
     sql, params, applied = compile("status == 'completed'")
@@ -90,8 +91,8 @@ def test_filter_not_in_list():
 def test_filter_none_eq_uses_is_null():
     """== None must compile to IS NULL, not = NULL (which is always FALSE in SQL)."""
     sql, params, applied = compile("status == None")
-    assert "IS NULL" in sql,      "Expected IS NULL for == None"
-    assert "= NULL" not in sql,   "= NULL is always FALSE in SQL — must not be emitted"
+    assert "IS NULL" in sql, "Expected IS NULL for == None"
+    assert "= NULL" not in sql, "= NULL is always FALSE in SQL — must not be emitted"
     assert params == []
     assert "filter" in applied
 
@@ -99,7 +100,7 @@ def test_filter_none_eq_uses_is_null():
 def test_filter_none_neq_uses_is_not_null():
     """!= None must compile to IS NOT NULL."""
     sql, params, applied = compile("status != None")
-    assert "IS NOT NULL" in sql,      "Expected IS NOT NULL for != None"
+    assert "IS NOT NULL" in sql, "Expected IS NOT NULL for != None"
     assert "!= NULL" not in sql
     assert params == []
     assert "filter" in applied
@@ -108,7 +109,7 @@ def test_filter_none_neq_uses_is_not_null():
 def test_filter_none_comparison_not_pushed():
     """Comparisons other than == / != against None can't be expressed in SQL."""
     sql, params, applied = compile("amount > None")
-    assert "filter" not in applied   # falls back to Python
+    assert "filter" not in applied  # falls back to Python
 
 
 def test_filter_dot_notation_not_pushed():
@@ -121,6 +122,7 @@ def test_filter_dot_notation_not_pushed():
 
 
 # ── SELECT pushdown ───────────────────────────────────────────────────────────
+
 
 def test_select_projection():
     sql, params, applied = compile("SELECT id, amount")
@@ -139,6 +141,7 @@ def test_select_mysql_backtick_quoting():
 
 # ── ORDER BY pushdown ─────────────────────────────────────────────────────────
 
+
 def test_order_by_asc():
     sql, params, applied = compile("ORDER BY amount")
     assert "ORDER BY" in sql
@@ -155,6 +158,7 @@ def test_order_by_desc():
 
 # ── LIMIT pushdown ────────────────────────────────────────────────────────────
 
+
 def test_limit():
     sql, params, applied = compile("LIMIT 25")
     assert "LIMIT 25" in sql
@@ -163,8 +167,11 @@ def test_limit():
 
 # ── Combined clauses ──────────────────────────────────────────────────────────
 
+
 def test_combined_filter_select_limit():
-    sql, params, applied = compile("status == 'completed' | SELECT id, amount | LIMIT 100")
+    sql, params, applied = compile(
+        "status == 'completed' | SELECT id, amount | LIMIT 100"
+    )
     assert "WHERE" in sql
     assert '"id"' in sql
     assert "LIMIT 100" in sql
@@ -183,8 +190,11 @@ def test_clause_order_in_sql():
 
 # ── GROUP BY + aggregates pushdown ────────────────────────────────────────────
 
+
 def test_group_by_with_aggregates():
-    sql, params, applied = compile("GROUP BY region | SELECT region, SUM(revenue) AS total")
+    sql, params, applied = compile(
+        "GROUP BY region | SELECT region, SUM(revenue) AS total"
+    )
     assert "GROUP BY" in sql
     assert "SUM(" in sql
     assert '"total"' in sql
@@ -200,9 +210,12 @@ def test_group_by_count_star():
 
 # ── Param offset (PostgreSQL numbered params) ─────────────────────────────────
 
+
 def test_param_offset_postgresql():
     """Existing $1,$2 in base query → focus params start at $3."""
-    sql, params, applied = compile("status == 'active'", dialect="postgresql", param_offset=2)
+    sql, params, applied = compile(
+        "status == 'active'", dialect="postgresql", param_offset=2
+    )
     assert "$3" in sql
     assert "$1" not in sql
     assert params == ["active"]
@@ -210,12 +223,15 @@ def test_param_offset_postgresql():
 
 def test_param_offset_mysql_unaffected():
     """MySQL uses %s regardless of offset — offset has no effect on placeholder style."""
-    sql, params, applied = compile("status == 'active'", dialect="mysql", param_offset=5)
+    sql, params, applied = compile(
+        "status == 'active'", dialect="mysql", param_offset=5
+    )
     assert "%s" in sql
     assert params == ["active"]
 
 
 # ── Subquery structure ────────────────────────────────────────────────────────
+
 
 def test_base_query_is_wrapped():
     sql, _, _ = compile("LIMIT 10")
@@ -224,6 +240,7 @@ def test_base_query_is_wrapped():
 
 
 # ── evaluate_remaining integration ───────────────────────────────────────────
+
 
 def test_applied_clauses_skipped_by_evaluator():
     """Clauses in applied are not re-applied by evaluate_remaining."""

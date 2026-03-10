@@ -49,7 +49,7 @@ class MemoryPlugin(BasePlugin):
         curation_model: Optional[str] = None,
         curation_api_key: Optional[str] = None,
         embedding_provider: str = "openai",
-        embedding_model: str = "text-embedding-3-small"
+        embedding_model: str = "text-embedding-3-small",
     ):
         """
         Args:
@@ -87,16 +87,16 @@ class MemoryPlugin(BasePlugin):
         # Derive stable workspace name from agent_id (strip UUID suffix)
         if self.workspace:
             workspace = self.workspace
-        elif '_' in agent_id and len(agent_id) > 9:
-            workspace = '_'.join(agent_id.split('_')[:-1])
+        elif "_" in agent_id and len(agent_id) > 9:
+            workspace = "_".join(agent_id.split("_")[:-1])
         else:
             workspace = agent_id
 
-        runtime = os.getenv('DAITA_RUNTIME', 'local')
+        runtime = os.getenv("DAITA_RUNTIME", "local")
 
-        if runtime == 'lambda':
-            backend_module = os.getenv('DAITA_MEMORY_BACKEND_MODULE')
-            backend_class_name = os.getenv('DAITA_MEMORY_BACKEND_CLASS')
+        if runtime == "lambda":
+            backend_module = os.getenv("DAITA_MEMORY_BACKEND_MODULE")
+            backend_class_name = os.getenv("DAITA_MEMORY_BACKEND_CLASS")
 
             if not backend_module or not backend_class_name:
                 raise RuntimeError(
@@ -105,14 +105,17 @@ class MemoryPlugin(BasePlugin):
                 )
 
             import importlib
+
             mod = importlib.import_module(backend_module)
             BackendClass = getattr(mod, backend_class_name)
 
-            org_id = os.getenv('DAITA_ORG_ID') or os.getenv('DAITA_ORGANIZATION_ID')
-            project_name = os.getenv('DAITA_PROJECT_NAME')
+            org_id = os.getenv("DAITA_ORG_ID") or os.getenv("DAITA_ORGANIZATION_ID")
+            project_name = os.getenv("DAITA_PROJECT_NAME")
 
             if not org_id or not project_name:
-                raise RuntimeError("Missing DAITA_ORG_ID and DAITA_PROJECT_NAME for cloud memory.")
+                raise RuntimeError(
+                    "Missing DAITA_ORG_ID and DAITA_PROJECT_NAME for cloud memory."
+                )
 
             self.backend = BackendClass(
                 org_id=org_id,
@@ -121,10 +124,12 @@ class MemoryPlugin(BasePlugin):
                 agent_id=agent_id,
                 scope=self.scope,
                 embedding_provider=self.embedding_provider,
-                embedding_model=self.embedding_model
+                embedding_model=self.embedding_model,
             )
             self.environment = "cloud"
-            print(f"Memory: cloud backend, {self.scope}-scoped, workspace='{workspace}'")
+            print(
+                f"Memory: cloud backend, {self.scope}-scoped, workspace='{workspace}'"
+            )
         else:
             from .local_backend import LocalMemoryBackend
 
@@ -133,14 +138,15 @@ class MemoryPlugin(BasePlugin):
                 agent_id=agent_id,
                 scope=self.scope,
                 embedding_provider=self.embedding_provider,
-                embedding_model=self.embedding_model
+                embedding_model=self.embedding_model,
             )
             self.environment = "local"
 
-        curator_module = os.getenv('DAITA_MEMORY_CURATOR_MODULE')
-        curator_class_name = os.getenv('DAITA_MEMORY_CURATOR_CLASS')
+        curator_module = os.getenv("DAITA_MEMORY_CURATOR_MODULE")
+        curator_class_name = os.getenv("DAITA_MEMORY_CURATOR_CLASS")
         if curator_module and curator_class_name:
             import importlib
+
             mod = importlib.import_module(curator_module)
             CuratorClass = getattr(mod, curator_class_name)
             self.curator = CuratorClass(
@@ -148,7 +154,7 @@ class MemoryPlugin(BasePlugin):
                 agent_id=agent_id,
                 llm_provider=self.curation_provider,
                 llm_model=self.curation_model,
-                api_key=self.curation_api_key
+                api_key=self.curation_api_key,
             )
         else:
             self.curator = None
@@ -160,7 +166,9 @@ class MemoryPlugin(BasePlugin):
             print(f"  Location: {self.backend.workspace_dir}")
 
         if self.auto_curate != "manual" and self.curator is not None:
-            print(f"  Auto-curation: {self.auto_curate} (provider: {self.curator.llm_provider}, model: {self.curator.llm_model})")
+            print(
+                f"  Auto-curation: {self.auto_curate} (provider: {self.curator.llm_provider}, model: {self.curator.llm_model})"
+            )
 
     def get_tools(self) -> List[AgentTool]:
         """Get memory tools for the LLM to use."""
@@ -175,6 +183,7 @@ class MemoryPlugin(BasePlugin):
         _checker = None
         if self.curator is not None:
             from .contradiction import ContradictionChecker
+
             _checker = ContradictionChecker(
                 llm=self.curator.llm,
                 recall_fn=backend.recall,
@@ -183,9 +192,7 @@ class MemoryPlugin(BasePlugin):
 
         @tool
         async def remember(
-            content: str,
-            importance: float = 0.5,
-            category: Optional[str] = None
+            content: str, importance: float = 0.5, category: Optional[str] = None
         ):
             """
             Store information in memory for future recall.
@@ -264,8 +271,8 @@ class MemoryPlugin(BasePlugin):
             metadata = MemoryMetadata(
                 content=content,
                 importance=importance,
-                source='agent_inferred',
-                category=category
+                source="agent_inferred",
+                category=category,
             )
             return await backend.remember(content, category=category, metadata=metadata)
 
@@ -276,7 +283,7 @@ class MemoryPlugin(BasePlugin):
             score_threshold: float = 0.6,
             min_importance: Optional[float] = None,
             max_importance: Optional[float] = None,
-            category: Optional[str] = None
+            category: Optional[str] = None,
         ):
             """
             Search memories by meaning using hybrid semantic + keyword search.
@@ -301,22 +308,21 @@ class MemoryPlugin(BasePlugin):
                 score_threshold=score_threshold,
                 min_importance=min_importance,
                 max_importance=max_importance,
-                category=category
+                category=category,
             )
 
             # Track access for usage-based pruning signals
-            chunk_ids = [r['chunk_id'] for r in results if r.get('chunk_id')]
+            chunk_ids = [r["chunk_id"] for r in results if r.get("chunk_id")]
             if chunk_ids:
                 backend.search.track_access(chunk_ids)
 
             import json as _json
+
             return _json.loads(_json.dumps(results, default=str))
 
         @tool
         async def list_by_category(
-            category: str,
-            min_importance: float = 0.0,
-            limit: int = 100
+            category: str, min_importance: float = 0.0, limit: int = 100
         ):
             """
             Enumerate ALL stored memories in a category without semantic ranking.
@@ -341,19 +347,14 @@ class MemoryPlugin(BasePlugin):
                 All matching memories ordered by importance descending
             """
             results = await backend.list_by_category(
-                category=category,
-                min_importance=min_importance,
-                limit=limit
+                category=category, min_importance=min_importance, limit=limit
             )
             import json as _json
+
             return _json.loads(_json.dumps(results, default=str))
 
         @tool
-        async def update_memory(
-            query: str,
-            new_content: str,
-            importance: float = 0.5
-        ):
+        async def update_memory(query: str, new_content: str, importance: float = 0.5):
             """
             Replace an existing memory with updated information.
 
@@ -399,23 +400,40 @@ class MemoryPlugin(BasePlugin):
                 Summary of available memory files with paths and sizes
             """
             from datetime import date as _date
+
             today = _date.today().isoformat()
             files = []
             try:
                 content = await backend.read_memory_md()
                 if content and not content.startswith("# Long-Term Memory\n\n(No"):
-                    files.append({"file": "MEMORY.md", "size_bytes": len(content.encode())})
+                    files.append(
+                        {"file": "MEMORY.md", "size_bytes": len(content.encode())}
+                    )
             except Exception:
                 pass
             try:
                 log_content = await backend.read_today_log()
-                if log_content and not log_content.startswith(f"# Daily Log - {today}\n\n(No"):
-                    files.append({"file": f"logs/{today}.md", "size_bytes": len(log_content.encode())})
+                if log_content and not log_content.startswith(
+                    f"# Daily Log - {today}\n\n(No"
+                ):
+                    files.append(
+                        {
+                            "file": f"logs/{today}.md",
+                            "size_bytes": len(log_content.encode()),
+                        }
+                    )
             except Exception:
                 pass
             return files
 
-        return [remember, recall, list_by_category, update_memory, read_memory, list_memories]
+        return [
+            remember,
+            recall,
+            list_by_category,
+            update_memory,
+            read_memory,
+            list_memories,
+        ]
 
     async def on_before_run(self, prompt: str) -> Optional[str]:
         """
@@ -434,49 +452,55 @@ class MemoryPlugin(BasePlugin):
 
             # Fallback: no semantic matches — inject top-3 by importance
             if not results:
-                all_results = await self.backend.recall(prompt, limit=10, score_threshold=0.0)
+                all_results = await self.backend.recall(
+                    prompt, limit=10, score_threshold=0.0
+                )
                 results = sorted(
                     all_results,
-                    key=lambda r: r.get('metadata', {}).get('importance', 0),
-                    reverse=True
+                    key=lambda r: r.get("metadata", {}).get("importance", 0),
+                    reverse=True,
                 )[:3]
             else:
                 # Always surface top-3 high-importance facts (importance >= 0.8),
                 # deduplicated against the semantic results already in the list.
-                seen = {r['chunk_id'] for r in results if r.get('chunk_id')}
+                seen = {r["chunk_id"] for r in results if r.get("chunk_id")}
                 top_important = await self.backend.recall(
                     prompt, limit=10, score_threshold=0.0, min_importance=0.8
                 )
                 for r in sorted(
                     top_important,
-                    key=lambda r: r.get('metadata', {}).get('importance', 0),
-                    reverse=True
+                    key=lambda r: r.get("metadata", {}).get("importance", 0),
+                    reverse=True,
                 )[:3]:
-                    if r.get('chunk_id') not in seen:
+                    if r.get("chunk_id") not in seen:
                         results.append(r)
-                        seen.add(r['chunk_id'])
+                        seen.add(r["chunk_id"])
 
             if not results:
                 return None
 
             # Track access for these auto-injected memories
-            chunk_ids = [r['chunk_id'] for r in results if r.get('chunk_id')]
+            chunk_ids = [r["chunk_id"] for r in results if r.get("chunk_id")]
             if chunk_ids:
                 self.backend.search.track_access(chunk_ids)
 
             lines = ["## Relevant Memory"]
             for r in results:
-                importance = r.get('metadata', {}).get('importance', 0.5)
-                category = r.get('metadata', {}).get('category', '')
+                importance = r.get("metadata", {}).get("importance", 0.5)
+                category = r.get("metadata", {}).get("category", "")
                 tag = f"[{category}] " if category else ""
-                lines.append(f"- {tag}{r['content'].strip()} (importance: {importance:.1f})")
+                lines.append(
+                    f"- {tag}{r['content'].strip()} (importance: {importance:.1f})"
+                )
 
-            return '\n'.join(lines)
+            return "\n".join(lines)
         except Exception as e:
             import logging as _logging
+
             _logging.getLogger(__name__).warning(
                 "Memory recall failed in on_before_run: %s. "
-                "Agent will proceed without memory context.", e
+                "Agent will proceed without memory context.",
+                e,
             )
             return None
 
@@ -491,7 +515,7 @@ class MemoryPlugin(BasePlugin):
 
     async def on_agent_stop(self):
         """Flush pending changes and auto-curate if enabled."""
-        if hasattr(self.backend, 'flush'):
+        if hasattr(self.backend, "flush"):
             await self.backend.flush()
 
         if self.auto_curate == "on_stop":
@@ -503,68 +527,89 @@ class MemoryPlugin(BasePlugin):
                         msg += f", ~{result.memories_updated} updated"
                     if result.memories_pruned > 0:
                         msg += f", -{result.memories_pruned} pruned"
-                    if getattr(result, 'existing_memories', 0) > 0:
+                    if getattr(result, "existing_memories", 0) > 0:
                         msg += f" ({result.existing_memories} stored by agent)"
                     msg += f", ${result.cost_usd:.4f}"
                     print(msg)
-            elif hasattr(self.backend, 'regenerate_memory_md'):
+            elif hasattr(self.backend, "regenerate_memory_md"):
                 path = await self.backend.regenerate_memory_md()
                 print(f"Memory summary written to: {path}")
 
     def get_pending_metrics(self) -> dict:
         if self.backend is None:
             return {"memory_count_delta": 0, "memory_retrieval_count": 0}
-        if hasattr(self.backend, 'get_pending_metrics'):
+        if hasattr(self.backend, "get_pending_metrics"):
             return self.backend.get_pending_metrics()
         return {
             "memory_count_delta": 0,
-            "memory_retrieval_count": getattr(self.backend, '_retrieval_count', 0)
+            "memory_retrieval_count": getattr(self.backend, "_retrieval_count", 0),
         }
 
-    async def mark_important(self, query: str, importance: float, source: str = 'user_explicit') -> dict:
+    async def mark_important(
+        self, query: str, importance: float, source: str = "user_explicit"
+    ) -> dict:
         """Mark memories matching query with a specific importance score."""
         if not 0.0 <= importance <= 1.0:
             raise ValueError(f"Importance must be 0.0-1.0, got {importance}")
 
         matches = await self.backend.recall(query, limit=100, score_threshold=0.7)
         if not matches:
-            return {"status": "success", "updated": 0, "message": "No matching memories found"}
+            return {
+                "status": "success",
+                "updated": 0,
+                "message": "No matching memories found",
+            }
 
         updated = 0
         for match in matches:
-            chunk_id = match.get('chunk_id')
+            chunk_id = match.get("chunk_id")
             if chunk_id:
-                await self.backend.update_chunk_metadata(chunk_id, {
-                    'importance': importance,
-                    'source': source,
-                })
+                await self.backend.update_chunk_metadata(
+                    chunk_id,
+                    {
+                        "importance": importance,
+                        "source": source,
+                    },
+                )
                 updated += 1
 
-        return {"status": "success", "updated": updated, "message": f"Updated importance to {importance} for {updated} memories"}
+        return {
+            "status": "success",
+            "updated": updated,
+            "message": f"Updated importance to {importance} for {updated} memories",
+        }
 
     async def pin(self, query: str) -> dict:
         """Pin memories matching query (importance=1.0, never pruned)."""
-        return await self.mark_important(query, 1.0, source='user_explicit')
+        return await self.mark_important(query, 1.0, source="user_explicit")
 
     async def forget(self, query: str) -> dict:
         """Delete memories matching query."""
         matches = await self.backend.recall(query, limit=100, score_threshold=0.7)
         if not matches:
-            return {"status": "success", "deleted": 0, "message": "No matching memories found"}
+            return {
+                "status": "success",
+                "deleted": 0,
+                "message": "No matching memories found",
+            }
 
-        chunk_ids = [m['chunk_id'] for m in matches if m.get('chunk_id')]
+        chunk_ids = [m["chunk_id"] for m in matches if m.get("chunk_id")]
         await self.backend.delete_chunks(chunk_ids)
 
-        return {"status": "success", "deleted": len(chunk_ids), "message": f"Deleted {len(chunk_ids)} memories"}
+        return {
+            "status": "success",
+            "deleted": len(chunk_ids),
+            "message": f"Deleted {len(chunk_ids)} memories",
+        }
 
     def configure(self, **kwargs) -> dict:
         """Update plugin configuration at runtime. Supports: auto_curate."""
         updated = {}
-        if 'auto_curate' in kwargs:
-            value = kwargs['auto_curate']
-            if isinstance(value, str) and value in ['on_stop', 'manual']:
+        if "auto_curate" in kwargs:
+            value = kwargs["auto_curate"]
+            if isinstance(value, str) and value in ["on_stop", "manual"]:
                 self.auto_curate = value
-                updated['auto_curate'] = self.auto_curate
+                updated["auto_curate"] = self.auto_curate
             else:
                 raise ValueError("auto_curate must be 'on_stop' or 'manual'")
         return {"status": "success", "updated": updated}

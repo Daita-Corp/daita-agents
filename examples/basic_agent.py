@@ -8,6 +8,7 @@ Prerequisites:
 Run:
     python examples/basic_agent.py
 """
+
 import asyncio
 from daita import Agent, tool
 

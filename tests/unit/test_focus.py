@@ -4,29 +4,30 @@ Unit tests for the Focus DSL system.
 Covers: parser, evaluator, backends (dict + pandas), and apply_focus end-to-end.
 No API keys or databases required.
 """
+
 import pytest
 
 from daita.core.focus import apply_focus, parse, FocusQuery
 from daita.core.exceptions import FocusDSLError
 
-
 # ── Sample data fixtures ──────────────────────────────────────────────────────
 
 PRODUCTS = [
-    {"name": "Widget", "price": 50,  "status": "active",   "region": "US"},
-    {"name": "Gadget", "price": 150, "status": "active",   "region": "EU"},
+    {"name": "Widget", "price": 50, "status": "active", "region": "US"},
+    {"name": "Gadget", "price": 150, "status": "active", "region": "EU"},
     {"name": "Doohickey", "price": 200, "status": "inactive", "region": "US"},
     {"name": "Thingamajig", "price": 75, "status": "active", "region": "EU"},
 ]
 
 NESTED = [
     {"user": {"name": "Alice", "age": 30}, "score": 90},
-    {"user": {"name": "Bob",   "age": 25}, "score": 60},
+    {"user": {"name": "Bob", "age": 25}, "score": 60},
     {"user": {"name": "Carol", "age": 35}, "score": 80},
 ]
 
 
 # ── Parser tests ──────────────────────────────────────────────────────────────
+
 
 class TestParser:
 
@@ -105,6 +106,7 @@ class TestParser:
 
 # ── Dict / list-of-dicts backend tests ───────────────────────────────────────
 
+
 class TestDictBackend:
 
     def test_select_fields(self):
@@ -162,27 +164,33 @@ class TestDictBackend:
     def test_combined_filter_select_limit(self):
         result = apply_focus(
             PRODUCTS,
-            "status == 'active' | SELECT name, price | ORDER BY price DESC | LIMIT 2"
+            "status == 'active' | SELECT name, price | ORDER BY price DESC | LIMIT 2",
         )
         assert len(result) == 2
         assert list(result[0].keys()) == ["name", "price"]
         assert result[0]["price"] >= result[1]["price"]
 
     def test_group_by_sum(self):
-        result = apply_focus(PRODUCTS, "GROUP BY region | SELECT region, SUM(price) AS total")
+        result = apply_focus(
+            PRODUCTS, "GROUP BY region | SELECT region, SUM(price) AS total"
+        )
         assert len(result) == 2
         totals = {r["region"]: r["total"] for r in result}
-        assert totals["US"] == 250   # 50 + 200
-        assert totals["EU"] == 225   # 150 + 75
+        assert totals["US"] == 250  # 50 + 200
+        assert totals["EU"] == 225  # 150 + 75
 
     def test_group_by_count_star(self):
-        result = apply_focus(PRODUCTS, "GROUP BY status | SELECT status, COUNT(*) AS cnt")
+        result = apply_focus(
+            PRODUCTS, "GROUP BY status | SELECT status, COUNT(*) AS cnt"
+        )
         counts = {r["status"]: r["cnt"] for r in result}
         assert counts["active"] == 3
         assert counts["inactive"] == 1
 
     def test_group_by_avg(self):
-        result = apply_focus(PRODUCTS, "GROUP BY region | SELECT region, AVG(price) AS avg_price")
+        result = apply_focus(
+            PRODUCTS, "GROUP BY region | SELECT region, AVG(price) AS avg_price"
+        )
         avgs = {r["region"]: r["avg_price"] for r in result}
         assert avgs["US"] == 125.0
         assert avgs["EU"] == 112.5
@@ -224,15 +232,18 @@ class TestDictBackend:
 
 # ── Pandas backend tests ──────────────────────────────────────────────────────
 
+
 class TestPandasBackend:
     pytest.importorskip("pandas")
 
     def _make_df(self):
         import pandas as pd
+
         return pd.DataFrame(PRODUCTS)
 
     def test_select_columns(self):
         import pandas as pd
+
         df = self._make_df()
         result = apply_focus(df, "SELECT name, price")
         assert isinstance(result, pd.DataFrame)
@@ -240,6 +251,7 @@ class TestPandasBackend:
 
     def test_filter_numeric(self):
         import pandas as pd
+
         df = self._make_df()
         result = apply_focus(df, "price > 100")
         assert isinstance(result, pd.DataFrame)
@@ -248,32 +260,40 @@ class TestPandasBackend:
 
     def test_filter_string(self):
         import pandas as pd
+
         df = self._make_df()
         result = apply_focus(df, "status == 'active'")
         assert len(result) == 3
 
     def test_limit(self):
         import pandas as pd
+
         df = self._make_df()
         result = apply_focus(df, "LIMIT 2")
         assert len(result) == 2
 
     def test_order_by(self):
         import pandas as pd
+
         df = self._make_df()
         result = apply_focus(df, "ORDER BY price DESC")
         assert result["price"].iloc[0] == 200
 
     def test_combined(self):
         import pandas as pd
+
         df = self._make_df()
-        result = apply_focus(df, "status == 'active' | SELECT name, price | ORDER BY price DESC | LIMIT 2")
+        result = apply_focus(
+            df,
+            "status == 'active' | SELECT name, price | ORDER BY price DESC | LIMIT 2",
+        )
         assert isinstance(result, pd.DataFrame)
         assert len(result) == 2
         assert list(result.columns) == ["name", "price"]
 
     def test_group_by_sum(self):
         import pandas as pd
+
         df = self._make_df()
         result = apply_focus(df, "GROUP BY region | SELECT region, SUM(price) AS total")
         assert isinstance(result, pd.DataFrame)

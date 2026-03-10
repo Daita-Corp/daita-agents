@@ -5,6 +5,7 @@ All functions operate on a nx.MultiDiGraph returned by backend.load_graph().
 Algorithms are stateless — they take a graph and return results with no
 backend dependency.
 """
+
 from collections import deque
 from typing import Any, Dict, List, Set
 
@@ -28,11 +29,15 @@ def traverse(
     """
     if direction == "both":
         return {
-            "downstream": _bfs(graph, start_node_id, reverse=False, max_depth=max_depth),
+            "downstream": _bfs(
+                graph, start_node_id, reverse=False, max_depth=max_depth
+            ),
             "upstream": _bfs(graph, start_node_id, reverse=True, max_depth=max_depth),
         }
 
-    return _bfs(graph, start_node_id, reverse=(direction == "upstream"), max_depth=max_depth)
+    return _bfs(
+        graph, start_node_id, reverse=(direction == "upstream"), max_depth=max_depth
+    )
 
 
 def _bfs(
@@ -92,17 +97,22 @@ def impact_analysis(
             # Take the maximum impact_weight across all edge types on this hop.
             edges_on_hop = graph[path[i]][path[i + 1]]
             weight = max(
-                (attrs.get("data", {}).get("impact_weight", 1.0) for attrs in edges_on_hop.values()),
+                (
+                    attrs.get("data", {}).get("impact_weight", 1.0)
+                    for attrs in edges_on_hop.values()
+                ),
                 default=1.0,
             )
             cumulative_impact *= weight
 
         node_data = graph.nodes[successor].get("data", {"node_id": successor})
-        affected.append({
-            "node": node_data,
-            "cumulative_impact": round(cumulative_impact, 3),
-            "path_length": len(path) - 1,
-        })
+        affected.append(
+            {
+                "node": node_data,
+                "cumulative_impact": round(cumulative_impact, 3),
+                "path_length": len(path) - 1,
+            }
+        )
 
     affected.sort(key=lambda x: x["cumulative_impact"], reverse=True)
 
