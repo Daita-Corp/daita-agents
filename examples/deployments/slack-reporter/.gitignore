@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.env
+.venv
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# API keys
+.env.local
+
+# Memory files (may contain sensitive data)
+# Remove this line if you want to commit agent memories to git
+.daita/memory/

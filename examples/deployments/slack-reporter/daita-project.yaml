@@ -1,0 +1,19 @@
+name: slack-reporter
+version: 1.0.0
+description: Daily sales digest posted to Slack on a schedule
+created_at: '2026-03-11T00:00:00'
+
+agents:
+  - name: reporter_agent
+    description: Queries the database and posts a daily sales digest to Slack
+    file: agents/reporter_agent.py
+    enabled: true
+
+workflows: []
+
+schedules:
+  - name: daily_digest
+    agent: reporter_agent
+    cron: "0 9 * * *"
+    prompt: "Run the daily sales digest for today and post it to Slack."
+    timezone: "UTC"
