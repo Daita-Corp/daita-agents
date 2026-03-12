@@ -98,7 +98,11 @@ async def validate_and_clean(records_json: str) -> Dict[str, Any]:
         df["properties"] = df["properties"].apply(parse_properties)
 
     # Deduplicate
-    dedup_cols = [c for c in ["user_id", "event_type", "session_id", "created_at"] if c in df.columns]
+    dedup_cols = [
+        c
+        for c in ["user_id", "event_type", "session_id", "created_at"]
+        if c in df.columns
+    ]
     before_dedup = len(df)
     df = df.drop_duplicates(subset=dedup_cols, keep="first")
     duplicates_removed = before_dedup - len(df)

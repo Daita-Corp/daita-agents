@@ -92,43 +92,51 @@ class TestClassifyTicketTool:
     async def test_billing_ticket(self):
         from agents.classifier import classify_ticket
 
-        result = await classify_ticket.execute({
-            "subject": "Invoice discrepancy",
-            "body": "I was charged twice for my subscription this month. "
-                    "Please refund the duplicate payment.",
-        })
+        result = await classify_ticket.execute(
+            {
+                "subject": "Invoice discrepancy",
+                "body": "I was charged twice for my subscription this month. "
+                "Please refund the duplicate payment.",
+            }
+        )
         assert result["suggested_category"] == "billing"
         assert result["billing_signals"] > 0
 
     async def test_technical_ticket(self):
         from agents.classifier import classify_ticket
 
-        result = await classify_ticket.execute({
-            "subject": "API returns 500 error",
-            "body": "My integration keeps getting a 500 error when calling the webhooks endpoint. "
-                    "The issue started after yesterday's deployment.",
-        })
+        result = await classify_ticket.execute(
+            {
+                "subject": "API returns 500 error",
+                "body": "My integration keeps getting a 500 error when calling the webhooks endpoint. "
+                "The issue started after yesterday's deployment.",
+            }
+        )
         assert result["suggested_category"] == "technical"
         assert result["technical_signals"] > 0
 
     async def test_general_ticket(self):
         from agents.classifier import classify_ticket
 
-        result = await classify_ticket.execute({
-            "subject": "Feature request: dark mode",
-            "body": "Would love a dark mode option in the dashboard. "
-                    "Keep up the great work!",
-        })
+        result = await classify_ticket.execute(
+            {
+                "subject": "Feature request: dark mode",
+                "body": "Would love a dark mode option in the dashboard. "
+                "Keep up the great work!",
+            }
+        )
         # No strong billing or technical signals → general
         assert result["suggested_category"] == "general"
 
     async def test_routing_matches_category(self):
         from agents.classifier import classify_ticket
 
-        result = await classify_ticket.execute({
-            "subject": "Refund request",
-            "body": "I'd like a refund for my annual subscription.",
-        })
+        result = await classify_ticket.execute(
+            {
+                "subject": "Refund request",
+                "body": "I'd like a refund for my annual subscription.",
+            }
+        )
         assert result["suggested_routing"] == f"{result['suggested_category']}_queue"
 
 
@@ -141,13 +149,15 @@ class TestDraftResponseTool:
     async def test_basic_response(self):
         from agents.specialist import draft_response
 
-        result = await draft_response.execute({
-            "category": "billing",
-            "issue_summary": "Duplicate charge in March",
-            "resolution": "We have confirmed the duplicate charge and issued a full refund.",
-            "next_steps": ["Check your bank statement in 3-5 business days"],
-            "escalate": False,
-        })
+        result = await draft_response.execute(
+            {
+                "category": "billing",
+                "issue_summary": "Duplicate charge in March",
+                "resolution": "We have confirmed the duplicate charge and issued a full refund.",
+                "next_steps": ["Check your bank statement in 3-5 business days"],
+                "escalate": False,
+            }
+        )
         assert "subject" in result
         assert "body" in result
         assert result["escalate"] is False
@@ -156,26 +166,37 @@ class TestDraftResponseTool:
     async def test_escalation_flag(self):
         from agents.specialist import draft_response
 
-        result = await draft_response.execute({
-            "category": "technical",
-            "issue_summary": "Platform outage affecting all users",
-            "resolution": "We are investigating a platform-wide issue.",
-            "next_steps": ["Monitor our status page for updates"],
-            "escalate": True,
-        })
+        result = await draft_response.execute(
+            {
+                "category": "technical",
+                "issue_summary": "Platform outage affecting all users",
+                "resolution": "We are investigating a platform-wide issue.",
+                "next_steps": ["Monitor our status page for updates"],
+                "escalate": True,
+            }
+        )
         assert result["escalate"] is True
         assert "ESCALATION FLAG" in result["body"]
 
     async def test_next_steps_limited(self):
         from agents.specialist import draft_response
 
-        result = await draft_response.execute({
-            "category": "general",
-            "issue_summary": "Feature request",
-            "resolution": "Thank you for your feedback.",
-            "next_steps": ["step 1", "step 2", "step 3", "step 4", "step 5", "step 6"],
-            "escalate": False,
-        })
+        result = await draft_response.execute(
+            {
+                "category": "general",
+                "issue_summary": "Feature request",
+                "resolution": "Thank you for your feedback.",
+                "next_steps": [
+                    "step 1",
+                    "step 2",
+                    "step 3",
+                    "step 4",
+                    "step 5",
+                    "step 6",
+                ],
+                "escalate": False,
+            }
+        )
         # Should cap at 5 next steps
         assert len(result["next_steps"]) <= 5
 

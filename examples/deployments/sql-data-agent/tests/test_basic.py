@@ -46,14 +46,18 @@ class TestRunQuerySafety:
     async def test_rejects_insert(self):
         from agents.sql_agent import run_query
 
-        result = await run_query.execute({"sql": "INSERT INTO users VALUES (1, 'alice')"})
+        result = await run_query.execute(
+            {"sql": "INSERT INTO users VALUES (1, 'alice')"}
+        )
         assert "error" in result
         assert "SELECT" in result["error"]
 
     async def test_rejects_update(self):
         from agents.sql_agent import run_query
 
-        result = await run_query.execute({"sql": "UPDATE users SET name = 'x' WHERE id = 1"})
+        result = await run_query.execute(
+            {"sql": "UPDATE users SET name = 'x' WHERE id = 1"}
+        )
         assert "error" in result
 
     async def test_rejects_drop(self):
@@ -131,7 +135,9 @@ class TestRunQuery:
     async def test_max_rows_clamped(self):
         from agents.sql_agent import run_query
 
-        result = await run_query.execute({"sql": "SELECT generate_series(1, 10) AS n", "max_rows": 3})
+        result = await run_query.execute(
+            {"sql": "SELECT generate_series(1, 10) AS n", "max_rows": 3}
+        )
         assert "error" not in result
         assert result["row_count"] <= 3
         assert result["truncated"] is True

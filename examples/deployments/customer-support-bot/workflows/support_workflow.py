@@ -71,7 +71,7 @@ if __name__ == "__main__":
             {
                 "subject": "Cannot log in to my account",
                 "body": "I keep getting a 403 error when I try to log in. "
-                        "My password was recently reset but the issue persists.",
+                "My password was recently reset but the issue persists.",
                 "customer_id": "cust_12345",
             }
         )

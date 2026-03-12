@@ -116,7 +116,9 @@ class TestValidateAndClean:
     async def test_rejects_missing_user_id(self):
         from agents.transformer import validate_and_clean
 
-        result = await validate_and_clean.execute({"records_json": json.dumps(self.SAMPLE_RECORDS)})
+        result = await validate_and_clean.execute(
+            {"records_json": json.dumps(self.SAMPLE_RECORDS)}
+        )
         assert "error" not in result
         rejected_reasons = [r.get("rejection_reason") for r in result["rejected"]]
         assert "missing_user_id" in rejected_reasons
@@ -124,7 +126,9 @@ class TestValidateAndClean:
     async def test_normalises_event_type(self):
         from agents.transformer import validate_and_clean
 
-        result = await validate_and_clean.execute({"records_json": json.dumps(self.SAMPLE_RECORDS)})
+        result = await validate_and_clean.execute(
+            {"records_json": json.dumps(self.SAMPLE_RECORDS)}
+        )
         assert "error" not in result
         event_types = {r["event_type"] for r in result["clean"]}
         # "Page View" → "page_view", "  Sign Up  " → "sign_up"
@@ -134,14 +138,18 @@ class TestValidateAndClean:
     async def test_deduplicates(self):
         from agents.transformer import validate_and_clean
 
-        result = await validate_and_clean.execute({"records_json": json.dumps(self.SAMPLE_RECORDS)})
+        result = await validate_and_clean.execute(
+            {"records_json": json.dumps(self.SAMPLE_RECORDS)}
+        )
         assert "error" not in result
         assert result["stats"]["duplicates_removed"] >= 1
 
     async def test_parses_properties_json_string(self):
         from agents.transformer import validate_and_clean
 
-        result = await validate_and_clean.execute({"records_json": json.dumps(self.SAMPLE_RECORDS)})
+        result = await validate_and_clean.execute(
+            {"records_json": json.dumps(self.SAMPLE_RECORDS)}
+        )
         assert "error" not in result
         for record in result["clean"]:
             assert isinstance(record["properties"], dict)

@@ -82,7 +82,6 @@ Policies:
 - Refunds are available within 30 days of charge for annual plans
 - Monthly plans are non-refundable but can be cancelled any time
 - Billing discrepancies are investigated within 2 business days""",
-
     "technical": """You are a technical support specialist. You handle bug reports,
 errors, login issues, API problems, and performance issues.
 
@@ -99,7 +98,6 @@ Troubleshooting approach:
 - Ask for error messages, stack traces, and reproduction steps if not provided
 - Check common causes first: auth tokens, rate limits, network issues
 - Provide specific commands or code snippets when helpful""",
-
     "general": """You are a general support specialist. You handle feature requests,
 general questions, account settings, and feedback.
 
@@ -124,7 +122,9 @@ def create_specialist(category: str) -> Agent:
         category: One of "billing", "technical", or "general".
     """
     if category not in _PROMPTS:
-        raise ValueError(f"Unknown category: {category!r}. Must be billing, technical, or general.")
+        raise ValueError(
+            f"Unknown category: {category!r}. Must be billing, technical, or general."
+        )
 
     memory = MemoryPlugin()
 

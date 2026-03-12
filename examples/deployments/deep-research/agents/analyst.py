@@ -29,9 +29,7 @@ async def extract_scope(findings_json: str) -> Dict[str, Any]:
     except (json.JSONDecodeError, TypeError) as e:
         return {"error": f"Invalid JSON: {e}"}
 
-    total_sources = sum(
-        len(f.get("sources", [])) for f in findings.get("findings", [])
-    )
+    total_sources = sum(len(f.get("sources", [])) for f in findings.get("findings", []))
 
     return {
         "query": findings.get("query", ""),

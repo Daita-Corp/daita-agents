@@ -107,7 +107,9 @@ class TestDecomposeQueryTool:
     async def test_returns_framework(self):
         from agents.orchestrator import decompose_query
 
-        result = await decompose_query.execute({"query": "What are the latest advances in quantum computing?"})
+        result = await decompose_query.execute(
+            {"query": "What are the latest advances in quantum computing?"}
+        )
         assert "original_query" in result
         assert "research_angles" in result
         assert "output_format" in result
@@ -134,8 +136,16 @@ SAMPLE_FINDINGS = {
             "answer": "A battery using solid electrolyte instead of liquid.",
             "key_facts": ["Higher energy density", "Safer than lithium-ion"],
             "sources": [
-                {"title": "Battery Tech Review", "url": "https://example.com/1", "snippet": "..."},
-                {"title": "Science Daily", "url": "https://example.com/2", "snippet": "..."},
+                {
+                    "title": "Battery Tech Review",
+                    "url": "https://example.com/1",
+                    "snippet": "...",
+                },
+                {
+                    "title": "Science Daily",
+                    "url": "https://example.com/2",
+                    "snippet": "...",
+                },
             ],
         },
         {
@@ -143,7 +153,11 @@ SAMPLE_FINDINGS = {
             "answer": "Toyota, QuantumScape, and several Chinese manufacturers.",
             "key_facts": ["Toyota plans commercial launch by 2027"],
             "sources": [
-                {"title": "EV Magazine", "url": "https://example.com/3", "snippet": "..."},
+                {
+                    "title": "EV Magazine",
+                    "url": "https://example.com/3",
+                    "snippet": "...",
+                },
             ],
         },
     ],
@@ -156,7 +170,9 @@ class TestExtractScopeTool:
     async def test_returns_scope(self):
         from agents.analyst import extract_scope
 
-        result = await extract_scope.execute({"findings_json": json.dumps(SAMPLE_FINDINGS)})
+        result = await extract_scope.execute(
+            {"findings_json": json.dumps(SAMPLE_FINDINGS)}
+        )
         assert "error" not in result
         assert result["query"] == "Solid-state battery breakthroughs"
         assert result["sub_question_count"] == 2
@@ -165,7 +181,9 @@ class TestExtractScopeTool:
     async def test_returns_sub_questions(self):
         from agents.analyst import extract_scope
 
-        result = await extract_scope.execute({"findings_json": json.dumps(SAMPLE_FINDINGS)})
+        result = await extract_scope.execute(
+            {"findings_json": json.dumps(SAMPLE_FINDINGS)}
+        )
         assert len(result["sub_questions"]) == 2
 
     async def test_invalid_json(self):
@@ -192,17 +210,21 @@ class TestFormatCitationTool:
     async def test_format_citation(self):
         from agents.report_writer import format_citation
 
-        result = await format_citation.execute({
-            "title": "Battery Tech Review",
-            "url": "https://example.com/1",
-            "index": 1,
-        })
+        result = await format_citation.execute(
+            {
+                "title": "Battery Tech Review",
+                "url": "https://example.com/1",
+                "index": 1,
+            }
+        )
         assert result == "[1] [Battery Tech Review](https://example.com/1)"
 
     async def test_citation_index(self):
         from agents.report_writer import format_citation
 
-        result = await format_citation.execute({"title": "Source", "url": "https://example.com", "index": 5})
+        result = await format_citation.execute(
+            {"title": "Source", "url": "https://example.com", "index": 5}
+        )
         assert result.startswith("[5]")
 
 
@@ -210,9 +232,9 @@ class TestBuildReportStructureTool:
     async def test_returns_structure(self):
         from agents.report_writer import build_report_structure
 
-        result = await build_report_structure.execute({
-            "query": "Solid-state battery breakthroughs", "section_count": 4
-        })
+        result = await build_report_structure.execute(
+            {"query": "Solid-state battery breakthroughs", "section_count": 4}
+        )
         assert "sections" in result
         assert "Executive Summary" in result["sections"]
         assert "References" in result["sections"]

@@ -49,7 +49,11 @@ class TestAgentCreation:
 
 
 @pytest.mark.skipif(
-    not (os.getenv("OPENAI_API_KEY") and os.getenv("DATABASE_URL") and os.getenv("SLACK_BOT_TOKEN")),
+    not (
+        os.getenv("OPENAI_API_KEY")
+        and os.getenv("DATABASE_URL")
+        and os.getenv("SLACK_BOT_TOKEN")
+    ),
     reason="OPENAI_API_KEY, DATABASE_URL, and SLACK_BOT_TOKEN all required",
 )
 class TestAgentIntegration:

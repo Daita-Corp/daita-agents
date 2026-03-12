@@ -12,7 +12,6 @@ import os
 from daita import Agent
 from daita.plugins import postgresql, slack
 
-
 # Expected database schema (adjust to your schema):
 #
 #   orders (id, customer_id, status, total_amount, created_at)

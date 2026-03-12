@@ -79,7 +79,11 @@ async def load_to_destination(records_json: str) -> Dict[str, Any]:
                     str(record.get("user_id", "")),
                     record.get("session_id"),
                     json.dumps(record.get("properties") or {}),
-                    record.get("created_at", "").split("T")[0] if record.get("created_at") else None,
+                    (
+                        record.get("created_at", "").split("T")[0]
+                        if record.get("created_at")
+                        else None
+                    ),
                     record.get("processed_at"),
                 )
                 # asyncpg returns "INSERT 0 N" — N=1 means inserted, N=0 means skipped
