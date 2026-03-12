@@ -99,6 +99,9 @@ production = [
 
 anthropic = ["anthropic>=0.5.0"]
 google = ["google-genai>=0.3.0"]
+
+# Data quality plugin — advanced anomaly detection (z-score via scipy)
+data-quality = ["scipy>=1.10.0"]
 transformers = ["transformers>=4.51.0"]  # Local models (LARGE: 2GB+)
 
 # Convenience bundle - all LLM providers

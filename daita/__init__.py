@@ -1,5 +1,5 @@
 """
-Daita Agents — An open-source framework for building production-ready AI agents.
+Daita Agents — A data focused framework for building production ready AI agents.
 
 Quick start:
     from daita import Agent, tool
@@ -36,7 +36,7 @@ from .core.relay import RelayManager
 # ---------------------------------------------------------------------------
 # Plugins — database and API integrations
 # ---------------------------------------------------------------------------
-from .plugins import postgresql, mysql, mongodb, rest, s3, slack, elasticsearch
+from .plugins import postgresql, mysql, mongodb, rest, s3, slack, elasticsearch, sqlite
 from .plugins.redis_messaging import redis_messaging
 
 # ---------------------------------------------------------------------------
@@ -66,7 +66,13 @@ from .core.exceptions import (
     AuthenticationError,
     ValidationError,
     FocusDSLError,
+    DataQualityError,
 )
+
+# ---------------------------------------------------------------------------
+# Data quality enforcement — ItemAssertion / RowAssertion + query_checked()
+# ---------------------------------------------------------------------------
+from .core.assertions import ItemAssertion, RowAssertion
 
 # ---------------------------------------------------------------------------
 # LLM factory — for explicit provider construction
@@ -96,6 +102,7 @@ __all__ = [
     "postgresql",
     "mysql",
     "mongodb",
+    "sqlite",
     "rest",
     "s3",
     "slack",
@@ -121,6 +128,10 @@ __all__ = [
     "AuthenticationError",
     "ValidationError",
     "FocusDSLError",
+    "DataQualityError",
+    # Assertions
+    "ItemAssertion",
+    "RowAssertion",
     # LLM
     "create_llm_provider",
     # Version

@@ -451,6 +451,32 @@ class FocusDSLError(PermanentError):
         super().__init__(message, context)
 
 
+class DataQualityError(PermanentError):
+    """
+    Exception raised when data fails ItemAssertion checks.
+
+    Carries the full list of violations so callers (and agents) can inspect
+    which assertions failed, how many items were affected, and sample rows.
+    retry_hint is "permanent" — retrying the same query won't fix bad data.
+    """
+
+    def __init__(
+        self,
+        message: str = "Data quality violation",
+        violations: list = None,
+        table: str = None,
+        context: dict = None,
+    ):
+        context = context or {}
+        if table:
+            context["table"] = table
+        if violations:
+            context["violations"] = violations
+        super().__init__(message, context)
+        self.violations = violations or []
+        self.table = table
+
+
 class NotFoundError(PermanentError):
     """Exception for missing resources."""
 

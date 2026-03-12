@@ -143,6 +143,37 @@ class BaseDatabasePlugin(BasePlugin):
                 context={"plugin": self.__class__.__name__, "operation": operation},
             ) from error
 
+    async def query_checked(
+        self,
+        sql: str,
+        params=None,
+        assertions=None,
+    ) -> list:
+        """
+        Run a query and enforce ItemAssertions against every returned row.
+
+        Identical to query() when assertions is None or empty. Raises
+        DataQualityError (permanent, not retried) if any assertion has
+        violations, with the full violation list attached.
+
+        Args:
+            sql: SQL query string.
+            params: Optional query parameters, passed through to query().
+            assertions: Optional list of ItemAssertion / RowAssertion objects.
+
+        Returns:
+            List of result rows (same as query()).
+
+        Raises:
+            DataQualityError: If one or more assertions have violations.
+        """
+        rows = await self.query(sql, params)
+        if assertions:
+            from ..core.assertions import _evaluate_assertions
+
+            _evaluate_assertions(rows, assertions, source=sql)
+        return rows
+
     async def _run_focus_query(self, sql: str, params: list, focus_dsl: str) -> list:
         """
         Parse *focus_dsl*, push as many clauses as possible into SQL, execute,

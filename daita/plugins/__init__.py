@@ -8,6 +8,7 @@ Database Plugins:
 - MySQL plugin for async database operations
 - MongoDB plugin for async document database operations
 - Snowflake plugin for cloud data warehouse operations
+- SQLite plugin for local file-based and in-memory database operations
 
 Vector Database Plugins:
 - Pinecone plugin for managed cloud vector database
@@ -44,6 +45,10 @@ Usage:
     # Database plugins
     async with postgresql(host="localhost", database="mydb") as db:
         results = await db.query("SELECT * FROM users")
+
+    async with sqlite(path="./data.db") as db:
+        await db.execute_script("CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, msg TEXT)")
+        results = await db.query("SELECT * FROM logs WHERE id > ?", [0])
 
     # Vector database plugins
     async with pinecone(api_key="...", index="docs") as db:
@@ -134,6 +139,7 @@ from .postgresql import PostgreSQLPlugin, postgresql
 from .mysql import MySQLPlugin, mysql
 from .mongodb import MongoDBPlugin, mongodb
 from .snowflake import SnowflakePlugin, snowflake
+from .sqlite import SQLitePlugin, sqlite
 
 # Vector database plugins
 from .pinecone import PineconePlugin, pinecone
@@ -175,6 +181,10 @@ from .orchestrator import OrchestratorPlugin, orchestrator
 # Graph database plugins
 from .neo4j_graph import Neo4jPlugin, neo4j
 
+# Data operations plugins
+from .data_quality import DataQualityPlugin, data_quality
+from .transformer import TransformerPlugin, transformer
+
 
 # Simple plugin access class for SDK
 class PluginAccess:
@@ -199,6 +209,10 @@ class PluginAccess:
     def snowflake(self, **kwargs) -> SnowflakePlugin:
         """Create Snowflake plugin."""
         return snowflake(**kwargs)
+
+    def sqlite(self, **kwargs) -> SQLitePlugin:
+        """Create SQLite plugin."""
+        return sqlite(**kwargs)
 
     def pinecone(self, **kwargs) -> PineconePlugin:
         """Create Pinecone plugin."""
@@ -256,6 +270,14 @@ class PluginAccess:
         """Create Orchestrator plugin for multi-agent coordination."""
         return orchestrator(**kwargs)
 
+    def data_quality(self, **kwargs) -> DataQualityPlugin:
+        """Create DataQuality plugin for profiling and quality checks."""
+        return data_quality(**kwargs)
+
+    def transformer(self, **kwargs) -> TransformerPlugin:
+        """Create Transformer plugin for managing SQL transformations."""
+        return transformer(**kwargs)
+
     def memory(self, **kwargs) -> MemoryPlugin:
         """Create Memory plugin for persistent semantic memory."""
         return MemoryPlugin(**kwargs)
@@ -272,6 +294,7 @@ __all__ = [
     "MySQLPlugin",
     "MongoDBPlugin",
     "SnowflakePlugin",
+    "SQLitePlugin",
     "PineconePlugin",
     "ChromaPlugin",
     "QdrantPlugin",
@@ -287,11 +310,14 @@ __all__ = [
     "Neo4jPlugin",
     "OrchestratorPlugin",
     "MemoryPlugin",
+    "DataQualityPlugin",
+    "TransformerPlugin",
     # Factory functions
     "postgresql",
     "mysql",
     "mongodb",
     "snowflake",
+    "sqlite",
     "pinecone",
     "chroma",
     "qdrant",
@@ -306,6 +332,8 @@ __all__ = [
     "lineage",
     "neo4j",
     "orchestrator",
+    "data_quality",
+    "transformer",
     # MCP module
     "mcp",
     # SDK access class
