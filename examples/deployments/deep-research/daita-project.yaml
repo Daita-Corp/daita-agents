@@ -1,0 +1,28 @@
+name: deep-research
+version: 1.0.0
+description: Four-agent deep research pipeline with web search and citations
+created_at: '2026-03-11T00:00:00'
+
+agents:
+  - name: orchestrator
+    description: Plans research strategy and decomposes queries into sub-questions
+    file: agents/orchestrator.py
+    enabled: true
+  - name: researcher
+    description: Searches the web for each sub-question using Tavily
+    file: agents/researcher.py
+    enabled: true
+  - name: analyst
+    description: Synthesises raw findings into structured insights
+    file: agents/analyst.py
+    enabled: true
+  - name: report_writer
+    description: Produces a formatted research report with citations
+    file: agents/report_writer.py
+    enabled: true
+
+workflows:
+  - name: research_pipeline
+    description: Full deep research pipeline
+    file: workflows/research_workflow.py
+    enabled: true

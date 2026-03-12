@@ -1,0 +1,28 @@
+name: customer-support-bot
+version: 1.0.0
+description: Automated ticket classification and routing to specialist agents
+created_at: '2026-03-11T00:00:00'
+
+agents:
+  - name: classifier
+    description: Classifies incoming tickets and routes to the right specialist
+    file: agents/classifier.py
+    enabled: true
+  - name: billing_specialist
+    description: Handles billing, payment, and subscription tickets
+    file: agents/specialist.py
+    enabled: true
+  - name: technical_specialist
+    description: Handles bug reports, errors, and technical issues
+    file: agents/specialist.py
+    enabled: true
+  - name: general_specialist
+    description: Handles general questions, feature requests, and feedback
+    file: agents/specialist.py
+    enabled: true
+
+workflows:
+  - name: support_workflow
+    description: Classify and route support tickets to specialists
+    file: workflows/support_workflow.py
+    enabled: true

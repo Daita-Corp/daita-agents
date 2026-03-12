@@ -1,0 +1,12 @@
+name: sql-data-agent
+version: 1.0.0
+description: Natural language SQL queries against PostgreSQL
+created_at: '2026-03-11T00:00:00'
+
+agents:
+  - name: sql_agent
+    description: Translates natural language to SQL and queries PostgreSQL
+    file: agents/sql_agent.py
+    enabled: true
+
+workflows: []

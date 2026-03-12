@@ -1,0 +1,30 @@
+name: etl-pipeline
+version: 1.0.0
+description: Three-agent ETL pipeline — extract, transform, load
+created_at: '2026-03-11T00:00:00'
+
+agents:
+  - name: extractor
+    description: Pulls unprocessed raw event logs from the source database
+    file: agents/extractor.py
+    enabled: true
+  - name: transformer
+    description: Cleans and normalises raw events with pandas
+    file: agents/transformer.py
+    enabled: true
+  - name: loader
+    description: Writes cleaned records to the destination reporting database
+    file: agents/loader.py
+    enabled: true
+
+workflows:
+  - name: etl_pipeline
+    description: Full extract-transform-load pipeline
+    file: workflows/etl_workflow.py
+    enabled: true
+
+schedules:
+  - name: nightly_etl
+    workflow: etl_pipeline
+    cron: "0 2 * * *"
+    timezone: "UTC"
