@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daita-agents"
-version = "0.9.0"
+version = "0.10.0"
 description = "Daita Agents - Data focused AI agent framework with free local use and premium hosted enterprise features"
 readme = "README.md"
 authors = [{name = "Daita", email = "support@daita-tech.io"}]
@@ -99,6 +99,9 @@ production = [
 
 anthropic = ["anthropic>=0.5.0"]
 google = ["google-genai>=0.3.0"]
+
+# Data quality plugin — advanced anomaly detection (z-score via scipy)
+data-quality = ["scipy>=1.10.0"]
 transformers = ["transformers>=4.51.0"]  # Local models (LARGE: 2GB+)
 
 # Convenience bundle - all LLM providers
