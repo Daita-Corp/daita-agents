@@ -1,11 +1,11 @@
 """
 Unit tests for daita/core/assertions.py.
 
-Covers ItemAssertion, RowAssertion alias, and _evaluate_assertions.
+Covers ItemAssertion and _evaluate_assertions.
 """
 
 import pytest
-from daita.core.assertions import ItemAssertion, RowAssertion, _evaluate_assertions
+from daita.core.assertions import ItemAssertion, _evaluate_assertions
 from daita.core.exceptions import DataQualityError
 
 
@@ -20,9 +20,6 @@ def test_item_assertion_stores_check_and_description():
     assert a.check is check
     assert a.description == "x must be positive"
 
-
-def test_row_assertion_is_item_assertion():
-    assert RowAssertion is ItemAssertion
 
 
 def test_item_assertion_check_returns_true_for_valid_item():

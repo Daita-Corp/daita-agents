@@ -48,10 +48,6 @@ class ItemAssertion:
     description: str
 
 
-# Alias for readability in SQL contexts — identical to ItemAssertion
-RowAssertion = ItemAssertion
-
-
 def _evaluate_assertions(
     items: List[Any],
     assertions: List[ItemAssertion],

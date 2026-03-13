@@ -159,7 +159,7 @@ class BaseDatabasePlugin(BasePlugin):
         Args:
             sql: SQL query string.
             params: Optional query parameters, passed through to query().
-            assertions: Optional list of ItemAssertion / RowAssertion objects.
+            assertions: Optional list of ItemAssertion objects.
 
         Returns:
             List of result rows (same as query()).

@@ -70,9 +70,9 @@ from .core.exceptions import (
 )
 
 # ---------------------------------------------------------------------------
-# Data quality enforcement — ItemAssertion / RowAssertion + query_checked()
+# Data quality enforcement — ItemAssertion + query_checked()
 # ---------------------------------------------------------------------------
-from .core.assertions import ItemAssertion, RowAssertion
+from .core.assertions import ItemAssertion
 
 # ---------------------------------------------------------------------------
 # LLM factory — for explicit provider construction
@@ -131,7 +131,6 @@ __all__ = [
     "DataQualityError",
     # Assertions
     "ItemAssertion",
-    "RowAssertion",
     # LLM
     "create_llm_provider",
     # Version
