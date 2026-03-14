@@ -194,6 +194,7 @@ class Agent(BaseAgent):
         agent_id: Optional[str] = None,
         prompt: Optional[Union[str, Dict[str, str]]] = None,
         focus: Optional[Union[str, Dict[str, str]]] = None,
+        auto_focus: bool = False,
         relay: Optional[str] = None,
         mcp: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
         display_reasoning: bool = False,
@@ -251,6 +252,7 @@ class Agent(BaseAgent):
         # Store customization options
         self.prompt = prompt
         self.default_focus = focus
+        self.auto_focus = auto_focus
         self.relay = relay
 
         # Decision display setup
@@ -758,6 +760,26 @@ class Agent(BaseAgent):
 
         if self.prompt:
             system_parts.append(self.prompt)
+
+        if self.auto_focus:
+            focus_tools = [
+                t for t in self.tool_registry.tools
+                if "focus" in t.parameters.get("properties", {})
+            ]
+            if focus_tools:
+                names = ", ".join(f"`{t.name}`" for t in focus_tools)
+                system_parts.append(
+                    "## Data Efficiency — Focus DSL\n"
+                    f"These tools support a `focus` parameter: {names}.\n"
+                    "ALWAYS include `focus` when calling them. Write the most restrictive "
+                    "expression that still answers the question.\n"
+                    "Syntax: `condition | SELECT col1, col2 | LIMIT N`\n"
+                    "Examples:\n"
+                    "  `revenue < 0 | SELECT region, product_id | LIMIT 100`\n"
+                    "  `status == 'active' | SELECT id, name | LIMIT 50`\n"
+                    "  `| SELECT category, SUM(amount) AS total | LIMIT 20` (no filter, just projection)\n"
+                    "Omitting `focus` loads all rows — expensive and slow."
+                )
 
         for source in self.tool_sources:
             if isinstance(source, LifecyclePlugin):
