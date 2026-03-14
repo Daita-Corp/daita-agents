@@ -17,9 +17,9 @@ from daita.core.focus.evaluator import evaluate_remaining
 BASE = "SELECT * FROM orders"
 
 
-def compile(dsl: str, dialect: str = "postgresql", param_offset: int = 0):
+def compile(dsl: str, dialect: str = "postgresql", param_offset: int = 0, mode: str = "safe"):
     fq = parse(dsl)
-    return compile_focus_to_sql(BASE, fq, dialect=dialect, param_offset=param_offset)
+    return compile_focus_to_sql(BASE, fq, dialect=dialect, param_offset=param_offset, mode=mode)
 
 
 # ── Filter pushdown ───────────────────────────────────────────────────────────
@@ -125,15 +125,23 @@ def test_filter_dot_notation_not_pushed():
 
 
 def test_select_projection():
-    sql, params, applied = compile("SELECT id, amount")
+    # SELECT pushdown only happens in full mode (developer-controlled schema)
+    sql, params, applied = compile("SELECT id, amount", mode="full")
     assert '"id"' in sql
     assert '"amount"' in sql
     assert "select" in applied
     assert params == []
 
 
+def test_select_not_pushed_in_safe_mode():
+    # In safe mode (LLM-generated SQL), SELECT stays in Python to avoid column mismatch
+    sql, params, applied = compile("SELECT id, amount", mode="safe")
+    assert "select" not in applied
+    assert '"id"' not in sql  # outer SELECT is just *
+
+
 def test_select_mysql_backtick_quoting():
-    sql, params, applied = compile("SELECT id, amount", dialect="mysql")
+    sql, params, applied = compile("SELECT id, amount", dialect="mysql", mode="full")
     assert "`id`" in sql
     assert "`amount`" in sql
     assert "select" in applied
@@ -143,7 +151,7 @@ def test_select_mysql_backtick_quoting():
 
 
 def test_order_by_asc():
-    sql, params, applied = compile("ORDER BY amount")
+    sql, params, applied = compile("ORDER BY amount", mode="full")
     assert "ORDER BY" in sql
     assert '"amount"' in sql
     assert "ASC" in sql
@@ -151,9 +159,15 @@ def test_order_by_asc():
 
 
 def test_order_by_desc():
-    sql, params, applied = compile("ORDER BY amount DESC")
+    sql, params, applied = compile("ORDER BY amount DESC", mode="full")
     assert "DESC" in sql
     assert "order_by" in applied
+
+
+def test_order_by_not_pushed_in_safe_mode():
+    sql, params, applied = compile("ORDER BY amount DESC", mode="safe")
+    assert "order_by" not in applied
+    assert "ORDER BY" not in sql
 
 
 # ── LIMIT pushdown ────────────────────────────────────────────────────────────
@@ -169,8 +183,9 @@ def test_limit():
 
 
 def test_combined_filter_select_limit():
+    # full mode: all three clauses pushed to SQL
     sql, params, applied = compile(
-        "status == 'completed' | SELECT id, amount | LIMIT 100"
+        "status == 'completed' | SELECT id, amount | LIMIT 100", mode="full"
     )
     assert "WHERE" in sql
     assert '"id"' in sql
@@ -179,9 +194,21 @@ def test_combined_filter_select_limit():
     assert params == ["completed"]
 
 
+def test_combined_filter_limit_safe_mode():
+    # safe mode: WHERE and LIMIT pushed; SELECT left for Python
+    sql, params, applied = compile(
+        "status == 'completed' | SELECT id, amount | LIMIT 100", mode="safe"
+    )
+    assert "WHERE" in sql
+    assert "LIMIT 100" in sql
+    assert "filter" in applied
+    assert "limit" in applied
+    assert "select" not in applied
+
+
 def test_clause_order_in_sql():
-    """WHERE must precede GROUP BY, ORDER BY, LIMIT."""
-    sql, params, applied = compile("amount > 0 | ORDER BY amount DESC | LIMIT 10")
+    """WHERE must precede ORDER BY, LIMIT (full mode)."""
+    sql, params, applied = compile("amount > 0 | ORDER BY amount DESC | LIMIT 10", mode="full")
     where_pos = sql.index("WHERE")
     order_pos = sql.index("ORDER BY")
     limit_pos = sql.index("LIMIT")
@@ -193,7 +220,7 @@ def test_clause_order_in_sql():
 
 def test_group_by_with_aggregates():
     sql, params, applied = compile(
-        "GROUP BY region | SELECT region, SUM(revenue) AS total"
+        "GROUP BY region | SELECT region, SUM(revenue) AS total", mode="full"
     )
     assert "GROUP BY" in sql
     assert "SUM(" in sql
@@ -203,9 +230,17 @@ def test_group_by_with_aggregates():
 
 
 def test_group_by_count_star():
-    sql, params, applied = compile("GROUP BY status | SELECT status, COUNT(*) AS cnt")
+    sql, params, applied = compile("GROUP BY status | SELECT status, COUNT(*) AS cnt", mode="full")
     assert "COUNT(*)" in sql
     assert "group_by" in applied
+
+
+def test_group_by_not_pushed_in_safe_mode():
+    sql, params, applied = compile(
+        "GROUP BY region | SELECT region, SUM(revenue) AS total", mode="safe"
+    )
+    assert "group_by" not in applied
+    assert "GROUP BY" not in sql
 
 
 # ── Param offset (PostgreSQL numbered params) ─────────────────────────────────

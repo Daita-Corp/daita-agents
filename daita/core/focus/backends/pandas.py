@@ -8,16 +8,14 @@ order_by (sort_values), limit (head), group_by + aggregates (groupby.agg).
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any, Set, Tuple
 
 from .base import FocusBackend
-from ..ast import FocusQuery
+from ..ast import FocusQuery, AGG_EXPR_RE as _AGG_RE
 
 logger = logging.getLogger(__name__)
 
 _FUNC_MAP = {"SUM": "sum", "COUNT": "count", "AVG": "mean", "MIN": "min", "MAX": "max"}
-_AGG_RE = re.compile(r"^(SUM|COUNT|AVG|MIN|MAX)\((\*|[\w.]+)\)$", re.IGNORECASE)
 
 
 class PandasBackend(FocusBackend):
@@ -89,17 +87,21 @@ def _native_groupby(df: Any, query: FocusQuery) -> Any:
 
     if agg_spec:
         result = grouped.agg(**agg_spec)
+        if count_star_alias:
+            # Merge COUNT(*) by group keys — never by positional index
+            size_df = (
+                df.groupby(query.group_by)
+                .size()
+                .reset_index(name=count_star_alias)
+            )
+            result = result.merge(size_df, on=query.group_by)
     else:
-        # COUNT(*) only
+        # COUNT(*) only — .size() handles it directly
         result = (
             df.groupby(query.group_by)
             .size()
             .reset_index(name=count_star_alias or "count")
         )
-        count_star_alias = None  # already set
-
-    if count_star_alias:
-        result[count_star_alias] = df.groupby(query.group_by).size().values
 
     if query.order_by and query.order_by in result.columns:
         result = result.sort_values(
