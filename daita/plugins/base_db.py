@@ -176,10 +176,14 @@ class BaseDatabasePlugin(BasePlugin):
 
     async def _run_focus_query(self, sql: str, params: list, focus_dsl: str) -> list:
         """
-        Parse *focus_dsl*, push as many clauses as possible into SQL, execute,
-        then let the Python evaluator handle any remainder.
+        Parse *focus_dsl*, push LIMIT and WHERE into SQL (safe mode), execute,
+        then let the Python evaluator handle SELECT, ORDER BY, GROUP BY, and
+        any remaining clauses.
 
-        This is the single integration point for focus in all SQL plugins.
+        If the DB-level pushdown raises an exception (e.g. a WHERE filter
+        references a column absent in an aggregated subquery), the original
+        query is executed without modification and the full focus expression is
+        applied in Python — so focus never crashes the agent.
         """
         from ..core.focus import parse as _parse
         from ..core.focus.backends.sql import compile_focus_to_sql
@@ -187,9 +191,18 @@ class BaseDatabasePlugin(BasePlugin):
 
         fq = _parse(focus_dsl)
         mod_sql, extra_params, applied = compile_focus_to_sql(
-            sql, fq, dialect=self.sql_dialect, param_offset=len(params)
+            sql, fq, dialect=self.sql_dialect, param_offset=len(params), mode="safe"
         )
-        rows = await self.query(mod_sql, params + extra_params or None)
+        try:
+            rows = await self.query(mod_sql, params + extra_params or None)
+        except Exception as db_err:
+            logger.warning(
+                f"Focus SQL pushdown failed ({db_err}); "
+                "falling back to Python-only focus evaluation"
+            )
+            rows = await self.query(sql, params or None)
+            applied = set()  # nothing was applied — Python evaluator handles everything
+
         return evaluate_remaining(rows, fq, applied)
 
     @property
