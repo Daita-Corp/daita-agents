@@ -875,6 +875,7 @@ class Agent(BaseAgent):
             source_agent="internal",
             channel="process",
             workflow_name=task,
+            **kwargs,
         )
 
         if context:
@@ -896,6 +897,7 @@ class Agent(BaseAgent):
         source_agent: str,
         channel: str,
         workflow_name: Optional[str] = None,
+        **kwargs,
     ) -> Dict[str, Any]:
         """Handle workflow relay message from another agent. Called automatically by workflow system."""
         prompt = "A message has arrived from the workflow system. Process the input data below."
@@ -906,7 +908,7 @@ class Agent(BaseAgent):
         elif data is not None:
             prompt += f"\n\n<input_data>{str(data)[:4000]}</input_data>"
 
-        result = await self.run_detailed(prompt)
+        result = await self.run_detailed(prompt, **kwargs)
 
         # Add workflow metadata to result
         result["workflow_metadata"] = {
