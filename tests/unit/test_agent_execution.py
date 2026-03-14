@@ -23,6 +23,7 @@ from daita.core.exceptions import AgentError
 from daita.core.streaming import EventType
 from daita.core.tools import AgentTool
 from daita.llm.mock import MockLLMProvider
+from daita.plugins.base import LifecyclePlugin
 
 from tests.conftest import SequentialMockLLM
 
@@ -311,6 +312,94 @@ class TestJsonSerialiser:
 
     async def test_bytes_serialised(self):
         await self._run_with_tool_returning(b"raw bytes")
+
+
+# ===========================================================================
+# _build_initial_conversation
+# ===========================================================================
+
+
+class MemoryPlugin(LifecyclePlugin):
+    """LifecyclePlugin that injects a fixed string via on_before_run."""
+
+    def __init__(self, context: str):
+        self._context = context
+
+    async def on_before_run(self, prompt: str):
+        return self._context
+
+
+class TestBuildInitialConversation:
+    async def test_user_message_always_last(self):
+        agent = _make_agent(["Done."])
+        conv = await agent._build_initial_conversation("Hello")
+        assert conv[-1] == {"role": "user", "content": "Hello"}
+
+    async def test_no_system_when_no_prompt_and_no_plugins(self):
+        agent = _make_agent(["Done."])
+        conv = await agent._build_initial_conversation("Hi")
+        roles = [m["role"] for m in conv]
+        assert "system" not in roles
+
+    async def test_system_included_when_prompt_configured(self):
+        llm = SequentialMockLLM(["Done."])
+        agent = Agent(name="X", llm_provider=llm, prompt="You are helpful.")
+        conv = await agent._build_initial_conversation("Hi")
+        assert conv[0]["role"] == "system"
+        assert "You are helpful." in conv[0]["content"]
+
+    async def test_initial_messages_injected_before_user_message(self):
+        agent = _make_agent(["Done."])
+        history = [
+            {"role": "user", "content": "prev"},
+            {"role": "assistant", "content": "reply"},
+        ]
+        conv = await agent._build_initial_conversation("new", history)
+        assert conv[-3]["content"] == "prev"
+        assert conv[-2]["content"] == "reply"
+        assert conv[-1]["content"] == "new"
+
+    async def test_on_before_run_context_injected_into_system(self):
+        llm = SequentialMockLLM(["Done."])
+        plugin = MemoryPlugin("Relevant memory: user likes Python.")
+        agent = Agent(name="X", llm_provider=llm, tools=[plugin])
+        conv = await agent._build_initial_conversation("Tell me something")
+        system_msg = next(m for m in conv if m["role"] == "system")
+        assert "Relevant memory" in system_msg["content"]
+
+    async def test_multiple_plugin_contexts_combined(self):
+        llm = SequentialMockLLM(["Done."])
+        agent = Agent(
+            name="X",
+            llm_provider=llm,
+            tools=[MemoryPlugin("Memory A"), MemoryPlugin("Memory B")],
+        )
+        conv = await agent._build_initial_conversation("Go")
+        system_msg = next(m for m in conv if m["role"] == "system")
+        assert "Memory A" in system_msg["content"]
+        assert "Memory B" in system_msg["content"]
+
+    async def test_base_plugin_not_called_for_lifecycle(self):
+        # BasePlugin (not LifecyclePlugin) is never consulted for on_before_run
+        from daita.plugins.base import BasePlugin
+
+        class ToolOnlyPlugin(BasePlugin):
+            def get_tools(self):
+                return []
+
+        llm = SequentialMockLLM(["Done."])
+        agent = Agent(name="X", llm_provider=llm, tools=[ToolOnlyPlugin()])
+        conv = await agent._build_initial_conversation("Hi")
+        roles = [m["role"] for m in conv]
+        assert "system" not in roles
+
+    async def test_lifecycle_plugin_returning_none_not_added(self):
+        # LifecyclePlugin.on_before_run returns None by default — no system message
+        llm = SequentialMockLLM(["Done."])
+        agent = Agent(name="X", llm_provider=llm, tools=[LifecyclePlugin()])
+        conv = await agent._build_initial_conversation("Hi")
+        roles = [m["role"] for m in conv]
+        assert "system" not in roles
 
 
 # ===========================================================================

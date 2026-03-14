@@ -459,9 +459,9 @@ class TestAgentIntegration:
 
         config = AgentConfig(
             name="retry_bot",
-            retry_enabled=True,
+            enable_retry=True,
             retry_policy=RetryPolicy(
-                max_attempts=2, strategy=RetryStrategy.FIXED, delay=0
+                max_retries=2, strategy=RetryStrategy.FIXED, base_delay=0.1
             ),
         )
         llm = SequentialMockLLM(response_sequence=["Remembered!"])
