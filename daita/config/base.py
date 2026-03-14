@@ -5,7 +5,7 @@ Configuration models for Daita Agents.
 import asyncio
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class YamlSerializableMixin:
@@ -17,10 +17,14 @@ class YamlSerializableMixin:
 
 
 class AgentType(str, Enum):
-    """Types of agents available."""
+    """Agent classification used in tracing metadata.
+
+    Currently only STANDARD exists. This enum is a placeholder for future
+    agent-type differentiation (e.g. streaming-only, batch, or pipeline
+    agents). It does not affect execution behaviour today.
+    """
 
     STANDARD = "standard"
-    # Additional agent types can be added here
 
 
 class RetryStrategy(str, Enum):
@@ -125,7 +129,9 @@ class RetryPolicy(YamlSerializableMixin, BaseModel):
 
 
 class AgentConfig(YamlSerializableMixin, BaseModel):
-    """Simplified agent configuration."""
+    """Agent configuration."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     type: AgentType = AgentType.STANDARD

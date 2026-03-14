@@ -8,7 +8,7 @@ correctly extend it to expose tools.
 import pytest
 
 from daita.core.tools import AgentTool
-from daita.plugins.base import BasePlugin
+from daita.plugins.base import BasePlugin, LifecyclePlugin
 
 # ===========================================================================
 # Helpers — concrete subclasses
@@ -128,3 +128,71 @@ class TestPluginInitialize:
         plugin.initialize(agent_id="first")
         plugin.initialize(agent_id="second")
         assert plugin.received_agent_id == "second"
+
+
+# ===========================================================================
+# LifecyclePlugin
+# ===========================================================================
+
+
+class ConcreteLifecyclePlugin(LifecyclePlugin):
+    """Minimal concrete LifecyclePlugin for testing default behaviour."""
+    pass
+
+
+class CustomLifecyclePlugin(LifecyclePlugin):
+    """LifecyclePlugin that records hook calls."""
+
+    def __init__(self):
+        self.before_run_prompts = []
+        self.stop_called = False
+
+    async def on_before_run(self, prompt: str):
+        self.before_run_prompts.append(prompt)
+        return f"context for: {prompt}"
+
+    async def on_agent_stop(self):
+        self.stop_called = True
+
+
+class TestLifecyclePlugin:
+    def test_is_subclass_of_base_plugin(self):
+        assert issubclass(LifecyclePlugin, BasePlugin)
+
+    def test_instance_is_base_plugin(self):
+        plugin = ConcreteLifecyclePlugin()
+        assert isinstance(plugin, BasePlugin)
+
+    def test_base_plugin_is_not_lifecycle_plugin(self):
+        plugin = NoToolPlugin()
+        assert not isinstance(plugin, LifecyclePlugin)
+
+    async def test_on_before_run_default_returns_none(self):
+        plugin = ConcreteLifecyclePlugin()
+        result = await plugin.on_before_run("some prompt")
+        assert result is None
+
+    async def test_on_agent_stop_default_does_not_raise(self):
+        plugin = ConcreteLifecyclePlugin()
+        await plugin.on_agent_stop()  # Should not raise
+
+    async def test_on_before_run_override_called_with_prompt(self):
+        plugin = CustomLifecyclePlugin()
+        await plugin.on_before_run("hello")
+        assert plugin.before_run_prompts == ["hello"]
+
+    async def test_on_before_run_override_returns_context(self):
+        plugin = CustomLifecyclePlugin()
+        result = await plugin.on_before_run("test prompt")
+        assert result == "context for: test prompt"
+
+    async def test_on_agent_stop_override_called(self):
+        plugin = CustomLifecyclePlugin()
+        await plugin.on_agent_stop()
+        assert plugin.stop_called is True
+
+    def test_lifecycle_plugin_still_exposes_tools(self):
+        """LifecyclePlugin inherits get_tools from BasePlugin."""
+        plugin = ConcreteLifecyclePlugin()
+        assert plugin.get_tools() == []
+        assert plugin.has_tools is False

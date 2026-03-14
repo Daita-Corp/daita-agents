@@ -7,12 +7,12 @@ Project-scoped by default, global as opt-in.
 
 import os
 from typing import List, Optional
-from ..base import BasePlugin
+from ..base import LifecyclePlugin
 from ...core.tools import AgentTool, tool
 from .metadata import MemoryMetadata
 
 
-class MemoryPlugin(BasePlugin):
+class MemoryPlugin(LifecyclePlugin):
     """
     Production-ready memory plugin for DAITA agents.
 

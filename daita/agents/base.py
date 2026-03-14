@@ -16,11 +16,10 @@ Responsibilities:
 import asyncio
 import logging
 import uuid
-import random
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from ..config.base import AgentConfig, RetryStrategy
+from ..config.base import AgentConfig
 from ..core.interfaces import AgentABC, LLMProvider
 
 from ..core.tracing import get_trace_manager, TraceType
@@ -226,9 +225,7 @@ class BaseAgent(AgentABC):
                             e, attempt, max_attempts, attempt_span_id
                         )
                         if should_retry:
-                            delay = self._calculate_retry_delay(
-                                attempt - 1, retry_policy
-                            )
+                            delay = retry_policy.calculate_delay(attempt)
                             logger.debug(f"Agent {self.name} retrying in {delay:.2f}s")
                             await asyncio.sleep(delay)
                             continue
@@ -318,94 +315,6 @@ class BaseAgent(AgentABC):
                 f"Retry decision for {error_type}: {should_retry} (confidence: {confidence:.2f})"
             )
             return should_retry
-
-    def _calculate_retry_delay(self, attempt: int, retry_policy) -> float:
-        """Calculate retry delay with jitter."""
-        if hasattr(retry_policy, "calculate_delay"):
-            # Use the RetryPolicy's built-in delay calculation
-            return retry_policy.calculate_delay(attempt)
-
-        # Legacy fallback for old-style retry policies
-        if retry_policy.strategy in [RetryStrategy.IMMEDIATE, "immediate"]:
-            delay = 0.0
-        elif retry_policy.strategy in [
-            RetryStrategy.FIXED,
-            RetryStrategy.FIXED_DELAY,
-            "fixed",
-            "fixed_delay",
-        ]:
-            delay = getattr(
-                retry_policy, "base_delay", getattr(retry_policy, "initial_delay", 1.0)
-            )
-        else:  # EXPONENTIAL (default)
-            base_delay = getattr(
-                retry_policy, "base_delay", getattr(retry_policy, "initial_delay", 1.0)
-            )
-            delay = base_delay * (2**attempt)
-
-        # Add small random jitter to prevent thundering herd
-        jitter = delay * 0.1 * random.random()
-        delay += jitter
-
-        return delay
-
-    def _format_success_response(
-        self, result: Any, context: Dict[str, Any], attempt: int, max_attempts: int
-    ) -> Dict[str, Any]:
-        """Format successful response with tracing metadata (flattened for better DX)."""
-        # Build response with framework metadata
-        response = {
-            "status": "success",
-            "agent_id": self.agent_id,
-            "agent_name": self.name,
-            "context": context,
-            "retry_info": (
-                {
-                    "attempt": attempt,
-                    "max_attempts": max_attempts,
-                    "retry_enabled": self.config.retry_enabled,
-                }
-                if self.config.retry_enabled
-                else None
-            ),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-        # Flatten execution result into top level for better DX
-        # If result is a dict, merge it; otherwise add as 'result' key
-        if isinstance(result, dict):
-            # Merge execution result at top level (result keys won't overwrite framework keys)
-            response.update(result)
-        else:
-            # Non-dict results stored under 'result' key
-            response["result"] = result
-
-        return response
-
-    def _format_error_response(
-        self, error: Exception, context: Dict[str, Any], attempt: int, max_attempts: int
-    ) -> Dict[str, Any]:
-        """Format error response with tracing metadata."""
-        return {
-            "status": "error",
-            "error": str(error),
-            "error_type": error.__class__.__name__,
-            "agent_id": self.agent_id,
-            "agent_name": self.name,
-            "context": context,
-            "result": None,  # Ensure result field exists for relay compatibility
-            "retry_info": (
-                {
-                    "attempt": attempt,
-                    "max_attempts": max_attempts,
-                    "retry_enabled": self.config.retry_enabled,
-                    "retry_exhausted": attempt >= max_attempts,
-                }
-                if self.config.retry_enabled
-                else None
-            ),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
 
     @property
     def health(self) -> Dict[str, Any]:
@@ -541,29 +450,6 @@ class BaseAgent(AgentABC):
         if not self.task_manager:
             return False
         return await self.task_manager.cancel_task(task_id)
-
-    # Integration helpers
-
-    def create_child_agent(
-        self, name: str, config_overrides: Optional[Dict[str, Any]] = None
-    ) -> "BaseAgent":
-        """Create a child agent that inherits tracing context."""
-        # Create new config based on current config
-        from ..config.base import AgentConfig
-
-        child_config = AgentConfig(
-            name=name,
-            type=self.config.type,
-            enable_retry=self.config.enable_retry,
-            retry_policy=self.config.retry_policy,
-            **(config_overrides or {}),
-        )
-
-        # Create child agent
-        child = self.__class__(config=child_config, llm_provider=self.llm, name=name)
-
-        logger.debug(f"Created child agent {name} from parent {self.name}")
-        return child
 
     def __repr__(self) -> str:
         return f"BaseAgent(name='{self.name}', id='{self.agent_id}', running={self._running})"

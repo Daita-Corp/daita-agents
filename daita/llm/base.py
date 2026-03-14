@@ -9,7 +9,6 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 import logging
-import asyncio
 
 from ..core.tracing import get_trace_manager, TraceType
 from ..core.interfaces import LLMProvider
@@ -291,31 +290,6 @@ class BaseLLMProvider(LLMProvider, ABC):
         to use their own format (e.g., Anthropic).
         """
         return [tool.to_openai_function() for tool in tools]
-
-    async def _execute_tool_call(
-        self, tool_call: Dict[str, Any], tools: List["AgentTool"]
-    ) -> Any:
-        """Execute a single tool call with timeout and error handling."""
-        tool_name = tool_call["name"]
-        arguments = tool_call["arguments"]
-
-        # Find the tool
-        tool = next((t for t in tools if t.name == tool_name), None)
-        if not tool:
-            return {"error": f"Tool '{tool_name}' not found"}
-
-        # Execute with timeout
-        try:
-            result = await asyncio.wait_for(
-                tool.handler(arguments), timeout=tool.timeout_seconds
-            )
-            return result
-        except asyncio.TimeoutError:
-            return {
-                "error": f"Tool '{tool_name}' timed out after {tool.timeout_seconds}s"
-            }
-        except Exception as e:
-            return {"error": f"Tool '{tool_name}' failed: {str(e)}"}
 
     @property
     def info(self) -> Dict[str, Any]:

@@ -18,7 +18,9 @@ from typing import TYPE_CHECKING, Dict, Any, Optional, List, Union, Callable
 if TYPE_CHECKING:
     from .conversation import ConversationHistory
 
-from ..config.base import AgentConfig, AgentType
+import asyncio
+
+from ..config.base import AgentConfig, AgentType, RetryPolicy
 from ..core.interfaces import LLMProvider
 from ..core.exceptions import AgentError
 from ..core.tracing import TraceType
@@ -26,8 +28,59 @@ from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
 
+
+async def _execute_tool_call(tool_call: Dict[str, Any], tools: List["AgentTool"]) -> Any:
+    """
+    Execute a single tool call with timeout and error handling.
+
+    Intentionally lives in the agent layer — tool execution is an agent concern.
+    The LLM layer is responsible for generating tool call requests; the agent
+    layer is responsible for acting on them.
+    """
+    tool_name = tool_call["name"]
+    arguments = tool_call["arguments"]
+
+    tool = next((t for t in tools if t.name == tool_name), None)
+    if not tool:
+        return {"error": f"Tool '{tool_name}' not found"}
+
+    try:
+        result = await asyncio.wait_for(
+            tool.handler(arguments), timeout=tool.timeout_seconds
+        )
+        return result
+    except asyncio.TimeoutError:
+        return {"error": f"Tool '{tool_name}' timed out after {tool.timeout_seconds}s"}
+    except Exception as e:
+        return {"error": f"Tool '{tool_name}' failed: {str(e)}"}
+
+
+def _json_serializer(obj):
+    """
+    Custom JSON serializer for types commonly returned by database plugins.
+
+    Handles datetime, Decimal, UUID, and other non-JSON-native types that
+    plugins might return from queries.
+    """
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    elif isinstance(obj, Decimal):
+        return float(obj)
+    elif isinstance(obj, UUID):
+        return str(obj)
+    elif isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+    elif hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return obj.to_dict()
+    elif hasattr(obj, "__dict__"):
+        # Exclude private/internal attributes to avoid leaking credentials or state
+        return {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 # Import unified plugin access
 from ..plugins import PluginAccess
+from ..plugins.base import LifecyclePlugin
 from ..llm.factory import create_llm_provider
 from ..config.settings import settings
 from ..core.tools import AgentTool, ToolRegistry
@@ -86,11 +139,6 @@ class LLMResult:
     tool_calls: List[Dict[str, Any]]
 
     @classmethod
-    def from_stream(cls, thinking_text: str, tool_calls: List[Dict]) -> "LLMResult":
-        """Create LLMResult from streaming chunks."""
-        return cls(text=thinking_text, tool_calls=tool_calls)
-
-    @classmethod
     def from_response(cls, response: Any) -> "LLMResult":
         """Create LLMResult from non-streaming response."""
         if isinstance(response, str):
@@ -146,11 +194,19 @@ class Agent(BaseAgent):
         agent_id: Optional[str] = None,
         prompt: Optional[Union[str, Dict[str, str]]] = None,
         focus: Optional[Union[str, Dict[str, str]]] = None,
-        relay: Optional[
-            str
-        ] = None,  # Relay channel name used by the workflow engine to route output
+        relay: Optional[str] = None,
         mcp: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
         display_reasoning: bool = False,
+        # Tool sources
+        tools: Optional[List] = None,
+        # Reliability
+        enable_reliability: bool = False,
+        max_concurrent_tasks: int = 10,
+        max_queue_size: int = 100,
+        # Retry (forwarded to AgentConfig when config is not provided)
+        enable_retry: bool = False,
+        retry_policy: Optional[RetryPolicy] = None,
+        # LLM provider pass-through only (temperature, max_tokens, timeout, etc.)
         **kwargs,
     ):
         """Initialize Agent with smart constructor auto-configuration."""
@@ -160,37 +216,37 @@ class Agent(BaseAgent):
             self._llm_provider_name = llm_provider or self._default_llm_provider
             self._llm_model = model or self._default_model
             self._llm_api_key = api_key
-            # Exclude known Agent-level kwargs that are not LLM provider parameters
-            _non_llm_keys = {
-                "tools",
-                "enable_reliability",
-                "max_concurrent_tasks",
-                "max_queue_size",
-            }
-            self._llm_kwargs = {
-                k: v for k, v in kwargs.items() if k not in _non_llm_keys
-            }
+            self._llm_kwargs = kwargs  # only LLM provider options remain
             self._llm = None
-            self._llm_initialized = False
             llm_provider_to_pass = None
         else:
             # User provided an actual LLM provider instance
             self._llm_provider_name = None
             self._llm_model = None
             self._llm_api_key = None
-            self._llm_kwargs = {}
+            self._llm_kwargs = kwargs
             self._llm = llm_provider
-            self._llm_initialized = True
             llm_provider_to_pass = llm_provider
 
         # Create default config if none provided
         if config is None:
             config = AgentConfig(
-                name=name or "Agent", type=AgentType.STANDARD, **kwargs
+                name=name or "Agent",
+                type=AgentType.STANDARD,
+                enable_retry=enable_retry,
+                retry_policy=retry_policy,
             )
 
         # Initialize base agent (which handles automatic tracing)
-        super().__init__(config, llm_provider_to_pass, agent_id, name)
+        super().__init__(
+            config,
+            llm_provider_to_pass,
+            agent_id,
+            name,
+            enable_reliability=enable_reliability,
+            max_concurrent_tasks=max_concurrent_tasks,
+            max_queue_size=max_queue_size,
+        )
 
         # Store customization options
         self.prompt = prompt
@@ -206,10 +262,10 @@ class Agent(BaseAgent):
 
         # Tool management (unified system)
         self.tool_registry = ToolRegistry()
-        self.tool_sources = kwargs.get(
-            "tools", []
-        )  # Plugins, AgentTool instances, or callables
+        self.tool_sources = []
         self._tools_setup = False
+        for source in (tools or []):
+            self.add_plugin(source)
         self._focus_default_warned: set = (
             set()
         )  # tracks @tool focus defaults already logged
@@ -241,7 +297,7 @@ class Agent(BaseAgent):
         This defers API key validation until the LLM is actually needed,
         improving developer experience when loading .env files.
         """
-        if self._llm is None and not self._llm_initialized:
+        if self._llm is None and self._llm_provider_name is not None:
             # Try to get API key
             api_key = self._llm_api_key or settings.get_llm_api_key(
                 self._llm_provider_name
@@ -257,18 +313,14 @@ class Agent(BaseAgent):
                 # Set agent_id for automatic LLM tracing
                 if self._llm:
                     self._llm.set_agent_id(self.agent_id)
-            self._llm_initialized = True
         return self._llm
 
     @llm.setter
     def llm(self, value):
         """Allow setting LLM provider directly."""
         self._llm = value
-        if value is not None:
-            self._llm_initialized = True
-            # Only set agent_id if it's already initialized (after super().__init__())
-            if hasattr(self, "agent_id"):
-                value.set_agent_id(self.agent_id)
+        if value is not None and hasattr(self, "agent_id"):
+            value.set_agent_id(self.agent_id)
 
     def _setup_decision_display(self):
         """Setup minimal decision display for local development."""
@@ -343,44 +395,39 @@ class Agent(BaseAgent):
             logger.error(f"Failed to setup MCP servers: {str(e)}")
             raise
 
+    def _register_tool_source(self, source) -> None:
+        """Register a single tool source (AgentTool or plugin) into the tool registry."""
+        if isinstance(source, AgentTool):
+            self.tool_registry.register(source)
+        elif hasattr(source, "get_tools"):
+            plugin_tools = source.get_tools()
+            if plugin_tools:
+                self.tool_registry.register_many(plugin_tools)
+                logger.info(
+                    f"Registered {len(plugin_tools)} tools from "
+                    f"{source.__class__.__name__}"
+                )
+        else:
+            logger.warning(
+                f"Invalid tool source: {source}. "
+                f"Expected AgentTool or plugin with get_tools() method."
+            )
+
     async def _setup_tools(self):
-        """Discover and register tools from all sources. Called lazily on first process()."""
+        """Set up MCP tools. Non-MCP tools are registered eagerly in add_plugin()."""
         if self._tools_setup:
             return  # Already setup
 
-        # 1. Setup MCP tools first
+        # Setup MCP tools (requires async connection)
         if self._mcp_server_configs and self.mcp_registry is None:
             await self._setup_mcp_tools()
-            # Convert MCP tools to AgentTool format
             for mcp_tool in self.mcp_tools:
                 agent_tool = AgentTool.from_mcp_tool(mcp_tool, self.mcp_registry)
                 self.tool_registry.register(agent_tool)
 
-        # 2. Register plugin tools
-        for source in self.tool_sources:
-            if isinstance(source, AgentTool):
-                # Direct AgentTool registration
-                self.tool_registry.register(source)
-                logger.debug(f"Registered tool: {source.name}")
-
-            elif hasattr(source, "get_tools"):
-                # Plugin with get_tools() method
-                plugin_tools = source.get_tools()
-                if plugin_tools:
-                    self.tool_registry.register_many(plugin_tools)
-                    logger.info(
-                        f"Registered {len(plugin_tools)} tools from "
-                        f"{source.__class__.__name__}"
-                    )
-            else:
-                logger.warning(
-                    f"Invalid tool source: {source}. "
-                    f"Expected AgentTool or plugin with get_tools() method."
-                )
-
         self._tools_setup = True
         logger.info(
-            f"Agent {self.name} initialized with {self.tool_registry.tool_count} tools"
+            f"Agent {self.name} ready with {self.tool_registry.tool_count} tools"
         )
 
     # ========================================================================
@@ -391,7 +438,7 @@ class Agent(BaseAgent):
         self,
         prompt: str,
         tools: Optional[List[Union[str, AgentTool]]] = None,
-        max_iterations: int = 5,
+        max_iterations: int = 20,
         on_event: Optional[Callable] = None,
         history: Optional["ConversationHistory"] = None,
         **kwargs,
@@ -406,7 +453,7 @@ class Agent(BaseAgent):
         self,
         prompt: str,
         tools: Optional[List[Union[str, AgentTool]]] = None,
-        max_iterations: int = 5,
+        max_iterations: int = 20,
         on_event: Optional[Callable] = None,
         history: Optional["ConversationHistory"] = None,
         **kwargs,
@@ -466,23 +513,6 @@ class Agent(BaseAgent):
             result["processing_time_ms"] = (time.time() - start_time) * 1000
             result["agent_id"] = self.agent_id
             result["agent_name"] = self.name
-
-            # Auto-log to memory plugins if present
-            for source in self.tool_sources:
-                if hasattr(source, "_auto_log"):
-                    try:
-                        await source._auto_log(
-                            user_input=prompt,
-                            agent_output=result.get("result", ""),
-                            timestamp=datetime.now(),
-                            source_metadata={
-                                "workflow": result.get("workflow_metadata"),
-                                "webhook": result.get("webhook_metadata"),
-                                "schedule": result.get("schedule_metadata"),
-                            },
-                        )
-                    except Exception as e:
-                        logger.warning(f"Auto-logging failed: {e}")
 
             # Append completed turn to conversation history
             if history is not None:
@@ -590,7 +620,7 @@ class Agent(BaseAgent):
                     tool_args=chunk.tool_args,
                 )
 
-        return LLMResult.from_stream(thinking_text, tool_calls)
+        return LLMResult(text=thinking_text, tool_calls=tool_calls)
 
     async def _nonstream_llm_turn(
         self, conversation: List[Dict], tools: List["AgentTool"], **kwargs
@@ -614,8 +644,7 @@ class Agent(BaseAgent):
         # Track execution time
         start_time = time.time()
 
-        # Execute via LLM provider (handles focus filtering via FocusedTool.handler)
-        result = await self.llm._execute_tool_call(tool_call=tool_call, tools=tools)
+        result = await _execute_tool_call(tool_call, tools)
 
         # Calculate duration
         duration_ms = int((time.time() - start_time) * 1000)
@@ -644,31 +673,6 @@ class Agent(BaseAgent):
         self, conversation: List[Dict], tool_calls: List[Dict], results: List[Any]
     ):
         """Add tool calls and results to conversation history."""
-
-        def json_serializer(obj):
-            """
-            Custom JSON serializer for types commonly returned by database plugins.
-
-            Handles datetime, Decimal, UUID, and other non-JSON-native types that
-            plugins might return from queries.
-            """
-            if isinstance(obj, (datetime, date)):
-                return obj.isoformat()
-            elif isinstance(obj, Decimal):
-                return float(obj)
-            elif isinstance(obj, UUID):
-                return str(obj)
-            elif isinstance(obj, bytes):
-                return obj.decode("utf-8", errors="replace")
-            elif hasattr(obj, "to_dict") and callable(obj.to_dict):
-                return obj.to_dict()
-            elif hasattr(obj, "__dict__"):
-                # Exclude private/internal attributes to avoid leaking credentials or state
-                return {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
-            raise TypeError(
-                f"Object of type {type(obj).__name__} is not JSON serializable"
-            )
-
         # Add assistant message with tool calls
         conversation.append({"role": "assistant", "tool_calls": tool_calls})
 
@@ -679,7 +683,7 @@ class Agent(BaseAgent):
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "name": tool_call["name"],
-                    "content": json.dumps(result["result"], default=json_serializer),
+                    "content": json.dumps(result["result"], default=_json_serializer),
                 }
             )
 
@@ -739,6 +743,42 @@ class Agent(BaseAgent):
 
         return await self._retry_with_tracing(execute, "autonomous_retry_attempt")
 
+    async def _build_initial_conversation(
+        self,
+        prompt: str,
+        initial_messages: Optional[List[Dict]] = None,
+    ) -> List[Dict]:
+        """Build the opening conversation list for a run.
+
+        Assembles: system prompt + memory context (from on_before_run hooks)
+        + prior history + current user message.
+        """
+        conversation = []
+        system_parts = []
+
+        if self.prompt:
+            system_parts.append(self.prompt)
+
+        for source in self.tool_sources:
+            if isinstance(source, LifecyclePlugin):
+                try:
+                    context = await source.on_before_run(prompt)
+                    if context:
+                        system_parts.append(context)
+                except Exception:
+                    pass
+
+        if system_parts:
+            conversation.append(
+                {"role": "system", "content": "\n\n".join(system_parts)}
+            )
+
+        if initial_messages:
+            conversation.extend(initial_messages)
+
+        conversation.append({"role": "user", "content": prompt})
+        return conversation
+
     async def _execute_autonomous(
         self,
         prompt: str,
@@ -766,34 +806,7 @@ class Agent(BaseAgent):
         # Reset tool call history for this execution
         self._tool_call_history = []
 
-        # Build conversation, injecting system prompt and memory context
-        conversation = []
-
-        # Collect system content: agent's configured prompt + memory context
-        system_parts = []
-        if self.prompt:
-            system_parts.append(self.prompt)
-
-        # Auto-inject relevant memories from any memory plugins
-        for source in self.tool_sources:
-            if hasattr(source, "on_before_run"):
-                try:
-                    context = await source.on_before_run(prompt)
-                    if context:
-                        system_parts.append(context)
-                except Exception:
-                    pass
-
-        if system_parts:
-            conversation.append(
-                {"role": "system", "content": "\n\n".join(system_parts)}
-            )
-
-        # Inject prior conversation turns between system message and current prompt
-        if initial_messages:
-            conversation.extend(initial_messages)
-
-        conversation.append({"role": "user", "content": prompt})
+        conversation = await self._build_initial_conversation(prompt, initial_messages)
         tools_called = []
 
         # Autonomous tool calling loop
@@ -852,21 +865,22 @@ class Agent(BaseAgent):
         context: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """INTERNAL: Process task with data and context. Used by framework for workflow/lambda/system integration."""
-        # Convert task/data to prompt
-        if data is not None:
-            prompt = f"{task}: {data}"
-        else:
-            prompt = task
+        """INTERNAL: Legacy entry point — delegates to receive_message.
 
-        # Use run_detailed as the core execution
-        result = await self.run_detailed(prompt=prompt, **kwargs)
+        Prefer receive_message() for new integrations; this exists for
+        backward compatibility with older workflow and lambda callers.
+        """
+        result = await self.receive_message(
+            data=data if data is not None else task,
+            source_agent="internal",
+            channel="process",
+            workflow_name=task,
+        )
 
-        # Merge context if provided (for internal tracking)
         if context:
             result["context"] = {**result.get("context", {}), **context}
 
-        # Add legacy fields for backward compatibility with internal systems
+        # Legacy fields expected by older internal callers
         result["task"] = task
         result["status"] = "success" if "result" in result else "error"
 
@@ -887,10 +901,8 @@ class Agent(BaseAgent):
         prompt = "A message has arrived from the workflow system. Process the input data below."
 
         # Frame data as content, not as instructions, to prevent prompt injection
-        if isinstance(data, dict):
-            prompt += f"\n\n<input_data>{json.dumps(data)}</input_data>"
-        elif isinstance(data, list):
-            prompt += f"\n\n<input_data>{json.dumps(data)}</input_data>"
+        if isinstance(data, (dict, list)):
+            prompt += f"\n\n<input_data>{json.dumps(data, default=_json_serializer)}</input_data>"
         elif data is not None:
             prompt += f"\n\n<input_data>{str(data)[:4000]}</input_data>"
 
@@ -913,10 +925,17 @@ class Agent(BaseAgent):
 
         Note: `instructions` in webhook_config must be developer-controlled configuration,
         not end-user-supplied content, as it is passed directly to the LLM.
+        The payload is framed as structured data (not instructions) to prevent prompt injection.
         """
         instructions = str(webhook_config.get("instructions", "Process webhook data"))[
             :2000
         ]
+
+        # Inject payload as structured content so the agent can act on it
+        if isinstance(payload, (dict, list)):
+            instructions += f"\n\n<webhook_payload>{json.dumps(payload, default=_json_serializer)}</webhook_payload>"
+        elif payload:
+            instructions += f"\n\n<webhook_payload>{str(payload)[:4000]}</webhook_payload>"
 
         result = await self.run_detailed(instructions)
 
@@ -946,16 +965,15 @@ class Agent(BaseAgent):
 
     def add_plugin(self, plugin: Any):
         """
-        Add a plugin to agent's tool sources.
+        Add a plugin to agent's tool sources and immediately register its tools.
 
         Automatically initializes plugin with agent context if plugin has initialize() method.
-        Tools registered on next setup.
         """
-        # Auto-inject agent context into plugin if it supports initialization
         if hasattr(plugin, "initialize") and callable(plugin.initialize):
             plugin.initialize(agent_id=self.agent_id)
 
         self.tool_sources.append(plugin)
+        self._register_tool_source(plugin)
         logger.debug(f"Added plugin: {plugin.__class__.__name__}")
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
@@ -977,7 +995,7 @@ class Agent(BaseAgent):
         """Stop agent and clean up all resources including MCP connections."""
         # Trigger auto-curation in memory plugins
         for source in self.tool_sources:
-            if hasattr(source, "on_agent_stop"):
+            if isinstance(source, LifecyclePlugin):
                 try:
                     await source.on_agent_stop()
                 except Exception as e:

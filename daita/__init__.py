@@ -38,6 +38,7 @@ from .core.relay import RelayManager
 # ---------------------------------------------------------------------------
 from .plugins import postgresql, mysql, mongodb, rest, s3, slack, elasticsearch, sqlite
 from .plugins.redis_messaging import redis_messaging
+from .plugins.base import BasePlugin, LifecyclePlugin
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -108,6 +109,8 @@ __all__ = [
     "slack",
     "elasticsearch",
     "redis_messaging",
+    "BasePlugin",
+    "LifecyclePlugin",
     # Configuration
     "AgentConfig",
     "RetryPolicy",
