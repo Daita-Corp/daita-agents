@@ -19,7 +19,7 @@ Key components:
 - AgentConfig           — Configure retry policies, LLM settings, and more
 """
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 # ---------------------------------------------------------------------------
 # Core — what 95% of users need
@@ -44,6 +44,11 @@ from .plugins.base import BasePlugin, LifecyclePlugin
 # Configuration
 # ---------------------------------------------------------------------------
 from .config.base import AgentConfig, RetryPolicy, RetryStrategy
+
+# ---------------------------------------------------------------------------
+# Watch system — data source monitoring via @agent.watch()
+# ---------------------------------------------------------------------------
+from .core.watch import WatchEvent
 
 # ---------------------------------------------------------------------------
 # Focus DSL — pre-filter tool results before the LLM sees them
@@ -115,6 +120,8 @@ __all__ = [
     "AgentConfig",
     "RetryPolicy",
     "RetryStrategy",
+    # Watch system
+    "WatchEvent",
     # Focus DSL
     "apply_focus",
     # Exceptions
