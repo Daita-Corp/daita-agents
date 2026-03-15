@@ -153,11 +153,14 @@ class PollingWatchSource:
         """Intentionally a no-op — we don't own the plugin connection."""
 
     async def events(self) -> AsyncGenerator[Any, None]:
-        """Yield one value per poll cycle, with exponential backoff on errors.
+        """Yield one value per poll cycle, with reconnection and exponential backoff.
 
+        connect() is called once before the first poll and again before each
+        retry attempt, so a dropped DB connection is re-established automatically.
         After max_failures consecutive failures the exception is re-raised,
         which lets _watch_loop mark the watch as status="error".
         """
+        await self.connect()
         consecutive_failures = 0
         while True:
             try:
@@ -175,6 +178,7 @@ class PollingWatchSource:
                     f"Poll error ({consecutive_failures}/{self._max_failures}),"
                     f" retrying in {delay}s: {e}"
                 )
+                await self.connect()  # reconnect before retry
                 await asyncio.sleep(delay)
                 continue
             await asyncio.sleep(self.interval.total_seconds())

@@ -233,6 +233,12 @@ class BaseAgent(AgentABC):
         def decorator(handler: Callable) -> Callable:
             watch_name = name or handler.__name__
 
+            if self._watches_started:
+                raise RuntimeError(
+                    f"Cannot register watch '{watch_name}' after the agent has started. "
+                    "Register all watches before calling run() or start()."
+                )
+
             if interval is not None:
                 watch_source = PollingWatchSource(
                     plugin=source,
@@ -281,6 +287,7 @@ class BaseAgent(AgentABC):
 
     async def _start_watch(self, config: Any) -> None:
         """Create and register a background task for a single watch."""
+        self._tasks = [t for t in self._tasks if not t.done()]
         task = asyncio.create_task(
             self._watch_loop(config), name=f"watch:{config.name}"
         )
@@ -304,7 +311,6 @@ class BaseAgent(AgentABC):
         state = WatchState(config=config, task=asyncio.current_task(), status="running")
         self._watch_states[config.name] = state
 
-        await config.source.connect()
         try:
             async for raw_value in config.source.events():
                 try:
@@ -332,7 +338,10 @@ class BaseAgent(AgentABC):
         except Exception as e:
             state.status = "error"
             state.last_error = e
-            logger.error(f"Watch '{config.name}' source failed: {e}")
+            logger.error(
+                f"Watch '{config.name}' failed permanently: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
 
     def _should_trigger(self, config: Any, state: Any, raw_value: Any) -> bool:
         """Determine whether this value should fire the handler."""
@@ -537,6 +546,21 @@ class BaseAgent(AgentABC):
             )
             return should_retry
 
+    def watch_status(self) -> Dict[str, Any]:
+        """Return the current status of all registered watches.
+
+        Useful for health checks, dashboards, and debugging in production.
+        Returns an empty dict if no watches are registered.
+        """
+        return {
+            name: {
+                "status": state.status,
+                "triggered": state.triggered,
+                "last_error": str(state.last_error) if state.last_error else None,
+            }
+            for name, state in self._watch_states.items()
+        }
+
     @property
     def health(self) -> Dict[str, Any]:
         """Get agent health information from unified tracing system."""
@@ -549,6 +573,7 @@ class BaseAgent(AgentABC):
             "type": self.agent_type.value,
             "running": self._running,
             "metrics": metrics,
+            "watches": self.watch_status(),
             "retry_config": {
                 "enabled": self.config.retry_enabled,
                 "max_retries": (
