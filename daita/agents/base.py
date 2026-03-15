@@ -16,8 +16,8 @@ Responsibilities:
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from ..config.base import AgentConfig
 from ..core.interfaces import AgentABC, LLMProvider
@@ -78,6 +78,11 @@ class BaseAgent(AgentABC):
         self._running = False
         self._tasks = []
 
+        # Watch system state
+        self._watches: list = []
+        self._watch_states: dict = {}
+        self._watches_started: bool = False
+
         # Get trace manager for automatic tracing
         self.trace_manager = get_trace_manager()
 
@@ -120,6 +125,9 @@ class BaseAgent(AgentABC):
             self._running = True
             logger.info(f"Agent {self.name} started")
 
+        # Start watches after _running is True so tasks can check agent state
+        await self._start_watches()
+
     async def stop(self) -> None:
         """Stop the agent with automatic lifecycle tracing."""
         if not self._running:
@@ -157,6 +165,213 @@ class BaseAgent(AgentABC):
 
             self._running = False
             logger.info(f"Agent {self.name} stopped")
+
+    # ========================================================================
+    # WATCH SYSTEM — polling/streaming data source monitoring
+    # ========================================================================
+
+    def watch(
+        self,
+        source: Any = None,
+        *,
+        condition: Any = None,
+        threshold: Optional[Callable[[Any], bool]] = None,
+        interval: Optional[Union[str, timedelta]] = None,
+        on_resolve: bool = False,
+        topic: Optional[str] = None,
+        filter: Optional[Callable[[Any], bool]] = None,
+        relay_channel: Optional[str] = None,
+        on_error: Optional[Callable[[Exception], Awaitable[None]]] = None,
+        name: Optional[str] = None,
+    ) -> Callable:
+        """Decorator: register an async handler as a watch on a data source.
+
+        Polling example::
+
+            @agent.watch(source=pg,
+                         condition="SELECT COUNT(*) FROM orders",
+                         threshold=lambda v: v > 100,
+                         interval="10s")
+            async def on_spike(event: WatchEvent):
+                print(f"Order spike: {event.value}")
+
+        Watches start automatically when ``agent.start()`` is called, or lazily
+        on the first ``run()`` / ``run_detailed()`` invocation.
+
+        Args:
+            source: Plugin or WatchSource to poll/subscribe.
+            condition: SQL string or async callable returning the watched value.
+            threshold: Called with the current value; watch fires when it returns True.
+            interval: Poll period — timedelta or string like "30s", "5m", "1h", "2d".
+            on_resolve: If True, fire again when the condition clears.
+            topic: Streaming topic (Phase 2).
+            filter: Message filter for streaming sources (Phase 2).
+            relay_channel: Relay channel to publish events to (Phase 3).
+            on_error: Called when the handler raises; receives the exception.
+            name: Override the watch name (defaults to handler.__name__).
+
+        Raises:
+            ValueError: If the configuration is invalid.
+        """
+        from ..core.watch import _parse_interval, WatchConfig, PollingWatchSource
+
+        if on_resolve and interval is None and topic is None:
+            raise ValueError(
+                "on_resolve=True requires either interval= (polling) or topic= (streaming)"
+            )
+
+        if interval is not None and condition is None and topic is None:
+            raise ValueError(
+                "interval= requires condition= to specify what to poll"
+            )
+
+        if isinstance(interval, str):
+            interval = _parse_interval(interval)
+
+        def decorator(handler: Callable) -> Callable:
+            watch_name = name or handler.__name__
+
+            if interval is not None:
+                watch_source = PollingWatchSource(
+                    plugin=source,
+                    condition=condition,
+                    interval=interval,
+                )
+            else:
+                watch_source = source
+
+            config = WatchConfig(
+                handler=handler,
+                source=watch_source,
+                name=watch_name,
+                condition=condition,
+                threshold=threshold,
+                interval=interval,
+                on_resolve=on_resolve,
+                topic=topic,
+                filter=filter,
+                relay_channel=relay_channel,
+                on_error=on_error,
+            )
+            self._watches.append(config)
+            logger.debug(f"Registered watch '{watch_name}' on agent {self.name}")
+            return handler
+
+        return decorator
+
+    async def _start_watches(self) -> None:
+        """Start all registered watches. Idempotent.
+
+        Called from start() and as a lazy fallback from Agent._run_traced().
+        """
+        if self._watches_started or not self._watches:
+            return
+        for config in self._watches:
+            await self._start_watch(config)
+        self._watches_started = True
+
+    async def _start_watch(self, config: Any) -> None:
+        """Create and register a background task for a single watch."""
+        task = asyncio.create_task(
+            self._watch_loop(config), name=f"watch:{config.name}"
+        )
+        self._tasks.append(task)
+        if self.task_manager:
+            try:
+                await self.task_manager.create_task(
+                    agent_id=self.agent_id,
+                    task_type="watch",
+                    data={"watch_name": config.name},
+                )
+            except Exception as e:
+                logger.debug(
+                    f"task_manager.create_task failed for watch '{config.name}': {e}"
+                )
+
+    async def _watch_loop(self, config: Any) -> None:
+        """Core watch runtime: polls/streams the source, fires the handler on trigger."""
+        from ..core.watch import WatchState
+
+        state = WatchState(config=config, task=asyncio.current_task(), status="running")
+        self._watch_states[config.name] = state
+
+        await config.source.connect()
+        try:
+            async for raw_value in config.source.events():
+                try:
+                    if self._should_trigger(config, state, raw_value):
+                        event = self._build_watch_event(config, state, raw_value)
+                        state.triggered = True
+                        state._previous_value = raw_value
+                        await self._emit_watch_event(event, config)
+                        await self._invoke_handler(config.handler, event, config)
+                    elif config.on_resolve and state.triggered:
+                        state.triggered = False
+                        event = self._build_watch_event(
+                            config, state, raw_value, resolved=True
+                        )
+                        state._previous_value = raw_value
+                        await self._emit_watch_event(event, config)
+                        await self._invoke_handler(config.handler, event, config)
+                    else:
+                        state._previous_value = raw_value
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    state.last_error = e
+                    logger.error(f"Watch '{config.name}' iteration error: {e}")
+        except asyncio.CancelledError:
+            state.status = "stopped"
+        except Exception as e:
+            state.status = "error"
+            state.last_error = e
+            logger.error(f"Watch '{config.name}' source failed: {e}")
+
+    def _should_trigger(self, config: Any, state: Any, raw_value: Any) -> bool:
+        """Determine whether this value should fire the handler."""
+        if config.filter is not None:
+            return config.filter(raw_value)
+        if config.threshold is None:
+            return True
+        return config.threshold(raw_value)
+
+    def _build_watch_event(
+        self, config: Any, state: Any, raw_value: Any, resolved: bool = False
+    ) -> Any:
+        """Construct a WatchEvent from the current state."""
+        from ..core.watch import WatchEvent
+
+        return WatchEvent(
+            value=raw_value,
+            triggered_at=datetime.now(timezone.utc),
+            source_type="polling" if config.interval else "streaming",
+            resolved=resolved,
+            previous_value=state._previous_value,
+        )
+
+    async def _invoke_handler(self, handler: Callable, event: Any, config: Any) -> None:
+        """Call the watch handler, isolating exceptions from the watch loop."""
+        try:
+            await handler(event)
+        except Exception as e:
+            logger.error(f"Watch handler '{config.name}' raised: {e}")
+            if config.on_error:
+                try:
+                    await config.on_error(e)
+                except Exception:
+                    pass
+
+    async def _emit_watch_event(self, event: Any, config: Any) -> None:
+        """Route a WatchEvent through the agent's on_event system if wired up."""
+        from ..core.streaming import AgentEvent, EventType
+
+        agent_event = AgentEvent(
+            type=EventType.WATCH_TRIGGERED if not event.resolved else EventType.WATCH_RESOLVED,
+            watch_name=config.name,
+            watch_event=event,
+        )
+        if hasattr(self, "_on_event") and self._on_event:
+            self._on_event(agent_event)
 
     async def _process(
         self,

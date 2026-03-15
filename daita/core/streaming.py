@@ -20,6 +20,8 @@ class EventType(Enum):
     ITERATION = "iteration"  # New iteration starting
     COMPLETE = "complete"  # Execution finished
     ERROR = "error"  # Error occurred
+    WATCH_TRIGGERED = "watch_triggered"  # Watch condition became active
+    WATCH_RESOLVED = "watch_resolved"  # Watch condition cleared
 
 
 @dataclass
@@ -65,6 +67,10 @@ class AgentEvent:
 
     # ERROR events
     error: Optional[str] = None
+
+    # WATCH_TRIGGERED / WATCH_RESOLVED events
+    watch_name: Optional[str] = None
+    watch_event: Optional[Any] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """

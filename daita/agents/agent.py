@@ -494,6 +494,9 @@ class Agent(BaseAgent):
             max_iterations=max_iterations,
             entry_point="run",  # Distinguishes from _process() calls
         ):
+            # Start watches lazily on first run (idempotent)
+            await self._start_watches()
+
             # Resolve history workspace and extract prior messages before branching
             if history is not None:
                 history._set_workspace(self.agent_id)

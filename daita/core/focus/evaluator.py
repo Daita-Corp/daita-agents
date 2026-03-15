@@ -44,13 +44,14 @@ def evaluate_remaining(data: Any, query: FocusQuery, applied: Set[str]) -> Any:
         rows = rows[: query.limit]
 
     if "select" not in applied and (query.select or query.aggregates):
-        # If every named SELECT column is absent from every row (e.g. the LLM
-        # wrote an aggregating query that dropped those columns), skip projection
-        # rather than returning rows full of None values.
+        # If every named SELECT column is structurally absent from every row
+        # (e.g. an aggregating query dropped those columns entirely), skip
+        # projection rather than returning rows full of None values.
+        # Use key-presence, not value truthiness — null values are legitimate.
         select_cols = query.select or []
         if select_cols and rows:
             entirely_absent = all(
-                all(_get_field(r, c) is None for r in rows) for c in select_cols
+                not any(_field_exists(r, c) for r in rows) for c in select_cols
             )
         else:
             entirely_absent = False
@@ -106,6 +107,18 @@ def _get_field(row: Dict, field: str) -> Any:
         else:
             return None
     return current
+
+
+def _field_exists(row: Dict, field: str) -> bool:
+    """Return True if field is structurally present in row, regardless of value."""
+    if field in row:
+        return True
+    current = row
+    for part in field.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    return True
 
 
 # ── Filter evaluation (AST walk — no eval) ───────────────────────────────────
