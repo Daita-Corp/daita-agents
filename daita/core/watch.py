@@ -87,6 +87,7 @@ class WatchConfig:
     # shared
     relay_channel: Optional[str] = None
     on_error: Optional[Callable[[Exception], Awaitable[None]]] = None
+    handler_timeout: Optional[float] = None  # seconds; None = no timeout
 
 
 @dataclass
@@ -131,10 +132,17 @@ class PollingWatchSource:
     The plugin may be shared with agent tool calls.
     """
 
-    def __init__(self, plugin: Any, condition: Any, interval: timedelta) -> None:
+    def __init__(
+        self,
+        plugin: Any,
+        condition: Any,
+        interval: timedelta,
+        max_failures: int = 5,
+    ) -> None:
         self._plugin = plugin
         self._condition = condition
         self.interval = interval
+        self._max_failures = max_failures
 
     async def connect(self) -> None:
         """Ensure the underlying plugin is connected (idempotent)."""
@@ -145,10 +153,30 @@ class PollingWatchSource:
         """Intentionally a no-op — we don't own the plugin connection."""
 
     async def events(self) -> AsyncGenerator[Any, None]:
-        """Yield one value per poll cycle, forever."""
+        """Yield one value per poll cycle, with exponential backoff on errors.
+
+        After max_failures consecutive failures the exception is re-raised,
+        which lets _watch_loop mark the watch as status="error".
+        """
+        consecutive_failures = 0
         while True:
-            value = await self._evaluate_condition()
-            yield value
+            try:
+                value = await self._evaluate_condition()
+                consecutive_failures = 0
+                yield value
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                consecutive_failures += 1
+                if consecutive_failures >= self._max_failures:
+                    raise
+                delay = min(2 ** consecutive_failures, 60)
+                logger.warning(
+                    f"Poll error ({consecutive_failures}/{self._max_failures}),"
+                    f" retrying in {delay}s: {e}"
+                )
+                await asyncio.sleep(delay)
+                continue
             await asyncio.sleep(self.interval.total_seconds())
 
     async def _evaluate_condition(self) -> Any:
@@ -160,10 +188,14 @@ class PollingWatchSource:
         result = await self._plugin.query(self._condition)
 
         # Unwrap common scalar patterns (e.g. SELECT COUNT(*))
+        # Handles both PostgreSQL-style {"rows": [...]} and SQLite-style plain list.
         if isinstance(result, dict) and "rows" in result:
             rows = result["rows"]
-            if len(rows) == 1 and len(rows[0]) == 1:
-                return list(rows[0].values())[0]
-            return rows
+        elif isinstance(result, list):
+            rows = result
+        else:
+            return result
 
-        return result
+        if len(rows) == 1 and len(rows[0]) == 1:
+            return list(rows[0].values())[0]
+        return rows

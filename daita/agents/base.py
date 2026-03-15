@@ -82,6 +82,7 @@ class BaseAgent(AgentABC):
         self._watches: list = []
         self._watch_states: dict = {}
         self._watches_started: bool = False
+        self._watches_lock: asyncio.Lock = asyncio.Lock()
 
         # Get trace manager for automatic tracing
         self.trace_manager = get_trace_manager()
@@ -182,6 +183,7 @@ class BaseAgent(AgentABC):
         filter: Optional[Callable[[Any], bool]] = None,
         relay_channel: Optional[str] = None,
         on_error: Optional[Callable[[Exception], Awaitable[None]]] = None,
+        handler_timeout: Optional[float] = None,
         name: Optional[str] = None,
     ) -> Callable:
         """Decorator: register an async handler as a watch on a data source.
@@ -252,6 +254,7 @@ class BaseAgent(AgentABC):
                 filter=filter,
                 relay_channel=relay_channel,
                 on_error=on_error,
+                handler_timeout=handler_timeout,
             )
             self._watches.append(config)
             logger.debug(f"Registered watch '{watch_name}' on agent {self.name}")
@@ -260,15 +263,21 @@ class BaseAgent(AgentABC):
         return decorator
 
     async def _start_watches(self) -> None:
-        """Start all registered watches. Idempotent.
+        """Start all registered watches. Idempotent, concurrency-safe.
 
         Called from start() and as a lazy fallback from Agent._run_traced().
+        The fast path (no lock) handles the common single-caller case; the
+        lock + double-check guards concurrent run() calls when reliability
+        is enabled (task_manager introduces yield points in _start_watch).
         """
         if self._watches_started or not self._watches:
             return
-        for config in self._watches:
-            await self._start_watch(config)
-        self._watches_started = True
+        async with self._watches_lock:
+            if self._watches_started:  # re-check after acquiring
+                return
+            for config in self._watches:
+                await self._start_watch(config)
+            self._watches_started = True
 
     async def _start_watch(self, config: Any) -> None:
         """Create and register a background task for a single watch."""
@@ -303,7 +312,6 @@ class BaseAgent(AgentABC):
                         event = self._build_watch_event(config, state, raw_value)
                         state.triggered = True
                         state._previous_value = raw_value
-                        await self._emit_watch_event(event, config)
                         await self._invoke_handler(config.handler, event, config)
                     elif config.on_resolve and state.triggered:
                         state.triggered = False
@@ -311,7 +319,6 @@ class BaseAgent(AgentABC):
                             config, state, raw_value, resolved=True
                         )
                         state._previous_value = raw_value
-                        await self._emit_watch_event(event, config)
                         await self._invoke_handler(config.handler, event, config)
                     else:
                         state._previous_value = raw_value
@@ -352,7 +359,18 @@ class BaseAgent(AgentABC):
     async def _invoke_handler(self, handler: Callable, event: Any, config: Any) -> None:
         """Call the watch handler, isolating exceptions from the watch loop."""
         try:
-            await handler(event)
+            if config.handler_timeout is not None:
+                await asyncio.wait_for(handler(event), timeout=config.handler_timeout)
+            else:
+                await handler(event)
+        except asyncio.TimeoutError:
+            msg = f"Watch handler '{config.name}' timed out after {config.handler_timeout}s"
+            logger.error(msg)
+            if config.on_error:
+                try:
+                    await config.on_error(TimeoutError(msg))
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(f"Watch handler '{config.name}' raised: {e}")
             if config.on_error:
@@ -360,18 +378,6 @@ class BaseAgent(AgentABC):
                     await config.on_error(e)
                 except Exception:
                     pass
-
-    async def _emit_watch_event(self, event: Any, config: Any) -> None:
-        """Route a WatchEvent through the agent's on_event system if wired up."""
-        from ..core.streaming import AgentEvent, EventType
-
-        agent_event = AgentEvent(
-            type=EventType.WATCH_TRIGGERED if not event.resolved else EventType.WATCH_RESOLVED,
-            watch_name=config.name,
-            watch_event=event,
-        )
-        if hasattr(self, "_on_event") and self._on_event:
-            self._on_event(agent_event)
 
     async def _process(
         self,
