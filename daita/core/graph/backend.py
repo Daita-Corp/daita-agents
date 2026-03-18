@@ -15,9 +15,10 @@ Developers never call auto_select_backend() directly. LineagePlugin and CatalogP
 call it during initialize() if no backend was provided at construction time.
 """
 
-from typing import Callable, List, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, List, Optional, Protocol, runtime_checkable
 
-import networkx as nx
+if TYPE_CHECKING:
+    import networkx as nx
 
 from .models import AgentGraphNode, AgentGraphEdge
 
@@ -59,7 +60,7 @@ class GraphBackend(Protocol):
         """
         ...
 
-    async def load_graph(self) -> nx.MultiDiGraph:
+    async def load_graph(self) -> "nx.MultiDiGraph":
         """
         Load the full graph into a NetworkX MultiDiGraph for algorithm execution.
         Each node carries its AgentGraphNode as the 'data' attribute.

@@ -9,15 +9,18 @@ Not suitable for concurrent writes from multiple processes. This is acceptable
 for local development. Use DynamoGraphBackend in production (when available).
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
-import networkx as nx
+if TYPE_CHECKING:
+    import networkx as nx
 
 from .models import AgentGraphNode, AgentGraphEdge
 
@@ -52,6 +55,12 @@ class LocalGraphBackend:
 
     def _load(self) -> nx.MultiDiGraph:
         """Load graph from disk into memory. Returns empty graph if file missing."""
+        try:
+            import networkx as nx
+        except ImportError:
+            raise ImportError(
+                "networkx is required for graph features. Install with: pip install 'daita-agents[lineage]'"
+            )
         if self._graph is not None:
             return self._graph
         if not self._graph_path.exists():
@@ -74,6 +83,8 @@ class LocalGraphBackend:
 
     def _save(self, graph: nx.MultiDiGraph) -> None:
         """Persist graph to disk."""
+        import networkx as nx
+
         data = nx.node_link_data(graph, edges="links")
         with open(self._graph_path, "w") as f:
             json.dump(data, f, indent=2, default=str)
