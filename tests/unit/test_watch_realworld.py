@@ -47,9 +47,15 @@ def _polling(condition, plugin=None) -> PollingWatchSource:
 
 
 async def _drain(agent: Agent, cycles: int = 30) -> None:
-    """Yield control `cycles` times; each sleep(0) lets the watch run one poll."""
+    """Yield control `cycles` times to let background watch tasks progress.
+
+    Uses a 1 ms sleep (not sleep(0)) so that thread-based I/O sources
+    (e.g. aiosqlite) have time to complete their operations between cycles.
+    sleep(0) only yields once; if a thread callback hasn't been posted yet
+    the coroutine resumes immediately and the cycle is wasted.
+    """
     for _ in range(cycles):
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.001)
 
 
 async def _stop(agent: Agent) -> None:
