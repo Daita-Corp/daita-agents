@@ -303,7 +303,7 @@ class AgentPool:
             else:
                 # Last resort: try run_detailed
                 prompt = context.get("prompt", str(data)) if context else str(data)
-                result = await instance.agent.run_detailed(prompt)
+                result = await instance.agent.run(prompt, detailed=True)
 
             logger.debug(f"Task '{task}' completed on instance {instance.id}")
             return result

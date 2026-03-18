@@ -134,6 +134,7 @@ class MySQLPlugin(BaseDatabasePlugin):
         Example:
             results = await db.query("SELECT * FROM users WHERE age > %s", [25])
         """
+        sql = self._normalize_sql(sql)
         # Only auto-connect if pool is None - allows manual mocking
         if self._pool is None:
             await self.connect()
@@ -161,6 +162,7 @@ class MySQLPlugin(BaseDatabasePlugin):
         Returns:
             Number of affected rows
         """
+        sql = self._normalize_sql(sql)
         # Only auto-connect if pool is None - allows manual mocking
         if self._pool is None:
             await self.connect()
@@ -243,7 +245,7 @@ class MySQLPlugin(BaseDatabasePlugin):
         """
         from ..core.tools import AgentTool
 
-        return [
+        tools = [
             AgentTool(
                 name="mysql_query",
                 description="Run a SELECT query on MySQL. Use limit and columns to avoid oversized responses.",
@@ -311,30 +313,6 @@ class MySQLPlugin(BaseDatabasePlugin):
                 timeout_seconds=30,
             ),
             AgentTool(
-                name="mysql_execute",
-                description="Execute INSERT, UPDATE, or DELETE on MySQL. Returns affected row count.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "sql": {
-                            "type": "string",
-                            "description": "SQL statement (INSERT, UPDATE, or DELETE)",
-                        },
-                        "params": {
-                            "type": "array",
-                            "description": "Optional parameter values",
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "required": ["sql"],
-                },
-                handler=self._tool_execute,
-                category="database",
-                source="plugin",
-                plugin_name="MySQL",
-                timeout_seconds=60,
-            ),
-            AgentTool(
                 name="mysql_inspect",
                 description="List all tables and their column schemas in one call. Use instead of calling mysql_list_tables then mysql_get_schema for each table.",
                 parameters={
@@ -355,10 +333,38 @@ class MySQLPlugin(BaseDatabasePlugin):
                 timeout_seconds=30,
             ),
         ]
+        if not self.read_only:
+            tools.append(
+                AgentTool(
+                    name="mysql_execute",
+                    description="Execute INSERT, UPDATE, or DELETE on MySQL. Returns affected row count.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "sql": {
+                                "type": "string",
+                                "description": "SQL statement (INSERT, UPDATE, or DELETE)",
+                            },
+                            "params": {
+                                "type": "array",
+                                "description": "Optional parameter values",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["sql"],
+                    },
+                    handler=self._tool_execute,
+                    category="database",
+                    source="plugin",
+                    plugin_name="MySQL",
+                    timeout_seconds=60,
+                )
+            )
+        return tools
 
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mysql_query"""
-        sql = args.get("sql")
+        sql = self._normalize_sql(args.get("sql"))
         params = args.get("params") or []
         focus_dsl = args.get("focus")
 
@@ -373,7 +379,8 @@ class MySQLPlugin(BaseDatabasePlugin):
                 )
                 if safe_cols:
                     sql = f"SELECT {safe_cols} FROM ({sql}) _mysql_q"
-            sql = f"{sql} LIMIT {int(limit)}"
+            if not re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
+                sql = f"{sql} LIMIT {int(limit)}"
             results = await self.query(sql, params or None)
 
         return {"success": True, "rows": results, "row_count": len(results)}

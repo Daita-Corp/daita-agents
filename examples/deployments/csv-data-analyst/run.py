@@ -51,7 +51,7 @@ DEMO_QUESTIONS = [
 async def ask(agent, question: str, csv_path: str) -> str:
     """Send one question to the agent and return the answer."""
     full_question = f"File: {csv_path}\n\n{question}"
-    result = await agent.run_detailed(full_question)
+    result = await agent.run(full_question, detailed=True)
     return (
         result.get("result", ""),
         result.get("processing_time_ms", 0),

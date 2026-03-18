@@ -169,8 +169,8 @@ if __name__ == "__main__":
             print(f"Analysis: {answer}")
 
             # Detailed usage - get full metadata (cost, time, tools used)
-            result = await agent.run_detailed(
-                f"What's the average and total of: {sales_data}?"
+            result = await agent.run(
+                f"What's the average and total of: {sales_data}?", detailed=True
             )
             print(f"\\nDetailed result:")
             print(f"  Answer: {result['result']}")
@@ -428,7 +428,7 @@ async def test_agent_run():
 
 @pytest.mark.asyncio
 async def test_agent_run_detailed():
-    """Test agent with run_detailed() API."""
+    """Test agent with run(detailed=True) API."""
     from agents.my_agent import create_agent
 
     agent = create_agent()
@@ -436,7 +436,7 @@ async def test_agent_run_detailed():
 
     try:
         # Test with metadata
-        result = await agent.run_detailed("What's the sum of [5, 10, 15]?")
+        result = await agent.run("What's the sum of [5, 10, 15]?", detailed=True)
 
         assert "result" in result
         assert isinstance(result["result"], str)

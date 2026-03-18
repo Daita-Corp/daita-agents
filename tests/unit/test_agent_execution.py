@@ -2,10 +2,10 @@
 Unit tests for Agent execution loop (daita/agents/agent.py).
 
 Covers:
-  - run() returns string, run_detailed() returns dict with expected keys
+  - run() returns string, run(detailed=True) returns dict with expected keys
   - System prompt injection
   - Max iterations limit raises AgentError
-  - Tool calling: tool is executed, result appears in run_detailed()
+  - Tool calling: tool is executed, result appears in run(detailed=True)
   - JSON serializer handles datetime / Decimal / UUID / bytes
   - on_event callback receives ITERATION and COMPLETE events
 """
@@ -73,45 +73,45 @@ class TestBasicExecution:
 
     async def test_run_detailed_returns_dict(self):
         agent = _make_agent(["Hi there."])
-        result = await agent.run_detailed("Say hi")
+        result = await agent.run("Say hi", detailed=True)
         assert isinstance(result, dict)
 
     async def test_run_detailed_has_result_key(self):
         agent = _make_agent(["Answer text."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert "result" in result
         assert isinstance(result["result"], str)
 
     async def test_run_detailed_has_iterations_key(self):
         agent = _make_agent(["Done."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert "iterations" in result
         assert result["iterations"] >= 1
 
     async def test_run_detailed_has_tool_calls_key(self):
         agent = _make_agent(["Done."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert "tool_calls" in result
         assert isinstance(result["tool_calls"], list)
 
     async def test_run_detailed_has_tokens_key(self):
         agent = _make_agent(["Done."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert "tokens" in result
 
     async def test_run_detailed_has_cost_key(self):
         agent = _make_agent(["Done."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert "cost" in result
 
     async def test_run_detailed_has_agent_id(self):
         agent = _make_agent(["Done."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert result.get("agent_id") == agent.agent_id
 
     async def test_run_detailed_has_agent_name(self):
         agent = _make_agent(["Done."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert result.get("agent_name") == agent.name
 
     async def test_run_no_llm_raises_agent_error(self):
@@ -177,7 +177,7 @@ class TestMaxIterations:
 
     async def test_single_iteration_when_no_tool_calls(self):
         agent = _make_agent(["Direct answer."])
-        result = await agent.run_detailed("prompt", max_iterations=5)
+        result = await agent.run("prompt", max_iterations=5, detailed=True)
         assert result["iterations"] == 1
 
 
@@ -225,7 +225,7 @@ class TestToolCallingLoop:
         assert len(call_log) == 1
         assert call_log[0] == {"a": 2, "b": 3}
 
-    async def test_tool_call_appears_in_run_detailed(self):
+    async def test_tool_call_appears_in_run_detailed(self):  # noqa: N802
         tool = _add_tool()
         llm = SequentialMockLLM(
             response_sequence=[
@@ -240,7 +240,7 @@ class TestToolCallingLoop:
         )
         agent = Agent(name="T", llm_provider=llm, tools=[tool])
 
-        result = await agent.run_detailed("add 1 and 1")
+        result = await agent.run("add 1 and 1", detailed=True)
         assert len(result["tool_calls"]) == 1
         assert result["tool_calls"][0]["tool"] == "add"
 
@@ -258,7 +258,7 @@ class TestToolCallingLoop:
             ]
         )
         agent = Agent(name="T", llm_provider=llm, tools=[tool])
-        result = await agent.run_detailed("go")
+        result = await agent.run("go", detailed=True)
         # 1 iteration for tool call + 1 iteration for final answer = 2
         assert result["iterations"] == 2
 

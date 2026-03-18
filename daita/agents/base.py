@@ -198,7 +198,7 @@ class BaseAgent(AgentABC):
                 print(f"Order spike: {event.value}")
 
         Watches start automatically when ``agent.start()`` is called, or lazily
-        on the first ``run()`` / ``run_detailed()`` invocation.
+        on the first ``run()`` / ``stream()`` invocation.
 
         Args:
             source: Plugin or WatchSource to poll/subscribe.
@@ -398,7 +398,7 @@ class BaseAgent(AgentABC):
         """
         INTERNAL: Override in subclasses to handle tasks.
 
-        Agent overrides this to route through run_detailed().
+        Agent overrides this to route through run(detailed=True).
         Custom BaseAgent subclasses can override this directly.
         Workflow and scaling infrastructure call this as a fallback
         when receive_message() is not available.

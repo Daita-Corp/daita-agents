@@ -521,6 +521,23 @@ class ToolRegistry:
         for tool in tools:
             self.register(tool)
 
+    def remove(self, name: str) -> bool:
+        """
+        Unregister a tool by name.
+
+        Args:
+            name: Tool name to remove
+
+        Returns:
+            True if the tool was found and removed, False if not registered
+        """
+        if name not in self._tool_map:
+            return False
+        self.tools = [t for t in self.tools if t.name != name]
+        del self._tool_map[name]
+        logger.debug(f"Unregistered tool: {name}")
+        return True
+
     def get(self, name: str) -> Optional[AgentTool]:
         """
         Get tool by name.

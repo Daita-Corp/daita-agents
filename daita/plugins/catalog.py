@@ -432,13 +432,14 @@ class CatalogPlugin(BasePlugin):
             ssl_mode,
         )
         creds = self._parse_conn_url(connection_string)
+        ssl_arg: Any = False if ssl_mode == "disable" else self._ssl_context(ssl_mode)
         conn = await asyncpg.connect(
             host=creds["host"],
             port=creds["port"] or 5432,
             user=creds["user"],
             password=creds["password"],
             database=creds["database"] or "postgres",
-            ssl=self._ssl_context(ssl_mode),
+            ssl=ssl_arg,
         )
 
         try:
@@ -456,21 +457,27 @@ class CatalogPlugin(BasePlugin):
                 schema,
             )
 
-            # Get columns
+            # Get columns (with optional column-level comments from pg_description)
             columns = await conn.fetch(
                 """
                 SELECT
-                    table_name,
-                    column_name,
-                    data_type,
-                    character_maximum_length,
-                    numeric_precision,
-                    numeric_scale,
-                    is_nullable,
-                    column_default
-                FROM information_schema.columns
-                WHERE table_schema = $1
-                ORDER BY table_name, ordinal_position
+                    c.table_name,
+                    c.column_name,
+                    c.data_type,
+                    c.character_maximum_length,
+                    c.numeric_precision,
+                    c.numeric_scale,
+                    c.is_nullable,
+                    c.column_default,
+                    d.description AS column_comment
+                FROM information_schema.columns c
+                LEFT JOIN pg_catalog.pg_description d
+                    ON d.objoid = (
+                        quote_ident(c.table_schema) || '.' || quote_ident(c.table_name)
+                    )::regclass
+                    AND d.objsubid = c.ordinal_position
+                WHERE c.table_schema = $1
+                ORDER BY c.table_name, c.ordinal_position
             """,
                 schema,
             )
@@ -636,7 +643,8 @@ class CatalogPlugin(BasePlugin):
                         NUMERIC_SCALE as numeric_scale,
                         IS_NULLABLE as is_nullable,
                         COLUMN_DEFAULT as column_default,
-                        COLUMN_KEY as column_key
+                        COLUMN_KEY as column_key,
+                        COLUMN_COMMENT as column_comment
                     FROM information_schema.COLUMNS
                     WHERE TABLE_SCHEMA = %s
                     ORDER BY TABLE_NAME, ORDINAL_POSITION
@@ -1289,6 +1297,168 @@ class CatalogPlugin(BasePlugin):
             logger.info(f"Catalog prune: removed {len(removed)} entries: {removed}")
 
         return {"removed": removed}
+
+    # ------------------------------------------------------------------
+    # Schema normalization — convert discover_* output to normalized shape
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def normalize_postgresql(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize CatalogPlugin PostgreSQL discovery output."""
+        col_by_table: Dict[str, List[Dict[str, Any]]] = {}
+        for col in raw.get("columns", []):
+            col_by_table.setdefault(col["table_name"], []).append(col)
+
+        pk_set = {
+            (pk["table_name"], pk["column_name"])
+            for pk in raw.get("primary_keys", [])
+        }
+
+        tables = []
+        for t in raw.get("tables", []):
+            tname = t["table_name"]
+            cols = []
+            for c in col_by_table.get(tname, []):
+                col: Dict[str, Any] = {
+                    "name": c["column_name"],
+                    "type": c["data_type"],
+                    "nullable": c.get("is_nullable", "YES") == "YES",
+                    "is_primary_key": (tname, c["column_name"]) in pk_set,
+                }
+                if c.get("column_comment"):
+                    col["column_comment"] = c["column_comment"]
+                cols.append(col)
+            tables.append({"name": tname, "row_count": t.get("row_count"), "columns": cols})
+
+        fks = [
+            {
+                "source_table": fk["source_table"],
+                "source_column": fk["source_column"],
+                "target_table": fk["target_table"],
+                "target_column": fk["target_column"],
+            }
+            for fk in raw.get("foreign_keys", [])
+        ]
+
+        db_name = raw.get("schema", "public")
+        return {
+            "database_type": "postgresql",
+            "database_name": db_name,
+            "tables": tables,
+            "foreign_keys": fks,
+            "table_count": len(tables),
+        }
+
+    @staticmethod
+    def normalize_mysql(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize CatalogPlugin MySQL discovery output."""
+        col_by_table: Dict[str, List[Dict[str, Any]]] = {}
+        for col in raw.get("columns", []):
+            col_by_table.setdefault(col["table_name"], []).append(col)
+
+        tables = []
+        for t in raw.get("tables", []):
+            tname = t["table_name"]
+            cols = []
+            for c in col_by_table.get(tname, []):
+                col: Dict[str, Any] = {
+                    "name": c["column_name"],
+                    "type": c.get("data_type", ""),
+                    "nullable": c.get("is_nullable", "YES") == "YES",
+                    "is_primary_key": c.get("column_key", "") == "PRI",
+                }
+                if c.get("column_comment"):
+                    col["column_comment"] = c["column_comment"]
+                cols.append(col)
+            tables.append({"name": tname, "row_count": t.get("row_count"), "columns": cols})
+
+        fks = [
+            {
+                "source_table": fk["source_table"],
+                "source_column": fk["source_column"],
+                "target_table": fk["target_table"],
+                "target_column": fk["target_column"],
+            }
+            for fk in raw.get("foreign_keys", [])
+        ]
+
+        db_name = raw.get("schema", "")
+        return {
+            "database_type": "mysql",
+            "database_name": db_name,
+            "tables": tables,
+            "foreign_keys": fks,
+            "table_count": len(tables),
+        }
+
+    @staticmethod
+    def normalize_mongodb(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize CatalogPlugin MongoDB discovery output."""
+        tables = []
+        for coll in raw.get("collections", []):
+            cols = [
+                {
+                    "name": f["field_name"],
+                    "type": f["types"][0] if f.get("types") else "mixed",
+                    "nullable": True,
+                    "is_primary_key": f["field_name"] == "_id",
+                }
+                for f in coll.get("fields", [])
+            ]
+            tables.append(
+                {
+                    "name": coll["collection_name"],
+                    "row_count": coll.get("document_count"),
+                    "columns": cols,
+                }
+            )
+
+        return {
+            "database_type": "mongodb",
+            "database_name": raw.get("database", ""),
+            "tables": tables,
+            "foreign_keys": [],
+            "table_count": len(tables),
+        }
+
+    @staticmethod
+    def normalize_discovery(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert ``discover_*`` output to the normalized schema shape.
+
+        Dispatches by ``raw["database_type"]``; returns *raw* unchanged for
+        unrecognized types.
+
+        Normalized shape::
+
+            {
+                "database_type": str,
+                "database_name": str,
+                "tables": [
+                    {
+                        "name": str,
+                        "row_count": int | None,
+                        "columns": [
+                            {"name": str, "type": str, "nullable": bool,
+                             "is_primary_key": bool}
+                        ],
+                    }
+                ],
+                "foreign_keys": [
+                    {"source_table": str, "source_column": str,
+                     "target_table": str, "target_column": str}
+                ],
+                "table_count": int,
+            }
+        """
+        db_type = raw.get("database_type", "unknown")
+        if db_type == "postgresql":
+            return CatalogPlugin.normalize_postgresql(raw)
+        if db_type == "mysql":
+            return CatalogPlugin.normalize_mysql(raw)
+        if db_type == "mongodb":
+            return CatalogPlugin.normalize_mongodb(raw)
+        return raw  # passthrough for unrecognized types
 
 
 def catalog(**kwargs) -> CatalogPlugin:

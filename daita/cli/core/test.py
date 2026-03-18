@@ -98,11 +98,11 @@ async def _test_agent(agent_file, name, test_data, verbose):
             # Start the agent
             await agent_instance.start()
 
-            # Run with test data - use run_detailed() to get full execution info
+            # Run with test data - use run(detailed=True) to get full execution info
             test_prompt = f"Process this test data: {test_data}"
-            result = await agent_instance.run_detailed(test_prompt)
+            result = await agent_instance.run(test_prompt, detailed=True)
 
-            # Validate result format from run_detailed()
+            # Validate result format from run(detailed=True)
             if not isinstance(result, dict):
                 print(
                     f"  {name}: Warning - agent returned {type(result).__name__} instead of dict"

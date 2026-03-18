@@ -52,6 +52,7 @@ class BaseDatabasePlugin(BasePlugin):
         self.config = kwargs
         self.timeout = kwargs.get("timeout", 30)
         self.max_retries = kwargs.get("max_retries", 3)
+        self.read_only = kwargs.get("read_only", False)
 
         logger.debug(
             f"{self.__class__.__name__} initialized with config keys: {list(kwargs.keys())}"
@@ -142,6 +143,19 @@ class BaseDatabasePlugin(BasePlugin):
                 error_msg,
                 context={"plugin": self.__class__.__name__, "operation": operation},
             ) from error
+
+    @staticmethod
+    def _normalize_sql(sql: str) -> str:
+        """Strip trailing whitespace and semicolons from a single SQL statement.
+
+        LLMs commonly append trailing semicolons to generated SQL. These break
+        query manipulation (LIMIT appending, subquery wrapping) and some drivers
+        reject single-statement calls that end with a semicolon.
+
+        Do NOT use this on multi-statement scripts (execute_script), only for
+        single-statement query/execute calls.
+        """
+        return sql.rstrip().rstrip(";").rstrip()
 
     async def query_checked(
         self,

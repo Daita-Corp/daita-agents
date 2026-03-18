@@ -6,6 +6,7 @@ File-based (or in-memory) async SQLite access via aiosqlite.
 
 import asyncio
 import logging
+import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from .base_db import BaseDatabasePlugin
 
@@ -139,6 +140,7 @@ class SQLitePlugin(BaseDatabasePlugin):
         Returns:
             List of rows as dictionaries.
         """
+        sql = self._normalize_sql(sql)
         if self._db is None:
             await self.connect()
 
@@ -160,6 +162,7 @@ class SQLitePlugin(BaseDatabasePlugin):
         Returns:
             Number of rows affected.
         """
+        sql = self._normalize_sql(sql)
         if self._db is None:
             await self.connect()
 
@@ -300,7 +303,7 @@ class SQLitePlugin(BaseDatabasePlugin):
         """Expose SQLite operations as agent tools."""
         from ..core.tools import AgentTool
 
-        return [
+        tools = [
             AgentTool(
                 name="sqlite_query",
                 description="Run a SELECT query on SQLite. Use ? placeholders for parameters. Use limit and columns to keep responses small.",
@@ -333,30 +336,6 @@ class SQLitePlugin(BaseDatabasePlugin):
                     "required": ["sql"],
                 },
                 handler=self._tool_query,
-                category="database",
-                source="plugin",
-                plugin_name="SQLite",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="sqlite_execute",
-                description="Execute INSERT, UPDATE, or DELETE on SQLite. Use ? placeholders. Returns affected row count.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "sql": {
-                            "type": "string",
-                            "description": "SQL statement (INSERT, UPDATE, or DELETE) with ? placeholders",
-                        },
-                        "params": {
-                            "type": "array",
-                            "description": "Optional parameter values for ? placeholders",
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "required": ["sql"],
-                },
-                handler=self._tool_execute,
                 category="database",
                 source="plugin",
                 plugin_name="SQLite",
@@ -412,13 +391,41 @@ class SQLitePlugin(BaseDatabasePlugin):
                 timeout_seconds=15,
             ),
         ]
+        if not self.read_only:
+            tools.append(
+                AgentTool(
+                    name="sqlite_execute",
+                    description="Execute INSERT, UPDATE, or DELETE on SQLite. Use ? placeholders. Returns affected row count.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "sql": {
+                                "type": "string",
+                                "description": "SQL statement (INSERT, UPDATE, or DELETE) with ? placeholders",
+                            },
+                            "params": {
+                                "type": "array",
+                                "description": "Optional parameter values for ? placeholders",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["sql"],
+                    },
+                    handler=self._tool_execute,
+                    category="database",
+                    source="plugin",
+                    plugin_name="SQLite",
+                    timeout_seconds=60,
+                )
+            )
+        return tools
 
     # ------------------------------------------------------------------
     # Tool handlers
     # ------------------------------------------------------------------
 
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        sql = args.get("sql")
+        sql = self._normalize_sql(args.get("sql"))
         params = args.get("params") or []
         focus_dsl = args.get("focus")
 
@@ -428,13 +435,13 @@ class SQLitePlugin(BaseDatabasePlugin):
             limit = args.get("limit", 50)
             columns = args.get("columns")
             if columns:
-                import re
                 safe_cols = ", ".join(
                     f'"{c}"' for c in columns if re.match(r"^[A-Za-z0-9_]+$", c)
                 )
                 if safe_cols:
                     sql = f"SELECT {safe_cols} FROM ({sql})"
-            sql = f"{sql} LIMIT {int(limit)}"
+            if not re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
+                sql = f"{sql} LIMIT {int(limit)}"
             results = await self.query(sql, params or None)
 
         return {"success": True, "rows": results, "row_count": len(results)}

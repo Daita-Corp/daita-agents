@@ -6,6 +6,7 @@ and zero-configuration tracing. Use Agent for most use cases; subclass BaseAgent
 for full control over the execution loop.
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -53,6 +54,14 @@ async def _execute_tool_call(tool_call: Dict[str, Any], tools: List["AgentTool"]
         return {"error": f"Tool '{tool_name}' timed out after {tool.timeout_seconds}s"}
     except Exception as e:
         return {"error": f"Tool '{tool_name}' failed: {str(e)}"}
+
+
+def _make_error_fingerprint(tool_call: Dict[str, Any]) -> str:
+    """Stable hash of (tool_name, arguments) used for loop detection."""
+    args_hash = hashlib.md5(
+        json.dumps(tool_call.get("arguments", {}), sort_keys=True, default=str).encode()
+    ).hexdigest()[:8]
+    return f"{tool_call['name']}:{args_hash}"
 
 
 def _json_serializer(obj):
@@ -191,6 +200,41 @@ class Agent(BaseAgent):
             )
         for key, value in kwargs.items():
             setattr(cls, f"_default_{key}", value)
+
+    @classmethod
+    async def from_db(cls, source, **kwargs):
+        """Create a fully configured Agent from a database connection string or plugin.
+
+        Connects to the database, discovers the schema, generates a system prompt,
+        and returns an Agent with query tools ready to use.
+
+        Args:
+            source: Connection string (e.g. "postgresql://user:pass@host/db") or
+                    a BaseDatabasePlugin instance.
+            **kwargs: Common options:
+                name: Agent name override.
+                model, api_key, llm_provider: LLM configuration.
+                prompt: User context prepended to auto-generated schema prompt.
+                db_schema: DB schema name override (e.g. "public" for PostgreSQL).
+                lineage: True to auto-create LineagePlugin, or pass an instance.
+                    Seeds FK relationships into a persistent graph.
+                memory: True to auto-create MemoryPlugin, or pass an instance.
+                    Enables conversational business context annotations.
+                cache_ttl: Schema cache TTL in seconds. None disables caching.
+                Additional kwargs forwarded to Agent.__init__.
+
+        Example:
+            agent = await Agent.from_db(
+                "postgresql://localhost/mydb",
+                lineage=True,
+                memory=True,
+                cache_ttl=3600,
+            )
+            result = await agent.run("What are our top customers?")
+        """
+        from .db import from_db
+
+        return await from_db(source, **kwargs)
 
     def __init__(
         self,
@@ -447,35 +491,89 @@ class Agent(BaseAgent):
         prompt: str,
         tools: Optional[List[Union[str, AgentTool]]] = None,
         max_iterations: int = 20,
+        timeout_seconds: Optional[int] = None,
         on_event: Optional[Callable] = None,
         history: Optional["ConversationHistory"] = None,
+        detailed: bool = False,
         **kwargs,
-    ) -> str:
-        """Execute instruction with autonomous tool calling, returns final answer string."""
-        result = await self._run_traced(
-            prompt, tools, max_iterations, on_event, history=history, **kwargs
-        )
-        return result["result"]
+    ) -> Union[str, Dict[str, Any]]:
+        """Execute instruction with autonomous tool calling.
 
-    async def run_detailed(
+        Args:
+            detailed: When ``True``, return the full execution dict (result,
+                tool_calls, iterations, tokens, cost, processing_time_ms, …)
+                instead of just the answer string.
+        """
+        result = await self._run_traced(
+            prompt, tools, max_iterations, timeout_seconds, on_event, history=history, **kwargs
+        )
+        return result if detailed else result["result"]
+
+    async def stream(
         self,
         prompt: str,
         tools: Optional[List[Union[str, AgentTool]]] = None,
         max_iterations: int = 20,
-        on_event: Optional[Callable] = None,
+        timeout_seconds: Optional[int] = None,
         history: Optional["ConversationHistory"] = None,
         **kwargs,
-    ) -> Dict[str, Any]:
-        """Like run() but returns full execution details: result, tool_calls, iterations, tokens, cost, time."""
-        return await self._run_traced(
-            prompt, tools, max_iterations, on_event, history=history, **kwargs
-        )
+    ):
+        """Execute instruction and yield :class:`AgentEvent` objects as they arrive.
+
+        Async generator — use ``async for event in agent.stream(...)``.
+        Yields events until a ``COMPLETE`` or ``ERROR`` event is emitted.
+
+        Example::
+
+            async for event in agent.stream("What are total sales?"):
+                if event.type == EventType.THINKING:
+                    print(event.content, end="", flush=True)
+                elif event.type == EventType.COMPLETE:
+                    print("\\nDone:", event.final_result)
+        """
+        from ..core.streaming import AgentEvent, EventType
+
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def _on_event(event: AgentEvent) -> None:
+            queue.put_nowait(event)
+
+        async def _run_bg() -> None:
+            try:
+                await self._run_traced(
+                    prompt, tools, max_iterations, timeout_seconds,
+                    _on_event, history=history, **kwargs,
+                )
+            except Exception as exc:
+                queue.put_nowait(exc)
+            finally:
+                queue.put_nowait(None)  # sentinel
+
+        task = asyncio.create_task(_run_bg())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+                if item.type in (EventType.COMPLETE, EventType.ERROR):
+                    break
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     async def _run_traced(
         self,
         prompt: str,
         tools: Optional[List[Union[str, AgentTool]]],
         max_iterations: int,
+        timeout_seconds: Optional[int],
         on_event: Optional[Callable],
         history: Optional["ConversationHistory"] = None,
         **kwargs,
@@ -502,23 +600,34 @@ class Agent(BaseAgent):
                 history._set_workspace(self.agent_id)
                 kwargs["initial_messages"] = history.messages
 
-            # Execute with or without retry based on configuration
-            if self.config.retry_enabled:
-                result = await self._execute_autonomous_with_retry(
+            # Collapse retry/non-retry into a single awaitable so timeout
+            # wraps both paths identically without duplicating the branch.
+            async def _run_inner() -> Dict[str, Any]:
+                if self.config.retry_enabled:
+                    return await self._execute_autonomous_with_retry(
+                        prompt=prompt,
+                        tools=tools,
+                        max_iterations=max_iterations,
+                        on_event=on_event,
+                        **kwargs,
+                    )
+                return await self._execute_autonomous(
                     prompt=prompt,
                     tools=tools,
                     max_iterations=max_iterations,
                     on_event=on_event,
                     **kwargs,
                 )
+
+            if timeout_seconds is not None:
+                try:
+                    result = await asyncio.wait_for(_run_inner(), timeout=timeout_seconds)
+                except asyncio.TimeoutError:
+                    raise AgentError(
+                        f"Run timed out after {timeout_seconds}s"
+                    )
             else:
-                result = await self._execute_autonomous(
-                    prompt=prompt,
-                    tools=tools,
-                    max_iterations=max_iterations,
-                    on_event=on_event,
-                    **kwargs,
-                )
+                result = await _run_inner()
 
             # Enrich result with metadata
             result["processing_time_ms"] = (time.time() - start_time) * 1000
@@ -820,6 +929,12 @@ class Agent(BaseAgent):
         conversation = await self._build_initial_conversation(prompt, initial_messages)
         tools_called = []
 
+        # Tracks consecutive error count per (tool_name, args) fingerprint.
+        # Reset to 0 on any successful call with that fingerprint.
+        # Raised to AgentError when the same call fails 3 times in a row —
+        # the agent has demonstrated it cannot self-correct from this error.
+        _error_fingerprints: Dict[str, int] = {}
+
         # Autonomous tool calling loop
         for iteration in range(max_iterations):
             # Emit iteration event
@@ -850,6 +965,20 @@ class Agent(BaseAgent):
                     )
                     tools_called.append(result)
                     results.append(result)
+
+                    # Loop detection: identical (tool, args) producing consecutive errors
+                    raw = result.get("result", {})
+                    fp = _make_error_fingerprint(tool_call)
+                    if isinstance(raw, dict) and "error" in raw:
+                        _error_fingerprints[fp] = _error_fingerprints.get(fp, 0) + 1
+                        if _error_fingerprints[fp] >= 3:
+                            raise AgentError(
+                                f"Loop detected: '{tool_call['name']}' returned an error "
+                                f"{_error_fingerprints[fp]} consecutive times with identical "
+                                f"arguments. Last error: {raw['error']}"
+                            )
+                    else:
+                        _error_fingerprints.pop(fp, None)
 
                 # Add to conversation and continue loop
                 self._append_tool_messages(conversation, llm_result.tool_calls, results)
@@ -919,7 +1048,7 @@ class Agent(BaseAgent):
         elif data is not None:
             prompt += f"\n\n<input_data>{str(data)[:4000]}</input_data>"
 
-        result = await self.run_detailed(prompt, **kwargs)
+        result = await self.run(prompt, detailed=True, **kwargs)
 
         # Add workflow metadata to result
         result["workflow_metadata"] = {
@@ -950,7 +1079,7 @@ class Agent(BaseAgent):
         elif payload:
             instructions += f"\n\n<webhook_payload>{str(payload)[:4000]}</webhook_payload>"
 
-        result = await self.run_detailed(instructions)
+        result = await self.run(instructions, detailed=True)
 
         result["webhook_metadata"] = {
             "webhook_id": webhook_config.get("webhook_id"),
@@ -964,7 +1093,7 @@ class Agent(BaseAgent):
         """Handle scheduled task execution (cron jobs). Called automatically by scheduler."""
         task = schedule_config.get("task", "Execute scheduled task")
 
-        result = await self.run_detailed(task)
+        result = await self.run(task, detailed=True)
 
         result["schedule_metadata"] = {
             "schedule_id": schedule_config.get("schedule_id"),
