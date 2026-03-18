@@ -263,6 +263,7 @@ dev = [
     "black>=23.0.0",
     "mypy>=1.4.0",
     "pre-commit>=3.0.0",
+    "aiosqlite>=0.21.0",  # used by sqlite unit tests (lightweight, built-in Python SQLite)
 ]
 
 [project.scripts]
