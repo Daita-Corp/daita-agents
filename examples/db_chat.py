@@ -38,7 +38,7 @@ async def main():
     print(f"Connecting to {db_url.split('@')[-1]} ...")
     agent = await daita.Agent.from_db(
         db_url,
-        history=True,   # keeps prior Q&A in context so follow-up questions work
+        history=True,  # keeps prior Q&A in context so follow-up questions work
         read_only=True,
     )
     print("Ready. Type your question, 'reset' to clear history, or 'quit' to exit.\n")
@@ -59,6 +59,7 @@ async def main():
 
         if question.lower() == "reset":
             from daita.agents.conversation import ConversationHistory
+
             agent._db_history = ConversationHistory()
             print("[History cleared]\n")
             continue
