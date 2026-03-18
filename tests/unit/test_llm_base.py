@@ -195,57 +195,6 @@ class TestSetAgentId:
 
 
 # ===========================================================================
-# _execute_tool_call
-# ===========================================================================
-
-
-class TestExecuteToolCall:
-    async def test_finds_and_executes_tool(self):
-        p = _make_provider()
-        t = _make_tool("calc", return_value=42)
-        result = await p._execute_tool_call(
-            tool_call={"name": "calc", "arguments": {}},
-            tools=[t],
-        )
-        assert result == 42
-
-    async def test_unknown_tool_returns_error_dict(self):
-        p = _make_provider()
-        result = await p._execute_tool_call(
-            tool_call={"name": "ghost", "arguments": {}},
-            tools=[],
-        )
-        assert isinstance(result, dict)
-        assert "error" in result
-        assert "not found" in result["error"]
-
-    async def test_tool_timeout_returns_error_dict(self):
-        p = _make_provider()
-        t = _make_slow_tool("slow")
-        result = await p._execute_tool_call(
-            tool_call={"name": "slow", "arguments": {}},
-            tools=[t],
-        )
-        assert isinstance(result, dict)
-        assert "error" in result
-        assert "timed out" in result["error"]
-
-    async def test_tool_exception_returns_error_dict(self):
-        async def h(args):
-            raise RuntimeError("unexpected failure")
-
-        t = AgentTool(name="broken", description="Broken", parameters={}, handler=h)
-        p = _make_provider()
-        result = await p._execute_tool_call(
-            tool_call={"name": "broken", "arguments": {}},
-            tools=[t],
-        )
-        assert isinstance(result, dict)
-        assert "error" in result
-        assert "failed" in result["error"]
-
-
-# ===========================================================================
 # provider.info property
 # ===========================================================================
 

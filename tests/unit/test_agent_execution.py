@@ -2,10 +2,10 @@
 Unit tests for Agent execution loop (daita/agents/agent.py).
 
 Covers:
-  - run() returns string, run_detailed() returns dict with expected keys
+  - run() returns string, run(detailed=True) returns dict with expected keys
   - System prompt injection
   - Max iterations limit raises AgentError
-  - Tool calling: tool is executed, result appears in run_detailed()
+  - Tool calling: tool is executed, result appears in run(detailed=True)
   - JSON serializer handles datetime / Decimal / UUID / bytes
   - on_event callback receives ITERATION and COMPLETE events
 """
@@ -23,6 +23,7 @@ from daita.core.exceptions import AgentError
 from daita.core.streaming import EventType
 from daita.core.tools import AgentTool
 from daita.llm.mock import MockLLMProvider
+from daita.plugins.base import LifecyclePlugin
 
 from tests.conftest import SequentialMockLLM
 
@@ -72,45 +73,45 @@ class TestBasicExecution:
 
     async def test_run_detailed_returns_dict(self):
         agent = _make_agent(["Hi there."])
-        result = await agent.run_detailed("Say hi")
+        result = await agent.run("Say hi", detailed=True)
         assert isinstance(result, dict)
 
     async def test_run_detailed_has_result_key(self):
         agent = _make_agent(["Answer text."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert "result" in result
         assert isinstance(result["result"], str)
 
     async def test_run_detailed_has_iterations_key(self):
         agent = _make_agent(["Done."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert "iterations" in result
         assert result["iterations"] >= 1
 
     async def test_run_detailed_has_tool_calls_key(self):
         agent = _make_agent(["Done."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert "tool_calls" in result
         assert isinstance(result["tool_calls"], list)
 
     async def test_run_detailed_has_tokens_key(self):
         agent = _make_agent(["Done."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert "tokens" in result
 
     async def test_run_detailed_has_cost_key(self):
         agent = _make_agent(["Done."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert "cost" in result
 
     async def test_run_detailed_has_agent_id(self):
         agent = _make_agent(["Done."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert result.get("agent_id") == agent.agent_id
 
     async def test_run_detailed_has_agent_name(self):
         agent = _make_agent(["Done."])
-        result = await agent.run_detailed("prompt")
+        result = await agent.run("prompt", detailed=True)
         assert result.get("agent_name") == agent.name
 
     async def test_run_no_llm_raises_agent_error(self):
@@ -176,7 +177,7 @@ class TestMaxIterations:
 
     async def test_single_iteration_when_no_tool_calls(self):
         agent = _make_agent(["Direct answer."])
-        result = await agent.run_detailed("prompt", max_iterations=5)
+        result = await agent.run("prompt", max_iterations=5, detailed=True)
         assert result["iterations"] == 1
 
 
@@ -224,7 +225,7 @@ class TestToolCallingLoop:
         assert len(call_log) == 1
         assert call_log[0] == {"a": 2, "b": 3}
 
-    async def test_tool_call_appears_in_run_detailed(self):
+    async def test_tool_call_appears_in_run_detailed(self):  # noqa: N802
         tool = _add_tool()
         llm = SequentialMockLLM(
             response_sequence=[
@@ -239,7 +240,7 @@ class TestToolCallingLoop:
         )
         agent = Agent(name="T", llm_provider=llm, tools=[tool])
 
-        result = await agent.run_detailed("add 1 and 1")
+        result = await agent.run("add 1 and 1", detailed=True)
         assert len(result["tool_calls"]) == 1
         assert result["tool_calls"][0]["tool"] == "add"
 
@@ -257,7 +258,7 @@ class TestToolCallingLoop:
             ]
         )
         agent = Agent(name="T", llm_provider=llm, tools=[tool])
-        result = await agent.run_detailed("go")
+        result = await agent.run("go", detailed=True)
         # 1 iteration for tool call + 1 iteration for final answer = 2
         assert result["iterations"] == 2
 
@@ -311,6 +312,94 @@ class TestJsonSerialiser:
 
     async def test_bytes_serialised(self):
         await self._run_with_tool_returning(b"raw bytes")
+
+
+# ===========================================================================
+# _build_initial_conversation
+# ===========================================================================
+
+
+class MemoryPlugin(LifecyclePlugin):
+    """LifecyclePlugin that injects a fixed string via on_before_run."""
+
+    def __init__(self, context: str):
+        self._context = context
+
+    async def on_before_run(self, prompt: str):
+        return self._context
+
+
+class TestBuildInitialConversation:
+    async def test_user_message_always_last(self):
+        agent = _make_agent(["Done."])
+        conv = await agent._build_initial_conversation("Hello")
+        assert conv[-1] == {"role": "user", "content": "Hello"}
+
+    async def test_no_system_when_no_prompt_and_no_plugins(self):
+        agent = _make_agent(["Done."])
+        conv = await agent._build_initial_conversation("Hi")
+        roles = [m["role"] for m in conv]
+        assert "system" not in roles
+
+    async def test_system_included_when_prompt_configured(self):
+        llm = SequentialMockLLM(["Done."])
+        agent = Agent(name="X", llm_provider=llm, prompt="You are helpful.")
+        conv = await agent._build_initial_conversation("Hi")
+        assert conv[0]["role"] == "system"
+        assert "You are helpful." in conv[0]["content"]
+
+    async def test_initial_messages_injected_before_user_message(self):
+        agent = _make_agent(["Done."])
+        history = [
+            {"role": "user", "content": "prev"},
+            {"role": "assistant", "content": "reply"},
+        ]
+        conv = await agent._build_initial_conversation("new", history)
+        assert conv[-3]["content"] == "prev"
+        assert conv[-2]["content"] == "reply"
+        assert conv[-1]["content"] == "new"
+
+    async def test_on_before_run_context_injected_into_system(self):
+        llm = SequentialMockLLM(["Done."])
+        plugin = MemoryPlugin("Relevant memory: user likes Python.")
+        agent = Agent(name="X", llm_provider=llm, tools=[plugin])
+        conv = await agent._build_initial_conversation("Tell me something")
+        system_msg = next(m for m in conv if m["role"] == "system")
+        assert "Relevant memory" in system_msg["content"]
+
+    async def test_multiple_plugin_contexts_combined(self):
+        llm = SequentialMockLLM(["Done."])
+        agent = Agent(
+            name="X",
+            llm_provider=llm,
+            tools=[MemoryPlugin("Memory A"), MemoryPlugin("Memory B")],
+        )
+        conv = await agent._build_initial_conversation("Go")
+        system_msg = next(m for m in conv if m["role"] == "system")
+        assert "Memory A" in system_msg["content"]
+        assert "Memory B" in system_msg["content"]
+
+    async def test_base_plugin_not_called_for_lifecycle(self):
+        # BasePlugin (not LifecyclePlugin) is never consulted for on_before_run
+        from daita.plugins.base import BasePlugin
+
+        class ToolOnlyPlugin(BasePlugin):
+            def get_tools(self):
+                return []
+
+        llm = SequentialMockLLM(["Done."])
+        agent = Agent(name="X", llm_provider=llm, tools=[ToolOnlyPlugin()])
+        conv = await agent._build_initial_conversation("Hi")
+        roles = [m["role"] for m in conv]
+        assert "system" not in roles
+
+    async def test_lifecycle_plugin_returning_none_not_added(self):
+        # LifecyclePlugin.on_before_run returns None by default — no system message
+        llm = SequentialMockLLM(["Done."])
+        agent = Agent(name="X", llm_provider=llm, tools=[LifecyclePlugin()])
+        conv = await agent._build_initial_conversation("Hi")
+        roles = [m["role"] for m in conv]
+        assert "system" not in roles
 
 
 # ===========================================================================

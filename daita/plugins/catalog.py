@@ -6,10 +6,12 @@ organizational metadata across multiple platforms.
 """
 
 import ipaddress
+import json
 import logging
+import os
 import socket
 import ssl
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 from urllib.parse import urlparse, unquote
 
 from .base import BasePlugin
@@ -18,6 +20,30 @@ if TYPE_CHECKING:
     from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
+
+# Module-level registry. Set once at startup via register_catalog_backend_factory().
+# None means persist to .daita/catalog.json (local default).
+_CATALOG_BACKEND_FACTORY: Optional[Callable[[], Any]] = None
+
+
+def register_catalog_backend_factory(factory: Optional[Callable[[], Any]]) -> None:
+    """
+    Register a factory that creates catalog backends.
+
+    Called once at application startup to inject a storage backend for schema
+    documents. Pass None to reset to the default (local .daita/catalog.json),
+    which is useful in tests.
+
+    Args:
+        factory: Callable that takes no arguments and returns a catalog backend
+                 with a ``persist_schema(schema: dict) -> bool`` coroutine method.
+                 Pass None to clear the registered factory and revert to default.
+
+    Example:
+        register_catalog_backend_factory(lambda: MyCatalogBackend())
+    """
+    global _CATALOG_BACKEND_FACTORY
+    _CATALOG_BACKEND_FACTORY = factory
 
 
 class CatalogPlugin(BasePlugin):
@@ -51,6 +77,7 @@ class CatalogPlugin(BasePlugin):
             auto_persist: If True, automatically persist discoveries to the graph backend
         """
         self._graph_backend = backend
+        self._catalog_backend: Optional[Any] = None
         self._organization_id = organization_id
         self._auto_persist = auto_persist
         self._agent_id: Optional[str] = None
@@ -68,8 +95,23 @@ class CatalogPlugin(BasePlugin):
 
             self._graph_backend = auto_select_backend(graph_type="catalog")
             logger.debug(
-                f"CatalogPlugin: using graph backend {type(self._graph_backend).__name__}"
+                "CatalogPlugin: using graph backend %s",
+                type(self._graph_backend).__name__,
             )
+
+        if _CATALOG_BACKEND_FACTORY is not None and self._catalog_backend is None:
+            try:
+                self._catalog_backend = _CATALOG_BACKEND_FACTORY()
+                logger.debug(
+                    "CatalogPlugin: using catalog backend %s",
+                    type(self._catalog_backend).__name__,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "CatalogPlugin: catalog backend factory failed: %s. "
+                    "Schema persistence will use local JSON.",
+                    exc,
+                )
 
     @staticmethod
     def _redact_url(connection_string: str) -> str:
@@ -390,13 +432,14 @@ class CatalogPlugin(BasePlugin):
             ssl_mode,
         )
         creds = self._parse_conn_url(connection_string)
+        ssl_arg: Any = False if ssl_mode == "disable" else self._ssl_context(ssl_mode)
         conn = await asyncpg.connect(
             host=creds["host"],
             port=creds["port"] or 5432,
             user=creds["user"],
             password=creds["password"],
             database=creds["database"] or "postgres",
-            ssl=self._ssl_context(ssl_mode),
+            ssl=ssl_arg,
         )
 
         try:
@@ -414,21 +457,27 @@ class CatalogPlugin(BasePlugin):
                 schema,
             )
 
-            # Get columns
+            # Get columns (with optional column-level comments from pg_description)
             columns = await conn.fetch(
                 """
                 SELECT
-                    table_name,
-                    column_name,
-                    data_type,
-                    character_maximum_length,
-                    numeric_precision,
-                    numeric_scale,
-                    is_nullable,
-                    column_default
-                FROM information_schema.columns
-                WHERE table_schema = $1
-                ORDER BY table_name, ordinal_position
+                    c.table_name,
+                    c.column_name,
+                    c.data_type,
+                    c.character_maximum_length,
+                    c.numeric_precision,
+                    c.numeric_scale,
+                    c.is_nullable,
+                    c.column_default,
+                    d.description AS column_comment
+                FROM information_schema.columns c
+                LEFT JOIN pg_catalog.pg_description d
+                    ON d.objoid = (
+                        quote_ident(c.table_schema) || '.' || quote_ident(c.table_name)
+                    )::regclass
+                    AND d.objsubid = c.ordinal_position
+                WHERE c.table_schema = $1
+                ORDER BY c.table_name, c.ordinal_position
             """,
                 schema,
             )
@@ -504,7 +553,7 @@ class CatalogPlugin(BasePlugin):
             if persist:
                 actually_persisted = await self._persist_schema(result)
                 if not actually_persisted:
-                    persist_skipped_reason = "DynamoDB not yet implemented"
+                    persist_skipped_reason = "catalog backend not configured"
 
             response = {
                 "success": True,
@@ -594,7 +643,8 @@ class CatalogPlugin(BasePlugin):
                         NUMERIC_SCALE as numeric_scale,
                         IS_NULLABLE as is_nullable,
                         COLUMN_DEFAULT as column_default,
-                        COLUMN_KEY as column_key
+                        COLUMN_KEY as column_key,
+                        COLUMN_COMMENT as column_comment
                     FROM information_schema.COLUMNS
                     WHERE TABLE_SCHEMA = %s
                     ORDER BY TABLE_NAME, ORDINAL_POSITION
@@ -636,7 +686,7 @@ class CatalogPlugin(BasePlugin):
             if persist:
                 actually_persisted = await self._persist_schema(result)
                 if not actually_persisted:
-                    persist_skipped_reason = "DynamoDB not yet implemented"
+                    persist_skipped_reason = "catalog backend not configured"
 
             response = {
                 "success": True,
@@ -752,7 +802,7 @@ class CatalogPlugin(BasePlugin):
             if persist:
                 actually_persisted = await self._persist_schema(result)
                 if not actually_persisted:
-                    persist_skipped_reason = "DynamoDB not yet implemented"
+                    persist_skipped_reason = "catalog backend not configured"
 
             response = {
                 "success": True,
@@ -853,7 +903,7 @@ class CatalogPlugin(BasePlugin):
         if persist:
             actually_persisted = await self._persist_schema(result)
             if not actually_persisted:
-                persist_skipped_reason = "DynamoDB not yet implemented"
+                persist_skipped_reason = "catalog backend not configured"
 
         response = {
             "success": True,
@@ -1056,62 +1106,65 @@ class CatalogPlugin(BasePlugin):
             return "string"
 
     async def _persist_schema(self, schema: Dict[str, Any]) -> bool:
-        """Persist schema to .daita/catalog.json (local) or DynamoDB (cloud).
+        """Persist schema to the catalog store and graph backend.
+
+        Storage selection (in priority order):
+        1. self._catalog_backend — set during initialize() when DAITA_CATALOG_BACKEND_CLASS
+           is present. Used in cloud deployments. Falls through to local JSON on failure.
+        2. Local .daita/catalog.json — default for local development.
+
+        In both cases, if a graph backend is available, schema entities are also
+        written as graph nodes so LineagePlugin can reference them by node_id.
 
         Returns True if schema was persisted, False if the operation was skipped.
         """
         import aiofiles
-        import json
-        import os
         from datetime import datetime, timezone
         from pathlib import Path
 
-        is_lambda = (
-            os.getenv("DAITA_RUNTIME") == "lambda"
-            or os.getenv("AWS_LAMBDA_FUNCTION_NAME") is not None
-        )
+        persisted = False
 
-        if is_lambda:
-            # DynamoDB catalog persistence — deferred until visualization surface is ready
-            logger.warning(
-                "Schema persistence skipped in Lambda (DynamoDB not yet implemented): "
-                "%s:%s",
-                schema.get("database_type", "unknown"),
-                schema.get("schema", "unknown"),
-            )
-            return False
-
-        catalog_path = Path(".daita") / "catalog.json"
-        catalog_path.parent.mkdir(parents=True, exist_ok=True)
-
-        existing: Dict[str, Any] = {}
-        if catalog_path.exists():
+        if self._catalog_backend is not None:
             try:
-                async with aiofiles.open(catalog_path, "r") as f:
-                    existing = json.loads(await f.read())
-            except (json.JSONDecodeError, ValueError):
-                logger.warning("catalog.json was corrupt, overwriting.")
+                persisted = await self._catalog_backend.persist_schema(schema)
+            except Exception as exc:
+                logger.warning(
+                    "Catalog backend failed, falling back to local JSON: %s", exc
+                )
 
-        key = f"{schema.get('database_type', 'unknown')}:{schema.get('schema', 'default')}"
-        now = datetime.now(timezone.utc).isoformat()
+        if not persisted:
+            catalog_path = Path(".daita") / "catalog.json"
+            catalog_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if key in existing:
-            # Preserve first_seen from initial discovery; update last_seen
-            schema["first_seen"] = existing[key].get("first_seen", now)
-            schema["last_seen"] = now
-        else:
-            schema["first_seen"] = now
-            schema["last_seen"] = now
+            existing: Dict[str, Any] = {}
+            if catalog_path.exists():
+                try:
+                    async with aiofiles.open(catalog_path, "r") as f:
+                        existing = json.loads(await f.read())
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning("catalog.json was corrupt, overwriting.")
 
-        existing[key] = schema
+            key = f"{schema.get('database_type', 'unknown')}:{schema.get('schema', 'default')}"
+            now = datetime.now(timezone.utc).isoformat()
 
-        async with aiofiles.open(catalog_path, "w") as f:
-            await f.write(json.dumps(existing, indent=2, default=str))
+            if key in existing:
+                # Preserve first_seen from initial discovery; update last_seen
+                schema["first_seen"] = existing[key].get("first_seen", now)
+                schema["last_seen"] = now
+            else:
+                schema["first_seen"] = now
+                schema["last_seen"] = now
 
-        logger.debug(f"Persisted schema {key} to {catalog_path}")
+            existing[key] = schema
 
-        # Also write discovered entities into the shared graph so LineagePlugin
-        # can reference them by node_id when building data flow relationships.
+            async with aiofiles.open(catalog_path, "w") as f:
+                await f.write(json.dumps(existing, indent=2, default=str))
+
+            logger.debug("Persisted schema to %s", catalog_path)
+            persisted = True
+
+        # Write discovered entities as graph nodes so LineagePlugin can reference
+        # them by node_id (e.g. "table:orders"). Runs in both local and cloud paths.
         if self._graph_backend:
             try:
                 await self._persist_schema_to_graph(schema)
@@ -1122,7 +1175,7 @@ class CatalogPlugin(BasePlugin):
                 )
                 schema["graph_persist_error"] = str(graph_err)
 
-        return True
+        return persisted
 
     async def _persist_schema_to_graph(self, schema: Dict[str, Any]) -> None:
         """
@@ -1244,6 +1297,171 @@ class CatalogPlugin(BasePlugin):
             logger.info(f"Catalog prune: removed {len(removed)} entries: {removed}")
 
         return {"removed": removed}
+
+    # ------------------------------------------------------------------
+    # Schema normalization — convert discover_* output to normalized shape
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def normalize_postgresql(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize CatalogPlugin PostgreSQL discovery output."""
+        col_by_table: Dict[str, List[Dict[str, Any]]] = {}
+        for col in raw.get("columns", []):
+            col_by_table.setdefault(col["table_name"], []).append(col)
+
+        pk_set = {
+            (pk["table_name"], pk["column_name"]) for pk in raw.get("primary_keys", [])
+        }
+
+        tables = []
+        for t in raw.get("tables", []):
+            tname = t["table_name"]
+            cols = []
+            for c in col_by_table.get(tname, []):
+                col: Dict[str, Any] = {
+                    "name": c["column_name"],
+                    "type": c["data_type"],
+                    "nullable": c.get("is_nullable", "YES") == "YES",
+                    "is_primary_key": (tname, c["column_name"]) in pk_set,
+                }
+                if c.get("column_comment"):
+                    col["column_comment"] = c["column_comment"]
+                cols.append(col)
+            tables.append(
+                {"name": tname, "row_count": t.get("row_count"), "columns": cols}
+            )
+
+        fks = [
+            {
+                "source_table": fk["source_table"],
+                "source_column": fk["source_column"],
+                "target_table": fk["target_table"],
+                "target_column": fk["target_column"],
+            }
+            for fk in raw.get("foreign_keys", [])
+        ]
+
+        db_name = raw.get("schema", "public")
+        return {
+            "database_type": "postgresql",
+            "database_name": db_name,
+            "tables": tables,
+            "foreign_keys": fks,
+            "table_count": len(tables),
+        }
+
+    @staticmethod
+    def normalize_mysql(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize CatalogPlugin MySQL discovery output."""
+        col_by_table: Dict[str, List[Dict[str, Any]]] = {}
+        for col in raw.get("columns", []):
+            col_by_table.setdefault(col["table_name"], []).append(col)
+
+        tables = []
+        for t in raw.get("tables", []):
+            tname = t["table_name"]
+            cols = []
+            for c in col_by_table.get(tname, []):
+                col: Dict[str, Any] = {
+                    "name": c["column_name"],
+                    "type": c.get("data_type", ""),
+                    "nullable": c.get("is_nullable", "YES") == "YES",
+                    "is_primary_key": c.get("column_key", "") == "PRI",
+                }
+                if c.get("column_comment"):
+                    col["column_comment"] = c["column_comment"]
+                cols.append(col)
+            tables.append(
+                {"name": tname, "row_count": t.get("row_count"), "columns": cols}
+            )
+
+        fks = [
+            {
+                "source_table": fk["source_table"],
+                "source_column": fk["source_column"],
+                "target_table": fk["target_table"],
+                "target_column": fk["target_column"],
+            }
+            for fk in raw.get("foreign_keys", [])
+        ]
+
+        db_name = raw.get("schema", "")
+        return {
+            "database_type": "mysql",
+            "database_name": db_name,
+            "tables": tables,
+            "foreign_keys": fks,
+            "table_count": len(tables),
+        }
+
+    @staticmethod
+    def normalize_mongodb(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize CatalogPlugin MongoDB discovery output."""
+        tables = []
+        for coll in raw.get("collections", []):
+            cols = [
+                {
+                    "name": f["field_name"],
+                    "type": f["types"][0] if f.get("types") else "mixed",
+                    "nullable": True,
+                    "is_primary_key": f["field_name"] == "_id",
+                }
+                for f in coll.get("fields", [])
+            ]
+            tables.append(
+                {
+                    "name": coll["collection_name"],
+                    "row_count": coll.get("document_count"),
+                    "columns": cols,
+                }
+            )
+
+        return {
+            "database_type": "mongodb",
+            "database_name": raw.get("database", ""),
+            "tables": tables,
+            "foreign_keys": [],
+            "table_count": len(tables),
+        }
+
+    @staticmethod
+    def normalize_discovery(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert ``discover_*`` output to the normalized schema shape.
+
+        Dispatches by ``raw["database_type"]``; returns *raw* unchanged for
+        unrecognized types.
+
+        Normalized shape::
+
+            {
+                "database_type": str,
+                "database_name": str,
+                "tables": [
+                    {
+                        "name": str,
+                        "row_count": int | None,
+                        "columns": [
+                            {"name": str, "type": str, "nullable": bool,
+                             "is_primary_key": bool}
+                        ],
+                    }
+                ],
+                "foreign_keys": [
+                    {"source_table": str, "source_column": str,
+                     "target_table": str, "target_column": str}
+                ],
+                "table_count": int,
+            }
+        """
+        db_type = raw.get("database_type", "unknown")
+        if db_type == "postgresql":
+            return CatalogPlugin.normalize_postgresql(raw)
+        if db_type == "mysql":
+            return CatalogPlugin.normalize_mysql(raw)
+        if db_type == "mongodb":
+            return CatalogPlugin.normalize_mongodb(raw)
+        return raw  # passthrough for unrecognized types
 
 
 def catalog(**kwargs) -> CatalogPlugin:

@@ -8,11 +8,10 @@ Filter evaluation walks the Python AST directly; no eval() is used.
 from __future__ import annotations
 
 import ast as pyast
-import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set
 
-from .ast import FocusQuery
+from .ast import FocusQuery, AGG_EXPR_RE as _AGG_EXPR_RE
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
@@ -45,9 +44,20 @@ def evaluate_remaining(data: Any, query: FocusQuery, applied: Set[str]) -> Any:
         rows = rows[: query.limit]
 
     if "select" not in applied and (query.select or query.aggregates):
-        rows = [
-            _project_row(r, query.select or [], query.aggregates or {}) for r in rows
-        ]
+        # If every named SELECT column is structurally absent from every row
+        # (e.g. an aggregating query dropped those columns entirely), skip
+        # projection rather than returning rows full of None values.
+        # Use key-presence, not value truthiness — null values are legitimate.
+        select_cols = query.select or []
+        if select_cols and rows:
+            entirely_absent = all(
+                not any(_field_exists(r, c) for r in rows) for c in select_cols
+            )
+        else:
+            entirely_absent = False
+
+        if not entirely_absent:
+            rows = [_project_row(r, select_cols, query.aggregates or {}) for r in rows]
 
     return _from_rows(rows, original)
 
@@ -95,6 +105,18 @@ def _get_field(row: Dict, field: str) -> Any:
         else:
             return None
     return current
+
+
+def _field_exists(row: Dict, field: str) -> bool:
+    """Return True if field is structurally present in row, regardless of value."""
+    if field in row:
+        return True
+    current = row
+    for part in field.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    return True
 
 
 # ── Filter evaluation (AST walk — no eval) ───────────────────────────────────
@@ -152,6 +174,40 @@ def _flatten_attr(node: pyast.Attribute) -> Optional[List[str]]:
     return None
 
 
+def _coerce_for_cmp(left: Any, right: Any):
+    """
+    Try to make left and right comparable when their types differ.
+
+    Handles the common case of datetime/date values compared against ISO
+    date strings (e.g. ``created_at >= '2023-01-01'``), which databases
+    accept implicitly but Python does not.
+    """
+    from datetime import date, datetime
+
+    if isinstance(left, datetime) and isinstance(right, str):
+        return left, datetime.fromisoformat(right)
+    if isinstance(right, datetime) and isinstance(left, str):
+        return datetime.fromisoformat(left), right
+    if (
+        isinstance(left, date)
+        and not isinstance(left, datetime)
+        and isinstance(right, str)
+    ):
+        return left, date.fromisoformat(right)
+    if (
+        isinstance(right, date)
+        and not isinstance(right, datetime)
+        and isinstance(left, str)
+    ):
+        return date.fromisoformat(left), right
+    # Generic fallback: try to cast right to left's type (e.g. int/float mixing)
+    if isinstance(right, str):
+        return left, type(left)(right)
+    if isinstance(left, str):
+        return type(right)(left), right
+    return left, right
+
+
 def _apply_cmp(op: pyast.cmpop, left: Any, right: Any) -> bool:
     try:
         if isinstance(op, pyast.Eq):
@@ -171,12 +227,8 @@ def _apply_cmp(op: pyast.cmpop, left: Any, right: Any) -> bool:
         if isinstance(op, pyast.NotIn):
             return left not in (right or [])
     except TypeError:
-        # Attempt lightweight coercion for mixed numeric/string comparisons
         try:
-            if isinstance(right, str):
-                right = type(left)(right)
-            elif isinstance(left, str):
-                left = type(right)(left)
+            left, right = _coerce_for_cmp(left, right)
             return _apply_cmp(op, left, right)
         except (TypeError, ValueError):
             return False
@@ -211,8 +263,6 @@ _AGG_FUNCS = {
     "MIN": lambda vals: min((v for v in vals if v is not None), default=None),
     "MAX": lambda vals: max((v for v in vals if v is not None), default=None),
 }
-
-_AGG_EXPR_RE = re.compile(r"^(SUM|COUNT|AVG|MIN|MAX)\((\*|[\w.]+)\)$", re.IGNORECASE)
 
 
 def _parse_agg_expr(expr: str):

@@ -32,6 +32,11 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_AGG = {"SUM", "COUNT", "AVG", "MIN", "MAX"}
 _AGG_EXPR_RE = re.compile(r"^(SUM|COUNT|AVG|MIN|MAX)\((\*|[\w]+)\)$", re.IGNORECASE)
 
+# Matches ISO date strings (YYYY-MM-DD) and ISO datetime strings (YYYY-MM-DD HH:MM:SS
+# or YYYY-MM-DDTHH:MM:SS) so they can be coerced to Python datetime objects before
+# being passed as asyncpg parameters — asyncpg will not auto-cast str → TIMESTAMP.
+_ISO_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?$")
+
 
 def _quote_id(name: str, dialect: str) -> str:
     q = _QUOTE.get(dialect, '"')
@@ -105,7 +110,18 @@ class _SQLFilterCompiler:
         if isinstance(node.value, bool):
             return "TRUE" if node.value else "FALSE"
         ph = self._placeholder()
-        self.params.append(node.value)
+        value = node.value
+        # Coerce ISO date/datetime strings to Python datetime objects so that
+        # database drivers (e.g. asyncpg) can bind them correctly against
+        # TIMESTAMP / DATE columns without a type-mismatch error.
+        if isinstance(value, str) and _ISO_DATETIME_RE.match(value):
+            from datetime import datetime
+
+            try:
+                value = datetime.fromisoformat(value)
+            except ValueError:
+                pass
+        self.params.append(value)
         return ph
 
     def _compare(self, node: pyast.Compare) -> Optional[str]:
@@ -187,10 +203,22 @@ def compile_focus_to_sql(
     fq: FocusQuery,
     dialect: str = "postgresql",
     param_offset: int = 0,
+    mode: str = "safe",
 ) -> tuple[str, list, set[str]]:
     """
-    Wrap *base_query* in a subquery and inject as many FocusQuery clauses as
-    possible as native SQL.
+    Wrap *base_query* in a subquery and inject FocusQuery clauses as native SQL.
+
+    Parameters
+    ----------
+    mode : str
+        ``"safe"`` (default) — push only LIMIT and WHERE.  SELECT, GROUP BY,
+        and ORDER BY are left for the Python evaluator.  Use this whenever the
+        base query is LLM-generated, because the compiler cannot know what
+        columns the subquery will return.
+
+        ``"full"`` — push all translatable clauses.  Use only when the
+        developer controls the base query schema (e.g. a static ``@tool``
+        function), so column compatibility is guaranteed.
 
     Returns
     -------
@@ -215,50 +243,49 @@ def compile_focus_to_sql(
         else:
             applied.add("filter")
 
-    # ── GROUP BY + aggregates ─────────────────────────────────────────────────
+    # ── GROUP BY + aggregates, SELECT, ORDER BY — full mode only ─────────────
     group_sql: Optional[str] = None
     agg_select_parts: list[str] = []
-
-    if fq.group_by:
-        group_cols = fq.group_by
-        # Validate all group-by column names are safe identifiers
-        if all(_IDENTIFIER_RE.match(c) for c in group_cols):
-            group_sql = ", ".join(_quote_id(c, dialect) for c in group_cols)
-            # Build aggregate expressions for the outer SELECT
-            if fq.aggregates:
-                ok = True
-                for alias, expr in fq.aggregates.items():
-                    m = _AGG_EXPR_RE.match(expr.strip())
-                    if not m or m.group(1).upper() not in _SAFE_AGG:
-                        ok = False
-                        break
-                    func = m.group(1).upper()
-                    col = m.group(2)
-                    col_sql = "*" if col == "*" else _quote_id(col, dialect)
-                    agg_select_parts.append(
-                        f"{func}({col_sql}) AS {_quote_id(alias, dialect)}"
-                    )
-                if ok:
-                    applied.update({"group_by", "aggregates"})
-                else:
-                    group_sql = None
-                    agg_select_parts.clear()
-
-    # ── SELECT (column projection) ────────────────────────────────────────────
     select_parts: list[str] = []
-    if fq.select and not group_sql:
-        # Plain projection — only if all names are safe identifiers
-        if all(_IDENTIFIER_RE.match(c) for c in fq.select):
-            select_parts = [_quote_id(c, dialect) for c in fq.select]
-            applied.add("select")
-
-    # ── ORDER BY ──────────────────────────────────────────────────────────────
     order_sql: Optional[str] = None
-    if fq.order_by and _IDENTIFIER_RE.match(fq.order_by):
-        order_sql = f"{_quote_id(fq.order_by, dialect)} {fq.order_dir}"
-        applied.add("order_by")
 
-    # ── LIMIT ─────────────────────────────────────────────────────────────────
+    if mode == "full":
+        # ── GROUP BY + aggregates ─────────────────────────────────────────────
+        if fq.group_by:
+            group_cols = fq.group_by
+            if all(_IDENTIFIER_RE.match(c) for c in group_cols):
+                group_sql = ", ".join(_quote_id(c, dialect) for c in group_cols)
+                if fq.aggregates:
+                    ok = True
+                    for alias, expr in fq.aggregates.items():
+                        m = _AGG_EXPR_RE.match(expr.strip())
+                        if not m or m.group(1).upper() not in _SAFE_AGG:
+                            ok = False
+                            break
+                        func = m.group(1).upper()
+                        col = m.group(2)
+                        col_sql = "*" if col == "*" else _quote_id(col, dialect)
+                        agg_select_parts.append(
+                            f"{func}({col_sql}) AS {_quote_id(alias, dialect)}"
+                        )
+                    if ok:
+                        applied.update({"group_by", "aggregates"})
+                    else:
+                        group_sql = None
+                        agg_select_parts.clear()
+
+        # ── SELECT (column projection) ────────────────────────────────────────
+        if fq.select and not group_sql:
+            if all(_IDENTIFIER_RE.match(c) for c in fq.select):
+                select_parts = [_quote_id(c, dialect) for c in fq.select]
+                applied.add("select")
+
+        # ── ORDER BY ──────────────────────────────────────────────────────────
+        if fq.order_by and _IDENTIFIER_RE.match(fq.order_by):
+            order_sql = f"{_quote_id(fq.order_by, dialect)} {fq.order_dir}"
+            applied.add("order_by")
+
+    # ── LIMIT — always pushed regardless of mode ──────────────────────────────
     limit_sql: Optional[str] = None
     if fq.limit is not None:
         limit_sql = str(fq.limit)

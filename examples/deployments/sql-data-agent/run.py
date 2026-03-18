@@ -53,7 +53,7 @@ DEMO_QUESTIONS = [
 
 
 async def ask(agent, question: str) -> tuple:
-    result = await agent.run_detailed(question)
+    result = await agent.run(question, detailed=True)
     return (
         result.get("result", ""),
         result.get("processing_time_ms", 0),

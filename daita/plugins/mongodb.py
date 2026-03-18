@@ -352,7 +352,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
         """
         from ..core.tools import AgentTool
 
-        return [
+        tools = [
             AgentTool(
                 name="find_documents",
                 description="Find documents in a MongoDB collection. Returns matches.",
@@ -375,79 +375,6 @@ class MongoDBPlugin(BaseDatabasePlugin):
                     "required": ["collection"],
                 },
                 handler=self._tool_find,
-                category="database",
-                source="plugin",
-                plugin_name="MongoDB",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="insert_document",
-                description="Insert a document into a MongoDB collection. Returns the inserted ID.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "collection": {
-                            "type": "string",
-                            "description": "Collection name to insert into",
-                        },
-                        "document": {
-                            "type": "object",
-                            "description": "Document data to insert as JSON object",
-                        },
-                    },
-                    "required": ["collection", "document"],
-                },
-                handler=self._tool_insert,
-                category="database",
-                source="plugin",
-                plugin_name="MongoDB",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="update_documents",
-                description="Update MongoDB documents. Returns matched and modified counts.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "collection": {
-                            "type": "string",
-                            "description": "Collection name",
-                        },
-                        "filter": {
-                            "type": "object",
-                            "description": "Query filter to match documents to update",
-                        },
-                        "update": {
-                            "type": "object",
-                            "description": 'Update operations (e.g., {"$set": {"status": "completed"}})',
-                        },
-                    },
-                    "required": ["collection", "filter", "update"],
-                },
-                handler=self._tool_update,
-                category="database",
-                source="plugin",
-                plugin_name="MongoDB",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="delete_documents",
-                description="Delete MongoDB documents by filter. Returns deleted count.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "collection": {
-                            "type": "string",
-                            "description": "Collection name",
-                        },
-                        "filter": {
-                            "type": "object",
-                            "description": "Query filter to match documents to delete",
-                        },
-                    },
-                    "required": ["collection", "filter"],
-                },
-                handler=self._tool_delete,
                 category="database",
                 source="plugin",
                 plugin_name="MongoDB",
@@ -488,6 +415,83 @@ class MongoDBPlugin(BaseDatabasePlugin):
                 timeout_seconds=60,
             ),
         ]
+        if not self.read_only:
+            tools += [
+                AgentTool(
+                    name="insert_document",
+                    description="Insert a document into a MongoDB collection. Returns the inserted ID.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "collection": {
+                                "type": "string",
+                                "description": "Collection name to insert into",
+                            },
+                            "document": {
+                                "type": "object",
+                                "description": "Document data to insert as JSON object",
+                            },
+                        },
+                        "required": ["collection", "document"],
+                    },
+                    handler=self._tool_insert,
+                    category="database",
+                    source="plugin",
+                    plugin_name="MongoDB",
+                    timeout_seconds=30,
+                ),
+                AgentTool(
+                    name="update_documents",
+                    description="Update MongoDB documents. Returns matched and modified counts.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "collection": {
+                                "type": "string",
+                                "description": "Collection name",
+                            },
+                            "filter": {
+                                "type": "object",
+                                "description": "Query filter to match documents to update",
+                            },
+                            "update": {
+                                "type": "object",
+                                "description": 'Update operations (e.g., {"$set": {"status": "completed"}})',
+                            },
+                        },
+                        "required": ["collection", "filter", "update"],
+                    },
+                    handler=self._tool_update,
+                    category="database",
+                    source="plugin",
+                    plugin_name="MongoDB",
+                    timeout_seconds=60,
+                ),
+                AgentTool(
+                    name="delete_documents",
+                    description="Delete MongoDB documents by filter. Returns deleted count.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "collection": {
+                                "type": "string",
+                                "description": "Collection name",
+                            },
+                            "filter": {
+                                "type": "object",
+                                "description": "Query filter to match documents to delete",
+                            },
+                        },
+                        "required": ["collection", "filter"],
+                    },
+                    handler=self._tool_delete,
+                    category="database",
+                    source="plugin",
+                    plugin_name="MongoDB",
+                    timeout_seconds=60,
+                ),
+            ]
+        return tools
 
     async def _tool_find(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for find_documents"""

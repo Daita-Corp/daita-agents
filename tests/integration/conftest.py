@@ -54,11 +54,44 @@ async def orders_db(db):
             total       REAL
         );
     """)
-    await db.insert_many("orders", [
-        {"id": 1, "customer_id": 100, "amount": 50.0,  "status": "active",   "created_at": "2024-01-01T10:00:00"},
-        {"id": 2, "customer_id": 101, "amount": 150.0, "status": "inactive", "created_at": "2024-01-01T11:00:00"},
-        {"id": 3, "customer_id": 100, "amount": 75.0,  "status": "active",   "created_at": "2024-01-01T12:00:00"},
-        {"id": 4, "customer_id": 102, "amount": 200.0, "status": "active",   "created_at": "2024-01-01T13:00:00"},
-        {"id": 5, "customer_id": 102, "amount": 25.0,  "status": "inactive", "created_at": "2024-01-01T14:00:00"},
-    ])
+    await db.insert_many(
+        "orders",
+        [
+            {
+                "id": 1,
+                "customer_id": 100,
+                "amount": 50.0,
+                "status": "active",
+                "created_at": "2024-01-01T10:00:00",
+            },
+            {
+                "id": 2,
+                "customer_id": 101,
+                "amount": 150.0,
+                "status": "inactive",
+                "created_at": "2024-01-01T11:00:00",
+            },
+            {
+                "id": 3,
+                "customer_id": 100,
+                "amount": 75.0,
+                "status": "active",
+                "created_at": "2024-01-01T12:00:00",
+            },
+            {
+                "id": 4,
+                "customer_id": 102,
+                "amount": 200.0,
+                "status": "active",
+                "created_at": "2024-01-01T13:00:00",
+            },
+            {
+                "id": 5,
+                "customer_id": 102,
+                "amount": 25.0,
+                "status": "inactive",
+                "created_at": "2024-01-01T14:00:00",
+            },
+        ],
+    )
     return db

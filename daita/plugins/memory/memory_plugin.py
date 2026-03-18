@@ -7,12 +7,12 @@ Project-scoped by default, global as opt-in.
 
 import os
 from typing import List, Optional
-from ..base import BasePlugin
+from ..base import LifecyclePlugin
 from ...core.tools import AgentTool, tool
 from .metadata import MemoryMetadata
 
 
-class MemoryPlugin(BasePlugin):
+class MemoryPlugin(LifecyclePlugin):
     """
     Production-ready memory plugin for DAITA agents.
 
@@ -286,7 +286,15 @@ class MemoryPlugin(BasePlugin):
             category: Optional[str] = None,
         ):
             """
-            Search memories by meaning using hybrid semantic + keyword search.
+            Search previously stored agent memories by meaning.
+
+            Use this ONLY to retrieve facts that were explicitly stored with
+            remember() — things like business rules, unit conventions, or
+            analyst notes (e.g. "prices are in cents", "exclude refunded orders").
+
+            Do NOT use this to query database records or find patterns in data.
+            For anything involving rows, columns, or data similarity, write a
+            SQL query instead.
 
             Results are ranked by relevance, weighted by importance, and
             adjusted for age (recent memories rank slightly higher).

@@ -1,12 +1,13 @@
 """
 Unit tests for tool registration and resolution on Agent
 (daita/agents/agent.py — _resolve_tools, call_tool, available_tools, tool_names,
-FocusedTool, and plugin tool setup).
+FocusedTool, plugin tool setup, and _execute_tool_call).
 """
 
+import asyncio
 import pytest
 
-from daita.agents.agent import Agent, FocusedTool
+from daita.agents.agent import Agent, FocusedTool, _execute_tool_call
 from daita.core.tools import AgentTool
 from daita.llm.mock import MockLLMProvider
 
@@ -165,6 +166,58 @@ class TestPluginToolSetup:
         count_after_second = agent.tool_registry.tool_count
 
         assert count_after_first == count_after_second
+
+
+# ===========================================================================
+# _execute_tool_call
+# ===========================================================================
+
+
+def _make_returning_tool(name: str, return_value=None):
+    async def h(args):
+        return return_value
+
+    return AgentTool(name=name, description=f"Tool {name}", parameters={}, handler=h)
+
+
+def _make_slow_tool(name: str, sleep: float = 10.0):
+    async def h(args):
+        await asyncio.sleep(sleep)
+        return "never"
+
+    return AgentTool(
+        name=name, description="Slow", parameters={}, handler=h, timeout_seconds=0.01
+    )
+
+
+class TestExecuteToolCall:
+    async def test_finds_and_executes_tool(self):
+        t = _make_returning_tool("calc", return_value=42)
+        result = await _execute_tool_call({"name": "calc", "arguments": {}}, [t])
+        assert result == 42
+
+    async def test_unknown_tool_returns_error_dict(self):
+        result = await _execute_tool_call({"name": "ghost", "arguments": {}}, [])
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "not found" in result["error"]
+
+    async def test_tool_timeout_returns_error_dict(self):
+        t = _make_slow_tool("slow")
+        result = await _execute_tool_call({"name": "slow", "arguments": {}}, [t])
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "timed out" in result["error"]
+
+    async def test_tool_exception_returns_error_dict(self):
+        async def h(args):
+            raise RuntimeError("unexpected failure")
+
+        t = AgentTool(name="broken", description="Broken", parameters={}, handler=h)
+        result = await _execute_tool_call({"name": "broken", "arguments": {}}, [t])
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "failed" in result["error"]
 
 
 # ===========================================================================

@@ -8,7 +8,6 @@ import pytest
 from daita.core.assertions import ItemAssertion, _evaluate_assertions
 from daita.core.exceptions import DataQualityError
 
-
 # ---------------------------------------------------------------------------
 # ItemAssertion dataclass
 # ---------------------------------------------------------------------------
@@ -19,7 +18,6 @@ def test_item_assertion_stores_check_and_description():
     a = ItemAssertion(check=check, description="x must be positive")
     assert a.check is check
     assert a.description == "x must be positive"
-
 
 
 def test_item_assertion_check_returns_true_for_valid_item():

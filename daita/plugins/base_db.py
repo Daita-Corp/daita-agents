@@ -52,6 +52,7 @@ class BaseDatabasePlugin(BasePlugin):
         self.config = kwargs
         self.timeout = kwargs.get("timeout", 30)
         self.max_retries = kwargs.get("max_retries", 3)
+        self.read_only = kwargs.get("read_only", False)
 
         logger.debug(
             f"{self.__class__.__name__} initialized with config keys: {list(kwargs.keys())}"
@@ -143,6 +144,19 @@ class BaseDatabasePlugin(BasePlugin):
                 context={"plugin": self.__class__.__name__, "operation": operation},
             ) from error
 
+    @staticmethod
+    def _normalize_sql(sql: str) -> str:
+        """Strip trailing whitespace and semicolons from a single SQL statement.
+
+        LLMs commonly append trailing semicolons to generated SQL. These break
+        query manipulation (LIMIT appending, subquery wrapping) and some drivers
+        reject single-statement calls that end with a semicolon.
+
+        Do NOT use this on multi-statement scripts (execute_script), only for
+        single-statement query/execute calls.
+        """
+        return sql.rstrip().rstrip(";").rstrip()
+
     async def query_checked(
         self,
         sql: str,
@@ -176,10 +190,14 @@ class BaseDatabasePlugin(BasePlugin):
 
     async def _run_focus_query(self, sql: str, params: list, focus_dsl: str) -> list:
         """
-        Parse *focus_dsl*, push as many clauses as possible into SQL, execute,
-        then let the Python evaluator handle any remainder.
+        Parse *focus_dsl*, push LIMIT and WHERE into SQL (safe mode), execute,
+        then let the Python evaluator handle SELECT, ORDER BY, GROUP BY, and
+        any remaining clauses.
 
-        This is the single integration point for focus in all SQL plugins.
+        If the DB-level pushdown raises an exception (e.g. a WHERE filter
+        references a column absent in an aggregated subquery), the original
+        query is executed without modification and the full focus expression is
+        applied in Python — so focus never crashes the agent.
         """
         from ..core.focus import parse as _parse
         from ..core.focus.backends.sql import compile_focus_to_sql
@@ -187,9 +205,18 @@ class BaseDatabasePlugin(BasePlugin):
 
         fq = _parse(focus_dsl)
         mod_sql, extra_params, applied = compile_focus_to_sql(
-            sql, fq, dialect=self.sql_dialect, param_offset=len(params)
+            sql, fq, dialect=self.sql_dialect, param_offset=len(params), mode="safe"
         )
-        rows = await self.query(mod_sql, params + extra_params or None)
+        try:
+            rows = await self.query(mod_sql, params + extra_params or None)
+        except Exception as db_err:
+            logger.warning(
+                f"Focus SQL pushdown failed ({db_err}); "
+                "falling back to Python-only focus evaluation"
+            )
+            rows = await self.query(sql, params or None)
+            applied = set()  # nothing was applied — Python evaluator handles everything
+
         return evaluate_remaining(rows, fq, applied)
 
     @property

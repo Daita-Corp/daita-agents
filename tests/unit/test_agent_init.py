@@ -111,9 +111,9 @@ class TestLazyLLM:
         agent = Agent(name="X", llm_provider="openai")
         assert agent._llm_provider_name == "openai"
 
-    def test_llm_instance_sets_initialized_flag(self, mock_llm):
+    def test_llm_instance_is_stored_directly(self, mock_llm):
         agent = Agent(name="X", llm_provider=mock_llm)
-        assert agent._llm_initialized is True
+        assert agent._llm is mock_llm
 
     def test_llm_instance_is_accessible(self, mock_llm):
         agent = Agent(name="X", llm_provider=mock_llm)

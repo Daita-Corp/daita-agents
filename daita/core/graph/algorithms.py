@@ -6,10 +6,13 @@ Algorithms are stateless — they take a graph and return results with no
 backend dependency.
 """
 
-from collections import deque
-from typing import Any, Dict, List, Set
+from __future__ import annotations
 
-import networkx as nx
+from collections import deque
+from typing import TYPE_CHECKING, Any, Dict, List, Set
+
+if TYPE_CHECKING:
+    import networkx as nx
 
 
 def traverse(
@@ -80,6 +83,8 @@ def impact_analysis(
     between the same node pair, the maximum impact_weight is used (conservative
     — assumes the highest-impact relationship drives the risk score).
     """
+    import networkx as nx
+
     affected = []
 
     try:
@@ -136,6 +141,8 @@ def find_paths(
     to_node_id: str,
 ) -> List[List[str]]:
     """Find all simple paths between two nodes."""
+    import networkx as nx
+
     try:
         return list(nx.all_simple_paths(graph, from_node_id, to_node_id))
     except (nx.NodeNotFound, nx.NetworkXNoPath):

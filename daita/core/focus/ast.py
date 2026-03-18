@@ -5,8 +5,14 @@ FocusQuery — the intermediate representation produced by the DSL parser.
 from __future__ import annotations
 
 import ast as pyast
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+# Matches already-parsed aggregate expressions stored in FocusQuery.aggregates,
+# e.g. "SUM(revenue)" or "COUNT(*)". The AS alias is stripped at parse time.
+# Shared by the Python evaluator and pandas backend to avoid divergence.
+AGG_EXPR_RE = re.compile(r"^(SUM|COUNT|AVG|MIN|MAX)\((\*|[\w.]+)\)$", re.IGNORECASE)
 
 
 @dataclass

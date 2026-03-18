@@ -16,7 +16,6 @@ from daita.plugins.data_quality import DataQualityPlugin
 from daita.core.assertions import ItemAssertion
 from daita.core.exceptions import DataQualityError
 
-
 # ---------------------------------------------------------------------------
 # Shared fixture: table with known quality characteristics
 # ---------------------------------------------------------------------------
@@ -41,18 +40,81 @@ async def quality_db(db):
         );
     """)
     now_str = datetime.now(timezone.utc).isoformat()
-    await db.insert_many("sales", [
-        {"id": 1,  "product": "A", "amount": 10.0,  "region": "east", "updated_at": now_str},
-        {"id": 2,  "product": "B", "amount": 20.0,  "region": "west", "updated_at": now_str},
-        {"id": 3,  "product": "A", "amount": 30.0,  "region": "east", "updated_at": now_str},
-        {"id": 4,  "product": "C", "amount": 40.0,  "region": "west", "updated_at": now_str},
-        {"id": 5,  "product": "B", "amount": 50.0,  "region": "east", "updated_at": now_str},
-        {"id": 6,  "product": "A", "amount": 60.0,  "region": "west", "updated_at": now_str},
-        {"id": 7,  "product": "C", "amount": 70.0,  "region": "east", "updated_at": now_str},
-        {"id": 8,  "product": "B", "amount": 80.0,  "region": "west", "updated_at": now_str},
-        {"id": 9,  "product": "A", "amount": None,  "region": "east", "updated_at": now_str},
-        {"id": 10, "product": "C", "amount": None,  "region": None,   "updated_at": now_str},
-    ])
+    await db.insert_many(
+        "sales",
+        [
+            {
+                "id": 1,
+                "product": "A",
+                "amount": 10.0,
+                "region": "east",
+                "updated_at": now_str,
+            },
+            {
+                "id": 2,
+                "product": "B",
+                "amount": 20.0,
+                "region": "west",
+                "updated_at": now_str,
+            },
+            {
+                "id": 3,
+                "product": "A",
+                "amount": 30.0,
+                "region": "east",
+                "updated_at": now_str,
+            },
+            {
+                "id": 4,
+                "product": "C",
+                "amount": 40.0,
+                "region": "west",
+                "updated_at": now_str,
+            },
+            {
+                "id": 5,
+                "product": "B",
+                "amount": 50.0,
+                "region": "east",
+                "updated_at": now_str,
+            },
+            {
+                "id": 6,
+                "product": "A",
+                "amount": 60.0,
+                "region": "west",
+                "updated_at": now_str,
+            },
+            {
+                "id": 7,
+                "product": "C",
+                "amount": 70.0,
+                "region": "east",
+                "updated_at": now_str,
+            },
+            {
+                "id": 8,
+                "product": "B",
+                "amount": 80.0,
+                "region": "west",
+                "updated_at": now_str,
+            },
+            {
+                "id": 9,
+                "product": "A",
+                "amount": None,
+                "region": "east",
+                "updated_at": now_str,
+            },
+            {
+                "id": 10,
+                "product": "C",
+                "amount": None,
+                "region": None,
+                "updated_at": now_str,
+            },
+        ],
+    )
     return db
 
 
@@ -198,7 +260,13 @@ async def test_profile_discovers_all_columns_when_unspecified(quality_db):
 
     assert result["success"] is True
     assert result["columns_profiled"] == 5
-    assert set(result["profile"].keys()) == {"id", "product", "amount", "region", "updated_at"}
+    assert set(result["profile"].keys()) == {
+        "id",
+        "product",
+        "amount",
+        "region",
+        "updated_at",
+    }
 
 
 async def test_profile_sample_size_limits_scan(quality_db):
@@ -229,9 +297,7 @@ async def test_check_freshness_returns_fresh_for_recent_data(quality_db):
 
 async def test_check_freshness_returns_stale_for_old_data(db):
     """is_fresh is False when all timestamps are older than the window."""
-    await db.execute_script(
-        "CREATE TABLE stale_events (id INTEGER, ts TEXT);"
-    )
+    await db.execute_script("CREATE TABLE stale_events (id INTEGER, ts TEXT);")
     old_ts = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
     await db.execute(f"INSERT INTO stale_events VALUES (1, '{old_ts}')")
 
@@ -354,11 +420,16 @@ async def test_report_completeness_score_reflects_nulls(quality_db):
 
 async def test_report_completeness_score_is_1_for_complete_table(db):
     """completeness_score is 1.0 when there are no NULLs anywhere."""
-    await db.execute_script("CREATE TABLE complete (id INTEGER, name TEXT, value REAL);")
-    await db.insert_many("complete", [
-        {"id": 1, "name": "a", "value": 1.0},
-        {"id": 2, "name": "b", "value": 2.0},
-    ])
+    await db.execute_script(
+        "CREATE TABLE complete (id INTEGER, name TEXT, value REAL);"
+    )
+    await db.insert_many(
+        "complete",
+        [
+            {"id": 1, "name": "a", "value": 1.0},
+            {"id": 2, "name": "b", "value": 2.0},
+        ],
+    )
 
     dq = DataQualityPlugin()
     result = await dq.report(db, "complete")

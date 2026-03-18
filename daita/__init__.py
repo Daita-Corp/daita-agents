@@ -19,7 +19,7 @@ Key components:
 - AgentConfig           — Configure retry policies, LLM settings, and more
 """
 
-__version__ = "0.9.0"
+__version__ = "0.11.0"
 
 # ---------------------------------------------------------------------------
 # Core — what 95% of users need
@@ -38,11 +38,17 @@ from .core.relay import RelayManager
 # ---------------------------------------------------------------------------
 from .plugins import postgresql, mysql, mongodb, rest, s3, slack, elasticsearch, sqlite
 from .plugins.redis_messaging import redis_messaging
+from .plugins.base import BasePlugin, LifecyclePlugin
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 from .config.base import AgentConfig, RetryPolicy, RetryStrategy
+
+# ---------------------------------------------------------------------------
+# Watch system — data source monitoring via @agent.watch()
+# ---------------------------------------------------------------------------
+from .core.watch import WatchEvent
 
 # ---------------------------------------------------------------------------
 # Focus DSL — pre-filter tool results before the LLM sees them
@@ -108,10 +114,14 @@ __all__ = [
     "slack",
     "elasticsearch",
     "redis_messaging",
+    "BasePlugin",
+    "LifecyclePlugin",
     # Configuration
     "AgentConfig",
     "RetryPolicy",
     "RetryStrategy",
+    # Watch system
+    "WatchEvent",
     # Focus DSL
     "apply_focus",
     # Exceptions
