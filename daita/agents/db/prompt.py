@@ -9,26 +9,65 @@ logger = logging.getLogger(__name__)
 
 DOMAIN_SIGNALS: Dict[str, List[str]] = {
     "e-commerce": [
-        "order", "product", "cart", "customer", "payment",
-        "shipping", "inventory", "sku",
+        "order",
+        "product",
+        "cart",
+        "customer",
+        "payment",
+        "shipping",
+        "inventory",
+        "sku",
     ],
     "CRM": [
-        "contact", "lead", "opportunity", "account", "campaign", "deal", "pipeline",
+        "contact",
+        "lead",
+        "opportunity",
+        "account",
+        "campaign",
+        "deal",
+        "pipeline",
     ],
     "analytics": [
-        "event", "metric", "dimension", "fact", "session", "pageview", "funnel",
+        "event",
+        "metric",
+        "dimension",
+        "fact",
+        "session",
+        "pageview",
+        "funnel",
     ],
     "content management": [
-        "post", "article", "page", "comment", "tag", "media", "author",
+        "post",
+        "article",
+        "page",
+        "comment",
+        "tag",
+        "media",
+        "author",
     ],
     "financial": [
-        "transaction", "ledger", "balance", "invoice", "journal", "budget",
+        "transaction",
+        "ledger",
+        "balance",
+        "invoice",
+        "journal",
+        "budget",
     ],
     "healthcare": [
-        "patient", "diagnosis", "prescription", "appointment", "provider", "claim",
+        "patient",
+        "diagnosis",
+        "prescription",
+        "appointment",
+        "provider",
+        "claim",
     ],
     "HR": [
-        "employee", "department", "salary", "leave", "payroll", "position",
+        "employee",
+        "department",
+        "salary",
+        "leave",
+        "payroll",
+        "position",
     ],
 }
 
@@ -58,9 +97,7 @@ def infer_domain(schema: Dict[str, Any]) -> str:
     best_score = 1  # Minimum threshold: >1 (i.e. >=2) to win
 
     for domain, keywords in DOMAIN_SIGNALS.items():
-        score = sum(
-            1 for kw in keywords if any(kw in name for name in simplified)
-        )
+        score = sum(1 for kw in keywords if any(kw in name for name in simplified))
         if score > best_score:
             best_score = score
             best_domain = domain
@@ -106,12 +143,12 @@ def build_prompt(
     elif table_count <= 30:
         for t in tables:
             row_info = (
-                f" ({t['row_count']:,} rows)"
-                if t.get("row_count") is not None
-                else ""
+                f" ({t['row_count']:,} rows)" if t.get("row_count") is not None else ""
             )
             lines.append(f"### {t['name']}{row_info}")
-            has_comments = any(col.get("column_comment") for col in t.get("columns", []))
+            has_comments = any(
+                col.get("column_comment") for col in t.get("columns", [])
+            )
             if has_comments:
                 lines.append("| Column | Type | PK | Nullable | Comment |")
                 lines.append("|--------|------|----|----------|---------|")
@@ -123,7 +160,9 @@ def build_prompt(
                 nullable_flag = "No" if not col.get("nullable", True) else "Yes"
                 type_str = col["type"]
                 if col.get("_samples"):
-                    type_str += f" (samples: {', '.join(str(v) for v in col['_samples'])})"
+                    type_str += (
+                        f" (samples: {', '.join(str(v) for v in col['_samples'])})"
+                    )
                 if has_comments:
                     comment = col.get("column_comment") or ""
                     lines.append(
@@ -137,9 +176,7 @@ def build_prompt(
     elif table_count <= 80:
         for t in tables:
             row_info = (
-                f" ({t['row_count']:,} rows)"
-                if t.get("row_count") is not None
-                else ""
+                f" ({t['row_count']:,} rows)" if t.get("row_count") is not None else ""
             )
             col_names = ", ".join(c["name"] for c in t.get("columns", []))
             lines.append(f"### {t['name']}{row_info}")
@@ -183,7 +220,7 @@ def build_prompt(
     )
     lines.append(
         "- When presenting numeric results, include units where known "
-        "(e.g. \"$12.50\" not \"1250\", \"1,500 kg\" not \"1500\")."
+        '(e.g. "$12.50" not "1250", "1,500 kg" not "1500").'
     )
     lines.append("")
     lines.append("## Analyst Toolkit")

@@ -57,9 +57,7 @@ def evaluate_remaining(data: Any, query: FocusQuery, applied: Set[str]) -> Any:
             entirely_absent = False
 
         if not entirely_absent:
-            rows = [
-                _project_row(r, select_cols, query.aggregates or {}) for r in rows
-            ]
+            rows = [_project_row(r, select_cols, query.aggregates or {}) for r in rows]
 
     return _from_rows(rows, original)
 
@@ -190,9 +188,17 @@ def _coerce_for_cmp(left: Any, right: Any):
         return left, datetime.fromisoformat(right)
     if isinstance(right, datetime) and isinstance(left, str):
         return datetime.fromisoformat(left), right
-    if isinstance(left, date) and not isinstance(left, datetime) and isinstance(right, str):
+    if (
+        isinstance(left, date)
+        and not isinstance(left, datetime)
+        and isinstance(right, str)
+    ):
         return left, date.fromisoformat(right)
-    if isinstance(right, date) and not isinstance(right, datetime) and isinstance(left, str):
+    if (
+        isinstance(right, date)
+        and not isinstance(right, datetime)
+        and isinstance(left, str)
+    ):
         return date.fromisoformat(left), right
     # Generic fallback: try to cast right to left's type (e.g. int/float mixing)
     if isinstance(right, str):

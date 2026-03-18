@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from daita.plugins.transformer import TransformerPlugin, transformer, _local_parse_sql
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -58,7 +57,9 @@ def make_tx(db=None, lineage=None, backend=None):
 
 
 def test_local_parse_sql_insert():
-    result = _local_parse_sql("INSERT INTO orders_summary SELECT customer_id FROM orders")
+    result = _local_parse_sql(
+        "INSERT INTO orders_summary SELECT customer_id FROM orders"
+    )
     assert "orders_summary" in result["target_tables"]
     assert "orders" in result["source_tables"]
 
@@ -80,9 +81,11 @@ def test_local_parse_sql_update():
     assert "orders" in result["target_tables"]
 
 
-def test_local_parse_sql_delete(  ):
+def test_local_parse_sql_delete():
     """TX-05: DELETE FROM produces a target (writes) edge, not a source (reads) edge."""
-    result = _local_parse_sql("DELETE FROM stale_records WHERE created_at < '2020-01-01'")
+    result = _local_parse_sql(
+        "DELETE FROM stale_records WHERE created_at < '2020-01-01'"
+    )
     assert "stale_records" in result["target_tables"]
     assert "stale_records" not in result["source_tables"]
 
@@ -110,7 +113,9 @@ def test_factory_passes_db():
 
 def test_initialize_sets_agent_id():
     plugin = TransformerPlugin()
-    with patch("daita.core.graph.backend.auto_select_backend", return_value=MagicMock()):
+    with patch(
+        "daita.core.graph.backend.auto_select_backend", return_value=MagicMock()
+    ):
         plugin.initialize("agent-xyz")
     assert plugin._agent_id == "agent-xyz"
 
@@ -350,7 +355,10 @@ async def test_transform_run_parameter_substitution():
         node_id="transformation:tx",
         node_type=NodeType.TRANSFORMATION,
         name="tx",
-        properties={"sql": "SELECT * FROM orders WHERE status = :status", "target_table": None},
+        properties={
+            "sql": "SELECT * FROM orders WHERE status = :status",
+            "target_table": None,
+        },
     )
     backend = make_backend(existing_node=node)
     db = make_db()
@@ -401,7 +409,9 @@ async def test_transform_run_word_boundary_param_substitution():
     backend = make_backend(existing_node=node)
     db = make_db()
     plugin = make_tx(db=db, backend=backend)
-    await plugin.transform_run(db, "tx", parameters={"status": "active", "status_code": "X1"})
+    await plugin.transform_run(
+        db, "tx", parameters={"status": "active", "status_code": "X1"}
+    )
     call_sql = db.execute.call_args[0][0]
     # :status_code should be replaced with X1, not activeX1 (which would happen with a non-boundary regex)
     assert "X1" in call_sql
@@ -417,7 +427,11 @@ async def test_transform_run_updates_run_history():
         node_id="transformation:tx",
         node_type=NodeType.TRANSFORMATION,
         name="tx",
-        properties={"sql": "INSERT INTO s SELECT 1", "target_table": "s", "run_count": 2},
+        properties={
+            "sql": "INSERT INTO s SELECT 1",
+            "target_table": "s",
+            "run_count": 2,
+        },
     )
     backend = make_backend(existing_node=node)
     db = make_db()
@@ -502,7 +516,10 @@ async def test_transform_test_substitutes_dummy_params():
         node_id="transformation:tx",
         node_type=NodeType.TRANSFORMATION,
         name="tx",
-        properties={"sql": "SELECT * FROM orders WHERE status = :status", "target_table": None},
+        properties={
+            "sql": "SELECT * FROM orders WHERE status = :status",
+            "target_table": None,
+        },
     )
     backend = make_backend(existing_node=node)
     db = MagicMock()
@@ -618,7 +635,10 @@ async def test_transform_diff_between_snapshots():
             "sql": "SELECT id, name, email FROM orders",
             "versions": [
                 {"sql": "SELECT id FROM orders", "created_at": "2024-01-01T00:00:00"},
-                {"sql": "SELECT id, name FROM orders", "created_at": "2024-01-02T00:00:00"},
+                {
+                    "sql": "SELECT id, name FROM orders",
+                    "created_at": "2024-01-02T00:00:00",
+                },
             ],
             "target_table": None,
         },
@@ -658,13 +678,23 @@ async def test_transform_list_returns_transformations():
         node_id="transformation:tx1",
         node_type=NodeType.TRANSFORMATION,
         name="tx1",
-        properties={"description": "First", "source_tables": [], "target_table": None, "versions": []},
+        properties={
+            "description": "First",
+            "source_tables": [],
+            "target_table": None,
+            "versions": [],
+        },
     )
     node2 = AgentGraphNode(
         node_id="transformation:tx2",
         node_type=NodeType.TRANSFORMATION,
         name="tx2",
-        properties={"description": "Second", "source_tables": [], "target_table": None, "versions": []},
+        properties={
+            "description": "Second",
+            "source_tables": [],
+            "target_table": None,
+            "versions": [],
+        },
     )
     # Include a non-transformation node to verify filtering
     table_node = AgentGraphNode(
@@ -725,7 +755,12 @@ async def test_transform_list_cold_start_uses_graph():
         node_id="transformation:cold_tx",
         node_type=NodeType.TRANSFORMATION,
         name="cold_tx",
-        properties={"description": "", "source_tables": [], "target_table": None, "versions": []},
+        properties={
+            "description": "",
+            "source_tables": [],
+            "target_table": None,
+            "versions": [],
+        },
     )
     mock_graph = MagicMock()
     mock_graph.nodes.return_value = [("transformation:cold_tx", {"data": node})]
@@ -761,11 +796,13 @@ async def test_transform_list_in_memory_no_backend():
 async def test_tool_create_dispatches():
     backend = make_backend()
     plugin = make_tx(backend=backend)
-    result = await plugin._tool_create({
-        "name": "test_tx",
-        "sql": "SELECT 1",
-        "description": "smoke test",
-    })
+    result = await plugin._tool_create(
+        {
+            "name": "test_tx",
+            "sql": "SELECT 1",
+            "description": "smoke test",
+        }
+    )
     assert result["success"] is True
 
 

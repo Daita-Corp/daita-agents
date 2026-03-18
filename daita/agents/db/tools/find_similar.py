@@ -7,13 +7,22 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ....core.tools import AgentTool
-from ._helpers import ensure_pandas, ensure_numpy, safe_query, to_serializable, get_pk_column, infer_dimensions
+from ._helpers import (
+    ensure_pandas,
+    ensure_numpy,
+    safe_query,
+    to_serializable,
+    get_pk_column,
+    infer_dimensions,
+)
 
 if TYPE_CHECKING:
     from ....plugins.base_db import BaseDatabasePlugin
 
 
-def create_find_similar_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, Any]) -> AgentTool:
+def create_find_similar_tool(
+    plugin: "BaseDatabasePlugin", schema: Dict[str, Any]
+) -> AgentTool:
     """Return an AgentTool that finds entities similar to a reference entity."""
 
     async def handler(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -37,7 +46,7 @@ def create_find_similar_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, Any
             return {
                 "success": False,
                 "error": f"Could not detect primary key for '{entity_table}'. "
-                         "Pass id_column explicitly.",
+                "Pass id_column explicitly.",
             }
 
         dims = custom_dimensions or infer_dimensions(schema, entity_table)
@@ -97,7 +106,9 @@ def create_find_similar_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, Any
                     for d in child_dims:
                         raw = row.get(d["alias"])
                         try:
-                            all_profiles[eid][d["alias"]] = float(to_serializable(raw) or 0)
+                            all_profiles[eid][d["alias"]] = float(
+                                to_serializable(raw) or 0
+                            )
                         except (TypeError, ValueError):
                             all_profiles[eid][d["alias"]] = 0.0
             except Exception:
@@ -113,14 +124,14 @@ def create_find_similar_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, Any
             }
 
         # Build matrix
-        all_dim_names = list(dict.fromkeys(
-            alias
-            for d in dims
-            for alias in [d["alias"]]
-        ))
+        all_dim_names = list(
+            dict.fromkeys(alias for d in dims for alias in [d["alias"]])
+        )
 
         eids = list(all_profiles.keys())
-        matrix = np.array([[all_profiles[eid].get(dim, 0.0) for dim in all_dim_names] for eid in eids])
+        matrix = np.array(
+            [[all_profiles[eid].get(dim, 0.0) for dim in all_dim_names] for eid in eids]
+        )
 
         # Min-max normalise per column
         col_min = matrix.min(axis=0)
@@ -141,11 +152,13 @@ def create_find_similar_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, Any
             if eids[idx] == entity_id:
                 continue
             profile = {dim: all_profiles[eids[idx]].get(dim) for dim in all_dim_names}
-            similar.append({
-                "entity_id": to_serializable(eids[idx]),
-                "distance": round(float(distances[idx]), 6),
-                "profile": {k: to_serializable(v) for k, v in profile.items()},
-            })
+            similar.append(
+                {
+                    "entity_id": to_serializable(eids[idx]),
+                    "distance": round(float(distances[idx]), 6),
+                    "profile": {k: to_serializable(v) for k, v in profile.items()},
+                }
+            )
             if len(similar) >= top_k:
                 break
 

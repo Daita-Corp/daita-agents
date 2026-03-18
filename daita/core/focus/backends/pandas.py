@@ -90,9 +90,7 @@ def _native_groupby(df: Any, query: FocusQuery) -> Any:
         if count_star_alias:
             # Merge COUNT(*) by group keys — never by positional index
             size_df = (
-                df.groupby(query.group_by)
-                .size()
-                .reset_index(name=count_star_alias)
+                df.groupby(query.group_by).size().reset_index(name=count_star_alias)
             )
             result = result.merge(size_df, on=query.group_by)
     else:

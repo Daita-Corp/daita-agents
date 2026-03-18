@@ -446,7 +446,10 @@ class MongoDBPlugin(BaseDatabasePlugin):
                     parameters={
                         "type": "object",
                         "properties": {
-                            "collection": {"type": "string", "description": "Collection name"},
+                            "collection": {
+                                "type": "string",
+                                "description": "Collection name",
+                            },
                             "filter": {
                                 "type": "object",
                                 "description": "Query filter to match documents to update",
@@ -470,7 +473,10 @@ class MongoDBPlugin(BaseDatabasePlugin):
                     parameters={
                         "type": "object",
                         "properties": {
-                            "collection": {"type": "string", "description": "Collection name"},
+                            "collection": {
+                                "type": "string",
+                                "description": "Collection name",
+                            },
                             "filter": {
                                 "type": "object",
                                 "description": "Query filter to match documents to delete",

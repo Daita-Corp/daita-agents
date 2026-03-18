@@ -16,15 +16,34 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 NUMERIC_TYPES = {
-    "int", "integer", "bigint", "smallint", "tinyint",
-    "float", "double", "real", "decimal", "numeric",
-    "number", "money", "currency", "int4", "int8", "float4", "float8",
+    "int",
+    "integer",
+    "bigint",
+    "smallint",
+    "tinyint",
+    "float",
+    "double",
+    "real",
+    "decimal",
+    "numeric",
+    "number",
+    "money",
+    "currency",
+    "int4",
+    "int8",
+    "float4",
+    "float8",
 }
 
 DATE_TYPES = {
-    "date", "datetime", "timestamp", "timestamptz",
-    "timestamp with time zone", "timestamp without time zone",
-    "time", "timetz",
+    "date",
+    "datetime",
+    "timestamp",
+    "timestamptz",
+    "timestamp with time zone",
+    "timestamp without time zone",
+    "time",
+    "timetz",
 }
 
 
@@ -32,10 +51,12 @@ DATE_TYPES = {
 # Lazy dependency helpers
 # ---------------------------------------------------------------------------
 
+
 def ensure_pandas():
     """Lazy import pandas, raising a helpful error if not installed."""
     try:
         import pandas as pd
+
         return pd
     except ImportError:
         raise ImportError(
@@ -48,6 +69,7 @@ def ensure_numpy():
     """Lazy import numpy, raising a helpful error if not installed."""
     try:
         import numpy as np
+
         return np
     except ImportError:
         raise ImportError(
@@ -59,6 +81,7 @@ def ensure_numpy():
 # ---------------------------------------------------------------------------
 # Schema introspection helpers
 # ---------------------------------------------------------------------------
+
 
 def get_pk_column(schema: Dict[str, Any], table: str) -> Optional[str]:
     """Return the primary key column name for a table, or None."""
@@ -144,33 +167,42 @@ def infer_dimensions(schema: Dict[str, Any], entity_table: str) -> List[Dict[str
         child_pk = get_pk_column(schema, child)
 
         # Exclude PK and FK columns from metrics — they are identifiers, not measures
-        child_excluded = (_fk_cols_for_table(schema, child) | ({child_pk} if child_pk else set()))
+        child_excluded = _fk_cols_for_table(schema, child) | (
+            {child_pk} if child_pk else set()
+        )
         numeric_cols = [
-            col for col in get_numeric_columns(schema, child)
+            col
+            for col in get_numeric_columns(schema, child)
             if col not in child_excluded
         ]
 
         # COUNT is always meaningful
-        dims.append({
-            "expression": f"COUNT(c.{fk_col})",
-            "alias": f"{child}_count",
-            "child_table": child,
-            "fk_col": fk_col,
-        })
+        dims.append(
+            {
+                "expression": f"COUNT(c.{fk_col})",
+                "alias": f"{child}_count",
+                "child_table": child,
+                "fk_col": fk_col,
+            }
+        )
 
         for col in numeric_cols[:3]:
-            dims.append({
-                "expression": f"SUM(c.{col})",
-                "alias": f"{child}_{col}_sum",
-                "child_table": child,
-                "fk_col": fk_col,
-            })
-            dims.append({
-                "expression": f"AVG(c.{col})",
-                "alias": f"{child}_{col}_avg",
-                "child_table": child,
-                "fk_col": fk_col,
-            })
+            dims.append(
+                {
+                    "expression": f"SUM(c.{col})",
+                    "alias": f"{child}_{col}_sum",
+                    "child_table": child,
+                    "fk_col": fk_col,
+                }
+            )
+            dims.append(
+                {
+                    "expression": f"AVG(c.{col})",
+                    "alias": f"{child}_{col}_avg",
+                    "child_table": child,
+                    "fk_col": fk_col,
+                }
+            )
 
         # 2-hop: when child has no meaningful numeric columns, look for
         # grandchild tables (e.g. customers → orders → order_items)
@@ -185,36 +217,40 @@ def infer_dimensions(schema: Dict[str, Any], entity_table: str) -> List[Dict[str
                 gc_fk_col = fk2["source_column"]
                 gc_alias = f"gc_{grandchild}"
                 gc_pk = get_pk_column(schema, grandchild)
-                gc_excluded = (
-                    _fk_cols_for_table(schema, grandchild)
-                    | ({gc_pk} if gc_pk else set())
+                gc_excluded = _fk_cols_for_table(schema, grandchild) | (
+                    {gc_pk} if gc_pk else set()
                 )
                 gc_numeric = [
-                    col for col in get_numeric_columns(schema, grandchild)
+                    col
+                    for col in get_numeric_columns(schema, grandchild)
                     if col not in gc_excluded
                 ]
 
                 for col in gc_numeric[:3]:
-                    dims.append({
-                        "expression": f"SUM({gc_alias}.{col})",
-                        "alias": f"{grandchild}_{col}_sum",
-                        "child_table": child,
-                        "fk_col": fk_col,
-                        "grandchild_table": grandchild,
-                        "grandchild_fk_col": gc_fk_col,
-                        "grandchild_alias": gc_alias,
-                        "child_pk": child_pk,
-                    })
-                    dims.append({
-                        "expression": f"AVG({gc_alias}.{col})",
-                        "alias": f"{grandchild}_{col}_avg",
-                        "child_table": child,
-                        "fk_col": fk_col,
-                        "grandchild_table": grandchild,
-                        "grandchild_fk_col": gc_fk_col,
-                        "grandchild_alias": gc_alias,
-                        "child_pk": child_pk,
-                    })
+                    dims.append(
+                        {
+                            "expression": f"SUM({gc_alias}.{col})",
+                            "alias": f"{grandchild}_{col}_sum",
+                            "child_table": child,
+                            "fk_col": fk_col,
+                            "grandchild_table": grandchild,
+                            "grandchild_fk_col": gc_fk_col,
+                            "grandchild_alias": gc_alias,
+                            "child_pk": child_pk,
+                        }
+                    )
+                    dims.append(
+                        {
+                            "expression": f"AVG({gc_alias}.{col})",
+                            "alias": f"{grandchild}_{col}_avg",
+                            "child_table": child,
+                            "fk_col": fk_col,
+                            "grandchild_table": grandchild,
+                            "grandchild_fk_col": gc_fk_col,
+                            "grandchild_alias": gc_alias,
+                            "child_pk": child_pk,
+                        }
+                    )
 
     return dims
 
@@ -222,6 +258,7 @@ def infer_dimensions(schema: Dict[str, Any], entity_table: str) -> List[Dict[str
 # ---------------------------------------------------------------------------
 # Query helper
 # ---------------------------------------------------------------------------
+
 
 async def safe_query(
     plugin: "BaseDatabasePlugin",
@@ -239,6 +276,7 @@ async def safe_query(
 # Serialisation
 # ---------------------------------------------------------------------------
 
+
 def to_serializable(value: Any) -> Any:
     """Convert non-JSON-serialisable types (Decimal, datetime) to primitives."""
     if isinstance(value, Decimal):
@@ -251,6 +289,7 @@ def to_serializable(value: Any) -> Any:
 # ---------------------------------------------------------------------------
 # Identifier quoting
 # ---------------------------------------------------------------------------
+
 
 def quote_id(name: str, dialect: str) -> str:
     """Quote an identifier per dialect."""

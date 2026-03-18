@@ -13,6 +13,7 @@ def extract_sslmode(connection_string: str) -> str:
     """Extract sslmode from DSN query params, mapping to CatalogPlugin ssl_mode values."""
     try:
         from urllib.parse import parse_qs
+
         qs = parse_qs(urlparse(connection_string).query)
         raw = qs.get("sslmode", [None])[0]
         if raw in ("disable", "allow", "prefer"):
@@ -57,6 +58,7 @@ def resolve_plugin(
             or source.endswith(".sqlite3")
         ):
             from ...plugins.sqlite import SQLitePlugin
+
             return SQLitePlugin(path=source, read_only=read_only), True
         raise ValueError(
             f"Unsupported source: {source!r}. "
@@ -69,10 +71,12 @@ def resolve_plugin(
 
     if scheme in ("postgresql", "postgres"):
         from ...plugins.postgresql import PostgreSQLPlugin
+
         return PostgreSQLPlugin(connection_string=source, read_only=read_only), True
 
     if scheme == "mysql":
         from ...plugins.mysql import MySQLPlugin
+
         return MySQLPlugin(connection_string=source, read_only=read_only), True
 
     if scheme in ("mongodb", "mongodb+srv"):
@@ -83,6 +87,7 @@ def resolve_plugin(
                 "e.g. mongodb://host/mydb"
             )
         from ...plugins.mongodb import MongoDBPlugin
+
         return MongoDBPlugin(connection_string=source, read_only=read_only), True
 
     if scheme == "sqlite":
@@ -90,6 +95,7 @@ def resolve_plugin(
         # sqlite://:memory:   ->  parsed.netloc = ":memory:"
         path = parsed.path or parsed.netloc or ":memory:"
         from ...plugins.sqlite import SQLitePlugin
+
         return SQLitePlugin(path=path, read_only=read_only), True
 
     if scheme == "snowflake":

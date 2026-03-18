@@ -30,7 +30,6 @@ from daita.core.watch import (
 from daita.core.streaming import EventType
 from daita.llm.mock import MockLLMProvider
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -183,7 +182,9 @@ class TestWatchDecoratorValidation:
     def test_custom_name_used(self):
         agent = _make_agent()
 
-        @agent.watch(source=object(), condition="SELECT 1", interval="10s", name="my_watch")
+        @agent.watch(
+            source=object(), condition="SELECT 1", interval="10s", name="my_watch"
+        )
         async def handler(event):
             pass
 
@@ -492,13 +493,17 @@ class TestPollingWatchSource:
         async def my_condition():
             return 99
 
-        source = PollingWatchSource(plugin=plugin, condition=my_condition, interval=timedelta(seconds=1))
+        source = PollingWatchSource(
+            plugin=plugin, condition=my_condition, interval=timedelta(seconds=1)
+        )
         # Directly call _evaluate_condition
         val = await source._evaluate_condition()
         assert val == 99
 
     async def test_disconnect_is_noop(self):
-        source = PollingWatchSource(plugin=object(), condition="SELECT 1", interval=timedelta(seconds=1))
+        source = PollingWatchSource(
+            plugin=object(), condition="SELECT 1", interval=timedelta(seconds=1)
+        )
         # Should not raise
         await source.disconnect()
 

@@ -263,7 +263,9 @@ async def test_query_checked_passes(db):
     await db.execute("INSERT INTO users (name, age) VALUES (?, ?)", ["Leo", 25])
     rows = await db.query_checked(
         "SELECT * FROM users",
-        assertions=[ItemAssertion(lambda r: r["name"] is not None, "name must not be null")],
+        assertions=[
+            ItemAssertion(lambda r: r["name"] is not None, "name must not be null")
+        ],
     )
     assert len(rows) == 1
 
@@ -278,7 +280,9 @@ async def test_query_checked_raises_on_violation(db):
     with pytest.raises(DataQualityError):
         await db.query_checked(
             "SELECT * FROM users",
-            assertions=[ItemAssertion(lambda r: r["age"] is not None, "age must not be null")],
+            assertions=[
+                ItemAssertion(lambda r: r["age"] is not None, "age must not be null")
+            ],
         )
 
 

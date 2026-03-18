@@ -7,13 +7,21 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ....core.tools import AgentTool
-from ._helpers import ensure_pandas, safe_query, to_serializable, get_pk_column, infer_dimensions
+from ._helpers import (
+    ensure_pandas,
+    safe_query,
+    to_serializable,
+    get_pk_column,
+    infer_dimensions,
+)
 
 if TYPE_CHECKING:
     from ....plugins.base_db import BaseDatabasePlugin
 
 
-def create_compare_entities_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, Any]) -> AgentTool:
+def create_compare_entities_tool(
+    plugin: "BaseDatabasePlugin", schema: Dict[str, Any]
+) -> AgentTool:
     """Return an AgentTool that compares entities side-by-side."""
 
     async def handler(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -35,7 +43,7 @@ def create_compare_entities_tool(plugin: "BaseDatabasePlugin", schema: Dict[str,
             return {
                 "success": False,
                 "error": f"Could not detect primary key for '{entity_table}'. "
-                         "Pass id_column explicitly.",
+                "Pass id_column explicitly.",
             }
 
         dims = custom_dimensions or infer_dimensions(schema, entity_table)
@@ -52,7 +60,9 @@ def create_compare_entities_tool(plugin: "BaseDatabasePlugin", schema: Dict[str,
         child_tables = list(dict.fromkeys(d["child_table"] for d in dims))
         entity_profiles: Dict[Any, Dict[str, Any]] = {eid: {} for eid in entity_ids}
 
-        id_list = ", ".join(f"'{eid}'" if isinstance(eid, str) else str(eid) for eid in entity_ids)
+        id_list = ", ".join(
+            f"'{eid}'" if isinstance(eid, str) else str(eid) for eid in entity_ids
+        )
 
         for child in child_tables:
             child_dims = [d for d in dims if d["child_table"] == child]
@@ -95,20 +105,23 @@ def create_compare_entities_tool(plugin: "BaseDatabasePlugin", schema: Dict[str,
                     eid = row.get("_entity_id")
                     if eid in entity_profiles:
                         for d in child_dims:
-                            entity_profiles[eid][d["alias"]] = to_serializable(row.get(d["alias"]))
+                            entity_profiles[eid][d["alias"]] = to_serializable(
+                                row.get(d["alias"])
+                            )
             except Exception:
                 # Skip dimension set that fails; don't abort entire comparison
                 continue
 
         if not any(entity_profiles.values()):
-            return {"success": False, "error": "Could not retrieve any dimension data for the entities"}
+            return {
+                "success": False,
+                "error": "Could not retrieve any dimension data for the entities",
+            }
 
         # Build comparison table
-        all_dim_names = list(dict.fromkeys(
-            alias
-            for d in dims
-            for alias in [d["alias"]]
-        ))
+        all_dim_names = list(
+            dict.fromkeys(alias for d in dims for alias in [d["alias"]])
+        )
 
         comparison = []
         for dim in all_dim_names:

@@ -57,6 +57,7 @@ def _validate_identifier(name: str) -> str:
 # Minimal dialect helpers (DQ-17 partial — enough for profile + discovery)
 # ---------------------------------------------------------------------------
 
+
 def _dialect(db: Any) -> str:
     return getattr(db, "sql_dialect", "standard")
 
@@ -254,7 +255,9 @@ class DataQualityPlugin(BasePlugin):
         table = _validate_identifier(args["table"])
         columns = [_validate_identifier(c) for c in args.get("columns", [])]
         sample_size = args.get("sample_size")
-        return await self.profile(db, table, columns=columns or None, sample_size=sample_size)
+        return await self.profile(
+            db, table, columns=columns or None, sample_size=sample_size
+        )
 
     async def _tool_detect_anomaly(self, args: Dict[str, Any]) -> Dict[str, Any]:
         db = self._validate_db()
@@ -262,14 +265,18 @@ class DataQualityPlugin(BasePlugin):
         column = _validate_identifier(args["column"])
         method = args.get("method", "zscore")
         sample_size = args.get("sample_size")
-        return await self.detect_anomaly(db, table, column, method=method, sample_size=sample_size)
+        return await self.detect_anomaly(
+            db, table, column, method=method, sample_size=sample_size
+        )
 
     async def _tool_check_freshness(self, args: Dict[str, Any]) -> Dict[str, Any]:
         db = self._validate_db()
         table = _validate_identifier(args["table"])
         ts_col = _validate_identifier(args["timestamp_column"])
         interval_hours = args.get("expected_interval_hours", 24)
-        return await self.check_freshness(db, table, ts_col, expected_interval_hours=interval_hours)
+        return await self.check_freshness(
+            db, table, ts_col, expected_interval_hours=interval_hours
+        )
 
     async def _tool_report(self, args: Dict[str, Any]) -> Dict[str, Any]:
         db = self._validate_db()
@@ -311,7 +318,9 @@ class DataQualityPlugin(BasePlugin):
 
         # Build the subquery wrapper for sample_size paths
         if sample_size:
-            sample_expr = f"(SELECT {{col}} FROM {table} LIMIT {int(sample_size)}) _sample"
+            sample_expr = (
+                f"(SELECT {{col}} FROM {table} LIMIT {int(sample_size)}) _sample"
+            )
             sample_expr_nn = (
                 f"(SELECT {{col}} FROM {table} WHERE {{col}} IS NOT NULL "
                 f"LIMIT {int(sample_size)}) _sample"
@@ -341,7 +350,11 @@ class DataQualityPlugin(BasePlugin):
                         non_null = int(r.get("non_null") or 0)
                         distinct_count = int(r.get("distinct_count") or 0)
                     else:
-                        total, non_null, distinct_count = int(r[0] or 0), int(r[1] or 0), int(r[2] or 0)
+                        total, non_null, distinct_count = (
+                            int(r[0] or 0),
+                            int(r[1] or 0),
+                            int(r[2] or 0),
+                        )
                 else:
                     total = non_null = distinct_count = 0
 
@@ -372,7 +385,9 @@ class DataQualityPlugin(BasePlugin):
                 except Exception as exc:
                     logger.debug(
                         "profile: skipping numeric stats for %s.%s: %s",
-                        table, col, exc,
+                        table,
+                        col,
+                        exc,
                     )
 
                 col_profiles[col] = {
@@ -522,7 +537,9 @@ class DataQualityPlugin(BasePlugin):
             "table": table,
             "column": timestamp_column,
             "is_fresh": is_fresh,
-            "latest_timestamp": latest.isoformat() if hasattr(latest, "isoformat") else str(latest),
+            "latest_timestamp": (
+                latest.isoformat() if hasattr(latest, "isoformat") else str(latest)
+            ),
             "age_hours": round(age_hours, 2),
             "expected_interval_hours": expected_interval_hours,
             "detail": f"Data is {age_hours:.1f}h old (limit: {expected_interval_hours}h)",
@@ -614,7 +631,9 @@ class DataQualityPlugin(BasePlugin):
                 report_data["graph_persisted"] = True
                 report_data["metric_node_id"] = metric_node_id
             except Exception as exc:
-                logger.warning("DataQualityPlugin: failed to persist report to graph: %s", exc)
+                logger.warning(
+                    "DataQualityPlugin: failed to persist report to graph: %s", exc
+                )
                 report_data["graph_persisted"] = False
 
         return report_data

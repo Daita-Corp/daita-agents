@@ -441,5 +441,3 @@ class TestOnEventCallback:
 
         complete_events = [e for e in events if e.type == EventType.COMPLETE]
         assert len(complete_events) == 1
-
-

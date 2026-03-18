@@ -52,8 +52,8 @@ async def calibrate_numerics(
         "values are stored in smallest units (e.g. cents, pence) or whole units "
         "(e.g. dollars, full amounts). Use the column name, type, and sample values "
         "as evidence. Respond with a JSON array where each item has keys: "
-        "\"table\", \"column\", \"unit\" (a short string like \"cents\", \"dollars\", "
-        "\"grams\", \"unknown\"), and \"confidence\" (\"high\", \"medium\", or \"low\").\n\n"
+        '"table", "column", "unit" (a short string like "cents", "dollars", '
+        '"grams", "unknown"), and "confidence" ("high", "medium", or "low").\n\n'
         f"Columns: {json.dumps(numeric_cols, default=lambda o: float(o) if isinstance(o, decimal.Decimal) else str(o))}"
     )
 

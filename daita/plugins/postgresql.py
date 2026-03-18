@@ -647,7 +647,10 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                                 "type": "string",
                                 "description": "Vector column name",
                             },
-                            "id": {"type": "string", "description": "ID value for the row"},
+                            "id": {
+                                "type": "string",
+                                "description": "ID value for the row",
+                            },
                             "vector": {
                                 "type": "array",
                                 "description": "Vector as array of floats",
@@ -658,7 +661,13 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                                 "description": "Optional additional columns to upsert as key-value pairs",
                             },
                         },
-                        "required": ["table", "id_column", "vector_column", "id", "vector"],
+                        "required": [
+                            "table",
+                            "id_column",
+                            "vector_column",
+                            "id",
+                            "vector",
+                        ],
                     },
                     handler=self._tool_vector_upsert,
                     category="database",

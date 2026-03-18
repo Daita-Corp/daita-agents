@@ -20,9 +20,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DISCOVERY_TOOLS = {
-    "postgres_list_tables", "postgres_get_schema", "postgres_inspect",
-    "mysql_list_tables", "mysql_get_schema", "mysql_inspect",
-    "sqlite_list_tables", "sqlite_get_schema", "sqlite_inspect",
+    "postgres_list_tables",
+    "postgres_get_schema",
+    "postgres_inspect",
+    "mysql_list_tables",
+    "mysql_get_schema",
+    "mysql_inspect",
+    "sqlite_list_tables",
+    "sqlite_get_schema",
+    "sqlite_inspect",
 }
 
 
@@ -170,6 +176,7 @@ async def from_db(
     # ------------------------------------------------------------------
     if toolkit in ("analyst", "all"):
         from .tools import register_analyst_tools
+
         register_analyst_tools(agent, plugin, schema)
 
     if drift is not None:
@@ -182,6 +189,7 @@ async def from_db(
     if lineage is not None and lineage is not False:
         if lineage is True:
             from ...plugins.lineage import LineagePlugin
+
             lineage_plugin = LineagePlugin()
         else:
             lineage_plugin = lineage
@@ -209,6 +217,7 @@ async def from_db(
     if memory is not None and memory is not False:
         if memory is True:
             from ...plugins.memory import MemoryPlugin
+
             workspace = name or f"{domain}_db_agent"
             memory_plugin = MemoryPlugin(workspace=workspace)
         else:
@@ -243,6 +252,7 @@ async def from_db(
     if history is not None and history is not False:
         if history is True:
             from ..conversation import ConversationHistory
+
             history_obj = ConversationHistory()
         else:
             history_obj = history

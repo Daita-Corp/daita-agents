@@ -29,7 +29,9 @@ def _strength_label(r: float) -> str:
     return "negligible"
 
 
-def create_correlate_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, Any]) -> AgentTool:
+def create_correlate_tool(
+    plugin: "BaseDatabasePlugin", schema: Dict[str, Any]
+) -> AgentTool:
     """Return an AgentTool that computes column correlations."""
 
     async def handler(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -49,9 +51,16 @@ def create_correlate_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, Any]) 
         try:
             rows = await safe_query(plugin, sql)
             if not rows:
-                return {"success": True, "correlations": [], "matrix": {}, "sample_size": 0}
+                return {
+                    "success": True,
+                    "correlations": [],
+                    "matrix": {},
+                    "sample_size": 0,
+                }
 
-            df = pd.DataFrame([{k: to_serializable(v) for k, v in r.items()} for r in rows])
+            df = pd.DataFrame(
+                [{k: to_serializable(v) for k, v in r.items()} for r in rows]
+            )
 
             # Select columns
             if columns:
@@ -80,12 +89,14 @@ def create_correlate_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, Any]) 
                         continue
                     r = float(r)
                     if abs(r) >= min_corr:
-                        pairs.append({
-                            "column_a": cols[i],
-                            "column_b": cols[j],
-                            "correlation": round(r, 4),
-                            "strength": _strength_label(r),
-                        })
+                        pairs.append(
+                            {
+                                "column_a": cols[i],
+                                "column_b": cols[j],
+                                "correlation": round(r, 4),
+                                "strength": _strength_label(r),
+                            }
+                        )
 
             pairs.sort(key=lambda x: abs(x["correlation"]), reverse=True)
 
@@ -119,7 +130,10 @@ def create_correlate_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, Any]) 
         parameters={
             "type": "object",
             "properties": {
-                "sql": {"type": "string", "description": "SQL query returning numeric columns to correlate"},
+                "sql": {
+                    "type": "string",
+                    "description": "SQL query returning numeric columns to correlate",
+                },
                 "columns": {
                     "type": "array",
                     "items": {"type": "string"},

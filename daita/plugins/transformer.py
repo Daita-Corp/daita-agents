@@ -124,7 +124,9 @@ class _InMemoryNode:
     tags: list = field(default_factory=list)
 
 
-def _make_tx_entry(name: str, props: Dict[str, Any], node_id: str = "") -> Dict[str, Any]:
+def _make_tx_entry(
+    name: str, props: Dict[str, Any], node_id: str = ""
+) -> Dict[str, Any]:
     """Build the dict returned by transform_list for a single transformation."""
     return {
         "name": name,
@@ -425,15 +427,24 @@ class TransformerPlugin(BasePlugin):
         node_id = f"transformation:{name}"
 
         if self._graph_backend:
-            from daita.core.graph.models import AgentGraphNode, AgentGraphEdge, NodeType, EdgeType
+            from daita.core.graph.models import (
+                AgentGraphNode,
+                AgentGraphEdge,
+                NodeType,
+                EdgeType,
+            )
 
             node_id = AgentGraphNode.make_id(NodeType.TRANSFORMATION, name)
 
             # Prefer existing created_at from graph over in-memory for first-run scenarios
             existing_graph = await self._graph_backend.get_node(node_id)
             if existing_graph:
-                properties["versions"] = existing_graph.properties.get("versions", properties["versions"])
-                properties["created_at"] = existing_graph.properties.get("created_at", properties["created_at"])
+                properties["versions"] = existing_graph.properties.get(
+                    "versions", properties["versions"]
+                )
+                properties["created_at"] = existing_graph.properties.get(
+                    "created_at", properties["created_at"]
+                )
                 is_update = True
 
             node = AgentGraphNode(
@@ -457,7 +468,9 @@ class TransformerPlugin(BasePlugin):
                 )
                 await self._graph_backend.add_edge(
                     AgentGraphEdge(
-                        edge_id=AgentGraphEdge.make_id(src_node_id, EdgeType.READS, node_id),
+                        edge_id=AgentGraphEdge.make_id(
+                            src_node_id, EdgeType.READS, node_id
+                        ),
                         from_node_id=src_node_id,
                         to_node_id=node_id,
                         edge_type=EdgeType.READS,
@@ -477,7 +490,9 @@ class TransformerPlugin(BasePlugin):
                 )
                 await self._graph_backend.add_edge(
                     AgentGraphEdge(
-                        edge_id=AgentGraphEdge.make_id(node_id, EdgeType.WRITES, tgt_node_id),
+                        edge_id=AgentGraphEdge.make_id(
+                            node_id, EdgeType.WRITES, tgt_node_id
+                        ),
                         from_node_id=node_id,
                         to_node_id=tgt_node_id,
                         edge_type=EdgeType.WRITES,
@@ -687,9 +702,15 @@ class TransformerPlugin(BasePlugin):
         sql_b = _get_sql(version_b)
 
         if sql_a is None:
-            return {"success": False, "error": f"Version index {version_a} out of range"}
+            return {
+                "success": False,
+                "error": f"Version index {version_a} out of range",
+            }
         if sql_b is None:
-            return {"success": False, "error": f"Version index {version_b} out of range"}
+            return {
+                "success": False,
+                "error": f"Version index {version_b} out of range",
+            }
 
         diff_lines = list(
             difflib.unified_diff(

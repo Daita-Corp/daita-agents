@@ -89,7 +89,9 @@ class GraphBackend(Protocol):
         ...
 
 
-def register_backend_factory(factory: Optional[Callable[[str], "GraphBackend"]]) -> None:
+def register_backend_factory(
+    factory: Optional[Callable[[str], "GraphBackend"]],
+) -> None:
     """
     Register a factory that creates graph backends.
 

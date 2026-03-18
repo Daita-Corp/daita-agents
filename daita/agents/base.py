@@ -223,9 +223,7 @@ class BaseAgent(AgentABC):
             )
 
         if interval is not None and condition is None and topic is None:
-            raise ValueError(
-                "interval= requires condition= to specify what to poll"
-            )
+            raise ValueError("interval= requires condition= to specify what to poll")
 
         if isinstance(interval, str):
             interval = _parse_interval(interval)

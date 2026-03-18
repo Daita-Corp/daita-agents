@@ -30,7 +30,9 @@ from .base import BaseAgent
 logger = logging.getLogger(__name__)
 
 
-async def _execute_tool_call(tool_call: Dict[str, Any], tools: List["AgentTool"]) -> Any:
+async def _execute_tool_call(
+    tool_call: Dict[str, Any], tools: List["AgentTool"]
+) -> Any:
     """
     Execute a single tool call with timeout and error handling.
 
@@ -316,7 +318,7 @@ class Agent(BaseAgent):
         self.tool_registry = ToolRegistry()
         self.tool_sources = []
         self._tools_setup = False
-        for source in (tools or []):
+        for source in tools or []:
             self.add_plugin(source)
         self._focus_default_warned: set = (
             set()
@@ -505,7 +507,13 @@ class Agent(BaseAgent):
                 instead of just the answer string.
         """
         result = await self._run_traced(
-            prompt, tools, max_iterations, timeout_seconds, on_event, history=history, **kwargs
+            prompt,
+            tools,
+            max_iterations,
+            timeout_seconds,
+            on_event,
+            history=history,
+            **kwargs,
         )
         return result if detailed else result["result"]
 
@@ -541,8 +549,13 @@ class Agent(BaseAgent):
         async def _run_bg() -> None:
             try:
                 await self._run_traced(
-                    prompt, tools, max_iterations, timeout_seconds,
-                    _on_event, history=history, **kwargs,
+                    prompt,
+                    tools,
+                    max_iterations,
+                    timeout_seconds,
+                    _on_event,
+                    history=history,
+                    **kwargs,
                 )
             except Exception as exc:
                 queue.put_nowait(exc)
@@ -621,11 +634,11 @@ class Agent(BaseAgent):
 
             if timeout_seconds is not None:
                 try:
-                    result = await asyncio.wait_for(_run_inner(), timeout=timeout_seconds)
-                except asyncio.TimeoutError:
-                    raise AgentError(
-                        f"Run timed out after {timeout_seconds}s"
+                    result = await asyncio.wait_for(
+                        _run_inner(), timeout=timeout_seconds
                     )
+                except asyncio.TimeoutError:
+                    raise AgentError(f"Run timed out after {timeout_seconds}s")
             else:
                 result = await _run_inner()
 
@@ -1077,7 +1090,9 @@ class Agent(BaseAgent):
         if isinstance(payload, (dict, list)):
             instructions += f"\n\n<webhook_payload>{json.dumps(payload, default=_json_serializer)}</webhook_payload>"
         elif payload:
-            instructions += f"\n\n<webhook_payload>{str(payload)[:4000]}</webhook_payload>"
+            instructions += (
+                f"\n\n<webhook_payload>{str(payload)[:4000]}</webhook_payload>"
+            )
 
         result = await self.run(instructions, detailed=True)
 

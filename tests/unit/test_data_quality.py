@@ -8,8 +8,11 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from typing import Any, Dict, List
 
-from daita.plugins.data_quality import DataQualityPlugin, data_quality, _validate_identifier
-
+from daita.plugins.data_quality import (
+    DataQualityPlugin,
+    data_quality,
+    _validate_identifier,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -135,7 +138,12 @@ def test_get_tools_returns_four_tools():
 def test_get_tools_names():
     plugin = make_dq()
     names = {t.name for t in plugin.get_tools()}
-    assert names == {"dq_profile", "dq_detect_anomaly", "dq_check_freshness", "dq_report"}
+    assert names == {
+        "dq_profile",
+        "dq_detect_anomaly",
+        "dq_check_freshness",
+        "dq_report",
+    }
 
 
 def test_all_tools_have_handlers():
@@ -205,13 +213,16 @@ async def test_profile_sample_size_uses_subquery():
     assert "limit" in count_sql.lower()
     limit_pos = count_sql.lower().index("limit")
     from_pos = count_sql.lower().index("from")
-    assert limit_pos > from_pos, "LIMIT must be inside the FROM subquery, not the outer query"
+    assert (
+        limit_pos > from_pos
+    ), "LIMIT must be inside the FROM subquery, not the outer query"
 
 
 async def test_profile_no_dead_sample_clause():
     """The dead `sample_clause = TABLESAMPLE...` variable must not appear (DQ-03)."""
     import inspect
     from daita.plugins import data_quality as dq_module
+
     source = inspect.getsource(dq_module)
     assert "TABLESAMPLE" not in source
 
@@ -328,7 +339,9 @@ async def test_check_freshness_fresh():
     db = MagicMock()
     db.query = AsyncMock(return_value=[{"latest": recent}])
     plugin = make_dq(db=db)
-    result = await plugin.check_freshness(db, "events", "created_at", expected_interval_hours=24)
+    result = await plugin.check_freshness(
+        db, "events", "created_at", expected_interval_hours=24
+    )
     assert result["is_fresh"] is True
     assert result["age_hours"] < 24
 
@@ -340,7 +353,9 @@ async def test_check_freshness_stale():
     db = MagicMock()
     db.query = AsyncMock(return_value=[{"latest": old}])
     plugin = make_dq(db=db)
-    result = await plugin.check_freshness(db, "events", "created_at", expected_interval_hours=24)
+    result = await plugin.check_freshness(
+        db, "events", "created_at", expected_interval_hours=24
+    )
     assert result["is_fresh"] is False
 
 
@@ -361,7 +376,9 @@ async def test_check_freshness_string_timestamp(monkeypatch):
     db = MagicMock()
     db.query = AsyncMock(return_value=[{"latest": recent_str}])
     plugin = make_dq(db=db)
-    result = await plugin.check_freshness(db, "events", "created_at", expected_interval_hours=24)
+    result = await plugin.check_freshness(
+        db, "events", "created_at", expected_interval_hours=24
+    )
     assert result["success"] is True
     assert result["is_fresh"] is True
 
@@ -370,14 +387,15 @@ async def test_check_freshness_string_timestamp_Z_suffix():
     """ISO string with Z suffix (e.g. aiosqlite) must be parsed correctly."""
     from datetime import datetime, timezone, timedelta
 
-    recent_str = (
-        (datetime.now(timezone.utc) - timedelta(hours=1))
-        .strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-    )
+    recent_str = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    ) + "Z"
     db = MagicMock()
     db.query = AsyncMock(return_value=[{"latest": recent_str}])
     plugin = make_dq(db=db)
-    result = await plugin.check_freshness(db, "events", "ts", expected_interval_hours=24)
+    result = await plugin.check_freshness(
+        db, "events", "ts", expected_interval_hours=24
+    )
     assert result["success"] is True
     assert result["is_fresh"] is True
 
@@ -409,6 +427,7 @@ async def test_report_returns_completeness_score():
 
 async def test_report_has_no_contract_field():
     """report() no longer accepts assertions — contract key must not appear."""
+
     async def mock_query(sql, params=None):
         if "information_schema" in sql.lower() or "pragma_table_info" in sql.lower():
             return [{"column_name": "id"}]
@@ -428,6 +447,7 @@ async def test_report_has_no_contract_field():
 
 async def test_report_persists_stable_metric_node_id():
     """Metric node ID must be quality_latest:{table}, not timestamp-based (DQ-12)."""
+
     async def mock_query(sql, params=None):
         if "information_schema" in sql.lower() or "pragma_table_info" in sql.lower():
             return [{"column_name": "id"}]
@@ -457,6 +477,7 @@ async def test_report_persists_stable_metric_node_id():
 
 async def test_report_metric_node_id_is_stable_across_calls():
     """Two calls for the same table must produce the same metric node ID."""
+
     async def mock_query(sql, params=None):
         if "information_schema" in sql.lower() or "pragma_table_info" in sql.lower():
             return [{"column_name": "id"}]

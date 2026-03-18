@@ -13,7 +13,9 @@ if TYPE_CHECKING:
     from ....plugins.base_db import BaseDatabasePlugin
 
 
-def create_detect_anomalies_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, Any]) -> AgentTool:
+def create_detect_anomalies_tool(
+    plugin: "BaseDatabasePlugin", schema: Dict[str, Any]
+) -> AgentTool:
     """Return an AgentTool that detects statistical outliers in a column."""
 
     async def handler(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -42,16 +44,29 @@ def create_detect_anomalies_tool(plugin: "BaseDatabasePlugin", schema: Dict[str,
         try:
             rows = await safe_query(plugin, sql)
             if not rows:
-                return {"success": True, "anomalies": [], "anomaly_count": 0, "total_rows": 0}
+                return {
+                    "success": True,
+                    "anomalies": [],
+                    "anomaly_count": 0,
+                    "total_rows": 0,
+                }
 
-            df = pd.DataFrame([{k: to_serializable(v) for k, v in r.items()} for r in rows])
+            df = pd.DataFrame(
+                [{k: to_serializable(v) for k, v in r.items()} for r in rows]
+            )
 
             if column not in df.columns:
-                return {"success": False, "error": f"Column '{column}' not found in query results"}
+                return {
+                    "success": False,
+                    "error": f"Column '{column}' not found in query results",
+                }
 
             series = pd.to_numeric(df[column], errors="coerce").dropna()
             if len(series) == 0:
-                return {"success": False, "error": f"No numeric values found in column '{column}'"}
+                return {
+                    "success": False,
+                    "error": f"No numeric values found in column '{column}'",
+                }
 
             values = series.values
             mean = float(np.mean(values))
@@ -69,14 +84,22 @@ def create_detect_anomalies_tool(plugin: "BaseDatabasePlugin", schema: Dict[str,
                         "anomalies": [],
                         "anomaly_count": 0,
                         "total_rows": len(df),
-                        "stats": {"mean": mean, "std": std, "median": median, "min": min_val, "max": max_val},
+                        "stats": {
+                            "mean": mean,
+                            "std": std,
+                            "median": median,
+                            "min": min_val,
+                            "max": max_val,
+                        },
                     }
                 zscores = (values - mean) / std
                 anomaly_mask = np.abs(zscores) > threshold
                 for idx, (is_anomaly, z) in enumerate(zip(anomaly_mask, zscores)):
                     if is_anomaly:
                         orig_idx = series.index[idx]
-                        row = {k: to_serializable(v) for k, v in df.loc[orig_idx].items()}
+                        row = {
+                            k: to_serializable(v) for k, v in df.loc[orig_idx].items()
+                        }
                         row["_zscore"] = round(float(z), 4)
                         row["_direction"] = "high" if z > 0 else "low"
                         anomaly_rows.append(row)
@@ -89,7 +112,13 @@ def create_detect_anomalies_tool(plugin: "BaseDatabasePlugin", schema: Dict[str,
                     "anomalies": anomaly_rows,
                     "anomaly_count": int(np.sum(anomaly_mask)),
                     "total_rows": len(df),
-                    "stats": {"mean": mean, "std": std, "median": median, "min": min_val, "max": max_val},
+                    "stats": {
+                        "mean": mean,
+                        "std": std,
+                        "median": median,
+                        "min": min_val,
+                        "max": max_val,
+                    },
                 }
 
             elif method == "iqr":
@@ -103,7 +132,9 @@ def create_detect_anomalies_tool(plugin: "BaseDatabasePlugin", schema: Dict[str,
                 for idx, (is_anomaly, val) in enumerate(zip(anomaly_mask, values)):
                     if is_anomaly:
                         orig_idx = series.index[idx]
-                        row = {k: to_serializable(v) for k, v in df.loc[orig_idx].items()}
+                        row = {
+                            k: to_serializable(v) for k, v in df.loc[orig_idx].items()
+                        }
                         if val > upper:
                             row["_iqr_distance"] = round(float(val - upper), 4)
                             row["_direction"] = "high"
@@ -120,12 +151,27 @@ def create_detect_anomalies_tool(plugin: "BaseDatabasePlugin", schema: Dict[str,
                     "anomalies": anomaly_rows,
                     "anomaly_count": int(np.sum(anomaly_mask)),
                     "total_rows": len(df),
-                    "bounds": {"lower": lower, "upper": upper, "q1": q1, "q3": q3, "iqr": iqr},
-                    "stats": {"mean": mean, "std": std, "median": median, "min": min_val, "max": max_val},
+                    "bounds": {
+                        "lower": lower,
+                        "upper": upper,
+                        "q1": q1,
+                        "q3": q3,
+                        "iqr": iqr,
+                    },
+                    "stats": {
+                        "mean": mean,
+                        "std": std,
+                        "median": median,
+                        "min": min_val,
+                        "max": max_val,
+                    },
                 }
 
             else:
-                return {"success": False, "error": f"Unknown method '{method}'. Use 'zscore' or 'iqr'"}
+                return {
+                    "success": False,
+                    "error": f"Unknown method '{method}'. Use 'zscore' or 'iqr'",
+                }
 
         except Exception as e:
             return {"success": False, "error": f"Anomaly detection failed: {e}"}
@@ -143,8 +189,14 @@ def create_detect_anomalies_tool(plugin: "BaseDatabasePlugin", schema: Dict[str,
         parameters={
             "type": "object",
             "properties": {
-                "sql": {"type": "string", "description": "SQL query returning rows to analyse"},
-                "column": {"type": "string", "description": "Numeric column to check for anomalies"},
+                "sql": {
+                    "type": "string",
+                    "description": "SQL query returning rows to analyse",
+                },
+                "column": {
+                    "type": "string",
+                    "description": "Numeric column to check for anomalies",
+                },
                 "method": {
                     "type": "string",
                     "enum": ["zscore", "iqr"],

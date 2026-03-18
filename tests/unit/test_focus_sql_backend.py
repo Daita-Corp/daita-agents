@@ -17,9 +17,13 @@ from daita.core.focus.evaluator import evaluate_remaining
 BASE = "SELECT * FROM orders"
 
 
-def compile(dsl: str, dialect: str = "postgresql", param_offset: int = 0, mode: str = "safe"):
+def compile(
+    dsl: str, dialect: str = "postgresql", param_offset: int = 0, mode: str = "safe"
+):
     fq = parse(dsl)
-    return compile_focus_to_sql(BASE, fq, dialect=dialect, param_offset=param_offset, mode=mode)
+    return compile_focus_to_sql(
+        BASE, fq, dialect=dialect, param_offset=param_offset, mode=mode
+    )
 
 
 # ── Filter pushdown ───────────────────────────────────────────────────────────
@@ -208,7 +212,9 @@ def test_combined_filter_limit_safe_mode():
 
 def test_clause_order_in_sql():
     """WHERE must precede ORDER BY, LIMIT (full mode)."""
-    sql, params, applied = compile("amount > 0 | ORDER BY amount DESC | LIMIT 10", mode="full")
+    sql, params, applied = compile(
+        "amount > 0 | ORDER BY amount DESC | LIMIT 10", mode="full"
+    )
     where_pos = sql.index("WHERE")
     order_pos = sql.index("ORDER BY")
     limit_pos = sql.index("LIMIT")
@@ -230,7 +236,9 @@ def test_group_by_with_aggregates():
 
 
 def test_group_by_count_star():
-    sql, params, applied = compile("GROUP BY status | SELECT status, COUNT(*) AS cnt", mode="full")
+    sql, params, applied = compile(
+        "GROUP BY status | SELECT status, COUNT(*) AS cnt", mode="full"
+    )
     assert "COUNT(*)" in sql
     assert "group_by" in applied
 

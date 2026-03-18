@@ -1310,8 +1310,7 @@ class CatalogPlugin(BasePlugin):
             col_by_table.setdefault(col["table_name"], []).append(col)
 
         pk_set = {
-            (pk["table_name"], pk["column_name"])
-            for pk in raw.get("primary_keys", [])
+            (pk["table_name"], pk["column_name"]) for pk in raw.get("primary_keys", [])
         }
 
         tables = []
@@ -1328,7 +1327,9 @@ class CatalogPlugin(BasePlugin):
                 if c.get("column_comment"):
                     col["column_comment"] = c["column_comment"]
                 cols.append(col)
-            tables.append({"name": tname, "row_count": t.get("row_count"), "columns": cols})
+            tables.append(
+                {"name": tname, "row_count": t.get("row_count"), "columns": cols}
+            )
 
         fks = [
             {
@@ -1370,7 +1371,9 @@ class CatalogPlugin(BasePlugin):
                 if c.get("column_comment"):
                     col["column_comment"] = c["column_comment"]
                 cols.append(col)
-            tables.append({"name": tname, "row_count": t.get("row_count"), "columns": cols})
+            tables.append(
+                {"name": tname, "row_count": t.get("row_count"), "columns": cols}
+            )
 
         fks = [
             {

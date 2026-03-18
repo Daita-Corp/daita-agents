@@ -30,7 +30,9 @@ def _detect_frequency(median_gap_days: float) -> str:
     return "quarterly"
 
 
-def create_forecast_trend_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, Any]) -> AgentTool:
+def create_forecast_trend_tool(
+    plugin: "BaseDatabasePlugin", schema: Dict[str, Any]
+) -> AgentTool:
     """Return an AgentTool that fits a linear trend and projects forward."""
 
     async def handler(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -56,21 +58,34 @@ def create_forecast_trend_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, A
         try:
             rows = await safe_query(plugin, sql)
             if not rows:
-                return {"success": True, "historical": [], "forecast": [], "trend": None}
+                return {
+                    "success": True,
+                    "historical": [],
+                    "forecast": [],
+                    "trend": None,
+                }
 
-            df = pd.DataFrame([{k: to_serializable(v) for k, v in r.items()} for r in rows])
+            df = pd.DataFrame(
+                [{k: to_serializable(v) for k, v in r.items()} for r in rows]
+            )
 
             if date_column not in df.columns:
                 return {"success": False, "error": f"Column '{date_column}' not found"}
             if metric_column not in df.columns:
-                return {"success": False, "error": f"Column '{metric_column}' not found"}
+                return {
+                    "success": False,
+                    "error": f"Column '{metric_column}' not found",
+                }
 
             df[date_column] = pd.to_datetime(df[date_column], errors="coerce")
             df[metric_column] = pd.to_numeric(df[metric_column], errors="coerce")
             df = df[[date_column, metric_column]].dropna().sort_values(date_column)
 
             if len(df) < 2:
-                return {"success": False, "error": "Need at least 2 data points to compute trend"}
+                return {
+                    "success": False,
+                    "error": "Need at least 2 data points to compute trend",
+                }
 
             dates = df[date_column].values
             values = df[metric_column].values.astype(float)
@@ -113,15 +128,22 @@ def create_forecast_trend_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, A
             forecast = []
             for i in range(1, periods + 1):
                 future_date = last_date + pd.Timedelta(days=freq_days * i)
-                future_ordinal = float(np.datetime64(future_date.date(), "D").astype(float))
+                future_ordinal = float(
+                    np.datetime64(future_date.date(), "D").astype(float)
+                )
                 predicted = float(np.polyval(coeffs, future_ordinal))
-                forecast.append({
-                    "date": future_date.date().isoformat(),
-                    "predicted": round(predicted, 4),
-                })
+                forecast.append(
+                    {
+                        "date": future_date.date().isoformat(),
+                        "predicted": round(predicted, 4),
+                    }
+                )
 
             historical = [
-                {"date": pd.Timestamp(d).date().isoformat(), "value": round(float(v), 4)}
+                {
+                    "date": pd.Timestamp(d).date().isoformat(),
+                    "value": round(float(v), 4),
+                }
                 for d, v in zip(dates, values)
             ]
 
@@ -159,8 +181,14 @@ def create_forecast_trend_tool(plugin: "BaseDatabasePlugin", schema: Dict[str, A
                     "type": "string",
                     "description": "SQL query returning at least two columns: a date and a numeric metric",
                 },
-                "date_column": {"type": "string", "description": "Name of the date/timestamp column"},
-                "metric_column": {"type": "string", "description": "Name of the numeric metric column"},
+                "date_column": {
+                    "type": "string",
+                    "description": "Name of the date/timestamp column",
+                },
+                "metric_column": {
+                    "type": "string",
+                    "description": "Name of the numeric metric column",
+                },
                 "periods": {
                     "type": "integer",
                     "description": "Number of future periods to forecast (default: 3)",

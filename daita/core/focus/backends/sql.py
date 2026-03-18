@@ -35,9 +35,7 @@ _AGG_EXPR_RE = re.compile(r"^(SUM|COUNT|AVG|MIN|MAX)\((\*|[\w]+)\)$", re.IGNOREC
 # Matches ISO date strings (YYYY-MM-DD) and ISO datetime strings (YYYY-MM-DD HH:MM:SS
 # or YYYY-MM-DDTHH:MM:SS) so they can be coerced to Python datetime objects before
 # being passed as asyncpg parameters — asyncpg will not auto-cast str → TIMESTAMP.
-_ISO_DATETIME_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?$"
-)
+_ISO_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?$")
 
 
 def _quote_id(name: str, dialect: str) -> str:
@@ -118,6 +116,7 @@ class _SQLFilterCompiler:
         # TIMESTAMP / DATE columns without a type-mismatch error.
         if isinstance(value, str) and _ISO_DATETIME_RE.match(value):
             from datetime import datetime
+
             try:
                 value = datetime.fromisoformat(value)
             except ValueError:

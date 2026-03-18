@@ -18,17 +18,21 @@ from daita.agents.db.cache import (
     load_cached_schema as _db_load_cached_schema,
     save_schema_cache as _db_save_schema_cache,
 )
-from daita.agents.db.prompt import build_prompt as _db_build_prompt, infer_domain as _infer_domain
+from daita.agents.db.prompt import (
+    build_prompt as _db_build_prompt,
+    infer_domain as _infer_domain,
+)
 from daita.agents.db.resolve import resolve_plugin as _db_resolve_plugin
 from daita.agents.db.schema import normalize_schema as _db_normalize_schema
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_normalized_schema(tables=None, fks=None, db_type="postgresql", db_name="public"):
+def _make_normalized_schema(
+    tables=None, fks=None, db_type="postgresql", db_name="public"
+):
     """Build a minimal normalized schema dict for tests."""
     tables = tables or []
     return {
@@ -41,7 +45,9 @@ def _make_normalized_schema(tables=None, fks=None, db_type="postgresql", db_name
 
 
 def _table(name, columns=None, row_count=None):
-    columns = columns or [{"name": "id", "type": "integer", "nullable": False, "is_primary_key": True}]
+    columns = columns or [
+        {"name": "id", "type": "integer", "nullable": False, "is_primary_key": True}
+    ]
     return {"name": name, "columns": columns, "row_count": row_count}
 
 
@@ -57,25 +63,33 @@ class TestResolveDbPlugin:
         with patch("daita.plugins.postgresql.PostgreSQLPlugin") as MockPg:
             plugin, created = _db_resolve_plugin("postgresql://user:pass@host/db")
         assert created is True
-        MockPg.assert_called_once_with(connection_string="postgresql://user:pass@host/db", read_only=True)
+        MockPg.assert_called_once_with(
+            connection_string="postgresql://user:pass@host/db", read_only=True
+        )
 
     def test_resolve_postgres_scheme(self):
         with patch("daita.plugins.postgresql.PostgreSQLPlugin") as MockPg:
             plugin, created = _db_resolve_plugin("postgres://user:pass@host/db")
         assert created is True
-        MockPg.assert_called_once_with(connection_string="postgres://user:pass@host/db", read_only=True)
+        MockPg.assert_called_once_with(
+            connection_string="postgres://user:pass@host/db", read_only=True
+        )
 
     def test_resolve_mysql_string(self):
         with patch("daita.plugins.mysql.MySQLPlugin") as MockMy:
             plugin, created = _db_resolve_plugin("mysql://user:pass@host/db")
         assert created is True
-        MockMy.assert_called_once_with(connection_string="mysql://user:pass@host/db", read_only=True)
+        MockMy.assert_called_once_with(
+            connection_string="mysql://user:pass@host/db", read_only=True
+        )
 
     def test_resolve_mongodb_string(self):
         with patch("daita.plugins.mongodb.MongoDBPlugin") as MockMongo:
             plugin, created = _db_resolve_plugin("mongodb://host/mydb")
         assert created is True
-        MockMongo.assert_called_once_with(connection_string="mongodb://host/mydb", read_only=True)
+        MockMongo.assert_called_once_with(
+            connection_string="mongodb://host/mydb", read_only=True
+        )
 
     def test_resolve_mongodb_no_database(self):
         with pytest.raises(ValueError, match="database name"):
@@ -214,8 +228,16 @@ class TestNormalizeDbSchema:
                     "collection_name": "events",
                     "document_count": 50000,
                     "fields": [
-                        {"field_name": "_id", "types": ["ObjectId"], "sample_count": 100},
-                        {"field_name": "user_id", "types": ["str"], "sample_count": 100},
+                        {
+                            "field_name": "_id",
+                            "types": ["ObjectId"],
+                            "sample_count": 100,
+                        },
+                        {
+                            "field_name": "user_id",
+                            "types": ["str"],
+                            "sample_count": 100,
+                        },
                     ],
                 }
             ],
@@ -303,7 +325,10 @@ class TestBuildDbPrompt:
         assert "5,000 rows" in prompt
 
     def test_prompt_large_schema_summary_only(self):
-        tables = [_table(f"table_{i}", self._cols(["id", "name"]), row_count=1000) for i in range(100)]
+        tables = [
+            _table(f"table_{i}", self._cols(["id", "name"]), row_count=1000)
+            for i in range(100)
+        ]
         schema = _make_normalized_schema(tables=tables)
         schema["table_count"] = 100
         prompt = _db_build_prompt(schema, "general-purpose", None)
@@ -343,7 +368,9 @@ class TestBuildDbPrompt:
 
     def test_prompt_with_user_prompt(self):
         schema = _make_normalized_schema(tables=[_table("foo")])
-        prompt = _db_build_prompt(schema, "general-purpose", "Focus on sales metrics only.")
+        prompt = _db_build_prompt(
+            schema, "general-purpose", "Focus on sales metrics only."
+        )
         assert "Focus on sales metrics only." in prompt
 
     def test_prompt_empty_database(self):
@@ -445,7 +472,11 @@ class TestFromDbIntegration:
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
-            patch.object(fac, "discover_schema", AsyncMock(side_effect=RuntimeError("schema error"))),
+            patch.object(
+                fac,
+                "discover_schema",
+                AsyncMock(side_effect=RuntimeError("schema error")),
+            ),
         ):
             with pytest.raises(AgentError, match="Schema discovery failed"):
                 await from_db("postgresql://localhost/testdb")
@@ -464,7 +495,11 @@ class TestFromDbIntegration:
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
-            patch.object(fac, "discover_schema", AsyncMock(return_value=_db_normalize_schema(raw))),
+            patch.object(
+                fac,
+                "discover_schema",
+                AsyncMock(return_value=_db_normalize_schema(raw)),
+            ),
             patch("daita.agents.agent.Agent", return_value=mock_agent) as MockAgent,
         ):
             await from_db(
@@ -686,7 +721,9 @@ class TestFromDbMemory:
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
             patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
             patch("daita.agents.agent.Agent", return_value=mock_agent),
-            patch("daita.plugins.memory.MemoryPlugin", return_value=mock_memory) as MockMem,
+            patch(
+                "daita.plugins.memory.MemoryPlugin", return_value=mock_memory
+            ) as MockMem,
         ):
             await from_db("postgresql://localhost/testdb", memory=True)
 
@@ -766,7 +803,9 @@ class TestSchemaCache:
         import daita.agents.db.builder as fac
         from daita.agents.db import from_db
 
-        schema = _make_normalized_schema(tables=[_table("orders"), _table("customers"), _table("products")])
+        schema = _make_normalized_schema(
+            tables=[_table("orders"), _table("customers"), _table("products")]
+        )
         mock_plugin = MagicMock()
         mock_plugin.connect = AsyncMock()
         mock_agent = MagicMock()
@@ -792,7 +831,9 @@ class TestSchemaCache:
         import daita.agents.db.builder as fac
         from daita.agents.db import from_db
 
-        schema = _make_normalized_schema(tables=[_table("orders"), _table("customers"), _table("products")])
+        schema = _make_normalized_schema(
+            tables=[_table("orders"), _table("customers"), _table("products")]
+        )
         mock_plugin = MagicMock()
         mock_plugin.connect = AsyncMock()
         mock_agent = MagicMock()
@@ -819,7 +860,9 @@ class TestSchemaCache:
 
     def test_drift_detection_added_table(self):
         old = _make_normalized_schema(tables=[_table("users"), _table("orders")])
-        new = _make_normalized_schema(tables=[_table("users"), _table("orders"), _table("products")])
+        new = _make_normalized_schema(
+            tables=[_table("users"), _table("orders"), _table("products")]
+        )
         drift = _db_detect_drift(old, new)
         assert drift is not None
         assert "products" in drift["added_tables"]
@@ -827,14 +870,33 @@ class TestSchemaCache:
 
     def test_drift_detection_removed_column(self):
         old_cols = [
-            {"name": "id", "type": "integer", "nullable": False, "is_primary_key": True},
-            {"name": "email", "type": "text", "nullable": True, "is_primary_key": False},
+            {
+                "name": "id",
+                "type": "integer",
+                "nullable": False,
+                "is_primary_key": True,
+            },
+            {
+                "name": "email",
+                "type": "text",
+                "nullable": True,
+                "is_primary_key": False,
+            },
         ]
         new_cols = [
-            {"name": "id", "type": "integer", "nullable": False, "is_primary_key": True},
+            {
+                "name": "id",
+                "type": "integer",
+                "nullable": False,
+                "is_primary_key": True,
+            },
         ]
-        old = _make_normalized_schema(tables=[{"name": "users", "columns": old_cols, "row_count": None}])
-        new = _make_normalized_schema(tables=[{"name": "users", "columns": new_cols, "row_count": None}])
+        old = _make_normalized_schema(
+            tables=[{"name": "users", "columns": old_cols, "row_count": None}]
+        )
+        new = _make_normalized_schema(
+            tables=[{"name": "users", "columns": new_cols, "row_count": None}]
+        )
         drift = _db_detect_drift(old, new)
         assert drift is not None
         change = next(c for c in drift["column_changes"] if c["table"] == "users")
@@ -850,7 +912,9 @@ class TestSchemaCache:
         import daita.agents.db.builder as fac
         from daita.agents.db import from_db
 
-        schema = _make_normalized_schema(tables=[_table("orders"), _table("customers"), _table("products")])
+        schema = _make_normalized_schema(
+            tables=[_table("orders"), _table("customers"), _table("products")]
+        )
         mock_plugin = MagicMock()
         mock_plugin.connect = AsyncMock()
         mock_agent = MagicMock()
@@ -867,7 +931,9 @@ class TestSchemaCache:
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
-            patch.object(fac, "discover_schema", AsyncMock(side_effect=RuntimeError("DB down"))),
+            patch.object(
+                fac, "discover_schema", AsyncMock(side_effect=RuntimeError("DB down"))
+            ),
             patch("daita.agents.agent.Agent", return_value=mock_agent),
         ):
             await from_db(source, cache_ttl=0)
@@ -913,12 +979,18 @@ class TestFromDbAuditLog:
         schema = _make_normalized_schema(tables=[_table("users")])
         mock_plugin, mock_agent = self._base_mocks()
 
-        tool_calls_run1 = [{"tool": "postgres_query", "arguments": {"sql": "SELECT 1"}, "result": {}}]
-        tool_calls_run2 = [{"tool": "postgres_query", "arguments": {"sql": "SELECT 2"}, "result": {}}]
-        mock_agent.run = AsyncMock(side_effect=[
-            {"result": "first", "tool_calls": tool_calls_run1},
-            {"result": "second", "tool_calls": tool_calls_run2},
-        ])
+        tool_calls_run1 = [
+            {"tool": "postgres_query", "arguments": {"sql": "SELECT 1"}, "result": {}}
+        ]
+        tool_calls_run2 = [
+            {"tool": "postgres_query", "arguments": {"sql": "SELECT 2"}, "result": {}}
+        ]
+        mock_agent.run = AsyncMock(
+            side_effect=[
+                {"result": "first", "tool_calls": tool_calls_run1},
+                {"result": "second", "tool_calls": tool_calls_run2},
+            ]
+        )
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
@@ -956,6 +1028,7 @@ class TestFromDbAuditLog:
         entry = agent._db_audit_log[0]
         assert "timestamp" in entry
         from datetime import datetime, timezone
+
         dt = datetime.fromisoformat(entry["timestamp"])
         assert dt.tzinfo is not None
 
@@ -967,7 +1040,12 @@ class TestFromDbAuditLog:
         schema = _make_normalized_schema(tables=[_table("users")])
         mock_plugin, mock_agent = self._base_mocks()
         mock_agent.run = AsyncMock(
-            return_value={"result": "42 rows found", "tool_calls": [], "tokens": {}, "cost": 0.0}
+            return_value={
+                "result": "42 rows found",
+                "tool_calls": [],
+                "tokens": {},
+                "cost": 0.0,
+            }
         )
 
         with (
@@ -1055,7 +1133,9 @@ class TestFromDbHistory:
             patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
             patch("daita.agents.agent.Agent", return_value=mock_agent),
         ):
-            agent = await from_db("postgresql://localhost/testdb", history=custom_history)
+            agent = await from_db(
+                "postgresql://localhost/testdb", history=custom_history
+            )
 
         assert agent._db_history is custom_history
 
@@ -1113,17 +1193,42 @@ def _analyst_schema():
             {
                 "name": "customers",
                 "columns": [
-                    {"name": "id", "type": "integer", "nullable": False, "is_primary_key": True},
-                    {"name": "name", "type": "varchar", "nullable": True, "is_primary_key": False},
+                    {
+                        "name": "id",
+                        "type": "integer",
+                        "nullable": False,
+                        "is_primary_key": True,
+                    },
+                    {
+                        "name": "name",
+                        "type": "varchar",
+                        "nullable": True,
+                        "is_primary_key": False,
+                    },
                 ],
                 "row_count": 100,
             },
             {
                 "name": "orders",
                 "columns": [
-                    {"name": "id", "type": "integer", "nullable": False, "is_primary_key": True},
-                    {"name": "customer_id", "type": "integer", "nullable": False, "is_primary_key": False},
-                    {"name": "total", "type": "numeric", "nullable": True, "is_primary_key": False},
+                    {
+                        "name": "id",
+                        "type": "integer",
+                        "nullable": False,
+                        "is_primary_key": True,
+                    },
+                    {
+                        "name": "customer_id",
+                        "type": "integer",
+                        "nullable": False,
+                        "is_primary_key": False,
+                    },
+                    {
+                        "name": "total",
+                        "type": "numeric",
+                        "nullable": True,
+                        "is_primary_key": False,
+                    },
                 ],
                 "row_count": 500,
             },
@@ -1193,13 +1298,15 @@ class TestPivotTableTool:
         plugin = _mock_plugin_with_query(rows)
         tool = create_pivot_table_tool(plugin, _analyst_schema())
 
-        result = await tool.handler({
-            "sql": "SELECT * FROM orders",
-            "rows": "category",
-            "columns": "month",
-            "values": "revenue",
-            "aggfunc": "sum",
-        })
+        result = await tool.handler(
+            {
+                "sql": "SELECT * FROM orders",
+                "rows": "category",
+                "columns": "month",
+                "values": "revenue",
+                "aggfunc": "sum",
+            }
+        )
 
         assert result["success"] is True
         assert result["row_count"] > 0
@@ -1225,15 +1332,23 @@ class TestPivotTableTool:
         plugin = _mock_plugin_with_query([])
         tool = create_pivot_table_tool(plugin, _analyst_schema())
 
-        with patch("daita.agents.db.tools.pivot_table.ensure_pandas", side_effect=ImportError("pandas not found")):
-            result = await tool.handler({
-                "sql": "SELECT 1",
-                "rows": "a",
-                "columns": "b",
-                "values": "c",
-            })
+        with patch(
+            "daita.agents.db.tools.pivot_table.ensure_pandas",
+            side_effect=ImportError("pandas not found"),
+        ):
+            result = await tool.handler(
+                {
+                    "sql": "SELECT 1",
+                    "rows": "a",
+                    "columns": "b",
+                    "values": "c",
+                }
+            )
         assert result["success"] is False
-        assert "pandas" in result["error"].lower() or "not found" in result["error"].lower()
+        assert (
+            "pandas" in result["error"].lower()
+            or "not found" in result["error"].lower()
+        )
 
 
 class TestCorrelateTool:
@@ -1254,7 +1369,14 @@ class TestCorrelateTool:
         assert result["success"] is True
         assert len(result["correlations"]) > 0
         # x and y should be perfectly correlated
-        xy = next((p for p in result["correlations"] if set([p["column_a"], p["column_b"]]) == {"x", "y"}), None)
+        xy = next(
+            (
+                p
+                for p in result["correlations"]
+                if set([p["column_a"], p["column_b"]]) == {"x", "y"}
+            ),
+            None,
+        )
         assert xy is not None
         assert abs(xy["correlation"]) > 0.99
 
@@ -1309,7 +1431,9 @@ class TestDetectAnomaliesTool:
         plugin = _mock_plugin_with_query(rows)
         tool = create_detect_anomalies_tool(plugin, _analyst_schema())
 
-        result = await tool.handler({"sql": "SELECT * FROM t", "column": "val", "method": "iqr"})
+        result = await tool.handler(
+            {"sql": "SELECT * FROM t", "column": "val", "method": "iqr"}
+        )
         assert result["success"] is True
         assert result["anomaly_count"] >= 1
 
@@ -1319,7 +1443,10 @@ class TestDetectAnomaliesTool:
         plugin = _mock_plugin_with_query([])
         tool = create_detect_anomalies_tool(plugin, _analyst_schema())
 
-        with patch("daita.agents.db.tools.detect_anomalies.ensure_numpy", side_effect=ImportError("numpy not found")):
+        with patch(
+            "daita.agents.db.tools.detect_anomalies.ensure_numpy",
+            side_effect=ImportError("numpy not found"),
+        ):
             result = await tool.handler({"sql": "SELECT 1", "column": "val"})
         assert result["success"] is False
 
@@ -1391,12 +1518,14 @@ class TestForecastTrendTool:
         plugin = _mock_plugin_with_query(rows)
         tool = create_forecast_trend_tool(plugin, _analyst_schema())
 
-        result = await tool.handler({
-            "sql": "SELECT month, revenue FROM orders",
-            "date_column": "month",
-            "metric_column": "revenue",
-            "periods": 3,
-        })
+        result = await tool.handler(
+            {
+                "sql": "SELECT month, revenue FROM orders",
+                "date_column": "month",
+                "metric_column": "revenue",
+                "periods": 3,
+            }
+        )
 
         assert result["success"] is True
         assert result["trend"]["direction"] == "up"
@@ -1415,11 +1544,13 @@ class TestForecastTrendTool:
         plugin = _mock_plugin_with_query([{"d": "2024-01-01", "v": 100}])
         tool = create_forecast_trend_tool(plugin, _analyst_schema())
 
-        result = await tool.handler({
-            "sql": "SELECT d, v FROM t",
-            "date_column": "d",
-            "metric_column": "v",
-        })
+        result = await tool.handler(
+            {
+                "sql": "SELECT d, v FROM t",
+                "date_column": "d",
+                "metric_column": "v",
+            }
+        )
         assert result["success"] is False
         assert "2 data points" in result["error"]
 
@@ -1450,10 +1581,14 @@ class TestToolkitParam:
             await from_db("postgresql://localhost/testdb", toolkit=None)
 
         analyst_tools = {
-            "pivot_table", "correlate", "detect_anomalies",
-            "compare_entities", "find_similar", "forecast_trend",
+            "pivot_table",
+            "correlate",
+            "detect_anomalies",
+            "compare_entities",
+            "find_similar",
+            "forecast_trend",
         }
         registered = set(real_registry.tool_names)
-        assert analyst_tools.isdisjoint(registered), (
-            f"Expected no analyst tools but found: {analyst_tools & registered}"
-        )
+        assert analyst_tools.isdisjoint(
+            registered
+        ), f"Expected no analyst tools but found: {analyst_tools & registered}"

@@ -176,6 +176,7 @@ class TestPluginToolSetup:
 def _make_returning_tool(name: str, return_value=None):
     async def h(args):
         return return_value
+
     return AgentTool(name=name, description=f"Tool {name}", parameters={}, handler=h)
 
 
@@ -183,7 +184,10 @@ def _make_slow_tool(name: str, sleep: float = 10.0):
     async def h(args):
         await asyncio.sleep(sleep)
         return "never"
-    return AgentTool(name=name, description="Slow", parameters={}, handler=h, timeout_seconds=0.01)
+
+    return AgentTool(
+        name=name, description="Slow", parameters={}, handler=h, timeout_seconds=0.01
+    )
 
 
 class TestExecuteToolCall:
@@ -208,6 +212,7 @@ class TestExecuteToolCall:
     async def test_tool_exception_returns_error_dict(self):
         async def h(args):
             raise RuntimeError("unexpected failure")
+
         t = AgentTool(name="broken", description="Broken", parameters={}, handler=h)
         result = await _execute_tool_call({"name": "broken", "arguments": {}}, [t])
         assert isinstance(result, dict)

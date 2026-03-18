@@ -137,6 +137,7 @@ class TestPluginInitialize:
 
 class ConcreteLifecyclePlugin(LifecyclePlugin):
     """Minimal concrete LifecyclePlugin for testing default behaviour."""
+
     pass
 
 

@@ -173,7 +173,7 @@ class PollingWatchSource:
                 consecutive_failures += 1
                 if consecutive_failures >= self._max_failures:
                     raise
-                delay = min(2 ** consecutive_failures, 60)
+                delay = min(2**consecutive_failures, 60)
                 logger.warning(
                     f"Poll error ({consecutive_failures}/{self._max_failures}),"
                     f" retrying in {delay}s: {e}"
