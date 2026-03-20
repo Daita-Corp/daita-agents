@@ -689,20 +689,83 @@ class S3Plugin(BasePlugin):
                 plugin_name="S3",
                 timeout_seconds=30,
             ),
+            AgentTool(
+                name="head_s3_object",
+                description="Get metadata for an S3 object (size, content type, last modified) without downloading it.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "description": "S3 object key (file path)",
+                        }
+                    },
+                    "required": ["key"],
+                },
+                handler=self._tool_head_object,
+                category="storage",
+                source="plugin",
+                plugin_name="S3",
+                timeout_seconds=15,
+            ),
         ]
 
     async def _tool_read_file(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for read_s3_file"""
         key = args.get("key")
         format_hint = args.get("format", "auto")
+        detected_format = self._detect_format(key)
+
+        # Binary formats (including pandas-read parquet/xlsx): return metadata only
+        if detected_format in ("bytes", "pandas"):
+            if self._client is None:
+                await self.connect()
+            import asyncio as _asyncio
+            _loop = _asyncio.get_running_loop()
+            _head = await _loop.run_in_executor(
+                None, lambda: self._client.head_object(Bucket=self.bucket, Key=key)
+            )
+            return {
+                "key": key,
+                "binary": True,
+                "content_type": _head.get("ContentType", "application/octet-stream"),
+                "size": _head.get("ContentLength"),
+                "last_modified": str(_head.get("LastModified", "")),
+                "bucket": self.bucket,
+            }
 
         data = await self.get_object(key, format=format_hint)
 
+        _MAX_CHARS = 50_000
+        _MAX_ROWS = 200
+
+        # CSV / list: cap rows
+        if isinstance(data, list):
+            total = len(data)
+            truncated = total > _MAX_ROWS
+            return {
+                "key": key,
+                "format": detected_format,
+                "rows": data[:_MAX_ROWS],
+                "total_rows": total,
+                "truncated": truncated,
+                "bucket": self.bucket,
+            }
+
+        # Text / JSON: cap characters
+        import json as _json
+        if isinstance(data, (dict, list)):
+            serialized = _json.dumps(data)
+        else:
+            serialized = str(data) if not isinstance(data, str) else data
+
+        truncated = len(serialized) > _MAX_CHARS
         return {
-            "success": True,
             "key": key,
-            "data": data,
-            "format": self._detect_format(key),
+            "format": detected_format,
+            "content": serialized[:_MAX_CHARS],
+            "truncated": truncated,
+            **({"total_chars": len(serialized)} if truncated else {}),
             "bucket": self.bucket,
         }
 
@@ -714,7 +777,6 @@ class S3Plugin(BasePlugin):
         result = await self.put_object(key, data)
 
         return {
-            "success": True,
             "key": key,
             "size": result.get("size"),
             "location": f"s3://{self.bucket}/{key}",
@@ -738,10 +800,15 @@ class S3Plugin(BasePlugin):
             for obj in objects
         ]
 
+        # Cap at 200 objects to avoid token bloat
+        total = len(simplified)
+        truncated = total > 200
+        simplified = simplified[:200]
+
         return {
-            "success": True,
             "objects": simplified,
-            "count": len(simplified),
+            "total_objects": total,
+            "truncated": truncated,
             "bucket": self.bucket,
             "prefix": prefix if prefix else "(all objects)",
         }
@@ -753,10 +820,31 @@ class S3Plugin(BasePlugin):
         result = await self.delete_object(key)
 
         return {
-            "success": True,
             "key": key,
             "deleted": result.get("deleted", True),
             "bucket": self.bucket,
+        }
+
+    async def _tool_head_object(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for head_s3_object"""
+        key = args.get("key")
+
+        if self._client is None:
+            await self.connect()
+
+        loop = __import__("asyncio").get_running_loop()
+        response = await loop.run_in_executor(
+            None, lambda: self._client.head_object(Bucket=self.bucket, Key=key)
+        )
+
+        return {
+            "key": key,
+            "bucket": self.bucket,
+            "size": response.get("ContentLength"),
+            "content_type": response.get("ContentType"),
+            "last_modified": str(response.get("LastModified", "")),
+            "etag": response.get("ETag"),
+            "metadata": response.get("Metadata", {}),
         }
 
     # Context manager support

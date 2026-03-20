@@ -152,7 +152,6 @@ class QdrantPlugin(BaseVectorPlugin):
         )
 
         return {
-            "success": True,
             "upserted_count": len(ids),
             "operation_id": (
                 result.operation_id if hasattr(result, "operation_id") else None
@@ -210,7 +209,7 @@ class QdrantPlugin(BaseVectorPlugin):
             if with_payload and result.payload:
                 # Remove internal fields from payload
                 payload = {
-                    k: v for k, v in result.payload.items() if not k.startswith("_")
+                    k: v for k, v in result.payload.items() if k != "_original_id"
                 }
                 match["payload"] = payload
             if with_vectors and result.vector:
@@ -245,7 +244,6 @@ class QdrantPlugin(BaseVectorPlugin):
                 collection_name=self.collection_name, points_selector=id_uuids
             )
             return {
-                "success": True,
                 "deleted_count": len(ids),
                 "operation_id": (
                     result.operation_id if hasattr(result, "operation_id") else None
@@ -258,7 +256,6 @@ class QdrantPlugin(BaseVectorPlugin):
                 collection_name=self.collection_name, points_selector=qdrant_filter
             )
             return {
-                "success": True,
                 "deleted": "by_filter",
                 "operation_id": (
                     result.operation_id if hasattr(result, "operation_id") else None
@@ -266,7 +263,8 @@ class QdrantPlugin(BaseVectorPlugin):
                 "collection": self.collection_name,
             }
         else:
-            return {"success": False, "error": "Must provide ids or filter"}
+            from ..core.exceptions import ValidationError
+            raise ValidationError("Must provide ids or filter")
 
     async def fetch(
         self, ids: List[str], with_payload: bool = True, with_vectors: bool = True
@@ -311,7 +309,7 @@ class QdrantPlugin(BaseVectorPlugin):
             if with_payload and result.payload:
                 # Remove internal fields from payload
                 payload = {
-                    k: v for k, v in result.payload.items() if not k.startswith("_")
+                    k: v for k, v in result.payload.items() if k != "_original_id"
                 }
                 vector["payload"] = payload
             if with_vectors and result.vector:
@@ -348,19 +346,15 @@ class QdrantPlugin(BaseVectorPlugin):
 
         distance_metric = distance_map.get(distance, Distance.COSINE)
 
-        try:
-            self._client.create_collection(
-                collection_name=name,
-                vectors_config=VectorParams(size=vector_size, distance=distance_metric),
-            )
-            return {
-                "success": True,
-                "collection": name,
-                "vector_size": vector_size,
-                "distance": distance,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e), "collection": name}
+        self._client.create_collection(
+            collection_name=name,
+            vectors_config=VectorParams(size=vector_size, distance=distance_metric),
+        )
+        return {
+            "collection": name,
+            "vector_size": vector_size,
+            "distance": distance,
+        }
 
     async def list_collections(self) -> List[str]:
         """
@@ -514,7 +508,7 @@ class QdrantPlugin(BaseVectorPlugin):
 
         matches = await self.query(vector=vector, top_k=top_k, filter=filter)
 
-        return {"success": True, "matches": matches, "count": len(matches)}
+        return {"matches": matches, "count": len(matches)}
 
     async def _tool_upsert(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for qdrant_upsert"""

@@ -377,6 +377,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         Example:
             results = await db.query("SELECT * FROM users WHERE age > %s", [25])
         """
+        sql = self._normalize_sql(sql)
         if self._connection is None:
             await self.connect()
         loop = asyncio.get_running_loop()
@@ -393,6 +394,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         Returns:
             Number of affected rows
         """
+        sql = self._normalize_sql(sql)
         if self._connection is None:
             await self.connect()
         loop = asyncio.get_running_loop()
@@ -455,9 +457,20 @@ class SnowflakePlugin(BaseDatabasePlugin):
         return await loop.run_in_executor(None, self._run_show, "SHOW WAREHOUSES", None)
 
     async def switch_warehouse(self, warehouse: str) -> None:
-        """Switch to a different warehouse."""
+        """Switch to a different warehouse.
+
+        Args:
+            warehouse: Warehouse name (must be alphanumeric + underscore)
+        """
         if self._connection is None:
             await self.connect()
+
+        # Validate warehouse name to prevent injection
+        if not re.match(r"^[A-Za-z0-9_]+$", warehouse):
+            raise ValueError(
+                f"Invalid warehouse name: {warehouse!r}. "
+                "Warehouse names must be alphanumeric with underscores only."
+            )
 
         def _switch():
             cursor = self._connection.cursor()
@@ -481,32 +494,27 @@ class SnowflakePlugin(BaseDatabasePlugin):
         result = await self.query("SELECT CURRENT_WAREHOUSE() as warehouse")
         return result[0] if result else {"warehouse": None}
 
-    async def query_history(self, limit: int = 100) -> List[Dict[str, Any]]:
+    async def query_history(self, limit: int = 20) -> List[Dict[str, Any]]:
         """
         Get recent query history.
 
         Args:
-            limit: Maximum number of queries to return (default: 100)
+            limit: Maximum number of queries to return (default: 20)
 
         Returns:
             List of query history records
         """
+        # Cap at 20 to avoid oversized responses
+        limit = min(int(limit), 20)
         sql = f"""
         SELECT
             query_id,
             query_text,
-            database_name,
-            schema_name,
             query_type,
             warehouse_name,
-            user_name,
-            role_name,
             execution_status,
-            error_message,
             start_time,
-            end_time,
             total_elapsed_time,
-            bytes_scanned,
             rows_produced
         FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY())
         ORDER BY start_time DESC
@@ -561,7 +569,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
             overwrite_str = "OVERWRITE = TRUE" if overwrite else ""
             sql = f"PUT 'file://{local_path}' {stage_path} {overwrite_str}"
             results = self._run_query(sql)
-            return {"success": True, "files_uploaded": len(results), "details": results}
+            return {"files_uploaded": len(results), "details": results}
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _put)
@@ -574,7 +582,6 @@ class SnowflakePlugin(BaseDatabasePlugin):
         def _get():
             results = self._run_query(f"GET {stage_path} 'file://{local_path}'")
             return {
-                "success": True,
                 "files_downloaded": len(results),
                 "details": results,
             }
@@ -606,7 +613,6 @@ class SnowflakePlugin(BaseDatabasePlugin):
             results = self._run_query(sql)
             rows_loaded = sum(row.get("rows_loaded", 0) or 0 for row in results)
             return {
-                "success": True,
                 "rows_loaded": rows_loaded,
                 "files_processed": len(results),
                 "details": results,
@@ -644,6 +650,39 @@ class SnowflakePlugin(BaseDatabasePlugin):
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _create)
 
+    async def count_rows(
+        self, table: str, filter: Optional[str] = None
+    ) -> int:
+        """
+        Count rows in a table.
+
+        Args:
+            table: Table name
+            filter: Optional WHERE clause (without the WHERE keyword)
+
+        Returns:
+            Row count
+        """
+        sql = f"SELECT COUNT(*) as cnt FROM {table}"
+        if filter:
+            sql += f" WHERE {filter}"
+        rows = await self.query(sql)
+        return rows[0]["cnt"] if rows else 0
+
+    async def sample_rows(self, table: str, n: int = 5) -> List[Dict[str, Any]]:
+        """
+        Return a random sample of rows from a table.
+
+        Args:
+            table: Table name
+            n: Number of rows to return
+
+        Returns:
+            List of sampled rows
+        """
+        sql = f"SELECT * FROM {table} SAMPLE ({int(n)} ROWS)"
+        return await self.query(sql)
+
     def get_tools(self) -> List["AgentTool"]:
         """
         Expose Snowflake operations as agent tools.
@@ -653,10 +692,10 @@ class SnowflakePlugin(BaseDatabasePlugin):
         """
         from ..core.tools import AgentTool
 
-        return [
+        tools = [
             AgentTool(
                 name="snowflake_query",
-                description="Run a SELECT query on Snowflake. Use limit and columns to avoid oversized responses.",
+                description="Run a SELECT query on Snowflake. Include LIMIT in your SQL to control result size.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -667,16 +706,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
                         "params": {
                             "type": "array",
                             "description": "Optional parameter values",
-                            "items": {"type": "string"},
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Max rows to return (default: 50)",
-                        },
-                        "columns": {
-                            "type": "array",
-                            "description": "Specific columns to return (returns all if omitted)",
-                            "items": {"type": "string"},
+                            "items": {},
                         },
                         "focus": {
                             "type": "string",
@@ -692,80 +722,8 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 timeout_seconds=60,
             ),
             AgentTool(
-                name="snowflake_execute",
-                description="Execute INSERT, UPDATE, or DELETE on Snowflake. Returns affected row count.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "sql": {
-                            "type": "string",
-                            "description": "SQL statement (INSERT, UPDATE, or DELETE)",
-                        },
-                        "params": {
-                            "type": "array",
-                            "description": "Optional parameter values",
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "required": ["sql"],
-                },
-                handler=self._tool_execute,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="snowflake_list_tables",
-                description="List all tables in the Snowflake database or a specific schema.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "schema": {
-                            "type": "string",
-                            "description": "Optional schema name (defaults to current schema)",
-                        }
-                    },
-                    "required": [],
-                },
-                handler=self._tool_list_tables,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="list_schemas",
-                description="List all schemas in the Snowflake database.",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_list_schemas,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="snowflake_get_schema",
-                description="Get column info for a Snowflake table including names, types, and constraints.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name (optionally schema-qualified like 'schema.table')",
-                        }
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_get_table_schema,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=30,
-            ),
-            AgentTool(
                 name="snowflake_inspect",
-                description="List all tables and their column schemas in one call. Use instead of calling snowflake_list_tables then snowflake_get_schema for each table.",
+                description="List all tables and their column schemas in one call. Use tables param to filter specific tables.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -773,7 +731,11 @@ class SnowflakePlugin(BaseDatabasePlugin):
                             "type": "array",
                             "description": "Filter to specific tables (returns all if omitted)",
                             "items": {"type": "string"},
-                        }
+                        },
+                        "schema": {
+                            "type": "string",
+                            "description": "Optional schema name to filter tables",
+                        },
                     },
                     "required": [],
                 },
@@ -784,7 +746,270 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 timeout_seconds=30,
             ),
             AgentTool(
-                name="list_warehouses",
+                name="snowflake_count",
+                description="Count rows in a Snowflake table, optionally filtered.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "table": {
+                            "type": "string",
+                            "description": "Table name (optionally schema-qualified)",
+                        },
+                        "filter": {
+                            "type": "string",
+                            "description": "Optional WHERE clause (without WHERE keyword)",
+                        },
+                    },
+                    "required": ["table"],
+                },
+                handler=self._tool_count,
+                category="database",
+                source="plugin",
+                plugin_name="Snowflake",
+                timeout_seconds=30,
+            ),
+            AgentTool(
+                name="snowflake_sample",
+                description="Return a random sample of rows from a Snowflake table.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "table": {
+                            "type": "string",
+                            "description": "Table name",
+                        },
+                        "n": {
+                            "type": "integer",
+                            "description": "Number of rows to sample (default: 5)",
+                        },
+                    },
+                    "required": ["table"],
+                },
+                handler=self._tool_sample,
+                category="database",
+                source="plugin",
+                plugin_name="Snowflake",
+                timeout_seconds=30,
+            ),
+            AgentTool(
+                name="snowflake_list_schemas",
+                description="List all schemas in the Snowflake database.",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=self._tool_list_schemas,
+                category="database",
+                source="plugin",
+                plugin_name="Snowflake",
+                timeout_seconds=30,
+            ),
+        ]
+
+        if not self.read_only:
+            tools.append(
+                AgentTool(
+                    name="snowflake_execute",
+                    description="Execute INSERT, UPDATE, or DELETE on Snowflake. Returns affected row count.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "sql": {
+                                "type": "string",
+                                "description": "SQL statement (INSERT, UPDATE, or DELETE)",
+                            },
+                            "params": {
+                                "type": "array",
+                                "description": "Optional parameter values",
+                                "items": {},
+                            },
+                        },
+                        "required": ["sql"],
+                    },
+                    handler=self._tool_execute,
+                    category="database",
+                    source="plugin",
+                    plugin_name="Snowflake",
+                    timeout_seconds=60,
+                )
+            )
+
+        return tools
+
+    # Tool handler methods
+
+    async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_query"""
+        sql = self._normalize_sql(args.get("sql"))
+        params = args.get("params") or []
+        focus_dsl = args.get("focus")
+
+        if focus_dsl:
+            results = await self._run_focus_query(sql, params, focus_dsl)
+        else:
+            if not re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
+                sql = f"{sql} LIMIT 50"
+            results = await self.query(sql, params or None)
+
+        truncated = self._truncate_result(results)
+        return {
+            "rows": truncated["rows"],
+            "total_rows": truncated["total_rows"],
+            "truncated": truncated["truncated"],
+        }
+
+    async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_execute"""
+        sql = args.get("sql")
+        params = args.get("params")
+        affected_rows = await self.execute(sql, params)
+        return {"affected_rows": affected_rows}
+
+    async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Kept for backward compat."""
+        schema = args.get("schema")
+        tables = await self.tables(schema)
+        return {"tables": tables}
+
+    async def _tool_list_schemas(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_list_schemas"""
+        schemas = await self.schemas()
+        return {"schemas": schemas}
+
+    async def _tool_get_table_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Kept for backward compat."""
+        table = args.get("table")
+        columns = await self.describe(table)
+        return {
+            "table": table,
+            "columns": [self._compact_column(c) for c in columns],
+        }
+
+    async def _tool_inspect(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_inspect — fetch all table schemas in parallel."""
+        filter_tables = args.get("tables")
+        schema = args.get("schema")
+
+        all_tables = await self.tables(schema)
+        targets = (
+            [t for t in all_tables if t in filter_tables]
+            if filter_tables
+            else all_tables
+        )
+
+        # Cap at 50 tables to avoid token bloat
+        total_tables = len(targets)
+        truncated = total_tables > 50
+        targets = targets[:50]
+
+        schemas = await asyncio.gather(*[self.describe(t) for t in targets])
+
+        return {
+            "tables": [
+                {"name": t, "columns": [self._compact_column(c) for c in s]}
+                for t, s in zip(targets, schemas)
+            ],
+            "total_tables": total_tables,
+            "truncated": truncated,
+        }
+
+    async def _tool_list_warehouses(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_list_warehouses"""
+        warehouses = await self.list_warehouses()
+        return {"warehouses": warehouses}
+
+    async def _tool_switch_warehouse(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_switch_warehouse"""
+        warehouse = args.get("warehouse")
+        await self.switch_warehouse(warehouse)
+        return {"warehouse": warehouse}
+
+    async def _tool_get_query_history(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_get_query_history"""
+        limit = args.get("limit", 20)
+        history = await self.query_history(limit)
+        # Truncate query_text to 200 chars to avoid token bloat
+        for row in history:
+            if "QUERY_TEXT" in row and row["QUERY_TEXT"]:
+                row["QUERY_TEXT"] = row["QUERY_TEXT"][:200]
+            if "query_text" in row and row["query_text"]:
+                row["query_text"] = row["query_text"][:200]
+        return {"queries": history}
+
+    async def _tool_list_stages(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_list_stages"""
+        stages = await self.list_stages()
+        return {"stages": stages}
+
+    async def _tool_load_from_stage(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_load_from_stage"""
+        table = args.get("table")
+        stage = args.get("stage")
+        file_format = args.get("file_format", "CSV")
+        pattern = args.get("pattern")
+        return await self.load_from_stage(table, stage, file_format, pattern)
+
+    async def _tool_create_stage(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_create_stage"""
+        name = args.get("name")
+        url = args.get("url")
+        storage_integration = args.get("storage_integration")
+        await self.create_stage(name, url, storage_integration)
+        return {"stage": name}
+
+    async def _tool_count(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_count"""
+        table = args.get("table")
+        filter_clause = args.get("filter")
+        count = await self.count_rows(table, filter_clause)
+        return {"table": table, "count": count}
+
+    async def _tool_sample(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for snowflake_sample"""
+        table = args.get("table")
+        n = args.get("n", 5)
+        rows = await self.sample_rows(table, n)
+        return {"table": table, "rows": rows}
+
+
+def snowflake(**kwargs) -> SnowflakePlugin:
+    """
+    Create Snowflake plugin with simplified interface.
+
+    Args:
+        **kwargs: Connection parameters (account, warehouse, database, etc.)
+
+    Returns:
+        SnowflakePlugin instance
+
+    Example:
+        from daita.plugins import snowflake
+
+        db = snowflake(
+            account="xy12345",
+            warehouse="COMPUTE_WH",
+            database="MYDB",
+            user="myuser",
+            password="mypass"
+        )
+    """
+    return SnowflakePlugin(**kwargs)
+
+
+class SnowflakeAdminPlugin(SnowflakePlugin):
+    """
+    Snowflake plugin with additional admin/ETL tools for warehouse management,
+    query history, and data staging.
+
+    Use this instead of SnowflakePlugin when the agent needs to manage
+    warehouses, inspect query history, or load data from stages.
+    """
+
+    def get_tools(self) -> List["AgentTool"]:
+        from ..core.tools import AgentTool
+
+        tools = super().get_tools()
+
+        tools += [
+            AgentTool(
+                name="snowflake_list_warehouses",
                 description="List all available Snowflake compute warehouses with their status and configuration",
                 parameters={"type": "object", "properties": {}, "required": []},
                 handler=self._tool_list_warehouses,
@@ -794,34 +1019,14 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 timeout_seconds=30,
             ),
             AgentTool(
-                name="switch_warehouse",
-                description="Switch to a different Snowflake compute warehouse for subsequent queries",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "warehouse": {
-                            "type": "string",
-                            "description": "Name of the warehouse to switch to",
-                        }
-                    },
-                    "required": ["warehouse"],
-                },
-                handler=self._tool_switch_warehouse,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="get_query_history",
-                description="Get recent query history from Snowflake including execution status, timing, and resource usage",
+                name="snowflake_get_query_history",
+                description="Get recent Snowflake query history (last 20 queries).",
                 parameters={
                     "type": "object",
                     "properties": {
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum number of queries to return (default: 100)",
-                            "default": 100,
+                            "description": "Maximum number of queries to return (default: 20, max: 20)",
                         }
                     },
                     "required": [],
@@ -833,7 +1038,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 timeout_seconds=45,
             ),
             AgentTool(
-                name="list_stages",
+                name="snowflake_list_stages",
                 description="List all Snowflake stages (internal and external) for data loading",
                 parameters={"type": "object", "properties": {}, "required": []},
                 handler=self._tool_list_stages,
@@ -843,35 +1048,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 timeout_seconds=30,
             ),
             AgentTool(
-                name="upload_to_stage",
-                description="Upload a local file to a Snowflake stage for data loading",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "local_path": {
-                            "type": "string",
-                            "description": "Local file path to upload",
-                        },
-                        "stage_path": {
-                            "type": "string",
-                            "description": "Stage location (e.g., '@my_stage/path/')",
-                        },
-                        "overwrite": {
-                            "type": "boolean",
-                            "description": "Whether to overwrite existing files (default: false)",
-                            "default": False,
-                        },
-                    },
-                    "required": ["local_path", "stage_path"],
-                },
-                handler=self._tool_upload_to_stage,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=120,
-            ),
-            AgentTool(
-                name="load_from_stage",
+                name="snowflake_load_from_stage",
                 description="Load data from a Snowflake stage into a table using COPY INTO command",
                 parameters={
                     "type": "object",
@@ -900,7 +1077,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 timeout_seconds=180,
             ),
             AgentTool(
-                name="create_stage",
+                name="snowflake_create_stage",
                 description="Create a new Snowflake stage (internal or external) for data loading",
                 parameters={
                     "type": "object",
@@ -925,168 +1102,27 @@ class SnowflakePlugin(BaseDatabasePlugin):
             ),
         ]
 
-    # Tool handler methods
-
-    async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for snowflake_query"""
-        sql = args.get("sql")
-        params = args.get("params") or []
-        focus_dsl = args.get("focus")
-
-        if focus_dsl:
-            results = await self._run_focus_query(sql, params, focus_dsl)
-        else:
-            limit = args.get("limit", 50)
-            columns = args.get("columns")
-            if columns:
-                safe_cols = ", ".join(
-                    f'"{c}"' for c in columns if re.match(r"^[A-Za-z0-9_]+$", c)
+        if not self.read_only:
+            tools.append(
+                AgentTool(
+                    name="snowflake_switch_warehouse",
+                    description="Switch to a different Snowflake compute warehouse for subsequent queries",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "warehouse": {
+                                "type": "string",
+                                "description": "Name of the warehouse to switch to (alphanumeric + underscore)",
+                            }
+                        },
+                        "required": ["warehouse"],
+                    },
+                    handler=self._tool_switch_warehouse,
+                    category="database",
+                    source="plugin",
+                    plugin_name="Snowflake",
+                    timeout_seconds=30,
                 )
-                if safe_cols:
-                    sql = f"SELECT {safe_cols} FROM ({sql}) _sf_q"
-            sql = f"{sql} LIMIT {int(limit)}"
-            results = await self.query(sql, params or None)
+            )
 
-        return {"success": True, "rows": results, "row_count": len(results)}
-
-    async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for snowflake_execute"""
-        sql = args.get("sql")
-        params = args.get("params")
-
-        affected_rows = await self.execute(sql, params)
-
-        return {"success": True, "affected_rows": affected_rows}
-
-    async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for snowflake_list_tables"""
-        schema = args.get("schema")
-
-        tables = await self.tables(schema)
-
-        return {"success": True, "tables": tables, "count": len(tables)}
-
-    async def _tool_list_schemas(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for list_schemas"""
-        schemas = await self.schemas()
-
-        return {"success": True, "schemas": schemas, "count": len(schemas)}
-
-    async def _tool_get_table_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for snowflake_get_schema"""
-        table = args.get("table")
-
-        columns = await self.describe(table)
-
-        return {
-            "success": True,
-            "table": table,
-            "columns": columns,
-            "column_count": len(columns),
-        }
-
-    async def _tool_inspect(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for snowflake_inspect — fetch all table schemas in parallel."""
-        filter_tables = args.get("tables")
-
-        all_tables = await self.tables()
-        targets = (
-            [t for t in all_tables if t in filter_tables]
-            if filter_tables
-            else all_tables
-        )
-
-        schemas = await asyncio.gather(*[self.describe(t) for t in targets])
-
-        return {
-            "success": True,
-            "tables": [{"name": t, "columns": s} for t, s in zip(targets, schemas)],
-            "count": len(targets),
-        }
-
-    async def _tool_list_warehouses(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for list_warehouses"""
-        warehouses = await self.list_warehouses()
-
-        return {"success": True, "warehouses": warehouses, "count": len(warehouses)}
-
-    async def _tool_switch_warehouse(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for switch_warehouse"""
-        warehouse = args.get("warehouse")
-
-        await self.switch_warehouse(warehouse)
-
-        return {
-            "success": True,
-            "message": f"Switched to warehouse: {warehouse}",
-            "warehouse": warehouse,
-        }
-
-    async def _tool_get_query_history(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for get_query_history"""
-        limit = args.get("limit", 100)
-
-        history = await self.query_history(limit)
-
-        return {"success": True, "queries": history, "count": len(history)}
-
-    async def _tool_list_stages(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for list_stages"""
-        stages = await self.list_stages()
-
-        return {"success": True, "stages": stages, "count": len(stages)}
-
-    async def _tool_upload_to_stage(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for upload_to_stage"""
-        local_path = args.get("local_path")
-        stage_path = args.get("stage_path")
-        overwrite = args.get("overwrite", False)
-
-        result = await self.put_file(local_path, stage_path, overwrite)
-
-        return result
-
-    async def _tool_load_from_stage(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for load_from_stage"""
-        table = args.get("table")
-        stage = args.get("stage")
-        file_format = args.get("file_format", "CSV")
-        pattern = args.get("pattern")
-
-        result = await self.load_from_stage(table, stage, file_format, pattern)
-
-        return result
-
-    async def _tool_create_stage(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for create_stage"""
-        name = args.get("name")
-        url = args.get("url")
-        storage_integration = args.get("storage_integration")
-
-        await self.create_stage(name, url, storage_integration)
-
-        return {"success": True, "message": f"Created stage: {name}", "stage": name}
-
-
-def snowflake(**kwargs) -> SnowflakePlugin:
-    """
-    Create Snowflake plugin with simplified interface.
-
-    Args:
-        **kwargs: Connection parameters (account, warehouse, database, etc.)
-
-    Returns:
-        SnowflakePlugin instance
-
-    Example:
-        from daita.plugins import snowflake
-
-        db = snowflake(
-            account="xy12345",
-            warehouse="COMPUTE_WH",
-            database="MYDB",
-            user="myuser",
-            password="mypass"
-        )
-    """
-    return SnowflakePlugin(**kwargs)
+        return tools

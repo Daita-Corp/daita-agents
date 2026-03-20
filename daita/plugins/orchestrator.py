@@ -5,6 +5,7 @@ Provides tools for finding capable agents, routing tasks, and executing
 workflows across multiple agents.
 """
 
+import hashlib
 import logging
 import time
 from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
@@ -258,7 +259,7 @@ class OrchestratorPlugin(BasePlugin):
             return list(self._agents.keys())[0]
 
         # Check cache
-        cache_key = f"task:{task[:100]}"  # Use first 100 chars as key
+        cache_key = f"task:{hashlib.sha256(task.encode()).hexdigest()}"
         if cache_key in self._routing_cache:
             cached = self._routing_cache[cache_key]
             if time.time() - cached["timestamp"] < self._routing_cache_ttl:
@@ -399,6 +400,14 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             f"Legacy routing: {task[:50]}... -> {best_agent} (score: {scores[best_agent]})"
         )
         return best_agent
+
+    @staticmethod
+    def _truncate_agent_result(result: Any, max_chars: int) -> Any:
+        """Truncate agent result string to max_chars to prevent context blowup."""
+        s = result if isinstance(result, str) else str(result)
+        if len(s) > max_chars:
+            return s[:max_chars] + f"... [truncated, total {len(s)} chars]"
+        return result
 
     def get_tools(self) -> List["AgentTool"]:
         """
@@ -673,15 +682,11 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         """Tool handler for find_agent"""
         task = args.get("task", "")
 
-        try:
-            agent_id = await self.find_agent(task)
-            return {
-                "success": True,
-                "agent_id": agent_id,
-                "message": f"Selected agent: {agent_id}",
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        agent_id = await self.find_agent(task)
+        return {
+            "agent_id": agent_id,
+            "message": f"Selected agent: {agent_id}",
+        }
 
     async def find_agent(self, task: str) -> str:
         """
@@ -719,8 +724,10 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         Returns:
             Performance metrics
         """
+        from ..core.exceptions import PluginError
+
         if agent_id not in self._capabilities:
-            return {"success": False, "error": f"Agent not found: {agent_id}"}
+            raise PluginError(f"Agent not found: {agent_id}")
 
         agent_info = self._capabilities[agent_id]
         total = agent_info.get("total_executions", 0)
@@ -733,7 +740,6 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             avg_time = agent_info.get("total_time_ms", 0) / total
 
         return {
-            "success": True,
             "agent_id": agent_id,
             "total_executions": total,
             "successful_executions": agent_info.get("successful_executions", 0),
@@ -759,13 +765,14 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         Returns:
             Agent capabilities
         """
+        from ..core.exceptions import PluginError
+
         if agent_id not in self._capabilities:
-            return {"success": False, "error": f"Agent not found: {agent_id}"}
+            raise PluginError(f"Agent not found: {agent_id}")
 
         agent_info = self._capabilities[agent_id]
 
         return {
-            "success": True,
             "agent_id": agent_id,
             "capabilities": agent_info.get("capabilities", []),
             "entity_types": agent_info.get("entity_types", []),
@@ -831,44 +838,35 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         # Find best agent using new routing
         agent_id = await self.find_agent(task)
 
+        from ..core.exceptions import PluginError
+
         if agent_id not in self._agents:
-            return {
-                "success": False,
-                "error": f"Agent found but not available: {agent_id}",
-            }
+            raise PluginError(f"Agent found but not available: {agent_id}")
 
         agent = self._agents[agent_id]
 
         # Execute task
-        try:
-            start_time = datetime.utcnow()
+        start_time = datetime.utcnow()
 
-            # Check if agent has run method
-            if hasattr(agent, "run"):
-                result = await agent.run(task)
-            else:
-                result = "Agent executed (no run method available)"
+        # Check if agent has run method
+        if hasattr(agent, "run"):
+            result = await agent.run(task)
+        else:
+            result = "Agent executed (no run method available)"
 
-            end_time = datetime.utcnow()
-            execution_time = (end_time - start_time).total_seconds() * 1000
+        end_time = datetime.utcnow()
+        execution_time = (end_time - start_time).total_seconds() * 1000
 
-            # Update metrics
-            self._capabilities[agent_id]["total_executions"] += 1
-            self._capabilities[agent_id]["successful_executions"] += 1
-            self._capabilities[agent_id]["total_time_ms"] += execution_time
+        # Update metrics
+        self._capabilities[agent_id]["total_executions"] += 1
+        self._capabilities[agent_id]["successful_executions"] += 1
+        self._capabilities[agent_id]["total_time_ms"] += execution_time
 
-            return {
-                "success": True,
-                "agent_id": agent_id,
-                "result": result,
-                "execution_time_ms": round(execution_time, 2),
-            }
-
-        except Exception as e:
-            # Update metrics
-            self._capabilities[agent_id]["total_executions"] += 1
-
-            return {"success": False, "agent_id": agent_id, "error": str(e)}
+        return {
+            "agent_id": agent_id,
+            "result": result,
+            "execution_time_ms": round(execution_time, 2),
+        }
 
     async def _tool_run_parallel(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for run_parallel"""
@@ -920,7 +918,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                 return {
                     "success": True,
                     "agent_id": agent_id,
-                    "result": result,
+                    "result": self._truncate_agent_result(result, 10_000),
                     "task": task,
                 }
             except Exception as e:
@@ -937,7 +935,6 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         successful = sum(1 for r in results if r.get("success"))
 
         return {
-            "success": True,
             "total_tasks": len(tasks),
             "successful_tasks": successful,
             "results": results,
@@ -973,9 +970,9 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
             agent_id = task_info["agent_id"]
             task = task_info["task"]
 
-            # Include previous result in task context
+            # Include previous result in task context (capped to avoid token bloat)
             if previous_result:
-                task = f"{task}\n\nContext from previous step: {previous_result}"
+                task = f"{task}\n\nContext from previous step: {self._truncate_agent_result(previous_result, 5_000)}"
 
             if agent_id not in self._agents:
                 results.append(
@@ -999,7 +996,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                     {
                         "success": True,
                         "agent_id": agent_id,
-                        "result": result,
+                        "result": self._truncate_agent_result(result, 10_000),
                         "task": task,
                     }
                 )
@@ -1019,7 +1016,6 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         successful = sum(1 for r in results if r.get("success"))
 
         return {
-            "success": True,
             "total_tasks": len(tasks),
             "completed_tasks": len(results),
             "successful_tasks": successful,
@@ -1056,7 +1052,7 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
 
         self._workflows[name] = workflow
 
-        return {"success": True, "workflow_id": name, "steps_count": len(steps)}
+        return {"workflow_id": name, "steps_count": len(steps)}
 
     async def _tool_run_workflow(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for run_workflow"""
@@ -1079,8 +1075,10 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
         Returns:
             Workflow execution results
         """
+        from ..core.exceptions import PluginError
+
         if workflow_id not in self._workflows:
-            return {"success": False, "error": f"Workflow not found: {workflow_id}"}
+            raise PluginError(f"Workflow not found: {workflow_id}")
 
         workflow = self._workflows[workflow_id]
         steps = workflow["steps"]
@@ -1122,41 +1120,32 @@ IMPORTANT: You must call a tool. Do not respond with text only."""
                         )
                         task = f"{task}\n\nContext:\n{context}"
 
+                    from ..core.exceptions import PluginError
+
                     if agent_id not in self._agents:
-                        return {
-                            "success": False,
-                            "error": f"Agent not found for step {step_id}: {agent_id}",
-                        }
+                        raise PluginError(
+                            f"Agent not found for step {step_id}: {agent_id}"
+                        )
 
                     agent = self._agents[agent_id]
 
-                    try:
-                        if hasattr(agent, "run"):
-                            result = await agent.run(task)
-                        else:
-                            result = "Agent executed"
+                    if hasattr(agent, "run"):
+                        result = await agent.run(task)
+                    else:
+                        result = "Agent executed"
 
-                        step_results[step_id] = result
-                        completed_steps.add(step_id)
-                        executed_any = True
-
-                    except Exception as e:
-                        return {
-                            "success": False,
-                            "error": f"Step {step_id} failed: {str(e)}",
-                            "completed_steps": list(completed_steps),
-                            "step_results": step_results,
-                        }
+                    step_results[step_id] = result
+                    completed_steps.add(step_id)
+                    executed_any = True
 
             if not executed_any:
-                return {
-                    "success": False,
-                    "error": "Workflow has circular dependencies or unreachable steps",
-                    "completed_steps": list(completed_steps),
-                }
+                from ..core.exceptions import PluginError
+
+                raise PluginError(
+                    "Workflow has circular dependencies or unreachable steps"
+                )
 
         return {
-            "success": True,
             "workflow_id": workflow_id,
             "total_steps": len(steps),
             "completed_steps": len(completed_steps),

@@ -354,8 +354,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
 
         tools = [
             AgentTool(
-                name="find_documents",
-                description="Find documents in a MongoDB collection. Returns matches.",
+                name="mongodb_find",
+                description="Find documents in a MongoDB collection. Returns matches. Use limit to control result size.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -369,7 +369,11 @@ class MongoDBPlugin(BaseDatabasePlugin):
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum number of documents to return",
+                            "description": "Maximum number of documents to return (default: 50)",
+                        },
+                        "projection": {
+                            "type": "object",
+                            "description": "Optional field projection (e.g., {\"name\": 1, \"email\": 1, \"_id\": 0})",
                         },
                     },
                     "required": ["collection"],
@@ -381,7 +385,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
                 timeout_seconds=60,
             ),
             AgentTool(
-                name="list_collections",
+                name="mongodb_list_collections",
                 description="List all collections in the MongoDB database.",
                 parameters={"type": "object", "properties": {}, "required": []},
                 handler=self._tool_list_collections,
@@ -414,11 +418,34 @@ class MongoDBPlugin(BaseDatabasePlugin):
                 plugin_name="MongoDB",
                 timeout_seconds=60,
             ),
+            AgentTool(
+                name="mongodb_count",
+                description="Count documents in a MongoDB collection, optionally filtered.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "collection": {
+                            "type": "string",
+                            "description": "Collection name",
+                        },
+                        "filter": {
+                            "type": "object",
+                            "description": "Optional MongoDB query filter",
+                        },
+                    },
+                    "required": ["collection"],
+                },
+                handler=self._tool_count,
+                category="database",
+                source="plugin",
+                plugin_name="MongoDB",
+                timeout_seconds=30,
+            ),
         ]
         if not self.read_only:
             tools += [
                 AgentTool(
-                    name="insert_document",
+                    name="mongodb_insert",
                     description="Insert a document into a MongoDB collection. Returns the inserted ID.",
                     parameters={
                         "type": "object",
@@ -441,7 +468,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
                     timeout_seconds=30,
                 ),
                 AgentTool(
-                    name="update_documents",
+                    name="mongodb_update",
                     description="Update MongoDB documents. Returns matched and modified counts.",
                     parameters={
                         "type": "object",
@@ -468,7 +495,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
                     timeout_seconds=60,
                 ),
                 AgentTool(
-                    name="delete_documents",
+                    name="mongodb_delete",
                     description="Delete MongoDB documents by filter. Returns deleted count.",
                     parameters={
                         "type": "object",
@@ -494,28 +521,36 @@ class MongoDBPlugin(BaseDatabasePlugin):
         return tools
 
     async def _tool_find(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for find_documents"""
+        """Tool handler for mongodb_find"""
         collection = args.get("collection")
         filter_doc = args.get("filter", {})
-        limit = args.get("limit")
+        limit = args.get("limit", 50)
+        projection = args.get("projection")
 
-        results = await self.find(
-            collection=collection, filter_doc=filter_doc, limit=limit
-        )
+        # Only auto-connect if client/db is None - allows manual mocking
+        if self._client is None or self._db is None:
+            await self.connect()
 
-        return {"success": True, "documents": results, "count": len(results)}
+        cursor = self._db[collection].find(filter_doc, projection)
+        cursor = cursor.limit(limit)
+        results = await cursor.to_list(length=None)
+        for doc in results:
+            if "_id" in doc:
+                doc["_id"] = str(doc["_id"])
+
+        return {"documents": results}
 
     async def _tool_insert(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for insert_document"""
+        """Tool handler for mongodb_insert"""
         collection = args.get("collection")
         document = args.get("document")
 
         inserted_id = await self.insert(collection, document)
 
-        return {"success": True, "inserted_id": inserted_id, "collection": collection}
+        return {"inserted_id": inserted_id, "collection": collection}
 
     async def _tool_update(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for update_documents"""
+        """Tool handler for mongodb_update"""
         collection = args.get("collection")
         filter_doc = args.get("filter")
         update_doc = args.get("update")
@@ -523,39 +558,48 @@ class MongoDBPlugin(BaseDatabasePlugin):
         result = await self.update(collection, filter_doc, update_doc)
 
         return {
-            "success": True,
             "matched_count": result["matched_count"],
             "modified_count": result["modified_count"],
             "collection": collection,
         }
 
     async def _tool_delete(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for delete_documents"""
+        """Tool handler for mongodb_delete"""
         collection = args.get("collection")
         filter_doc = args.get("filter")
 
         deleted_count = await self.delete(collection, filter_doc)
 
         return {
-            "success": True,
             "deleted_count": deleted_count,
             "collection": collection,
         }
 
     async def _tool_list_collections(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for list_collections"""
+        """Tool handler for mongodb_list_collections"""
         collections = await self.collections()
-
-        return {"success": True, "collections": collections, "count": len(collections)}
+        return {"collections": collections}
 
     async def _tool_aggregate(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mongodb_aggregate"""
         collection = args.get("collection")
-        pipeline = args.get("pipeline")
+        pipeline = args.get("pipeline") or []
+
+        # Inject a $limit safety cap if the pipeline has no $limit stage
+        if not any("$limit" in stage for stage in pipeline):
+            pipeline = list(pipeline) + [{"$limit": 200}]
 
         results = await self.aggregate(collection, pipeline)
 
-        return {"success": True, "results": results, "count": len(results)}
+        return {"results": results}
+
+    async def _tool_count(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for mongodb_count"""
+        collection = args.get("collection")
+        filter_doc = args.get("filter")
+
+        n = await self.count(collection, filter_doc)
+        return {"collection": collection, "count": n}
 
 
 def mongodb(**kwargs) -> MongoDBPlugin:

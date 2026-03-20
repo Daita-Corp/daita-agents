@@ -219,6 +219,55 @@ class BaseDatabasePlugin(BasePlugin):
 
         return evaluate_remaining(rows, fq, applied)
 
+    @staticmethod
+    def _compact_column(col_dict: Dict[str, Any]) -> str:
+        """Return a compact column representation: 'colname:datatype:null_status'.
+
+        null_status is 'nn' (not nullable) or 'null' (nullable).
+        Works with the column shape returned by all SQL plugins' describe() methods.
+        """
+        name = col_dict.get("column_name", col_dict.get("name", ""))
+        dtype = col_dict.get("data_type", col_dict.get("type", ""))
+        nullable = col_dict.get("is_nullable", "YES")
+        nn = "nn" if str(nullable).upper() in ("NO", "NOT NULL", "0", "FALSE") else "null"
+        return f"{name}:{dtype}:{nn}"
+
+    @staticmethod
+    def _truncate_result(rows: list, max_rows: int = 200, max_chars: int = 50000) -> Dict[str, Any]:
+        """Truncate a list of rows to fit within guardrails.
+
+        Returns:
+            dict with keys: rows, total_rows, truncated (bool)
+        """
+        import json
+
+        total_rows = len(rows)
+        truncated = False
+
+        # Row count cap
+        if total_rows > max_rows:
+            rows = rows[:max_rows]
+            truncated = True
+
+        # Character cap — serialize and truncate if over limit
+        try:
+            serialized = json.dumps(rows)
+            if len(serialized) > max_chars:
+                # Binary-search to find how many rows fit
+                lo, hi = 0, len(rows)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if len(json.dumps(rows[:mid])) <= max_chars:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                rows = rows[:lo]
+                truncated = True
+        except (TypeError, ValueError):
+            pass
+
+        return {"rows": rows, "total_rows": total_rows, "truncated": truncated}
+
     @property
     def info(self) -> Dict[str, Any]:
         """

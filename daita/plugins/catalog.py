@@ -244,6 +244,14 @@ class CatalogPlugin(BasePlugin):
                             "type": "string",
                             "description": "SSL mode: 'verify-full' (default, validates cert) or 'require' (encrypt only, for pgbouncer poolers)",
                         },
+                        "table_filter": {
+                            "type": "string",
+                            "description": "Glob pattern to filter tables (e.g. 'sales_*', 'orders*'). Leave empty for all tables.",
+                        },
+                        "max_tables": {
+                            "type": "integer",
+                            "description": "Maximum number of tables to include (default: 50)",
+                        },
                     },
                     "required": ["connection_string"],
                 },
@@ -270,6 +278,14 @@ class CatalogPlugin(BasePlugin):
                         "persist": {
                             "type": "boolean",
                             "description": "Whether to persist schema to graph storage if available",
+                        },
+                        "table_filter": {
+                            "type": "string",
+                            "description": "Glob pattern to filter tables (e.g. 'sales_*'). Leave empty for all tables.",
+                        },
+                        "max_tables": {
+                            "type": "integer",
+                            "description": "Maximum number of tables to include (default: 50)",
                         },
                     },
                     "required": ["connection_string"],
@@ -388,13 +404,17 @@ class CatalogPlugin(BasePlugin):
 
     async def _tool_discover_postgres(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for discover_postgres"""
+        import fnmatch
         connection_string = args.get("connection_string")
         if not connection_string:
-            return {"success": False, "error": "connection_string is required"}
+            from ..core.exceptions import ValidationError
+            raise ValidationError("connection_string is required")
 
         schema = args.get("schema", "public")
         persist = args.get("persist", self._auto_persist)
         ssl_mode = args.get("ssl_mode", "verify-full")
+        table_filter = args.get("table_filter")
+        max_tables = int(args.get("max_tables") or 50)
 
         result = await self.discover_postgres(
             connection_string=connection_string,
@@ -402,6 +422,17 @@ class CatalogPlugin(BasePlugin):
             persist=persist,
             ssl_mode=ssl_mode,
         )
+
+        # Apply table_filter and max_tables
+        if "tables" in result:
+            tables = result["tables"]
+            if table_filter:
+                tables = [t for t in tables if fnmatch.fnmatch(t.get("table_name", ""), table_filter)]
+            total_tables = len(tables)
+            truncated = total_tables > max_tables
+            result["tables"] = tables[:max_tables]
+            result["total_tables"] = total_tables
+            result["truncated"] = truncated
 
         return result
 
@@ -556,8 +587,7 @@ class CatalogPlugin(BasePlugin):
                     persist_skipped_reason = "catalog backend not configured"
 
             response = {
-                "success": True,
-                "schema": result,
+                                "schema": result,
                 "persisted": actually_persisted,
             }
             if persist_skipped_reason:
@@ -569,16 +599,31 @@ class CatalogPlugin(BasePlugin):
 
     async def _tool_discover_mysql(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for discover_mysql"""
+        import fnmatch
         connection_string = args.get("connection_string")
         if not connection_string:
-            return {"success": False, "error": "connection_string is required"}
+            from ..core.exceptions import ValidationError
+            raise ValidationError("connection_string is required")
 
         schema = args.get("schema")
         persist = args.get("persist", self._auto_persist)
+        table_filter = args.get("table_filter")
+        max_tables = int(args.get("max_tables") or 50)
 
         result = await self.discover_mysql(
             connection_string=connection_string, schema=schema, persist=persist
         )
+
+        # Apply table_filter and max_tables
+        if "tables" in result:
+            tables = result["tables"]
+            if table_filter:
+                tables = [t for t in tables if fnmatch.fnmatch(t.get("table_name", ""), table_filter)]
+            total_tables = len(tables)
+            truncated = total_tables > max_tables
+            result["tables"] = tables[:max_tables]
+            result["total_tables"] = total_tables
+            result["truncated"] = truncated
 
         return result
 
@@ -689,8 +734,7 @@ class CatalogPlugin(BasePlugin):
                     persist_skipped_reason = "catalog backend not configured"
 
             response = {
-                "success": True,
-                "schema": result,
+                                "schema": result,
                 "persisted": actually_persisted,
             }
             if persist_skipped_reason:
@@ -704,11 +748,13 @@ class CatalogPlugin(BasePlugin):
         """Tool handler for discover_mongodb"""
         connection_string = args.get("connection_string")
         if not connection_string:
-            return {"success": False, "error": "connection_string is required"}
+            from ..core.exceptions import ValidationError
+            raise ValidationError("connection_string is required")
 
         database = args.get("database")
         if not database:
-            return {"success": False, "error": "database is required"}
+            from ..core.exceptions import ValidationError
+            raise ValidationError("database is required")
 
         sample_size = args.get("sample_size", 100)
         persist = args.get("persist", self._auto_persist)
@@ -805,8 +851,7 @@ class CatalogPlugin(BasePlugin):
                     persist_skipped_reason = "catalog backend not configured"
 
             response = {
-                "success": True,
-                "schema": result,
+                                "schema": result,
                 "persisted": actually_persisted,
             }
             if persist_skipped_reason:
@@ -820,7 +865,8 @@ class CatalogPlugin(BasePlugin):
         """Tool handler for discover_openapi"""
         spec_url = args.get("spec_url")
         if not spec_url:
-            return {"success": False, "error": "spec_url is required"}
+            from ..core.exceptions import ValidationError
+            raise ValidationError("spec_url is required")
 
         service_name = args.get("service_name")
         persist = args.get("persist", self._auto_persist)
@@ -850,7 +896,8 @@ class CatalogPlugin(BasePlugin):
 
         url_error = self._validate_openapi_url(spec_url)
         if url_error:
-            return {"success": False, "error": url_error}
+            from ..core.exceptions import ValidationError
+            raise ValidationError(url_error)
 
         # follow_redirects=False prevents redirect-based SSRF bypasses.
         # timeout guards against slow-loris / hung internal endpoints.
@@ -906,8 +953,7 @@ class CatalogPlugin(BasePlugin):
                 persist_skipped_reason = "catalog backend not configured"
 
         response = {
-            "success": True,
-            "schema": result,
+                        "schema": result,
             "persisted": actually_persisted,
         }
         if persist_skipped_reason:
@@ -978,8 +1024,7 @@ class CatalogPlugin(BasePlugin):
                 )
 
         return {
-            "success": True,
-            "comparison": {
+                        "comparison": {
                 "added_tables": added_tables,
                 "removed_tables": removed_tables,
                 "added_columns": [
@@ -1046,7 +1091,7 @@ class CatalogPlugin(BasePlugin):
 
             diagram = "\n".join(lines)
 
-            return {"success": True, "format": "mermaid", "diagram": diagram}
+            return {"format": "mermaid", "diagram": diagram}
 
         elif format == "json_schema":
             # Generate JSON Schema representation
@@ -1078,13 +1123,11 @@ class CatalogPlugin(BasePlugin):
                     "properties": properties,
                 }
 
-            return {"success": True, "format": "json_schema", "schema": json_schema}
+            return {"format": "json_schema", "schema": json_schema}
 
         else:
-            return {
-                "success": False,
-                "error": f"Unsupported format: {format}. Use 'mermaid' or 'json_schema'",
-            }
+            from ..core.exceptions import ValidationError
+            raise ValidationError(f"Unsupported format: {format}. Use 'mermaid' or 'json_schema'")
 
     def _map_sql_to_json_type(self, sql_type: str) -> str:
         """Map SQL data types to JSON Schema types"""

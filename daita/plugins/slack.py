@@ -483,7 +483,7 @@ class SlackPlugin(BasePlugin):
         end_time = agent_results.get("end_time", "N/A")
         duration = agent_results.get("duration_ms", 0)
 
-        status_emoji = "" if status == "success" else "" if status == "error" else ""
+        status_emoji = "[ok]" if status == "success" else "[err]" if status == "error" else "[?]"
 
         blocks.append(
             {
@@ -555,7 +555,7 @@ class SlackPlugin(BasePlugin):
         failed_agents = total_agents - successful_agents
 
         workflow_status = (
-            " Success" if failed_agents == 0 else f" {failed_agents} Failed"
+            "Success" if failed_agents == 0 else f"{failed_agents} Failed"
         )
 
         blocks.append(
@@ -657,6 +657,29 @@ class SlackPlugin(BasePlugin):
                 plugin_name="Slack",
                 timeout_seconds=30,
             ),
+            AgentTool(
+                name="read_slack_messages",
+                description="Read recent messages from a Slack channel.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "channel": {
+                            "type": "string",
+                            "description": "Channel ID or name (e.g., #general)",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of messages to return (default: 20)",
+                        },
+                    },
+                    "required": ["channel"],
+                },
+                handler=self._tool_read_messages,
+                category="communication",
+                source="plugin",
+                plugin_name="Slack",
+                timeout_seconds=30,
+            ),
         ]
 
     async def _tool_send_message(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -667,7 +690,6 @@ class SlackPlugin(BasePlugin):
         result = await self.send_message(channel, text)
 
         return {
-            "success": True,
             "channel": result.get("channel"),
             "timestamp": result.get("ts"),
             "message_sent": True,
@@ -683,7 +705,7 @@ class SlackPlugin(BasePlugin):
             channel=channel, agent_results={"summary": summary, "data": results}
         )
 
-        return {"success": True, "channel": channel, "summary_sent": True}
+        return {"channel": channel, "summary_sent": True}
 
     async def _tool_list_channels(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for list_slack_channels"""
@@ -700,7 +722,28 @@ class SlackPlugin(BasePlugin):
             for ch in channels
         ]
 
-        return {"success": True, "channels": simplified, "count": len(simplified)}
+        return {"channels": simplified, "count": len(simplified)}
+
+    async def _tool_read_messages(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for read_slack_messages"""
+        channel = args.get("channel")
+        limit = args.get("limit", 20)
+
+        messages = await self.get_channel_history(channel=channel, limit=limit)
+
+        # Return simplified message data
+        simplified = [
+            {
+                "ts": msg.get("ts"),
+                "user": msg.get("user"),
+                "text": msg.get("text", ""),
+                "thread_ts": msg.get("thread_ts"),
+                "reply_count": msg.get("reply_count", 0),
+            }
+            for msg in messages
+        ]
+
+        return {"channel": channel, "messages": simplified, "count": len(simplified)}
 
     # Context manager support
     async def __aenter__(self):
