@@ -48,6 +48,7 @@ from .base import BasePlugin
 
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
+    from ..core.graph.models import EdgeType
 
 logger = logging.getLogger(__name__)
 
