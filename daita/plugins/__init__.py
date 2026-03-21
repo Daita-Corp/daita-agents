@@ -19,6 +19,7 @@ Vector Database Plugins:
 Integration Plugins:
 - REST API plugin for HTTP client functionality
 - AWS S3 plugin for cloud object storage operations
+- Google Drive plugin for file reading, searching, and organizing across Google Drive
 - Slack plugin for team collaboration and notifications
 - Email plugin for IMAP/SMTP email operations (Gmail, Outlook, Yahoo, etc.)
 - Elasticsearch plugin for search and analytics
@@ -76,6 +77,11 @@ Usage:
     # S3 plugin
     async with s3(bucket="my-bucket", region="us-west-2") as storage:
         data = await storage.get_object("data/file.csv", format="pandas")
+
+    # Google Drive plugin
+    async with google_drive(credentials_path="service_account.json") as drive:
+        results = await drive.search("Q4 report", file_type="spreadsheet")
+        content = await drive.read(results[0]["id"])  # auto-detects format
 
     # Slack plugin
     async with slack(token="xoxb-token") as slack_client:
@@ -151,6 +157,7 @@ from .rest import RESTPlugin, rest
 
 # Cloud storage plugins
 from .s3 import S3Plugin, s3
+from .google_drive import GoogleDrivePlugin, google_drive
 
 # Collaboration plugins
 from .slack import SlackPlugin, slack
@@ -234,6 +241,10 @@ class PluginAccess:
         """Create S3 plugin."""
         return s3(**kwargs)
 
+    def google_drive(self, **kwargs) -> GoogleDrivePlugin:
+        """Create Google Drive plugin."""
+        return google_drive(**kwargs)
+
     def slack(self, **kwargs) -> SlackPlugin:
         """Create Slack plugin."""
         return slack(**kwargs)
@@ -300,6 +311,7 @@ __all__ = [
     "QdrantPlugin",
     "RESTPlugin",
     "S3Plugin",
+    "GoogleDrivePlugin",
     "SlackPlugin",
     "EmailPlugin",
     "ElasticsearchPlugin",
@@ -323,6 +335,7 @@ __all__ = [
     "qdrant",
     "rest",
     "s3",
+    "google_drive",
     "slack",
     "email",
     "elasticsearch",
