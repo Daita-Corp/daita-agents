@@ -178,7 +178,7 @@ from .redis_messaging import RedisMessagingPlugin, redis_messaging
 from . import mcp
 
 # Memory plugin
-from .memory import MemoryPlugin
+from .memory import MemoryPlugin, memory
 
 # Knowledge & Orchestration plugins
 from .catalog import CatalogPlugin, catalog
@@ -291,7 +291,7 @@ class PluginAccess:
 
     def memory(self, **kwargs) -> MemoryPlugin:
         """Create Memory plugin for persistent semantic memory."""
-        return MemoryPlugin(**kwargs)
+        return memory(**kwargs)
 
     def mcp(self, **kwargs):
         """Access MCP plugin module for Model Context Protocol integration."""
@@ -347,6 +347,7 @@ __all__ = [
     "orchestrator",
     "data_quality",
     "transformer",
+    "memory",
     # MCP module
     "mcp",
     # SDK access class

@@ -10,6 +10,7 @@ import json
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from datetime import datetime
 from .base import BasePlugin
+from ..core.exceptions import AuthenticationError, PluginError
 
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
@@ -81,22 +82,29 @@ class SlackPlugin(BasePlugin):
 
             except SlackApiError as e:
                 if e.response["error"] == "invalid_auth":
-                    raise RuntimeError(
-                        "Invalid Slack token. Please check your bot token."
+                    raise AuthenticationError(
+                        "Invalid Slack token. Please check your bot token.",
+                        provider="Slack",
                     )
                 elif e.response["error"] == "account_inactive":
-                    raise RuntimeError("Slack account is inactive.")
+                    raise AuthenticationError(
+                        "Slack account is inactive.",
+                        provider="Slack",
+                    )
                 else:
-                    raise RuntimeError(
-                        f"Slack authentication failed: {e.response['error']}"
+                    raise AuthenticationError(
+                        f"Slack authentication failed: {e.response['error']}",
+                        provider="Slack",
                     )
 
         except ImportError:
             raise ImportError(
                 "slack-sdk not installed. Install with: pip install 'daita-agents[slack]'"
             )
+        except (AuthenticationError, PluginError):
+            raise
         except Exception as e:
-            raise RuntimeError(f"Failed to connect to Slack: {e}")
+            raise PluginError(f"Failed to connect to Slack: {e}", plugin_name="Slack")
 
     async def disconnect(self):
         """Close Slack connection."""
@@ -184,7 +192,7 @@ class SlackPlugin(BasePlugin):
 
         except Exception as e:
             logger.error(f"Failed to send Slack message: {e}")
-            raise RuntimeError(f"Slack send_message failed: {e}")
+            raise PluginError(f"Slack send_message failed: {e}", plugin_name="Slack")
 
     async def send_agent_summary(
         self,
@@ -225,7 +233,7 @@ class SlackPlugin(BasePlugin):
 
         except Exception as e:
             logger.error(f"Failed to send agent summary: {e}")
-            raise RuntimeError(f"Slack send_agent_summary failed: {e}")
+            raise PluginError(f"Slack send_agent_summary failed: {e}", plugin_name="Slack")
 
     async def create_thread_from_workflow(
         self,
@@ -297,7 +305,7 @@ class SlackPlugin(BasePlugin):
 
         except Exception as e:
             logger.error(f"Failed to create workflow thread: {e}")
-            raise RuntimeError(f"Slack create_thread_from_workflow failed: {e}")
+            raise PluginError(f"Slack create_thread_from_workflow failed: {e}", plugin_name="Slack")
 
     async def upload_file(
         self,
@@ -358,7 +366,7 @@ class SlackPlugin(BasePlugin):
 
         except Exception as e:
             logger.error(f"Failed to upload file to Slack: {e}")
-            raise RuntimeError(f"Slack upload_file failed: {e}")
+            raise PluginError(f"Slack upload_file failed: {e}", plugin_name="Slack")
 
     async def get_channel_history(
         self,
@@ -420,7 +428,7 @@ class SlackPlugin(BasePlugin):
 
         except Exception as e:
             logger.error(f"Failed to get channel history: {e}")
-            raise RuntimeError(f"Slack get_channel_history failed: {e}")
+            raise PluginError(f"Slack get_channel_history failed: {e}", plugin_name="Slack")
 
     async def get_channels(
         self, types: str = "public_channel,private_channel"
@@ -466,7 +474,7 @@ class SlackPlugin(BasePlugin):
 
         except Exception as e:
             logger.error(f"Failed to get channels: {e}")
-            raise RuntimeError(f"Slack get_channels failed: {e}")
+            raise PluginError(f"Slack get_channels failed: {e}", plugin_name="Slack")
 
     def _format_agent_results(
         self, agent_results: Dict[str, Any], title: str
@@ -754,6 +762,6 @@ class SlackPlugin(BasePlugin):
         await self.disconnect()
 
 
-def slack(token: str, **kwargs) -> SlackPlugin:
+def slack(**kwargs) -> SlackPlugin:
     """Create Slack plugin with simplified interface."""
-    return SlackPlugin(token=token, **kwargs)
+    return SlackPlugin(**kwargs)

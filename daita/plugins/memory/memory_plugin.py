@@ -621,3 +621,8 @@ class MemoryPlugin(LifecyclePlugin):
             else:
                 raise ValueError("auto_curate must be 'on_stop' or 'manual'")
         return {"status": "success", "updated": updated}
+
+
+def memory(**kwargs) -> MemoryPlugin:
+    """Create Memory plugin with simplified interface."""
+    return MemoryPlugin(**kwargs)

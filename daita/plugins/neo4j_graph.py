@@ -113,9 +113,11 @@ class Neo4jPlugin(BasePlugin):
             raise ImportError(
                 "neo4j driver not installed. Install with: pip install 'daita-agents[neo4j]'"
             )
+        except PluginError:
+            raise
         except Exception as e:
             logger.error(f"Failed to connect to Neo4j: {e}")
-            raise
+            raise PluginError(f"Failed to connect to Neo4j: {e}", plugin_name="Neo4j")
 
     async def disconnect(self):
         """Disconnect from Neo4j database."""
