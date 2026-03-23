@@ -33,11 +33,12 @@ import time
 import uuid
 from typing import Dict, Any, Optional, List, Callable
 import weakref
+from .base import BasePlugin
 
 logger = logging.getLogger(__name__)
 
 
-class RedisMessagingPlugin:
+class RedisMessagingPlugin(BasePlugin):
     """
     Redis messaging plugin for distributed agent communication.
 
@@ -85,8 +86,8 @@ class RedisMessagingPlugin:
 
         logger.debug(f"RedisMessagingPlugin initialized (url: {url})")
 
-    async def start(self) -> None:
-        """Start the Redis messaging plugin."""
+    async def connect(self) -> None:
+        """Connect the Redis messaging plugin."""
         if self._running:
             return
 
@@ -112,8 +113,8 @@ class RedisMessagingPlugin:
         self._running = True
         logger.info("RedisMessagingPlugin started")
 
-    async def stop(self) -> None:
-        """Stop the Redis messaging plugin and cleanup connections."""
+    async def disconnect(self) -> None:
+        """Disconnect the Redis messaging plugin and cleanup connections."""
         if not self._running:
             return
 
@@ -139,7 +140,7 @@ class RedisMessagingPlugin:
     async def _get_redis(self):
         """Get Redis client from pool."""
         if not self._running:
-            await self.start()
+            await self.connect()
 
         import redis.asyncio as redis
 
@@ -160,7 +161,7 @@ class RedisMessagingPlugin:
             Message ID
         """
         if not self._running:
-            await self.start()
+            await self.connect()
 
         redis_client = await self._get_redis()
         message_id = uuid.uuid4().hex
@@ -216,7 +217,7 @@ class RedisMessagingPlugin:
             callback: Callback function to receive messages
         """
         if not self._running:
-            await self.start()
+            await self.connect()
 
         # Add callback to subscribers
         if channel not in self._subscribers:
@@ -326,7 +327,7 @@ class RedisMessagingPlugin:
             List of message data (newest first)
         """
         if not self._running:
-            await self.start()
+            await self.connect()
 
         redis_client = await self._get_redis()
 
@@ -402,7 +403,7 @@ class RedisMessagingPlugin:
             True if channel was cleared
         """
         if not self._running:
-            await self.start()
+            await self.connect()
 
         redis_client = await self._get_redis()
 
@@ -446,56 +447,15 @@ class RedisMessagingPlugin:
     # Context manager support
     async def __aenter__(self) -> "RedisMessagingPlugin":
         """Async context manager entry."""
-        await self.start()
+        await self.connect()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """Async context manager exit."""
-        await self.stop()
+        await self.disconnect()
 
 
 # Factory function for easy instantiation
-def redis_messaging(
-    url: str = "redis://localhost:6379",
-    max_connections: int = 10,
-    message_ttl: int = 86400,
-    max_stream_length: int = 10000,
-    connection_timeout: int = 30,
-    **kwargs,
-) -> RedisMessagingPlugin:
-    """
-    Create a Redis messaging plugin instance.
-
-    Args:
-        url: Redis connection URL (default: redis://localhost:6379)
-        max_connections: Maximum Redis connections in pool (default: 10)
-        message_ttl: Message TTL in seconds (default: 24 hours)
-        max_stream_length: Maximum messages per stream (default: 10k)
-        connection_timeout: Connection timeout in seconds (default: 30)
-        **kwargs: Additional Redis parameters
-
-    Returns:
-        RedisMessagingPlugin instance
-
-    Example:
-        ```python
-        # Basic usage
-        redis_msg = redis_messaging()
-
-        # Production configuration
-        redis_msg = redis_messaging(
-            url="redis://redis-cluster:6379",
-            max_connections=20,
-            message_ttl=7*24*3600,  # 7 days
-            max_stream_length=50000
-        )
-        ```
-    """
-    return RedisMessagingPlugin(
-        url=url,
-        max_connections=max_connections,
-        message_ttl=message_ttl,
-        max_stream_length=max_stream_length,
-        connection_timeout=connection_timeout,
-        **kwargs,
-    )
+def redis_messaging(**kwargs) -> RedisMessagingPlugin:
+    """Create a Redis messaging plugin instance."""
+    return RedisMessagingPlugin(**kwargs)

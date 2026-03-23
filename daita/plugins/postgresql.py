@@ -10,6 +10,7 @@ import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from urllib.parse import quote
 from .base_db import BaseDatabasePlugin
+from ..core.exceptions import PluginError, ValidationError
 
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
@@ -268,6 +269,18 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         """
         return await self.query(sql, [table])
 
+    async def count_rows(self, table: str, filter: Optional[str] = None) -> int:
+        """Count rows in a table with an optional WHERE clause."""
+        where_clause = f"WHERE {filter}" if filter else ""
+        sql = f"SELECT COUNT(*) AS cnt FROM {table} {where_clause}"
+        result = await self.query(sql)
+        return result[0]["cnt"] if result else 0
+
+    async def sample_rows(self, table: str, n: int = 5) -> List[Dict[str, Any]]:
+        """Return a random sample of n rows from a table."""
+        sql = f"SELECT * FROM {table} ORDER BY RANDOM() LIMIT {int(n)}"
+        return await self.query(sql)
+
     async def vector_search(
         self,
         table: str,
@@ -292,20 +305,24 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
 
         Returns:
             List of rows with similarity scores
-
-        Example:
-            results = await db.vector_search(
-                table="documents",
-                vector_column="embedding",
-                query_vector=[0.1, 0.2, 0.3, ...],
-                top_k=5,
-                filter="category = 'tech'",
-                distance_type="cosine"
-            )
         """
         # Only auto-connect if pool is None
         if self._pool is None:
             await self.connect()
+
+        # Validate filter param for injection prevention
+        if filter:
+            if ";" in filter:
+                raise ValidationError(
+                    "filter contains invalid character: ';'", field="filter"
+                )
+            if "--" in filter or "/*" in filter:
+                raise ValidationError(
+                    "filter contains SQL comment syntax", field="filter"
+                )
+            # Detect subqueries: nested parens containing SELECT
+            if re.search(r"\(.*\bSELECT\b.*\)", filter, re.IGNORECASE | re.DOTALL):
+                raise ValidationError("filter contains a subquery", field="filter")
 
         # Distance operators: <=> (cosine), <-> (L2), <#> (inner product)
         distance_ops = {"cosine": "<=>", "l2": "<->", "inner_product": "<#>"}
@@ -356,16 +373,6 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
 
         Returns:
             Dictionary with operation results
-
-        Example:
-            result = await db.vector_upsert(
-                table="documents",
-                id_column="id",
-                vector_column="embedding",
-                id="doc123",
-                vector=[0.1, 0.2, 0.3, ...],
-                extra_columns={"title": "My Doc", "category": "tech"}
-            )
         """
         # Only auto-connect if pool is None
         if self._pool is None:
@@ -393,12 +400,14 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         VALUES ({', '.join(values_placeholders)})
         ON CONFLICT ({id_column})
         DO UPDATE SET {', '.join(update_clauses)}
-        RETURNING *
+        RETURNING {id_column}
         """
 
         async with self._pool.acquire() as conn:
             result = await conn.fetchrow(sql, *params)
-            return dict(result) if result else {}
+            if result:
+                return {"id": str(result[id_column]), "upserted": True}
+            return {"upserted": False}
 
     async def create_vector_index(
         self,
@@ -418,14 +427,6 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
 
         Returns:
             Dictionary with index creation results
-
-        Example:
-            result = await db.create_vector_index(
-                table="documents",
-                vector_column="embedding",
-                index_type="hnsw",
-                distance_type="cosine"
-            )
         """
         # Only auto-connect if pool is None
         if self._pool is None:
@@ -454,7 +455,6 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         try:
             await self.execute(sql)
             return {
-                "success": True,
                 "index_name": index_name,
                 "table": table,
                 "column": vector_column,
@@ -462,12 +462,10 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 "distance_type": distance_type,
             }
         except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "table": table,
-                "column": vector_column,
-            }
+            raise PluginError(
+                f"Failed to create vector index: {e}",
+                plugin_name="PostgreSQL",
+            ) from e
 
     def get_tools(self) -> List["AgentTool"]:
         """
@@ -481,7 +479,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         tools = [
             AgentTool(
                 name="postgres_query",
-                description="Run a SELECT query on PostgreSQL. Use limit and columns to avoid oversized responses.",
+                description="Run a SELECT query on PostgreSQL. Use the focus DSL or add LIMIT to avoid oversized responses (default LIMIT 50 applied if omitted).",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -492,16 +490,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                         "params": {
                             "type": "array",
                             "description": "Optional parameter values for placeholders",
-                            "items": {"type": "string"},
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Max rows to return (default: 50)",
-                        },
-                        "columns": {
-                            "type": "array",
-                            "description": "Specific columns to return (returns all if omitted)",
-                            "items": {"type": "string"},
+                            "items": {},
                         },
                         "focus": {
                             "type": "string",
@@ -517,35 +506,6 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 timeout_seconds=60,
             ),
             AgentTool(
-                name="postgres_list_tables",
-                description="List all tables in the PostgreSQL database.",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_list_tables,
-                category="database",
-                source="plugin",
-                plugin_name="PostgreSQL",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="postgres_get_schema",
-                description="Get column info (name, type, nullable) for a PostgreSQL table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table_name": {
-                            "type": "string",
-                            "description": "Table name to inspect",
-                        }
-                    },
-                    "required": ["table_name"],
-                },
-                handler=self._tool_get_schema,
-                category="database",
-                source="plugin",
-                plugin_name="PostgreSQL",
-                timeout_seconds=30,
-            ),
-            AgentTool(
                 name="postgres_inspect",
                 description="List all tables and their column schemas in one call. Use instead of calling postgres_list_tables then postgres_get_schema for each table.",
                 parameters={
@@ -553,7 +513,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                     "properties": {
                         "tables": {
                             "type": "array",
-                            "description": "Filter to specific tables (returns all if omitted)",
+                            "description": "Filter to specific tables (returns all if omitted, capped at 50)",
                             "items": {"type": "string"},
                         }
                     },
@@ -566,7 +526,53 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 timeout_seconds=30,
             ),
             AgentTool(
-                name="vector_search",
+                name="postgres_count",
+                description="Count rows in a PostgreSQL table with an optional filter.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "table": {
+                            "type": "string",
+                            "description": "Table name",
+                        },
+                        "filter": {
+                            "type": "string",
+                            "description": "Optional SQL WHERE clause (without the WHERE keyword)",
+                        },
+                    },
+                    "required": ["table"],
+                },
+                handler=self._tool_count,
+                category="database",
+                source="plugin",
+                plugin_name="PostgreSQL",
+                timeout_seconds=30,
+            ),
+            AgentTool(
+                name="postgres_sample",
+                description="Return a random sample of rows from a PostgreSQL table.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "table": {
+                            "type": "string",
+                            "description": "Table name",
+                        },
+                        "n": {
+                            "type": "integer",
+                            "description": "Number of rows to sample (default: 5)",
+                        },
+                    },
+                    "required": ["table"],
+                },
+                handler=self._tool_sample,
+                category="database",
+                source="plugin",
+                plugin_name="PostgreSQL",
+                timeout_seconds=30,
+            ),
+            AgentTool(
+                name="postgres_vector_search",
                 description="Search for similar vectors using pgvector extension. Returns matching rows with similarity scores.",
                 parameters={
                     "type": "object",
@@ -621,7 +627,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                             "params": {
                                 "type": "array",
                                 "description": "Optional parameter values",
-                                "items": {"type": "string"},
+                                "items": {},
                             },
                         },
                         "required": ["sql"],
@@ -633,7 +639,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                     timeout_seconds=60,
                 ),
                 AgentTool(
-                    name="vector_upsert",
+                    name="postgres_vector_upsert",
                     description="Insert or update a vector with metadata in PostgreSQL using pgvector. Uses ON CONFLICT to handle duplicates.",
                     parameters={
                         "type": "object",
@@ -687,36 +693,37 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         if focus_dsl:
             results = await self._run_focus_query(sql, params, focus_dsl)
         else:
-            limit = args.get("limit", 50)
-            columns = args.get("columns")
-            if columns:
-                safe_cols = ", ".join(
-                    f'"{c}"' for c in columns if re.match(r"^[A-Za-z0-9_]+$", c)
-                )
-                if safe_cols:
-                    sql = f"SELECT {safe_cols} FROM ({sql}) _pg_q"
             if not re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
-                sql = f"{sql} LIMIT {int(limit)}"
+                sql = f"{sql} LIMIT 50"
             results = await self.query(sql, params or None)
 
-        return {"success": True, "rows": results, "row_count": len(results)}
+        truncated = self._truncate_result(results)
+        return {
+            "rows": truncated["rows"],
+            "total_rows": truncated["total_rows"],
+            "truncated": truncated["truncated"],
+        }
 
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for postgres_list_tables"""
+        """Tool handler for postgres_list_tables (kept for backward compat, not in get_tools)"""
         tables = await self.tables()
-
-        return {"success": True, "tables": tables, "count": len(tables)}
+        total = len(tables)
+        truncated = total > 50
+        return {
+            "tables": tables[:50],
+            "count": len(tables[:50]),
+            "total_tables": total,
+            "truncated": truncated,
+        }
 
     async def _tool_get_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for postgres_get_schema"""
+        """Tool handler for postgres_get_schema (kept for backward compat, not in get_tools)"""
         table_name = args.get("table_name")
         columns = await self.describe(table_name)
 
         return {
-            "success": True,
             "table": table_name,
-            "columns": columns,
-            "column_count": len(columns),
+            "columns": [self._compact_column(c) for c in columns],
         }
 
     async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -726,29 +733,49 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
 
         affected_rows = await self.execute(sql, params)
 
-        return {"success": True, "affected_rows": affected_rows}
+        return {"affected_rows": affected_rows}
 
     async def _tool_inspect(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_inspect — fetch all table schemas in parallel."""
         filter_tables = args.get("tables")
 
         all_tables = await self.tables()
+        total_tables = len(all_tables)
         targets = (
             [t for t in all_tables if t in filter_tables]
             if filter_tables
-            else all_tables
+            else all_tables[:50]
         )
+        truncated = not filter_tables and total_tables > 50
 
         schemas = await asyncio.gather(*[self.describe(t) for t in targets])
 
         return {
-            "success": True,
-            "tables": [{"name": t, "columns": s} for t, s in zip(targets, schemas)],
+            "tables": [
+                {"name": t, "columns": [self._compact_column(c) for c in s]}
+                for t, s in zip(targets, schemas)
+            ],
             "count": len(targets),
+            "total_tables": total_tables,
+            "truncated": truncated,
         }
 
+    async def _tool_count(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for postgres_count"""
+        table = args.get("table")
+        filter_clause = args.get("filter")
+        count = await self.count_rows(table, filter_clause)
+        return {"table": table, "count": count}
+
+    async def _tool_sample(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for postgres_sample"""
+        table = args.get("table")
+        n = args.get("n", 5)
+        rows = await self.sample_rows(table, n)
+        return {"table": table, "rows": rows}
+
     async def _tool_vector_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for vector_search"""
+        """Tool handler for postgres_vector_search"""
         table = args.get("table")
         vector_column = args.get("vector_column")
         query_vector = args.get("query_vector")
@@ -765,10 +792,10 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             distance_type=distance_type,
         )
 
-        return {"success": True, "results": results, "count": len(results)}
+        return {"results": results, "count": len(results)}
 
     async def _tool_vector_upsert(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for vector_upsert"""
+        """Tool handler for postgres_vector_upsert"""
         table = args.get("table")
         id_column = args.get("id_column")
         vector_column = args.get("vector_column")
@@ -785,7 +812,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             extra_columns=extra_columns,
         )
 
-        return {"success": True, "row": result}
+        return result
 
 
 def postgresql(**kwargs) -> PostgreSQLPlugin:

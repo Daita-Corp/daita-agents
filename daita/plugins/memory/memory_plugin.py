@@ -50,6 +50,8 @@ class MemoryPlugin(LifecyclePlugin):
         curation_api_key: Optional[str] = None,
         embedding_provider: str = "openai",
         embedding_model: str = "text-embedding-3-small",
+        enable_reranking: bool = False,
+        enable_fact_extraction: bool = False,
     ):
         """
         Args:
@@ -61,6 +63,11 @@ class MemoryPlugin(LifecyclePlugin):
             curation_api_key: API key for curation (default: global settings)
             embedding_provider: Provider for embeddings (default: "openai")
             embedding_model: Embedding model (default: "text-embedding-3-small")
+            enable_reranking: Rerank top recall results with an LLM call for
+                higher accuracy at the cost of latency. Requires curator LLM.
+            enable_fact_extraction: Extract structured facts from memories at
+                ingestion time for richer temporal and relational recall.
+                Requires curator LLM.
         """
         self.workspace = workspace
         self.scope = scope
@@ -70,11 +77,15 @@ class MemoryPlugin(LifecyclePlugin):
         self.curation_api_key = curation_api_key
         self.embedding_provider = embedding_provider
         self.embedding_model = embedding_model
+        self.enable_reranking = enable_reranking
+        self.enable_fact_extraction = enable_fact_extraction
 
         self._agent_id = None
         self.backend = None
         self.curator = None
         self.environment = None
+        self._reranker = None
+        self._fact_extractor = None
 
     def initialize(self, agent_id: str):
         """Called by Agent.add_plugin() to inject agent context."""
@@ -170,6 +181,16 @@ class MemoryPlugin(LifecyclePlugin):
                 f"  Auto-curation: {self.auto_curate} (provider: {self.curator.llm_provider}, model: {self.curator.llm_model})"
             )
 
+        if self.enable_reranking and self.curator is not None:
+            from .reranker import MemoryReranker
+
+            self._reranker = MemoryReranker(llm=self.curator.llm)
+
+        if self.enable_fact_extraction and self.curator is not None:
+            from .fact_extractor import FactExtractor
+
+            self._fact_extractor = FactExtractor(llm=self.curator.llm)
+
     def get_tools(self) -> List[AgentTool]:
         """Get memory tools for the LLM to use."""
         if self.backend is None:
@@ -178,6 +199,8 @@ class MemoryPlugin(LifecyclePlugin):
             )
 
         backend = self.backend
+        _reranker = self._reranker
+        _fact_extractor = self._fact_extractor
 
         # Instantiate contradiction checker if curation LLM is available.
         _checker = None
@@ -274,7 +297,26 @@ class MemoryPlugin(LifecyclePlugin):
                 source="agent_inferred",
                 category=category,
             )
-            return await backend.remember(content, category=category, metadata=metadata)
+
+            # Structured fact extraction (opt-in via enable_fact_extraction).
+            # Facts are stored in metadata JSON under "extracted_facts" for
+            # richer temporal and relational recall.
+            extra_metadata = None
+            if _fact_extractor is not None:
+                from .fact_extractor import FactExtractor
+
+                facts = await _fact_extractor.extract(content)
+                if facts:
+                    extra_metadata = {
+                        "extracted_facts": FactExtractor.facts_to_metadata(facts)
+                    }
+
+            return await backend.remember(
+                content,
+                category=category,
+                metadata=metadata,
+                extra_metadata=extra_metadata,
+            )
 
         @tool
         async def recall(
@@ -317,6 +359,7 @@ class MemoryPlugin(LifecyclePlugin):
                 min_importance=min_importance,
                 max_importance=max_importance,
                 category=category,
+                reranker=_reranker,
             )
 
             # Track access for usage-based pruning signals
@@ -456,7 +499,9 @@ class MemoryPlugin(LifecyclePlugin):
             return None
 
         try:
-            results = await self.backend.recall(prompt, limit=10, score_threshold=0.55)
+            results = await self.backend.recall(
+                prompt, limit=10, score_threshold=0.55, reranker=self._reranker
+            )
 
             # Fallback: no semantic matches — inject top-3 by importance
             if not results:
@@ -621,3 +666,8 @@ class MemoryPlugin(LifecyclePlugin):
             else:
                 raise ValueError("auto_curate must be 'on_stop' or 'manual'")
         return {"status": "success", "updated": updated}
+
+
+def memory(**kwargs) -> MemoryPlugin:
+    """Create Memory plugin with simplified interface."""
+    return MemoryPlugin(**kwargs)

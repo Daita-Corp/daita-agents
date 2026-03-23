@@ -236,6 +236,37 @@ class MySQLPlugin(BaseDatabasePlugin):
         """
         return await self.query(sql, [table])
 
+    async def count_rows(self, table: str, filter: Optional[str] = None) -> int:
+        """
+        Count rows in a table.
+
+        Args:
+            table: Table name
+            filter: Optional WHERE clause (without the WHERE keyword)
+
+        Returns:
+            Row count
+        """
+        sql = f"SELECT COUNT(*) as cnt FROM `{table}`"
+        if filter:
+            sql += f" WHERE {filter}"
+        rows = await self.query(sql)
+        return rows[0]["cnt"] if rows else 0
+
+    async def sample_rows(self, table: str, n: int = 5) -> List[Dict[str, Any]]:
+        """
+        Return a random sample of rows from a table.
+
+        Args:
+            table: Table name
+            n: Number of rows to return
+
+        Returns:
+            List of sampled rows
+        """
+        sql = f"SELECT * FROM `{table}` ORDER BY RAND() LIMIT {int(n)}"
+        return await self.query(sql)
+
     def get_tools(self) -> List["AgentTool"]:
         """
         Expose MySQL operations as agent tools.
@@ -248,7 +279,7 @@ class MySQLPlugin(BaseDatabasePlugin):
         tools = [
             AgentTool(
                 name="mysql_query",
-                description="Run a SELECT query on MySQL. Use limit and columns to avoid oversized responses.",
+                description="Run a SELECT query on MySQL. Include LIMIT in your SQL to control result size.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -259,16 +290,7 @@ class MySQLPlugin(BaseDatabasePlugin):
                         "params": {
                             "type": "array",
                             "description": "Optional parameter values",
-                            "items": {"type": "string"},
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Max rows to return (default: 50)",
-                        },
-                        "columns": {
-                            "type": "array",
-                            "description": "Specific columns to return (returns all if omitted)",
-                            "items": {"type": "string"},
+                            "items": {},
                         },
                         "focus": {
                             "type": "string",
@@ -284,37 +306,8 @@ class MySQLPlugin(BaseDatabasePlugin):
                 timeout_seconds=60,
             ),
             AgentTool(
-                name="mysql_list_tables",
-                description="List all tables in the MySQL database.",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_list_tables,
-                category="database",
-                source="plugin",
-                plugin_name="MySQL",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="mysql_get_schema",
-                description="Get column info (name, type, nullable) for a MySQL table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table_name": {
-                            "type": "string",
-                            "description": "Table name to inspect",
-                        }
-                    },
-                    "required": ["table_name"],
-                },
-                handler=self._tool_get_schema,
-                category="database",
-                source="plugin",
-                plugin_name="MySQL",
-                timeout_seconds=30,
-            ),
-            AgentTool(
                 name="mysql_inspect",
-                description="List all tables and their column schemas in one call. Use instead of calling mysql_list_tables then mysql_get_schema for each table.",
+                description="List all tables and their column schemas in one call. Use tables param to filter specific tables.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -327,6 +320,52 @@ class MySQLPlugin(BaseDatabasePlugin):
                     "required": [],
                 },
                 handler=self._tool_inspect,
+                category="database",
+                source="plugin",
+                plugin_name="MySQL",
+                timeout_seconds=30,
+            ),
+            AgentTool(
+                name="mysql_count",
+                description="Count rows in a MySQL table, optionally filtered by a WHERE clause.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "table": {
+                            "type": "string",
+                            "description": "Table name",
+                        },
+                        "filter": {
+                            "type": "string",
+                            "description": "Optional WHERE clause (without WHERE keyword), e.g. 'status = \"active\"'",
+                        },
+                    },
+                    "required": ["table"],
+                },
+                handler=self._tool_count,
+                category="database",
+                source="plugin",
+                plugin_name="MySQL",
+                timeout_seconds=30,
+            ),
+            AgentTool(
+                name="mysql_sample",
+                description="Return a random sample of rows from a MySQL table.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "table": {
+                            "type": "string",
+                            "description": "Table name",
+                        },
+                        "n": {
+                            "type": "integer",
+                            "description": "Number of rows to sample (default: 5)",
+                        },
+                    },
+                    "required": ["table"],
+                },
+                handler=self._tool_sample,
                 category="database",
                 source="plugin",
                 plugin_name="MySQL",
@@ -348,7 +387,7 @@ class MySQLPlugin(BaseDatabasePlugin):
                             "params": {
                                 "type": "array",
                                 "description": "Optional parameter values",
-                                "items": {"type": "string"},
+                                "items": {},
                             },
                         },
                         "required": ["sql"],
@@ -371,36 +410,29 @@ class MySQLPlugin(BaseDatabasePlugin):
         if focus_dsl:
             results = await self._run_focus_query(sql, params, focus_dsl)
         else:
-            limit = args.get("limit", 50)
-            columns = args.get("columns")
-            if columns:
-                safe_cols = ", ".join(
-                    f"`{c}`" for c in columns if re.match(r"^[A-Za-z0-9_]+$", c)
-                )
-                if safe_cols:
-                    sql = f"SELECT {safe_cols} FROM ({sql}) _mysql_q"
             if not re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
-                sql = f"{sql} LIMIT {int(limit)}"
+                sql = f"{sql} LIMIT 50"
             results = await self.query(sql, params or None)
 
-        return {"success": True, "rows": results, "row_count": len(results)}
+        truncated = self._truncate_result(results)
+        return {
+            "rows": truncated["rows"],
+            "total_rows": truncated["total_rows"],
+            "truncated": truncated["truncated"],
+        }
 
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for mysql_list_tables"""
+        """Tool handler for mysql_list_tables (kept for backward compat)"""
         tables = await self.tables()
-
-        return {"success": True, "tables": tables, "count": len(tables)}
+        return {"tables": tables}
 
     async def _tool_get_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for mysql_get_schema"""
+        """Tool handler for mysql_get_schema (kept for backward compat)"""
         table_name = args.get("table_name")
         columns = await self.describe(table_name)
-
         return {
-            "success": True,
             "table": table_name,
-            "columns": columns,
-            "column_count": len(columns),
+            "columns": [self._compact_column(c) for c in columns],
         }
 
     async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -410,7 +442,7 @@ class MySQLPlugin(BaseDatabasePlugin):
 
         affected_rows = await self.execute(sql, params)
 
-        return {"success": True, "affected_rows": affected_rows}
+        return {"affected_rows": affected_rows}
 
     async def _tool_inspect(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mysql_inspect — fetch all table schemas in parallel."""
@@ -423,13 +455,35 @@ class MySQLPlugin(BaseDatabasePlugin):
             else all_tables
         )
 
+        # Cap at 50 tables to avoid token bloat
+        total_tables = len(targets)
+        truncated = total_tables > 50
+        targets = targets[:50]
+
         schemas = await asyncio.gather(*[self.describe(t) for t in targets])
 
         return {
-            "success": True,
-            "tables": [{"name": t, "columns": s} for t, s in zip(targets, schemas)],
-            "count": len(targets),
+            "tables": [
+                {"name": t, "columns": [self._compact_column(c) for c in s]}
+                for t, s in zip(targets, schemas)
+            ],
+            "total_tables": total_tables,
+            "truncated": truncated,
         }
+
+    async def _tool_count(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for mysql_count"""
+        table = args.get("table")
+        filter_clause = args.get("filter")
+        count = await self.count_rows(table, filter_clause)
+        return {"table": table, "count": count}
+
+    async def _tool_sample(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for mysql_sample"""
+        table = args.get("table")
+        n = args.get("n", 5)
+        rows = await self.sample_rows(table, n)
+        return {"table": table, "rows": rows}
 
 
 def mysql(**kwargs) -> MySQLPlugin:

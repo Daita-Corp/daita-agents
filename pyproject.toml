@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daita-agents"
-version = "0.11.0"
+version = "0.12.0"
 description = "Daita Agents - Data focused AI agent framework with free local use and premium hosted enterprise features"
 readme = "README.md"
 authors = [{name = "Daita", email = "support@daita-tech.io"}]
@@ -153,6 +153,13 @@ vectordb = [
 # =============================================================================
 
 aws = ["boto3>=1.38.0"]
+google-drive = [
+    "google-api-python-client>=2.0.0",
+    "google-auth>=2.0.0",
+    "google-auth-oauthlib>=1.0.0",
+    "pypdf>=3.0.0",
+    "python-docx>=1.0.0",
+]
 slack = ["slack-sdk>=3.31.0"]
 mcp = ["mcp>=1.0.0"]  # Model Context Protocol
 neo4j = ["neo4j>=5.0.0"]
@@ -162,6 +169,11 @@ lineage = ["networkx>=3.0"]
 # Convenience bundle - cloud services
 cloud = [
     "boto3>=1.38.0",
+    "google-api-python-client>=2.0.0",
+    "google-auth>=2.0.0",
+    "google-auth-oauthlib>=1.0.0",
+    "pypdf>=3.0.0",
+    "python-docx>=1.0.0",
     "slack-sdk>=3.31.0"
 ]
 
@@ -208,6 +220,11 @@ complete = [
     "tavily-python>=0.3.0",
     # Cloud & integrations
     "boto3>=1.38.0",
+    "google-api-python-client>=2.0.0",
+    "google-auth>=2.0.0",
+    "google-auth-oauthlib>=1.0.0",
+    "pypdf>=3.0.0",
+    "python-docx>=1.0.0",
     "slack-sdk>=3.31.0",
 ]
 
@@ -233,6 +250,11 @@ all = [
     "qdrant-client>=1.16.0",
     # Cloud & integrations
     "boto3>=1.38.0",
+    "google-api-python-client>=2.0.0",
+    "google-auth>=2.0.0",
+    "google-auth-oauthlib>=1.0.0",
+    "pypdf>=3.0.0",
+    "python-docx>=1.0.0",
     "slack-sdk>=3.31.0",
     "mcp>=1.0.0",
     "neo4j>=5.0.0",

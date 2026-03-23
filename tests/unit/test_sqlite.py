@@ -186,61 +186,58 @@ async def test_pragma_write(db):
 # ---------------------------------------------------------------------------
 
 
-async def test_get_tools_returns_five(db):
+async def test_get_tools_returns_correct_tools(db):
     tools = db.get_tools()
     names = [t.name for t in tools]
-    assert len(tools) == 5
     assert "sqlite_query" in names
     assert "sqlite_execute" in names
-    assert "sqlite_list_tables" in names
-    assert "sqlite_get_schema" in names
     assert "sqlite_inspect" in names
+    assert "sqlite_count" in names
+    assert "sqlite_sample" in names
+    # list_tables and get_schema removed from default tools
+    assert "sqlite_list_tables" not in names
+    assert "sqlite_get_schema" not in names
 
 
 async def test_tool_query(db):
     await db.execute("INSERT INTO users (name, age) VALUES (?, ?)", ["Ivy", 22])
-    result = await db._tool_query({"sql": "SELECT * FROM users", "limit": 10})
-    assert result["success"] is True
-    assert result["row_count"] == 1
+    result = await db._tool_query({"sql": "SELECT * FROM users LIMIT 10"})
+    assert result["total_rows"] == 1
     assert result["rows"][0]["name"] == "Ivy"
 
 
 async def test_tool_query_with_params(db):
     await db.execute("INSERT INTO users (name, age) VALUES (?, ?)", ["Jack", 45])
     result = await db._tool_query(
-        {"sql": "SELECT * FROM users WHERE age > ?", "params": ["30"], "limit": 10}
+        {"sql": "SELECT * FROM users WHERE age > ? LIMIT 10", "params": [30]}
     )
-    assert result["success"] is True
-    assert result["row_count"] == 1
+    assert result["total_rows"] == 1
 
 
 async def test_tool_execute(db):
     await db.execute("INSERT INTO users (name, age) VALUES (?, ?)", ["Kate", 29])
     result = await db._tool_execute(
-        {"sql": "UPDATE users SET age = ? WHERE name = ?", "params": ["30", "Kate"]}
+        {"sql": "UPDATE users SET age = ? WHERE name = ?", "params": [30, "Kate"]}
     )
-    assert result["success"] is True
     assert result["affected_rows"] == 1
 
 
 async def test_tool_list_tables(db):
+    """_tool_list_tables kept for backward compat."""
     result = await db._tool_list_tables({})
-    assert result["success"] is True
     assert "users" in result["tables"]
-    assert result["count"] == 2
 
 
 async def test_tool_get_schema(db):
+    """_tool_get_schema kept for backward compat."""
     result = await db._tool_get_schema({"table_name": "users"})
-    assert result["success"] is True
     assert result["table"] == "users"
-    assert result["column_count"] == 3
+    assert len(result["columns"]) == 3
 
 
 async def test_tool_inspect(db):
     result = await db._tool_inspect({})
-    assert result["success"] is True
-    assert result["count"] == 2
+    assert result["total_tables"] == 2
     table_names = [t["name"] for t in result["tables"]]
     assert "users" in table_names
     assert "orders" in table_names
@@ -248,8 +245,38 @@ async def test_tool_inspect(db):
 
 async def test_tool_inspect_filtered(db):
     result = await db._tool_inspect({"tables": ["users"]})
-    assert result["count"] == 1
+    assert result["total_tables"] == 1
     assert result["tables"][0]["name"] == "users"
+
+
+async def test_tool_count(db):
+    await db.execute("INSERT INTO users (name, age) VALUES (?, ?)", ["Leo", 25])
+    result = await db._tool_count({"table": "users"})
+    assert result["count"] == 1
+    assert result["table"] == "users"
+
+
+async def test_tool_sample(db):
+    data = [{"name": "Sam", "age": 30}, {"name": "Tina", "age": 28}]
+    await db.insert_many("users", data)
+    result = await db._tool_sample({"table": "users", "n": 2})
+    assert len(result["rows"]) == 2
+    assert result["table"] == "users"
+
+
+# ---------------------------------------------------------------------------
+# compact_column helper
+# ---------------------------------------------------------------------------
+
+
+async def test_compact_column_format(db):
+    columns = await db.describe("users")
+    compact = [db._compact_column(c) for c in columns]
+    # Should be "colname:datatype:null_status" format
+    for c in compact:
+        parts = c.split(":")
+        assert len(parts) == 3
+        assert parts[2] in ("nn", "null")
 
 
 # ---------------------------------------------------------------------------

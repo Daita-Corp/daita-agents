@@ -519,7 +519,6 @@ class EmailPlugin(BasePlugin):
             )
 
             result = {
-                "success": True,
                 "to": recipients,
                 "subject": subject,
                 "timestamp": datetime.now().isoformat(),
@@ -625,7 +624,7 @@ class EmailPlugin(BasePlugin):
             await loop.run_in_executor(None, _delete)
 
             logger.info(f"Deleted email: {email_id}")
-            return {"success": True, "email_id": email_id, "permanent": permanent}
+            return {"email_id": email_id, "permanent": permanent, "deleted": True}
 
         except Exception as e:
             logger.error(f"Failed to delete email: {e}")
@@ -786,7 +785,7 @@ class EmailPlugin(BasePlugin):
             folder=folder, limit=limit, unread_only=unread_only
         )
 
-        return {"success": True, "emails": emails, "count": len(emails)}
+        return {"emails": emails, "count": len(emails)}
 
     async def _tool_read_email(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for read_email"""
@@ -809,21 +808,26 @@ class EmailPlugin(BasePlugin):
             safe_email["body_truncated"] = True
             safe_email["body_total_chars"] = len(body)
 
-        return {"success": True, "email": safe_email}
+        return {"email": safe_email}
+
+    @staticmethod
+    def _parse_recipients(val) -> List[str]:
+        """Accept a comma-separated string or a list of addresses."""
+        if isinstance(val, str):
+            return [addr.strip() for addr in val.split(",") if addr.strip()]
+        return list(val) if val else []
 
     async def _tool_send_email(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for send_email"""
-        to = args.get("to")
+        to = self._parse_recipients(args.get("to"))
         subject = args.get("subject")
         body = args.get("body")
         html = args.get("html", False)
-        cc = args.get("cc")
+        cc = self._parse_recipients(args.get("cc")) or None
 
-        result = await self.send_email(
+        return await self.send_email(
             to=to, subject=subject, body=body, html=html, cc=cc
         )
-
-        return result
 
     async def _tool_reply_to_email(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for reply_to_email"""
@@ -831,9 +835,7 @@ class EmailPlugin(BasePlugin):
         body = args.get("body")
         html = args.get("html", False)
 
-        result = await self.reply_to_email(email_id=email_id, body=body, html=html)
-
-        return result
+        return await self.reply_to_email(email_id=email_id, body=body, html=html)
 
     async def _tool_search_emails(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for search_emails"""
@@ -842,7 +844,7 @@ class EmailPlugin(BasePlugin):
 
         emails = await self.search_emails(query=query, limit=limit)
 
-        return {"success": True, "emails": emails, "count": len(emails)}
+        return {"emails": emails, "count": len(emails)}
 
     # Context manager support
     async def __aenter__(self):

@@ -16,6 +16,7 @@ import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from .base import BasePlugin
+from ..core.exceptions import PluginError
 
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
@@ -60,6 +61,7 @@ class Neo4jPlugin(BasePlugin):
         username: Optional[str] = None,
         password: Optional[str] = None,
         database: str = "neo4j",
+        read_only: bool = False,
         **kwargs,
     ):
         """
@@ -71,10 +73,12 @@ class Neo4jPlugin(BasePlugin):
             username: Username (alternative to auth tuple)
             password: Password (alternative to auth tuple)
             database: Database name (default: "neo4j")
+            read_only: If True, only expose read tools (default: False)
             **kwargs: Additional neo4j driver parameters
         """
         self._uri = uri
         self._database = database
+        self.read_only = read_only
 
         # Handle auth parameter
         if auth:
@@ -109,9 +113,11 @@ class Neo4jPlugin(BasePlugin):
             raise ImportError(
                 "neo4j driver not installed. Install with: pip install 'daita-agents[neo4j]'"
             )
+        except PluginError:
+            raise
         except Exception as e:
             logger.error(f"Failed to connect to Neo4j: {e}")
-            raise
+            raise PluginError(f"Failed to connect to Neo4j: {e}", plugin_name="Neo4j")
 
     async def disconnect(self):
         """Disconnect from Neo4j database."""
@@ -138,10 +144,10 @@ class Neo4jPlugin(BasePlugin):
         """
         from ..core.tools import AgentTool
 
-        return [
+        tools = [
             AgentTool(
-                name="query_graph",
-                description="Execute a Cypher query against the Neo4j graph database",
+                name="neo4j_query",
+                description="Execute a Cypher query against the Neo4j graph database. Include LIMIT in your query to control result size.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -163,75 +169,7 @@ class Neo4jPlugin(BasePlugin):
                 timeout_seconds=60,
             ),
             AgentTool(
-                name="create_node",
-                description="Create a new node in the graph with a label and properties",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "label": {
-                            "type": "string",
-                            "description": "Node label (e.g., 'Person', 'Company')",
-                        },
-                        "properties": {
-                            "type": "object",
-                            "description": "Node properties as key-value pairs",
-                        },
-                    },
-                    "required": ["label", "properties"],
-                },
-                handler=self._tool_create_node,
-                category="graph",
-                source="plugin",
-                plugin_name="Neo4j",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="create_relationship",
-                description="Create a relationship between two nodes",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "from_label": {
-                            "type": "string",
-                            "description": "Label of source node",
-                        },
-                        "from_properties": {
-                            "type": "object",
-                            "description": "Properties to match source node",
-                        },
-                        "to_label": {
-                            "type": "string",
-                            "description": "Label of target node",
-                        },
-                        "to_properties": {
-                            "type": "object",
-                            "description": "Properties to match target node",
-                        },
-                        "relationship_type": {
-                            "type": "string",
-                            "description": "Type of relationship (e.g., 'KNOWS', 'WORKS_AT')",
-                        },
-                        "relationship_properties": {
-                            "type": "object",
-                            "description": "Optional properties for the relationship",
-                        },
-                    },
-                    "required": [
-                        "from_label",
-                        "from_properties",
-                        "to_label",
-                        "to_properties",
-                        "relationship_type",
-                    ],
-                },
-                handler=self._tool_create_relationship,
-                category="graph",
-                source="plugin",
-                plugin_name="Neo4j",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="find_nodes",
+                name="neo4j_find_nodes",
                 description="Find nodes by label and properties",
                 parameters={
                     "type": "object",
@@ -258,7 +196,7 @@ class Neo4jPlugin(BasePlugin):
                 timeout_seconds=60,
             ),
             AgentTool(
-                name="find_path",
+                name="neo4j_find_path",
                 description="Find shortest path between two nodes",
                 parameters={
                     "type": "object",
@@ -298,7 +236,7 @@ class Neo4jPlugin(BasePlugin):
                 timeout_seconds=60,
             ),
             AgentTool(
-                name="get_neighbors",
+                name="neo4j_get_neighbors",
                 description="Get all neighboring nodes connected to a node",
                 parameters={
                     "type": "object",
@@ -326,23 +264,10 @@ class Neo4jPlugin(BasePlugin):
                 timeout_seconds=60,
             ),
             AgentTool(
-                name="delete_node",
-                description="Delete a node and its relationships",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "label": {
-                            "type": "string",
-                            "description": "Label of the node to delete",
-                        },
-                        "properties": {
-                            "type": "object",
-                            "description": "Properties to match the node",
-                        },
-                    },
-                    "required": ["label", "properties"],
-                },
-                handler=self._tool_delete_node,
+                name="neo4j_schema",
+                description="List all node labels and relationship types in the Neo4j database. Use this to explore the graph schema.",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=self._tool_schema,
                 category="graph",
                 source="plugin",
                 plugin_name="Neo4j",
@@ -350,13 +275,194 @@ class Neo4jPlugin(BasePlugin):
             ),
         ]
 
+        tools += [
+            AgentTool(
+                name="neo4j_list_labels",
+                description="List all node labels in the Neo4j database",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=self._tool_list_labels,
+                category="graph",
+                source="plugin",
+                plugin_name="Neo4j",
+                timeout_seconds=30,
+            ),
+            AgentTool(
+                name="neo4j_list_relationship_types",
+                description="List all relationship types in the Neo4j database",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=self._tool_list_relationship_types,
+                category="graph",
+                source="plugin",
+                plugin_name="Neo4j",
+                timeout_seconds=30,
+            ),
+            AgentTool(
+                name="neo4j_graph_stats",
+                description="Get node and relationship counts in the Neo4j database",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=self._tool_graph_stats,
+                category="graph",
+                source="plugin",
+                plugin_name="Neo4j",
+                timeout_seconds=30,
+            ),
+        ]
+
+        if not self.read_only:
+            tools += [
+                AgentTool(
+                    name="neo4j_create_node",
+                    description="Create a new node in the graph with a label and properties",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": "Node label (e.g., 'Person', 'Company')",
+                            },
+                            "properties": {
+                                "type": "object",
+                                "description": "Node properties as key-value pairs",
+                            },
+                        },
+                        "required": ["label", "properties"],
+                    },
+                    handler=self._tool_create_node,
+                    category="graph",
+                    source="plugin",
+                    plugin_name="Neo4j",
+                    timeout_seconds=30,
+                ),
+                AgentTool(
+                    name="neo4j_create_relationship",
+                    description="Create a relationship between two nodes",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "from_label": {
+                                "type": "string",
+                                "description": "Label of source node",
+                            },
+                            "from_properties": {
+                                "type": "object",
+                                "description": "Properties to match source node",
+                            },
+                            "to_label": {
+                                "type": "string",
+                                "description": "Label of target node",
+                            },
+                            "to_properties": {
+                                "type": "object",
+                                "description": "Properties to match target node",
+                            },
+                            "relationship_type": {
+                                "type": "string",
+                                "description": "Type of relationship (e.g., 'KNOWS', 'WORKS_AT')",
+                            },
+                            "relationship_properties": {
+                                "type": "object",
+                                "description": "Optional properties for the relationship",
+                            },
+                        },
+                        "required": [
+                            "from_label",
+                            "from_properties",
+                            "to_label",
+                            "to_properties",
+                            "relationship_type",
+                        ],
+                    },
+                    handler=self._tool_create_relationship,
+                    category="graph",
+                    source="plugin",
+                    plugin_name="Neo4j",
+                    timeout_seconds=30,
+                ),
+                AgentTool(
+                    name="neo4j_delete_node",
+                    description="Delete a node and its relationships",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": "Label of the node to delete",
+                            },
+                            "properties": {
+                                "type": "object",
+                                "description": "Properties to match the node",
+                            },
+                        },
+                        "required": ["label", "properties"],
+                    },
+                    handler=self._tool_delete_node,
+                    category="graph",
+                    source="plugin",
+                    plugin_name="Neo4j",
+                    timeout_seconds=30,
+                ),
+            ]
+
+        return tools
+
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for query_graph"""
-        cypher = args.get("cypher")
+        """Tool handler for neo4j_query"""
+        import re
+
+        cypher = args.get("cypher", "").rstrip()
         parameters = args.get("parameters", {})
 
-        result = await self.query(cypher, parameters)
-        return result
+        # Inject LIMIT 200 safety cap if no LIMIT present
+        if not re.search(r"\bLIMIT\b", cypher, re.IGNORECASE):
+            cypher = cypher.rstrip(";") + " LIMIT 200"
+
+        return await self.query(cypher, parameters)
+
+    async def _tool_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for neo4j_schema — returns labels and relationship types."""
+        labels_result = await self.query("CALL db.labels() YIELD label RETURN label")
+        rel_result = await self.query(
+            "CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType"
+        )
+        return {
+            "labels": [r["label"] for r in labels_result["records"]],
+            "relationship_types": [
+                r["relationshipType"] for r in rel_result["records"]
+            ],
+        }
+
+    async def _tool_list_labels(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for neo4j_list_labels"""
+        result = await self.query("CALL db.labels() YIELD label RETURN label")
+        return {"labels": [r["label"] for r in result["records"]]}
+
+    async def _tool_list_relationship_types(
+        self, args: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Tool handler for neo4j_list_relationship_types"""
+        result = await self.query(
+            "CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType"
+        )
+        return {
+            "relationship_types": [r["relationshipType"] for r in result["records"]]
+        }
+
+    async def _tool_graph_stats(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for neo4j_graph_stats"""
+        node_result = await self.query("MATCH (n) RETURN count(n) as node_count")
+        rel_result = await self.query(
+            "MATCH ()-[r]->() RETURN count(r) as relationship_count"
+        )
+        return {
+            "node_count": (
+                node_result["records"][0]["node_count"] if node_result["records"] else 0
+            ),
+            "relationship_count": (
+                rel_result["records"][0]["relationship_count"]
+                if rel_result["records"]
+                else 0
+            ),
+        }
 
     async def query(
         self, cypher: str, parameters: Optional[Dict[str, Any]] = None
@@ -369,7 +475,10 @@ class Neo4jPlugin(BasePlugin):
             parameters: Optional query parameters
 
         Returns:
-            Query results and metadata
+            Query results as {"records": [...], "count": int}
+
+        Raises:
+            PluginError: If the query fails
         """
         if self._driver is None:
             await self.connect()
@@ -379,10 +488,12 @@ class Neo4jPlugin(BasePlugin):
                 result = await session.run(cypher, parameters or {})
                 records = await result.data()
 
-                return {"success": True, "records": records, "count": len(records)}
+                return {"records": records, "count": len(records)}
+        except PluginError:
+            raise
         except Exception as e:
             logger.error(f"Cypher query failed: {e}")
-            return {"success": False, "error": str(e), "query": cypher}
+            raise PluginError(f"Neo4j query failed: {e}")
 
     async def _tool_create_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for create_node"""
@@ -412,14 +523,10 @@ class Neo4jPlugin(BasePlugin):
 
         result = await self.query(cypher, properties)
 
-        if result["success"]:
-            return {
-                "success": True,
-                "node": result["records"][0]["n"] if result["records"] else None,
-                "label": label,
-            }
-        else:
-            return result
+        return {
+            "node": result["records"][0]["n"] if result["records"] else None,
+            "label": label,
+        }
 
     async def _tool_create_relationship(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for create_relationship"""
@@ -492,15 +599,11 @@ class Neo4jPlugin(BasePlugin):
 
         result = await self.query(cypher, params)
 
-        if result["success"]:
-            return {
-                "success": True,
-                "relationship_type": relationship_type,
-                "from_node": result["records"][0]["a"] if result["records"] else None,
-                "to_node": result["records"][0]["b"] if result["records"] else None,
-            }
-        else:
-            return result
+        return {
+            "relationship_type": relationship_type,
+            "from_node": result["records"][0]["a"] if result["records"] else None,
+            "to_node": result["records"][0]["b"] if result["records"] else None,
+        }
 
     async def _tool_find_nodes(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for find_nodes"""
@@ -531,14 +634,10 @@ class Neo4jPlugin(BasePlugin):
 
         result = await self.query(cypher, properties or {})
 
-        if result["success"]:
-            return {
-                "success": True,
-                "nodes": [record["n"] for record in result["records"]],
-                "count": len(result["records"]),
-            }
-        else:
-            return result
+        return {
+            "nodes": [record["n"] for record in result["records"]],
+            "count": len(result["records"]),
+        }
 
     async def _tool_find_path(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for find_path"""
@@ -591,17 +690,13 @@ class Neo4jPlugin(BasePlugin):
 
         result = await self.query(cypher, params)
 
-        if result["success"]:
-            return {
-                "success": True,
-                "path": result["records"][0]["p"] if result["records"] else None,
-                "path_length": (
-                    result["records"][0]["path_length"] if result["records"] else None
-                ),
-                "found": len(result["records"]) > 0,
-            }
-        else:
-            return result
+        return {
+            "path": result["records"][0]["p"] if result["records"] else None,
+            "path_length": (
+                result["records"][0]["path_length"] if result["records"] else None
+            ),
+            "found": len(result["records"]) > 0,
+        }
 
     async def _tool_get_neighbors(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for get_neighbors"""
@@ -653,21 +748,17 @@ class Neo4jPlugin(BasePlugin):
 
         result = await self.query(cypher, properties)
 
-        if result["success"]:
-            return {
-                "success": True,
-                "neighbors": [
-                    {
-                        "node": record["m"],
-                        "relationship_type": record["relationship_type"],
-                        "relationship": record["r"],
-                    }
-                    for record in result["records"]
-                ],
-                "count": len(result["records"]),
-            }
-        else:
-            return result
+        return {
+            "neighbors": [
+                {
+                    "node": record["m"],
+                    "relationship_type": record["relationship_type"],
+                    "relationship": record["r"],
+                }
+                for record in result["records"]
+            ],
+            "count": len(result["records"]),
+        }
 
     async def _tool_delete_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for delete_node"""
@@ -694,12 +785,8 @@ class Neo4jPlugin(BasePlugin):
 
         cypher = f"MATCH (n:{label} {match_condition}) DETACH DELETE n"
 
-        result = await self.query(cypher, properties)
-
-        if result["success"]:
-            return {"success": True, "deleted": True}
-        else:
-            return result
+        await self.query(cypher, properties)
+        return {"deleted": True}
 
     def _build_match_condition(
         self, properties: Dict[str, Any], prefix: str = ""

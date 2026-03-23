@@ -5,12 +5,20 @@ Simple S3 object storage operations - no over-engineering.
 """
 
 import asyncio
+import functools
 import logging
 import os
 import io
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 from pathlib import Path
 from .base import BasePlugin
+from ..core.exceptions import (
+    PluginError,
+    NotFoundError,
+    PermissionError as DaitaPermissionError,
+    AuthenticationError,
+    TransientError,
+)
 
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
@@ -62,58 +70,119 @@ class S3Plugin(BasePlugin):
 
         self._client = None
         self._session = None
+        self._connect_lock = asyncio.Lock()
 
         logger.debug(f"S3 plugin configured for bucket {bucket} in region {region}")
 
-    async def connect(self):
-        """Initialize S3 client."""
-        if self._client is not None:
-            return  # Already connected
+    # ---------------------------------------------------------------------------
+    # Error mapping
+    # ---------------------------------------------------------------------------
 
+    def _map_s3_error(self, error: Exception, operation: str) -> Exception:
+        """Map boto3/botocore errors to framework exceptions."""
+        if isinstance(error, ImportError):
+            return PluginError(
+                f"S3 {operation} failed: boto3 not installed. Install with: pip install 'daita-agents[aws]'",
+                plugin_name="S3",
+                retry_hint="permanent",
+            )
         try:
-            import boto3
             from botocore.exceptions import ClientError
 
-            def _create_client():
-                session_kwargs = {"region_name": self.region}
-                if self.aws_access_key_id:
-                    session_kwargs["aws_access_key_id"] = self.aws_access_key_id
-                if self.aws_secret_access_key:
-                    session_kwargs["aws_secret_access_key"] = self.aws_secret_access_key
-                if self.aws_session_token:
-                    session_kwargs["aws_session_token"] = self.aws_session_token
-
-                session = boto3.Session(**session_kwargs)
-                client_kwargs = {}
-                if self.endpoint_url:
-                    client_kwargs["endpoint_url"] = self.endpoint_url
-                client = session.client("s3", **client_kwargs)
-                client.head_bucket(Bucket=self.bucket)
-                return session, client
-
-            loop = asyncio.get_running_loop()
-            try:
-                self._session, self._client = await loop.run_in_executor(
-                    None, _create_client
-                )
-                logger.info(f"Connected to S3 bucket: {self.bucket}")
-            except ClientError as e:
-                error_code = e.response["Error"]["Code"]
-                if error_code == "404":
-                    raise RuntimeError(f"S3 bucket '{self.bucket}' does not exist")
-                elif error_code == "403":
-                    raise RuntimeError(f"Access denied to S3 bucket '{self.bucket}'")
+            if isinstance(error, ClientError):
+                code = error.response["Error"]["Code"]
+                if code in ("404", "NoSuchKey", "NoSuchBucket"):
+                    return NotFoundError(
+                        f"S3 resource not found during {operation}",
+                        resource_type="s3_object",
+                    )
+                elif code in ("403", "AccessDenied"):
+                    return DaitaPermissionError(
+                        f"Access denied to S3 bucket '{self.bucket}' during {operation}",
+                        resource=self.bucket,
+                        action=operation,
+                    )
+                elif code in (
+                    "InvalidAccessKeyId",
+                    "SignatureDoesNotMatch",
+                    "ExpiredTokenException",
+                ):
+                    self._client = (
+                        None  # force reconnect on next call (credential refresh)
+                    )
+                    return AuthenticationError(
+                        f"AWS authentication failed during S3 {operation}",
+                        provider="AWS S3",
+                    )
+                elif code in ("500", "503", "SlowDown", "RequestTimeout"):
+                    return TransientError(f"S3 {operation} transient error: {error}")
                 else:
-                    raise RuntimeError(f"S3 connection error: {e}")
-
+                    return PluginError(
+                        f"S3 {operation} failed: {error}", plugin_name="S3"
+                    )
         except ImportError:
-            raise ImportError(
-                "boto3 not installed. Install with: pip install 'daita-agents[aws]'"
-            )
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"Failed to connect to S3: {e}")
+            pass
+        return PluginError(f"S3 {operation} failed: {error}", plugin_name="S3")
+
+    # ---------------------------------------------------------------------------
+    # Connection management
+    # ---------------------------------------------------------------------------
+
+    async def connect(self):
+        """Initialize S3 client."""
+        async with self._connect_lock:
+            if self._client is not None:
+                return  # Already connected
+
+            try:
+                import boto3
+                from botocore.exceptions import ClientError
+
+                def _create_client():
+                    session_kwargs = {"region_name": self.region}
+                    if self.aws_access_key_id:
+                        session_kwargs["aws_access_key_id"] = self.aws_access_key_id
+                    if self.aws_secret_access_key:
+                        session_kwargs["aws_secret_access_key"] = (
+                            self.aws_secret_access_key
+                        )
+                    if self.aws_session_token:
+                        session_kwargs["aws_session_token"] = self.aws_session_token
+
+                    session = boto3.Session(**session_kwargs)
+                    client_kwargs = {}
+                    if self.endpoint_url:
+                        client_kwargs["endpoint_url"] = self.endpoint_url
+                    client = session.client("s3", **client_kwargs)
+                    # list_objects_v2 is more reliable than head_bucket across boto3 versions
+                    client.list_objects_v2(Bucket=self.bucket, MaxKeys=1)
+                    return session, client
+
+                loop = asyncio.get_running_loop()
+                try:
+                    self._session, self._client = await loop.run_in_executor(
+                        None, _create_client
+                    )
+                    logger.info(f"Connected to S3 bucket: {self.bucket}")
+                except ClientError as e:
+                    raise self._map_s3_error(e, "connect") from e
+
+            except ImportError as e:
+                raise PluginError(
+                    "boto3 not installed. Install with: pip install 'daita-agents[aws]'",
+                    plugin_name="S3",
+                    retry_hint="permanent",
+                ) from e
+            except (
+                PluginError,
+                NotFoundError,
+                DaitaPermissionError,
+                AuthenticationError,
+                TransientError,
+            ):
+                raise
+            except Exception as e:
+                raise self._map_s3_error(e, "connect") from e
 
     async def disconnect(self):
         """Close S3 connection."""
@@ -123,9 +192,59 @@ class S3Plugin(BasePlugin):
             self._session = None
             logger.info("Disconnected from S3")
 
+    # ---------------------------------------------------------------------------
+    # Sync helpers (called via run_in_executor — no inline lambdas)
+    # ---------------------------------------------------------------------------
+
+    def _sync_list_objects(
+        self, prefix: str, max_keys: int, continuation_token: Optional[str]
+    ) -> dict:
+        kwargs: Dict[str, Any] = {
+            "Bucket": self.bucket,
+            "Prefix": prefix,
+            "MaxKeys": max_keys,
+        }
+        if continuation_token:
+            kwargs["ContinuationToken"] = continuation_token
+        return self._client.list_objects_v2(**kwargs)
+
+    def _sync_get_object(self, key: str) -> bytes:
+        response = self._client.get_object(Bucket=self.bucket, Key=key)
+        return response["Body"].read()
+
+    def _sync_put_object(self, put_args: dict) -> dict:
+        return self._client.put_object(**put_args)
+
+    def _sync_head_object(self, key: str) -> dict:
+        return self._client.head_object(Bucket=self.bucket, Key=key)
+
+    def _sync_delete_object(self, key: str) -> dict:
+        return self._client.delete_object(Bucket=self.bucket, Key=key)
+
+    def _sync_copy_object(self, copy_source: dict, dest_key: str) -> dict:
+        return self._client.copy_object(
+            CopySource=copy_source, Bucket=self.bucket, Key=dest_key
+        )
+
+    def _sync_download_file(self, key: str, local_path: str) -> None:
+        self._client.download_file(self.bucket, key, local_path)
+
+    def _sync_upload_file(self, local_path: str, key: str, content_type: str) -> None:
+        self._client.upload_file(
+            local_path, self.bucket, key, ExtraArgs={"ContentType": content_type}
+        )
+
+    # ---------------------------------------------------------------------------
+    # Core operations
+    # ---------------------------------------------------------------------------
+
     async def list_objects(
-        self, prefix: str = "", max_keys: int = 1000, focus: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
+        self,
+        prefix: str = "",
+        max_keys: int = 1000,
+        focus: Optional[str] = None,
+        continuation_token: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
         """
         List objects in the S3 bucket.
 
@@ -133,12 +252,13 @@ class S3Plugin(BasePlugin):
             prefix: Object key prefix filter
             max_keys: Maximum number of objects to return
             focus: Focus DSL expression (e.g. "SELECT Key, Size" or "Size > 1000 | SELECT Key, Size")
+            continuation_token: S3 continuation token for paginated results
 
         Returns:
-            List of object metadata dictionaries
+            Tuple of (objects list, is_truncated flag)
 
         Example:
-            objects = await s3.list_objects(prefix="data/", focus="SELECT Key, Size")
+            objects, truncated = await s3.list_objects(prefix="data/", focus="SELECT Key, Size")
         """
         if self._client is None:
             await self.connect()
@@ -147,22 +267,31 @@ class S3Plugin(BasePlugin):
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
-                lambda: self._client.list_objects_v2(
-                    Bucket=self.bucket, Prefix=prefix, MaxKeys=max_keys
+                functools.partial(
+                    self._sync_list_objects, prefix, max_keys, continuation_token
                 ),
             )
             objects = response.get("Contents", [])
+            is_truncated = response.get("IsTruncated", False)
 
             if focus:
                 from ..core.focus import apply_focus
 
-                return apply_focus(objects, focus)
+                objects = apply_focus(objects, focus)
 
-            return objects
+            return objects, is_truncated
 
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
+            raise
         except Exception as e:
             logger.error(f"Failed to list S3 objects: {e}")
-            raise RuntimeError(f"S3 list_objects failed: {e}")
+            raise self._map_s3_error(e, "list_objects") from e
 
     async def get_object(
         self, key: str, format: str = "auto", focus: Optional[str] = None
@@ -187,55 +316,42 @@ class S3Plugin(BasePlugin):
 
         try:
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None, lambda: self._client.get_object(Bucket=self.bucket, Key=key)
+            content = await loop.run_in_executor(
+                None, functools.partial(self._sync_get_object, key)
             )
-            content = await loop.run_in_executor(None, response["Body"].read)
 
             # Auto-detect format from file extension
             if format == "auto":
                 format = self._detect_format(key)
 
-            # Process based on format
+            # Process based on format — all branches assign to `data`
             if format == "bytes":
-                return content
+                return content  # focus not applicable to raw bytes
             elif format == "text":
-                return content.decode("utf-8")
+                data = content.decode("utf-8")
             elif format == "json":
                 import json
 
-                return json.loads(content.decode("utf-8"))
+                data = json.loads(content.decode("utf-8"))
             elif format == "csv":
                 import csv
 
-                content_str = content.decode("utf-8")
-                reader = csv.DictReader(io.StringIO(content_str))
-                rows = list(reader)
-                if focus:
-                    from ..core.focus import apply_focus
-
-                    return apply_focus(rows, focus)
-                return rows
+                reader = csv.DictReader(io.StringIO(content.decode("utf-8")))
+                data = list(reader)
             elif format == "pandas":
                 try:
                     import pandas as pd
 
                     if key.endswith(".csv"):
-                        df = pd.read_csv(io.BytesIO(content))
+                        data = pd.read_csv(io.BytesIO(content))
                     elif key.endswith(".json"):
-                        df = pd.read_json(io.BytesIO(content))
+                        data = pd.read_json(io.BytesIO(content))
                     elif key.endswith(".parquet"):
-                        df = pd.read_parquet(io.BytesIO(content))
+                        data = pd.read_parquet(io.BytesIO(content))
                     elif key.endswith(".xlsx"):
-                        df = pd.read_excel(io.BytesIO(content))
+                        data = pd.read_excel(io.BytesIO(content))
                     else:
-                        df = pd.read_csv(io.BytesIO(content))
-
-                    if focus:
-                        from ..core.focus import apply_focus
-
-                        return apply_focus(df, focus)
-                    return df
+                        data = pd.read_csv(io.BytesIO(content))
                 except ImportError:
                     raise ImportError(
                         "pandas not installed. Install with: pip install 'daita-agents[data]'"
@@ -243,14 +359,29 @@ class S3Plugin(BasePlugin):
             else:
                 return content
 
+            # Single apply point for focus — works for json, csv, pandas, and text
+            if focus and data is not None:
+                from ..core.focus import apply_focus
+
+                return apply_focus(data, focus)
+            return data
+
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
+            raise
         except Exception as e:
             logger.error(f"Failed to get S3 object {key}: {e}")
-            raise RuntimeError(f"S3 get_object failed: {e}")
+            raise self._map_s3_error(e, "get_object") from e
 
     async def put_object(
         self,
         key: str,
-        data: Union[bytes, str, Dict[str, Any], Any],
+        data: Union[bytes, str, Dict[str, Any], List[Any], Any],
         content_type: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
@@ -259,7 +390,7 @@ class S3Plugin(BasePlugin):
 
         Args:
             key: S3 object key
-            data: Data to upload (bytes, string, dict, or pandas DataFrame)
+            data: Data to upload (bytes, string, list, dict, or pandas DataFrame)
             content_type: Content type (auto-detected if not provided)
             metadata: Object metadata
 
@@ -284,6 +415,11 @@ class S3Plugin(BasePlugin):
                 data.to_json(buffer, orient="records", indent=2)
                 body = buffer.getvalue().encode("utf-8")
                 content_type = content_type or "application/json"
+            elif isinstance(data, list):
+                import json
+
+                body = json.dumps(data, indent=2).encode("utf-8")
+                content_type = content_type or "application/json"
             elif isinstance(data, dict):
                 import json
 
@@ -299,6 +435,14 @@ class S3Plugin(BasePlugin):
                 # Try to convert to string
                 body = str(data).encode("utf-8")
                 content_type = content_type or "text/plain"
+
+            # Reject payloads that exceed S3's single-PUT limit
+            if len(body) > 5 * 1024**3:
+                raise PluginError(
+                    "Payload exceeds S3 5 GB single-PUT limit. Use upload_file() for large files.",
+                    plugin_name="S3",
+                    retry_hint="permanent",
+                )
 
             # Auto-detect content type from key if not provided
             if not content_type:
@@ -318,7 +462,7 @@ class S3Plugin(BasePlugin):
             # Upload object (synchronous — wrapped in executor)
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
-                None, lambda: self._client.put_object(**put_args)
+                None, functools.partial(self._sync_put_object, put_args)
             )
 
             result = {
@@ -334,9 +478,17 @@ class S3Plugin(BasePlugin):
             logger.info(f"Uploaded S3 object: {key} ({len(body)} bytes)")
             return result
 
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
+            raise
         except Exception as e:
             logger.error(f"Failed to put S3 object {key}: {e}")
-            raise RuntimeError(f"S3 put_object failed: {e}")
+            raise self._map_s3_error(e, "put_object") from e
 
     async def upload_dataframe(
         self, df: Any, key: str, format: str = "csv", **kwargs
@@ -381,9 +533,17 @@ class S3Plugin(BasePlugin):
             # Upload using put_object
             return await self.put_object(key, body, content_type)
 
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
+            raise
         except Exception as e:
             logger.error(f"Failed to upload DataFrame to S3: {e}")
-            raise RuntimeError(f"S3 upload_dataframe failed: {e}")
+            raise self._map_s3_error(e, "upload_dataframe") from e
 
     async def download_file(self, key: str, local_path: str) -> str:
         """
@@ -403,21 +563,32 @@ class S3Plugin(BasePlugin):
             await self.connect()
 
         try:
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            # Ensure directory exists (dirname is empty string for bare filenames)
+            parent = os.path.dirname(local_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
 
             # Download file (synchronous — wrapped in executor)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
-                None, lambda: self._client.download_file(self.bucket, key, local_path)
+                None,
+                functools.partial(self._sync_download_file, key, local_path),
             )
 
             logger.info(f"Downloaded S3 object {key} to {local_path}")
             return local_path
 
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
+            raise
         except Exception as e:
             logger.error(f"Failed to download S3 object {key}: {e}")
-            raise RuntimeError(f"S3 download_file failed: {e}")
+            raise self._map_s3_error(e, "download_file") from e
 
     async def upload_file(self, local_path: str, key: str) -> Dict[str, Any]:
         """
@@ -446,21 +617,17 @@ class S3Plugin(BasePlugin):
             # Auto-detect content type
             content_type = self._detect_content_type(local_path)
 
-            # Upload file (synchronous — wrapped in executor)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
-                lambda: self._client.upload_file(
-                    local_path,
-                    self.bucket,
-                    key,
-                    ExtraArgs={"ContentType": content_type},
+                functools.partial(
+                    self._sync_upload_file, local_path, key, content_type
                 ),
             )
 
             # Get object metadata
             response = await loop.run_in_executor(
-                None, lambda: self._client.head_object(Bucket=self.bucket, Key=key)
+                None, functools.partial(self._sync_head_object, key)
             )
 
             result = {
@@ -474,9 +641,17 @@ class S3Plugin(BasePlugin):
             logger.info(f"Uploaded file {local_path} to S3 object {key}")
             return result
 
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
+            raise
         except Exception as e:
             logger.error(f"Failed to upload file {local_path} to S3: {e}")
-            raise RuntimeError(f"S3 upload_file failed: {e}")
+            raise self._map_s3_error(e, "upload_file") from e
 
     async def delete_object(self, key: str) -> Dict[str, Any]:
         """
@@ -496,8 +671,8 @@ class S3Plugin(BasePlugin):
 
         try:
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None, lambda: self._client.delete_object(Bucket=self.bucket, Key=key)
+            await loop.run_in_executor(
+                None, functools.partial(self._sync_delete_object, key)
             )
 
             result = {"key": key, "deleted": True}
@@ -505,9 +680,17 @@ class S3Plugin(BasePlugin):
             logger.info(f"Deleted S3 object: {key}")
             return result
 
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
+            raise
         except Exception as e:
             logger.error(f"Failed to delete S3 object {key}: {e}")
-            raise RuntimeError(f"S3 delete_object failed: {e}")
+            raise self._map_s3_error(e, "delete_object") from e
 
     async def copy_object(
         self, source_key: str, dest_key: str, source_bucket: Optional[str] = None
@@ -536,9 +719,7 @@ class S3Plugin(BasePlugin):
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
-                lambda: self._client.copy_object(
-                    CopySource=copy_source, Bucket=self.bucket, Key=dest_key
-                ),
+                functools.partial(self._sync_copy_object, copy_source, dest_key),
             )
 
             result = {
@@ -552,9 +733,21 @@ class S3Plugin(BasePlugin):
             logger.info(f"Copied S3 object {source_key} to {dest_key}")
             return result
 
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
+            raise
         except Exception as e:
             logger.error(f"Failed to copy S3 object {source_key}: {e}")
-            raise RuntimeError(f"S3 copy_object failed: {e}")
+            raise self._map_s3_error(e, "copy_object") from e
+
+    # ---------------------------------------------------------------------------
+    # Format helpers
+    # ---------------------------------------------------------------------------
 
     def _detect_format(self, key: str) -> str:
         """Detect format from file extension."""
@@ -591,6 +784,10 @@ class S3Plugin(BasePlugin):
 
         return content_type_map.get(ext, "application/octet-stream")
 
+    # ---------------------------------------------------------------------------
+    # Tool definitions
+    # ---------------------------------------------------------------------------
+
     def get_tools(self) -> List["AgentTool"]:
         """
         Expose S3 operations as agent tools.
@@ -615,6 +812,10 @@ class S3Plugin(BasePlugin):
                             "type": "string",
                             "description": "Format hint: 'auto', 'csv', 'json', 'pandas', 'text'. Default is 'auto' which detects from extension.",
                         },
+                        "focus": {
+                            "type": "string",
+                            "description": 'Focus DSL to filter/project results, e.g. "price > 100 | SELECT name, price"',
+                        },
                     },
                     "required": ["key"],
                 },
@@ -626,7 +827,7 @@ class S3Plugin(BasePlugin):
             ),
             AgentTool(
                 name="write_s3_file",
-                description="Write data to S3 bucket. Accepts dictionaries (saved as JSON), strings, or binary data.",
+                description="Write data to S3 bucket. Accepts dictionaries or lists (saved as JSON), strings (saved as text), or binary data.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -635,8 +836,7 @@ class S3Plugin(BasePlugin):
                             "description": "S3 object key (file path within the bucket)",
                         },
                         "data": {
-                            "type": "object",
-                            "description": "Data to write (dict for JSON, string for text, or bytes for binary)",
+                            "description": "Data to write (dict or list for JSON, string for text, or bytes for binary)",
                         },
                     },
                     "required": ["key", "data"],
@@ -660,6 +860,10 @@ class S3Plugin(BasePlugin):
                         "max_keys": {
                             "type": "integer",
                             "description": "Maximum number of objects to return. Default is 100.",
+                        },
+                        "focus": {
+                            "type": "string",
+                            "description": 'Focus DSL to filter/project results, e.g. "SELECT Key, Size"',
                         },
                     },
                     "required": [],
@@ -689,20 +893,90 @@ class S3Plugin(BasePlugin):
                 plugin_name="S3",
                 timeout_seconds=30,
             ),
+            AgentTool(
+                name="head_s3_object",
+                description="Get metadata for an S3 object (size, content type, last modified) without downloading it.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "description": "S3 object key (file path)",
+                        }
+                    },
+                    "required": ["key"],
+                },
+                handler=self._tool_head_object,
+                category="storage",
+                source="plugin",
+                plugin_name="S3",
+                timeout_seconds=15,
+            ),
         ]
+
+    # ---------------------------------------------------------------------------
+    # Tool handlers
+    # ---------------------------------------------------------------------------
 
     async def _tool_read_file(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for read_s3_file"""
         key = args.get("key")
         format_hint = args.get("format", "auto")
+        focus = args.get("focus")
+        detected_format = self._detect_format(key)
 
-        data = await self.get_object(key, format=format_hint)
+        # Binary formats (including pandas-read parquet/xlsx): return metadata only
+        if detected_format in ("bytes", "pandas"):
+            if self._client is None:
+                await self.connect()
+            loop = asyncio.get_running_loop()
+            head = await loop.run_in_executor(
+                None, functools.partial(self._sync_head_object, key)
+            )
+            return {
+                "key": key,
+                "binary": True,
+                "content_type": head.get("ContentType", "application/octet-stream"),
+                "size": head.get("ContentLength"),
+                "last_modified": str(head.get("LastModified", "")),
+                "bucket": self.bucket,
+            }
 
+        # Avoid calling _detect_format twice when format_hint is "auto"
+        effective_format = detected_format if format_hint == "auto" else format_hint
+        data = await self.get_object(key, format=effective_format, focus=focus)
+
+        _MAX_CHARS = 50_000
+        _MAX_ROWS = 200
+
+        # CSV / list: cap rows
+        if isinstance(data, list):
+            total = len(data)
+            truncated = total > _MAX_ROWS
+            return {
+                "key": key,
+                "format": detected_format,
+                "rows": data[:_MAX_ROWS],
+                "total_rows": total,
+                "truncated": truncated,
+                "bucket": self.bucket,
+            }
+
+        # Text / JSON: cap characters
+        import json as _json
+
+        if isinstance(data, (dict, list)):
+            serialized = _json.dumps(data)
+        else:
+            serialized = str(data) if not isinstance(data, str) else data
+
+        truncated = len(serialized) > _MAX_CHARS
         return {
-            "success": True,
             "key": key,
-            "data": data,
-            "format": self._detect_format(key),
+            "format": detected_format,
+            "content": serialized[:_MAX_CHARS],
+            "truncated": truncated,
+            **({"total_chars": len(serialized)} if truncated else {}),
             "bucket": self.bucket,
         }
 
@@ -714,7 +988,6 @@ class S3Plugin(BasePlugin):
         result = await self.put_object(key, data)
 
         return {
-            "success": True,
             "key": key,
             "size": result.get("size"),
             "location": f"s3://{self.bucket}/{key}",
@@ -725,8 +998,11 @@ class S3Plugin(BasePlugin):
         """Tool handler for list_s3_objects"""
         prefix = args.get("prefix", "")
         max_keys = args.get("max_keys", 100)
+        focus = args.get("focus")
 
-        objects = await self.list_objects(prefix=prefix, max_keys=max_keys)
+        objects, is_s3_truncated = await self.list_objects(
+            prefix=prefix, max_keys=max_keys, focus=focus
+        )
 
         # Simplify object metadata for LLM consumption
         simplified = [
@@ -738,13 +1014,26 @@ class S3Plugin(BasePlugin):
             for obj in objects
         ]
 
-        return {
-            "success": True,
+        # Cap at 200 objects to avoid token bloat
+        total = len(simplified)
+        display_truncated = total > 200
+        simplified = simplified[:200]
+        is_truncated = is_s3_truncated or display_truncated
+
+        result: Dict[str, Any] = {
             "objects": simplified,
-            "count": len(simplified),
+            "total_objects": total,
+            "truncated": is_truncated,
             "bucket": self.bucket,
             "prefix": prefix if prefix else "(all objects)",
         }
+
+        if is_s3_truncated:
+            result["note"] = (
+                "More objects exist. Use a more specific prefix to narrow results."
+            )
+
+        return result
 
     async def _tool_delete_file(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for delete_s3_file"""
@@ -753,10 +1042,31 @@ class S3Plugin(BasePlugin):
         result = await self.delete_object(key)
 
         return {
-            "success": True,
             "key": key,
             "deleted": result.get("deleted", True),
             "bucket": self.bucket,
+        }
+
+    async def _tool_head_object(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Tool handler for head_s3_object"""
+        key = args.get("key")
+
+        if self._client is None:
+            await self.connect()
+
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None, functools.partial(self._sync_head_object, key)
+        )
+
+        return {
+            "key": key,
+            "bucket": self.bucket,
+            "size": response.get("ContentLength"),
+            "content_type": response.get("ContentType"),
+            "last_modified": str(response.get("LastModified", "")),
+            "etag": response.get("ETag"),
+            "metadata": response.get("Metadata", {}),
         }
 
     # Context manager support

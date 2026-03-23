@@ -62,10 +62,6 @@ class BM25Scorer:
         # Compute IDF values for all terms in corpus
         self.idf_cache = self._compute_idf()
 
-        # Track score range for normalization
-        self.max_score = None
-        self.min_score = None
-
     def _tokenize(self, text: str) -> List[str]:
         """
         Tokenize text into words.
@@ -145,12 +141,6 @@ class BM25Scorer:
 
             score += idf * (numerator / denominator)
 
-        # Track score range for normalization
-        if self.max_score is None or score > self.max_score:
-            self.max_score = score
-        if self.min_score is None or score < self.min_score:
-            self.min_score = score
-
         return score
 
     def _score_new_document(self, query: List[str], document: str) -> float:
@@ -191,43 +181,63 @@ class BM25Scorer:
 
         return score
 
-    def normalize_score(self, score: float) -> float:
+    def normalize_score(self, score: float, max_score: float) -> float:
         """
-        Normalize BM25 score to 0-1 range using corpus statistics.
-
-        Uses observed max/min scores to normalize. Falls back to heuristic
-        if no scores have been computed yet.
+        Normalize a raw BM25 score to 0-1 given an explicit max.
 
         Args:
             score: Raw BM25 score
+            max_score: The maximum raw score across all documents for this query
 
         Returns:
             Normalized score in range [0, 1]
         """
-        if score == 0:
+        if score == 0 or max_score <= 0:
             return 0.0
+        return min(score / max_score, 1.0)
 
-        # Use observed range if available
-        if self.max_score is not None and self.max_score > 0:
-            # Normalize using observed max
-            normalized = score / self.max_score
-            return min(normalized, 1.0)
+    def score_all_normalized(self, query: List[str]) -> List[float]:
+        """
+        Score all corpus documents against a query and return normalized scores.
 
-        # Fallback: heuristic normalization
-        # Typical BM25 scores range from 0-15 for good matches
-        # Use sigmoid-like normalization
-        return min(score / 10.0, 1.0)
+        Computes all raw scores first, then normalizes by the true max — so
+        results are order-independent and consistent regardless of iteration order.
+
+        Args:
+            query: List of query keywords
+
+        Returns:
+            List of normalized scores [0, 1] aligned with self.documents
+        """
+        raw_scores = [self.score(query, doc) for doc in self.documents]
+        max_score = max(raw_scores) if raw_scores else 0.0
+        if max_score <= 0:
+            return [0.0] * len(raw_scores)
+        return [min(s / max_score, 1.0) for s in raw_scores]
 
     def score_and_normalize(self, query: List[str], document: str) -> float:
         """
-        Convenience method to score and normalize in one call.
+        Convenience method: score a single document and normalize within the corpus.
+
+        Uses score_all_normalized internally so normalization is consistent.
+        Prefer score_all_normalized() when scoring all documents in a loop.
 
         Args:
             query: Query keywords
-            document: Document text
+            document: Document text (must be in self.documents)
 
         Returns:
             Normalized score [0, 1]
         """
-        raw_score = self.score(query, document)
-        return self.normalize_score(raw_score)
+        normalized = self.score_all_normalized(query)
+        try:
+            idx = self.documents.index(document)
+            return normalized[idx]
+        except ValueError:
+            raw = self.score(query, document)
+            corpus_max = (
+                max(self.score(query, d) for d in self.documents)
+                if self.documents
+                else 0.0
+            )
+            return min(raw / corpus_max, 1.0) if corpus_max > 0 else 0.0

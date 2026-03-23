@@ -264,16 +264,36 @@ class RESTPlugin(BasePlugin):
                     raise RuntimeError(f"HTTP {response.status}: {error_text}")
 
                 # Parse response based on content type
+                _MAX_CHARS = 50_000
                 if "application/json" in content_type:
-                    return await response.json()
+                    import json as _json
+
+                    raw = await response.text()
+                    parsed = _json.loads(raw)  # parse full response first
+                    if len(raw) > _MAX_CHARS:
+                        return {
+                            "data": raw[:_MAX_CHARS],
+                            "content_type": content_type,
+                            "truncated": True,
+                            "total_chars": len(raw),
+                        }
+                    return {"data": parsed, "content_type": content_type}
                 elif "text/" in content_type:
                     text_content = await response.text()
-                    return {"content": text_content, "content_type": content_type}
+                    truncated = len(text_content) > _MAX_CHARS
+                    result = {
+                        "content": text_content[:_MAX_CHARS],
+                        "content_type": content_type,
+                    }
+                    if truncated:
+                        result["truncated"] = True
+                        result["total_chars"] = len(text_content)
+                    return result
                 else:
-                    # Binary content
+                    # Binary content — return metadata only
                     binary_content = await response.read()
                     return {
-                        "content": binary_content,
+                        "binary": True,
                         "content_type": content_type,
                         "size": len(binary_content),
                     }
@@ -506,46 +526,36 @@ class RESTPlugin(BasePlugin):
         """Tool handler for http_get"""
         endpoint = args.get("endpoint")
         params = args.get("params")
-
         result = await self.get(endpoint, params=params)
-
-        return {"success": True, "data": result, "endpoint": endpoint}
+        return {**result, "endpoint": endpoint}
 
     async def _tool_post(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for http_post"""
         endpoint = args.get("endpoint")
         data = args.get("data")
-
         result = await self.post(endpoint, json_data=data)
-
-        return {"success": True, "data": result, "endpoint": endpoint}
+        return {**result, "endpoint": endpoint}
 
     async def _tool_put(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for http_put"""
         endpoint = args.get("endpoint")
         data = args.get("data")
-
         result = await self.put(endpoint, json_data=data)
-
-        return {"success": True, "data": result, "endpoint": endpoint}
+        return {**result, "endpoint": endpoint}
 
     async def _tool_patch(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for http_patch"""
         endpoint = args.get("endpoint")
         data = args.get("data")
-
         result = await self.patch(endpoint, json_data=data)
-
-        return {"success": True, "data": result, "endpoint": endpoint}
+        return {**result, "endpoint": endpoint}
 
     async def _tool_delete(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for http_delete"""
         endpoint = args.get("endpoint")
         params = args.get("params")
-
         result = await self.delete(endpoint, params=params)
-
-        return {"success": True, "data": result, "endpoint": endpoint}
+        return {**result, "endpoint": endpoint}
 
     # Context manager support
     async def __aenter__(self):

@@ -48,6 +48,7 @@ from .base import BasePlugin
 
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
+    from ..core.graph.models import EdgeType
 
 logger = logging.getLogger(__name__)
 
@@ -346,14 +347,13 @@ class LineagePlugin(BasePlugin):
         max_age_hours = args.get("max_age_hours", 48)
         max_age_seconds = int(max_age_hours * 3600)
 
+        from ..core.exceptions import PluginError
+
         if self._graph_backend is None:
-            return {"success": False, "error": "No graph backend available"}
+            raise PluginError("No graph backend available")
 
         summary = await self._graph_backend.prune_stale(max_age_seconds)
         return {
-            "success": True,
-            "removed_nodes": summary["removed_nodes"],
-            "removed_edges": summary["removed_edges"],
             "removed_node_count": len(summary["removed_nodes"]),
             "removed_edge_count": len(summary["removed_edges"]),
             "max_age_hours": max_age_hours,
@@ -407,7 +407,6 @@ class LineagePlugin(BasePlugin):
                 "downstream": downstream,
             }
             return {
-                "success": True,
                 "lineage": lineage,
                 "upstream_count": len(upstream),
                 "downstream_count": len(downstream),
@@ -427,7 +426,6 @@ class LineagePlugin(BasePlugin):
             )
 
         return {
-            "success": True,
             "lineage": lineage,
             "upstream_count": len(lineage["upstream"]),
             "downstream_count": len(lineage["downstream"]),
@@ -504,7 +502,6 @@ class LineagePlugin(BasePlugin):
 
         result = await self.trace_lineage(entity_id, "upstream", max_depth)
         return {
-            "success": True,
             "entity_id": entity_id,
             "upstream_sources": result["lineage"]["upstream"],
             "count": len(result["lineage"]["upstream"]),
@@ -517,7 +514,6 @@ class LineagePlugin(BasePlugin):
 
         result = await self.trace_lineage(entity_id, "downstream", max_depth)
         return {
-            "success": True,
             "entity_id": entity_id,
             "downstream_consumers": result["lineage"]["downstream"],
             "count": len(result["lineage"]["downstream"]),
@@ -584,7 +580,6 @@ class LineagePlugin(BasePlugin):
             await self._persist_flow(flow)
 
         return {
-            "success": True,
             "flow_id": flow_id,
             "source_id": source_id,
             "target_id": target_id,
@@ -632,7 +627,7 @@ class LineagePlugin(BasePlugin):
                 metadata={"pipeline": name, "step_index": i},
             )
 
-        return {"success": True, "pipeline_name": name, "steps_registered": len(steps)}
+        return {"pipeline_name": name, "steps_registered": len(steps)}
 
     async def _tool_analyze_impact(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for analyze_impact"""
@@ -674,7 +669,6 @@ class LineagePlugin(BasePlugin):
             )
 
             return {
-                "success": True,
                 "entity_id": entity_id,
                 "change_type": change_type,
                 "directly_affected_count": directly_affected,
@@ -705,7 +699,6 @@ class LineagePlugin(BasePlugin):
             risk_level = "LOW"
 
         return {
-            "success": True,
             "entity_id": entity_id,
             "change_type": change_type,
             "directly_affected_count": direct_impact,
@@ -779,7 +772,7 @@ class LineagePlugin(BasePlugin):
 
             diagram = "\n".join(lines)
 
-            return {"success": True, "format": "mermaid", "diagram": diagram}
+            return {"format": "mermaid", "diagram": diagram}
 
         elif format == "dot":
             lines = ["digraph lineage {"]
@@ -799,13 +792,14 @@ class LineagePlugin(BasePlugin):
             lines.append("}")
             diagram = "\n".join(lines)
 
-            return {"success": True, "format": "dot", "diagram": diagram}
+            return {"format": "dot", "diagram": diagram}
 
         else:
-            return {
-                "success": False,
-                "error": f"Unsupported format: {format}. Use 'mermaid' or 'dot'",
-            }
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError(
+                f"Unsupported format: {format}. Use 'mermaid' or 'dot'"
+            )
 
     def _sanitize_id(self, entity_id: str) -> str:
         """Sanitize entity ID for use as a Mermaid node identifier."""
@@ -1045,7 +1039,6 @@ class LineagePlugin(BasePlugin):
                 flows_registered.append(flow_result["flow_id"])
 
         return {
-            "success": True,
             "flows_registered": flows_registered,
             "source_tables": parsed["source_tables"],
             "target_tables": parsed["target_tables"],
