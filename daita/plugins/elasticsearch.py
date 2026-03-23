@@ -281,7 +281,9 @@ class ElasticsearchPlugin(BasePlugin):
             raise
         except Exception as e:
             logger.error(f"Elasticsearch search failed: {e}")
-            raise PluginError(f"Elasticsearch search failed: {e}", plugin_name="Elasticsearch")
+            raise PluginError(
+                f"Elasticsearch search failed: {e}", plugin_name="Elasticsearch"
+            )
 
     async def index_document(
         self,
@@ -340,7 +342,9 @@ class ElasticsearchPlugin(BasePlugin):
             raise
         except Exception as e:
             logger.error(f"Document indexing failed: {e}")
-            raise PluginError(f"Elasticsearch index_document failed: {e}", plugin_name="Elasticsearch")
+            raise PluginError(
+                f"Elasticsearch index_document failed: {e}", plugin_name="Elasticsearch"
+            )
 
     async def bulk_index(
         self,
@@ -415,13 +419,17 @@ class ElasticsearchPlugin(BasePlugin):
 
             except BulkIndexError as e:
                 logger.error(f"Bulk indexing error: {e}")
-                raise PluginError(f"Bulk indexing failed: {e}", plugin_name="Elasticsearch")
+                raise PluginError(
+                    f"Bulk indexing failed: {e}", plugin_name="Elasticsearch"
+                )
 
         except PluginError:
             raise
         except Exception as e:
             logger.error(f"Bulk indexing failed: {e}")
-            raise PluginError(f"Elasticsearch bulk_index failed: {e}", plugin_name="Elasticsearch")
+            raise PluginError(
+                f"Elasticsearch bulk_index failed: {e}", plugin_name="Elasticsearch"
+            )
 
     async def delete_document(
         self, index: str, doc_id: str, refresh: Union[bool, str] = False, **kwargs
@@ -464,7 +472,10 @@ class ElasticsearchPlugin(BasePlugin):
             raise
         except Exception as e:
             logger.error(f"Document deletion failed: {e}")
-            raise PluginError(f"Elasticsearch delete_document failed: {e}", plugin_name="Elasticsearch")
+            raise PluginError(
+                f"Elasticsearch delete_document failed: {e}",
+                plugin_name="Elasticsearch",
+            )
 
     async def create_index(
         self,
@@ -517,7 +528,9 @@ class ElasticsearchPlugin(BasePlugin):
             raise
         except Exception as e:
             logger.error(f"Index creation failed: {e}")
-            raise PluginError(f"Elasticsearch create_index failed: {e}", plugin_name="Elasticsearch")
+            raise PluginError(
+                f"Elasticsearch create_index failed: {e}", plugin_name="Elasticsearch"
+            )
 
     async def get_mapping(self, index: str) -> Dict[str, Any]:
         """
@@ -551,7 +564,9 @@ class ElasticsearchPlugin(BasePlugin):
             raise
         except Exception as e:
             logger.error(f"Get mapping failed: {e}")
-            raise PluginError(f"Elasticsearch get_mapping failed: {e}", plugin_name="Elasticsearch")
+            raise PluginError(
+                f"Elasticsearch get_mapping failed: {e}", plugin_name="Elasticsearch"
+            )
 
     async def search_agent_logs(
         self,
@@ -733,7 +748,10 @@ class ElasticsearchPlugin(BasePlugin):
             raise
         except Exception as e:
             logger.error(f"Get cluster health failed: {e}")
-            raise PluginError(f"Elasticsearch get_cluster_health failed: {e}", plugin_name="Elasticsearch")
+            raise PluginError(
+                f"Elasticsearch get_cluster_health failed: {e}",
+                plugin_name="Elasticsearch",
+            )
 
     def get_tools(self) -> List["AgentTool"]:
         """
@@ -769,7 +787,7 @@ class ElasticsearchPlugin(BasePlugin):
                         },
                         "sort": {
                             "type": "array",
-                            "description": "Sort configuration (e.g., [{\"timestamp\": {\"order\": \"desc\"}}])",
+                            "description": 'Sort configuration (e.g., [{"timestamp": {"order": "desc"}}])',
                             "items": {"type": "object"},
                         },
                     },
@@ -919,7 +937,9 @@ class ElasticsearchPlugin(BasePlugin):
         from_ = args.get("from_", 0)
         sort = args.get("sort")
 
-        results = await self.search(index=index, query=query, size=size, from_=from_, sort=sort)
+        results = await self.search(
+            index=index, query=query, size=size, from_=from_, sort=sort
+        )
 
         return {
             "documents": results["hits"]["documents"],

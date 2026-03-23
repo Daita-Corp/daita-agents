@@ -7,7 +7,6 @@ Tests comma-separated recipient parsing without a real SMTP/IMAP connection.
 import pytest
 from daita.plugins.email import EmailPlugin
 
-
 # ---------------------------------------------------------------------------
 # _parse_recipients (static helper)
 # ---------------------------------------------------------------------------
@@ -60,7 +59,12 @@ def test_parse_empty_list_returns_empty():
 
 
 async def test_tool_send_email_splits_comma_separated_to(monkeypatch):
-    plugin = EmailPlugin(email_address="test@x.com", password="p", imap_host="imap.x.com", smtp_host="smtp.x.com")
+    plugin = EmailPlugin(
+        email_address="test@x.com",
+        password="p",
+        imap_host="imap.x.com",
+        smtp_host="smtp.x.com",
+    )
 
     captured = {}
 
@@ -71,17 +75,24 @@ async def test_tool_send_email_splits_comma_separated_to(monkeypatch):
 
     plugin.send_email = fake_send
 
-    await plugin._tool_send_email({
-        "to": "alice@x.com, bob@x.com",
-        "subject": "Hello",
-        "body": "Hi there",
-    })
+    await plugin._tool_send_email(
+        {
+            "to": "alice@x.com, bob@x.com",
+            "subject": "Hello",
+            "body": "Hi there",
+        }
+    )
 
     assert captured["to"] == ["alice@x.com", "bob@x.com"]
 
 
 async def test_tool_send_email_splits_comma_separated_cc(monkeypatch):
-    plugin = EmailPlugin(email_address="test@x.com", password="p", imap_host="imap.x.com", smtp_host="smtp.x.com")
+    plugin = EmailPlugin(
+        email_address="test@x.com",
+        password="p",
+        imap_host="imap.x.com",
+        smtp_host="smtp.x.com",
+    )
 
     captured = {}
 
@@ -91,18 +102,25 @@ async def test_tool_send_email_splits_comma_separated_cc(monkeypatch):
 
     plugin.send_email = fake_send
 
-    await plugin._tool_send_email({
-        "to": "alice@x.com",
-        "subject": "Hello",
-        "body": "Hi",
-        "cc": "carol@x.com, dave@x.com",
-    })
+    await plugin._tool_send_email(
+        {
+            "to": "alice@x.com",
+            "subject": "Hello",
+            "body": "Hi",
+            "cc": "carol@x.com, dave@x.com",
+        }
+    )
 
     assert captured["cc"] == ["carol@x.com", "dave@x.com"]
 
 
 async def test_tool_send_email_list_to_passthrough():
-    plugin = EmailPlugin(email_address="test@x.com", password="p", imap_host="imap.x.com", smtp_host="smtp.x.com")
+    plugin = EmailPlugin(
+        email_address="test@x.com",
+        password="p",
+        imap_host="imap.x.com",
+        smtp_host="smtp.x.com",
+    )
 
     captured = {}
 
@@ -112,17 +130,24 @@ async def test_tool_send_email_list_to_passthrough():
 
     plugin.send_email = fake_send
 
-    await plugin._tool_send_email({
-        "to": ["alice@x.com", "bob@x.com"],
-        "subject": "Test",
-        "body": "Body",
-    })
+    await plugin._tool_send_email(
+        {
+            "to": ["alice@x.com", "bob@x.com"],
+            "subject": "Test",
+            "body": "Body",
+        }
+    )
 
     assert captured["to"] == ["alice@x.com", "bob@x.com"]
 
 
 async def test_tool_send_email_empty_cc_becomes_none():
-    plugin = EmailPlugin(email_address="test@x.com", password="p", imap_host="imap.x.com", smtp_host="smtp.x.com")
+    plugin = EmailPlugin(
+        email_address="test@x.com",
+        password="p",
+        imap_host="imap.x.com",
+        smtp_host="smtp.x.com",
+    )
 
     captured = {}
 
@@ -132,11 +157,13 @@ async def test_tool_send_email_empty_cc_becomes_none():
 
     plugin.send_email = fake_send
 
-    await plugin._tool_send_email({
-        "to": "alice@x.com",
-        "subject": "Test",
-        "body": "Body",
-        # no cc key
-    })
+    await plugin._tool_send_email(
+        {
+            "to": "alice@x.com",
+            "subject": "Test",
+            "body": "Body",
+            # no cc key
+        }
+    )
 
     assert captured["cc"] is None

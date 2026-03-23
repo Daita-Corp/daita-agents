@@ -233,7 +233,9 @@ class SlackPlugin(BasePlugin):
 
         except Exception as e:
             logger.error(f"Failed to send agent summary: {e}")
-            raise PluginError(f"Slack send_agent_summary failed: {e}", plugin_name="Slack")
+            raise PluginError(
+                f"Slack send_agent_summary failed: {e}", plugin_name="Slack"
+            )
 
     async def create_thread_from_workflow(
         self,
@@ -305,7 +307,9 @@ class SlackPlugin(BasePlugin):
 
         except Exception as e:
             logger.error(f"Failed to create workflow thread: {e}")
-            raise PluginError(f"Slack create_thread_from_workflow failed: {e}", plugin_name="Slack")
+            raise PluginError(
+                f"Slack create_thread_from_workflow failed: {e}", plugin_name="Slack"
+            )
 
     async def upload_file(
         self,
@@ -428,7 +432,9 @@ class SlackPlugin(BasePlugin):
 
         except Exception as e:
             logger.error(f"Failed to get channel history: {e}")
-            raise PluginError(f"Slack get_channel_history failed: {e}", plugin_name="Slack")
+            raise PluginError(
+                f"Slack get_channel_history failed: {e}", plugin_name="Slack"
+            )
 
     async def get_channels(
         self, types: str = "public_channel,private_channel"
@@ -491,7 +497,9 @@ class SlackPlugin(BasePlugin):
         end_time = agent_results.get("end_time", "N/A")
         duration = agent_results.get("duration_ms", 0)
 
-        status_emoji = "[ok]" if status == "success" else "[err]" if status == "error" else "[?]"
+        status_emoji = (
+            "[ok]" if status == "success" else "[err]" if status == "error" else "[?]"
+        )
 
         blocks.append(
             {
@@ -562,9 +570,7 @@ class SlackPlugin(BasePlugin):
         )
         failed_agents = total_agents - successful_agents
 
-        workflow_status = (
-            "Success" if failed_agents == 0 else f"{failed_agents} Failed"
-        )
+        workflow_status = "Success" if failed_agents == 0 else f"{failed_agents} Failed"
 
         blocks.append(
             {

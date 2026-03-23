@@ -295,9 +295,7 @@ class SQLitePlugin(BaseDatabasePlugin):
             await self._db.commit()
             return None
 
-    async def count_rows(
-        self, table: str, filter: Optional[str] = None
-    ) -> int:
+    async def count_rows(self, table: str, filter: Optional[str] = None) -> int:
         """
         Count rows in a table.
 

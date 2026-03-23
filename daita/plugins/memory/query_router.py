@@ -17,11 +17,11 @@ from dataclasses import dataclass
 
 @dataclass
 class QueryRoute:
-    query_type: str          # "temporal", "contextual", "factual"
-    score_threshold: float   # minimum score to include a result
-    semantic_weight: float   # weight for cosine similarity in hybrid scoring
-    keyword_weight: float    # weight for BM25 in hybrid scoring
-    temporal_boost: float    # extra score bonus for recent memories (0 = disabled)
+    query_type: str  # "temporal", "contextual", "factual"
+    score_threshold: float  # minimum score to include a result
+    semantic_weight: float  # weight for cosine similarity in hybrid scoring
+    keyword_weight: float  # weight for BM25 in hybrid scoring
+    temporal_boost: float  # extra score bonus for recent memories (0 = disabled)
 
 
 class QueryRouter:

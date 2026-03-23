@@ -10,7 +10,6 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock
 from daita.plugins.orchestrator import OrchestratorPlugin
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -67,7 +66,9 @@ async def test_run_parallel_truncates_long_results():
     long_result = "z" * 20_000
     plugin._agents["agent_a"].run = AsyncMock(return_value=long_result)
 
-    results = await plugin.run_parallel([{"task": "do something", "agent_id": "agent_a"}])
+    results = await plugin.run_parallel(
+        [{"task": "do something", "agent_id": "agent_a"}]
+    )
 
     task_result = results["results"][0]["result"]
     assert len(task_result) < 20_000
@@ -79,7 +80,9 @@ async def test_run_parallel_short_results_not_modified():
     short_result = "done"
     plugin._agents["agent_a"].run = AsyncMock(return_value=short_result)
 
-    results = await plugin.run_parallel([{"task": "do something", "agent_id": "agent_a"}])
+    results = await plugin.run_parallel(
+        [{"task": "do something", "agent_id": "agent_a"}]
+    )
 
     assert results["results"][0]["result"] == short_result
 
@@ -102,10 +105,12 @@ async def test_run_sequential_caps_previous_result_context():
 
     plugin._agents["agent_b"].run = capture_task
 
-    await plugin.run_sequential([
-        {"task": "step one", "agent_id": "agent_a"},
-        {"task": "step two", "agent_id": "agent_b"},
-    ])
+    await plugin.run_sequential(
+        [
+            {"task": "step one", "agent_id": "agent_a"},
+            {"task": "step two", "agent_id": "agent_b"},
+        ]
+    )
 
     # The context injected into step two should be capped at 5000 chars
     second_task = received_tasks[0]

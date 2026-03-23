@@ -62,7 +62,6 @@ class BM25Scorer:
         # Compute IDF values for all terms in corpus
         self.idf_cache = self._compute_idf()
 
-
     def _tokenize(self, text: str) -> List[str]:
         """
         Tokenize text into words.
@@ -236,5 +235,9 @@ class BM25Scorer:
             return normalized[idx]
         except ValueError:
             raw = self.score(query, document)
-            corpus_max = max(self.score(query, d) for d in self.documents) if self.documents else 0.0
+            corpus_max = (
+                max(self.score(query, d) for d in self.documents)
+                if self.documents
+                else 0.0
+            )
             return min(raw / corpus_max, 1.0) if corpus_max > 0 else 0.0

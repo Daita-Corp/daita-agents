@@ -373,7 +373,7 @@ class MongoDBPlugin(BaseDatabasePlugin):
                         },
                         "projection": {
                             "type": "object",
-                            "description": "Optional field projection (e.g., {\"name\": 1, \"email\": 1, \"_id\": 0})",
+                            "description": 'Optional field projection (e.g., {"name": 1, "email": 1, "_id": 0})',
                         },
                     },
                     "required": ["collection"],

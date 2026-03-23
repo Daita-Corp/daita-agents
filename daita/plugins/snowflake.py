@@ -650,9 +650,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _create)
 
-    async def count_rows(
-        self, table: str, filter: Optional[str] = None
-    ) -> int:
+    async def count_rows(self, table: str, filter: Optional[str] = None) -> int:
         """
         Count rows in a table.
 

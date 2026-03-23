@@ -92,6 +92,7 @@ class MemoryReranker:
             raw = response.strip()
             # Strip markdown code fences if present
             import re
+
             fence = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
             if fence:
                 raw = fence.group(1).strip()

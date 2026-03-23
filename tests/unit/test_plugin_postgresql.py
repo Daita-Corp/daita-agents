@@ -9,7 +9,6 @@ filter for SQL injection — without a real PostgreSQL connection.
 import pytest
 from daita.plugins.postgresql import PostgreSQLPlugin
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -141,22 +140,26 @@ async def test_vector_search_rejects_semicolon_in_filter():
     plugin = make_plugin()
 
     with pytest.raises(Exception):
-        await plugin._tool_vector_search({
-            "table": "embeddings",
-            "vector": [0.1] * 3,
-            "filter": "id = 1; DROP TABLE users--",
-        })
+        await plugin._tool_vector_search(
+            {
+                "table": "embeddings",
+                "vector": [0.1] * 3,
+                "filter": "id = 1; DROP TABLE users--",
+            }
+        )
 
 
 async def test_vector_search_rejects_comment_in_filter():
     plugin = make_plugin()
 
     with pytest.raises(Exception):
-        await plugin._tool_vector_search({
-            "table": "embeddings",
-            "vector": [0.1] * 3,
-            "filter": "id = 1 -- comment",
-        })
+        await plugin._tool_vector_search(
+            {
+                "table": "embeddings",
+                "vector": [0.1] * 3,
+                "filter": "id = 1 -- comment",
+            }
+        )
 
 
 # ---------------------------------------------------------------------------

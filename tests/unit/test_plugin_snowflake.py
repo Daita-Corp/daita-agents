@@ -9,7 +9,6 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock
 from daita.plugins.snowflake import SnowflakePlugin, SnowflakeAdminPlugin
 
-
 # ---------------------------------------------------------------------------
 # Core vs Admin tool split
 # ---------------------------------------------------------------------------
@@ -34,13 +33,27 @@ CORE_TOOL_NAMES = {
 
 
 def make_plugin(**kwargs):
-    plugin = SnowflakePlugin(account="xy12345", user="u", password="p", warehouse="COMPUTE_WH", database="TESTDB", **kwargs)
+    plugin = SnowflakePlugin(
+        account="xy12345",
+        user="u",
+        password="p",
+        warehouse="COMPUTE_WH",
+        database="TESTDB",
+        **kwargs,
+    )
     plugin._connection = MagicMock()
     return plugin
 
 
 def make_admin_plugin(**kwargs):
-    plugin = SnowflakeAdminPlugin(account="xy12345", user="u", password="p", warehouse="COMPUTE_WH", database="TESTDB", **kwargs)
+    plugin = SnowflakeAdminPlugin(
+        account="xy12345",
+        user="u",
+        password="p",
+        warehouse="COMPUTE_WH",
+        database="TESTDB",
+        **kwargs,
+    )
     plugin._connection = MagicMock()
     return plugin
 
@@ -49,7 +62,9 @@ def test_base_plugin_does_not_expose_admin_tools():
     plugin = make_plugin()
     names = {t.name for t in plugin.get_tools()}
     for admin_name in ADMIN_TOOL_NAMES:
-        assert admin_name not in names, f"Admin tool {admin_name!r} leaked into base plugin"
+        assert (
+            admin_name not in names
+        ), f"Admin tool {admin_name!r} leaked into base plugin"
 
 
 def test_base_plugin_exposes_core_tools():
@@ -64,7 +79,9 @@ def test_admin_plugin_exposes_admin_tools():
     names = {t.name for t in plugin.get_tools()}
     # Admin plugin exposes all admin tools (except switch_warehouse which requires not read_only)
     for admin_name in ADMIN_TOOL_NAMES - {"snowflake_switch_warehouse"}:
-        assert admin_name in names, f"Admin tool {admin_name!r} missing from admin plugin"
+        assert (
+            admin_name in names
+        ), f"Admin tool {admin_name!r} missing from admin plugin"
 
 
 def test_admin_plugin_also_exposes_core_tools():
@@ -109,8 +126,16 @@ async def test_query_history_truncates_query_text():
 
     async def fake_query_history(limit=20):
         return [
-            {"QUERY_TEXT": long_sql, "QUERY_TYPE": "SELECT", "EXECUTION_STATUS": "SUCCESS"},
-            {"QUERY_TEXT": "SELECT 1", "QUERY_TYPE": "SELECT", "EXECUTION_STATUS": "SUCCESS"},
+            {
+                "QUERY_TEXT": long_sql,
+                "QUERY_TYPE": "SELECT",
+                "EXECUTION_STATUS": "SUCCESS",
+            },
+            {
+                "QUERY_TEXT": "SELECT 1",
+                "QUERY_TYPE": "SELECT",
+                "EXECUTION_STATUS": "SUCCESS",
+            },
         ]
 
     plugin.query_history = fake_query_history

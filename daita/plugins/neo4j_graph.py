@@ -408,12 +408,13 @@ class Neo4jPlugin(BasePlugin):
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for neo4j_query"""
         import re
+
         cypher = args.get("cypher", "").rstrip()
         parameters = args.get("parameters", {})
 
         # Inject LIMIT 200 safety cap if no LIMIT present
-        if not re.search(r'\bLIMIT\b', cypher, re.IGNORECASE):
-            cypher = cypher.rstrip(';') + ' LIMIT 200'
+        if not re.search(r"\bLIMIT\b", cypher, re.IGNORECASE):
+            cypher = cypher.rstrip(";") + " LIMIT 200"
 
         return await self.query(cypher, parameters)
 
@@ -435,20 +436,32 @@ class Neo4jPlugin(BasePlugin):
         result = await self.query("CALL db.labels() YIELD label RETURN label")
         return {"labels": [r["label"] for r in result["records"]]}
 
-    async def _tool_list_relationship_types(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _tool_list_relationship_types(
+        self, args: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Tool handler for neo4j_list_relationship_types"""
         result = await self.query(
             "CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType"
         )
-        return {"relationship_types": [r["relationshipType"] for r in result["records"]]}
+        return {
+            "relationship_types": [r["relationshipType"] for r in result["records"]]
+        }
 
     async def _tool_graph_stats(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for neo4j_graph_stats"""
         node_result = await self.query("MATCH (n) RETURN count(n) as node_count")
-        rel_result = await self.query("MATCH ()-[r]->() RETURN count(r) as relationship_count")
+        rel_result = await self.query(
+            "MATCH ()-[r]->() RETURN count(r) as relationship_count"
+        )
         return {
-            "node_count": node_result["records"][0]["node_count"] if node_result["records"] else 0,
-            "relationship_count": rel_result["records"][0]["relationship_count"] if rel_result["records"] else 0,
+            "node_count": (
+                node_result["records"][0]["node_count"] if node_result["records"] else 0
+            ),
+            "relationship_count": (
+                rel_result["records"][0]["relationship_count"]
+                if rel_result["records"]
+                else 0
+            ),
         }
 
     async def query(

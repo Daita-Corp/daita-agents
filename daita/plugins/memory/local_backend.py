@@ -183,7 +183,7 @@ class LocalMemoryBackend:
         """
         # When reranking, fetch more candidates than the final limit so the
         # reranker has a pool to work with.
-        fetch_limit = (reranker._top_n if reranker is not None else limit)
+        fetch_limit = reranker._top_n if reranker is not None else limit
 
         if strategy == "semantic":
             results = await self._semantic_recall(
@@ -194,7 +194,9 @@ class LocalMemoryBackend:
                 query, fetch_limit, score_threshold, category
             )
         else:
-            results = await self._hybrid_recall(query, fetch_limit, score_threshold, category)
+            results = await self._hybrid_recall(
+                query, fetch_limit, score_threshold, category
+            )
 
         if min_importance is not None or max_importance is not None:
             results = self._filter_by_importance(
@@ -272,7 +274,14 @@ class LocalMemoryBackend:
         normalized_scores = bm25.score_all_normalized(keywords)
 
         results = []
-        for i, (chunk_id, file_path, content, line_start, line_end, metadata_json) in enumerate(chunks):
+        for i, (
+            chunk_id,
+            file_path,
+            content,
+            line_start,
+            line_end,
+            metadata_json,
+        ) in enumerate(chunks):
             metadata_dict = {}
             if metadata_json:
                 try:
@@ -383,7 +392,9 @@ class LocalMemoryBackend:
 
             keyword_score = bm25_scores[i]
 
-            base_score = (route.semantic_weight * semantic_score) + (route.keyword_weight * keyword_score)
+            base_score = (route.semantic_weight * semantic_score) + (
+                route.keyword_weight * keyword_score
+            )
             phrase_bonus = 0.15 if contains_exact_phrase(query, content) else 0.0
             consensus_bonus = (
                 0.10 if semantic_score > 0.5 and keyword_score > 0.5 else 0.0
@@ -392,10 +403,13 @@ class LocalMemoryBackend:
             # Temporal boost: recent memories score higher for temporal queries
             temporal_bonus = 0.0
             if route.temporal_boost > 0:
-                created_at_str = metadata_dict.get("created_at") if metadata_dict else None
+                created_at_str = (
+                    metadata_dict.get("created_at") if metadata_dict else None
+                )
                 if created_at_str:
                     try:
                         from datetime import datetime
+
                         created_at = datetime.fromisoformat(created_at_str)
                         age_days = (datetime.now() - created_at).days
                         # Full boost for today, decays to 0 over 30 days
@@ -404,7 +418,9 @@ class LocalMemoryBackend:
                     except Exception:
                         pass
 
-            raw_score = min(base_score + phrase_bonus + consensus_bonus + temporal_bonus, 1.0)
+            raw_score = min(
+                base_score + phrase_bonus + consensus_bonus + temporal_bonus, 1.0
+            )
             adjusted = self.search._apply_score_adjustments(raw_score, metadata_dict)
 
             if adjusted >= effective_threshold:

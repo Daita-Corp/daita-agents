@@ -10,7 +10,6 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from daita.plugins.rest import RESTPlugin
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

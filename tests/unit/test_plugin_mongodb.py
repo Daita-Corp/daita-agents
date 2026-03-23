@@ -9,7 +9,6 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock
 from daita.plugins.mongodb import MongoDBPlugin
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -81,7 +80,9 @@ async def test_aggregate_injects_limit_when_missing():
 
     plugin.aggregate = fake_aggregate
 
-    await plugin._tool_aggregate({"collection": "orders", "pipeline": [{"$match": {"status": "active"}}]})
+    await plugin._tool_aggregate(
+        {"collection": "orders", "pipeline": [{"$match": {"status": "active"}}]}
+    )
 
     assert len(captured) == 1
     pipeline_used = captured[0]
@@ -100,10 +101,12 @@ async def test_aggregate_does_not_double_inject_limit():
 
     plugin.aggregate = fake_aggregate
 
-    await plugin._tool_aggregate({
-        "collection": "orders",
-        "pipeline": [{"$match": {}}, {"$limit": 50}],
-    })
+    await plugin._tool_aggregate(
+        {
+            "collection": "orders",
+            "pipeline": [{"$match": {}}, {"$limit": 50}],
+        }
+    )
 
     pipeline_used = captured[0]
     limit_stages = [s for s in pipeline_used if "$limit" in s]
@@ -137,10 +140,12 @@ async def test_find_default_limit_is_50():
     captured_limits = []
 
     cursor = MagicMock()
+
     # cursor.limit() returns itself (chainable) and records the call
     def limit_side_effect(n):
         captured_limits.append(n)
         return cursor
+
     cursor.limit = MagicMock(side_effect=limit_side_effect)
     cursor.to_list = AsyncMock(return_value=[])
 
@@ -158,9 +163,11 @@ async def test_find_respects_explicit_limit():
     captured_limits = []
 
     cursor = MagicMock()
+
     def limit_side_effect(n):
         captured_limits.append(n)
         return cursor
+
     cursor.limit = MagicMock(side_effect=limit_side_effect)
     cursor.to_list = AsyncMock(return_value=[])
 
@@ -187,6 +194,11 @@ async def test_aggregate_returns_results():
 
     plugin.aggregate = fake_aggregate
 
-    result = await plugin._tool_aggregate({"collection": "sales", "pipeline": [{"$group": {"_id": "$region", "total": {"$sum": "$amount"}}}]})
+    result = await plugin._tool_aggregate(
+        {
+            "collection": "sales",
+            "pipeline": [{"$group": {"_id": "$region", "total": {"$sum": "$amount"}}}],
+        }
+    )
 
     assert result["results"] == docs

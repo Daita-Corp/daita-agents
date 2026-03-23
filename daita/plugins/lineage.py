@@ -669,7 +669,7 @@ class LineagePlugin(BasePlugin):
             )
 
             return {
-                                "entity_id": entity_id,
+                "entity_id": entity_id,
                 "change_type": change_type,
                 "directly_affected_count": directly_affected,
                 "total_affected_count": result["affected_count"],
@@ -699,7 +699,7 @@ class LineagePlugin(BasePlugin):
             risk_level = "LOW"
 
         return {
-                        "entity_id": entity_id,
+            "entity_id": entity_id,
             "change_type": change_type,
             "directly_affected_count": direct_impact,
             "total_affected_count": total_impact,
@@ -797,7 +797,9 @@ class LineagePlugin(BasePlugin):
         else:
             from ..core.exceptions import ValidationError
 
-            raise ValidationError(f"Unsupported format: {format}. Use 'mermaid' or 'dot'")
+            raise ValidationError(
+                f"Unsupported format: {format}. Use 'mermaid' or 'dot'"
+            )
 
     def _sanitize_id(self, entity_id: str) -> str:
         """Sanitize entity ID for use as a Mermaid node identifier."""
@@ -1037,7 +1039,7 @@ class LineagePlugin(BasePlugin):
                 flows_registered.append(flow_result["flow_id"])
 
         return {
-                        "flows_registered": flows_registered,
+            "flows_registered": flows_registered,
             "source_tables": parsed["source_tables"],
             "target_tables": parsed["target_tables"],
             "flow_count": len(flows_registered),

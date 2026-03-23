@@ -27,7 +27,6 @@ from daita.core.exceptions import (
     PluginError,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -55,7 +54,8 @@ def _drive_file(
         "mimeType": mime_type,
         "size": size,
         "modifiedTime": modified,
-        "owners": owners or [{"displayName": "Test User", "emailAddress": "test@example.com"}],
+        "owners": owners
+        or [{"displayName": "Test User", "emailAddress": "test@example.com"}],
         "webViewLink": web_link,
     }
 
@@ -454,7 +454,9 @@ async def test_extract_content_binary_unknown():
     raw = b"\x00\x01\x02\x03"
 
     with patch.object(plugin, "_sync_files_download", return_value=raw):
-        result = await plugin._extract_content("file1", "application/octet-stream", "blob.bin")
+        result = await plugin._extract_content(
+            "file1", "application/octet-stream", "blob.bin"
+        )
 
     assert result["binary"] is True
     assert "gdrive_download" in result["note"]
@@ -470,10 +472,16 @@ async def test_search_builds_query():
     files = [_drive_file()]
     _wire_files_list(plugin, files)
 
-    results = await plugin.search("report", file_type="pdf", modified_after="2024-01-01")
+    results = await plugin.search(
+        "report", file_type="pdf", modified_after="2024-01-01"
+    )
 
     call_args = plugin._service.files.return_value.list.call_args
-    q = call_args.kwargs.get("q") or call_args[1].get("q") or call_args[0][0] if call_args[0] else ""
+    q = (
+        call_args.kwargs.get("q") or call_args[1].get("q") or call_args[0][0]
+        if call_args[0]
+        else ""
+    )
     # Check the query was called (we may not be able to inspect kwargs easily across mock versions)
     assert plugin._service.files.return_value.list.called
     assert len(results) == 1
@@ -495,7 +503,10 @@ async def test_search_unknown_file_type_ignored():
 
 async def test_list_folder_default_root():
     plugin = make_plugin()
-    files = [_drive_file(id="f1", name="file1.csv"), _drive_file(id="f2", name="file2.pdf")]
+    files = [
+        _drive_file(id="f1", name="file1.csv"),
+        _drive_file(id="f2", name="file2.pdf"),
+    ]
     _wire_files_list(plugin, files)
 
     results = await plugin.list_folder()
@@ -575,7 +586,9 @@ async def test_organize_copy_calls_copy():
     mock_copy.execute.return_value = copied_file
     plugin._service.files.return_value.copy.return_value = mock_copy
 
-    result = await plugin.organize("file1", action="copy", new_name="copy.pdf", dest_folder_id="folder2")
+    result = await plugin.organize(
+        "file1", action="copy", new_name="copy.pdf", dest_folder_id="folder2"
+    )
     assert result["action"] == "copied"
 
 
@@ -663,12 +676,14 @@ async def test_tool_list_handler_defaults_to_root():
 async def test_tool_info_handler():
     plugin = make_plugin()
     f = _drive_file(id="abc")
-    f.update({
-        "createdTime": "2024-01-01T00:00:00Z",
-        "description": None,
-        "starred": False,
-        "lastModifyingUser": {"emailAddress": "x@x.com"},
-    })
+    f.update(
+        {
+            "createdTime": "2024-01-01T00:00:00Z",
+            "description": None,
+            "starred": False,
+            "lastModifyingUser": {"emailAddress": "x@x.com"},
+        }
+    )
     _wire_files_get(plugin, f)
 
     result = await plugin._tool_info({"file_id": "abc"})
@@ -677,7 +692,10 @@ async def test_tool_info_handler():
 
 async def test_tool_read_delegates_to_read():
     plugin = make_plugin()
-    _wire_files_get(plugin, {"id": "file1", "name": "doc.txt", "mimeType": "text/plain", "size": "100"})
+    _wire_files_get(
+        plugin,
+        {"id": "file1", "name": "doc.txt", "mimeType": "text/plain", "size": "100"},
+    )
     text_bytes = b"Hello from Drive"
     with patch.object(plugin, "_sync_files_download", return_value=text_bytes):
         result = await plugin._tool_read({"file_id": "file1"})

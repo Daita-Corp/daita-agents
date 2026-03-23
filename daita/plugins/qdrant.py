@@ -264,6 +264,7 @@ class QdrantPlugin(BaseVectorPlugin):
             }
         else:
             from ..core.exceptions import ValidationError
+
             raise ValidationError("Must provide ids or filter")
 
     async def fetch(

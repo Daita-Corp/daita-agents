@@ -102,8 +102,14 @@ class S3Plugin(BasePlugin):
                         resource=self.bucket,
                         action=operation,
                     )
-                elif code in ("InvalidAccessKeyId", "SignatureDoesNotMatch", "ExpiredTokenException"):
-                    self._client = None  # force reconnect on next call (credential refresh)
+                elif code in (
+                    "InvalidAccessKeyId",
+                    "SignatureDoesNotMatch",
+                    "ExpiredTokenException",
+                ):
+                    self._client = (
+                        None  # force reconnect on next call (credential refresh)
+                    )
                     return AuthenticationError(
                         f"AWS authentication failed during S3 {operation}",
                         provider="AWS S3",
@@ -137,7 +143,9 @@ class S3Plugin(BasePlugin):
                     if self.aws_access_key_id:
                         session_kwargs["aws_access_key_id"] = self.aws_access_key_id
                     if self.aws_secret_access_key:
-                        session_kwargs["aws_secret_access_key"] = self.aws_secret_access_key
+                        session_kwargs["aws_secret_access_key"] = (
+                            self.aws_secret_access_key
+                        )
                     if self.aws_session_token:
                         session_kwargs["aws_session_token"] = self.aws_session_token
 
@@ -612,7 +620,9 @@ class S3Plugin(BasePlugin):
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
-                functools.partial(self._sync_upload_file, local_path, key, content_type),
+                functools.partial(
+                    self._sync_upload_file, local_path, key, content_type
+                ),
             )
 
             # Get object metadata
@@ -804,7 +814,7 @@ class S3Plugin(BasePlugin):
                         },
                         "focus": {
                             "type": "string",
-                            "description": "Focus DSL to filter/project results, e.g. \"price > 100 | SELECT name, price\"",
+                            "description": 'Focus DSL to filter/project results, e.g. "price > 100 | SELECT name, price"',
                         },
                     },
                     "required": ["key"],
@@ -853,7 +863,7 @@ class S3Plugin(BasePlugin):
                         },
                         "focus": {
                             "type": "string",
-                            "description": "Focus DSL to filter/project results, e.g. \"SELECT Key, Size\"",
+                            "description": 'Focus DSL to filter/project results, e.g. "SELECT Key, Size"',
                         },
                     },
                     "required": [],
@@ -1019,7 +1029,9 @@ class S3Plugin(BasePlugin):
         }
 
         if is_s3_truncated:
-            result["note"] = "More objects exist. Use a more specific prefix to narrow results."
+            result["note"] = (
+                "More objects exist. Use a more specific prefix to narrow results."
+            )
 
         return result
 

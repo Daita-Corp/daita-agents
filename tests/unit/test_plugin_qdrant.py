@@ -9,7 +9,6 @@ import pytest
 from unittest.mock import MagicMock
 from daita.plugins.qdrant import QdrantPlugin
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -44,13 +43,16 @@ def _mock_search(plugin, points):
 
 async def test_original_id_stripped_from_payload():
     plugin = make_plugin()
-    _mock_search(plugin, [
-        FakeScoredPoint(
-            id="uuid-1",
-            score=0.9,
-            payload={"_original_id": "my-id", "name": "Alice", "age": 30},
-        )
-    ])
+    _mock_search(
+        plugin,
+        [
+            FakeScoredPoint(
+                id="uuid-1",
+                score=0.9,
+                payload={"_original_id": "my-id", "name": "Alice", "age": 30},
+            )
+        ],
+    )
 
     results = await plugin.query([0.1] * 128, top_k=1, with_payload=True)
 
@@ -62,18 +64,21 @@ async def test_original_id_stripped_from_payload():
 async def test_other_underscore_keys_preserved():
     """Keys starting with _ other than _original_id must NOT be stripped."""
     plugin = make_plugin()
-    _mock_search(plugin, [
-        FakeScoredPoint(
-            id="uuid-2",
-            score=0.8,
-            payload={
-                "_original_id": "ext-99",
-                "_source": "import_job",
-                "_version": 3,
-                "title": "Engineer",
-            },
-        )
-    ])
+    _mock_search(
+        plugin,
+        [
+            FakeScoredPoint(
+                id="uuid-2",
+                score=0.8,
+                payload={
+                    "_original_id": "ext-99",
+                    "_source": "import_job",
+                    "_version": 3,
+                    "title": "Engineer",
+                },
+            )
+        ],
+    )
 
     results = await plugin.query([0.1] * 128, top_k=1, with_payload=True)
 
@@ -87,13 +92,16 @@ async def test_other_underscore_keys_preserved():
 async def test_original_id_used_as_result_id():
     """_original_id in payload should become the id in the result."""
     plugin = make_plugin()
-    _mock_search(plugin, [
-        FakeScoredPoint(
-            id="internal-uuid",
-            score=0.95,
-            payload={"_original_id": "human-readable-id", "data": "x"},
-        )
-    ])
+    _mock_search(
+        plugin,
+        [
+            FakeScoredPoint(
+                id="internal-uuid",
+                score=0.95,
+                payload={"_original_id": "human-readable-id", "data": "x"},
+            )
+        ],
+    )
 
     results = await plugin.query([0.1] * 128, top_k=1, with_payload=True)
 
@@ -102,13 +110,16 @@ async def test_original_id_used_as_result_id():
 
 async def test_no_original_id_uses_internal_id():
     plugin = make_plugin()
-    _mock_search(plugin, [
-        FakeScoredPoint(
-            id="internal-uuid",
-            score=0.7,
-            payload={"name": "Bob"},
-        )
-    ])
+    _mock_search(
+        plugin,
+        [
+            FakeScoredPoint(
+                id="internal-uuid",
+                score=0.7,
+                payload={"name": "Bob"},
+            )
+        ],
+    )
 
     results = await plugin.query([0.1] * 128, top_k=1, with_payload=True)
 
@@ -117,13 +128,16 @@ async def test_no_original_id_uses_internal_id():
 
 async def test_payload_without_underscore_keys_unchanged():
     plugin = make_plugin()
-    _mock_search(plugin, [
-        FakeScoredPoint(
-            id="abc",
-            score=0.6,
-            payload={"city": "NYC", "score": 99},
-        )
-    ])
+    _mock_search(
+        plugin,
+        [
+            FakeScoredPoint(
+                id="abc",
+                score=0.6,
+                payload={"city": "NYC", "score": 99},
+            )
+        ],
+    )
 
     results = await plugin.query([0.1] * 128, top_k=1, with_payload=True)
 
@@ -133,9 +147,7 @@ async def test_payload_without_underscore_keys_unchanged():
 async def test_empty_payload_handled():
     """Empty dict payload is falsy — plugin omits the payload key entirely."""
     plugin = make_plugin()
-    _mock_search(plugin, [
-        FakeScoredPoint(id="x", score=0.5, payload={})
-    ])
+    _mock_search(plugin, [FakeScoredPoint(id="x", score=0.5, payload={})])
 
     results = await plugin.query([0.1] * 128, top_k=1, with_payload=True)
 

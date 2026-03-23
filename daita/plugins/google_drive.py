@@ -54,9 +54,18 @@ _LIST_FIELDS = f"files({_FILE_FIELDS}), nextPageToken"
 
 # Export formats for Google-native files when downloading
 _EXPORT_MAP = {
-    _GDOC: ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx"),
-    _GSHEET: ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"),
-    _GSLIDES: ("application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx"),
+    _GDOC: (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".docx",
+    ),
+    _GSHEET: (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xlsx",
+    ),
+    _GSLIDES: (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".pptx",
+    ),
 }
 
 
@@ -153,7 +162,9 @@ class GoogleDrivePlugin(BasePlugin):
                         provider="Google Drive",
                     )
                 elif status in (429, 500, 503):
-                    return TransientError(f"Google Drive {operation} transient error: {error}")
+                    return TransientError(
+                        f"Google Drive {operation} transient error: {error}"
+                    )
                 else:
                     return PluginError(
                         f"Google Drive {operation} failed (HTTP {status}): {error}",
@@ -161,7 +172,9 @@ class GoogleDrivePlugin(BasePlugin):
                     )
         except ImportError:
             pass
-        return PluginError(f"Google Drive {operation} failed: {error}", plugin_name="GoogleDrive")
+        return PluginError(
+            f"Google Drive {operation} failed: {error}", plugin_name="GoogleDrive"
+        )
 
     # ---------------------------------------------------------------------------
     # Connection management
@@ -177,13 +190,17 @@ class GoogleDrivePlugin(BasePlugin):
                 from googleapiclient.discovery import build
 
                 creds = await self._resolve_credentials()
-                self._service = build("drive", "v3", credentials=creds, cache_discovery=False)
+                self._service = build(
+                    "drive", "v3", credentials=creds, cache_discovery=False
+                )
 
                 # Verify connectivity with a minimal API call
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None,
-                    lambda: self._service.files().list(pageSize=1, fields="files(id)").execute(),
+                    lambda: self._service.files()
+                    .list(pageSize=1, fields="files(id)")
+                    .execute(),
                 )
                 logger.info("Connected to Google Drive")
 
@@ -194,7 +211,13 @@ class GoogleDrivePlugin(BasePlugin):
                     plugin_name="GoogleDrive",
                     retry_hint="permanent",
                 ) from e
-            except (PluginError, NotFoundError, DaitaPermissionError, AuthenticationError, TransientError):
+            except (
+                PluginError,
+                NotFoundError,
+                DaitaPermissionError,
+                AuthenticationError,
+                TransientError,
+            ):
                 raise
             except Exception as e:
                 raise self._map_drive_error(e, "connect") from e
@@ -209,6 +232,7 @@ class GoogleDrivePlugin(BasePlugin):
                 info = json.load(f)
             if info.get("type") == "service_account":
                 from google.oauth2.service_account import Credentials
+
                 return Credentials.from_service_account_file(
                     self.credentials_path, scopes=self.scopes
                 )
@@ -217,6 +241,7 @@ class GoogleDrivePlugin(BasePlugin):
 
         # Application Default Credentials
         from google.auth import default as gauth_default
+
         creds, _ = gauth_default(scopes=self.scopes)
         return creds
 
@@ -228,7 +253,9 @@ class GoogleDrivePlugin(BasePlugin):
 
         creds = None
         if os.path.exists(self.token_path):
-            creds = OAuthCredentials.from_authorized_user_file(self.token_path, self.scopes)
+            creds = OAuthCredentials.from_authorized_user_file(
+                self.token_path, self.scopes
+            )
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
@@ -267,7 +294,9 @@ class GoogleDrivePlugin(BasePlugin):
         return self._service.files().get(fileId=file_id, fields=fields).execute()
 
     def _sync_files_export(self, file_id: str, mime_type: str) -> bytes:
-        return self._service.files().export(fileId=file_id, mimeType=mime_type).execute()
+        return (
+            self._service.files().export(fileId=file_id, mimeType=mime_type).execute()
+        )
 
     def _sync_files_download(self, file_id: str) -> bytes:
         from googleapiclient.http import MediaIoBaseDownload
@@ -281,25 +310,33 @@ class GoogleDrivePlugin(BasePlugin):
         return buf.getvalue()
 
     def _sync_files_create(self, metadata: dict, media_body: Any) -> dict:
-        return self._service.files().create(
-            body=metadata, media_body=media_body, fields=_FILE_FIELDS
-        ).execute()
+        return (
+            self._service.files()
+            .create(body=metadata, media_body=media_body, fields=_FILE_FIELDS)
+            .execute()
+        )
 
     def _sync_files_update(
         self, file_id: str, metadata: dict, add_parents: str, remove_parents: str
     ) -> dict:
-        return self._service.files().update(
-            fileId=file_id,
-            body=metadata,
-            addParents=add_parents,
-            removeParents=remove_parents,
-            fields=_FILE_FIELDS,
-        ).execute()
+        return (
+            self._service.files()
+            .update(
+                fileId=file_id,
+                body=metadata,
+                addParents=add_parents,
+                removeParents=remove_parents,
+                fields=_FILE_FIELDS,
+            )
+            .execute()
+        )
 
     def _sync_files_copy(self, file_id: str, metadata: dict) -> dict:
-        return self._service.files().copy(
-            fileId=file_id, body=metadata, fields=_FILE_FIELDS
-        ).execute()
+        return (
+            self._service.files()
+            .copy(fileId=file_id, body=metadata, fields=_FILE_FIELDS)
+            .execute()
+        )
 
     def _sync_files_delete(self, file_id: str) -> None:
         self._service.files().delete(fileId=file_id).execute()
@@ -335,10 +372,18 @@ class GoogleDrivePlugin(BasePlugin):
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
-                functools.partial(self._sync_files_list, drive_query, page_size, _LIST_FIELDS, None),
+                functools.partial(
+                    self._sync_files_list, drive_query, page_size, _LIST_FIELDS, None
+                ),
             )
             return self._format_file_list(response.get("files", []))
-        except (PluginError, NotFoundError, DaitaPermissionError, AuthenticationError, TransientError):
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
             raise
         except Exception as e:
             raise self._map_drive_error(e, "search") from e
@@ -358,11 +403,21 @@ class GoogleDrivePlugin(BasePlugin):
             response = await loop.run_in_executor(
                 None,
                 functools.partial(
-                    self._sync_files_list, query, min(max_results, 200), _LIST_FIELDS, None
+                    self._sync_files_list,
+                    query,
+                    min(max_results, 200),
+                    _LIST_FIELDS,
+                    None,
                 ),
             )
             return self._format_file_list(response.get("files", []))
-        except (PluginError, NotFoundError, DaitaPermissionError, AuthenticationError, TransientError):
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
             raise
         except Exception as e:
             raise self._map_drive_error(e, "list_folder") from e
@@ -397,12 +452,20 @@ class GoogleDrivePlugin(BasePlugin):
                 "description": f.get("description"),
                 "starred": f.get("starred"),
             }
-        except (PluginError, NotFoundError, DaitaPermissionError, AuthenticationError, TransientError):
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
             raise
         except Exception as e:
             raise self._map_drive_error(e, "get_info") from e
 
-    async def read(self, file_id: str, sheet_name: Optional[str] = None) -> Dict[str, Any]:
+    async def read(
+        self, file_id: str, sheet_name: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Read file content with automatic format detection."""
         if self._service is None:
             await self.connect()
@@ -411,12 +474,20 @@ class GoogleDrivePlugin(BasePlugin):
             loop = asyncio.get_running_loop()
             meta = await loop.run_in_executor(
                 None,
-                functools.partial(self._sync_files_get, file_id, "id, name, mimeType, size"),
+                functools.partial(
+                    self._sync_files_get, file_id, "id, name, mimeType, size"
+                ),
             )
             return await self._extract_content(
                 file_id, meta.get("mimeType", ""), meta.get("name", ""), sheet_name
             )
-        except (PluginError, NotFoundError, DaitaPermissionError, AuthenticationError, TransientError):
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
             raise
         except Exception as e:
             raise self._map_drive_error(e, "read") from e
@@ -454,7 +525,13 @@ class GoogleDrivePlugin(BasePlugin):
                 f.write(content)
 
             return dest
-        except (PluginError, NotFoundError, DaitaPermissionError, AuthenticationError, TransientError):
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
             raise
         except Exception as e:
             raise self._map_drive_error(e, "download") from e
@@ -471,7 +548,9 @@ class GoogleDrivePlugin(BasePlugin):
 
         local_path = os.path.expanduser(local_path)
         if not os.path.exists(local_path):
-            raise NotFoundError(f"Local file not found: {local_path}", resource_type="local_file")
+            raise NotFoundError(
+                f"Local file not found: {local_path}", resource_type="local_file"
+            )
 
         try:
             from googleapiclient.http import MediaFileUpload
@@ -482,7 +561,9 @@ class GoogleDrivePlugin(BasePlugin):
                 metadata["parents"] = [folder_id]
 
             mime_type, _ = mimetypes.guess_type(local_path)
-            media = MediaFileUpload(local_path, mimetype=mime_type or "application/octet-stream")
+            media = MediaFileUpload(
+                local_path, mimetype=mime_type or "application/octet-stream"
+            )
 
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
@@ -490,7 +571,13 @@ class GoogleDrivePlugin(BasePlugin):
                 functools.partial(self._sync_files_create, metadata, media),
             )
             return self._format_file(result)
-        except (PluginError, NotFoundError, DaitaPermissionError, AuthenticationError, TransientError):
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
             raise
         except Exception as e:
             raise self._map_drive_error(e, "upload") from e
@@ -529,16 +616,22 @@ class GoogleDrivePlugin(BasePlugin):
 
             elif action == "rename":
                 if not new_name:
-                    raise PluginError("rename requires new_name", plugin_name="GoogleDrive")
+                    raise PluginError(
+                        "rename requires new_name", plugin_name="GoogleDrive"
+                    )
                 result = await loop.run_in_executor(
                     None,
-                    functools.partial(self._sync_files_update, file_id, {"name": new_name}, "", ""),
+                    functools.partial(
+                        self._sync_files_update, file_id, {"name": new_name}, "", ""
+                    ),
                 )
                 return {**self._format_file(result), "action": "renamed"}
 
             else:  # move
                 if not dest_folder_id:
-                    raise PluginError("move requires dest_folder_id", plugin_name="GoogleDrive")
+                    raise PluginError(
+                        "move requires dest_folder_id", plugin_name="GoogleDrive"
+                    )
                 meta = await loop.run_in_executor(
                     None,
                     functools.partial(self._sync_files_get, file_id, "parents"),
@@ -547,12 +640,22 @@ class GoogleDrivePlugin(BasePlugin):
                 result = await loop.run_in_executor(
                     None,
                     functools.partial(
-                        self._sync_files_update, file_id, {}, dest_folder_id, current_parents
+                        self._sync_files_update,
+                        file_id,
+                        {},
+                        dest_folder_id,
+                        current_parents,
                     ),
                 )
                 return {**self._format_file(result), "action": "moved"}
 
-        except (PluginError, NotFoundError, DaitaPermissionError, AuthenticationError, TransientError):
+        except (
+            PluginError,
+            NotFoundError,
+            DaitaPermissionError,
+            AuthenticationError,
+            TransientError,
+        ):
             raise
         except Exception as e:
             raise self._map_drive_error(e, "organize") from e
@@ -619,13 +722,15 @@ class GoogleDrivePlugin(BasePlugin):
             return self._wrap_rows(rows, name, "csv")
 
         if (
-            mime_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime_type
+            == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             or low_name.endswith(".xlsx")
         ):
             return self._parse_xlsx(raw, name, sheet_name)
 
         if (
-            mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            mime_type
+            == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             or low_name.endswith(".docx")
         ):
             return self._parse_docx(raw, name)
@@ -649,7 +754,18 @@ class GoogleDrivePlugin(BasePlugin):
                 pass
 
         if mime_type.startswith("text/") or low_name.endswith(
-            (".txt", ".md", ".xml", ".yaml", ".yml", ".log", ".py", ".js", ".ts", ".sql")
+            (
+                ".txt",
+                ".md",
+                ".xml",
+                ".yaml",
+                ".yml",
+                ".log",
+                ".py",
+                ".js",
+                ".ts",
+                ".sql",
+            )
         ):
             try:
                 return self._wrap_text(raw.decode("utf-8"), name, "text")
@@ -688,7 +804,9 @@ class GoogleDrivePlugin(BasePlugin):
             if headers is None:
                 headers = [str(c) if c is not None else "" for c in row]
                 continue
-            rows.append(dict(zip(headers, [str(v) if v is not None else "" for v in row])))
+            rows.append(
+                dict(zip(headers, [str(v) if v is not None else "" for v in row]))
+            )
 
         return self._wrap_rows(rows, name, "xlsx")
 
@@ -1007,14 +1125,20 @@ class GoogleDrivePlugin(BasePlugin):
         return {"files": results, "count": len(results)}
 
     async def _tool_read(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        return await self.read(file_id=args["file_id"], sheet_name=args.get("sheet_name"))
+        return await self.read(
+            file_id=args["file_id"], sheet_name=args.get("sheet_name")
+        )
 
     async def _tool_list(self, args: Dict[str, Any]) -> Dict[str, Any]:
         files = await self.list_folder(
             folder_id=args.get("folder_id", "root"),
             max_results=args.get("max_results", 50),
         )
-        return {"files": files, "count": len(files), "folder_id": args.get("folder_id", "root")}
+        return {
+            "files": files,
+            "count": len(files),
+            "folder_id": args.get("folder_id", "root"),
+        }
 
     async def _tool_info(self, args: Dict[str, Any]) -> Dict[str, Any]:
         return await self.get_info(file_id=args["file_id"])

@@ -20,7 +20,6 @@ from daita.core.exceptions import (
     PluginError,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -36,13 +35,22 @@ def make_plugin():
 def _mock_get_object(plugin, content: bytes, content_type: str = "text/plain"):
     """Wire plugin._client.get_object to return the given bytes via _sync_get_object."""
     plugin._client.get_object = MagicMock(
-        return_value={"Body": MagicMock(read=MagicMock(return_value=content)), "ContentType": content_type}
+        return_value={
+            "Body": MagicMock(read=MagicMock(return_value=content)),
+            "ContentType": content_type,
+        }
     )
 
 
-def _mock_head_object(plugin, size: int, content_type: str = "application/octet-stream"):
+def _mock_head_object(
+    plugin, size: int, content_type: str = "application/octet-stream"
+):
     plugin._client.head_object = MagicMock(
-        return_value={"ContentLength": size, "ContentType": content_type, "LastModified": "2024-01-01"}
+        return_value={
+            "ContentLength": size,
+            "ContentType": content_type,
+            "LastModified": "2024-01-01",
+        }
     )
 
 
@@ -120,7 +128,11 @@ async def test_parquet_file_returns_metadata_only():
 
 async def test_xlsx_file_returns_metadata_only():
     plugin = make_plugin()
-    _mock_head_object(plugin, size=8192, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    _mock_head_object(
+        plugin,
+        size=8192,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
     result = await plugin._tool_read_file({"key": "report.xlsx"})
 
@@ -277,7 +289,10 @@ async def test_connect_creates_client():
 
     with patch("boto3.Session") as mock_session_cls:
         mock_client = MagicMock()
-        mock_client.list_objects_v2.return_value = {"Contents": [], "IsTruncated": False}
+        mock_client.list_objects_v2.return_value = {
+            "Contents": [],
+            "IsTruncated": False,
+        }
         mock_session_cls.return_value.client.return_value = mock_client
 
         await plugin.connect()
@@ -343,13 +358,15 @@ async def test_put_error_maps_to_plugin_error():
 
 async def test_list_basic():
     plugin = make_plugin()
-    plugin._client.list_objects_v2 = MagicMock(return_value={
-        "Contents": [
-            {"Key": "a.txt", "Size": 10, "LastModified": "2024-01-01"},
-            {"Key": "b.txt", "Size": 20, "LastModified": "2024-01-02"},
-        ],
-        "IsTruncated": False,
-    })
+    plugin._client.list_objects_v2 = MagicMock(
+        return_value={
+            "Contents": [
+                {"Key": "a.txt", "Size": 10, "LastModified": "2024-01-01"},
+                {"Key": "b.txt", "Size": 20, "LastModified": "2024-01-02"},
+            ],
+            "IsTruncated": False,
+        }
+    )
 
     objects, is_truncated = await plugin.list_objects(prefix="")
 
@@ -360,10 +377,12 @@ async def test_list_basic():
 
 async def test_list_empty():
     plugin = make_plugin()
-    plugin._client.list_objects_v2 = MagicMock(return_value={
-        "Contents": [],
-        "IsTruncated": False,
-    })
+    plugin._client.list_objects_v2 = MagicMock(
+        return_value={
+            "Contents": [],
+            "IsTruncated": False,
+        }
+    )
 
     objects, is_truncated = await plugin.list_objects()
 
@@ -373,10 +392,12 @@ async def test_list_empty():
 
 async def test_list_with_continuation_token():
     plugin = make_plugin()
-    plugin._client.list_objects_v2 = MagicMock(return_value={
-        "Contents": [{"Key": "page2.txt", "Size": 5, "LastModified": "2024-01-03"}],
-        "IsTruncated": False,
-    })
+    plugin._client.list_objects_v2 = MagicMock(
+        return_value={
+            "Contents": [{"Key": "page2.txt", "Size": 5, "LastModified": "2024-01-03"}],
+            "IsTruncated": False,
+        }
+    )
 
     objects, _ = await plugin.list_objects(continuation_token="token-abc")
 
@@ -401,9 +422,9 @@ async def test_delete_returns_metadata():
 
 async def test_copy_returns_metadata():
     plugin = make_plugin()
-    plugin._client.copy_object = MagicMock(return_value={
-        "CopyObjectResult": {"ETag": '"copyetag"'}
-    })
+    plugin._client.copy_object = MagicMock(
+        return_value={"CopyObjectResult": {"ETag": '"copyetag"'}}
+    )
 
     result = await plugin.copy_object("src/file.txt", "dst/file.txt")
 
@@ -466,10 +487,12 @@ async def test_tool_write_list():
     plugin = make_plugin()
     _mock_put_object(plugin)
 
-    result = await plugin._tool_write_file({
-        "key": "out/items.json",
-        "data": [{"id": 1}, {"id": 2}],
-    })
+    result = await plugin._tool_write_file(
+        {
+            "key": "out/items.json",
+            "data": [{"id": 1}, {"id": 2}],
+        }
+    )
 
     assert result["key"] == "out/items.json"
     call_body = plugin._client.put_object.call_args[1]["Body"]
@@ -484,13 +507,15 @@ async def test_tool_write_list():
 
 async def test_tool_list_default():
     plugin = make_plugin()
-    plugin._client.list_objects_v2 = MagicMock(return_value={
-        "Contents": [
-            {"Key": f"file_{i}.txt", "Size": i * 10, "LastModified": "2024-01-01"}
-            for i in range(5)
-        ],
-        "IsTruncated": False,
-    })
+    plugin._client.list_objects_v2 = MagicMock(
+        return_value={
+            "Contents": [
+                {"Key": f"file_{i}.txt", "Size": i * 10, "LastModified": "2024-01-01"}
+                for i in range(5)
+            ],
+            "IsTruncated": False,
+        }
+    )
 
     result = await plugin._tool_list_objects({"prefix": "file_"})
 
@@ -501,13 +526,15 @@ async def test_tool_list_default():
 
 async def test_tool_list_s3_truncated_surfaces_note():
     plugin = make_plugin()
-    plugin._client.list_objects_v2 = MagicMock(return_value={
-        "Contents": [
-            {"Key": f"f{i}.txt", "Size": 1, "LastModified": "2024-01-01"}
-            for i in range(10)
-        ],
-        "IsTruncated": True,
-    })
+    plugin._client.list_objects_v2 = MagicMock(
+        return_value={
+            "Contents": [
+                {"Key": f"f{i}.txt", "Size": 1, "LastModified": "2024-01-01"}
+                for i in range(10)
+            ],
+            "IsTruncated": True,
+        }
+    )
 
     result = await plugin._tool_list_objects({})
 

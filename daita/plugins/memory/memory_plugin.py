@@ -183,10 +183,12 @@ class MemoryPlugin(LifecyclePlugin):
 
         if self.enable_reranking and self.curator is not None:
             from .reranker import MemoryReranker
+
             self._reranker = MemoryReranker(llm=self.curator.llm)
 
         if self.enable_fact_extraction and self.curator is not None:
             from .fact_extractor import FactExtractor
+
             self._fact_extractor = FactExtractor(llm=self.curator.llm)
 
     def get_tools(self) -> List[AgentTool]:
@@ -302,12 +304,18 @@ class MemoryPlugin(LifecyclePlugin):
             extra_metadata = None
             if _fact_extractor is not None:
                 from .fact_extractor import FactExtractor
+
                 facts = await _fact_extractor.extract(content)
                 if facts:
-                    extra_metadata = {"extracted_facts": FactExtractor.facts_to_metadata(facts)}
+                    extra_metadata = {
+                        "extracted_facts": FactExtractor.facts_to_metadata(facts)
+                    }
 
             return await backend.remember(
-                content, category=category, metadata=metadata, extra_metadata=extra_metadata
+                content,
+                category=category,
+                metadata=metadata,
+                extra_metadata=extra_metadata,
             )
 
         @tool

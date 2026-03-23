@@ -229,11 +229,17 @@ class BaseDatabasePlugin(BasePlugin):
         name = col_dict.get("column_name", col_dict.get("name", ""))
         dtype = col_dict.get("data_type", col_dict.get("type", ""))
         nullable = col_dict.get("is_nullable", "YES")
-        nn = "nn" if str(nullable).upper() in ("NO", "NOT NULL", "0", "FALSE") else "null"
+        nn = (
+            "nn"
+            if str(nullable).upper() in ("NO", "NOT NULL", "0", "FALSE")
+            else "null"
+        )
         return f"{name}:{dtype}:{nn}"
 
     @staticmethod
-    def _truncate_result(rows: list, max_rows: int = 200, max_chars: int = 50000) -> Dict[str, Any]:
+    def _truncate_result(
+        rows: list, max_rows: int = 200, max_chars: int = 50000
+    ) -> Dict[str, Any]:
         """Truncate a list of rows to fit within guardrails.
 
         Returns:

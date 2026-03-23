@@ -236,9 +236,7 @@ class MySQLPlugin(BaseDatabasePlugin):
         """
         return await self.query(sql, [table])
 
-    async def count_rows(
-        self, table: str, filter: Optional[str] = None
-    ) -> int:
+    async def count_rows(self, table: str, filter: Optional[str] = None) -> int:
         """
         Count rows in a table.
 

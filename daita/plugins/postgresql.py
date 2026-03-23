@@ -313,11 +313,15 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         # Validate filter param for injection prevention
         if filter:
             if ";" in filter:
-                raise ValidationError("filter contains invalid character: ';'", field="filter")
+                raise ValidationError(
+                    "filter contains invalid character: ';'", field="filter"
+                )
             if "--" in filter or "/*" in filter:
-                raise ValidationError("filter contains SQL comment syntax", field="filter")
+                raise ValidationError(
+                    "filter contains SQL comment syntax", field="filter"
+                )
             # Detect subqueries: nested parens containing SELECT
-            if re.search(r'\(.*\bSELECT\b.*\)', filter, re.IGNORECASE | re.DOTALL):
+            if re.search(r"\(.*\bSELECT\b.*\)", filter, re.IGNORECASE | re.DOTALL):
                 raise ValidationError("filter contains a subquery", field="filter")
 
         # Distance operators: <=> (cosine), <-> (L2), <#> (inner product)
@@ -694,15 +698,23 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             results = await self.query(sql, params or None)
 
         truncated = self._truncate_result(results)
-        return {"rows": truncated["rows"], "total_rows": truncated["total_rows"], "truncated": truncated["truncated"]}
+        return {
+            "rows": truncated["rows"],
+            "total_rows": truncated["total_rows"],
+            "truncated": truncated["truncated"],
+        }
 
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_list_tables (kept for backward compat, not in get_tools)"""
         tables = await self.tables()
         total = len(tables)
         truncated = total > 50
-        return {"tables": tables[:50], "count": len(tables[:50]),
-                "total_tables": total, "truncated": truncated}
+        return {
+            "tables": tables[:50],
+            "count": len(tables[:50]),
+            "total_tables": total,
+            "truncated": truncated,
+        }
 
     async def _tool_get_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_get_schema (kept for backward compat, not in get_tools)"""
@@ -739,8 +751,10 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         schemas = await asyncio.gather(*[self.describe(t) for t in targets])
 
         return {
-            "tables": [{"name": t, "columns": [self._compact_column(c) for c in s]}
-                       for t, s in zip(targets, schemas)],
+            "tables": [
+                {"name": t, "columns": [self._compact_column(c) for c in s]}
+                for t, s in zip(targets, schemas)
+            ],
             "count": len(targets),
             "total_tables": total_tables,
             "truncated": truncated,

@@ -267,6 +267,7 @@ class RESTPlugin(BasePlugin):
                 _MAX_CHARS = 50_000
                 if "application/json" in content_type:
                     import json as _json
+
                     raw = await response.text()
                     parsed = _json.loads(raw)  # parse full response first
                     if len(raw) > _MAX_CHARS:

@@ -405,9 +405,11 @@ class CatalogPlugin(BasePlugin):
     async def _tool_discover_postgres(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for discover_postgres"""
         import fnmatch
+
         connection_string = args.get("connection_string")
         if not connection_string:
             from ..core.exceptions import ValidationError
+
             raise ValidationError("connection_string is required")
 
         schema = args.get("schema", "public")
@@ -427,7 +429,11 @@ class CatalogPlugin(BasePlugin):
         if "tables" in result:
             tables = result["tables"]
             if table_filter:
-                tables = [t for t in tables if fnmatch.fnmatch(t.get("table_name", ""), table_filter)]
+                tables = [
+                    t
+                    for t in tables
+                    if fnmatch.fnmatch(t.get("table_name", ""), table_filter)
+                ]
             total_tables = len(tables)
             truncated = total_tables > max_tables
             result["tables"] = tables[:max_tables]
@@ -587,7 +593,7 @@ class CatalogPlugin(BasePlugin):
                     persist_skipped_reason = "catalog backend not configured"
 
             response = {
-                                "schema": result,
+                "schema": result,
                 "persisted": actually_persisted,
             }
             if persist_skipped_reason:
@@ -600,9 +606,11 @@ class CatalogPlugin(BasePlugin):
     async def _tool_discover_mysql(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for discover_mysql"""
         import fnmatch
+
         connection_string = args.get("connection_string")
         if not connection_string:
             from ..core.exceptions import ValidationError
+
             raise ValidationError("connection_string is required")
 
         schema = args.get("schema")
@@ -618,7 +626,11 @@ class CatalogPlugin(BasePlugin):
         if "tables" in result:
             tables = result["tables"]
             if table_filter:
-                tables = [t for t in tables if fnmatch.fnmatch(t.get("table_name", ""), table_filter)]
+                tables = [
+                    t
+                    for t in tables
+                    if fnmatch.fnmatch(t.get("table_name", ""), table_filter)
+                ]
             total_tables = len(tables)
             truncated = total_tables > max_tables
             result["tables"] = tables[:max_tables]
@@ -734,7 +746,7 @@ class CatalogPlugin(BasePlugin):
                     persist_skipped_reason = "catalog backend not configured"
 
             response = {
-                                "schema": result,
+                "schema": result,
                 "persisted": actually_persisted,
             }
             if persist_skipped_reason:
@@ -749,11 +761,13 @@ class CatalogPlugin(BasePlugin):
         connection_string = args.get("connection_string")
         if not connection_string:
             from ..core.exceptions import ValidationError
+
             raise ValidationError("connection_string is required")
 
         database = args.get("database")
         if not database:
             from ..core.exceptions import ValidationError
+
             raise ValidationError("database is required")
 
         sample_size = args.get("sample_size", 100)
@@ -851,7 +865,7 @@ class CatalogPlugin(BasePlugin):
                     persist_skipped_reason = "catalog backend not configured"
 
             response = {
-                                "schema": result,
+                "schema": result,
                 "persisted": actually_persisted,
             }
             if persist_skipped_reason:
@@ -866,6 +880,7 @@ class CatalogPlugin(BasePlugin):
         spec_url = args.get("spec_url")
         if not spec_url:
             from ..core.exceptions import ValidationError
+
             raise ValidationError("spec_url is required")
 
         service_name = args.get("service_name")
@@ -897,6 +912,7 @@ class CatalogPlugin(BasePlugin):
         url_error = self._validate_openapi_url(spec_url)
         if url_error:
             from ..core.exceptions import ValidationError
+
             raise ValidationError(url_error)
 
         # follow_redirects=False prevents redirect-based SSRF bypasses.
@@ -953,7 +969,7 @@ class CatalogPlugin(BasePlugin):
                 persist_skipped_reason = "catalog backend not configured"
 
         response = {
-                        "schema": result,
+            "schema": result,
             "persisted": actually_persisted,
         }
         if persist_skipped_reason:
@@ -1024,7 +1040,7 @@ class CatalogPlugin(BasePlugin):
                 )
 
         return {
-                        "comparison": {
+            "comparison": {
                 "added_tables": added_tables,
                 "removed_tables": removed_tables,
                 "added_columns": [
@@ -1127,7 +1143,10 @@ class CatalogPlugin(BasePlugin):
 
         else:
             from ..core.exceptions import ValidationError
-            raise ValidationError(f"Unsupported format: {format}. Use 'mermaid' or 'json_schema'")
+
+            raise ValidationError(
+                f"Unsupported format: {format}. Use 'mermaid' or 'json_schema'"
+            )
 
     def _map_sql_to_json_type(self, sql_type: str) -> str:
         """Map SQL data types to JSON Schema types"""

@@ -10,14 +10,15 @@ from unittest.mock import AsyncMock
 from daita.plugins.neo4j_graph import Neo4jPlugin
 from daita.core.exceptions import PluginError
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
 def make_plugin(read_only=False):
-    plugin = Neo4jPlugin(uri="bolt://localhost:7687", auth=("neo4j", "test"), read_only=read_only)
+    plugin = Neo4jPlugin(
+        uri="bolt://localhost:7687", auth=("neo4j", "test"), read_only=read_only
+    )
     # Inject fake driver so connect() is never needed
     plugin._driver = object()  # truthy sentinel
     return plugin
@@ -134,7 +135,9 @@ async def test_list_labels_returns_labels():
 
 async def test_list_relationship_types_returns_types():
     plugin = make_plugin()
-    _stub_query(plugin, [{"relationshipType": "KNOWS"}, {"relationshipType": "WORKS_AT"}])
+    _stub_query(
+        plugin, [{"relationshipType": "KNOWS"}, {"relationshipType": "WORKS_AT"}]
+    )
 
     result = await plugin._tool_list_relationship_types({})
 

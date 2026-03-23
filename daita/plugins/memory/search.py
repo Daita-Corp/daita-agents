@@ -121,9 +121,7 @@ class SQLiteVectorSearch:
             # Content-based hash only (no timestamp) so identical content
             # submitted in the same session produces the same chunk_id and is
             # caught by the incremental-check below instead of creating a duplicate.
-            chunk_id = hashlib.md5(
-                f"direct:{content.strip()}".encode()
-            ).hexdigest()
+            chunk_id = hashlib.md5(f"direct:{content.strip()}".encode()).hexdigest()
 
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
