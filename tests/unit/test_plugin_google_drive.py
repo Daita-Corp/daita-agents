@@ -715,7 +715,16 @@ async def test_tool_upload_handler(tmp_path):
     mock_create.execute.return_value = created_file
     plugin._service.files.return_value.create.return_value = mock_create
 
-    with patch("googleapiclient.http.MediaFileUpload"):
+    import sys
+    from types import ModuleType
+
+    fake_http = ModuleType("googleapiclient.http")
+    fake_http.MediaFileUpload = MagicMock(return_value=MagicMock())
+    fake_googleapiclient = ModuleType("googleapiclient")
+    with patch.dict(
+        sys.modules,
+        {"googleapiclient": fake_googleapiclient, "googleapiclient.http": fake_http},
+    ):
         result = await plugin._tool_upload({"local_path": str(local_file)})
 
     assert result["id"] == "new_file"
