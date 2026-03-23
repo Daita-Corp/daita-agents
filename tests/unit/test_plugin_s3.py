@@ -10,7 +10,10 @@ import json
 import io
 import pytest
 from unittest.mock import MagicMock, patch
-from botocore.exceptions import ClientError
+
+botocore = pytest.importorskip("botocore", reason="botocore (boto3) not installed")
+ClientError = botocore.exceptions.ClientError
+
 from daita.plugins.s3 import S3Plugin
 from daita.core.exceptions import (
     NotFoundError,
