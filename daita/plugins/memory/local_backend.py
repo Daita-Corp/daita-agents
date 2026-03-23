@@ -81,10 +81,15 @@ class LocalMemoryBackend:
         content: str,
         category: Optional[str] = None,
         metadata: Optional[MemoryMetadata] = None,
+        extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Store a memory: appends to today's daily log and indexes in the vector DB.
         MEMORY.md is managed exclusively by the curator.
+
+        Args:
+            extra_metadata: Optional dict merged into the stored metadata JSON.
+                            Used by FactExtractor to attach "extracted_facts".
         """
         # Always write to daily log (human-readable history + curator input)
         await self.storage.append_to_daily_log(content, category)
@@ -98,7 +103,9 @@ class LocalMemoryBackend:
                 category=category,
             )
 
-        chunk_id = await self.search.store_chunk(content, metadata)
+        chunk_id = await self.search.store_chunk(
+            content, metadata, extra_metadata=extra_metadata
+        )
 
         return {
             "status": "success",
@@ -164,26 +171,40 @@ class LocalMemoryBackend:
         min_importance: Optional[float] = None,
         max_importance: Optional[float] = None,
         category: Optional[str] = None,
+        reranker=None,
     ) -> List[Dict[str, Any]]:
         """
         Search memories using hybrid semantic + keyword search.
         Results are importance-weighted and temporally decayed.
+
+        Args:
+            reranker: Optional MemoryReranker instance. When provided, top results
+                      are reranked by LLM reasoning before being returned.
         """
+        # When reranking, fetch more candidates than the final limit so the
+        # reranker has a pool to work with.
+        fetch_limit = (reranker._top_n if reranker is not None else limit)
+
         if strategy == "semantic":
             results = await self._semantic_recall(
-                query, limit, score_threshold, category
+                query, fetch_limit, score_threshold, category
             )
         elif strategy == "keyword":
             results = await self._keyword_recall(
-                query, limit, score_threshold, category
+                query, fetch_limit, score_threshold, category
             )
         else:
-            results = await self._hybrid_recall(query, limit, score_threshold, category)
+            results = await self._hybrid_recall(query, fetch_limit, score_threshold, category)
 
         if min_importance is not None or max_importance is not None:
             results = self._filter_by_importance(
                 results, min_importance, max_importance
             )
+
+        if reranker is not None and results:
+            results = await reranker.rerank(query, results, final_limit=limit)
+        else:
+            results = results[:limit]
 
         return results
 
@@ -248,9 +269,10 @@ class LocalMemoryBackend:
 
         documents = [c[2] for c in chunks]
         bm25 = BM25Scorer(documents)
+        normalized_scores = bm25.score_all_normalized(keywords)
 
         results = []
-        for chunk_id, file_path, content, line_start, line_end, metadata_json in chunks:
+        for i, (chunk_id, file_path, content, line_start, line_end, metadata_json) in enumerate(chunks):
             metadata_dict = {}
             if metadata_json:
                 try:
@@ -262,8 +284,7 @@ class LocalMemoryBackend:
                         "pinned": False,
                     }
 
-            raw_score = bm25.score(keywords, content)
-            keyword_score = bm25.normalize_score(raw_score)
+            keyword_score = normalized_scores[i]
             adjusted = self.search._apply_score_adjustments(
                 keyword_score, metadata_dict
             )
@@ -293,8 +314,13 @@ class LocalMemoryBackend:
     ) -> List[Dict]:
         from .keyword_search import BM25Scorer
         from .text_utils import extract_keywords, contains_exact_phrase
+        from .query_router import QueryRouter
         import sqlite3
         import numpy as np
+
+        route = QueryRouter.classify(query)
+        # Use the caller's threshold if stricter, otherwise let the route loosen it
+        effective_threshold = min(score_threshold, route.score_threshold)
 
         keywords = extract_keywords(query)
 
@@ -324,11 +350,12 @@ class LocalMemoryBackend:
 
         documents = [c[2] for c in chunks]
         bm25 = BM25Scorer(documents)
+        bm25_scores = bm25.score_all_normalized(keywords)
         query_embedding = await self.search.embed_text(query)
         query_vec = np.array(query_embedding)
 
         results = []
-        for (
+        for i, (
             chunk_id,
             file_path,
             content,
@@ -336,7 +363,7 @@ class LocalMemoryBackend:
             line_end,
             metadata_json,
             embedding_json,
-        ) in chunks:
+        ) in enumerate(chunks):
             metadata_dict = {}
             if metadata_json:
                 try:
@@ -354,19 +381,33 @@ class LocalMemoryBackend:
                 float(np.dot(query_vec, chunk_vec) / denom) if denom > 0 else 0.0
             )
 
-            keyword_raw = bm25.score(keywords, content)
-            keyword_score = bm25.normalize_score(keyword_raw)
+            keyword_score = bm25_scores[i]
 
-            base_score = (0.6 * semantic_score) + (0.4 * keyword_score)
+            base_score = (route.semantic_weight * semantic_score) + (route.keyword_weight * keyword_score)
             phrase_bonus = 0.15 if contains_exact_phrase(query, content) else 0.0
             consensus_bonus = (
                 0.10 if semantic_score > 0.5 and keyword_score > 0.5 else 0.0
             )
 
-            raw_score = min(base_score + phrase_bonus + consensus_bonus, 1.0)
+            # Temporal boost: recent memories score higher for temporal queries
+            temporal_bonus = 0.0
+            if route.temporal_boost > 0:
+                created_at_str = metadata_dict.get("created_at") if metadata_dict else None
+                if created_at_str:
+                    try:
+                        from datetime import datetime
+                        created_at = datetime.fromisoformat(created_at_str)
+                        age_days = (datetime.now() - created_at).days
+                        # Full boost for today, decays to 0 over 30 days
+                        recency = max(0.0, 1.0 - age_days / 30.0)
+                        temporal_bonus = route.temporal_boost * recency
+                    except Exception:
+                        pass
+
+            raw_score = min(base_score + phrase_bonus + consensus_bonus + temporal_bonus, 1.0)
             adjusted = self.search._apply_score_adjustments(raw_score, metadata_dict)
 
-            if adjusted >= score_threshold:
+            if adjusted >= effective_threshold:
                 results.append(
                     {
                         "content": content,
@@ -382,6 +423,8 @@ class LocalMemoryBackend:
                             "keyword": float(keyword_score),
                             "phrase_bonus": float(phrase_bonus),
                             "consensus_bonus": float(consensus_bonus),
+                            "temporal_bonus": float(temporal_bonus),
+                            "query_type": route.query_type,
                         },
                     }
                 )

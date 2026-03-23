@@ -98,7 +98,11 @@ class SQLiteVectorSearch:
         return embedding
 
     async def store_chunk(
-        self, content: str, metadata: MemoryMetadata, chunk_id: Optional[str] = None
+        self,
+        content: str,
+        metadata: MemoryMetadata,
+        chunk_id: Optional[str] = None,
+        extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Store a single chunk directly into the vector DB.
@@ -106,15 +110,19 @@ class SQLiteVectorSearch:
         This is the primary write path. Checks for existence before embedding
         to avoid redundant API calls (incremental indexing).
 
+        Args:
+            extra_metadata: Optional dict merged into the metadata JSON before
+                            storage. Used to attach e.g. "extracted_facts".
+
         Returns:
             chunk_id of the stored chunk
         """
         if chunk_id is None:
-            # P1-A: content-based hash only (no timestamp) so identical content
+            # Content-based hash only (no timestamp) so identical content
             # submitted in the same session produces the same chunk_id and is
             # caught by the incremental-check below instead of creating a duplicate.
             chunk_id = hashlib.md5(
-                f"direct:{content.strip()[:200]}".encode()
+                f"direct:{content.strip()}".encode()
             ).hexdigest()
 
         conn = sqlite3.connect(str(self.db_path))
@@ -131,6 +139,14 @@ class SQLiteVectorSearch:
         # Generate embedding only for new chunks
         embedding = await self.embed_text(content)
 
+        # Build final metadata JSON, merging any extra fields
+        if extra_metadata:
+            metadata_dict = json.loads(metadata.to_json())
+            metadata_dict.update(extra_metadata)
+            metadata_json = json.dumps(metadata_dict)
+        else:
+            metadata_json = metadata.to_json()
+
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
 
@@ -139,7 +155,7 @@ class SQLiteVectorSearch:
             INSERT INTO chunks (chunk_id, file_path, content, line_start, line_end, metadata)
             VALUES (?, ?, ?, ?, ?, ?)
         """,
-            (chunk_id, "memory://direct", content, 0, 0, metadata.to_json()),
+            (chunk_id, "memory://direct", content, 0, 0, metadata_json),
         )
 
         cursor.execute(
