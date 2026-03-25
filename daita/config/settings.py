@@ -196,13 +196,13 @@ class Settings(BaseModel):
         provider = provider.lower()
 
         if provider == "openai":
-            return self.openai_api_key
+            return os.getenv("OPENAI_API_KEY") or self.openai_api_key
         elif provider == "anthropic":
-            return self.anthropic_api_key
+            return os.getenv("ANTHROPIC_API_KEY") or self.anthropic_api_key
         elif provider in ["google", "gemini"]:
-            return self.google_api_key or self.gemini_api_key
+            return os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or self.google_api_key or self.gemini_api_key
         elif provider in ["xai", "grok"]:
-            return self.xai_api_key or self.grok_api_key
+            return os.getenv("XAI_API_KEY") or os.getenv("GROK_API_KEY") or self.xai_api_key or self.grok_api_key
 
         return None
 
