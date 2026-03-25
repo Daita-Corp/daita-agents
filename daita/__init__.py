@@ -19,10 +19,10 @@ Key components:
 - AgentConfig           — Configure retry policies, LLM settings, and more
 """
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 
 # ---------------------------------------------------------------------------
-# Core — what 95% of users need
+# Core
 # ---------------------------------------------------------------------------
 from .agents.agent import Agent
 from .agents.base import BaseAgent

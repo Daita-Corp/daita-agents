@@ -440,8 +440,7 @@ class Agent(BaseAgent):
 
         except ImportError:
             logger.error(
-                "MCP SDK not installed. Install with: pip install mcp\n"
-                "See: https://github.com/modelcontextprotocol/python-sdk"
+                "MCP SDK not installed. Install with: pip install 'daita-agents[mcp]'"
             )
             raise
 

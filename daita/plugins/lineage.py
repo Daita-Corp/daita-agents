@@ -754,20 +754,22 @@ class LineagePlugin(BasePlugin):
 
             # Add upstream connections
             for item in lineage["upstream"]:
-                source = self._sanitize_id(item["entity_id"])
+                item_id = item.get("node_id") or item.get("entity_id", "unknown")
+                source = self._sanitize_id(item_id)
                 target = self._sanitize_id(entity_id)
                 flow_type = item.get("flow_type", "FLOWS_TO")
                 lines.append(
-                    f"    {source}[{self._mermaid_label(item['entity_id'])}] -->|{flow_type}| {target}"
+                    f"    {source}[{self._mermaid_label(item_id)}] -->|{flow_type}| {target}"
                 )
 
             # Add downstream connections
             for item in lineage["downstream"]:
+                item_id = item.get("node_id") or item.get("entity_id", "unknown")
                 source = self._sanitize_id(entity_id)
-                target = self._sanitize_id(item["entity_id"])
+                target = self._sanitize_id(item_id)
                 flow_type = item.get("flow_type", "FLOWS_TO")
                 lines.append(
-                    f"    {source} -->|{flow_type}| {target}[{self._mermaid_label(item['entity_id'])}]"
+                    f"    {source} -->|{flow_type}| {target}[{self._mermaid_label(item_id)}]"
                 )
 
             diagram = "\n".join(lines)
@@ -782,12 +784,14 @@ class LineagePlugin(BasePlugin):
             lines.append(f'    "{entity_id}" [shape=box];')
 
             for item in lineage["upstream"]:
-                lines.append(f'    "{item["entity_id"]}" [shape=box];')
-                lines.append(f'    "{item["entity_id"]}" -> "{entity_id}";')
+                item_id = item.get("node_id") or item.get("entity_id", "unknown")
+                lines.append(f'    "{item_id}" [shape=box];')
+                lines.append(f'    "{item_id}" -> "{entity_id}";')
 
             for item in lineage["downstream"]:
-                lines.append(f'    "{item["entity_id"]}" [shape=box];')
-                lines.append(f'    "{entity_id}" -> "{item["entity_id"]}";')
+                item_id = item.get("node_id") or item.get("entity_id", "unknown")
+                lines.append(f'    "{item_id}" [shape=box];')
+                lines.append(f'    "{entity_id}" -> "{item_id}";')
 
             lines.append("}")
             diagram = "\n".join(lines)
