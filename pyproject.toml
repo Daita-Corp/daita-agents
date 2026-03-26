@@ -29,11 +29,11 @@ dependencies = [
     "aiohttp>=3.8.0",         # HTTP client for internal framework operations
     "python-dotenv>=1.0.0",   # Environment variable loading
 
-    # CLI essentials (needed for daita commands)
-    "click>=8.0.0",           # CLI framework
-    "PyYAML>=6.0.0",          # Config file parsing (required by CLI and framework)
+    # CLI (daita-cli owns all CLI and MCP concerns)
+    "daita-cli>=0.1.0",       # Standalone CLI + MCP server
+    "PyYAML>=6.0.0",          # Config file parsing (required by framework)
     "croniter>=1.0.0",        # Cron expression parsing for scheduling
-    "aiofiles>=24.1.0",       # Async file operations (framework + CLI)
+    "aiofiles>=24.1.0",       # Async file operations (framework)
 
     # Default LLM provider (most common starting point - enables immediate usage)
     "openai>=1.0.0",          # Primary LLM provider
@@ -296,9 +296,6 @@ dev = [
     "pre-commit>=3.0.0",
     "aiosqlite>=0.21.0",  # used by sqlite unit tests (lightweight, built-in Python SQLite)
 ]
-
-[project.scripts]
-daita = "daita.cli.main:main"
 
 [tool.setuptools.packages.find]
 include = ["daita*"]
