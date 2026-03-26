@@ -90,8 +90,8 @@ from .llm.factory import create_llm_provider
 # ---------------------------------------------------------------------------
 # from daita.core.reliability import TaskManager, CircuitBreaker, BackpressureController
 # from daita.core.scaling import AgentPool, LoadBalancer, create_agent_pool
-# from daita.core.tracing import get_trace_manager
 # from daita.core.interfaces import AgentABC, LLMProvider
+from .core.tracing import get_trace_manager, configure_tracing
 
 __all__ = [
     # Primary interfaces
@@ -104,6 +104,9 @@ __all__ = [
     "tool",
     "AgentTool",
     "ToolRegistry",
+    # Tracing
+    "configure_tracing",
+    "get_trace_manager",
     # Plugins
     "postgresql",
     "mysql",

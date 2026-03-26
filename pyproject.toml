@@ -42,6 +42,10 @@ dependencies = [
     "certifi>=2025.4.0",      # SSL certificates
     "PyJWT>=2.10.0",          # JWT token handling
     "numpy>=1.20.0",          # Required by memory plugin for semantic search (cosine similarity)
+
+    # Observability — OTel is the sole tracing engine (powers dashboard + Datadog/Jaeger/etc.)
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
 ]
 
 [project.urls]
@@ -98,6 +102,9 @@ production = [
 
 anthropic = ["anthropic>=0.5.0"]
 google = ["google-genai>=0.3.0"]
+
+# OTLP exporter — for exporting spans to Datadog, Jaeger, Honeycomb, etc.
+otlp = ["opentelemetry-exporter-otlp>=1.20.0"]
 
 # Data quality plugin — advanced anomaly detection (z-score via scipy)
 data-quality = ["scipy>=1.10.0"]
@@ -275,6 +282,8 @@ all = [
     "fastapi>=0.115.0",
     "uvicorn>=0.34.0",
     "python-multipart>=0.0.20",
+    # OTLP exporter
+    "opentelemetry-exporter-otlp>=1.20.0",
 ]
 
 # Development dependencies
