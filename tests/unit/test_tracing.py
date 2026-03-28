@@ -46,6 +46,7 @@ def flush(tm: TraceManager) -> None:
 # BoundedInMemorySpanExporter
 # ---------------------------------------------------------------------------
 
+
 class TestBoundedInMemorySpanExporter:
     def test_export_and_retrieve(self):
         exp = BoundedInMemorySpanExporter(maxlen=10)
@@ -86,6 +87,7 @@ class TestBoundedInMemorySpanExporter:
 # DaitaSpanExporter
 # ---------------------------------------------------------------------------
 
+
 class TestDaitaSpanExporter:
     def test_disabled_when_no_env_vars(self):
         """Exporter is no-op when API key / URL not set."""
@@ -96,13 +98,19 @@ class TestDaitaSpanExporter:
         assert result == SpanExportResult.SUCCESS  # no-op success
 
     def test_enabled_when_env_vars_set(self):
-        env = {"DAITA_API_KEY": "sk-test", "DAITA_DASHBOARD_URL": "http://localhost:8000"}
+        env = {
+            "DAITA_API_KEY": "sk-test",
+            "DAITA_DASHBOARD_URL": "http://localhost:8000",
+        }
         with patch.dict("os.environ", env):
             exp = DaitaSpanExporter()
         assert exp.enabled
 
     def test_shutdown_stops_export(self):
-        env = {"DAITA_API_KEY": "sk-test", "DAITA_DASHBOARD_URL": "http://localhost:8000"}
+        env = {
+            "DAITA_API_KEY": "sk-test",
+            "DAITA_DASHBOARD_URL": "http://localhost:8000",
+        }
         with patch.dict("os.environ", env):
             exp = DaitaSpanExporter()
         exp.shutdown()
@@ -113,6 +121,7 @@ class TestDaitaSpanExporter:
 # ---------------------------------------------------------------------------
 # TraceManager — span lifecycle
 # ---------------------------------------------------------------------------
+
 
 class TestSpanLifecycle:
     def test_start_span_returns_hex_span_id(self):
@@ -153,18 +162,23 @@ class TestSpanLifecycle:
 # TraceManager — trace ID format
 # ---------------------------------------------------------------------------
 
+
 class TestTraceIdFormat:
     def test_trace_id_is_w3c_hex(self):
         tm = fresh_manager()
         tm.start_span("op", TraceType.AGENT_EXECUTION, agent_id="a1")
         trace_id = tm.trace_context.current_trace_id
         assert trace_id is not None
-        assert HEX32_RE.match(trace_id), f"Expected 32-char hex trace ID, got: {trace_id!r}"
+        assert HEX32_RE.match(
+            trace_id
+        ), f"Expected 32-char hex trace ID, got: {trace_id!r}"
 
     def test_span_id_is_w3c_hex(self):
         tm = fresh_manager()
         span_id = tm.start_span("op", TraceType.AGENT_EXECUTION, agent_id="a1")
-        assert HEX16_RE.match(span_id), f"Expected 16-char hex span ID, got: {span_id!r}"
+        assert HEX16_RE.match(
+            span_id
+        ), f"Expected 16-char hex span ID, got: {span_id!r}"
 
     async def test_context_manager_sets_contextvars(self):
         tm = fresh_manager()
@@ -177,6 +191,7 @@ class TestTraceIdFormat:
 # ---------------------------------------------------------------------------
 # TraceManager — async context manager
 # ---------------------------------------------------------------------------
+
 
 class TestSpanContextManager:
     async def test_success_path(self):
@@ -210,9 +225,13 @@ class TestSpanContextManager:
 
     async def test_nested_spans_share_trace_id(self):
         tm = fresh_manager()
-        async with tm.span("outer", TraceType.AGENT_EXECUTION, agent_id="a1") as outer_id:
+        async with tm.span(
+            "outer", TraceType.AGENT_EXECUTION, agent_id="a1"
+        ) as outer_id:
             outer_trace = tm.trace_context.current_trace_id
-            async with tm.span("inner", TraceType.TOOL_EXECUTION, agent_id="a1") as inner_id:
+            async with tm.span(
+                "inner", TraceType.TOOL_EXECUTION, agent_id="a1"
+            ) as inner_id:
                 inner_trace = tm.trace_context.current_trace_id
         assert outer_trace == inner_trace
 
@@ -220,6 +239,7 @@ class TestSpanContextManager:
 # ---------------------------------------------------------------------------
 # TraceManager — record_decision / record_llm_call
 # ---------------------------------------------------------------------------
+
 
 class TestRecordMethods:
     def test_record_decision(self):
@@ -242,7 +262,9 @@ class TestRecordMethods:
     def test_record_llm_call(self):
         tm = fresh_manager()
         span_id = tm.start_span("llm", TraceType.LLM_CALL, agent_id="a1")
-        tm.record_llm_call(span_id, model="gpt-4o", prompt_tokens=100, completion_tokens=50)
+        tm.record_llm_call(
+            span_id, model="gpt-4o", prompt_tokens=100, completion_tokens=50
+        )
         tm.end_span(span_id, TraceStatus.SUCCESS)
 
     def test_record_llm_call_unknown_span(self):
@@ -254,6 +276,7 @@ class TestRecordMethods:
 # ---------------------------------------------------------------------------
 # TraceManager — query methods
 # ---------------------------------------------------------------------------
+
 
 class TestQueryMethods:
     async def test_get_recent_operations_returns_dict_list(self):
@@ -344,6 +367,7 @@ class TestQueryMethods:
 # TraceManager — decision stream callbacks
 # ---------------------------------------------------------------------------
 
+
 class TestDecisionStreamCallbacks:
     def test_register_and_emit(self):
         tm = fresh_manager()
@@ -379,8 +403,10 @@ class TestDecisionStreamCallbacks:
 
     def test_callback_exception_does_not_propagate(self):
         tm = fresh_manager()
+
         def bad_cb(evt):
             raise ValueError("callback error")
+
         tm.register_decision_stream_callback("agent1", bad_cb)
         # Should not raise
         tm.emit_decision_event("agent1", MagicMock())
@@ -389,6 +415,7 @@ class TestDecisionStreamCallbacks:
 # ---------------------------------------------------------------------------
 # configure_tracing — adds custom exporter
 # ---------------------------------------------------------------------------
+
 
 class TestConfigureTracing:
     def test_custom_exporter_receives_spans(self):
@@ -420,6 +447,7 @@ class TestConfigureTracing:
 # Shutdown / flush
 # ---------------------------------------------------------------------------
 
+
 class TestShutdownFlush:
     def test_flush_does_not_raise(self):
         tm = fresh_manager()
@@ -438,13 +466,16 @@ class TestShutdownFlush:
 # Legacy compatibility functions
 # ---------------------------------------------------------------------------
 
+
 class TestLegacyCompatFunctions:
     def test_record_tokens_is_noop(self):
         from daita.core.tracing import record_tokens
+
         record_tokens("agent1", total_tokens=100)  # Should not raise
 
     def test_get_agent_tokens_returns_dict(self):
         from daita.core.tracing import get_agent_tokens
+
         result = get_agent_tokens("agent1")
         assert isinstance(result, dict)
         assert "total_tokens" in result
@@ -452,6 +483,7 @@ class TestLegacyCompatFunctions:
 
     def test_record_operation_returns_span_id(self):
         from daita.core.tracing import record_operation
+
         span_id = record_operation(
             agent_id="a1",
             agent_name="TestAgent",
@@ -466,5 +498,6 @@ class TestLegacyCompatFunctions:
 
     def test_get_recent_operations_module_level(self):
         from daita.core.tracing import get_recent_operations
+
         result = get_recent_operations()
         assert isinstance(result, list)

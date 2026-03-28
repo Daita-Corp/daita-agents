@@ -22,7 +22,6 @@ from daita.core.exceptions import FocusDSLError
 from daita.plugins.base_db import BaseDatabasePlugin
 from daita.agents.agent import _json_serializer
 
-
 # ---------------------------------------------------------------------------
 # Focus DSL filter — SQL-style injection via filter expression
 # ---------------------------------------------------------------------------
@@ -114,15 +113,17 @@ class TestFocusSQLIdentifierValidation:
         # "select" should NOT be in applied if any column failed validation
         if "select" in applied:
             # If it was applied, every column in fq.select must have passed validation
-            for col in (fq.select or []):
-                assert _IDENTIFIER_RE.match(col), f"Column '{col}' failed validation but was pushed"
+            for col in fq.select or []:
+                assert _IDENTIFIER_RE.match(
+                    col
+                ), f"Column '{col}' failed validation but was pushed"
 
     def test_filter_values_are_parameterized_not_concatenated(self):
         """
         Filter values (constants) must become parameters, not raw SQL strings.
         This is the primary SQL injection defense for filters.
         """
-        fq = parse_focus("name == \"'; DROP TABLE users; --\"")
+        fq = parse_focus('name == "\'; DROP TABLE users; --"')
         mod_sql, extra_params, applied = compile_focus_to_sql(
             "SELECT * FROM users",
             fq,
@@ -278,7 +279,9 @@ class TestReceiveMessagePayloadContainment:
         # The framed prompt will contain the closing tag inside the JSON value
         # (known limitation documented here)
         framed = f"<input_data>{encoded}</input_data>"
-        assert framed.count("</input_data>") == 2  # one in data, one as real closing tag
+        assert (
+            framed.count("</input_data>") == 2
+        )  # one in data, one as real closing tag
 
     def test_non_dict_payload_is_string_truncated(self):
         """Non-dict payloads are converted to string and truncated at 4000 chars."""

@@ -152,7 +152,9 @@ class DaitaSpanExporter(SpanExporter):
                     {
                         "name": event.name,
                         "timestamp_unix_nano": event.timestamp,
-                        "attributes": dict(event.attributes) if event.attributes else {},
+                        "attributes": (
+                            dict(event.attributes) if event.attributes else {}
+                        ),
                     }
                 )
 
@@ -171,7 +173,9 @@ class DaitaSpanExporter(SpanExporter):
                     "start_time_unix_nano": span.start_time,
                     "end_time_unix_nano": span.end_time,
                     "duration_ms": duration_ms,
-                    "status_code": span.status.status_code.name if span.status else "UNSET",
+                    "status_code": (
+                        span.status.status_code.name if span.status else "UNSET"
+                    ),
                     "status_message": span.status.description if span.status else None,
                     "attributes": attrs,
                     "events": events,

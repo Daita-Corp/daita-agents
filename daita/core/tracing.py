@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 # Public enums / dataclasses (API unchanged)
 # ---------------------------------------------------------------------------
 
+
 class TraceType(str, Enum):
     """Types of traces we capture."""
 
@@ -129,11 +130,19 @@ class TraceSpan:
             "parent_span_id": self.parent_span_id,
             "agent_id": self.agent_id,
             "operation": self.operation_name,
-            "type": self.trace_type.value if isinstance(self.trace_type, TraceType) else self.trace_type,
+            "type": (
+                self.trace_type.value
+                if isinstance(self.trace_type, TraceType)
+                else self.trace_type
+            ),
             "start_time": self.start_time,
             "end_time": self.end_time,
             "duration_ms": self.duration_ms,
-            "status": self.status.value if isinstance(self.status, TraceStatus) else self.status,
+            "status": (
+                self.status.value
+                if isinstance(self.status, TraceStatus)
+                else self.status
+            ),
             "input_preview": self._create_preview(self.input_data),
             "output_preview": self._create_preview(self.output_data),
             "error": self.error_message,
@@ -204,6 +213,7 @@ class TraceContext:
 # Attribute mapping helper
 # ---------------------------------------------------------------------------
 
+
 def _map_metadata_to_attributes(
     trace_type: Any,
     agent_id: Optional[str],
@@ -213,7 +223,9 @@ def _map_metadata_to_attributes(
     attrs: Dict[str, Any] = {}
 
     # Core daita attributes
-    type_val = trace_type.value if isinstance(trace_type, TraceType) else str(trace_type)
+    type_val = (
+        trace_type.value if isinstance(trace_type, TraceType) else str(trace_type)
+    )
     attrs["daita.trace.type"] = type_val
 
     if agent_id:
@@ -271,6 +283,7 @@ def _map_metadata_to_attributes(
 # TraceManager
 # ---------------------------------------------------------------------------
 
+
 class TraceManager:
     """
     OTel-backed tracing facade.  Public API is identical to the old
@@ -302,9 +315,7 @@ class TraceManager:
 
         # Dashboard exporter — self-disabling when env vars absent
         self._daita_exporter = DaitaSpanExporter()
-        self._provider.add_span_processor(
-            BatchSpanProcessor(self._daita_exporter)
-        )
+        self._provider.add_span_processor(BatchSpanProcessor(self._daita_exporter))
 
         # Register as the global OTel provider
         otel_trace.set_tracer_provider(self._provider)
@@ -461,12 +472,18 @@ class TraceManager:
             if span:
                 span.set_attribute("daita.decision.confidence", float(confidence))
                 if reasoning is not None:
-                    span.set_attribute("daita.decision.reasoning", json.dumps(reasoning))
+                    span.set_attribute(
+                        "daita.decision.reasoning", json.dumps(reasoning)
+                    )
                 if alternatives is not None:
-                    span.set_attribute("daita.decision.alternatives", json.dumps(alternatives))
+                    span.set_attribute(
+                        "daita.decision.alternatives", json.dumps(alternatives)
+                    )
                 if factors:
                     span.set_attribute("daita.decision.factors", json.dumps(factors))
-                logger.debug(f"Recorded decision for span {span_id} (confidence={confidence:.2f})")
+                logger.debug(
+                    f"Recorded decision for span {span_id} (confidence={confidence:.2f})"
+                )
             else:
                 logger.debug(f"Cannot record decision for unknown span: {span_id}")
         except Exception as e:
@@ -493,7 +510,9 @@ class TraceManager:
                     "gen_ai.usage.total_tokens",
                     total_tokens or (prompt_tokens + completion_tokens),
                 )
-                logger.debug(f"Recorded LLM call for span {span_id} ({total_tokens} tokens)")
+                logger.debug(
+                    f"Recorded LLM call for span {span_id} ({total_tokens} tokens)"
+                )
             else:
                 logger.debug(f"Cannot record LLM call for unknown span: {span_id}")
         except Exception as e:
@@ -529,7 +548,9 @@ class TraceManager:
             self._metrics["total_spans"] += 1
 
             # Mirror to custom contextvars
-            async with self.trace_context.span_context(hex_trace_id, hex_span_id, agent_id):
+            async with self.trace_context.span_context(
+                hex_trace_id, hex_span_id, agent_id
+            ):
                 try:
                     yield hex_span_id
                     otel_span.set_status(Status(StatusCode.OK))
@@ -556,7 +577,10 @@ class TraceManager:
     ):
         metadata.update({"tool_name": tool_name, "tool_operation": operation})
         return self.span(
-            f"tool_{tool_name}_{operation}", TraceType.TOOL_EXECUTION, agent_id, **metadata
+            f"tool_{tool_name}_{operation}",
+            TraceType.TOOL_EXECUTION,
+            agent_id,
+            **metadata,
         )
 
     # ------------------------------------------------------------------
@@ -571,7 +595,8 @@ class TraceManager:
             spans = self._memory_exporter.get_finished_spans()
             if agent_id:
                 spans = [
-                    s for s in spans
+                    s
+                    for s in spans
                     if (s.attributes or {}).get("daita.agent.id") == agent_id
                 ]
             result = [_readable_span_to_dict(s) for s in spans[-limit:]]
@@ -587,7 +612,7 @@ class TraceManager:
         return {
             **self._metrics,
             "active_spans": active,
-            "dashboard_reports_sent": 0,   # legacy field — exporter handles internally
+            "dashboard_reports_sent": 0,  # legacy field — exporter handles internally
             "dashboard_reports_failed": 0,
         }
 
@@ -595,7 +620,8 @@ class TraceManager:
         """Get metrics for a specific agent."""
         try:
             spans = [
-                s for s in self._memory_exporter.get_finished_spans()
+                s
+                for s in self._memory_exporter.get_finished_spans()
                 if (s.attributes or {}).get("daita.agent.id") == agent_id
             ]
             if not spans:
@@ -603,8 +629,7 @@ class TraceManager:
 
             total_ops = len(spans)
             successful_ops = sum(
-                1 for s in spans
-                if s.status and s.status.status_code == StatusCode.OK
+                1 for s in spans if s.status and s.status.status_code == StatusCode.OK
             )
             latencies = []
             for s in spans:
@@ -629,7 +654,8 @@ class TraceManager:
         """Get workflow communication traces (agent-to-agent messages)."""
         try:
             spans = [
-                s for s in self._memory_exporter.get_finished_spans()
+                s
+                for s in self._memory_exporter.get_finished_spans()
                 if (s.attributes or {}).get("daita.trace.type")
                 == TraceType.WORKFLOW_COMMUNICATION.value
                 and (
@@ -655,7 +681,8 @@ class TraceManager:
         """Get metrics for a specific workflow."""
         try:
             spans = [
-                s for s in self._memory_exporter.get_finished_spans()
+                s
+                for s in self._memory_exporter.get_finished_spans()
                 if (s.attributes or {}).get("daita.trace.type")
                 == TraceType.WORKFLOW_COMMUNICATION.value
                 and (s.attributes or {}).get("daita.workflow.name") == workflow_name
@@ -664,8 +691,7 @@ class TraceManager:
                 return {"total_messages": 0, "success_rate": 0}
             total = len(spans)
             successful = sum(
-                1 for s in spans
-                if s.status and s.status.status_code == StatusCode.OK
+                1 for s in spans if s.status and s.status.status_code == StatusCode.OK
             )
             return {
                 "workflow_name": workflow_name,
@@ -762,6 +788,7 @@ def get_trace_manager() -> TraceManager:
 # configure_tracing() — user-facing API for custom exporters
 # ---------------------------------------------------------------------------
 
+
 def configure_tracing(
     *,
     exporters: Optional[List["SpanExporter"]] = None,
@@ -798,9 +825,11 @@ def configure_tracing(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _get_version() -> str:
     try:
         from importlib.metadata import version
+
         return version("daita-agents")
     except Exception:
         return "unknown"
@@ -878,8 +907,10 @@ def _readable_span_to_dict(span) -> Dict[str, Any]:
         "output_preview": output_preview,
         "error": error_message,
         "metadata": {
-            k: v for k, v in attrs.items()
-            if not k.startswith("gen_ai.") and not k.startswith("daita.")
+            k: v
+            for k, v in attrs.items()
+            if not k.startswith("gen_ai.")
+            and not k.startswith("daita.")
             and not k.startswith("deployment.")
         },
         "environment": attrs.get("deployment.environment", "development"),
@@ -891,6 +922,7 @@ def _readable_span_to_dict(span) -> Dict[str, Any]:
 # Legacy compatibility functions (none are called anywhere in the codebase,
 # but kept to avoid breaking any external code that may import them)
 # ---------------------------------------------------------------------------
+
 
 def record_tokens(
     agent_id: str,

@@ -10,7 +10,6 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock
 from daita.plugins.mongodb import MongoDBPlugin
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -80,7 +79,9 @@ class TestAggregateLimit:
 
         limit_stages = [s for s in captured[0] if "$limit" in s]
         assert len(limit_stages) == 1
-        assert limit_stages[0]["$limit"] == 50  # original value preserved, not overwritten
+        assert (
+            limit_stages[0]["$limit"] == 50
+        )  # original value preserved, not overwritten
 
     async def test_empty_pipeline_gets_limit(self):
         plugin = make_plugin()
@@ -105,7 +106,9 @@ class TestAggregateLimit:
         result = await plugin._tool_aggregate(
             {
                 "collection": "sales",
-                "pipeline": [{"$group": {"_id": "$region", "total": {"$sum": "$amount"}}}],
+                "pipeline": [
+                    {"$group": {"_id": "$region", "total": {"$sum": "$amount"}}}
+                ],
             }
         )
         assert result["results"] == docs
@@ -175,9 +178,7 @@ class TestFindForwarding:
         collection_mock = _wire_collection(plugin, cursor)
         projection = {"name": 1, "email": 1, "_id": 0}
 
-        await plugin._tool_find(
-            {"collection": "users", "projection": projection}
-        )
+        await plugin._tool_find({"collection": "users", "projection": projection})
 
         call_args = collection_mock.find.call_args
         # projection is second arg to find()

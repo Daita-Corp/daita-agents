@@ -22,7 +22,6 @@ from daita.core.tools import AgentTool
 from daita.core.exceptions import AgentError
 from daita.llm.mock import MockLLMProvider
 
-
 # ---------------------------------------------------------------------------
 # Streaming-aware mock LLMs
 # ---------------------------------------------------------------------------
@@ -131,7 +130,9 @@ class TestStreamBasic:
 
         assert len(events) > 0
         for event in events:
-            assert isinstance(event, AgentEvent), f"Expected AgentEvent, got {type(event)}"
+            assert isinstance(
+                event, AgentEvent
+            ), f"Expected AgentEvent, got {type(event)}"
 
     async def test_stream_yields_complete_event(self):
         """COMPLETE event must be emitted at the end of a successful run."""
@@ -205,7 +206,11 @@ class TestStreamToolEvents:
         tool = make_tool("add")
         llm = StreamingSequentialLLM(
             [
-                {"tool_calls": [{"id": "c1", "name": "add", "arguments": {"a": 3, "b": 4}}]},
+                {
+                    "tool_calls": [
+                        {"id": "c1", "name": "add", "arguments": {"a": 3, "b": 4}}
+                    ]
+                },
                 "The sum is 7.",
             ]
         )
@@ -224,7 +229,11 @@ class TestStreamToolEvents:
         tool = make_tool("add")
         llm = StreamingSequentialLLM(
             [
-                {"tool_calls": [{"id": "c1", "name": "add", "arguments": {"a": 2, "b": 5}}]},
+                {
+                    "tool_calls": [
+                        {"id": "c1", "name": "add", "arguments": {"a": 2, "b": 5}}
+                    ]
+                },
                 "The answer is 7.",
             ]
         )
@@ -243,7 +252,11 @@ class TestStreamToolEvents:
         tool = make_tool("add")
         llm = StreamingSequentialLLM(
             [
-                {"tool_calls": [{"id": "c1", "name": "add", "arguments": {"a": 1, "b": 1}}]},
+                {
+                    "tool_calls": [
+                        {"id": "c1", "name": "add", "arguments": {"a": 1, "b": 1}}
+                    ]
+                },
                 "Done.",
             ]
         )

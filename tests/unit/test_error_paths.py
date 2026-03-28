@@ -25,7 +25,6 @@ from daita.plugins.base import LifecyclePlugin
 
 from tests.conftest import SequentialMockLLM
 
-
 # ---------------------------------------------------------------------------
 # _execute_tool_call — error dict shapes
 # ---------------------------------------------------------------------------
@@ -195,7 +194,9 @@ class TestResolveTools:
             parameters={"type": "object", "properties": {}, "required": []},
             handler=h,
         )
-        agent = Agent(name="TestAgent", llm_provider=MockLLMProvider(delay=0), tools=[tool])
+        agent = Agent(
+            name="TestAgent", llm_provider=MockLLMProvider(delay=0), tools=[tool]
+        )
         resolved = agent._resolve_tools(None)
         assert any(t.name == "my_tool" for t in resolved)
 
@@ -300,7 +301,13 @@ class TestLoopDetection:
             "tool_calls": [{"id": "c1", "name": "fail_tool", "arguments": {"x": 1}}],
         }
         llm = SequentialMockLLM(
-            response_sequence=[same_call, same_call, same_call, same_call, "Final answer"]
+            response_sequence=[
+                same_call,
+                same_call,
+                same_call,
+                same_call,
+                "Final answer",
+            ]
         )
 
         agent = Agent(name="LoopAgent", llm_provider=llm, tools=[fail_tool])

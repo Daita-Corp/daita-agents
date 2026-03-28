@@ -12,7 +12,6 @@ from daita.plugins.base_db import BaseDatabasePlugin
 from daita.core.exceptions import ValidationError, PluginError
 from daita.core.exceptions import ConnectionError as DaitaConnectionError
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -173,9 +172,7 @@ class TestHandleConnectionError:
     def test_generic_error_raises_daita_connection_error(self):
         plugin = make_plugin()
         with pytest.raises(DaitaConnectionError):
-            plugin._handle_connection_error(
-                RuntimeError("connection refused"), "query"
-            )
+            plugin._handle_connection_error(RuntimeError("connection refused"), "query")
 
     def test_error_message_includes_operation(self):
         plugin = make_plugin()

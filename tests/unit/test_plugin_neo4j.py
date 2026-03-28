@@ -11,7 +11,6 @@ import pytest
 from daita.plugins.neo4j_graph import Neo4jPlugin
 from daita.core.exceptions import PluginError
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -111,7 +110,9 @@ class TestLimitInjection:
         plugin = make_plugin()
         captured = stub_query(plugin)
         params = {"name": "Alice"}
-        await plugin._tool_query({"cypher": "MATCH (n {name: $name}) RETURN n", "parameters": params})
+        await plugin._tool_query(
+            {"cypher": "MATCH (n {name: $name}) RETURN n", "parameters": params}
+        )
         assert captured[0]["params"] == params
 
     async def test_result_shape_from_query(self):
@@ -141,7 +142,9 @@ class TestIntrospectionCypherContent:
         plugin = make_plugin()
         stub_query(
             plugin,
-            records_by_cypher={"db.labels": [{"label": "Person"}, {"label": "Company"}]},
+            records_by_cypher={
+                "db.labels": [{"label": "Person"}, {"label": "Company"}]
+            },
         )
         result = await plugin._tool_list_labels({})
         assert result["labels"] == ["Person", "Company"]
@@ -196,7 +199,9 @@ class TestIntrospectionCypherContent:
 class TestFindNodes:
     async def test_result_has_nodes_and_count(self):
         plugin = make_plugin()
-        stub_query(plugin, default_records=[{"n": {"name": "Alice"}}, {"n": {"name": "Bob"}}])
+        stub_query(
+            plugin, default_records=[{"n": {"name": "Alice"}}, {"n": {"name": "Bob"}}]
+        )
         result = await plugin._tool_find_nodes({"label": "Person"})
         assert "nodes" in result
         assert "count" in result
@@ -223,7 +228,9 @@ class TestFindNodes:
     async def test_properties_included_in_match_condition(self):
         plugin = make_plugin()
         captured = stub_query(plugin, default_records=[])
-        await plugin._tool_find_nodes({"label": "Person", "properties": {"name": "Alice"}})
+        await plugin._tool_find_nodes(
+            {"label": "Person", "properties": {"name": "Alice"}}
+        )
         assert any("$name" in c["cypher"] for c in captured)
 
     async def test_nodes_extracted_from_n_key(self):
@@ -326,7 +333,11 @@ class TestGetNeighbors:
         stub_query(
             plugin,
             default_records=[
-                {"m": {"name": "Bob"}, "relationship_type": "KNOWS", "r": {"since": 2020}}
+                {
+                    "m": {"name": "Bob"},
+                    "relationship_type": "KNOWS",
+                    "r": {"since": 2020},
+                }
             ],
         )
         result = await plugin._tool_get_neighbors(
@@ -341,7 +352,11 @@ class TestGetNeighbors:
         plugin = make_plugin()
         captured = stub_query(plugin, default_records=[])
         await plugin._tool_get_neighbors(
-            {"label": "Person", "properties": {"name": "Alice"}, "direction": "outgoing"}
+            {
+                "label": "Person",
+                "properties": {"name": "Alice"},
+                "direction": "outgoing",
+            }
         )
         # Outgoing should produce -[r]->
         assert any("->" in c["cypher"] for c in captured)
@@ -350,7 +365,11 @@ class TestGetNeighbors:
         plugin = make_plugin()
         captured = stub_query(plugin, default_records=[])
         await plugin._tool_get_neighbors(
-            {"label": "Person", "properties": {"name": "Alice"}, "direction": "incoming"}
+            {
+                "label": "Person",
+                "properties": {"name": "Alice"},
+                "direction": "incoming",
+            }
         )
         # Incoming should produce <-[r]-
         assert any("<-" in c["cypher"] for c in captured)
