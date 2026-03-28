@@ -77,7 +77,7 @@ class TracedPlugin:
         self, method: Callable, method_name: str, args: tuple, kwargs: dict
     ):
         """Trace an async plugin method."""
-        from .tracing import TraceType, TraceStatus
+        from .tracing import TraceType
 
         async with self._trace_manager.span(
             operation_name=f"{self._plugin_name}_{method_name}",
@@ -86,34 +86,21 @@ class TracedPlugin:
             tool_operation=method_name,
             input_data=self._prepare_input_data(args, kwargs),
         ) as span_id:
+            result = await method(*args, **kwargs)
 
-            start_time = time.time()
-            try:
-                result = await method(*args, **kwargs)
+            # Attach result metadata as span attributes; span() handles OK/ERROR status
+            metadata = self._extract_result_metadata(result)
+            for k, v in metadata.items():
+                if isinstance(v, (str, bool, int, float)):
+                    try:
+                        with self._trace_manager._otel_spans_lock:
+                            otel_span = self._trace_manager._otel_spans.get(span_id)
+                        if otel_span:
+                            otel_span.set_attribute(f"daita.plugin.{k}", v)
+                    except Exception:
+                        pass
 
-                # Extract metadata from result
-                metadata = self._extract_result_metadata(result)
-
-                # Update span with success metadata
-                self._trace_manager.end_span(
-                    span_id=span_id,
-                    status=TraceStatus.SUCCESS,
-                    output_data=result,
-                    duration_ms=(time.time() - start_time) * 1000,
-                    **metadata,
-                )
-
-                return result
-
-            except Exception as e:
-                # Update span with error metadata
-                self._trace_manager.end_span(
-                    span_id=span_id,
-                    status=TraceStatus.ERROR,
-                    error_message=str(e),
-                    duration_ms=(time.time() - start_time) * 1000,
-                )
-                raise
+            return result
 
     def _trace_sync_method(
         self, method: Callable, method_name: str, args: tuple, kwargs: dict

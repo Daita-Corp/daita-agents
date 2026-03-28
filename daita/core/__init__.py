@@ -68,18 +68,18 @@ from .focus import (
     FocusDSLError,
 )
 
-# Unified Tracing System - Automatic observability for all operations
+# Unified Tracing System - OTel-backed automatic observability for all operations
 from .tracing import (
     # Main tracing interface
     get_trace_manager,
     TraceManager,
+    configure_tracing,
     # Trace types and status
     TraceType,
     TraceStatus,
     # Core tracing components
     TraceSpan,
     TraceContext,
-    DashboardReporter,
 )
 
 # Plugin Tracing System - Automatic tool execution monitoring
@@ -166,17 +166,17 @@ __all__ = [
     "parse_focus",
     "register_backend",
     "FocusDSLError",
-    # === Unified Tracing System ===
+    # === Unified Tracing System (OTel-backed) ===
     # Main tracing interface
     "get_trace_manager",
     "TraceManager",
+    "configure_tracing",
     # Trace types and status
     "TraceType",
     "TraceStatus",
     # Core tracing components
     "TraceSpan",
     "TraceContext",
-    "DashboardReporter",
     # === Plugin Tracing System ===
     # Main plugin tracing
     "trace_plugin",

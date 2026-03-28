@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daita-agents"
-version = "0.12.1"
+version = "0.13.0"
 description = "Daita Agents - Data focused AI agent framework with free local use and premium hosted enterprise features"
 readme = "README.md"
 authors = [{name = "Daita", email = "support@daita-tech.io"}]
@@ -29,11 +29,11 @@ dependencies = [
     "aiohttp>=3.8.0",         # HTTP client for internal framework operations
     "python-dotenv>=1.0.0",   # Environment variable loading
 
-    # CLI essentials (needed for daita commands)
-    "click>=8.0.0",           # CLI framework
-    "PyYAML>=6.0.0",          # Config file parsing (required by CLI and framework)
+    # CLI (daita-cli owns all CLI and MCP concerns)
+    "daita-cli>=0.1.0",       # Standalone CLI + MCP server
+    "PyYAML>=6.0.0",          # Config file parsing (required by framework)
     "croniter>=1.0.0",        # Cron expression parsing for scheduling
-    "aiofiles>=24.1.0",       # Async file operations (framework + CLI)
+    "aiofiles>=24.1.0",       # Async file operations (framework)
 
     # Default LLM provider (most common starting point - enables immediate usage)
     "openai>=1.0.0",          # Primary LLM provider
@@ -42,6 +42,10 @@ dependencies = [
     "certifi>=2025.4.0",      # SSL certificates
     "PyJWT>=2.10.0",          # JWT token handling
     "numpy>=1.20.0",          # Required by memory plugin for semantic search (cosine similarity)
+
+    # Observability — OTel is the sole tracing engine (powers dashboard + Datadog/Jaeger/etc.)
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
 ]
 
 [project.urls]
@@ -98,6 +102,9 @@ production = [
 
 anthropic = ["anthropic>=0.5.0"]
 google = ["google-genai>=0.3.0"]
+
+# OTLP exporter — for exporting spans to Datadog, Jaeger, Honeycomb, etc.
+otlp = ["opentelemetry-exporter-otlp>=1.20.0"]
 
 # Data quality plugin — advanced anomaly detection (z-score via scipy)
 data-quality = ["scipy>=1.10.0"]
@@ -275,6 +282,8 @@ all = [
     "fastapi>=0.115.0",
     "uvicorn>=0.34.0",
     "python-multipart>=0.0.20",
+    # OTLP exporter
+    "opentelemetry-exporter-otlp>=1.20.0",
 ]
 
 # Development dependencies
@@ -287,9 +296,6 @@ dev = [
     "pre-commit>=3.0.0",
     "aiosqlite>=0.21.0",  # used by sqlite unit tests (lightweight, built-in Python SQLite)
 ]
-
-[project.scripts]
-daita = "daita.cli.main:main"
 
 [tool.setuptools.packages.find]
 include = ["daita*"]
