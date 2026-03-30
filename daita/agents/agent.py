@@ -327,7 +327,9 @@ class Agent(BaseAgent):
         # MCP server integration — setup happens lazily on first use
         self.mcp_registry = None
         self.mcp_tools = []
-        self._mcp_server_configs = ([mcp] if isinstance(mcp, dict) else mcp) if mcp is not None else []
+        self._mcp_server_configs = (
+            ([mcp] if isinstance(mcp, dict) else mcp) if mcp is not None else []
+        )
 
         # Plugin access for direct plugin usage
         self.plugins = PluginAccess()
@@ -628,6 +630,10 @@ class Agent(BaseAgent):
             result["processing_time_ms"] = (time.time() - start_time) * 1000
             result["agent_id"] = self.agent_id
             result["agent_name"] = self.name
+            # Capture OTel trace_id while the span is still live
+            result["_daita_trace_id"] = (
+                self.trace_manager.trace_context.current_trace_id
+            )
 
             # Append completed turn to conversation history
             if history is not None:
@@ -742,7 +748,9 @@ class Agent(BaseAgent):
     ) -> LLMResult:
         """Execute non-streaming LLM turn."""
         return LLMResult.from_response(
-            await self.llm.generate(messages=conversation, tools=tools, stream=False, **kwargs)
+            await self.llm.generate(
+                messages=conversation, tools=tools, stream=False, **kwargs
+            )
         )
 
     async def _execute_and_track_tool(
