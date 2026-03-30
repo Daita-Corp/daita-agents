@@ -265,20 +265,17 @@ class Agent(BaseAgent):
     ):
         """Initialize Agent with smart constructor auto-configuration."""
         # Store LLM provider config for lazy initialization
-        if isinstance(llm_provider, str) or llm_provider is None:
+        self._llm_kwargs = kwargs
+        if llm_provider is None or isinstance(llm_provider, str):
             # Defer LLM provider creation until first use
             self._llm_provider_name = llm_provider or self._default_llm_provider
             self._llm_model = model or self._default_model
             self._llm_api_key = api_key
-            self._llm_kwargs = kwargs  # only LLM provider options remain
             self._llm = None
             llm_provider_to_pass = None
         else:
             # User provided an actual LLM provider instance
-            self._llm_provider_name = None
-            self._llm_model = None
-            self._llm_api_key = None
-            self._llm_kwargs = kwargs
+            self._llm_provider_name = self._llm_model = self._llm_api_key = None
             self._llm = llm_provider
             llm_provider_to_pass = llm_provider
 
@@ -327,16 +324,10 @@ class Agent(BaseAgent):
         # Tool call history tracking for operations metadata
         self._tool_call_history = []
 
-        # MCP server integration
+        # MCP server integration — setup happens lazily on first use
         self.mcp_registry = None
         self.mcp_tools = []
-        if mcp is not None:
-            # Normalize to list
-            mcp_servers = [mcp] if isinstance(mcp, dict) else mcp
-            self._mcp_server_configs = mcp_servers
-            # MCP setup happens lazily on first use to avoid blocking init
-        else:
-            self._mcp_server_configs = []
+        self._mcp_server_configs = ([mcp] if isinstance(mcp, dict) else mcp) if mcp is not None else []
 
         # Plugin access for direct plugin usage
         self.plugins = PluginAccess()
@@ -612,34 +603,26 @@ class Agent(BaseAgent):
                 history._set_workspace(self.agent_id)
                 kwargs["initial_messages"] = history.messages
 
-            # Collapse retry/non-retry into a single awaitable so timeout
-            # wraps both paths identically without duplicating the branch.
-            async def _run_inner() -> Dict[str, Any]:
-                if self.config.retry_enabled:
-                    return await self._execute_autonomous_with_retry(
-                        prompt=prompt,
-                        tools=tools,
-                        max_iterations=max_iterations,
-                        on_event=on_event,
-                        **kwargs,
-                    )
-                return await self._execute_autonomous(
-                    prompt=prompt,
-                    tools=tools,
-                    max_iterations=max_iterations,
-                    on_event=on_event,
-                    **kwargs,
-                )
+            execute_fn = (
+                self._execute_autonomous_with_retry
+                if self.config.retry_enabled
+                else self._execute_autonomous
+            )
+            coro = execute_fn(
+                prompt=prompt,
+                tools=tools,
+                max_iterations=max_iterations,
+                on_event=on_event,
+                **kwargs,
+            )
 
             if timeout_seconds is not None:
                 try:
-                    result = await asyncio.wait_for(
-                        _run_inner(), timeout=timeout_seconds
-                    )
+                    result = await asyncio.wait_for(coro, timeout=timeout_seconds)
                 except asyncio.TimeoutError:
                     raise AgentError(f"Run timed out after {timeout_seconds}s")
             else:
-                result = await _run_inner()
+                result = await coro
 
             # Enrich result with metadata
             result["processing_time_ms"] = (time.time() - start_time) * 1000
@@ -758,11 +741,9 @@ class Agent(BaseAgent):
         self, conversation: List[Dict], tools: List["AgentTool"], **kwargs
     ) -> LLMResult:
         """Execute non-streaming LLM turn."""
-        response = await self.llm.generate(
-            messages=conversation, tools=tools, stream=False, **kwargs
+        return LLMResult.from_response(
+            await self.llm.generate(messages=conversation, tools=tools, stream=False, **kwargs)
         )
-
-        return LLMResult.from_response(response)
 
     async def _execute_and_track_tool(
         self,
@@ -830,13 +811,14 @@ class Agent(BaseAgent):
         from ..core.streaming import EventType
 
         token_stats = self.llm.get_token_stats()
+        cost = token_stats.get("estimated_cost", 0.0)
 
         result = {
             "result": final_text,
             "tool_calls": tools_called,
             "iterations": iterations,
             "tokens": token_stats,
-            "cost": token_stats.get("estimated_cost", 0.0),
+            "cost": cost,
         }
 
         # Emit completion event with all metadata
@@ -846,7 +828,7 @@ class Agent(BaseAgent):
             final_result=final_text,
             iterations=iterations,
             token_usage=token_stats,
-            cost=token_stats.get("estimated_cost", 0.0),
+            cost=cost,
         )
 
         return result
@@ -1043,6 +1025,14 @@ class Agent(BaseAgent):
     # SYSTEM INTEGRATION API - What infrastructure calls
     # ========================================================================
 
+    def _frame_payload(self, data: Any, tag: str) -> str:
+        """Wrap data in an XML-like tag for safe LLM framing (prevents prompt injection)."""
+        if isinstance(data, (dict, list)):
+            return f"\n\n<{tag}>{json.dumps(data, default=_json_serializer)}</{tag}>"
+        elif data is not None:
+            return f"\n\n<{tag}>{str(data)[:4000]}</{tag}>"
+        return ""
+
     async def receive_message(
         self,
         data: Any,
@@ -1053,12 +1043,7 @@ class Agent(BaseAgent):
     ) -> Dict[str, Any]:
         """Handle workflow relay message from another agent. Called automatically by workflow system."""
         prompt = "A message has arrived from the workflow system. Process the input data below."
-
-        # Frame data as content, not as instructions, to prevent prompt injection
-        if isinstance(data, (dict, list)):
-            prompt += f"\n\n<input_data>{json.dumps(data, default=_json_serializer)}</input_data>"
-        elif data is not None:
-            prompt += f"\n\n<input_data>{str(data)[:4000]}</input_data>"
+        prompt += self._frame_payload(data, "input_data")
 
         result = await self.run(prompt, detailed=True, **kwargs)
 
@@ -1086,12 +1071,7 @@ class Agent(BaseAgent):
         ]
 
         # Inject payload as structured content so the agent can act on it
-        if isinstance(payload, (dict, list)):
-            instructions += f"\n\n<webhook_payload>{json.dumps(payload, default=_json_serializer)}</webhook_payload>"
-        elif payload:
-            instructions += (
-                f"\n\n<webhook_payload>{str(payload)[:4000]}</webhook_payload>"
-            )
+        instructions += self._frame_payload(payload, "webhook_payload")
 
         result = await self.run(instructions, detailed=True)
 
