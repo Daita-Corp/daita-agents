@@ -312,20 +312,17 @@ class BaseAgent(AgentABC):
         try:
             async for raw_value in config.source.events():
                 try:
+                    state._previous_value = raw_value
                     if self._should_trigger(config, state, raw_value):
                         event = self._build_watch_event(config, state, raw_value)
                         state.triggered = True
-                        state._previous_value = raw_value
                         await self._invoke_handler(config.handler, event, config)
                     elif config.on_resolve and state.triggered:
                         state.triggered = False
                         event = self._build_watch_event(
                             config, state, raw_value, resolved=True
                         )
-                        state._previous_value = raw_value
                         await self._invoke_handler(config.handler, event, config)
-                    else:
-                        state._previous_value = raw_value
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -363,6 +360,14 @@ class BaseAgent(AgentABC):
             previous_value=state._previous_value,
         )
 
+    async def _call_on_error(self, config: Any, error: Exception) -> None:
+        """Dispatch to config.on_error, swallowing any secondary exceptions."""
+        if config.on_error:
+            try:
+                await config.on_error(error)
+            except Exception:
+                pass
+
     async def _invoke_handler(self, handler: Callable, event: Any, config: Any) -> None:
         """Call the watch handler, isolating exceptions from the watch loop."""
         try:
@@ -373,18 +378,10 @@ class BaseAgent(AgentABC):
         except asyncio.TimeoutError:
             msg = f"Watch handler '{config.name}' timed out after {config.handler_timeout}s"
             logger.error(msg)
-            if config.on_error:
-                try:
-                    await config.on_error(TimeoutError(msg))
-                except Exception:
-                    pass
+            await self._call_on_error(config, TimeoutError(msg))
         except Exception as e:
             logger.error(f"Watch handler '{config.name}' raised: {e}")
-            if config.on_error:
-                try:
-                    await config.on_error(e)
-                except Exception:
-                    pass
+            await self._call_on_error(config, e)
 
     async def _process(
         self,
@@ -564,6 +561,7 @@ class BaseAgent(AgentABC):
         """Get agent health information from unified tracing system."""
         # Get real-time metrics from trace manager
         metrics = self.trace_manager.get_agent_metrics(self.agent_id)
+        retry_policy = self.config.retry_policy if self.config.retry_enabled else None
 
         return {
             "id": self.agent_id,
@@ -574,16 +572,8 @@ class BaseAgent(AgentABC):
             "watches": self.watch_status(),
             "retry_config": {
                 "enabled": self.config.retry_enabled,
-                "max_retries": (
-                    self.config.retry_policy.max_retries
-                    if self.config.retry_enabled
-                    else None
-                ),
-                "strategy": (
-                    self.config.retry_policy.strategy.value
-                    if self.config.retry_enabled
-                    else None
-                ),
+                "max_retries": retry_policy.max_retries if retry_policy else None,
+                "strategy": retry_policy.strategy.value if retry_policy else None,
             },
             "tracing": {
                 "enabled": True,

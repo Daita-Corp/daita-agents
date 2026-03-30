@@ -253,6 +253,10 @@ def _map_metadata_to_attributes(
     if metadata.get("alternatives") is not None:
         attrs["daita.decision.alternatives"] = json.dumps(metadata["alternatives"])
 
+    # Agent input — captured from prompt kwarg passed to span()
+    if metadata.get("prompt"):
+        attrs["daita.agent.prompt"] = str(metadata["prompt"])[:2000]
+
     # Tool attributes
     if metadata.get("tool_name"):
         attrs["daita.tool.name"] = str(metadata["tool_name"])
