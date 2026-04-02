@@ -1,0 +1,12 @@
+name: infrastructure-catalog
+version: 1.0.0
+description: Discover and catalog data stores across AWS and GitHub
+created_at: '2026-04-02T00:00:00'
+
+agents:
+  - name: catalog_agent
+    description: Discovers data stores across AWS accounts and GitHub repos
+    file: agents/catalog_agent.py
+    enabled: true
+
+workflows: []

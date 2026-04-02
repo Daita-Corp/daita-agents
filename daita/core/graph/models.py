@@ -27,6 +27,9 @@ class NodeType(str, Enum):
     FILE = "file"
     METRIC = "metric"
     QUERY = "query"
+    DATABASE = "database"
+    BUCKET = "bucket"
+    SERVICE = "service"
 
 
 class EdgeType(str, Enum):
