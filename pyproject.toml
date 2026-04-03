@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daita-agents"
-version = "0.13.2"
+version = "0.14.0"
 description = "Daita Agents - Data focused AI agent framework with free local use and premium hosted enterprise features"
 readme = "README.md"
 authors = [{name = "Daita", email = "support@daita-tech.io"}]
@@ -127,6 +127,7 @@ mongodb = ["motor>=3.0.0"]
 sqlite = ["aiosqlite>=0.21.0", "SQLAlchemy>=2.0.0"]
 snowflake = ["snowflake-connector-python>=3.0.0", "cryptography>=3.0.0"]
 elasticsearch = ["elasticsearch>=8.0.0"]
+bigquery = ["google-cloud-bigquery>=3.0.0"]
 
 # Convenience bundle - all traditional databases
 databases = [
@@ -137,7 +138,8 @@ databases = [
     "motor>=3.0.0",
     "aiosqlite>=0.21.0",
     "snowflake-connector-python>=3.0.0",
-    "elasticsearch>=8.0.0"
+    "elasticsearch>=8.0.0",
+    "google-cloud-bigquery>=3.0.0"
 ]
 
 # =============================================================================
@@ -251,6 +253,7 @@ all = [
     "snowflake-connector-python>=3.0.0",
     "cryptography>=3.0.0",
     "elasticsearch>=8.0.0",
+    "google-cloud-bigquery>=3.0.0",
     # All vector databases
     "chromadb>=1.3.0",
     "pinecone>=5.0.0",

@@ -174,6 +174,12 @@ from .websearch import WebSearchPlugin, websearch
 # Messaging plugins
 from .redis_messaging import RedisMessagingPlugin, redis_messaging
 
+# Redis data store plugin
+from .redis import RedisPlugin, redis
+
+# BigQuery plugin
+from .bigquery import BigQueryPlugin, bigquery
+
 # MCP plugin
 from . import mcp
 
@@ -265,6 +271,14 @@ class PluginAccess:
         """Create Redis messaging plugin."""
         return redis_messaging(**kwargs)
 
+    def redis(self, **kwargs) -> RedisPlugin:
+        """Create Redis data store plugin."""
+        return redis(**kwargs)
+
+    def bigquery(self, **kwargs) -> BigQueryPlugin:
+        """Create BigQuery plugin."""
+        return bigquery(**kwargs)
+
     def catalog(self, **kwargs) -> CatalogPlugin:
         """Create Catalog plugin for schema discovery."""
         return catalog(**kwargs)
@@ -317,6 +331,8 @@ __all__ = [
     "ElasticsearchPlugin",
     "WebSearchPlugin",
     "RedisMessagingPlugin",
+    "RedisPlugin",
+    "BigQueryPlugin",
     "CatalogPlugin",
     "LineagePlugin",
     "Neo4jPlugin",
@@ -341,6 +357,8 @@ __all__ = [
     "elasticsearch",
     "websearch",
     "redis_messaging",
+    "redis",
+    "bigquery",
     "catalog",
     "lineage",
     "neo4j",
