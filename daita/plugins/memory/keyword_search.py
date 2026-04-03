@@ -215,29 +215,3 @@ class BM25Scorer:
             return [0.0] * len(raw_scores)
         return [min(s / max_score, 1.0) for s in raw_scores]
 
-    def score_and_normalize(self, query: List[str], document: str) -> float:
-        """
-        Convenience method: score a single document and normalize within the corpus.
-
-        Uses score_all_normalized internally so normalization is consistent.
-        Prefer score_all_normalized() when scoring all documents in a loop.
-
-        Args:
-            query: Query keywords
-            document: Document text (must be in self.documents)
-
-        Returns:
-            Normalized score [0, 1]
-        """
-        normalized = self.score_all_normalized(query)
-        try:
-            idx = self.documents.index(document)
-            return normalized[idx]
-        except ValueError:
-            raw = self.score(query, document)
-            corpus_max = (
-                max(self.score(query, d) for d in self.documents)
-                if self.documents
-                else 0.0
-            )
-            return min(raw / corpus_max, 1.0) if corpus_max > 0 else 0.0

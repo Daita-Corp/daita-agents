@@ -3,10 +3,14 @@ Tests for the Infrastructure Catalog Agent.
 
 Agent creation and discoverer configuration are tested without any cloud
 credentials. Integration tests that need AWS or GitHub are skipped automatically.
+Memory plugin integration is tested with mocked embeddings (no API keys needed).
 """
 
+import json
 import os
+import sqlite3
 import sys
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -22,27 +26,45 @@ class TestAgentCreation:
     def test_agent_can_be_created(self):
         from agents.catalog_agent import create_agent
 
-        agent = create_agent()
+        agent = create_agent(enable_memory=False)
         assert agent is not None
         assert agent.name == "Infrastructure Catalog Agent"
 
     def test_agent_with_custom_regions(self):
         from agents.catalog_agent import create_agent
 
-        agent = create_agent(aws_regions=["us-west-2", "eu-west-1"])
+        agent = create_agent(aws_regions=["us-west-2", "eu-west-1"], enable_memory=False)
         assert agent is not None
 
     def test_agent_with_github_repos(self):
         from agents.catalog_agent import create_agent
 
-        agent = create_agent(github_repos=["myorg/myrepo"])
+        agent = create_agent(github_repos=["myorg/myrepo"], enable_memory=False)
         assert agent is not None
 
     def test_agent_with_github_org(self):
         from agents.catalog_agent import create_agent
 
-        agent = create_agent(github_org="myorg")
+        agent = create_agent(github_org="myorg", enable_memory=False)
         assert agent is not None
+
+    def test_agent_with_memory_disabled(self):
+        from agents.catalog_agent import create_agent
+
+        agent = create_agent(enable_memory=False)
+        assert agent is not None
+
+    def test_agent_has_memory_tools(self, monkeypatch):
+        from agents.catalog_agent import create_agent
+        from daita.plugins.memory import MemoryPlugin
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-fake-key")
+        agent = create_agent()
+        # Check registered tools include memory tools
+        tool_names = set(agent.tool_registry.tool_names)
+        assert "remember" in tool_names
+        assert "recall" in tool_names
+        assert "list_memories" in tool_names
 
 
 # ---------------------------------------------------------------------------
@@ -446,3 +468,236 @@ class TestAPIGatewayIntegration:
         matching = [p for p in catalog._profilers if p.supports("apigateway")]
         assert len(matching) == 1
         assert isinstance(matching[0], APIGatewayProfiler)
+
+
+# ---------------------------------------------------------------------------
+# Memory plugin integration (mocked embeddings — no API keys needed)
+# ---------------------------------------------------------------------------
+
+
+def _fake_embedding(text, dim=8):
+    """Deterministic fake embedding from text hash."""
+    import hashlib
+    h = hashlib.md5(text.encode()).hexdigest()
+    return [int(c, 16) / 15.0 for c in h[:dim]]
+
+
+async def _mock_embed_text(self, text):
+    return _fake_embedding(text)
+
+
+async def _mock_embed_texts(self, texts):
+    return [_fake_embedding(t) for t in texts]
+
+
+class TestMemoryIntegration:
+    """Test memory plugin features using the infrastructure catalog context."""
+
+    def _make_backend(self, tmp_path):
+        from daita.plugins.memory.local_backend import LocalMemoryBackend
+        from daita.plugins.memory.search import SQLiteVectorSearch
+
+        with patch.object(SQLiteVectorSearch, "__init__", lambda self, *a, **kw: None):
+            backend = LocalMemoryBackend(
+                workspace="test-infra-catalog",
+                agent_id="catalog_agent",
+                scope="project",
+                base_dir=tmp_path,
+            )
+        search = SQLiteVectorSearch.__new__(SQLiteVectorSearch)
+        search.db_path = backend.vector_db
+        search.embedding_provider = "openai"
+        search.embedding_model = "test"
+        search._embed_cache = {}
+        search._init_database()
+        backend.search = search
+        return backend
+
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text)
+    async def test_batch_store_infrastructure_discoveries(self, tmp_path):
+        """Simulate batch-storing discovered stores — tests batch remember."""
+        backend = self._make_backend(tmp_path)
+
+        discoveries = [
+            {"content": "RDS: orders-db (PostgreSQL) in us-east-1, environment=production", "importance": 0.8, "category": "store"},
+            {"content": "RDS: users-db (PostgreSQL) in us-east-1, environment=production", "importance": 0.8, "category": "store"},
+            {"content": "DynamoDB: sessions in us-east-1, environment=production", "importance": 0.8, "category": "store"},
+            {"content": "S3: data-lake-staging in us-west-2, environment=staging", "importance": 0.6, "category": "store"},
+            {"content": "ElastiCache: cache-dev in us-east-1, environment=dev", "importance": 0.4, "category": "store"},
+        ]
+
+        result = await backend.remember_batch(discoveries)
+        assert result["status"] == "success"
+        assert result["stored"] == 5
+        assert result["skipped"] == 0
+
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text)
+    async def test_memory_stats_after_discovery(self, tmp_path):
+        """After batch-storing, stats should reflect categories."""
+        backend = self._make_backend(tmp_path)
+
+        stores = [
+            {"content": "RDS: orders-db in us-east-1", "importance": 0.8, "category": "store"},
+            {"content": "RDS: users-db in us-east-1", "importance": 0.8, "category": "store"},
+        ]
+        rules = [
+            {"content": "Production databases must have encryption enabled", "importance": 0.9, "category": "rule"},
+        ]
+        await backend.remember_batch(stores)
+        await backend.remember_batch(rules)
+
+        stats = await backend.get_stats()
+        assert stats["total_memories"] == 3
+        assert stats["categories"]["store"]["count"] == 2
+        assert stats["categories"]["rule"]["count"] == 1
+        assert stats["categories"]["rule"]["avg_importance"] == 0.9
+
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text)
+    async def test_recall_by_category(self, tmp_path):
+        """list_by_category should enumerate all stores without semantic search."""
+        backend = self._make_backend(tmp_path)
+
+        await backend.remember_batch([
+            {"content": "RDS: orders-db (production)", "importance": 0.8, "category": "store"},
+            {"content": "RDS: users-db (production)", "importance": 0.8, "category": "store"},
+            {"content": "Encryption must be enabled", "importance": 0.9, "category": "rule"},
+        ])
+
+        stores = await backend.list_by_category("store")
+        assert len(stores) == 2
+        assert all("RDS:" in s["content"] for s in stores)
+
+        rules = await backend.list_by_category("rule")
+        assert len(rules) == 1
+        assert "Encryption" in rules[0]["content"]
+
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text)
+    async def test_temporal_recall(self, tmp_path):
+        """Recall with since should filter to recent discoveries."""
+        from datetime import datetime, timedelta
+        from daita.plugins.memory.metadata import MemoryMetadata
+
+        backend = self._make_backend(tmp_path)
+
+        # Store an old discovery
+        old_meta = MemoryMetadata(
+            content="Old S3 bucket from last month",
+            importance=0.6,
+            category="store",
+            created_at=datetime.now() - timedelta(days=30),
+        )
+        await backend.search.store_chunk(
+            "Old S3 bucket from last month", old_meta, chunk_id="old_store"
+        )
+
+        # Store a recent discovery
+        await backend.remember_batch([
+            {"content": "New RDS instance discovered today", "importance": 0.8, "category": "store"},
+        ])
+
+        # Recall since 7 days ago
+        since = (datetime.now() - timedelta(days=7)).isoformat()
+        results = await backend.recall("store", limit=10, score_threshold=0.0, since=since)
+        contents = [r["content"] for r in results]
+        assert "New RDS instance discovered today" in contents
+        assert "Old S3 bucket from last month" not in contents
+
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text)
+    async def test_pinned_rules_always_injected(self, tmp_path):
+        """Pinned org rules should appear in on_before_run regardless of query."""
+        from daita.plugins.memory.metadata import MemoryMetadata
+
+        backend = self._make_backend(tmp_path)
+
+        # Store a pinned org rule
+        rule_meta = MemoryMetadata(
+            content="All production databases must have encryption enabled",
+            importance=1.0,
+            source="user_explicit",
+            category="rule",
+            pinned=True,
+        )
+        await backend.search.store_chunk(
+            "All production databases must have encryption enabled",
+            rule_meta,
+            chunk_id="pinned_rule",
+        )
+
+        pinned = await backend.get_pinned_memories()
+        assert len(pinned) == 1
+        assert "encryption" in pinned[0]["content"]
+
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text)
+    async def test_query_facts_infrastructure(self, tmp_path):
+        """query_facts should find structured facts about infrastructure."""
+        backend = self._make_backend(tmp_path)
+
+        await backend.remember_batch(
+            [
+                {"content": "orders-db is in us-east-1", "importance": 0.8},
+                {"content": "users-db is in us-west-2", "importance": 0.8},
+            ],
+            extra_metadata_list=[
+                {"extracted_facts": [
+                    {"entity": "orders-db", "relation": "hosted in", "value": "us-east-1", "temporal_context": None},
+                    {"entity": "orders-db", "relation": "type", "value": "PostgreSQL", "temporal_context": None},
+                ]},
+                {"extracted_facts": [
+                    {"entity": "users-db", "relation": "hosted in", "value": "us-west-2", "temporal_context": None},
+                    {"entity": "users-db", "relation": "type", "value": "PostgreSQL", "temporal_context": None},
+                ]},
+            ],
+        )
+
+        # Query by entity
+        results = await backend.query_facts(entity="orders-db")
+        assert len(results) == 2
+        entities = {r["entity"] for r in results}
+        assert entities == {"orders-db"}
+
+        # Query by relation
+        results = await backend.query_facts(relation="hosted in")
+        assert len(results) == 2
+
+        # Query by value
+        results = await backend.query_facts(value="us-east-1")
+        assert len(results) == 1
+        assert results[0]["entity"] == "orders-db"
+
+        # Combined filter
+        results = await backend.query_facts(entity="users-db", relation="type")
+        assert len(results) == 1
+        assert results[0]["value"] == "PostgreSQL"
+
+    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
+    async def test_batch_dedup_on_rescan(self, tmp_path):
+        """Re-scanning should skip already-stored discoveries."""
+        backend = self._make_backend(tmp_path)
+
+        scan1 = [
+            {"content": "RDS: orders-db in us-east-1", "importance": 0.8, "category": "store"},
+            {"content": "RDS: users-db in us-east-1", "importance": 0.8, "category": "store"},
+        ]
+
+        result1 = await backend.remember_batch(scan1)
+        assert result1["stored"] == 2
+
+        # Re-scan with same content — should all be skipped
+        result2 = await backend.remember_batch(scan1)
+        assert result2["stored"] == 0
+        assert result2["skipped"] == 2
+
+        # Partial overlap
+        scan2 = [
+            {"content": "RDS: orders-db in us-east-1", "importance": 0.8, "category": "store"},
+            {"content": "S3: data-lake in us-west-2", "importance": 0.6, "category": "store"},
+        ]
+        result3 = await backend.remember_batch(scan2)
+        assert result3["stored"] == 1
+        assert result3["skipped"] == 1

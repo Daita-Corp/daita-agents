@@ -14,6 +14,7 @@ Follows the same LLM call pattern as contradiction.py:
 
 import json
 import logging
+import re
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
@@ -91,8 +92,6 @@ class MemoryReranker:
             )
             raw = response.strip()
             # Strip markdown code fences if present
-            import re
-
             fence = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
             if fence:
                 raw = fence.group(1).strip()

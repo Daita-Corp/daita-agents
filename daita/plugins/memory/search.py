@@ -5,16 +5,23 @@ Uses embeddings for semantic search over memory files.
 Supports importance-weighted scoring and temporal decay.
 """
 
-import sqlite3
-import hashlib
 import json
 import os
-from pathlib import Path
-from typing import List, Optional, Dict, Any
+import sqlite3
 from dataclasses import dataclass
-import numpy as np
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+
 from .metadata import MemoryMetadata
+from .utils import (
+    build_where_clause,
+    generate_chunk_id,
+    merge_metadata_json,
+    parse_metadata_json,
+)
 
 
 @dataclass
@@ -83,7 +90,21 @@ class SQLiteVectorSearch:
             )
         """)
 
+        # Indexes for common filter patterns
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON chunks(file_path)")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_category ON chunks(json_extract(metadata, '$.category'))"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_created_at ON chunks(json_extract(metadata, '$.created_at'))"
+        )
+
+        # Migration: add norm column for pre-computed vector norms
+        try:
+            cursor.execute("ALTER TABLE embeddings ADD COLUMN norm REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         conn.commit()
         conn.close()
 
@@ -96,6 +117,34 @@ class SQLiteVectorSearch:
         embedding = response.data[0].embedding
         self._embed_cache[text] = embedding
         return embedding
+
+    async def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """Batch embed multiple texts in a single API call.
+
+        Returns embeddings in the same order as the input texts.
+        Leverages the cache for already-seen texts.
+        """
+        results: List[Optional[List[float]]] = [None] * len(texts)
+        uncached_indices = []
+        uncached_texts = []
+
+        for i, text in enumerate(texts):
+            if text in self._embed_cache:
+                results[i] = self._embed_cache[text]
+            else:
+                uncached_indices.append(i)
+                uncached_texts.append(text)
+
+        if uncached_texts:
+            response = await self.embedder.embeddings.create(
+                model=self.embedding_model, input=uncached_texts
+            )
+            for j, data in enumerate(response.data):
+                idx = uncached_indices[j]
+                self._embed_cache[uncached_texts[j]] = data.embedding
+                results[idx] = data.embedding
+
+        return results
 
     async def store_chunk(
         self,
@@ -118,10 +167,7 @@ class SQLiteVectorSearch:
             chunk_id of the stored chunk
         """
         if chunk_id is None:
-            # Content-based hash only (no timestamp) so identical content
-            # submitted in the same session produces the same chunk_id and is
-            # caught by the incremental-check below instead of creating a duplicate.
-            chunk_id = hashlib.md5(f"direct:{content.strip()}".encode()).hexdigest()
+            chunk_id = generate_chunk_id(content)
 
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
@@ -137,13 +183,7 @@ class SQLiteVectorSearch:
         # Generate embedding only for new chunks
         embedding = await self.embed_text(content)
 
-        # Build final metadata JSON, merging any extra fields
-        if extra_metadata:
-            metadata_dict = json.loads(metadata.to_json())
-            metadata_dict.update(extra_metadata)
-            metadata_json = json.dumps(metadata_dict)
-        else:
-            metadata_json = metadata.to_json()
+        metadata_json = merge_metadata_json(metadata, extra_metadata)
 
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
@@ -156,17 +196,85 @@ class SQLiteVectorSearch:
             (chunk_id, "memory://direct", content, 0, 0, metadata_json),
         )
 
+        norm = float(np.linalg.norm(embedding))
         cursor.execute(
             """
-            INSERT INTO embeddings (chunk_id, embedding)
-            VALUES (?, ?)
+            INSERT INTO embeddings (chunk_id, embedding, norm)
+            VALUES (?, ?, ?)
         """,
-            (chunk_id, json.dumps(embedding)),
+            (chunk_id, json.dumps(embedding), norm),
         )
 
         conn.commit()
         conn.close()
         return chunk_id
+
+    async def store_chunks_batch(
+        self,
+        items: List[dict],
+    ) -> List[dict]:
+        """Store multiple chunks in a single batch with one embedding API call.
+
+        Args:
+            items: List of dicts with keys: content, metadata (MemoryMetadata),
+                   and optional extra_metadata and chunk_id.
+
+        Returns:
+            List of dicts with chunk_id and status ("stored" or "skipped").
+        """
+        prepared = []
+        for item in items:
+            cid = item.get("chunk_id") or generate_chunk_id(item["content"])
+            prepared.append({**item, "chunk_id": cid})
+
+        # Check existing in one query
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        all_cids = [p["chunk_id"] for p in prepared]
+        placeholders = ",".join("?" * len(all_cids))
+        cursor.execute(
+            f"SELECT chunk_id FROM chunks WHERE chunk_id IN ({placeholders})",
+            all_cids,
+        )
+        existing_ids = {row[0] for row in cursor.fetchall()}
+        conn.close()
+
+        results = [
+            {
+                "chunk_id": p["chunk_id"],
+                "status": "skipped" if p["chunk_id"] in existing_ids else "stored",
+            }
+            for p in prepared
+        ]
+        new_items = [p for p in prepared if p["chunk_id"] not in existing_ids]
+
+        if not new_items:
+            return results
+
+        # Batch embed all new items
+        texts = [item["content"] for item in new_items]
+        embeddings = await self.embed_texts(texts)
+
+        # Batch insert
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        for i, item in enumerate(new_items):
+            metadata_json = merge_metadata_json(
+                item["metadata"], item.get("extra_metadata")
+            )
+            cursor.execute(
+                "INSERT INTO chunks (chunk_id, file_path, content, line_start, line_end, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+                (item["chunk_id"], "memory://direct", item["content"], 0, 0, metadata_json),
+            )
+            norm = float(np.linalg.norm(embeddings[i]))
+            cursor.execute(
+                "INSERT INTO embeddings (chunk_id, embedding, norm) VALUES (?, ?, ?)",
+                (item["chunk_id"], json.dumps(embeddings[i]), norm),
+            )
+        conn.commit()
+        conn.close()
+
+        return results
 
     async def index_file(
         self,
@@ -245,7 +353,7 @@ class SQLiteVectorSearch:
     def track_access(self, chunk_ids: List[str]):
         """
         Increment access_count and update last_accessed for recalled chunks.
-        Used to build usage signals for smarter pruning over time.
+        Uses atomic SQL to avoid read-modify-write race conditions.
         """
         if not chunk_ids:
             return
@@ -256,22 +364,15 @@ class SQLiteVectorSearch:
 
         for chunk_id in chunk_ids:
             cursor.execute(
-                "SELECT metadata FROM chunks WHERE chunk_id = ?", (chunk_id,)
+                """
+                UPDATE chunks SET metadata = json_set(
+                    metadata,
+                    '$.access_count', COALESCE(json_extract(metadata, '$.access_count'), 0) + 1,
+                    '$.last_accessed', ?
+                ) WHERE chunk_id = ? AND metadata IS NOT NULL
+                """,
+                (now, chunk_id),
             )
-            row = cursor.fetchone()
-            if row and row[0]:
-                try:
-                    metadata_dict = json.loads(row[0])
-                    metadata_dict["access_count"] = (
-                        metadata_dict.get("access_count", 0) + 1
-                    )
-                    metadata_dict["last_accessed"] = now
-                    cursor.execute(
-                        "UPDATE chunks SET metadata = ? WHERE chunk_id = ?",
-                        (json.dumps(metadata_dict), chunk_id),
-                    )
-                except Exception:
-                    pass
 
         conn.commit()
         conn.close()
@@ -312,62 +413,60 @@ class SQLiteVectorSearch:
         limit: int = 5,
         score_threshold: float = 0.7,
         category: Optional[str] = None,
+        since: Optional[str] = None,
+        before: Optional[str] = None,
     ) -> List[SearchResult]:
-        """Semantic search with importance weighting and temporal decay."""
+        """Semantic search with importance weighting and temporal decay.
+
+        Args:
+            since: Only return memories created at or after this datetime (ISO format).
+            before: Only return memories created before this datetime (ISO format).
+        """
         query_embedding = await self.embed_text(query)
         query_vec = np.array(query_embedding)
 
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
 
-        if category:
-            cursor.execute(
-                """
-                SELECT c.chunk_id, c.file_path, c.content, c.line_start, c.line_end, c.metadata, e.embedding
-                FROM chunks c
-                JOIN embeddings e ON c.chunk_id = e.chunk_id
-                WHERE json_extract(c.metadata, '$.category') = ?
+        where_sql, params = build_where_clause(
+            category=category, since=since, before=before, table_alias="c"
+        )
+        cursor.execute(
+            f"""
+            SELECT c.chunk_id, c.file_path, c.content, c.line_start, c.line_end,
+                   c.metadata, e.embedding, e.norm
+            FROM chunks c
+            JOIN embeddings e ON c.chunk_id = e.chunk_id
+            {where_sql}
             """,
-                (category,),
-            )
-        else:
-            cursor.execute("""
-                SELECT c.chunk_id, c.file_path, c.content, c.line_start, c.line_end, c.metadata, e.embedding
-                FROM chunks c
-                JOIN embeddings e ON c.chunk_id = e.chunk_id
-            """)
+            params,
+        )
+        rows = cursor.fetchall()
+        conn.close()
 
+        if not rows:
+            return []
+
+        # Batch vectorized cosine similarity
+        embedding_jsons = [r[6] for r in rows]
+        stored_norms = [r[7] for r in rows]
+        all_vecs = np.array([json.loads(e) for e in embedding_jsons])
+        query_norm = np.linalg.norm(query_vec)
+        all_norms = np.array([
+            n if n is not None else float(np.linalg.norm(v))
+            for n, v in zip(stored_norms, all_vecs)
+        ])
+        denoms = query_norm * all_norms
+        similarities = np.where(denoms > 0, all_vecs @ query_vec / denoms, 0.0)
+
+        # Apply score adjustments and filter
         results = []
-        for row in cursor.fetchall():
-            (
-                chunk_id,
-                file_path,
-                content,
-                line_start,
-                line_end,
-                metadata_json,
-                embedding_json,
-            ) = row
-
-            metadata_dict = None
-            if metadata_json:
-                try:
-                    metadata_dict = json.loads(metadata_json)
-                except json.JSONDecodeError:
-                    metadata_dict = {
-                        "importance": 0.5,
-                        "source": "agent_inferred",
-                        "pinned": False,
-                    }
-
-            chunk_vec = np.array(json.loads(embedding_json))
-            denom = np.linalg.norm(query_vec) * np.linalg.norm(chunk_vec)
-            similarity = (
-                float(np.dot(query_vec, chunk_vec) / denom) if denom > 0 else 0.0
+        for i, row in enumerate(rows):
+            chunk_id, file_path, content, line_start, line_end, metadata_json = row[:6]
+            metadata_dict = parse_metadata_json(metadata_json)
+            adjusted = self._apply_score_adjustments(
+                float(similarities[i]), metadata_dict
             )
-
-            adjusted = self._apply_score_adjustments(similarity, metadata_dict)
-
             if adjusted >= score_threshold:
                 results.append(
                     SearchResult(
@@ -378,10 +477,9 @@ class SQLiteVectorSearch:
                         line_end=line_end,
                         chunk_id=chunk_id,
                         metadata=metadata_dict,
-                        raw_semantic_score=similarity,
+                        raw_semantic_score=float(similarities[i]),
                     )
                 )
 
-        conn.close()
         results.sort(key=lambda x: x.score, reverse=True)
         return results[:limit]

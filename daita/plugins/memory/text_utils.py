@@ -272,43 +272,6 @@ def contains_exact_phrase(query: str, content: str) -> bool:
     return False
 
 
-def get_exact_phrases(query: str, content: str) -> List[str]:
-    """
-    Get list of exact phrases from query that appear in content.
-
-    Useful for debugging and transparency.
-
-    Args:
-        query: Query string
-        content: Content to search within
-
-    Returns:
-        List of matching phrases
-    """
-    matches = []
-
-    query_norm = normalize_text(query)
-    content_norm = normalize_text(content)
-
-    query_tokens = re.findall(r"\b[\w.-]+\b", query_norm)
-
-    # Generate all 2-word, 3-word, and 4-word phrases
-    for phrase_len in [4, 3, 2]:
-        for i in range(len(query_tokens) - phrase_len + 1):
-            phrase = " ".join(query_tokens[i : i + phrase_len])
-
-            # Skip if phrase is mostly stop words
-            phrase_words = phrase.split()
-            non_stop_count = sum(1 for w in phrase_words if w not in STOP_WORDS)
-            if non_stop_count < 2:
-                continue
-
-            if phrase in content_norm:
-                matches.append(phrase)
-
-    return matches
-
-
 def clean_memory_content(text: str) -> str:
     """
     Strip LLM-generated meta prefixes from memory content.
