@@ -2,7 +2,8 @@
 AWS infrastructure discoverer.
 
 Enumerates RDS instances, DynamoDB tables, S3 buckets, ElastiCache clusters,
-Redshift clusters, and API Gateway APIs across configured AWS regions using boto3.
+Redshift clusters, API Gateway APIs, SQS queues, SNS topics, OpenSearch domains,
+DocumentDB clusters, and Kinesis streams across configured AWS regions using boto3.
 """
 
 import hashlib
@@ -40,6 +41,11 @@ class AWSDiscoverer(BaseDiscoverer):
     - ElastiCache clusters
     - Redshift clusters
     - API Gateway REST APIs and HTTP APIs
+    - SQS queues
+    - SNS topics
+    - OpenSearch domains
+    - DocumentDB clusters
+    - Kinesis Data Streams
 
     Lazy imports boto3 inside authenticate().
     """
@@ -59,12 +65,16 @@ class AWSDiscoverer(BaseDiscoverer):
             role_arn: Optional IAM role ARN to assume for cross-account discovery.
             profile_name: Optional AWS CLI profile name.
             services: Services to enumerate. Defaults to all supported.
-                      Options: "rds", "dynamodb", "s3", "elasticache", "redshift", "apigateway"
+                      Options: "rds", "dynamodb", "s3", "elasticache", "redshift",
+                      "apigateway", "sqs", "sns", "opensearch", "documentdb", "kinesis"
         """
         self._regions = regions or ["us-east-1"]
         self._role_arn = role_arn
         self._profile_name = profile_name
-        self._services = services or ["rds", "dynamodb", "s3", "elasticache", "redshift", "apigateway"]
+        self._services = services or [
+            "rds", "dynamodb", "s3", "elasticache", "redshift", "apigateway",
+            "sqs", "sns", "opensearch", "documentdb", "kinesis",
+        ]
         self._session = None
         self._account_id: Optional[str] = None
 
@@ -129,6 +139,21 @@ class AWSDiscoverer(BaseDiscoverer):
                     yield store
             if "apigateway" in self._services:
                 async for store in self._enumerate_apigateway(region):
+                    yield store
+            if "sqs" in self._services:
+                async for store in self._enumerate_sqs(region):
+                    yield store
+            if "sns" in self._services:
+                async for store in self._enumerate_sns(region):
+                    yield store
+            if "opensearch" in self._services:
+                async for store in self._enumerate_opensearch(region):
+                    yield store
+            if "documentdb" in self._services:
+                async for store in self._enumerate_documentdb(region):
+                    yield store
+            if "kinesis" in self._services:
+                async for store in self._enumerate_kinesis(region):
                     yield store
 
     def fingerprint(self, store: DiscoveredStore) -> str:
@@ -474,3 +499,237 @@ class AWSDiscoverer(BaseDiscoverer):
                         yield store
         except Exception as exc:
             logger.warning("API Gateway HTTP enumeration failed in %s: %s", region, exc)
+
+    async def _enumerate_sqs(self, region: str) -> AsyncIterator[DiscoveredStore]:
+        """Enumerate SQS queues in a region."""
+        client = self._session.client("sqs", region_name=region)
+        now = datetime.now(timezone.utc).isoformat()
+
+        try:
+            paginator = client.get_paginator("list_queues")
+            for page in paginator.paginate():
+                for queue_url in page.get("QueueUrls", []):
+                    try:
+                        attrs = client.get_queue_attributes(
+                            QueueUrl=queue_url,
+                            AttributeNames=["All"],
+                        )["Attributes"]
+                    except Exception:
+                        attrs = {}
+
+                    arn = attrs.get("QueueArn", "")
+                    queue_name = arn.rsplit(":", 1)[-1] if arn else queue_url.rsplit("/", 1)[-1]
+
+                    store = DiscoveredStore(
+                        id="",
+                        store_type="sqs",
+                        display_name=f"{queue_name} ({region})",
+                        connection_hint={
+                            "queue_url": queue_url,
+                            "region": region,
+                        },
+                        source="aws_sqs",
+                        region=region,
+                        confidence=0.95,
+                        metadata={
+                            "arn": arn,
+                            "approximate_message_count": int(attrs.get("ApproximateNumberOfMessages", 0)),
+                            "approximate_not_visible": int(attrs.get("ApproximateNumberOfMessagesNotVisible", 0)),
+                            "visibility_timeout": int(attrs.get("VisibilityTimeout", 30)),
+                            "created_timestamp": attrs.get("CreatedTimestamp", ""),
+                            "is_fifo": queue_name.endswith(".fifo"),
+                        },
+                        discovered_at=now,
+                        last_seen=now,
+                    )
+                    store.id = self.fingerprint(store)
+                    yield store
+        except Exception as exc:
+            logger.warning("SQS enumeration failed in %s: %s", region, exc)
+
+    async def _enumerate_sns(self, region: str) -> AsyncIterator[DiscoveredStore]:
+        """Enumerate SNS topics in a region."""
+        client = self._session.client("sns", region_name=region)
+        now = datetime.now(timezone.utc).isoformat()
+
+        try:
+            paginator = client.get_paginator("list_topics")
+            for page in paginator.paginate():
+                for topic in page.get("Topics", []):
+                    topic_arn = topic["TopicArn"]
+                    topic_name = topic_arn.rsplit(":", 1)[-1]
+
+                    try:
+                        attrs = client.get_topic_attributes(TopicArn=topic_arn)["Attributes"]
+                    except Exception:
+                        attrs = {}
+
+                    store = DiscoveredStore(
+                        id="",
+                        store_type="sns",
+                        display_name=f"{topic_name} ({region})",
+                        connection_hint={
+                            "topic_arn": topic_arn,
+                            "region": region,
+                        },
+                        source="aws_sns",
+                        region=region,
+                        confidence=0.95,
+                        metadata={
+                            "arn": topic_arn,
+                            "subscription_count": int(attrs.get("SubscriptionsConfirmed", 0)),
+                            "subscriptions_pending": int(attrs.get("SubscriptionsPending", 0)),
+                            "display_name": attrs.get("DisplayName", ""),
+                            "is_fifo": topic_name.endswith(".fifo"),
+                        },
+                        discovered_at=now,
+                        last_seen=now,
+                    )
+                    store.id = self.fingerprint(store)
+                    yield store
+        except Exception as exc:
+            logger.warning("SNS enumeration failed in %s: %s", region, exc)
+
+    async def _enumerate_opensearch(self, region: str) -> AsyncIterator[DiscoveredStore]:
+        """Enumerate OpenSearch (Elasticsearch) domains in a region."""
+        client = self._session.client("opensearch", region_name=region)
+        now = datetime.now(timezone.utc).isoformat()
+
+        try:
+            domain_names = [
+                d["DomainName"]
+                for d in client.list_domain_names().get("DomainNames", [])
+            ]
+
+            if not domain_names:
+                return
+
+            # describe_domains accepts up to 5 at a time
+            for i in range(0, len(domain_names), 5):
+                batch = domain_names[i : i + 5]
+                resp = client.describe_domains(DomainNames=batch)
+
+                for domain in resp.get("DomainStatusList", []):
+                    domain_name = domain["DomainName"]
+                    endpoint = domain.get("Endpoint") or domain.get("Endpoints", {}).get("vpc", "")
+                    arn = domain.get("ARN", "")
+                    engine_version = domain.get("EngineVersion", "")
+
+                    cluster_config = domain.get("ClusterConfig", {})
+
+                    store = DiscoveredStore(
+                        id="",
+                        store_type="opensearch",
+                        display_name=f"{domain_name} ({region})",
+                        connection_hint={
+                            "host": endpoint,
+                            "port": 443,
+                            "region": region,
+                        },
+                        source="aws_opensearch",
+                        region=region,
+                        confidence=0.95,
+                        metadata={
+                            "arn": arn,
+                            "engine_version": engine_version,
+                            "instance_type": cluster_config.get("InstanceType", ""),
+                            "instance_count": cluster_config.get("InstanceCount", 1),
+                            "dedicated_master": cluster_config.get("DedicatedMasterEnabled", False),
+                            "zone_awareness": cluster_config.get("ZoneAwarenessEnabled", False),
+                            "status": "processing" if domain.get("Processing") else "active",
+                        },
+                        discovered_at=now,
+                        last_seen=now,
+                    )
+                    store.id = self.fingerprint(store)
+                    yield store
+        except Exception as exc:
+            logger.warning("OpenSearch enumeration failed in %s: %s", region, exc)
+
+    async def _enumerate_documentdb(self, region: str) -> AsyncIterator[DiscoveredStore]:
+        """Enumerate DocumentDB clusters in a region."""
+        client = self._session.client("docdb", region_name=region)
+        now = datetime.now(timezone.utc).isoformat()
+
+        try:
+            paginator = client.get_paginator("describe_db_clusters")
+            for page in paginator.paginate(
+                Filters=[{"Name": "engine", "Values": ["docdb"]}]
+            ):
+                for cluster in page.get("DBClusters", []):
+                    cluster_id = cluster["DBClusterIdentifier"]
+                    endpoint = cluster.get("Endpoint", "")
+                    port = cluster.get("Port", 27017)
+
+                    store = DiscoveredStore(
+                        id="",
+                        store_type="documentdb",
+                        display_name=f"{cluster_id} ({region})",
+                        connection_hint={
+                            "host": endpoint,
+                            "port": port,
+                            "region": region,
+                        },
+                        source="aws_documentdb",
+                        region=region,
+                        confidence=0.95,
+                        metadata={
+                            "arn": cluster.get("DBClusterArn", ""),
+                            "engine_version": cluster.get("EngineVersion", ""),
+                            "instance_count": len(cluster.get("DBClusterMembers", [])),
+                            "status": cluster.get("Status", ""),
+                            "reader_endpoint": cluster.get("ReaderEndpoint", ""),
+                            "storage_encrypted": cluster.get("StorageEncrypted", False),
+                        },
+                        discovered_at=now,
+                        last_seen=now,
+                    )
+                    store.id = self.fingerprint(store)
+                    yield store
+        except Exception as exc:
+            logger.warning("DocumentDB enumeration failed in %s: %s", region, exc)
+
+    async def _enumerate_kinesis(self, region: str) -> AsyncIterator[DiscoveredStore]:
+        """Enumerate Kinesis Data Streams in a region."""
+        client = self._session.client("kinesis", region_name=region)
+        now = datetime.now(timezone.utc).isoformat()
+
+        try:
+            paginator = client.get_paginator("list_streams")
+            for page in paginator.paginate():
+                for stream_name in page.get("StreamNames", []):
+                    try:
+                        summary = client.describe_stream_summary(
+                            StreamName=stream_name
+                        )["StreamDescriptionSummary"]
+                    except Exception:
+                        summary = {}
+
+                    arn = summary.get("StreamARN", f"arn:aws:kinesis:{region}:{self._account_id}:stream/{stream_name}")
+
+                    store = DiscoveredStore(
+                        id="",
+                        store_type="kinesis",
+                        display_name=f"{stream_name} ({region})",
+                        connection_hint={
+                            "stream_name": stream_name,
+                            "region": region,
+                        },
+                        source="aws_kinesis",
+                        region=region,
+                        confidence=0.95,
+                        metadata={
+                            "arn": arn,
+                            "shard_count": summary.get("OpenShardCount", 0),
+                            "retention_hours": summary.get("RetentionPeriodHours", 24),
+                            "status": summary.get("StreamStatus", ""),
+                            "stream_mode": summary.get("StreamModeDetails", {}).get("StreamMode", "PROVISIONED"),
+                            "consumer_count": summary.get("ConsumerCount", 0),
+                        },
+                        discovered_at=now,
+                        last_seen=now,
+                    )
+                    store.id = self.fingerprint(store)
+                    yield store
+        except Exception as exc:
+            logger.warning("Kinesis enumeration failed in %s: %s", region, exc)

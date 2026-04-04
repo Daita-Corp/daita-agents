@@ -178,6 +178,16 @@ def normalize_discovery(raw: Dict[str, Any]) -> Dict[str, Any]:
         return normalize_s3(raw)
     if db_type == "apigateway":
         return normalize_apigateway(raw)
+    if db_type == "sqs":
+        return normalize_sqs(raw)
+    if db_type == "sns":
+        return normalize_sns(raw)
+    if db_type == "opensearch":
+        return normalize_opensearch(raw)
+    if db_type == "documentdb":
+        return normalize_documentdb(raw)
+    if db_type == "kinesis":
+        return normalize_kinesis(raw)
     return raw  # passthrough for unrecognized types
 
 
@@ -366,6 +376,202 @@ def normalize_apigateway(raw: Dict[str, Any]) -> Dict[str, Any]:
             "protocol_type": raw.get("protocol_type", ""),
             "authorizers": raw.get("authorizers", []),
             "integrations": integrations,
+        },
+    }
+
+
+def normalize_sqs(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize SQS discover output.
+
+    The "schema" of an SQS queue combines standard message fields with
+    message attributes and JSON body keys inferred from sampling.
+    """
+    queue_name = raw.get("queue_name", "")
+
+    # Standard SQS message fields
+    columns: List[Dict[str, Any]] = [
+        {"name": "MessageId", "type": "string", "nullable": False, "is_primary_key": True},
+        {"name": "Body", "type": "string", "nullable": False, "is_primary_key": False},
+        {"name": "MD5OfBody", "type": "string", "nullable": False, "is_primary_key": False},
+        {"name": "ReceiptHandle", "type": "string", "nullable": False, "is_primary_key": False},
+    ]
+
+    # Message attributes from sampling
+    for attr_name, types in raw.get("message_attributes", {}).items():
+        dtype = types[0] if types else "String"
+        columns.append({
+            "name": f"attr:{attr_name}",
+            "type": dtype.lower(),
+            "nullable": True,
+            "is_primary_key": False,
+            "column_comment": "message attribute",
+        })
+
+    # JSON body keys from sampling
+    for key, dtype in raw.get("body_keys", {}).items():
+        columns.append({
+            "name": f"body.{key}",
+            "type": dtype,
+            "nullable": True,
+            "is_primary_key": False,
+            "column_comment": "inferred from JSON body sample",
+        })
+
+    tables = [{
+        "name": queue_name,
+        "row_count": raw.get("approximate_message_count"),
+        "columns": columns,
+    }]
+
+    return {
+        "database_type": "sqs",
+        "database_name": queue_name,
+        "tables": tables,
+        "foreign_keys": [],
+        "table_count": 1,
+        "metadata": {
+            "is_fifo": raw.get("is_fifo", False),
+            "visibility_timeout": raw.get("visibility_timeout", 30),
+            "retention_seconds": raw.get("retention_seconds", 345600),
+        },
+    }
+
+
+def normalize_sns(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize SNS discover output.
+
+    The "schema" is the topic itself with subscriptions as columns,
+    capturing the routing topology.
+    """
+    topic_name = raw.get("topic_name", "")
+
+    columns: List[Dict[str, Any]] = [
+        {"name": "TopicArn", "type": "string", "nullable": False, "is_primary_key": True},
+        {"name": "Message", "type": "string", "nullable": False, "is_primary_key": False},
+        {"name": "Subject", "type": "string", "nullable": True, "is_primary_key": False},
+        {"name": "MessageAttributes", "type": "map", "nullable": True, "is_primary_key": False},
+    ]
+
+    # Add subscriptions as columns to capture routing
+    for sub in raw.get("subscriptions", []):
+        protocol = sub.get("protocol", "unknown")
+        endpoint = sub.get("endpoint", "")
+        columns.append({
+            "name": f"sub:{protocol}:{endpoint}",
+            "type": "subscription",
+            "nullable": True,
+            "is_primary_key": False,
+            "column_comment": f"protocol={protocol}",
+        })
+
+    tables = [{
+        "name": topic_name,
+        "row_count": raw.get("subscription_count"),
+        "columns": columns,
+    }]
+
+    return {
+        "database_type": "sns",
+        "database_name": topic_name,
+        "tables": tables,
+        "foreign_keys": [],
+        "table_count": 1,
+        "metadata": {
+            "is_fifo": raw.get("is_fifo", False),
+            "display_name": raw.get("display_name", ""),
+        },
+    }
+
+
+def normalize_opensearch(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize OpenSearch discover output.
+
+    Each index becomes a table, field mappings become columns.
+    """
+    host = raw.get("host", "")
+    cluster_name = raw.get("cluster_name", host)
+
+    tables = []
+    for idx in raw.get("indices", []):
+        cols = []
+        for field in idx.get("fields", []):
+            cols.append({
+                "name": field["field_name"],
+                "type": field.get("type", "object"),
+                "nullable": True,
+                "is_primary_key": field["field_name"] == "_id",
+            })
+        tables.append({
+            "name": idx["index_name"],
+            "row_count": idx.get("doc_count"),
+            "columns": cols,
+        })
+
+    return {
+        "database_type": "opensearch",
+        "database_name": cluster_name,
+        "tables": tables,
+        "foreign_keys": [],
+        "table_count": len(tables),
+        "metadata": {
+            "version": raw.get("version", ""),
+        },
+    }
+
+
+def normalize_documentdb(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize DocumentDB discover output.
+
+    DocumentDB is MongoDB wire-compatible, so we reuse the MongoDB
+    normalizer and override the database_type.
+    """
+    result = normalize_mongodb(raw)
+    result["database_type"] = "documentdb"
+    return result
+
+
+def normalize_kinesis(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize Kinesis discover output.
+
+    The stream is a single "table". Standard Kinesis record fields plus
+    JSON payload keys inferred from sampling become the columns.
+    """
+    stream_name = raw.get("stream_name", "")
+
+    # Standard Kinesis record fields
+    columns: List[Dict[str, Any]] = [
+        {"name": "SequenceNumber", "type": "string", "nullable": False, "is_primary_key": True},
+        {"name": "PartitionKey", "type": "string", "nullable": False, "is_primary_key": False},
+        {"name": "Data", "type": "blob", "nullable": False, "is_primary_key": False},
+        {"name": "ApproximateArrivalTimestamp", "type": "timestamp", "nullable": False, "is_primary_key": False},
+    ]
+
+    # JSON payload keys from sampling
+    for key, dtype in raw.get("record_fields", {}).items():
+        columns.append({
+            "name": f"data.{key}",
+            "type": dtype,
+            "nullable": True,
+            "is_primary_key": False,
+            "column_comment": "inferred from JSON record sample",
+        })
+
+    tables = [{
+        "name": stream_name,
+        "row_count": None,  # Kinesis doesn't expose record count
+        "columns": columns,
+    }]
+
+    return {
+        "database_type": "kinesis",
+        "database_name": stream_name,
+        "tables": tables,
+        "foreign_keys": [],
+        "table_count": 1,
+        "metadata": {
+            "shard_count": raw.get("shard_count", 0),
+            "retention_hours": raw.get("retention_hours", 24),
+            "stream_mode": raw.get("stream_mode", "PROVISIONED"),
         },
     }
 

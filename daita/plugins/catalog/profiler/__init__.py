@@ -12,6 +12,11 @@ from ._mongodb import MongoDBProfiler
 from ._dynamodb import DynamoDBProfiler
 from ._s3 import S3Profiler
 from ._apigateway import APIGatewayProfiler
+from ._sqs import SQSProfiler
+from ._sns import SNSProfiler
+from ._opensearch import OpenSearchProfiler
+from ._documentdb import DocumentDBProfiler
+from ._kinesis import KinesisProfiler
 
 __all__ = [
     "_dict_to_normalized_schema",
@@ -21,4 +26,9 @@ __all__ = [
     "DynamoDBProfiler",
     "S3Profiler",
     "APIGatewayProfiler",
+    "SQSProfiler",
+    "SNSProfiler",
+    "OpenSearchProfiler",
+    "DocumentDBProfiler",
+    "KinesisProfiler",
 ]

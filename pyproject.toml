@@ -127,6 +127,7 @@ mongodb = ["motor>=3.0.0"]
 sqlite = ["aiosqlite>=0.21.0", "SQLAlchemy>=2.0.0"]
 snowflake = ["snowflake-connector-python>=3.0.0", "cryptography>=3.0.0"]
 elasticsearch = ["elasticsearch>=8.0.0"]
+opensearch = ["opensearch-py>=2.0.0"]
 bigquery = ["google-cloud-bigquery>=3.0.0"]
 
 # Convenience bundle - all traditional databases
