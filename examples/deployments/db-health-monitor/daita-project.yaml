@@ -1,0 +1,12 @@
+name: db-health-monitor
+version: 1.0.0
+description: Continuous PostgreSQL health monitoring with watch-based alerting
+created_at: '2026-04-04T00:00:00'
+
+agents:
+  - name: monitor_agent
+    description: Monitors PostgreSQL for slow queries, connection pressure, and table bloat
+    file: agents/monitor_agent.py
+    enabled: true
+
+workflows: []

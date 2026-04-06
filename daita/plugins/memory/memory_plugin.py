@@ -6,10 +6,29 @@ Project-scoped by default, global as opt-in.
 """
 
 import os
-from typing import List, Optional
+import re
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Union
 from ..base import LifecyclePlugin
 from ...core.tools import AgentTool, tool
 from .metadata import MemoryMetadata
+from .utils import serialize_results
+
+
+def _parse_time_param(value: Optional[str]) -> Optional[str]:
+    """Parse a time parameter into an ISO datetime string.
+
+    Accepts ISO datetimes directly or relative shorthand: "24h", "7d", "30d".
+    """
+    if value is None:
+        return None
+    match = re.fullmatch(r"(\d+)([hd])", value.strip())
+    if match:
+        amount, unit = int(match.group(1)), match.group(2)
+        delta = timedelta(hours=amount) if unit == "h" else timedelta(days=amount)
+        return (datetime.now() - delta).isoformat()
+    # Assume ISO format
+    return value
 
 
 class MemoryPlugin(LifecyclePlugin):
@@ -52,6 +71,8 @@ class MemoryPlugin(LifecyclePlugin):
         embedding_model: str = "text-embedding-3-small",
         enable_reranking: bool = False,
         enable_fact_extraction: bool = False,
+        max_chunks: int = 2000,
+        default_ttl_days: Optional[int] = None,
     ):
         """
         Args:
@@ -68,6 +89,9 @@ class MemoryPlugin(LifecyclePlugin):
             enable_fact_extraction: Extract structured facts from memories at
                 ingestion time for richer temporal and relational recall.
                 Requires curator LLM.
+            max_chunks: Maximum stored chunks before eviction (default: 2000).
+            default_ttl_days: Default time-to-live in days for new memories.
+                None means no expiry (default). Can be overridden per-memory.
         """
         self.workspace = workspace
         self.scope = scope
@@ -79,6 +103,8 @@ class MemoryPlugin(LifecyclePlugin):
         self.embedding_model = embedding_model
         self.enable_reranking = enable_reranking
         self.enable_fact_extraction = enable_fact_extraction
+        self.max_chunks = max_chunks
+        self.default_ttl_days = default_ttl_days
 
         self._agent_id = None
         self.backend = None
@@ -150,6 +176,7 @@ class MemoryPlugin(LifecyclePlugin):
                 scope=self.scope,
                 embedding_provider=self.embedding_provider,
                 embedding_model=self.embedding_model,
+                max_chunks=self.max_chunks,
             )
             self.environment = "local"
 
@@ -213,9 +240,14 @@ class MemoryPlugin(LifecyclePlugin):
                 importance_threshold=0.7,
             )
 
+        _default_ttl = self.default_ttl_days
+
         @tool
         async def remember(
-            content: str, importance: float = 0.5, category: Optional[str] = None
+            content: Union[str, List[Dict[str, Any]]],
+            importance: float = 0.5,
+            category: Optional[str] = None,
+            ttl_days: Optional[int] = None,
         ):
             """
             Store information in memory for future recall.
@@ -223,18 +255,55 @@ class MemoryPlugin(LifecyclePlugin):
             Use for facts, decisions, action items, and context worth preserving.
 
             Args:
-                content: The information to store (be specific and self-contained)
-                importance: How critical this memory is (0.0-1.0):
+                content: The information to store. Either:
+                    - A string (single memory, be specific and self-contained)
+                    - A list of dicts for batch storage, each with keys:
+                        "content" (required), "importance" (optional, 0.0-1.0),
+                        "category" (optional). Uses a single embedding API call.
+                importance: How critical this memory is (0.0-1.0), used when
+                    content is a string. Ignored for batch input (use per-item):
                     0.9+ = critical (security issues, hard deadlines, major decisions)
                     0.7-0.8 = important (key facts, events, action items)
                     0.5-0.6 = useful (general context, preferences)
                     0.3-0.4 = low priority (minor notes)
-                category: Optional tag (e.g. "security", "project", "contact", "event")
+                category: Optional tag (e.g. "security", "project", "contact", "event").
+                    Used when content is a string. Ignored for batch input.
+                ttl_days: Days until this memory expires (default: no expiry).
+                    Expired memories are pruned at session start/stop.
 
             Returns:
-                Confirmation with chunk_id
+                Confirmation with chunk_id (single) or batch summary (batch)
             """
+            from .auto_classify import infer_category, infer_importance
+
+            # --- Batch path ---
+            if isinstance(content, list):
+                items = content
+
+                # Auto-classify items with default values
+                for item in items:
+                    if item.get("category") is None:
+                        item["category"] = infer_category(item["content"])
+                    if item.get("importance", 0.5) == 0.5:
+                        item["importance"] = infer_importance(item["content"], 0.5)
+
+                # Lazy fact extraction: mark for later extraction
+                extra_metadata_list = None
+                if _fact_extractor is not None:
+                    extra_metadata_list = [{"_facts_extracted": False} for _ in items]
+
+                return await backend.remember_batch(
+                    items, extra_metadata_list=extra_metadata_list
+                )
+
+            # --- Single-item path ---
             importance = max(0.0, min(1.0, importance))
+
+            # Auto-classify when agent uses defaults
+            if category is None:
+                category = infer_category(content)
+            if importance == 0.5:
+                importance = infer_importance(content, importance)
 
             # Semantic dedup: skip if a near-identical memory already exists.
             # Compare against raw_semantic_score (not the hybrid score) to prevent
@@ -296,20 +365,13 @@ class MemoryPlugin(LifecyclePlugin):
                 importance=importance,
                 source="agent_inferred",
                 category=category,
+                ttl_days=ttl_days or _default_ttl,
             )
 
-            # Structured fact extraction (opt-in via enable_fact_extraction).
-            # Facts are stored in metadata JSON under "extracted_facts" for
-            # richer temporal and relational recall.
+            # Lazy fact extraction: mark for later extraction on query_facts()
             extra_metadata = None
             if _fact_extractor is not None:
-                from .fact_extractor import FactExtractor
-
-                facts = await _fact_extractor.extract(content)
-                if facts:
-                    extra_metadata = {
-                        "extracted_facts": FactExtractor.facts_to_metadata(facts)
-                    }
+                extra_metadata = {"_facts_extracted": False}
 
             return await backend.remember(
                 content,
@@ -326,6 +388,8 @@ class MemoryPlugin(LifecyclePlugin):
             min_importance: Optional[float] = None,
             max_importance: Optional[float] = None,
             category: Optional[str] = None,
+            since: Optional[str] = None,
+            before: Optional[str] = None,
         ):
             """
             Search previously stored agent memories by meaning.
@@ -348,6 +412,11 @@ class MemoryPlugin(LifecyclePlugin):
                 min_importance: Filter to memories with importance >= this value
                 max_importance: Filter to memories with importance <= this value
                 category: Restrict search to a specific category (e.g. "fk_constraint")
+                since: Only return memories created at or after this time.
+                    Accepts ISO datetime (e.g. "2026-04-01T00:00:00") or
+                    relative shorthand: "24h", "7d", "30d".
+                before: Only return memories created before this time.
+                    Same format as since.
 
             Returns:
                 Ranked list of relevant memories with scores and metadata
@@ -360,6 +429,8 @@ class MemoryPlugin(LifecyclePlugin):
                 max_importance=max_importance,
                 category=category,
                 reranker=_reranker,
+                since=_parse_time_param(since),
+                before=_parse_time_param(before),
             )
 
             # Track access for usage-based pruning signals
@@ -367,9 +438,7 @@ class MemoryPlugin(LifecyclePlugin):
             if chunk_ids:
                 backend.search.track_access(chunk_ids)
 
-            import json as _json
-
-            return _json.loads(_json.dumps(results, default=str))
+            return serialize_results(results)
 
         @tool
         async def list_by_category(
@@ -400,9 +469,7 @@ class MemoryPlugin(LifecyclePlugin):
             results = await backend.list_by_category(
                 category=category, min_importance=min_importance, limit=limit
             )
-            import json as _json
-
-            return _json.loads(_json.dumps(results, default=str))
+            return serialize_results(results)
 
         @tool
         async def update_memory(query: str, new_content: str, importance: float = 0.5):
@@ -443,12 +510,21 @@ class MemoryPlugin(LifecyclePlugin):
                 return await backend.read_memory(file)
 
         @tool
-        async def list_memories():
+        async def list_memories(include_stats: bool = False):
             """
-            List available memory files (MEMORY.md and today's log).
+            List available memory files and optionally show memory statistics.
+
+            Args:
+                include_stats: When true, include category counts, importance
+                    distribution, time range, and pinned count. Useful for
+                    understanding what the agent already knows before storing
+                    or recalling. (default: false)
 
             Returns:
-                Summary of available memory files with paths and sizes
+                Summary of available memory files with paths and sizes.
+                When include_stats=True, also includes a "stats" key with:
+                  total_memories, categories (with count and avg_importance),
+                  oldest/newest timestamps, and pinned_count.
             """
             from datetime import date as _date
 
@@ -475,9 +551,14 @@ class MemoryPlugin(LifecyclePlugin):
                     )
             except Exception:
                 pass
-            return files
 
-        return [
+            if not include_stats:
+                return files
+
+            stats = await backend.get_stats()
+            return {"files": files, "stats": stats}
+
+        tools = [
             remember,
             recall,
             list_by_category,
@@ -485,6 +566,65 @@ class MemoryPlugin(LifecyclePlugin):
             read_memory,
             list_memories,
         ]
+
+        # Conditionally add query_facts when fact extraction is enabled.
+        if _fact_extractor is not None:
+
+            @tool
+            async def query_facts(
+                entity: Optional[str] = None,
+                relation: Optional[str] = None,
+                value: Optional[str] = None,
+                limit: int = 50,
+            ):
+                """
+                Query structured facts extracted from memories.
+
+                Use when you need to look up specific entities, relationships,
+                or values rather than doing a semantic search. Returns facts
+                as (entity, relation, value, temporal_context) tuples.
+
+                Examples:
+                  - query_facts(entity="users") -> all facts about the users table
+                  - query_facts(relation="FK references") -> all foreign key relationships
+                  - query_facts(entity="orders", relation="has column") -> columns of orders
+
+                Args:
+                    entity: Filter by subject (partial match, case-insensitive)
+                    relation: Filter by relationship type (partial match)
+                    value: Filter by object/value (partial match)
+                    limit: Maximum results (default: 50)
+
+                Returns:
+                    List of structured facts with source content and metadata
+                """
+                # Lazy extraction: extract facts for chunks that need them
+                unextracted = await backend.get_unextracted_chunks(limit=50)
+                if unextracted:
+                    from .fact_extractor import FactExtractor
+
+                    for chunk_id, chunk_content in unextracted:
+                        facts = await _fact_extractor.extract(chunk_content)
+                        await backend.update_chunk_metadata(
+                            chunk_id,
+                            {
+                                "_facts_extracted": True,
+                                "extracted_facts": (
+                                    FactExtractor.facts_to_metadata(facts)
+                                    if facts
+                                    else []
+                                ),
+                            },
+                        )
+
+                results = await backend.query_facts(
+                    entity=entity, relation=relation, value=value, limit=limit
+                )
+                return serialize_results(results)
+
+            tools.append(query_facts)
+
+        return tools
 
     async def on_before_run(self, prompt: str) -> Optional[str]:
         """
@@ -497,6 +637,13 @@ class MemoryPlugin(LifecyclePlugin):
         """
         if self.backend is None:
             return None
+
+        # Prune expired memories at session start
+        if hasattr(self.backend, "prune"):
+            try:
+                await self.backend.prune()
+            except Exception:
+                pass
 
         try:
             results = await self.backend.recall(
@@ -531,6 +678,18 @@ class MemoryPlugin(LifecyclePlugin):
 
             if not results:
                 return None
+
+            # Always inject pinned memories — these are org rules / critical
+            # facts that must be visible regardless of semantic similarity.
+            seen = {r.get("chunk_id") for r in results if r.get("chunk_id")}
+            try:
+                pinned = await self.backend.get_pinned_memories()
+                for p in pinned:
+                    if p.get("chunk_id") not in seen:
+                        results.append(p)
+                        seen.add(p["chunk_id"])
+            except Exception:
+                pass
 
             # Track access for these auto-injected memories
             chunk_ids = [r["chunk_id"] for r in results if r.get("chunk_id")]
@@ -567,9 +726,16 @@ class MemoryPlugin(LifecyclePlugin):
         return await self.curator.curate()
 
     async def on_agent_stop(self):
-        """Flush pending changes and auto-curate if enabled."""
+        """Flush pending changes, prune stale memories, and auto-curate."""
         if hasattr(self.backend, "flush"):
             await self.backend.flush()
+
+        # Prune expired and over-limit memories
+        if hasattr(self.backend, "prune"):
+            try:
+                await self.backend.prune()
+            except Exception:
+                pass
 
         if self.auto_curate == "on_stop":
             if self.curator is not None:

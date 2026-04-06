@@ -8,12 +8,13 @@ project you can run locally and deploy to production with `daita push`.
 Start simple and work up to multi-agent pipelines:
 
 ```
-csv-data-analyst      → single agent, no external services
-sql-data-agent        → single agent + database plugin
-slack-reporter        → single agent + two plugins + scheduling
-etl-pipeline          → multi-agent linear workflow
-customer-support-bot  → multi-agent routing workflow
-deep-research         → multi-agent pipeline with memory + web search
+csv-data-analyst         → single agent, no external services
+sql-data-agent           → single agent + database plugin
+infrastructure-catalog   → single agent + catalog plugin (AWS + GitHub discovery)
+slack-reporter           → single agent + two plugins + scheduling
+etl-pipeline             → multi-agent linear workflow
+customer-support-bot     → multi-agent routing workflow
+deep-research            → multi-agent pipeline with memory + web search
 ```
 
 ---
@@ -56,6 +57,37 @@ schema, generates the right SQL, runs it, and summarises the output.
 ```
 OPENAI_API_KEY
 DATABASE_URL   # postgresql://user:pass@host:5432/dbname
+```
+
+---
+
+### [`infrastructure-catalog`](./infrastructure-catalog/)
+
+A single agent that discovers data stores across AWS accounts and GitHub
+repositories, builds a unified catalog, and answers questions about the
+organization's data landscape.
+
+**Use case:** "What production databases do we have?" -> the agent scans AWS
+RDS/DynamoDB/S3/ElastiCache/Redshift, scans GitHub repos for connection strings,
+deduplicates results, and returns a categorized summary.
+
+**Highlights:**
+- CatalogPlugin with pluggable `AWSDiscoverer` and `GitHubScanner`
+- Store deduplication and environment inference
+- Schema profiling via `PostgresProfiler` / `MySQLProfiler`
+- Paginated tool responses for large catalogs
+
+**Required env vars:**
+```
+OPENAI_API_KEY
+AWS credentials (AWS_ACCESS_KEY_ID / AWS_PROFILE / AWS_ROLE_ARN)
+```
+
+**Optional env vars:**
+```
+GITHUB_TOKEN       # enables GitHub repo scanning
+GITHUB_ORG         # scan all repos in an org
+AWS_REGIONS        # comma-separated (default: us-east-1)
 ```
 
 ---

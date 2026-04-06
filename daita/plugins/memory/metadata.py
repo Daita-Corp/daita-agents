@@ -27,6 +27,7 @@ class MemoryMetadata:
     pinned: bool = False
     access_count: int = 0
     last_accessed: Optional[datetime] = None
+    ttl_days: Optional[int] = None
 
     def __post_init__(self):
         """Set defaults for datetime fields."""
@@ -64,16 +65,6 @@ class MemoryMetadata:
         """Serialize to JSON string."""
         return json.dumps(self.to_dict())
 
-    @classmethod
-    def from_json(cls, json_str: str) -> "MemoryMetadata":
-        """Deserialize from JSON string."""
-        return cls.from_dict(json.loads(json_str))
-
-    def increment_access(self):
-        """Track that this memory was accessed."""
-        self.access_count += 1
-        self.last_accessed = datetime.now()
-
     def should_prune(
         self, max_age_days: int = 90, min_importance_threshold: float = 0.3
     ) -> bool:
@@ -98,6 +89,10 @@ class MemoryMetadata:
 
         # Calculate age
         age_days = (datetime.now() - self.created_at).days
+
+        # TTL expiry — hard cutoff regardless of importance or access
+        if self.ttl_days is not None and age_days > self.ttl_days:
+            return True
 
         # Never-accessed old memories prune sooner
         if self.access_count == 0 and age_days > 60 and self.importance < 0.5:

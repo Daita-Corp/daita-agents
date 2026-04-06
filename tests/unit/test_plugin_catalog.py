@@ -18,28 +18,41 @@ def make_plugin():
 
 
 def _make_tables(names):
-    return [{"table_name": n, "row_count": 0} for n in names]
+    return [{"name": n, "row_count": 0} for n in names]
+
+
+def _wrap_result(schema_dict):
+    """Wrap a raw schema dict in the standard response shape."""
+    return {
+        "schema": schema_dict,
+        "persisted": False,
+        "persist_skipped": "catalog backend not configured",
+    }
 
 
 async def _fake_discover_postgres(
     connection_string, schema="public", persist=False, ssl_mode="verify-full"
 ):
-    """Returns a fixed schema dict for testing."""
-    return {
-        "database_type": "postgresql",
-        "schema": schema,
-        "tables": _make_tables([f"table_{i}" for i in range(60)]),
-        "columns": [],
-    }
+    """Returns a fixed schema dict in the real wrapper shape."""
+    return _wrap_result(
+        {
+            "database_type": "postgresql",
+            "schema": schema,
+            "tables": _make_tables([f"table_{i}" for i in range(60)]),
+            "columns": [],
+        }
+    )
 
 
 async def _fake_discover_mysql(connection_string, schema=None, persist=False):
-    return {
-        "database_type": "mysql",
-        "schema": schema or "testdb",
-        "tables": _make_tables([f"tbl_{i}" for i in range(60)]),
-        "columns": [],
-    }
+    return _wrap_result(
+        {
+            "database_type": "mysql",
+            "schema": schema or "testdb",
+            "tables": _make_tables([f"tbl_{i}" for i in range(60)]),
+            "columns": [],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -72,43 +85,49 @@ async def test_postgres_max_tables_default_is_50(monkeypatch):
     plugin = make_plugin()
     plugin.discover_postgres = _fake_discover_postgres
 
-    result = await plugin._tool_discover_postgres(
+    tools = {t.name: t for t in plugin.get_tools()}
+    result = await tools["discover_postgres"].handler(
         {"connection_string": "postgresql://localhost/db"}
     )
 
-    assert len(result["tables"]) == 50
-    assert result["total_tables"] == 60
-    assert result["truncated"] is True
+    schema = result["schema"]
+    assert len(schema["tables"]) == 50
+    assert schema["total_tables"] == 60
+    assert schema["truncated"] is True
 
 
 async def test_postgres_max_tables_custom(monkeypatch):
     plugin = make_plugin()
     plugin.discover_postgres = _fake_discover_postgres
 
-    result = await plugin._tool_discover_postgres(
+    tools = {t.name: t for t in plugin.get_tools()}
+    result = await tools["discover_postgres"].handler(
         {
             "connection_string": "postgresql://localhost/db",
             "max_tables": 10,
         }
     )
 
-    assert len(result["tables"]) == 10
-    assert result["total_tables"] == 60
+    schema = result["schema"]
+    assert len(schema["tables"]) == 10
+    assert schema["total_tables"] == 60
 
 
 async def test_postgres_max_tables_larger_than_total_not_truncated(monkeypatch):
     plugin = make_plugin()
     plugin.discover_postgres = _fake_discover_postgres
 
-    result = await plugin._tool_discover_postgres(
+    tools = {t.name: t for t in plugin.get_tools()}
+    result = await tools["discover_postgres"].handler(
         {
             "connection_string": "postgresql://localhost/db",
             "max_tables": 100,
         }
     )
 
-    assert len(result["tables"]) == 60
-    assert result["truncated"] is False
+    schema = result["schema"]
+    assert len(schema["tables"]) == 60
+    assert schema["truncated"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -122,21 +141,24 @@ async def test_postgres_table_filter_glob(monkeypatch):
     async def fake_discover(
         connection_string, schema="public", persist=False, ssl_mode="verify-full"
     ):
-        return {
-            "tables": _make_tables(["orders", "order_items", "products", "users"]),
-            "columns": [],
-        }
+        return _wrap_result(
+            {
+                "tables": _make_tables(["orders", "order_items", "products", "users"]),
+                "columns": [],
+            }
+        )
 
     plugin.discover_postgres = fake_discover
 
-    result = await plugin._tool_discover_postgres(
+    tools = {t.name: t for t in plugin.get_tools()}
+    result = await tools["discover_postgres"].handler(
         {
             "connection_string": "postgresql://localhost/db",
             "table_filter": "order*",
         }
     )
 
-    names = [t["table_name"] for t in result["tables"]]
+    names = [t["name"] for t in result["schema"]["tables"]]
     assert "orders" in names
     assert "order_items" in names
     assert "products" not in names
@@ -149,19 +171,22 @@ async def test_postgres_table_filter_no_match_returns_empty(monkeypatch):
     async def fake_discover(
         connection_string, schema="public", persist=False, ssl_mode="verify-full"
     ):
-        return {"tables": _make_tables(["users", "products"]), "columns": []}
+        return _wrap_result(
+            {"tables": _make_tables(["users", "products"]), "columns": []}
+        )
 
     plugin.discover_postgres = fake_discover
 
-    result = await plugin._tool_discover_postgres(
+    tools = {t.name: t for t in plugin.get_tools()}
+    result = await tools["discover_postgres"].handler(
         {
             "connection_string": "postgresql://localhost/db",
             "table_filter": "xyz_*",
         }
     )
 
-    assert result["tables"] == []
-    assert result["total_tables"] == 0
+    assert result["schema"]["tables"] == []
+    assert result["schema"]["total_tables"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -173,34 +198,39 @@ async def test_mysql_max_tables_default_is_50(monkeypatch):
     plugin = make_plugin()
     plugin.discover_mysql = _fake_discover_mysql
 
-    result = await plugin._tool_discover_mysql(
+    tools = {t.name: t for t in plugin.get_tools()}
+    result = await tools["discover_mysql"].handler(
         {"connection_string": "mysql://localhost/db"}
     )
 
-    assert len(result["tables"]) == 50
-    assert result["total_tables"] == 60
-    assert result["truncated"] is True
+    schema = result["schema"]
+    assert len(schema["tables"]) == 50
+    assert schema["total_tables"] == 60
+    assert schema["truncated"] is True
 
 
 async def test_mysql_table_filter_applied(monkeypatch):
     plugin = make_plugin()
 
     async def fake_discover(connection_string, schema=None, persist=False):
-        return {
-            "tables": _make_tables(["sales_2023", "sales_2024", "customers"]),
-            "columns": [],
-        }
+        return _wrap_result(
+            {
+                "tables": _make_tables(["sales_2023", "sales_2024", "customers"]),
+                "columns": [],
+            }
+        )
 
     plugin.discover_mysql = fake_discover
 
-    result = await plugin._tool_discover_mysql(
+    tools = {t.name: t for t in plugin.get_tools()}
+    result = await tools["discover_mysql"].handler(
         {
             "connection_string": "mysql://localhost/db",
             "table_filter": "sales_*",
         }
     )
 
-    names = [t["table_name"] for t in result["tables"]]
+    names = [t["name"] for t in result["schema"]["tables"]]
     assert "sales_2023" in names
     assert "sales_2024" in names
     assert "customers" not in names

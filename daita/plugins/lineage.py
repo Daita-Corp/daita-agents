@@ -353,6 +353,8 @@ class LineagePlugin(BasePlugin):
             raise PluginError("No graph backend available")
 
         summary = await self._graph_backend.prune_stale(max_age_seconds)
+        if hasattr(self._graph_backend, "flush"):
+            await self._graph_backend.flush()
         return {
             "removed_node_count": len(summary["removed_nodes"]),
             "removed_edge_count": len(summary["removed_edges"]),

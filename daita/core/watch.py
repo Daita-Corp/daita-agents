@@ -9,7 +9,16 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncGenerator, Callable, Awaitable, Literal, Optional, Protocol
+from typing import (
+    Any,
+    AsyncGenerator,
+    Callable,
+    Awaitable,
+    Literal,
+    Optional,
+    Protocol,
+    Union,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,10 +84,12 @@ class WatchConfig:
     name: str  # auto-derived from handler.__name__
 
     # polling
-    condition: Any = None  # SQL string or async callable
     threshold: Optional[Callable[[Any], bool]] = None
     interval: Optional[timedelta] = None
     on_resolve: bool = False
+    cooldown: Union[bool, timedelta] = (
+        False  # False=every cycle, True=once, timedelta=re-alert
+    )
 
     # streaming (Phase 2 — stored but not used yet)
     topic: Optional[str] = None
@@ -100,6 +111,7 @@ class WatchState:
     triggered: bool = False  # True while condition is currently active
     last_error: Optional[Exception] = None
     _previous_value: Any = field(default=None, repr=False)
+    _last_trigger_time: Optional[datetime] = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------

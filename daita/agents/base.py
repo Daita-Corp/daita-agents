@@ -17,7 +17,10 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from ..core.watch import WatchConfig, WatchEvent, WatchState
 
 from ..config.base import AgentConfig
 from ..core.interfaces import AgentABC, LLMProvider
@@ -179,6 +182,7 @@ class BaseAgent(AgentABC):
         threshold: Optional[Callable[[Any], bool]] = None,
         interval: Optional[Union[str, timedelta]] = None,
         on_resolve: bool = False,
+        cooldown: Optional[Union[bool, str, timedelta]] = None,
         topic: Optional[str] = None,
         filter: Optional[Callable[[Any], bool]] = None,
         relay_channel: Optional[str] = None,
@@ -193,7 +197,8 @@ class BaseAgent(AgentABC):
             @agent.watch(source=pg,
                          condition="SELECT COUNT(*) FROM orders",
                          threshold=lambda v: v > 100,
-                         interval="10s")
+                         interval="10s",
+                         cooldown=True)
             async def on_spike(event: WatchEvent):
                 print(f"Order spike: {event.value}")
 
@@ -206,6 +211,10 @@ class BaseAgent(AgentABC):
             threshold: Called with the current value; watch fires when it returns True.
             interval: Poll period — timedelta or string like "30s", "5m", "1h", "2d".
             on_resolve: If True, fire again when the condition clears.
+            cooldown: Controls repeat alerting while a threshold is met.
+                False/None (default): fire every poll cycle.
+                True: fire once, then only on resolve (alarm model).
+                str/timedelta: fire once, then re-alert on this interval (e.g. "5m").
             topic: Streaming topic (Phase 2).
             filter: Message filter for streaming sources (Phase 2).
             relay_channel: Relay channel to publish events to (Phase 3).
@@ -225,8 +234,28 @@ class BaseAgent(AgentABC):
         if interval is not None and condition is None and topic is None:
             raise ValueError("interval= requires condition= to specify what to poll")
 
+        if filter is not None and threshold is not None:
+            raise ValueError(
+                "Cannot set both filter= and threshold=. "
+                "Use threshold= for polling watches, filter= for streaming watches."
+            )
+
         if isinstance(interval, str):
             interval = _parse_interval(interval)
+
+        # Normalize cooldown to bool | timedelta
+        if cooldown is None or cooldown is False:
+            cooldown_value: Union[bool, timedelta] = False
+        elif cooldown is True:
+            cooldown_value = True
+        elif isinstance(cooldown, str):
+            cooldown_value = _parse_interval(cooldown)
+        elif isinstance(cooldown, timedelta):
+            cooldown_value = cooldown
+        else:
+            raise ValueError(
+                f"cooldown must be bool, str, or timedelta — got {type(cooldown).__name__}"
+            )
 
         def decorator(handler: Callable) -> Callable:
             watch_name = name or handler.__name__
@@ -250,10 +279,10 @@ class BaseAgent(AgentABC):
                 handler=handler,
                 source=watch_source,
                 name=watch_name,
-                condition=condition,
                 threshold=threshold,
                 interval=interval,
                 on_resolve=on_resolve,
+                cooldown=cooldown_value,
                 topic=topic,
                 filter=filter,
                 relay_channel=relay_channel,
@@ -279,13 +308,13 @@ class BaseAgent(AgentABC):
         async with self._watches_lock:
             if self._watches_started:  # re-check after acquiring
                 return
+            self._tasks = [t for t in self._tasks if not t.done()]
             for config in self._watches:
                 await self._start_watch(config)
             self._watches_started = True
 
-    async def _start_watch(self, config: Any) -> None:
+    async def _start_watch(self, config: "WatchConfig") -> None:
         """Create and register a background task for a single watch."""
-        self._tasks = [t for t in self._tasks if not t.done()]
         task = asyncio.create_task(
             self._watch_loop(config), name=f"watch:{config.name}"
         )
@@ -302,8 +331,15 @@ class BaseAgent(AgentABC):
                     f"task_manager.create_task failed for watch '{config.name}': {e}"
                 )
 
-    async def _watch_loop(self, config: Any) -> None:
-        """Core watch runtime: polls/streams the source, fires the handler on trigger."""
+    async def _watch_loop(self, config: "WatchConfig") -> None:
+        """Core watch runtime: polls/streams the source, fires the handler on trigger.
+
+        State machine per poll cycle:
+        - Threshold met + not yet triggered → fire handler, mark triggered
+        - Threshold met + triggered + cooldown allows re-alert → fire handler
+        - Threshold met + triggered + cooldown suppresses → skip (poll continues)
+        - Threshold cleared + was triggered → reset state, fire resolve if on_resolve
+        """
         from ..core.watch import WatchState
 
         state = WatchState(config=config, task=asyncio.current_task(), status="running")
@@ -312,17 +348,24 @@ class BaseAgent(AgentABC):
         try:
             async for raw_value in config.source.events():
                 try:
-                    state._previous_value = raw_value
-                    if self._should_trigger(config, state, raw_value):
-                        event = self._build_watch_event(config, state, raw_value)
-                        state.triggered = True
-                        await self._invoke_handler(config.handler, event, config)
-                    elif config.on_resolve and state.triggered:
+                    threshold_met = self._should_trigger(config, state, raw_value)
+
+                    if threshold_met:
+                        if not state.triggered or self._should_realert(config, state):
+                            event = self._build_watch_event(config, state, raw_value)
+                            state.triggered = True
+                            state._last_trigger_time = datetime.now(timezone.utc)
+                            await self._invoke_handler(config.handler, event, config)
+                    elif state.triggered:
                         state.triggered = False
-                        event = self._build_watch_event(
-                            config, state, raw_value, resolved=True
-                        )
-                        await self._invoke_handler(config.handler, event, config)
+                        state._last_trigger_time = None
+                        if config.on_resolve:
+                            event = self._build_watch_event(
+                                config, state, raw_value, resolved=True
+                            )
+                            await self._invoke_handler(config.handler, event, config)
+
+                    state._previous_value = raw_value
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -338,17 +381,37 @@ class BaseAgent(AgentABC):
                 exc_info=True,
             )
 
-    def _should_trigger(self, config: Any, state: Any, raw_value: Any) -> bool:
-        """Determine whether this value should fire the handler."""
-        if config.filter is not None:
-            return config.filter(raw_value)
+    def _should_trigger(
+        self, config: "WatchConfig", state: "WatchState", raw_value: Any
+    ) -> bool:
+        """Determine whether the threshold condition is met."""
         if config.threshold is None:
             return True
         return config.threshold(raw_value)
 
+    def _should_realert(self, config: "WatchConfig", state: "WatchState") -> bool:
+        """Determine whether a triggered watch should fire again.
+
+        Called only when threshold is still met and state.triggered is True.
+        Returns False to suppress the handler (cooldown active), True to re-fire.
+        """
+        if config.cooldown is False:
+            return True  # no cooldown — fire every cycle
+        if config.cooldown is True:
+            return False  # strict cooldown — fire once until resolved
+        # timedelta cooldown — re-alert if enough time has elapsed
+        if state._last_trigger_time is None:
+            return True
+        elapsed = datetime.now(timezone.utc) - state._last_trigger_time
+        return elapsed >= config.cooldown
+
     def _build_watch_event(
-        self, config: Any, state: Any, raw_value: Any, resolved: bool = False
-    ) -> Any:
+        self,
+        config: "WatchConfig",
+        state: "WatchState",
+        raw_value: Any,
+        resolved: bool = False,
+    ) -> "WatchEvent":
         """Construct a WatchEvent from the current state."""
         from ..core.watch import WatchEvent
 
@@ -360,15 +423,19 @@ class BaseAgent(AgentABC):
             previous_value=state._previous_value,
         )
 
-    async def _call_on_error(self, config: Any, error: Exception) -> None:
+    async def _call_on_error(self, config: "WatchConfig", error: Exception) -> None:
         """Dispatch to config.on_error, swallowing any secondary exceptions."""
         if config.on_error:
             try:
                 await config.on_error(error)
             except Exception:
-                pass
+                logger.debug(
+                    f"on_error callback for '{config.name}' raised", exc_info=True
+                )
 
-    async def _invoke_handler(self, handler: Callable, event: Any, config: Any) -> None:
+    async def _invoke_handler(
+        self, handler: Callable, event: "WatchEvent", config: "WatchConfig"
+    ) -> None:
         """Call the watch handler, isolating exceptions from the watch loop."""
         try:
             if config.handler_timeout is not None:

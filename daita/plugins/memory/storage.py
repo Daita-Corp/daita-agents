@@ -65,41 +65,6 @@ class FileStorage:
 
         return str(log_file)
 
-    async def append_to_long_term(
-        self, content: str, section: Optional[str] = None
-    ) -> str:
-        """
-        Append to long-term MEMORY.md file.
-
-        Args:
-            content: Content to append (may include metadata)
-            section: Optional section header
-
-        Returns:
-            Path to the memory file
-        """
-        # Initialize memory file if it doesn't exist
-        if not self.memory_file.exists():
-            async with aiofiles.open(self.memory_file, mode="w", encoding="utf-8") as f:
-                await f.write("# Long-Term Memory\n\n")
-
-        # Format entry with agent attribution
-        entry = ""
-        if section:
-            entry += f"\n## {section}\n\n"
-
-        # Add agent attribution for shared workspaces (inline)
-        if self.agent_id:
-            entry += f"*[{self.agent_id}]* "
-
-        entry += f"{content}\n"
-
-        # Append to file
-        async with aiofiles.open(self.memory_file, mode="a", encoding="utf-8") as f:
-            await f.write(entry)
-
-        return str(self.memory_file)
-
     async def read_file(self, file_path: str) -> str:
         """
         Read a complete memory file.
