@@ -14,7 +14,12 @@ async def discover_openapi(
 
     Returns a raw result dict with endpoints and API metadata.
     """
-    import httpx
+    try:
+        import httpx
+    except ImportError:
+        raise ImportError(
+            "httpx is required. Install with: pip install 'daita-agents[github]'"
+        )
     import yaml
 
     url_error = validate_openapi_url(spec_url)

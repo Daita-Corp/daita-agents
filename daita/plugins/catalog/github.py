@@ -121,7 +121,7 @@ class GitHubScanner(BaseDiscoverer):
             import httpx
         except ImportError:
             raise ImportError(
-                "httpx is required. Install with: pip install httpx"
+                "httpx is required. Install with: pip install 'daita-agents[github]'"
             )
         import os
 

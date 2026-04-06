@@ -18,7 +18,12 @@ async def discover_s3(
     Returns a raw result dict with prefix structure, object metadata stats,
     and versioning/encryption configuration.
     """
-    import boto3
+    try:
+        import boto3
+    except ImportError:
+        raise ImportError(
+            "boto3 is required. Install with: pip install 'daita-agents[aws]'"
+        )
 
     logger.debug("discover_s3: sampling bucket %s in %s", bucket, region)
 

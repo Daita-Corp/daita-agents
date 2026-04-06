@@ -18,7 +18,12 @@ async def discover_dynamodb(
     Returns a raw result dict with key schema, attribute definitions, GSIs,
     and attributes inferred from sampled items.
     """
-    import boto3
+    try:
+        import boto3
+    except ImportError:
+        raise ImportError(
+            "boto3 is required. Install with: pip install 'daita-agents[aws]'"
+        )
 
     logger.debug("discover_dynamodb: describing table %s in %s", table_name, region)
 

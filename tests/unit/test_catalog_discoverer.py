@@ -3,7 +3,6 @@ Tests for BaseDiscoverer contract, discovery orchestration, and new tools.
 """
 
 import pytest
-from dataclasses import dataclass, field
 from typing import AsyncIterator, List
 
 from daita.plugins.catalog.base_discoverer import (

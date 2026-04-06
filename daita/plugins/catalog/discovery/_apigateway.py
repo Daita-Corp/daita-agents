@@ -29,7 +29,12 @@ async def discover_apigateway(
     and stage configuration. The integration URIs are the key data for
     lineage inference — they contain Lambda ARNs and HTTP endpoints.
     """
-    import boto3
+    try:
+        import boto3
+    except ImportError:
+        raise ImportError(
+            "boto3 is required. Install with: pip install 'daita-agents[aws]'"
+        )
 
     logger.debug("discover_apigateway: profiling %s (%s) in %s", api_id, api_type, region)
 

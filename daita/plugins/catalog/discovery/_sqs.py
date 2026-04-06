@@ -19,7 +19,12 @@ async def discover_sqs(
     Returns a raw result dict with queue attributes and sampled message
     attribute keys/types.
     """
-    import boto3
+    try:
+        import boto3
+    except ImportError:
+        raise ImportError(
+            "boto3 is required. Install with: pip install 'daita-agents[aws]'"
+        )
 
     logger.debug("discover_sqs: inspecting queue %s in %s", queue_url, region)
 

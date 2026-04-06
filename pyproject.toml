@@ -128,6 +128,7 @@ sqlite = ["aiosqlite>=0.21.0", "SQLAlchemy>=2.0.0"]
 snowflake = ["snowflake-connector-python>=3.0.0", "cryptography>=3.0.0"]
 elasticsearch = ["elasticsearch>=8.0.0"]
 opensearch = ["opensearch-py>=2.0.0"]
+github = ["httpx>=0.24.0"]
 bigquery = ["google-cloud-bigquery>=3.0.0"]
 
 # Convenience bundle - all traditional databases
@@ -255,12 +256,14 @@ all = [
     "cryptography>=3.0.0",
     "elasticsearch>=8.0.0",
     "google-cloud-bigquery>=3.0.0",
+    "opensearch-py>=2.0.0",
     # All vector databases
     "chromadb>=1.3.0",
     "pinecone>=5.0.0",
     "qdrant-client>=1.16.0",
     # Cloud & integrations
     "boto3>=1.38.0",
+    "httpx>=0.24.0",
     "google-api-python-client>=2.0.0",
     "google-auth>=2.0.0",
     "google-auth-oauthlib>=1.0.0",

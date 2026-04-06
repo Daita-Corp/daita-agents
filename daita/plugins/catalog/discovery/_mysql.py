@@ -17,7 +17,12 @@ async def discover_mysql(
 
     Returns a raw result dict with tables, columns, and foreign keys.
     """
-    import aiomysql
+    try:
+        import aiomysql
+    except ImportError:
+        raise ImportError(
+            "aiomysql is required. Install with: pip install 'daita-agents[mysql]'"
+        )
 
     logger.debug(
         "discover_mysql: connecting to %s", redact_url(connection_string)

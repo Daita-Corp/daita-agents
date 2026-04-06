@@ -18,7 +18,12 @@ async def discover_kinesis(
 
     Returns a raw result dict with stream metadata and inferred record fields.
     """
-    import boto3
+    try:
+        import boto3
+    except ImportError:
+        raise ImportError(
+            "boto3 is required. Install with: pip install 'daita-agents[aws]'"
+        )
 
     logger.debug("discover_kinesis: inspecting stream %s in %s", stream_name, region)
 

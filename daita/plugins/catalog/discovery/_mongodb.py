@@ -18,7 +18,12 @@ async def discover_mongodb(
 
     Returns a raw result dict with collections and inferred field schemas.
     """
-    from motor.motor_asyncio import AsyncIOMotorClient
+    try:
+        from motor.motor_asyncio import AsyncIOMotorClient
+    except ImportError:
+        raise ImportError(
+            "motor is required. Install with: pip install 'daita-agents[mongodb]'"
+        )
 
     logger.debug(
         "discover_mongodb: connecting to %s", redact_url(connection_string)

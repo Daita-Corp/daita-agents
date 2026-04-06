@@ -19,7 +19,12 @@ async def discover_postgres(
     Returns a raw result dict with tables, columns, primary keys, foreign keys,
     and indexes. Caller is responsible for persistence.
     """
-    import asyncpg
+    try:
+        import asyncpg
+    except ImportError:
+        raise ImportError(
+            "asyncpg is required. Install with: pip install 'daita-agents[postgresql]'"
+        )
 
     logger.debug(
         "discover_postgres: connecting to %s (ssl_mode=%s)",
