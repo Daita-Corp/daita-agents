@@ -464,6 +464,7 @@ async def test_report_persists_stable_metric_node_id():
     backend = MagicMock()
     backend.add_node = AsyncMock()
     backend.add_edge = AsyncMock()
+    backend.flush = AsyncMock()
 
     plugin = make_dq(db=db, backend=backend)
     result = await plugin.report(db, "orders")
@@ -494,6 +495,7 @@ async def test_report_metric_node_id_is_stable_across_calls():
     backend = MagicMock()
     backend.add_node = AsyncMock()
     backend.add_edge = AsyncMock()
+    backend.flush = AsyncMock()
 
     plugin = make_dq(db=db, backend=backend)
     r1 = await plugin.report(db, "orders")

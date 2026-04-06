@@ -91,7 +91,7 @@ class AgentGraphEdge(BaseModel):
     confidence: float = 1.0
 
     # Impact weight: 1.0 = critical dependency, 0.0 = loose coupling
-    impact_weight: float = 1.0
+    impact_weight: float = Field(default=1.0, ge=0.0, le=1.0)
 
     # Temporal
     timestamp: datetime = Field(default_factory=_utcnow)

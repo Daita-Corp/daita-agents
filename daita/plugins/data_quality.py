@@ -628,6 +628,9 @@ class DataQualityPlugin(BasePlugin):
                 )
                 await self._graph_backend.add_edge(edge)
 
+                if hasattr(self._graph_backend, "flush"):
+                    await self._graph_backend.flush()
+
                 report_data["graph_persisted"] = True
                 report_data["metric_node_id"] = metric_node_id
             except Exception as exc:

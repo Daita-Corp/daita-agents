@@ -19,6 +19,7 @@ def make_backend(existing_node=None):
     backend = MagicMock()
     backend.add_node = AsyncMock()
     backend.add_edge = AsyncMock()
+    backend.flush = AsyncMock()
     backend.get_node = AsyncMock(return_value=existing_node)
 
     mock_graph = MagicMock()

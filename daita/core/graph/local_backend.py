@@ -157,34 +157,37 @@ class LocalGraphBackend:
             logger.debug(f"Graph: upserted edge {edge.edge_id}")
 
     async def get_node(self, node_id: str) -> Optional[AgentGraphNode]:
-        graph = self._load()
-        if node_id not in graph:
-            return None
-        raw = graph.nodes[node_id].get("data", {})
-        if not raw.get("node_type"):
-            return None
-        return AgentGraphNode(**raw)
+        async with self._lock:
+            graph = self._load()
+            if node_id not in graph:
+                return None
+            raw = graph.nodes[node_id].get("data", {})
+            if not raw.get("node_type"):
+                return None
+            return AgentGraphNode(**raw)
 
     async def get_edges(
         self,
         from_node_id: Optional[str] = None,
         to_node_id: Optional[str] = None,
     ) -> List[AgentGraphEdge]:
-        graph = self._load()
-        edges = []
-        for u, v, _key, edge_data in graph.edges(keys=True, data=True):
-            raw = edge_data.get("data", {})
-            if not raw:
-                continue
-            if from_node_id and u != from_node_id:
-                continue
-            if to_node_id and v != to_node_id:
-                continue
-            edges.append(AgentGraphEdge(**raw))
-        return edges
+        async with self._lock:
+            graph = self._load()
+            edges = []
+            for u, v, _key, edge_data in graph.edges(keys=True, data=True):
+                raw = edge_data.get("data", {})
+                if not raw:
+                    continue
+                if from_node_id and u != from_node_id:
+                    continue
+                if to_node_id and v != to_node_id:
+                    continue
+                edges.append(AgentGraphEdge(**raw))
+            return edges
 
     async def load_graph(self) -> nx.MultiDiGraph:
-        return self._load()
+        async with self._lock:
+            return self._load()
 
     async def flush(self) -> None:
         """
@@ -205,7 +208,7 @@ class LocalGraphBackend:
             graph = self._load()
             if node_id in graph:
                 graph.remove_node(node_id)
-                self._save(graph)
+                self._dirty = True
 
     async def update_node_properties(self, node_id: str, properties: dict) -> None:
         async with self._lock:
@@ -213,9 +216,9 @@ class LocalGraphBackend:
             if node_id in graph:
                 existing = graph.nodes[node_id].get("data", {})
                 existing.setdefault("properties", {}).update(properties)
-                existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+                existing["updated_at"] = datetime.now(timezone.utc)
                 graph.nodes[node_id]["data"] = existing
-                self._save(graph)
+                self._dirty = True
 
     async def prune_stale(self, max_age_seconds: int) -> dict:
         """
@@ -293,7 +296,7 @@ class LocalGraphBackend:
                     continue
 
             if removed_nodes or removed_edges:
-                self._save(graph)
+                self._dirty = True
 
             summary = {"removed_nodes": removed_nodes, "removed_edges": removed_edges}
             logger.info(

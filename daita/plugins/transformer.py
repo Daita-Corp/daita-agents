@@ -500,6 +500,9 @@ class TransformerPlugin(BasePlugin):
                     )
                 )
 
+            if hasattr(self._graph_backend, "flush"):
+                await self._graph_backend.flush()
+
         return {
             "success": True,
             "name": name,
@@ -569,6 +572,8 @@ class TransformerPlugin(BasePlugin):
                         properties=updated_props,
                     )
                 )
+                if hasattr(self._graph_backend, "flush"):
+                    await self._graph_backend.flush()
         except Exception as exc:
             logger.warning("TransformerPlugin: failed to update run metadata: %s", exc)
 
@@ -661,6 +666,8 @@ class TransformerPlugin(BasePlugin):
                     properties=updated_props,
                 )
             )
+            if hasattr(self._graph_backend, "flush"):
+                await self._graph_backend.flush()
 
         return {
             "success": True,
