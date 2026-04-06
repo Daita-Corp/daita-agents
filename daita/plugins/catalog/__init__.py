@@ -5,7 +5,11 @@ Provides tools for discovering database schemas, API structures, and other
 organizational metadata across multiple platforms.
 """
 
-from .catalog import CatalogPlugin, catalog as create_catalog, register_catalog_backend_factory
+from .catalog import (
+    CatalogPlugin,
+    catalog as create_catalog,
+    register_catalog_backend_factory,
+)
 from .base_discoverer import (
     BaseDiscoverer,
     DiscoveredStore,
@@ -19,7 +23,6 @@ from .base_profiler import (
     NormalizedSchema,
     NormalizedTable,
 )
-
 
 # Backward compat: `from daita.plugins.catalog import catalog` still works
 catalog = create_catalog

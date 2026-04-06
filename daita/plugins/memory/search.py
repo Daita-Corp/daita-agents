@@ -264,7 +264,14 @@ class SQLiteVectorSearch:
             )
             cursor.execute(
                 "INSERT INTO chunks (chunk_id, file_path, content, line_start, line_end, metadata) VALUES (?, ?, ?, ?, ?, ?)",
-                (item["chunk_id"], "memory://direct", item["content"], 0, 0, metadata_json),
+                (
+                    item["chunk_id"],
+                    "memory://direct",
+                    item["content"],
+                    0,
+                    0,
+                    metadata_json,
+                ),
             )
             norm = float(np.linalg.norm(embeddings[i]))
             cursor.execute(
@@ -452,10 +459,12 @@ class SQLiteVectorSearch:
         stored_norms = [r[7] for r in rows]
         all_vecs = np.array([json.loads(e) for e in embedding_jsons])
         query_norm = np.linalg.norm(query_vec)
-        all_norms = np.array([
-            n if n is not None else float(np.linalg.norm(v))
-            for n, v in zip(stored_norms, all_vecs)
-        ])
+        all_norms = np.array(
+            [
+                n if n is not None else float(np.linalg.norm(v))
+                for n, v in zip(stored_norms, all_vecs)
+            ]
+        )
         denoms = query_norm * all_norms
         similarities = np.where(denoms > 0, all_vecs @ query_vec / denoms, 0.0)
 

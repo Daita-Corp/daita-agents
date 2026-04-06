@@ -37,14 +37,16 @@ async def discover_sqs(
     # Queue attributes
     attrs = {}
     try:
-        attrs = client.get_queue_attributes(
-            QueueUrl=queue_url, AttributeNames=["All"]
-        )["Attributes"]
+        attrs = client.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["All"])[
+            "Attributes"
+        ]
     except Exception as exc:
         logger.warning("SQS get_queue_attributes failed for %s: %s", queue_url, exc)
 
     queue_arn = attrs.get("QueueArn", "")
-    queue_name = queue_arn.rsplit(":", 1)[-1] if queue_arn else queue_url.rsplit("/", 1)[-1]
+    queue_name = (
+        queue_arn.rsplit(":", 1)[-1] if queue_arn else queue_url.rsplit("/", 1)[-1]
+    )
 
     # Peek at messages to infer message attribute schema (does not delete)
     message_attributes: Dict[str, List[str]] = {}

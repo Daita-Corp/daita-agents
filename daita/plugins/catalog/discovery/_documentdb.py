@@ -84,12 +84,14 @@ async def discover_documentdb(
             except Exception:
                 pass
 
-            collections_schema.append({
-                "collection_name": coll_name,
-                "document_count": doc_count,
-                "sampled_count": len(docs),
-                "fields": list(fields.values()),
-            })
+            collections_schema.append(
+                {
+                    "collection_name": coll_name,
+                    "document_count": doc_count,
+                    "sampled_count": len(docs),
+                    "fields": list(fields.values()),
+                }
+            )
 
         return {
             "database_type": "documentdb",

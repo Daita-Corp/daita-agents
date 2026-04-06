@@ -38,9 +38,7 @@ def normalize_postgresql(raw: Dict[str, Any]) -> Dict[str, Any]:
             if c.get("column_comment"):
                 col["column_comment"] = c["column_comment"]
             cols.append(col)
-        tables.append(
-            {"name": tname, "row_count": t.get("row_count"), "columns": cols}
-        )
+        tables.append({"name": tname, "row_count": t.get("row_count"), "columns": cols})
 
     fks = [
         {
@@ -82,9 +80,7 @@ def normalize_mysql(raw: Dict[str, Any]) -> Dict[str, Any]:
             if c.get("column_comment"):
                 col["column_comment"] = c["column_comment"]
             cols.append(col)
-        tables.append(
-            {"name": tname, "row_count": t.get("row_count"), "columns": cols}
-        )
+        tables.append({"name": tname, "row_count": t.get("row_count"), "columns": cols})
 
     fks = [
         {
@@ -217,7 +213,9 @@ def normalize_dynamodb(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     # Build type map from attribute definitions
     defined_types = {
-        a["AttributeName"]: _DYNAMODB_TYPE_MAP.get(a["AttributeType"], a["AttributeType"])
+        a["AttributeName"]: _DYNAMODB_TYPE_MAP.get(
+            a["AttributeType"], a["AttributeType"]
+        )
         for a in attribute_defs
     }
 
@@ -229,13 +227,15 @@ def normalize_dynamodb(raw: Dict[str, Any]) -> Dict[str, Any]:
     for key in key_schema:
         name = key["AttributeName"]
         seen.add(name)
-        columns.append({
-            "name": name,
-            "type": defined_types.get(name, "string"),
-            "nullable": False,
-            "is_primary_key": True,
-            "column_comment": f"{'Partition' if key['KeyType'] == 'HASH' else 'Sort'} key",
-        })
+        columns.append(
+            {
+                "name": name,
+                "type": defined_types.get(name, "string"),
+                "nullable": False,
+                "is_primary_key": True,
+                "column_comment": f"{'Partition' if key['KeyType'] == 'HASH' else 'Sort'} key",
+            }
+        )
 
     # Remaining defined attributes
     for attr in attribute_defs:
@@ -243,12 +243,16 @@ def normalize_dynamodb(raw: Dict[str, Any]) -> Dict[str, Any]:
         if name in seen:
             continue
         seen.add(name)
-        columns.append({
-            "name": name,
-            "type": _DYNAMODB_TYPE_MAP.get(attr["AttributeType"], attr["AttributeType"]),
-            "nullable": True,
-            "is_primary_key": False,
-        })
+        columns.append(
+            {
+                "name": name,
+                "type": _DYNAMODB_TYPE_MAP.get(
+                    attr["AttributeType"], attr["AttributeType"]
+                ),
+                "nullable": True,
+                "is_primary_key": False,
+            }
+        )
 
     # Sampled attributes not in definitions
     for attr_name, types in sampled.items():
@@ -257,19 +261,23 @@ def normalize_dynamodb(raw: Dict[str, Any]) -> Dict[str, Any]:
         seen.add(attr_name)
         # Pick the most common type, or first
         dtype = types[0] if types else "S"
-        columns.append({
-            "name": attr_name,
-            "type": _DYNAMODB_TYPE_MAP.get(dtype, dtype),
-            "nullable": True,
-            "is_primary_key": False,
-            "column_comment": "inferred from sample",
-        })
+        columns.append(
+            {
+                "name": attr_name,
+                "type": _DYNAMODB_TYPE_MAP.get(dtype, dtype),
+                "nullable": True,
+                "is_primary_key": False,
+                "column_comment": "inferred from sample",
+            }
+        )
 
-    tables = [{
-        "name": table_name,
-        "row_count": raw.get("item_count"),
-        "columns": columns,
-    }]
+    tables = [
+        {
+            "name": table_name,
+            "row_count": raw.get("item_count"),
+            "columns": columns,
+        }
+    ]
 
     return {
         "database_type": "dynamodb",
@@ -293,16 +301,33 @@ def normalize_s3(raw: Dict[str, Any]) -> Dict[str, Any]:
     # These fields exist on every S3 object — this is the real schema
     columns = [
         {"name": "key", "type": "string", "nullable": False, "is_primary_key": True},
-        {"name": "size_bytes", "type": "number", "nullable": False, "is_primary_key": False},
-        {"name": "last_modified", "type": "timestamp", "nullable": False, "is_primary_key": False},
-        {"name": "storage_class", "type": "string", "nullable": True, "is_primary_key": False},
+        {
+            "name": "size_bytes",
+            "type": "number",
+            "nullable": False,
+            "is_primary_key": False,
+        },
+        {
+            "name": "last_modified",
+            "type": "timestamp",
+            "nullable": False,
+            "is_primary_key": False,
+        },
+        {
+            "name": "storage_class",
+            "type": "string",
+            "nullable": True,
+            "is_primary_key": False,
+        },
     ]
 
-    tables = [{
-        "name": bucket,
-        "row_count": raw.get("object_count"),
-        "columns": columns,
-    }]
+    tables = [
+        {
+            "name": bucket,
+            "row_count": raw.get("object_count"),
+            "columns": columns,
+        }
+    ]
 
     return {
         "database_type": "s3",
@@ -342,13 +367,15 @@ def normalize_apigateway(raw: Dict[str, Any]) -> Dict[str, Any]:
         if ep.get("integration_uri"):
             integration_hint = f" -> {ep['integration_uri']}"
 
-        columns.append({
-            "name": col_name,
-            "type": "endpoint",
-            "nullable": False,
-            "is_primary_key": False,
-            "column_comment": f"{auth}{integration_hint}",
-        })
+        columns.append(
+            {
+                "name": col_name,
+                "type": "endpoint",
+                "nullable": False,
+                "is_primary_key": False,
+                "column_comment": f"{auth}{integration_hint}",
+            }
+        )
 
         # Collect full integration map for metadata
         if ep.get("integration_type") or ep.get("integration_uri"):
@@ -357,11 +384,13 @@ def normalize_apigateway(raw: Dict[str, Any]) -> Dict[str, Any]:
                 "uri": ep.get("integration_uri", ""),
             }
 
-    tables = [{
-        "name": api_name,
-        "row_count": len(endpoints),
-        "columns": columns,
-    }]
+    tables = [
+        {
+            "name": api_name,
+            "row_count": len(endpoints),
+            "columns": columns,
+        }
+    ]
 
     return {
         "database_type": "apigateway",
@@ -390,38 +419,59 @@ def normalize_sqs(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     # Standard SQS message fields
     columns: List[Dict[str, Any]] = [
-        {"name": "MessageId", "type": "string", "nullable": False, "is_primary_key": True},
+        {
+            "name": "MessageId",
+            "type": "string",
+            "nullable": False,
+            "is_primary_key": True,
+        },
         {"name": "Body", "type": "string", "nullable": False, "is_primary_key": False},
-        {"name": "MD5OfBody", "type": "string", "nullable": False, "is_primary_key": False},
-        {"name": "ReceiptHandle", "type": "string", "nullable": False, "is_primary_key": False},
+        {
+            "name": "MD5OfBody",
+            "type": "string",
+            "nullable": False,
+            "is_primary_key": False,
+        },
+        {
+            "name": "ReceiptHandle",
+            "type": "string",
+            "nullable": False,
+            "is_primary_key": False,
+        },
     ]
 
     # Message attributes from sampling
     for attr_name, types in raw.get("message_attributes", {}).items():
         dtype = types[0] if types else "String"
-        columns.append({
-            "name": f"attr:{attr_name}",
-            "type": dtype.lower(),
-            "nullable": True,
-            "is_primary_key": False,
-            "column_comment": "message attribute",
-        })
+        columns.append(
+            {
+                "name": f"attr:{attr_name}",
+                "type": dtype.lower(),
+                "nullable": True,
+                "is_primary_key": False,
+                "column_comment": "message attribute",
+            }
+        )
 
     # JSON body keys from sampling
     for key, dtype in raw.get("body_keys", {}).items():
-        columns.append({
-            "name": f"body.{key}",
-            "type": dtype,
-            "nullable": True,
-            "is_primary_key": False,
-            "column_comment": "inferred from JSON body sample",
-        })
+        columns.append(
+            {
+                "name": f"body.{key}",
+                "type": dtype,
+                "nullable": True,
+                "is_primary_key": False,
+                "column_comment": "inferred from JSON body sample",
+            }
+        )
 
-    tables = [{
-        "name": queue_name,
-        "row_count": raw.get("approximate_message_count"),
-        "columns": columns,
-    }]
+    tables = [
+        {
+            "name": queue_name,
+            "row_count": raw.get("approximate_message_count"),
+            "columns": columns,
+        }
+    ]
 
     return {
         "database_type": "sqs",
@@ -446,29 +496,53 @@ def normalize_sns(raw: Dict[str, Any]) -> Dict[str, Any]:
     topic_name = raw.get("topic_name", "")
 
     columns: List[Dict[str, Any]] = [
-        {"name": "TopicArn", "type": "string", "nullable": False, "is_primary_key": True},
-        {"name": "Message", "type": "string", "nullable": False, "is_primary_key": False},
-        {"name": "Subject", "type": "string", "nullable": True, "is_primary_key": False},
-        {"name": "MessageAttributes", "type": "map", "nullable": True, "is_primary_key": False},
+        {
+            "name": "TopicArn",
+            "type": "string",
+            "nullable": False,
+            "is_primary_key": True,
+        },
+        {
+            "name": "Message",
+            "type": "string",
+            "nullable": False,
+            "is_primary_key": False,
+        },
+        {
+            "name": "Subject",
+            "type": "string",
+            "nullable": True,
+            "is_primary_key": False,
+        },
+        {
+            "name": "MessageAttributes",
+            "type": "map",
+            "nullable": True,
+            "is_primary_key": False,
+        },
     ]
 
     # Add subscriptions as columns to capture routing
     for sub in raw.get("subscriptions", []):
         protocol = sub.get("protocol", "unknown")
         endpoint = sub.get("endpoint", "")
-        columns.append({
-            "name": f"sub:{protocol}:{endpoint}",
-            "type": "subscription",
-            "nullable": True,
-            "is_primary_key": False,
-            "column_comment": f"protocol={protocol}",
-        })
+        columns.append(
+            {
+                "name": f"sub:{protocol}:{endpoint}",
+                "type": "subscription",
+                "nullable": True,
+                "is_primary_key": False,
+                "column_comment": f"protocol={protocol}",
+            }
+        )
 
-    tables = [{
-        "name": topic_name,
-        "row_count": raw.get("subscription_count"),
-        "columns": columns,
-    }]
+    tables = [
+        {
+            "name": topic_name,
+            "row_count": raw.get("subscription_count"),
+            "columns": columns,
+        }
+    ]
 
     return {
         "database_type": "sns",
@@ -495,17 +569,21 @@ def normalize_opensearch(raw: Dict[str, Any]) -> Dict[str, Any]:
     for idx in raw.get("indices", []):
         cols = []
         for field in idx.get("fields", []):
-            cols.append({
-                "name": field["field_name"],
-                "type": field.get("type", "object"),
-                "nullable": True,
-                "is_primary_key": field["field_name"] == "_id",
-            })
-        tables.append({
-            "name": idx["index_name"],
-            "row_count": idx.get("doc_count"),
-            "columns": cols,
-        })
+            cols.append(
+                {
+                    "name": field["field_name"],
+                    "type": field.get("type", "object"),
+                    "nullable": True,
+                    "is_primary_key": field["field_name"] == "_id",
+                }
+            )
+        tables.append(
+            {
+                "name": idx["index_name"],
+                "row_count": idx.get("doc_count"),
+                "columns": cols,
+            }
+        )
 
     return {
         "database_type": "opensearch",
@@ -540,27 +618,46 @@ def normalize_kinesis(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     # Standard Kinesis record fields
     columns: List[Dict[str, Any]] = [
-        {"name": "SequenceNumber", "type": "string", "nullable": False, "is_primary_key": True},
-        {"name": "PartitionKey", "type": "string", "nullable": False, "is_primary_key": False},
+        {
+            "name": "SequenceNumber",
+            "type": "string",
+            "nullable": False,
+            "is_primary_key": True,
+        },
+        {
+            "name": "PartitionKey",
+            "type": "string",
+            "nullable": False,
+            "is_primary_key": False,
+        },
         {"name": "Data", "type": "blob", "nullable": False, "is_primary_key": False},
-        {"name": "ApproximateArrivalTimestamp", "type": "timestamp", "nullable": False, "is_primary_key": False},
+        {
+            "name": "ApproximateArrivalTimestamp",
+            "type": "timestamp",
+            "nullable": False,
+            "is_primary_key": False,
+        },
     ]
 
     # JSON payload keys from sampling
     for key, dtype in raw.get("record_fields", {}).items():
-        columns.append({
-            "name": f"data.{key}",
-            "type": dtype,
-            "nullable": True,
-            "is_primary_key": False,
-            "column_comment": "inferred from JSON record sample",
-        })
+        columns.append(
+            {
+                "name": f"data.{key}",
+                "type": dtype,
+                "nullable": True,
+                "is_primary_key": False,
+                "column_comment": "inferred from JSON record sample",
+            }
+        )
 
-    tables = [{
-        "name": stream_name,
-        "row_count": None,  # Kinesis doesn't expose record count
-        "columns": columns,
-    }]
+    tables = [
+        {
+            "name": stream_name,
+            "row_count": None,  # Kinesis doesn't expose record count
+            "columns": columns,
+        }
+    ]
 
     return {
         "database_type": "kinesis",
@@ -583,7 +680,9 @@ def normalize_kinesis(raw: Dict[str, Any]) -> Dict[str, Any]:
 _ENV_PATTERNS = {
     "production": re.compile(r"(^|[\s_\-\.])prod(uction)?([\s_\-\.]|$)", re.IGNORECASE),
     "staging": re.compile(r"(^|[\s_\-\.])stag(ing|e)?([\s_\-\.]|$)", re.IGNORECASE),
-    "development": re.compile(r"(^|[\s_\-\.])(dev(elopment)?|local)([\s_\-\.]|$)", re.IGNORECASE),
+    "development": re.compile(
+        r"(^|[\s_\-\.])(dev(elopment)?|local)([\s_\-\.]|$)", re.IGNORECASE
+    ),
     "test": re.compile(r"(^|[\s_\-\.])test(ing)?([\s_\-\.]|$)", re.IGNORECASE),
 }
 

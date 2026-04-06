@@ -67,28 +67,30 @@ async def discover_opensearch(
             if index_name.startswith("."):
                 continue  # skip system indices
 
-            properties = (
-                index_data.get("mappings", {}).get("properties", {})
-            )
+            properties = index_data.get("mappings", {}).get("properties", {})
 
             fields = []
             for field_name, field_info in properties.items():
-                fields.append({
-                    "field_name": field_name,
-                    "type": field_info.get("type", "object"),
-                    "index": field_info.get("index", True),
-                })
+                fields.append(
+                    {
+                        "field_name": field_name,
+                        "type": field_info.get("type", "object"),
+                        "index": field_info.get("index", True),
+                    }
+                )
 
             index_stats = stats.get(index_name, {}).get("total", {})
             doc_count = index_stats.get("docs", {}).get("count")
             size_bytes = index_stats.get("store", {}).get("size_in_bytes")
 
-            indices.append({
-                "index_name": index_name,
-                "doc_count": doc_count,
-                "size_bytes": size_bytes,
-                "fields": fields,
-            })
+            indices.append(
+                {
+                    "index_name": index_name,
+                    "doc_count": doc_count,
+                    "size_bytes": size_bytes,
+                    "fields": fields,
+                }
+            )
     except Exception as exc:
         logger.warning("OpenSearch mapping retrieval failed for %s: %s", host, exc)
 

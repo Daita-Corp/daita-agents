@@ -24,9 +24,7 @@ async def discover_mysql(
             "aiomysql is required. Install with: pip install 'daita-agents[mysql]'"
         )
 
-    logger.debug(
-        "discover_mysql: connecting to %s", redact_url(connection_string)
-    )
+    logger.debug("discover_mysql: connecting to %s", redact_url(connection_string))
     creds = parse_conn_url(connection_string)
     db_name = schema or creds["database"] or "mysql"
 

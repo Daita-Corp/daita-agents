@@ -209,9 +209,7 @@ class CatalogPlugin(LifecyclePlugin):
         self._last_scan = datetime.now(timezone.utc).isoformat()
         return result
 
-    async def discover_and_profile(
-        self, concurrency: int = 5
-    ) -> DiscoveryResult:
+    async def discover_and_profile(self, concurrency: int = 5) -> DiscoveryResult:
         """
         Discover all stores, then profile each one with a matching profiler.
         """
@@ -337,9 +335,7 @@ class CatalogPlugin(LifecyclePlugin):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _persist_response(
-        result: Dict[str, Any], persisted: bool
-    ) -> Dict[str, Any]:
+    def _persist_response(result: Dict[str, Any], persisted: bool) -> Dict[str, Any]:
         """Wrap a discover_* result dict in a standard tool response."""
         response: Dict[str, Any] = {"schema": result, "persisted": persisted}
         if not persisted:

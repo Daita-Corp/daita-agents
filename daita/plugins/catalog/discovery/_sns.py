@@ -46,11 +46,13 @@ async def discover_sns(
         paginator = client.get_paginator("list_subscriptions_by_topic")
         for page in paginator.paginate(TopicArn=topic_arn):
             for sub in page.get("Subscriptions", []):
-                subscriptions.append({
-                    "subscription_arn": sub.get("SubscriptionArn", ""),
-                    "protocol": sub.get("Protocol", ""),
-                    "endpoint": sub.get("Endpoint", ""),
-                })
+                subscriptions.append(
+                    {
+                        "subscription_arn": sub.get("SubscriptionArn", ""),
+                        "protocol": sub.get("Protocol", ""),
+                        "endpoint": sub.get("Endpoint", ""),
+                    }
+                )
     except Exception as exc:
         logger.warning("SNS list_subscriptions failed for %s: %s", topic_arn, exc)
 

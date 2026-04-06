@@ -406,7 +406,11 @@ class BaseAgent(AgentABC):
         return elapsed >= config.cooldown
 
     def _build_watch_event(
-        self, config: "WatchConfig", state: "WatchState", raw_value: Any, resolved: bool = False
+        self,
+        config: "WatchConfig",
+        state: "WatchState",
+        raw_value: Any,
+        resolved: bool = False,
     ) -> "WatchEvent":
         """Construct a WatchEvent from the current state."""
         from ..core.watch import WatchEvent
@@ -429,7 +433,9 @@ class BaseAgent(AgentABC):
                     f"on_error callback for '{config.name}' raised", exc_info=True
                 )
 
-    async def _invoke_handler(self, handler: Callable, event: "WatchEvent", config: "WatchConfig") -> None:
+    async def _invoke_handler(
+        self, handler: Callable, event: "WatchEvent", config: "WatchConfig"
+    ) -> None:
         """Call the watch handler, isolating exceptions from the watch loop."""
         try:
             if config.handler_timeout is not None:

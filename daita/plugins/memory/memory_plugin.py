@@ -285,16 +285,12 @@ class MemoryPlugin(LifecyclePlugin):
                     if item.get("category") is None:
                         item["category"] = infer_category(item["content"])
                     if item.get("importance", 0.5) == 0.5:
-                        item["importance"] = infer_importance(
-                            item["content"], 0.5
-                        )
+                        item["importance"] = infer_importance(item["content"], 0.5)
 
                 # Lazy fact extraction: mark for later extraction
                 extra_metadata_list = None
                 if _fact_extractor is not None:
-                    extra_metadata_list = [
-                        {"_facts_extracted": False} for _ in items
-                    ]
+                    extra_metadata_list = [{"_facts_extracted": False} for _ in items]
 
                 return await backend.remember_batch(
                     items, extra_metadata_list=extra_metadata_list
@@ -609,14 +605,17 @@ class MemoryPlugin(LifecyclePlugin):
 
                     for chunk_id, chunk_content in unextracted:
                         facts = await _fact_extractor.extract(chunk_content)
-                        await backend.update_chunk_metadata(chunk_id, {
-                            "_facts_extracted": True,
-                            "extracted_facts": (
-                                FactExtractor.facts_to_metadata(facts)
-                                if facts
-                                else []
-                            ),
-                        })
+                        await backend.update_chunk_metadata(
+                            chunk_id,
+                            {
+                                "_facts_extracted": True,
+                                "extracted_facts": (
+                                    FactExtractor.facts_to_metadata(facts)
+                                    if facts
+                                    else []
+                                ),
+                            },
+                        )
 
                 results = await backend.query_facts(
                     entity=entity, relation=relation, value=value, limit=limit

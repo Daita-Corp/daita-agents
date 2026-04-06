@@ -118,9 +118,7 @@ def test_infer_from_tags():
 
 
 def test_infer_from_metadata():
-    store = _make_store(
-        display_name="my-db", metadata={"environment": "Staging"}
-    )
+    store = _make_store(display_name="my-db", metadata={"environment": "Staging"})
     assert infer_environment(store) == "staging"
 
 
@@ -342,7 +340,9 @@ def test_normalize_apigateway():
             },
         ],
         "endpoint_count": 2,
-        "authorizers": [{"id": "auth1", "name": "cognito", "type": "COGNITO_USER_POOLS"}],
+        "authorizers": [
+            {"id": "auth1", "name": "cognito", "type": "COGNITO_USER_POOLS"}
+        ],
         "stage_variables": {},
     }
     result = normalize_apigateway(raw)
@@ -425,7 +425,9 @@ def test_metadata_survives_round_trip():
             },
         ],
         "endpoint_count": 1,
-        "authorizers": [{"id": "auth1", "name": "cognito", "type": "COGNITO_USER_POOLS"}],
+        "authorizers": [
+            {"id": "auth1", "name": "cognito", "type": "COGNITO_USER_POOLS"}
+        ],
         "stage_variables": {},
     }
     normalized_dict = normalize_apigateway(raw)
@@ -468,8 +470,14 @@ def test_s3_metadata_survives_round_trip():
 
 
 def test_normalize_discovery_dispatches():
-    pg_raw = {"database_type": "postgresql", "schema": "public", "tables": [],
-              "columns": [], "primary_keys": [], "foreign_keys": []}
+    pg_raw = {
+        "database_type": "postgresql",
+        "schema": "public",
+        "tables": [],
+        "columns": [],
+        "primary_keys": [],
+        "foreign_keys": [],
+    }
     result = normalize_discovery(pg_raw)
     assert result["database_type"] == "postgresql"
     assert result["database_name"] == "public"

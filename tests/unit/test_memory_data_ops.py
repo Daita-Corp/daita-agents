@@ -21,10 +21,10 @@ from daita.plugins.memory.memory_plugin import MemoryPlugin, _parse_time_param
 from daita.plugins.memory.metadata import MemoryMetadata
 from daita.plugins.memory.search import SQLiteVectorSearch
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_backend(tmp_path: Path) -> LocalMemoryBackend:
     """Create a LocalMemoryBackend with mocked embeddings (no OpenAI calls)."""
@@ -55,6 +55,7 @@ def _make_search(db_path: Path) -> SQLiteVectorSearch:
 def _fake_embedding(text: str, dim: int = 8) -> list:
     """Deterministic fake embedding based on text hash."""
     import hashlib
+
     h = hashlib.md5(text.encode()).hexdigest()
     return [int(c, 16) / 15.0 for c in h[:dim]]
 
@@ -70,6 +71,7 @@ async def _mock_embed_texts(self, texts):
 # ---------------------------------------------------------------------------
 # _parse_time_param
 # ---------------------------------------------------------------------------
+
 
 class TestParseTimeParam:
     def test_none(self):
@@ -94,6 +96,7 @@ class TestParseTimeParam:
 # ---------------------------------------------------------------------------
 # Batch remember
 # ---------------------------------------------------------------------------
+
 
 class TestRememberBatch:
     @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
@@ -141,6 +144,7 @@ class TestRememberBatch:
 # query_facts
 # ---------------------------------------------------------------------------
 
+
 class TestQueryFacts:
     @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_query_by_entity(self, tmp_path):
@@ -150,12 +154,26 @@ class TestQueryFacts:
             {"content": "orders table has total column", "importance": 0.7},
         ]
         extra = [
-            {"extracted_facts": [
-                {"entity": "users", "relation": "has column", "value": "email", "temporal_context": None},
-            ]},
-            {"extracted_facts": [
-                {"entity": "orders", "relation": "has column", "value": "total", "temporal_context": None},
-            ]},
+            {
+                "extracted_facts": [
+                    {
+                        "entity": "users",
+                        "relation": "has column",
+                        "value": "email",
+                        "temporal_context": None,
+                    },
+                ]
+            },
+            {
+                "extracted_facts": [
+                    {
+                        "entity": "orders",
+                        "relation": "has column",
+                        "value": "total",
+                        "temporal_context": None,
+                    },
+                ]
+            },
         ]
         await backend.remember_batch(items, extra_metadata_list=extra)
 
@@ -168,9 +186,18 @@ class TestQueryFacts:
     async def test_query_by_relation(self, tmp_path):
         backend = _make_backend(tmp_path)
         items = [{"content": "FK: orders.user_id -> users.id", "importance": 0.8}]
-        extra = [{"extracted_facts": [
-            {"entity": "orders.user_id", "relation": "FK references", "value": "users.id", "temporal_context": None},
-        ]}]
+        extra = [
+            {
+                "extracted_facts": [
+                    {
+                        "entity": "orders.user_id",
+                        "relation": "FK references",
+                        "value": "users.id",
+                        "temporal_context": None,
+                    },
+                ]
+            }
+        ]
         await backend.remember_batch(items, extra_metadata_list=extra)
 
         results = await backend.query_facts(relation="FK")
@@ -187,10 +214,24 @@ class TestQueryFacts:
     async def test_query_combined_filters(self, tmp_path):
         backend = _make_backend(tmp_path)
         items = [{"content": "schema info", "importance": 0.7}]
-        extra = [{"extracted_facts": [
-            {"entity": "users", "relation": "has column", "value": "email", "temporal_context": None},
-            {"entity": "users", "relation": "has constraint", "value": "UNIQUE on email", "temporal_context": None},
-        ]}]
+        extra = [
+            {
+                "extracted_facts": [
+                    {
+                        "entity": "users",
+                        "relation": "has column",
+                        "value": "email",
+                        "temporal_context": None,
+                    },
+                    {
+                        "entity": "users",
+                        "relation": "has constraint",
+                        "value": "UNIQUE on email",
+                        "temporal_context": None,
+                    },
+                ]
+            }
+        ]
         await backend.remember_batch(items, extra_metadata_list=extra)
 
         results = await backend.query_facts(entity="users", relation="has constraint")
@@ -201,6 +242,7 @@ class TestQueryFacts:
 # ---------------------------------------------------------------------------
 # get_stats
 # ---------------------------------------------------------------------------
+
 
 class TestGetStats:
     @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
@@ -235,6 +277,7 @@ class TestGetStats:
 # get_pinned_memories
 # ---------------------------------------------------------------------------
 
+
 class TestGetPinnedMemories:
     @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_no_pinned(self, tmp_path):
@@ -267,6 +310,7 @@ class TestGetPinnedMemories:
 # Temporal filtering in recall
 # ---------------------------------------------------------------------------
 
+
 class TestTemporalFiltering:
     @patch.object(SQLiteVectorSearch, "embed_text", _mock_embed_text)
     @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
@@ -280,18 +324,14 @@ class TestTemporalFiltering:
             importance=0.8,
             created_at=datetime.now() - timedelta(days=10),
         )
-        await backend.search.store_chunk(
-            "old fact", metadata_old, chunk_id="old_chunk"
-        )
+        await backend.search.store_chunk("old fact", metadata_old, chunk_id="old_chunk")
 
         # Store a recent memory
         metadata_new = MemoryMetadata(
             content="new fact",
             importance=0.8,
         )
-        await backend.search.store_chunk(
-            "new fact", metadata_new, chunk_id="new_chunk"
-        )
+        await backend.search.store_chunk("new fact", metadata_new, chunk_id="new_chunk")
 
         # Recall with since=2 days ago should only return the new fact
         since = (datetime.now() - timedelta(days=2)).isoformat()
@@ -340,6 +380,7 @@ class TestTemporalFiltering:
 # embed_texts batch
 # ---------------------------------------------------------------------------
 
+
 class TestEmbedTextsBatch:
     async def test_batch_uses_cache(self, tmp_path):
         search = _make_search(tmp_path / "test_batch.db")
@@ -373,9 +414,7 @@ class TestEmbedTextsBatch:
         search._embed_cache["cached"] = [0.5, 0.5]
 
         mock_embedder.embeddings.create = AsyncMock(
-            return_value=MagicMock(
-                data=[MagicMock(embedding=[0.1, 0.2])]
-            )
+            return_value=MagicMock(data=[MagicMock(embedding=[0.1, 0.2])])
         )
 
         results = await search.embed_texts(["cached", "new_text"])
@@ -389,6 +428,7 @@ class TestEmbedTextsBatch:
 # ---------------------------------------------------------------------------
 # Auto-classification
 # ---------------------------------------------------------------------------
+
 
 class TestAutoClassify:
     def test_infer_category_rule(self):
@@ -454,6 +494,7 @@ class TestAutoClassify:
 # ---------------------------------------------------------------------------
 # TTL and pruning
 # ---------------------------------------------------------------------------
+
 
 class TestTTL:
     def test_should_prune_with_ttl_expired(self):
@@ -565,14 +606,14 @@ class TestPruning:
             ttl_days=1,
             created_at=datetime.now() - timedelta(days=5),
         )
-        await backend.search.store_chunk(
-            "expired", expired_meta, chunk_id="exp"
-        )
+        await backend.search.store_chunk("expired", expired_meta, chunk_id="exp")
 
         # Store a normal memory
-        await backend.remember_batch([
-            {"content": "normal fact", "importance": 0.7},
-        ])
+        await backend.remember_batch(
+            [
+                {"content": "normal fact", "importance": 0.7},
+            ]
+        )
 
         await backend.prune()
 
@@ -584,6 +625,7 @@ class TestPruning:
 # Vectorized search (regression)
 # ---------------------------------------------------------------------------
 
+
 class TestVectorizedSearch:
     @patch.object(SQLiteVectorSearch, "embed_text", _mock_embed_text)
     @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
@@ -591,15 +633,15 @@ class TestVectorizedSearch:
         """Vectorized search should produce valid results."""
         backend = _make_backend(tmp_path)
 
-        await backend.remember_batch([
-            {"content": "PostgreSQL database in production", "importance": 0.8},
-            {"content": "S3 bucket for staging data", "importance": 0.6},
-            {"content": "DynamoDB table for sessions", "importance": 0.7},
-        ])
-
-        results = await backend.recall(
-            "database", limit=10, score_threshold=0.0
+        await backend.remember_batch(
+            [
+                {"content": "PostgreSQL database in production", "importance": 0.8},
+                {"content": "S3 bucket for staging data", "importance": 0.6},
+                {"content": "DynamoDB table for sessions", "importance": 0.7},
+            ]
         )
+
+        results = await backend.recall("database", limit=10, score_threshold=0.0)
         assert len(results) > 0
         assert all("score" in r for r in results)
         # Results should be sorted by score descending
@@ -630,6 +672,7 @@ class TestVectorizedSearch:
 # Lazy fact extraction
 # ---------------------------------------------------------------------------
 
+
 class TestLazyFactExtraction:
     @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_get_unextracted_chunks(self, tmp_path):
@@ -652,10 +695,12 @@ class TestLazyFactExtraction:
         # Store with facts already extracted
         await backend.remember_batch(
             [{"content": "extracted fact", "importance": 0.5}],
-            extra_metadata_list=[{
-                "_facts_extracted": True,
-                "extracted_facts": [{"entity": "x", "relation": "y", "value": "z"}],
-            }],
+            extra_metadata_list=[
+                {
+                    "_facts_extracted": True,
+                    "extracted_facts": [{"entity": "x", "relation": "y", "value": "z"}],
+                }
+            ],
         )
 
         unextracted = await backend.get_unextracted_chunks()

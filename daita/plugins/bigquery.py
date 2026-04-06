@@ -65,7 +65,9 @@ class BigQueryPlugin(BaseDatabasePlugin):
             )
 
         super().__init__(timeout=timeout, **kwargs)
-        logger.debug(f"BigQueryPlugin configured for project={self.project}, dataset={self.dataset}")
+        logger.debug(
+            f"BigQueryPlugin configured for project={self.project}, dataset={self.dataset}"
+        )
 
     async def connect(self) -> None:
         if self._client is not None:
@@ -115,10 +117,12 @@ class BigQueryPlugin(BaseDatabasePlugin):
 
         if params:
             idx = [0]
+
             def _replacer(match):
                 name = f"@p{idx[0]}"
                 idx[0] += 1
                 return name
+
             sql = re.sub(r"%s", _replacer, sql)
 
             # bool must be checked before int (since bool is a subclass of int)
@@ -126,7 +130,9 @@ class BigQueryPlugin(BaseDatabasePlugin):
             bq_params = [
                 bq_mod.ScalarQueryParameter(
                     f"p{i}",
-                    next((v for k, v in type_map.items() if isinstance(val, k)), "STRING"),
+                    next(
+                        (v for k, v in type_map.items() if isinstance(val, k)), "STRING"
+                    ),
                     val,
                 )
                 for i, val in enumerate(params)
@@ -137,7 +143,9 @@ class BigQueryPlugin(BaseDatabasePlugin):
 
         return sql, job_config
 
-    def _run_query(self, sql: str, params: Optional[List] = None) -> List[Dict[str, Any]]:
+    def _run_query(
+        self, sql: str, params: Optional[List] = None
+    ) -> List[Dict[str, Any]]:
         sql, job_config = self._prepare_job(sql, params)
         job = self._client.query(sql, job_config=job_config, timeout=self.timeout)
         return [dict(row) for row in job.result(timeout=self.timeout)]
@@ -150,7 +158,9 @@ class BigQueryPlugin(BaseDatabasePlugin):
 
     # ── Core async methods ────────────────────────────────────────────
 
-    async def query(self, sql: str, params: Optional[List] = None) -> List[Dict[str, Any]]:
+    async def query(
+        self, sql: str, params: Optional[List] = None
+    ) -> List[Dict[str, Any]]:
         sql = self._normalize_sql(sql)
         if self._client is None:
             await self.connect()
@@ -167,12 +177,16 @@ class BigQueryPlugin(BaseDatabasePlugin):
     async def tables(self, dataset: Optional[str] = None) -> List[str]:
         ds = dataset or self.dataset
         if not ds:
-            raise ValueError("Dataset is required. Provide 'dataset' parameter or set BIGQUERY_DATASET.")
+            raise ValueError(
+                "Dataset is required. Provide 'dataset' parameter or set BIGQUERY_DATASET."
+            )
         if self._client is None:
             await self.connect()
 
         def _list():
-            return [t.table_id for t in self._client.list_tables(f"{self.project}.{ds}")]
+            return [
+                t.table_id for t in self._client.list_tables(f"{self.project}.{ds}")
+            ]
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _list)
@@ -241,9 +255,19 @@ class BigQueryPlugin(BaseDatabasePlugin):
                 parameters={
                     "type": "object",
                     "properties": {
-                        "sql": {"type": "string", "description": "SQL SELECT query with %s placeholders"},
-                        "params": {"type": "array", "description": "Optional parameter values", "items": {}},
-                        "focus": {"type": "string", "description": "Focus DSL to filter/project results"},
+                        "sql": {
+                            "type": "string",
+                            "description": "SQL SELECT query with %s placeholders",
+                        },
+                        "params": {
+                            "type": "array",
+                            "description": "Optional parameter values",
+                            "items": {},
+                        },
+                        "focus": {
+                            "type": "string",
+                            "description": "Focus DSL to filter/project results",
+                        },
                     },
                     "required": ["sql"],
                 },
@@ -257,8 +281,15 @@ class BigQueryPlugin(BaseDatabasePlugin):
                 parameters={
                     "type": "object",
                     "properties": {
-                        "dataset": {"type": "string", "description": "Dataset name (uses default if omitted)"},
-                        "tables": {"type": "array", "items": {"type": "string"}, "description": "Filter to specific tables"},
+                        "dataset": {
+                            "type": "string",
+                            "description": "Dataset name (uses default if omitted)",
+                        },
+                        "tables": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Filter to specific tables",
+                        },
                     },
                     "required": [],
                 },
@@ -273,7 +304,10 @@ class BigQueryPlugin(BaseDatabasePlugin):
                     "type": "object",
                     "properties": {
                         "table": {"type": "string", "description": "Table name"},
-                        "filter": {"type": "string", "description": "Optional WHERE clause (without WHERE keyword)"},
+                        "filter": {
+                            "type": "string",
+                            "description": "Optional WHERE clause (without WHERE keyword)",
+                        },
                     },
                     "required": ["table"],
                 },
@@ -288,7 +322,10 @@ class BigQueryPlugin(BaseDatabasePlugin):
                     "type": "object",
                     "properties": {
                         "table": {"type": "string", "description": "Table name"},
-                        "n": {"type": "integer", "description": "Number of rows to sample (default: 5)"},
+                        "n": {
+                            "type": "integer",
+                            "description": "Number of rows to sample (default: 5)",
+                        },
                     },
                     "required": ["table"],
                 },
@@ -314,8 +351,15 @@ class BigQueryPlugin(BaseDatabasePlugin):
                     parameters={
                         "type": "object",
                         "properties": {
-                            "sql": {"type": "string", "description": "SQL DML/DDL statement"},
-                            "params": {"type": "array", "description": "Optional parameter values", "items": {}},
+                            "sql": {
+                                "type": "string",
+                                "description": "SQL DML/DDL statement",
+                            },
+                            "params": {
+                                "type": "array",
+                                "description": "Optional parameter values",
+                                "items": {},
+                            },
                         },
                         "required": ["sql"],
                     },
@@ -358,7 +402,9 @@ class BigQueryPlugin(BaseDatabasePlugin):
 
         all_tables = await self.tables(dataset)
         targets = (
-            [t for t in all_tables if t in filter_tables] if filter_tables else all_tables
+            [t for t in all_tables if t in filter_tables]
+            if filter_tables
+            else all_tables
         )
 
         total_tables = len(targets)

@@ -214,8 +214,14 @@ class GitHubScanner(BaseDiscoverer):
                     if any(
                         placeholder in conn_str.lower()
                         for placeholder in [
-                            "${", "{{", "<your", "example.com", "localhost",
-                            "your_", "change_me", "password_here",
+                            "${",
+                            "{{",
+                            "<your",
+                            "example.com",
+                            "localhost",
+                            "your_",
+                            "change_me",
+                            "password_here",
                         ]
                     ):
                         confidence = max(0.3, base_confidence - 0.4)

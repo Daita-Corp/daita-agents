@@ -214,4 +214,3 @@ class BM25Scorer:
         if max_score <= 0:
             return [0.0] * len(raw_scores)
         return [min(s / max_score, 1.0) for s in raw_scores]
-

@@ -73,9 +73,7 @@ async def compare_schemas(
         "comparison": {
             "added_tables": added_tables,
             "removed_tables": removed_tables,
-            "added_columns": [
-                {"table": k[0], "column": k[1]} for k in added_columns
-            ],
+            "added_columns": [{"table": k[0], "column": k[1]} for k in added_columns],
             "removed_columns": [
                 {"table": k[0], "column": k[1]} for k in removed_columns
             ],

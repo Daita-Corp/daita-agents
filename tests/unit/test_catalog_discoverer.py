@@ -20,7 +20,6 @@ from daita.plugins.catalog.base_profiler import (
 )
 from daita.plugins.catalog import CatalogPlugin
 
-
 # ---------------------------------------------------------------------------
 # Fake implementations for testing
 # ---------------------------------------------------------------------------
@@ -100,7 +99,9 @@ def _make_store(
         id=id,
         store_type=store_type,
         display_name=display_name,
-        connection_hint=kwargs.get("connection_hint", {"host": "localhost", "port": 5432}),
+        connection_hint=kwargs.get(
+            "connection_hint", {"host": "localhost", "port": 5432}
+        ),
         source=source,
         region=kwargs.get("region"),
         environment=kwargs.get("environment"),
@@ -135,9 +136,7 @@ async def test_fake_discoverer_close():
 
 async def test_base_discoverer_default_fingerprint():
     d = FakeDiscoverer()
-    store = _make_store(
-        connection_hint={"host": "db.example.com", "port": 5432}
-    )
+    store = _make_store(connection_hint={"host": "db.example.com", "port": 5432})
     fp = d.fingerprint(store)
     assert isinstance(fp, str)
     assert len(fp) == 16
@@ -236,7 +235,9 @@ async def test_discover_all_with_fake_discoverers():
 async def test_discover_all_merges_from_multiple_discoverers():
     plugin = CatalogPlugin()
     plugin.add_discoverer(FakeDiscoverer(stores=[_make_store(id="s1", source="aws")]))
-    plugin.add_discoverer(FakeDiscoverer(stores=[_make_store(id="s2", source="github")]))
+    plugin.add_discoverer(
+        FakeDiscoverer(stores=[_make_store(id="s2", source="github")])
+    )
 
     result = await plugin.discover_all()
     assert result.store_count == 2
@@ -346,10 +347,19 @@ async def test_find_store_tool_handler():
 
     plugin = CatalogPlugin()
     stores = [
-        _make_store(id="s1", display_name="prod-orders", store_type="postgresql",
-                     environment="production", tags=["team:backend"]),
-        _make_store(id="s2", display_name="staging-users", store_type="mysql",
-                     environment="staging"),
+        _make_store(
+            id="s1",
+            display_name="prod-orders",
+            store_type="postgresql",
+            environment="production",
+            tags=["team:backend"],
+        ),
+        _make_store(
+            id="s2",
+            display_name="staging-users",
+            store_type="mysql",
+            environment="staging",
+        ),
     ]
     plugin.add_discoverer(FakeDiscoverer(stores=stores))
     await plugin.discover_all()

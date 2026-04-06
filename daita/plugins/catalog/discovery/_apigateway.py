@@ -36,7 +36,9 @@ async def discover_apigateway(
             "boto3 is required. Install with: pip install 'daita-agents[aws]'"
         )
 
-    logger.debug("discover_apigateway: profiling %s (%s) in %s", api_id, api_type, region)
+    logger.debug(
+        "discover_apigateway: profiling %s (%s) in %s", api_id, api_type, region
+    )
 
     kwargs: Dict[str, Any] = {}
     if profile_name:
@@ -94,11 +96,13 @@ async def _discover_rest_api(
     try:
         auth_resp = client.get_authorizers(restApiId=api_id)
         for auth in auth_resp.get("items", []):
-            authorizers.append({
-                "id": auth.get("id", ""),
-                "name": auth.get("name", ""),
-                "type": auth.get("type", ""),
-            })
+            authorizers.append(
+                {
+                    "id": auth.get("id", ""),
+                    "name": auth.get("name", ""),
+                    "type": auth.get("type", ""),
+                }
+            )
     except Exception:
         pass
 
@@ -158,28 +162,36 @@ async def _discover_http_api(
 
         # Look up integration for this route
         target = route.get("Target", "")
-        integration_id = target.replace("integrations/", "") if target.startswith("integrations/") else ""
+        integration_id = (
+            target.replace("integrations/", "")
+            if target.startswith("integrations/")
+            else ""
+        )
         integ = integrations_by_id.get(integration_id, {})
 
-        endpoints.append({
-            "path": path,
-            "method": method,
-            "authorization": route.get("AuthorizationType", "NONE"),
-            "api_key_required": route.get("ApiKeyRequired", False),
-            "integration_type": integ.get("IntegrationType", ""),
-            "integration_uri": integ.get("IntegrationUri", ""),
-        })
+        endpoints.append(
+            {
+                "path": path,
+                "method": method,
+                "authorization": route.get("AuthorizationType", "NONE"),
+                "api_key_required": route.get("ApiKeyRequired", False),
+                "integration_type": integ.get("IntegrationType", ""),
+                "integration_uri": integ.get("IntegrationUri", ""),
+            }
+        )
 
     # Authorizers
     authorizers = []
     try:
         auth_resp = client.get_authorizers(ApiId=api_id)
         for auth in auth_resp.get("Items", []):
-            authorizers.append({
-                "id": auth.get("AuthorizerId", ""),
-                "name": auth.get("Name", ""),
-                "type": auth.get("AuthorizerType", ""),
-            })
+            authorizers.append(
+                {
+                    "id": auth.get("AuthorizerId", ""),
+                    "name": auth.get("Name", ""),
+                    "type": auth.get("AuthorizerType", ""),
+                }
+            )
     except Exception:
         pass
 

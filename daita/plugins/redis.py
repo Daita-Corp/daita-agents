@@ -59,7 +59,7 @@ class RedisPlugin(BaseDatabasePlugin):
     def _upk(self, key: str) -> str:
         """Strip the prefix from a key."""
         if self.key_prefix and key.startswith(self.key_prefix):
-            return key[len(self.key_prefix):]
+            return key[len(self.key_prefix) :]
         return key
 
     async def _ensure_connected(self):
@@ -123,9 +123,7 @@ class RedisPlugin(BaseDatabasePlugin):
         """Scan keys matching pattern. Uses SCAN (non-blocking)."""
         await self._ensure_connected()
         result = []
-        async for key in self._client.scan_iter(
-            match=self._pk(pattern), count=100
-        ):
+        async for key in self._client.scan_iter(match=self._pk(pattern), count=100):
             result.append(self._upk(key))
             if len(result) >= count:
                 break
@@ -186,7 +184,12 @@ class RedisPlugin(BaseDatabasePlugin):
     def get_tools(self) -> List["AgentTool"]:
         from ..core.tools import AgentTool
 
-        _common = dict(category="database", source="plugin", plugin_name="Redis", timeout_seconds=30)
+        _common = dict(
+            category="database",
+            source="plugin",
+            plugin_name="Redis",
+            timeout_seconds=30,
+        )
 
         tools = [
             AgentTool(
@@ -194,7 +197,9 @@ class RedisPlugin(BaseDatabasePlugin):
                 description="Get the value of a Redis key.",
                 parameters={
                     "type": "object",
-                    "properties": {"key": {"type": "string", "description": "Key name"}},
+                    "properties": {
+                        "key": {"type": "string", "description": "Key name"}
+                    },
                     "required": ["key"],
                 },
                 handler=self._tool_get,
@@ -206,8 +211,14 @@ class RedisPlugin(BaseDatabasePlugin):
                 parameters={
                     "type": "object",
                     "properties": {
-                        "pattern": {"type": "string", "description": "Glob pattern (default: '*')"},
-                        "count": {"type": "integer", "description": "Max keys to return (default: 1000)"},
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern (default: '*')",
+                        },
+                        "count": {
+                            "type": "integer",
+                            "description": "Max keys to return (default: 1000)",
+                        },
                     },
                     "required": [],
                 },
@@ -219,7 +230,13 @@ class RedisPlugin(BaseDatabasePlugin):
                 description="Check if one or more Redis keys exist. Returns count of existing keys.",
                 parameters={
                     "type": "object",
-                    "properties": {"keys": {"type": "array", "items": {"type": "string"}, "description": "Keys to check"}},
+                    "properties": {
+                        "keys": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Keys to check",
+                        }
+                    },
                     "required": ["keys"],
                 },
                 handler=self._tool_exists,
@@ -230,7 +247,9 @@ class RedisPlugin(BaseDatabasePlugin):
                 description="Get the remaining TTL (seconds) of a Redis key. Returns -1 if no TTL, -2 if key doesn't exist.",
                 parameters={
                     "type": "object",
-                    "properties": {"key": {"type": "string", "description": "Key name"}},
+                    "properties": {
+                        "key": {"type": "string", "description": "Key name"}
+                    },
                     "required": ["key"],
                 },
                 handler=self._tool_ttl,
@@ -241,7 +260,9 @@ class RedisPlugin(BaseDatabasePlugin):
                 description="Get all fields and values of a Redis hash.",
                 parameters={
                     "type": "object",
-                    "properties": {"key": {"type": "string", "description": "Hash key name"}},
+                    "properties": {
+                        "key": {"type": "string", "description": "Hash key name"}
+                    },
                     "required": ["key"],
                 },
                 handler=self._tool_hgetall,
@@ -254,8 +275,14 @@ class RedisPlugin(BaseDatabasePlugin):
                     "type": "object",
                     "properties": {
                         "key": {"type": "string", "description": "List key name"},
-                        "start": {"type": "integer", "description": "Start index (default: 0)"},
-                        "stop": {"type": "integer", "description": "Stop index inclusive (default: -1 for all)"},
+                        "start": {
+                            "type": "integer",
+                            "description": "Start index (default: 0)",
+                        },
+                        "stop": {
+                            "type": "integer",
+                            "description": "Stop index inclusive (default: -1 for all)",
+                        },
                     },
                     "required": ["key"],
                 },
@@ -267,7 +294,9 @@ class RedisPlugin(BaseDatabasePlugin):
                 description="Get all members of a Redis set.",
                 parameters={
                     "type": "object",
-                    "properties": {"key": {"type": "string", "description": "Set key name"}},
+                    "properties": {
+                        "key": {"type": "string", "description": "Set key name"}
+                    },
                     "required": ["key"],
                 },
                 handler=self._tool_smembers,
@@ -291,8 +320,14 @@ class RedisPlugin(BaseDatabasePlugin):
                         "type": "object",
                         "properties": {
                             "key": {"type": "string", "description": "Key name"},
-                            "value": {"type": "string", "description": "Value to store"},
-                            "ttl": {"type": "integer", "description": "Optional TTL in seconds"},
+                            "value": {
+                                "type": "string",
+                                "description": "Value to store",
+                            },
+                            "ttl": {
+                                "type": "integer",
+                                "description": "Optional TTL in seconds",
+                            },
                         },
                         "required": ["key", "value"],
                     },
@@ -304,7 +339,13 @@ class RedisPlugin(BaseDatabasePlugin):
                     description="Delete one or more Redis keys. Returns count deleted.",
                     parameters={
                         "type": "object",
-                        "properties": {"keys": {"type": "array", "items": {"type": "string"}, "description": "Keys to delete"}},
+                        "properties": {
+                            "keys": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Keys to delete",
+                            }
+                        },
                         "required": ["keys"],
                     },
                     handler=self._tool_delete,
@@ -317,7 +358,10 @@ class RedisPlugin(BaseDatabasePlugin):
                         "type": "object",
                         "properties": {
                             "key": {"type": "string", "description": "Hash key name"},
-                            "mapping": {"type": "object", "description": "Field-value pairs to set"},
+                            "mapping": {
+                                "type": "object",
+                                "description": "Field-value pairs to set",
+                            },
                         },
                         "required": ["key", "mapping"],
                     },
@@ -331,7 +375,11 @@ class RedisPlugin(BaseDatabasePlugin):
                         "type": "object",
                         "properties": {
                             "key": {"type": "string", "description": "List key name"},
-                            "values": {"type": "array", "items": {"type": "string"}, "description": "Values to push"},
+                            "values": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Values to push",
+                            },
                         },
                         "required": ["key", "values"],
                     },
@@ -345,7 +393,11 @@ class RedisPlugin(BaseDatabasePlugin):
                         "type": "object",
                         "properties": {
                             "key": {"type": "string", "description": "List key name"},
-                            "values": {"type": "array", "items": {"type": "string"}, "description": "Values to push"},
+                            "values": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Values to push",
+                            },
                         },
                         "required": ["key", "values"],
                     },
@@ -359,7 +411,11 @@ class RedisPlugin(BaseDatabasePlugin):
                         "type": "object",
                         "properties": {
                             "key": {"type": "string", "description": "Set key name"},
-                            "members": {"type": "array", "items": {"type": "string"}, "description": "Members to add"},
+                            "members": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Members to add",
+                            },
                         },
                         "required": ["key", "members"],
                     },
@@ -373,7 +429,10 @@ class RedisPlugin(BaseDatabasePlugin):
                         "type": "object",
                         "properties": {
                             "key": {"type": "string", "description": "Key name"},
-                            "seconds": {"type": "integer", "description": "TTL in seconds"},
+                            "seconds": {
+                                "type": "integer",
+                                "description": "TTL in seconds",
+                            },
                         },
                         "required": ["key", "seconds"],
                     },
@@ -409,7 +468,9 @@ class RedisPlugin(BaseDatabasePlugin):
         return {"key": args["key"], "fields": fields}
 
     async def _tool_lrange(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        elements = await self.lrange(args["key"], args.get("start", 0), args.get("stop", -1))
+        elements = await self.lrange(
+            args["key"], args.get("start", 0), args.get("stop", -1)
+        )
         return {"key": args["key"], "elements": elements, "count": len(elements)}
 
     async def _tool_smembers(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -418,7 +479,11 @@ class RedisPlugin(BaseDatabasePlugin):
 
     async def _tool_info(self, args: Dict[str, Any]) -> Dict[str, Any]:
         size = await self.dbsize()
-        return {"db": self.db, "key_count": size, "key_prefix": self.key_prefix or "(none)"}
+        return {
+            "db": self.db,
+            "key_count": size,
+            "key_prefix": self.key_prefix or "(none)",
+        }
 
     async def _tool_set(self, args: Dict[str, Any]) -> Dict[str, Any]:
         ok = await self.set(args["key"], args["value"], ttl=args.get("ttl"))

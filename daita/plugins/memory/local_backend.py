@@ -193,15 +193,30 @@ class LocalMemoryBackend:
 
         if strategy == "semantic":
             results = await self._semantic_recall(
-                query, fetch_limit, score_threshold, category, since=since, before=before
+                query,
+                fetch_limit,
+                score_threshold,
+                category,
+                since=since,
+                before=before,
             )
         elif strategy == "keyword":
             results = await self._keyword_recall(
-                query, fetch_limit, score_threshold, category, since=since, before=before
+                query,
+                fetch_limit,
+                score_threshold,
+                category,
+                since=since,
+                before=before,
             )
         else:
             results = await self._hybrid_recall(
-                query, fetch_limit, score_threshold, category, since=since, before=before
+                query,
+                fetch_limit,
+                score_threshold,
+                category,
+                since=since,
+                before=before,
             )
 
         if min_importance is not None or max_importance is not None:
@@ -361,17 +376,25 @@ class LocalMemoryBackend:
         # Batch vectorized cosine similarity
         all_vecs = np.array([json.loads(c[6]) for c in chunks])
         query_norm = np.linalg.norm(query_vec)
-        all_norms = np.array([
-            c[7] if c[7] is not None else float(np.linalg.norm(v))
-            for c, v in zip(chunks, all_vecs)
-        ])
+        all_norms = np.array(
+            [
+                c[7] if c[7] is not None else float(np.linalg.norm(v))
+                for c, v in zip(chunks, all_vecs)
+            ]
+        )
         denoms = query_norm * all_norms
         semantic_scores = np.where(denoms > 0, all_vecs @ query_vec / denoms, 0.0)
 
         results = []
         for i, (
-            chunk_id, file_path, content, line_start, line_end,
-            metadata_json, _emb, _norm,
+            chunk_id,
+            file_path,
+            content,
+            line_start,
+            line_end,
+            metadata_json,
+            _emb,
+            _norm,
         ) in enumerate(chunks):
             metadata_dict = parse_metadata_json(metadata_json)
             semantic_score = float(semantic_scores[i])
@@ -491,11 +514,13 @@ class LocalMemoryBackend:
                 if extra_metadata_list and i < len(extra_metadata_list)
                 else None
             )
-            prepared.append({
-                "content": content,
-                "metadata": metadata,
-                "extra_metadata": extra,
-            })
+            prepared.append(
+                {
+                    "content": content,
+                    "metadata": metadata,
+                    "extra_metadata": extra,
+                }
+            )
 
         # Write all to daily log
         for item in items:
@@ -572,16 +597,18 @@ class LocalMemoryBackend:
         results = []
         for chunk_id, content, ent, rel, val, temporal, metadata_json in rows:
             meta = parse_metadata_json(metadata_json)
-            results.append({
-                "chunk_id": chunk_id,
-                "source_content": content,
-                "entity": ent,
-                "relation": rel,
-                "value": val,
-                "temporal_context": temporal,
-                "importance": meta.get("importance", 0.5),
-                "category": meta.get("category"),
-            })
+            results.append(
+                {
+                    "chunk_id": chunk_id,
+                    "source_content": content,
+                    "entity": ent,
+                    "relation": rel,
+                    "value": val,
+                    "temporal_context": temporal,
+                    "importance": meta.get("importance", 0.5),
+                    "category": meta.get("category"),
+                }
+            )
         return results
 
     async def get_unextracted_chunks(self, limit: int = 50) -> List[tuple]:
@@ -612,15 +639,13 @@ class LocalMemoryBackend:
         total = cursor.fetchone()[0]
 
         # Category breakdown
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT json_extract(metadata, '$.category') as cat,
                    COUNT(*) as cnt,
                    AVG(CAST(json_extract(metadata, '$.importance') AS REAL)) as avg_imp
             FROM chunks
             GROUP BY cat
-            """
-        )
+            """)
         categories = {}
         for cat, cnt, avg_imp in cursor.fetchall():
             cat_name = cat or "uncategorized"
@@ -630,14 +655,12 @@ class LocalMemoryBackend:
             }
 
         # Time range
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT MIN(json_extract(metadata, '$.created_at')),
                    MAX(json_extract(metadata, '$.created_at'))
             FROM chunks
             WHERE json_extract(metadata, '$.created_at') IS NOT NULL
-            """
-        )
+            """)
         row = cursor.fetchone()
         oldest = row[0] if row else None
         newest = row[1] if row else None
@@ -662,13 +685,11 @@ class LocalMemoryBackend:
         """Return all pinned memories, ordered by importance descending."""
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT chunk_id, content, metadata FROM chunks
             WHERE json_extract(metadata, '$.pinned') = 1
             ORDER BY json_extract(metadata, '$.importance') DESC
-            """
-        )
+            """)
         rows = cursor.fetchall()
         conn.close()
 
@@ -843,7 +864,9 @@ class LocalMemoryBackend:
 
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
-        cursor.execute("SELECT chunk_id, metadata FROM chunks WHERE metadata IS NOT NULL")
+        cursor.execute(
+            "SELECT chunk_id, metadata FROM chunks WHERE metadata IS NOT NULL"
+        )
         rows = cursor.fetchall()
         conn.close()
 

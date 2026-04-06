@@ -23,28 +23,36 @@ def _make_tables(names):
 
 def _wrap_result(schema_dict):
     """Wrap a raw schema dict in the standard response shape."""
-    return {"schema": schema_dict, "persisted": False, "persist_skipped": "catalog backend not configured"}
+    return {
+        "schema": schema_dict,
+        "persisted": False,
+        "persist_skipped": "catalog backend not configured",
+    }
 
 
 async def _fake_discover_postgres(
     connection_string, schema="public", persist=False, ssl_mode="verify-full"
 ):
     """Returns a fixed schema dict in the real wrapper shape."""
-    return _wrap_result({
-        "database_type": "postgresql",
-        "schema": schema,
-        "tables": _make_tables([f"table_{i}" for i in range(60)]),
-        "columns": [],
-    })
+    return _wrap_result(
+        {
+            "database_type": "postgresql",
+            "schema": schema,
+            "tables": _make_tables([f"table_{i}" for i in range(60)]),
+            "columns": [],
+        }
+    )
 
 
 async def _fake_discover_mysql(connection_string, schema=None, persist=False):
-    return _wrap_result({
-        "database_type": "mysql",
-        "schema": schema or "testdb",
-        "tables": _make_tables([f"tbl_{i}" for i in range(60)]),
-        "columns": [],
-    })
+    return _wrap_result(
+        {
+            "database_type": "mysql",
+            "schema": schema or "testdb",
+            "tables": _make_tables([f"tbl_{i}" for i in range(60)]),
+            "columns": [],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -133,10 +141,12 @@ async def test_postgres_table_filter_glob(monkeypatch):
     async def fake_discover(
         connection_string, schema="public", persist=False, ssl_mode="verify-full"
     ):
-        return _wrap_result({
-            "tables": _make_tables(["orders", "order_items", "products", "users"]),
-            "columns": [],
-        })
+        return _wrap_result(
+            {
+                "tables": _make_tables(["orders", "order_items", "products", "users"]),
+                "columns": [],
+            }
+        )
 
     plugin.discover_postgres = fake_discover
 
@@ -161,7 +171,9 @@ async def test_postgres_table_filter_no_match_returns_empty(monkeypatch):
     async def fake_discover(
         connection_string, schema="public", persist=False, ssl_mode="verify-full"
     ):
-        return _wrap_result({"tables": _make_tables(["users", "products"]), "columns": []})
+        return _wrap_result(
+            {"tables": _make_tables(["users", "products"]), "columns": []}
+        )
 
     plugin.discover_postgres = fake_discover
 
@@ -201,10 +213,12 @@ async def test_mysql_table_filter_applied(monkeypatch):
     plugin = make_plugin()
 
     async def fake_discover(connection_string, schema=None, persist=False):
-        return _wrap_result({
-            "tables": _make_tables(["sales_2023", "sales_2024", "customers"]),
-            "columns": [],
-        })
+        return _wrap_result(
+            {
+                "tables": _make_tables(["sales_2023", "sales_2024", "customers"]),
+                "columns": [],
+            }
+        )
 
     plugin.discover_mysql = fake_discover
 

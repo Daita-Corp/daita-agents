@@ -48,11 +48,7 @@ def apply_table_filter(
         return
     tables = schema["tables"]
     if table_filter:
-        tables = [
-            t
-            for t in tables
-            if fnmatch.fnmatch(t.get("name", ""), table_filter)
-        ]
+        tables = [t for t in tables if fnmatch.fnmatch(t.get("name", ""), table_filter)]
     total_tables = len(tables)
     schema["tables"] = tables[:max_tables]
     schema["total_tables"] = total_tables
@@ -149,7 +145,9 @@ async def _handle_compare_schemas(
 async def _handle_export_diagram(
     plugin: "CatalogPlugin", args: Dict[str, Any]
 ) -> Dict[str, Any]:
-    return await plugin.export_diagram(args.get("schema"), args.get("format", "mermaid"))
+    return await plugin.export_diagram(
+        args.get("schema"), args.get("format", "mermaid")
+    )
 
 
 async def _handle_discover_infrastructure(
@@ -176,10 +174,7 @@ async def _handle_discover_infrastructure(
         "offset": offset,
         "limit": limit,
         "last_scan": plugin._last_scan,
-        "errors": [
-            {"discoverer": e.discoverer_name, "error": e.error}
-            for e in errors
-        ],
+        "errors": [{"discoverer": e.discoverer_name, "error": e.error} for e in errors],
     }
 
 
@@ -196,9 +191,7 @@ async def _handle_profile_store(
 
     profiler = plugin._find_profiler(store.store_type)
     if not profiler:
-        return {
-            "error": f"No profiler registered for store type '{store.store_type}'"
-        }
+        return {"error": f"No profiler registered for store type '{store.store_type}'"}
 
     schema = await profiler.profile(store)
     plugin._schemas[store_id] = schema
@@ -218,7 +211,9 @@ async def _handle_compare_store_to_baseline(
 
     current = plugin._schemas.get(store_id)
     if not current:
-        return {"error": f"No profiled schema for store {store_id}. Run profile_store first."}
+        return {
+            "error": f"No profiled schema for store {store_id}. Run profile_store first."
+        }
 
     # Load baseline from persistence
     catalog_path = Path(".daita") / "catalog.json"
@@ -259,9 +254,7 @@ async def _handle_find_store(
 
     if query:
         query_lower = query.lower()
-        stores = [
-            s for s in stores if query_lower in s.display_name.lower()
-        ]
+        stores = [s for s in stores if query_lower in s.display_name.lower()]
 
     if tag:
         stores = [s for s in stores if tag in s.tags]

@@ -21,7 +21,9 @@ class DiscoveredStore:
     connection_hint: Dict[str, Any]  # host, port, dbname, etc. (NO plaintext passwords)
     source: str  # "aws_rds", "github_scan", "vault", "manual"
     region: Optional[str] = None
-    environment: Optional[str] = None  # "production", "staging", "dev" (inferred or tagged)
+    environment: Optional[str] = (
+        None  # "production", "staging", "dev" (inferred or tagged)
+    )
     confidence: float = 0.5
     tags: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)

@@ -25,9 +25,7 @@ async def discover_mongodb(
             "motor is required. Install with: pip install 'daita-agents[mongodb]'"
         )
 
-    logger.debug(
-        "discover_mongodb: connecting to %s", redact_url(connection_string)
-    )
+    logger.debug("discover_mongodb: connecting to %s", redact_url(connection_string))
     client = AsyncIOMotorClient(connection_string)
     db = client[database]
 

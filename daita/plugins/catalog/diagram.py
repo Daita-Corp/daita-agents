@@ -14,9 +14,7 @@ def map_sql_to_json_type(sql_type: str) -> str:
 
     if any(t in sql_type for t in ["int", "serial", "bigint", "smallint"]):
         return "integer"
-    elif any(
-        t in sql_type for t in ["float", "double", "decimal", "numeric", "real"]
-    ):
+    elif any(t in sql_type for t in ["float", "double", "decimal", "numeric", "real"]):
         return "number"
     elif any(t in sql_type for t in ["bool", "boolean"]):
         return "boolean"

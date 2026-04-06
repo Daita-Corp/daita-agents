@@ -83,8 +83,6 @@ async def discover_dynamodb(
             }
             for l in lsis
         ],
-        "sampled_attributes": {
-            k: list(v) for k, v in sampled_attributes.items()
-        },
+        "sampled_attributes": {k: list(v) for k, v in sampled_attributes.items()},
         "sample_size": sample_size,
     }

@@ -72,8 +72,17 @@ class AWSDiscoverer(BaseDiscoverer):
         self._role_arn = role_arn
         self._profile_name = profile_name
         self._services = services or [
-            "rds", "dynamodb", "s3", "elasticache", "redshift", "apigateway",
-            "sqs", "sns", "opensearch", "documentdb", "kinesis",
+            "rds",
+            "dynamodb",
+            "s3",
+            "elasticache",
+            "redshift",
+            "apigateway",
+            "sqs",
+            "sns",
+            "opensearch",
+            "documentdb",
+            "kinesis",
         ]
         self._session = None
         self._account_id: Optional[str] = None
@@ -198,8 +207,7 @@ class AWSDiscoverer(BaseDiscoverer):
                         region=region,
                         confidence=0.95,
                         tags=[
-                            f"{t['Key']}={t['Value']}"
-                            for t in db.get("TagList", [])
+                            f"{t['Key']}={t['Value']}" for t in db.get("TagList", [])
                         ],
                         metadata={
                             "arn": arn,
@@ -231,7 +239,10 @@ class AWSDiscoverer(BaseDiscoverer):
                     except Exception:
                         desc = {}
 
-                    arn = desc.get("TableArn", f"arn:aws:dynamodb:{region}:{self._account_id}:table/{table_name}")
+                    arn = desc.get(
+                        "TableArn",
+                        f"arn:aws:dynamodb:{region}:{self._account_id}:table/{table_name}",
+                    )
                     store = DiscoveredStore(
                         id="",
                         store_type="dynamodb",
@@ -300,7 +311,9 @@ class AWSDiscoverer(BaseDiscoverer):
         except Exception as exc:
             logger.warning("S3 enumeration failed: %s", exc)
 
-    async def _enumerate_elasticache(self, region: str) -> AsyncIterator[DiscoveredStore]:
+    async def _enumerate_elasticache(
+        self, region: str
+    ) -> AsyncIterator[DiscoveredStore]:
         """Enumerate ElastiCache clusters in a region."""
         client = self._session.client("elasticache", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
@@ -317,7 +330,10 @@ class AWSDiscoverer(BaseDiscoverer):
                     nodes = cluster.get("CacheNodes", [])
                     if nodes:
                         ep = nodes[0].get("Endpoint", {})
-                        endpoint = {"host": ep.get("Address", ""), "port": ep.get("Port")}
+                        endpoint = {
+                            "host": ep.get("Address", ""),
+                            "port": ep.get("Port"),
+                        }
 
                     store = DiscoveredStore(
                         id="",
@@ -380,7 +396,9 @@ class AWSDiscoverer(BaseDiscoverer):
         except Exception as exc:
             logger.warning("Redshift enumeration failed in %s: %s", region, exc)
 
-    async def _enumerate_apigateway(self, region: str) -> AsyncIterator[DiscoveredStore]:
+    async def _enumerate_apigateway(
+        self, region: str
+    ) -> AsyncIterator[DiscoveredStore]:
         """Enumerate API Gateway REST APIs (v1) and HTTP APIs (v2) in a region."""
         now = datetime.now(timezone.utc).isoformat()
 
@@ -518,7 +536,9 @@ class AWSDiscoverer(BaseDiscoverer):
                         attrs = {}
 
                     arn = attrs.get("QueueArn", "")
-                    queue_name = arn.rsplit(":", 1)[-1] if arn else queue_url.rsplit("/", 1)[-1]
+                    queue_name = (
+                        arn.rsplit(":", 1)[-1] if arn else queue_url.rsplit("/", 1)[-1]
+                    )
 
                     store = DiscoveredStore(
                         id="",
@@ -533,9 +553,15 @@ class AWSDiscoverer(BaseDiscoverer):
                         confidence=0.95,
                         metadata={
                             "arn": arn,
-                            "approximate_message_count": int(attrs.get("ApproximateNumberOfMessages", 0)),
-                            "approximate_not_visible": int(attrs.get("ApproximateNumberOfMessagesNotVisible", 0)),
-                            "visibility_timeout": int(attrs.get("VisibilityTimeout", 30)),
+                            "approximate_message_count": int(
+                                attrs.get("ApproximateNumberOfMessages", 0)
+                            ),
+                            "approximate_not_visible": int(
+                                attrs.get("ApproximateNumberOfMessagesNotVisible", 0)
+                            ),
+                            "visibility_timeout": int(
+                                attrs.get("VisibilityTimeout", 30)
+                            ),
                             "created_timestamp": attrs.get("CreatedTimestamp", ""),
                             "is_fifo": queue_name.endswith(".fifo"),
                         },
@@ -560,7 +586,9 @@ class AWSDiscoverer(BaseDiscoverer):
                     topic_name = topic_arn.rsplit(":", 1)[-1]
 
                     try:
-                        attrs = client.get_topic_attributes(TopicArn=topic_arn)["Attributes"]
+                        attrs = client.get_topic_attributes(TopicArn=topic_arn)[
+                            "Attributes"
+                        ]
                     except Exception:
                         attrs = {}
 
@@ -577,8 +605,12 @@ class AWSDiscoverer(BaseDiscoverer):
                         confidence=0.95,
                         metadata={
                             "arn": topic_arn,
-                            "subscription_count": int(attrs.get("SubscriptionsConfirmed", 0)),
-                            "subscriptions_pending": int(attrs.get("SubscriptionsPending", 0)),
+                            "subscription_count": int(
+                                attrs.get("SubscriptionsConfirmed", 0)
+                            ),
+                            "subscriptions_pending": int(
+                                attrs.get("SubscriptionsPending", 0)
+                            ),
                             "display_name": attrs.get("DisplayName", ""),
                             "is_fifo": topic_name.endswith(".fifo"),
                         },
@@ -590,7 +622,9 @@ class AWSDiscoverer(BaseDiscoverer):
         except Exception as exc:
             logger.warning("SNS enumeration failed in %s: %s", region, exc)
 
-    async def _enumerate_opensearch(self, region: str) -> AsyncIterator[DiscoveredStore]:
+    async def _enumerate_opensearch(
+        self, region: str
+    ) -> AsyncIterator[DiscoveredStore]:
         """Enumerate OpenSearch (Elasticsearch) domains in a region."""
         client = self._session.client("opensearch", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
@@ -611,7 +645,9 @@ class AWSDiscoverer(BaseDiscoverer):
 
                 for domain in resp.get("DomainStatusList", []):
                     domain_name = domain["DomainName"]
-                    endpoint = domain.get("Endpoint") or domain.get("Endpoints", {}).get("vpc", "")
+                    endpoint = domain.get("Endpoint") or domain.get(
+                        "Endpoints", {}
+                    ).get("vpc", "")
                     arn = domain.get("ARN", "")
                     engine_version = domain.get("EngineVersion", "")
 
@@ -634,9 +670,15 @@ class AWSDiscoverer(BaseDiscoverer):
                             "engine_version": engine_version,
                             "instance_type": cluster_config.get("InstanceType", ""),
                             "instance_count": cluster_config.get("InstanceCount", 1),
-                            "dedicated_master": cluster_config.get("DedicatedMasterEnabled", False),
-                            "zone_awareness": cluster_config.get("ZoneAwarenessEnabled", False),
-                            "status": "processing" if domain.get("Processing") else "active",
+                            "dedicated_master": cluster_config.get(
+                                "DedicatedMasterEnabled", False
+                            ),
+                            "zone_awareness": cluster_config.get(
+                                "ZoneAwarenessEnabled", False
+                            ),
+                            "status": (
+                                "processing" if domain.get("Processing") else "active"
+                            ),
                         },
                         discovered_at=now,
                         last_seen=now,
@@ -646,7 +688,9 @@ class AWSDiscoverer(BaseDiscoverer):
         except Exception as exc:
             logger.warning("OpenSearch enumeration failed in %s: %s", region, exc)
 
-    async def _enumerate_documentdb(self, region: str) -> AsyncIterator[DiscoveredStore]:
+    async def _enumerate_documentdb(
+        self, region: str
+    ) -> AsyncIterator[DiscoveredStore]:
         """Enumerate DocumentDB clusters in a region."""
         client = self._session.client("docdb", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
@@ -705,7 +749,10 @@ class AWSDiscoverer(BaseDiscoverer):
                     except Exception:
                         summary = {}
 
-                    arn = summary.get("StreamARN", f"arn:aws:kinesis:{region}:{self._account_id}:stream/{stream_name}")
+                    arn = summary.get(
+                        "StreamARN",
+                        f"arn:aws:kinesis:{region}:{self._account_id}:stream/{stream_name}",
+                    )
 
                     store = DiscoveredStore(
                         id="",
@@ -723,7 +770,9 @@ class AWSDiscoverer(BaseDiscoverer):
                             "shard_count": summary.get("OpenShardCount", 0),
                             "retention_hours": summary.get("RetentionPeriodHours", 24),
                             "status": summary.get("StreamStatus", ""),
-                            "stream_mode": summary.get("StreamModeDetails", {}).get("StreamMode", "PROVISIONED"),
+                            "stream_mode": summary.get("StreamModeDetails", {}).get(
+                                "StreamMode", "PROVISIONED"
+                            ),
                             "consumer_count": summary.get("ConsumerCount", 0),
                         },
                         discovered_at=now,

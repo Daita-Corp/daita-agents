@@ -9,7 +9,16 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncGenerator, Callable, Awaitable, Literal, Optional, Protocol, Union
+from typing import (
+    Any,
+    AsyncGenerator,
+    Callable,
+    Awaitable,
+    Literal,
+    Optional,
+    Protocol,
+    Union,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +87,9 @@ class WatchConfig:
     threshold: Optional[Callable[[Any], bool]] = None
     interval: Optional[timedelta] = None
     on_resolve: bool = False
-    cooldown: Union[bool, timedelta] = False  # False=every cycle, True=once, timedelta=re-alert
+    cooldown: Union[bool, timedelta] = (
+        False  # False=every cycle, True=once, timedelta=re-alert
+    )
 
     # streaming (Phase 2 — stored but not used yet)
     topic: Optional[str] = None

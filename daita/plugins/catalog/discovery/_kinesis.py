@@ -40,7 +40,9 @@ async def discover_kinesis(
             "StreamDescriptionSummary"
         ]
     except Exception as exc:
-        logger.warning("Kinesis describe_stream_summary failed for %s: %s", stream_name, exc)
+        logger.warning(
+            "Kinesis describe_stream_summary failed for %s: %s", stream_name, exc
+        )
 
     # Sample records from the first shard to infer schema
     record_fields: Dict[str, str] = {}
@@ -82,7 +84,9 @@ async def discover_kinesis(
         "shard_count": summary.get("OpenShardCount", 0),
         "retention_hours": summary.get("RetentionPeriodHours", 24),
         "status": summary.get("StreamStatus", ""),
-        "stream_mode": summary.get("StreamModeDetails", {}).get("StreamMode", "PROVISIONED"),
+        "stream_mode": summary.get("StreamModeDetails", {}).get(
+            "StreamMode", "PROVISIONED"
+        ),
         "consumer_count": summary.get("ConsumerCount", 0),
         "record_fields": record_fields,
         "sampled_count": sampled_count,
