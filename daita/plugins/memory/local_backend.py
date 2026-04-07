@@ -11,13 +11,16 @@ curator-generated human-readable summary, never written by the agent directly.
 
 import json
 import sqlite3
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import aiofiles
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 from .metadata import MemoryMetadata
 from .utils import build_where_clause, parse_metadata_json
+
+if TYPE_CHECKING:
+    from ...embeddings.base import BaseEmbeddingProvider
 
 
 def _find_project_root(start_path: Optional[Path] = None) -> Optional[Path]:
@@ -47,8 +50,7 @@ class LocalMemoryBackend:
         agent_id: Optional[str] = None,
         scope: str = "project",
         base_dir: Optional[Path] = None,
-        embedding_provider: str = "openai",
-        embedding_model: str = "text-embedding-3-small",
+        embedder: "BaseEmbeddingProvider" = None,
         max_chunks: int = 2000,
     ):
         self.workspace = workspace
@@ -76,9 +78,7 @@ class LocalMemoryBackend:
 
         self.max_chunks = max_chunks
         self.storage = FileStorage(self.workspace_dir, agent_id=agent_id)
-        self.search = SQLiteVectorSearch(
-            self.vector_db, embedding_provider, embedding_model
-        )
+        self.search = SQLiteVectorSearch(self.vector_db, embedder)
 
     async def remember(
         self,

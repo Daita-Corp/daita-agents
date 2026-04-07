@@ -76,6 +76,16 @@ memory = [
     "openai>=1.0.0",             # Embeddings (text-embedding-3-small)
 ]
 
+# Voyage AI embeddings
+voyage = [
+    "voyageai>=0.3.0",
+]
+
+# Local embeddings via HuggingFace (not supported in Daita Cloud)
+sentence-transformers = [
+    "sentence-transformers>=2.2.0",
+]
+
 # Data-focused agents (analysis, ETL, reporting)
 data = [
     "pandas>=1.5.0",

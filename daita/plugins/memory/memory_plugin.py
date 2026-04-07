@@ -8,11 +8,14 @@ Project-scoped by default, global as opt-in.
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from ..base import LifecyclePlugin
 from ...core.tools import AgentTool, tool
 from .metadata import MemoryMetadata
 from .utils import serialize_results
+
+if TYPE_CHECKING:
+    from ...embeddings.base import BaseEmbeddingProvider
 
 
 def _parse_time_param(value: Optional[str]) -> Optional[str]:
@@ -69,6 +72,7 @@ class MemoryPlugin(LifecyclePlugin):
         curation_api_key: Optional[str] = None,
         embedding_provider: str = "openai",
         embedding_model: str = "text-embedding-3-small",
+        embedder: Optional["BaseEmbeddingProvider"] = None,
         enable_reranking: bool = False,
         enable_fact_extraction: bool = False,
         max_chunks: int = 2000,
@@ -82,8 +86,12 @@ class MemoryPlugin(LifecyclePlugin):
             curation_provider: LLM for curation (default: "openai")
             curation_model: Model for curation (default: "gpt-4o-mini")
             curation_api_key: API key for curation (default: global settings)
-            embedding_provider: Provider for embeddings (default: "openai")
-            embedding_model: Embedding model (default: "text-embedding-3-small")
+            embedding_provider: Provider name for embeddings (default: "openai").
+                Ignored if ``embedder`` is provided.
+            embedding_model: Embedding model (default: "text-embedding-3-small").
+                Ignored if ``embedder`` is provided.
+            embedder: Pre-constructed BaseEmbeddingProvider instance.
+                Takes precedence over embedding_provider/embedding_model strings.
             enable_reranking: Rerank top recall results with an LLM call for
                 higher accuracy at the cost of latency. Requires curator LLM.
             enable_fact_extraction: Extract structured facts from memories at
@@ -101,6 +109,7 @@ class MemoryPlugin(LifecyclePlugin):
         self.curation_api_key = curation_api_key
         self.embedding_provider = embedding_provider
         self.embedding_model = embedding_model
+        self._embedder = embedder
         self.enable_reranking = enable_reranking
         self.enable_fact_extraction = enable_fact_extraction
         self.max_chunks = max_chunks
@@ -128,6 +137,15 @@ class MemoryPlugin(LifecyclePlugin):
             workspace = "_".join(agent_id.split("_")[:-1])
         else:
             workspace = agent_id
+
+        # Build embedding provider (factory or pre-constructed)
+        if self._embedder is None:
+            from ...embeddings import create_embedding_provider
+
+            self._embedder = create_embedding_provider(
+                provider=self.embedding_provider,
+                model=self.embedding_model,
+            )
 
         runtime = os.getenv("DAITA_RUNTIME", "local")
 
@@ -160,8 +178,7 @@ class MemoryPlugin(LifecyclePlugin):
                 workspace=workspace,
                 agent_id=agent_id,
                 scope=self.scope,
-                embedding_provider=self.embedding_provider,
-                embedding_model=self.embedding_model,
+                embedder=self._embedder,
             )
             self.environment = "cloud"
             print(
@@ -174,8 +191,7 @@ class MemoryPlugin(LifecyclePlugin):
                 workspace=workspace,
                 agent_id=agent_id,
                 scope=self.scope,
-                embedding_provider=self.embedding_provider,
-                embedding_model=self.embedding_model,
+                embedder=self._embedder,
                 max_chunks=self.max_chunks,
             )
             self.environment = "local"

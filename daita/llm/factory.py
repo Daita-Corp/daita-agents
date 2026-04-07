@@ -11,6 +11,7 @@ from .openai import OpenAIProvider
 from .anthropic import AnthropicProvider
 from .grok import GrokProvider
 from .gemini import GeminiProvider
+from .ollama import OllamaProvider
 from .mock import MockLLMProvider
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ PROVIDER_REGISTRY = {
     "anthropic": AnthropicProvider,
     "grok": GrokProvider,
     "gemini": GeminiProvider,
+    "ollama": OllamaProvider,
     "mock": MockLLMProvider,
 }
 
