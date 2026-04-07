@@ -47,7 +47,6 @@ class BaseEmbeddingProvider(EmbeddingProvider):
 
         # Accumulated metrics
         self._total_calls = 0
-        self._total_tokens = 0
 
         logger.debug(
             f"Initialized {self.__class__.__name__} with model {model} "

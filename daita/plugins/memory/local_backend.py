@@ -47,10 +47,10 @@ class LocalMemoryBackend:
     def __init__(
         self,
         workspace: str,
+        embedder: "BaseEmbeddingProvider",
         agent_id: Optional[str] = None,
         scope: str = "project",
         base_dir: Optional[Path] = None,
-        embedder: "BaseEmbeddingProvider" = None,
         max_chunks: int = 2000,
     ):
         self.workspace = workspace

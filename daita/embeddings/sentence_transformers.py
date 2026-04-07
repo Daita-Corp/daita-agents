@@ -9,9 +9,10 @@ Usage:
     MemoryPlugin(embedding_provider="sentence-transformers", embedding_model="BAAI/bge-large-en-v1.5")
 """
 
+import asyncio
 import os
 import logging
-from typing import List, Optional
+from typing import List
 
 from .base import BaseEmbeddingProvider
 
@@ -61,9 +62,13 @@ class SentenceTransformersEmbeddingProvider(BaseEmbeddingProvider):
         return self._dimensions
 
     async def _embed_text_impl(self, text: str) -> List[float]:
-        embedding = self._st_model.encode(text, normalize_embeddings=True)
+        embedding = await asyncio.to_thread(
+            self._st_model.encode, text, normalize_embeddings=True
+        )
         return embedding.tolist()
 
     async def _embed_texts_impl(self, texts: List[str]) -> List[List[float]]:
-        embeddings = self._st_model.encode(texts, normalize_embeddings=True)
+        embeddings = await asyncio.to_thread(
+            self._st_model.encode, texts, normalize_embeddings=True
+        )
         return embeddings.tolist()

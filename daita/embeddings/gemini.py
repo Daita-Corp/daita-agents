@@ -6,6 +6,7 @@ Supports gemini-embedding-001 with configurable output dimensions
 Uses the google-genai SDK.
 """
 
+import asyncio
 import os
 import logging
 from typing import List, Optional
@@ -13,11 +14,6 @@ from typing import List, Optional
 from .base import BaseEmbeddingProvider
 
 logger = logging.getLogger(__name__)
-
-# Default dimensions per model (before output_dimensionality override)
-_GEMINI_DEFAULT_DIMENSIONS = {
-    "gemini-embedding-001": 3072,
-}
 
 
 class GeminiEmbeddingProvider(BaseEmbeddingProvider):
@@ -66,7 +62,8 @@ class GeminiEmbeddingProvider(BaseEmbeddingProvider):
     async def _embed_text_impl(self, text: str) -> List[float]:
         from google.genai import types
 
-        result = self.client.models.embed_content(
+        result = await asyncio.to_thread(
+            self.client.models.embed_content,
             model=self.model,
             contents=text,
             config=types.EmbedContentConfig(
@@ -78,7 +75,8 @@ class GeminiEmbeddingProvider(BaseEmbeddingProvider):
     async def _embed_texts_impl(self, texts: List[str]) -> List[List[float]]:
         from google.genai import types
 
-        result = self.client.models.embed_content(
+        result = await asyncio.to_thread(
+            self.client.models.embed_content,
             model=self.model,
             contents=texts,
             config=types.EmbedContentConfig(

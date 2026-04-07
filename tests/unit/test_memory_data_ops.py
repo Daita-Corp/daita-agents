@@ -12,7 +12,6 @@ import sqlite3
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -46,20 +45,6 @@ def _make_search(db_path: Path) -> SQLiteVectorSearch:
     return SQLiteVectorSearch(db_path, _test_embedder)
 
 
-def _fake_embedding(text: str, dim: int = 8) -> list:
-    """Deterministic fake embedding based on text hash."""
-    import hashlib
-
-    h = hashlib.md5(text.encode()).hexdigest()
-    return [int(c, 16) / 15.0 for c in h[:dim]]
-
-
-async def _mock_embed_text(self, text):
-    return _fake_embedding(text)
-
-
-async def _mock_embed_texts(self, texts):
-    return [_fake_embedding(t) for t in texts]
 
 
 # ---------------------------------------------------------------------------

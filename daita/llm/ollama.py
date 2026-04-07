@@ -15,6 +15,7 @@ Usage:
     )
 """
 
+import json
 import os
 import logging
 from typing import Dict, Any, Optional
@@ -83,8 +84,6 @@ class OllamaProvider(BaseLLMProvider):
         **kwargs,
     ):
         """Non-streaming generation via Ollama's OpenAI-compatible endpoint."""
-        import json
-
         try:
             api_params = {
                 "model": self.model,
@@ -140,7 +139,6 @@ class OllamaProvider(BaseLLMProvider):
     ):
         """Streaming generation via Ollama's OpenAI-compatible endpoint."""
         from ..core.streaming import LLMChunk
-        import json
 
         try:
             api_params = {
@@ -237,7 +235,6 @@ class OllamaProvider(BaseLLMProvider):
         self, messages: list[Dict[str, Any]]
     ) -> list[Dict[str, Any]]:
         """Convert internal flat tool_calls format to OpenAI nested format."""
-        import json
 
         converted = []
         for msg in messages:
