@@ -9,6 +9,7 @@ Usage:
     MemoryPlugin(embedding_provider="sentence-transformers", embedding_model="BAAI/bge-large-en-v1.5")
 """
 
+import os
 import logging
 from typing import List, Optional
 
@@ -25,6 +26,11 @@ class SentenceTransformersEmbeddingProvider(BaseEmbeddingProvider):
         model: str = "all-MiniLM-L6-v2",
         **kwargs,
     ):
+        if os.getenv("DAITA_RUNTIME") == "lambda":
+            raise ValueError(
+                "sentence-transformers is a local-only embedding provider and cannot "
+                "run in Daita Cloud. Use a cloud provider instead (openai, voyage, gemini)."
+            )
         kwargs.pop("api_key", None)
         super().__init__(model=model, api_key=None, **kwargs)
         self._model = None

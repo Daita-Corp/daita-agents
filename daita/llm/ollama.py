@@ -129,10 +129,7 @@ class OllamaProvider(BaseLLMProvider):
         except Exception as e:
             error_msg = str(e)
             if "Connection" in error_msg or "refused" in error_msg:
-                raise LLMError(
-                    f"Cannot connect to Ollama at {self._base_url}. "
-                    f"Is Ollama running? Start it with: ollama serve"
-                )
+                raise LLMError(self._connection_error_message())
             raise LLMError(f"Ollama generation failed: {error_msg}")
 
     async def _stream_impl(
@@ -222,11 +219,19 @@ class OllamaProvider(BaseLLMProvider):
         except Exception as e:
             error_msg = str(e)
             if "Connection" in error_msg or "refused" in error_msg:
-                raise LLMError(
-                    f"Cannot connect to Ollama at {self._base_url}. "
-                    f"Is Ollama running? Start it with: ollama serve"
-                )
+                raise LLMError(self._connection_error_message())
             raise LLMError(f"Ollama streaming failed: {error_msg}")
+
+    def _connection_error_message(self) -> str:
+        if os.getenv("DAITA_RUNTIME") == "lambda":
+            return (
+                "Ollama is a local-only LLM provider and cannot run in Daita Cloud. "
+                "Use a cloud provider instead (openai, anthropic, gemini, grok)."
+            )
+        return (
+            f"Cannot connect to Ollama at {self._base_url}. "
+            f"Is Ollama running? Start it with: ollama serve"
+        )
 
     def _convert_messages(
         self, messages: list[Dict[str, Any]]
