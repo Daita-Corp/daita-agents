@@ -30,6 +30,9 @@ class NodeType(str, Enum):
     DATABASE = "database"
     BUCKET = "bucket"
     SERVICE = "service"
+    # Memory graph types
+    MEMORY = "memory"
+    ENTITY = "entity"
 
 
 class EdgeType(str, Enum):
@@ -43,6 +46,10 @@ class EdgeType(str, Enum):
     DERIVED_FROM = "derived_from"
     HAS_COLUMN = "has_column"
     PART_OF = "part_of"
+    # Memory graph types
+    MENTIONS = "mentions"
+    RELATED_TO = "related_to"
+    SUPERSEDES = "supersedes"
 
 
 class AgentGraphNode(BaseModel):

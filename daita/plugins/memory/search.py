@@ -399,6 +399,18 @@ class SQLiteVectorSearch:
         importance = metadata_dict.get("importance", 0.5)
         importance_boost = (importance - 0.5) * 0.2
 
+        # Reinforcement signal: net positive boosts up to +0.05, net negative penalizes
+        reinforcements = metadata_dict.get("reinforcements")
+        if reinforcements:
+            positives = sum(
+                1 for r in reinforcements if r.get("outcome") == "positive"
+            )
+            negatives = sum(
+                1 for r in reinforcements if r.get("outcome") == "negative"
+            )
+            net = (positives - negatives) / len(reinforcements)
+            importance_boost += net * 0.05
+
         # Temporal decay (pinned memories are exempt)
         decay = 1.0
         if not metadata_dict.get("pinned", False):

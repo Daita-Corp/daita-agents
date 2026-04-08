@@ -75,6 +75,9 @@ class MemoryPlugin(LifecyclePlugin):
         embedder: Optional["BaseEmbeddingProvider"] = None,
         enable_reranking: bool = False,
         enable_fact_extraction: bool = False,
+        enable_working_memory: bool = False,
+        enable_reinforcement: bool = False,
+        enable_memory_graph: bool = False,
         max_chunks: int = 2000,
         default_ttl_days: Optional[int] = None,
     ):
@@ -97,6 +100,15 @@ class MemoryPlugin(LifecyclePlugin):
             enable_fact_extraction: Extract structured facts from memories at
                 ingestion time for richer temporal and relational recall.
                 Requires curator LLM.
+            enable_working_memory: Enable session-scoped scratchpad. Adds
+                scratch() and think() tools. Working memory auto-evicts on
+                agent stop unless promoted via remember(promote_key=...).
+            enable_reinforcement: Enable outcome-based learning. Adds
+                reinforce() tool for recording whether recalled memories
+                led to good or bad outcomes.
+            enable_memory_graph: Enable knowledge graph over memories. Adds
+                traverse_memory() tool and auto-expands recall results via
+                graph traversal. Works best with enable_fact_extraction=True.
             max_chunks: Maximum stored chunks before eviction (default: 2000).
             default_ttl_days: Default time-to-live in days for new memories.
                 None means no expiry (default). Can be overridden per-memory.
@@ -112,6 +124,9 @@ class MemoryPlugin(LifecyclePlugin):
         self._embedder = embedder
         self.enable_reranking = enable_reranking
         self.enable_fact_extraction = enable_fact_extraction
+        self.enable_working_memory = enable_working_memory
+        self.enable_reinforcement = enable_reinforcement
+        self.enable_memory_graph = enable_memory_graph
         self.max_chunks = max_chunks
         self.default_ttl_days = default_ttl_days
 
@@ -121,6 +136,8 @@ class MemoryPlugin(LifecyclePlugin):
         self.environment = None
         self._reranker = None
         self._fact_extractor = None
+        self._working_memory = None
+        self._memory_graph = None
 
     def initialize(self, agent_id: str):
         """Called by Agent.add_plugin() to inject agent context."""
@@ -234,6 +251,21 @@ class MemoryPlugin(LifecyclePlugin):
 
             self._fact_extractor = FactExtractor(llm=self.curator.llm)
 
+        if self.enable_working_memory:
+            from .working_memory import WorkingMemory
+
+            self._working_memory = WorkingMemory()
+
+        if self.enable_memory_graph:
+            from .memory_graph import MemoryGraph
+
+            self._memory_graph = MemoryGraph(agent_id=agent_id)
+            if not self.enable_fact_extraction:
+                print(
+                    "  Memory graph using keyword heuristics only. "
+                    "Enable fact_extraction for richer entity graphs."
+                )
+
     def get_tools(self) -> List[AgentTool]:
         """Get memory tools for the LLM to use."""
         if self.backend is None:
@@ -244,6 +276,8 @@ class MemoryPlugin(LifecyclePlugin):
         backend = self.backend
         _reranker = self._reranker
         _fact_extractor = self._fact_extractor
+        _working_memory = self._working_memory
+        _memory_graph = self._memory_graph
 
         # Instantiate contradiction checker if curation LLM is available.
         _checker = None
@@ -264,6 +298,7 @@ class MemoryPlugin(LifecyclePlugin):
             importance: float = 0.5,
             category: Optional[str] = None,
             ttl_days: Optional[int] = None,
+            promote_key: Optional[str] = None,
         ):
             """
             Store information in memory for future recall.
@@ -276,6 +311,9 @@ class MemoryPlugin(LifecyclePlugin):
                     - A list of dicts for batch storage, each with keys:
                         "content" (required), "importance" (optional, 0.0-1.0),
                         "category" (optional). Uses a single embedding API call.
+                promote_key: Optional key from working memory (scratch) to promote
+                    to long-term storage. When provided, uses the scratch item's
+                    content (overrides the content parameter).
                 importance: How critical this memory is (0.0-1.0), used when
                     content is a string. Ignored for batch input (use per-item):
                     0.9+ = critical (security issues, hard deadlines, major decisions)
@@ -291,6 +329,16 @@ class MemoryPlugin(LifecyclePlugin):
                 Confirmation with chunk_id (single) or batch summary (batch)
             """
             from .auto_classify import infer_category, infer_importance
+
+            # --- Promote from working memory ---
+            if promote_key and _working_memory:
+                promoted = _working_memory.promote(promote_key)
+                if promoted is None:
+                    return {
+                        "status": "not_found",
+                        "message": f"No scratch item with key '{promote_key}'",
+                    }
+                content = promoted["content"]
 
             # --- Batch path ---
             if isinstance(content, list):
@@ -389,12 +437,22 @@ class MemoryPlugin(LifecyclePlugin):
             if _fact_extractor is not None:
                 extra_metadata = {"_facts_extracted": False}
 
-            return await backend.remember(
+            result = await backend.remember(
                 content,
                 category=category,
                 metadata=metadata,
                 extra_metadata=extra_metadata,
             )
+
+            # Index in memory graph if enabled (uses keyword heuristics;
+            # fact extraction is lazy so facts aren't available at remember-time)
+            if _memory_graph and result.get("chunk_id"):
+                try:
+                    await _memory_graph.index_memory(result["chunk_id"], content)
+                except Exception:
+                    pass  # Graph indexing is best-effort
+
+            return result
 
         @tool
         async def recall(
@@ -453,6 +511,27 @@ class MemoryPlugin(LifecyclePlugin):
             chunk_ids = [r["chunk_id"] for r in results if r.get("chunk_id")]
             if chunk_ids:
                 backend.search.track_access(chunk_ids)
+
+            # Graph expansion: pull in connected memories for high-confidence hits
+            if _memory_graph and results:
+                try:
+                    seen = {r["chunk_id"] for r in results if r.get("chunk_id")}
+                    graph_results = []
+                    for r in results[:3]:
+                        if r.get("score", 0) >= 0.7:
+                            connected = await _memory_graph.get_connected_memories(
+                                r["chunk_id"]
+                            )
+                            for cid in connected:
+                                if cid not in seen:
+                                    chunk = await backend.get_chunk(cid)
+                                    if chunk:
+                                        chunk["source"] = "graph"
+                                        graph_results.append(chunk)
+                                        seen.add(cid)
+                    results.extend(graph_results[:limit])
+                except Exception:
+                    pass  # Graph expansion is best-effort
 
             return serialize_results(results)
 
@@ -640,6 +719,150 @@ class MemoryPlugin(LifecyclePlugin):
 
             tools.append(query_facts)
 
+        # Working memory tools
+        if _working_memory is not None:
+
+            @tool
+            async def scratch(content: str, key: Optional[str] = None):
+                """
+                Store temporary info in session working memory.
+
+                Fast (no embedding cost). Discarded when agent stops unless
+                promoted to long-term memory via remember(promote_key=key).
+
+                Use for intermediate results, checklists, or temporary state
+                during multi-step tasks.
+
+                Args:
+                    content: Information to store temporarily
+                    key: Optional key for later reference (auto-generated if omitted)
+
+                Returns:
+                    The key assigned to this scratch item
+                """
+                assigned_key = _working_memory.scratch(content, key)
+                return {
+                    "status": "stored",
+                    "key": assigned_key,
+                    "message": f"Stored in working memory as '{assigned_key}'",
+                }
+
+            @tool
+            async def think(query: str, limit: int = 5):
+                """
+                Search session working memory (scratch items only).
+
+                Use to retrieve temporary notes, intermediate results, or
+                scratchpad items stored during this session with scratch().
+
+                Args:
+                    query: What to search for (keyword matching)
+                    limit: Maximum results (default: 5)
+
+                Returns:
+                    Matching scratch items from this session
+                """
+                return _working_memory.think(query, limit)
+
+            tools.extend([scratch, think])
+
+        # Reinforcement tool
+        if self.enable_reinforcement:
+
+            @tool
+            async def reinforce(
+                memory_ids: Union[str, List[str]],
+                outcome: str,
+                signal_strength: float = 0.5,
+                context: Optional[str] = None,
+            ):
+                """
+                Record whether recalled memories led to good or bad outcomes.
+
+                Call after acting on recalled memories to improve future recall.
+                Positive reinforcement increases importance; negative flags for
+                review and accelerates pruning.
+
+                Args:
+                    memory_ids: chunk_id(s) to reinforce (from recall results).
+                        Accepts a single string or a list.
+                    outcome: "positive", "negative", or "neutral"
+                    signal_strength: How strong the signal (0.0-1.0, default 0.5)
+                    context: Optional description of what happened
+
+                Returns:
+                    Summary of reinforcement applied
+                """
+                if outcome not in ("positive", "negative", "neutral"):
+                    return {
+                        "status": "error",
+                        "message": "outcome must be 'positive', 'negative', or 'neutral'",
+                    }
+                signal_strength = max(0.0, min(1.0, signal_strength))
+
+                if isinstance(memory_ids, str):
+                    memory_ids = [memory_ids]
+
+                reinforcement = {
+                    "outcome": outcome,
+                    "signal": signal_strength,
+                    "timestamp": datetime.now().isoformat(),
+                    "context": context,
+                }
+
+                importance_delta = (
+                    signal_strength * 0.1 if outcome == "positive" else 0.0
+                )
+
+                updated = 0
+                for chunk_id in memory_ids:
+                    try:
+                        await backend.append_reinforcement(
+                            chunk_id, reinforcement, importance_delta
+                        )
+                        if outcome == "negative":
+                            await backend.update_chunk_metadata(
+                                chunk_id, {"flagged_for_review": True}
+                            )
+                        updated += 1
+                    except Exception:
+                        pass
+
+                return {
+                    "status": "success",
+                    "reinforced": updated,
+                    "outcome": outcome,
+                    "message": f"Reinforced {updated} memories as {outcome}",
+                }
+
+            tools.append(reinforce)
+
+        # Memory graph traversal tool
+        if _memory_graph is not None:
+
+            @tool
+            async def traverse_memory(entity: str, max_depth: int = 2):
+                """
+                Walk the memory knowledge graph to find all connected knowledge.
+
+                Use when you need to find everything related to a concept,
+                especially facts that semantic search might miss. For example:
+                "what are all the infrastructure constraints for Project Orion?"
+
+                Args:
+                    entity: Entity name to start from (e.g. "PostgreSQL",
+                        "users table", "Project Orion")
+                    max_depth: How many hops to traverse (default: 2)
+
+                Returns:
+                    Connected entities and the memories that reference them
+                """
+                return await _memory_graph.traverse_entity(
+                    entity, direction="both", max_depth=max_depth
+                )
+
+            tools.append(traverse_memory)
+
         return tools
 
     async def on_before_run(self, prompt: str) -> Optional[str]:
@@ -692,7 +915,7 @@ class MemoryPlugin(LifecyclePlugin):
                         results.append(r)
                         seen.add(r["chunk_id"])
 
-            if not results:
+            if not results and not (self._working_memory and len(self._working_memory) > 0):
                 return None
 
             # Always inject pinned memories — these are org rules / critical
@@ -712,14 +935,26 @@ class MemoryPlugin(LifecyclePlugin):
             if chunk_ids:
                 self.backend.search.track_access(chunk_ids)
 
-            lines = ["## Relevant Memory"]
-            for r in results:
-                importance = r.get("metadata", {}).get("importance", 0.5)
-                category = r.get("metadata", {}).get("category", "")
-                tag = f"[{category}] " if category else ""
-                lines.append(
-                    f"- {tag}{r['content'].strip()} (importance: {importance:.1f})"
-                )
+            lines = []
+            if results:
+                lines.append("## Relevant Memory")
+                for r in results:
+                    importance = r.get("metadata", {}).get("importance", 0.5)
+                    category = r.get("metadata", {}).get("category", "")
+                    tag = f"[{category}] " if category else ""
+                    lines.append(
+                        f"- {tag}{r['content'].strip()} (importance: {importance:.1f})"
+                    )
+
+            # Inject working memory if it has items
+            if self._working_memory and len(self._working_memory) > 0:
+                lines.append("")
+                lines.append("## Working Memory (session scratchpad)")
+                for item in self._working_memory.dump():
+                    status = " [promoted]" if item["promoted"] else ""
+                    lines.append(
+                        f"- [{item['key']}] {item['content'].strip()}{status}"
+                    )
 
             return "\n".join(lines)
         except Exception as e:
@@ -743,6 +978,17 @@ class MemoryPlugin(LifecyclePlugin):
 
     async def on_agent_stop(self):
         """Flush pending changes, prune stale memories, and auto-curate."""
+        # Clear working memory (session-scoped)
+        if self._working_memory:
+            self._working_memory.clear()
+
+        # Flush memory graph
+        if self._memory_graph:
+            try:
+                await self._memory_graph.flush()
+            except Exception:
+                pass
+
         if hasattr(self.backend, "flush"):
             await self.backend.flush()
 

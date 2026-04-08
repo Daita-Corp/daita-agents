@@ -6,7 +6,7 @@ Replaces old text-suffix format with proper structured metadata.
 
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 import json
 
 
@@ -28,6 +28,8 @@ class MemoryMetadata:
     access_count: int = 0
     last_accessed: Optional[datetime] = None
     ttl_days: Optional[int] = None
+    reinforcements: Optional[List[Dict[str, Any]]] = None
+    flagged_for_review: bool = False
 
     def __post_init__(self):
         """Set defaults for datetime fields."""
@@ -93,6 +95,16 @@ class MemoryMetadata:
         # TTL expiry — hard cutoff regardless of importance or access
         if self.ttl_days is not None and age_days > self.ttl_days:
             return True
+
+        # Consistently negative reinforcement: prune at half the normal age threshold
+        if self.reinforcements:
+            negatives = sum(
+                1 for r in self.reinforcements if r.get("outcome") == "negative"
+            )
+            total = len(self.reinforcements)
+            if total >= 3 and negatives / total >= 0.7:
+                if age_days > max_age_days / 2 and self.importance < 0.6:
+                    return True
 
         # Never-accessed old memories prune sooner
         if self.access_count == 0 and age_days > 60 and self.importance < 0.5:

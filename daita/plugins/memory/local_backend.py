@@ -765,6 +765,56 @@ class LocalMemoryBackend:
         conn.commit()
         conn.close()
 
+    async def append_reinforcement(
+        self, chunk_id: str, reinforcement: dict, importance_delta: float = 0.0
+    ):
+        """Append a reinforcement record and optionally adjust importance.
+
+        Unlike update_chunk_metadata() which overwrites keys, this appends
+        to the reinforcements list and applies an importance delta atomically.
+        """
+        conn = sqlite3.connect(str(self.vector_db))
+        cursor = conn.cursor()
+        cursor.execute("SELECT metadata FROM chunks WHERE chunk_id = ?", (chunk_id,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            try:
+                meta = json.loads(row[0])
+                if "reinforcements" not in meta or meta["reinforcements"] is None:
+                    meta["reinforcements"] = []
+                meta["reinforcements"].append(reinforcement)
+                if importance_delta != 0.0:
+                    current = meta.get("importance", 0.5)
+                    meta["importance"] = max(0.0, min(1.0, current + importance_delta))
+                cursor.execute(
+                    "UPDATE chunks SET metadata = ? WHERE chunk_id = ?",
+                    (json.dumps(meta), chunk_id),
+                )
+            except Exception:
+                pass
+        conn.commit()
+        conn.close()
+
+    async def get_chunk(self, chunk_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single memory chunk by ID. Used by graph expansion."""
+        conn = sqlite3.connect(str(self.vector_db))
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT chunk_id, content, metadata FROM chunks WHERE chunk_id = ?",
+            (chunk_id,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        metadata = parse_metadata_json(row[2]) if row[2] else {}
+        return {
+            "chunk_id": row[0],
+            "content": row[1],
+            "metadata": metadata,
+            "score": 0.0,
+        }
+
     async def delete_chunks(self, chunk_ids: list):
         """Hard-delete chunks from the local vector DB."""
         if not chunk_ids:
