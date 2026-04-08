@@ -86,6 +86,7 @@ class LocalMemoryBackend:
         category: Optional[str] = None,
         metadata: Optional[MemoryMetadata] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
+        index_content: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Store a memory: appends to today's daily log and indexes in the vector DB.
@@ -94,6 +95,9 @@ class LocalMemoryBackend:
         Args:
             extra_metadata: Optional dict merged into the stored metadata JSON.
                             Used by FactExtractor to attach "extracted_facts".
+            index_content: Cleaned text for embedding computation. When
+                provided, the embedding is computed from this instead of
+                ``content``. The original ``content`` is stored in the DB.
         """
         # Always write to daily log (human-readable history + curator input)
         await self.storage.append_to_daily_log(content, category)
@@ -108,7 +112,8 @@ class LocalMemoryBackend:
             )
 
         chunk_id = await self.search.store_chunk(
-            content, metadata, extra_metadata=extra_metadata
+            content, metadata, extra_metadata=extra_metadata,
+            index_content=index_content,
         )
 
         return {
@@ -704,14 +709,31 @@ class LocalMemoryBackend:
 
     async def regenerate_memory_md(self, min_importance: float = 0.4) -> str:
         """
-        Regenerate MEMORY.md from the vector DB. Curator-only write path.
+        Regenerate MEMORY.md from the vector DB.
 
         Groups memories by category, sorts by importance descending.
-        This replaces the old append-only approach - MEMORY.md is always
-        a clean, current snapshot of what's worth remembering.
+        Skips regeneration if the DB hasn't changed since the last call
+        (shared-workspace safe: multiple plugin instances calling stop()
+        on the same workspace won't redundantly rewrite the file).
         """
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
+
+        # Quick fingerprint: skip if DB unchanged since last regeneration.
+        # Stored on disk so multiple plugin instances sharing a workspace
+        # don't redundantly rewrite the same file.
+        cursor.execute("SELECT COUNT(*), MAX(rowid) FROM chunks")
+        row = cursor.fetchone()
+        fingerprint = f"{row[0]}:{row[1]}" if row else "0:0"
+        fingerprint_file = self.workspace_dir / ".regen_fingerprint"
+        if fingerprint_file.exists():
+            try:
+                if fingerprint_file.read_text().strip() == fingerprint:
+                    conn.close()
+                    return None  # DB unchanged, skip regeneration
+            except Exception:
+                pass
+
         cursor.execute(
             "SELECT content, metadata FROM chunks WHERE file_path = 'memory://direct' OR file_path LIKE '%MEMORY%'"
         )
@@ -743,6 +765,12 @@ class LocalMemoryBackend:
 
         async with aiofiles.open(self.memory_file, "w", encoding="utf-8") as f:
             await f.write("".join(lines))
+
+        # Persist fingerprint so other instances sharing this workspace skip
+        try:
+            fingerprint_file.write_text(fingerprint)
+        except Exception:
+            pass
 
         return str(self.memory_file)
 

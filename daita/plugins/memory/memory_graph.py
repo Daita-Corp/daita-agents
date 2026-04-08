@@ -35,6 +35,42 @@ _CAPITALIZED_PHRASE_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b")
 _TABLE_COLUMN_RE = re.compile(r"\b(\w+\.\w+)\b")
 _QUOTED_RE = re.compile(r'"([^"]+)"')
 
+# Entity quality filters
+_TEMPORAL_RE = re.compile(
+    r"^(as of|before|after|since|by|in|during|until)\s+\d", re.IGNORECASE
+)
+_CURRENCY_RE = re.compile(
+    r"[\$€£]|(?:USD|EUR|GBP)\s*\d|^\d[\d,.]*\s*(million|billion|trillion|k|m|b)$",
+    re.IGNORECASE,
+)
+_BARE_NUMBER_RE = re.compile(r"^[\d,.%/]+$")
+_MAX_ENTITY_WORDS = 5
+
+# Technical identifier patterns — these are code/data names, not English prose.
+# They bypass the single-lowercase-word filter because "customers", "etl_orders_agg",
+# and "orders.total" are high-value entities in data/engineering domains.
+_SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")  # customer_segments
+_DOT_NOTATION_RE = re.compile(r"^\w+\.\w+$")  # orders.total
+_ALL_CAPS_RE = re.compile(r"^[A-Z][A-Z0-9_(),.]+$")  # DECIMAL(10,2), INTEGER
+
+
+def _is_technical_identifier(name: str) -> bool:
+    """Return True if name looks like a code/data identifier, not English prose."""
+    stripped = name.strip()
+    if _SNAKE_CASE_RE.match(stripped):
+        return True
+    if _DOT_NOTATION_RE.match(stripped):
+        return True
+    if _ALL_CAPS_RE.match(stripped):
+        return True
+    return False
+_GENERIC_ENTITIES = frozenset({
+    "challenges", "challenges and limitations", "efforts", "r&d efforts",
+    "companies", "companies and research institutions", "issues", "problems",
+    "advantages", "benefits", "features", "results", "findings", "data",
+    "information", "details", "aspects", "factors", "elements", "things",
+})
+
 
 class MemoryGraph:
     """Lightweight graph layer for memory relationships.
@@ -151,7 +187,13 @@ class MemoryGraph:
                 await self.backend.add_edge(rel_edge)
 
     def _entities_from_facts(self, facts: List[dict]) -> List[dict]:
-        """Convert FactExtractor output to entity pairs."""
+        """Convert FactExtractor output to entity pairs with quality filtering.
+
+        Uses relaxed filtering (``from_facts=True``) because the LLM was
+        explicitly asked to extract entities — single lowercase words like
+        ``customers`` or ``orders`` are legitimate table/column names, not
+        English prose noise.
+        """
         pairs = []
         for fact in facts:
             entity = fact.get("entity") or fact.get("subject")
@@ -160,7 +202,149 @@ class MemoryGraph:
             value = fact.get("value") or fact.get("object")
             relation = fact.get("relation") or fact.get("predicate", "related_to")
             pairs.append({"entity": entity, "value": value, "relation": relation})
-        return pairs
+        pairs = self._filter_entity_pairs(pairs, from_facts=True)
+        return self._deduplicate_entities(pairs)
+
+    @staticmethod
+    def _is_low_quality_entity(name: str, from_facts: bool = False) -> bool:
+        """Return True if the entity name is too generic, temporal, or numeric.
+
+        Args:
+            name: Entity name to check.
+            from_facts: When True, skip the single-lowercase-word filter.
+                LLM-extracted facts have already been curated for relevance,
+                so single lowercase words like ``customers`` or ``orders``
+                are legitimate domain entities, not English prose noise.
+        """
+        if not name or len(name) < 2:
+            return True
+        normalized = name.strip().lower()
+        if normalized in _GENERIC_ENTITIES:
+            return True
+        if _TEMPORAL_RE.match(name):
+            return True
+        if _CURRENCY_RE.search(name):
+            return True
+        if _BARE_NUMBER_RE.match(normalized):
+            return True
+        if len(name.split()) > _MAX_ENTITY_WORDS:
+            return True
+        # Single words must be proper nouns (capitalized) or technical identifiers
+        # to be useful entities. English words like "rapidly", "advancements",
+        # "production" create low-value graph connections, but code/data names
+        # like "customer_segments", "orders.total", "INTEGER" are high-value.
+        # When from_facts=True, the LLM already filtered for relevance so we
+        # trust single lowercase words as legitimate domain entities.
+        if not from_facts and len(name.split()) == 1 and not name[0].isupper():
+            if not _is_technical_identifier(name):
+                return True
+        return False
+
+    @staticmethod
+    def _filter_entity_pairs(
+        pairs: List[dict], from_facts: bool = False
+    ) -> List[dict]:
+        """Remove pairs whose entity or value fails quality checks.
+
+        Args:
+            pairs: Entity pairs to filter.
+            from_facts: Pass True when pairs come from LLM-extracted facts
+                to apply relaxed filtering (see ``_is_low_quality_entity``).
+        """
+        filtered = []
+        for p in pairs:
+            if MemoryGraph._is_low_quality_entity(p["entity"], from_facts):
+                continue
+            # Filter value too — if low quality, keep the entity but drop the value
+            if p.get("value") and MemoryGraph._is_low_quality_entity(
+                p["value"], from_facts
+            ):
+                p = {**p, "value": None}
+            filtered.append(p)
+        return filtered
+
+    @staticmethod
+    def _deduplicate_entities(pairs: List[dict]) -> List[dict]:
+        """Absorb entities that are substrings of shorter canonical forms.
+
+        If "solid-state batteries" and "solid-state battery technology" both
+        appear, keep only "solid-state batteries" (the shorter one) and
+        redirect the longer one's relations to the shorter entity.
+
+        Uses word-set containment: if all words of the shorter entity appear
+        in the longer entity, the longer one is absorbed. This handles
+        inflection differences like "batteries" appearing in a name that
+        contains "battery" by checking if the shorter word-stem (minus
+        trailing 1-3 characters) matches a word in the longer name.
+        """
+        if len(pairs) <= 1:
+            return pairs
+
+        # Collect all unique entity names (normalized)
+        entity_names = list({_normalize_entity(p["entity"]) for p in pairs})
+        # Sort by length so shorter names come first
+        entity_names.sort(key=len)
+
+        def _words(name: str) -> set:
+            return set(name.split())
+
+        def _is_absorbed(shorter: str, longer: str) -> bool:
+            """Check if shorter's words are contained in longer (with fuzzy stems).
+
+            Single-token technical identifiers (no spaces) are never absorbed
+            by other single-token identifiers — ``customers`` and
+            ``customer_segments`` are distinct entities, not variations.
+            """
+            shorter_words = _words(shorter)
+            longer_words = _words(longer)
+            # Two single-token names are distinct unless exactly equal
+            # (which is handled before this function is called).
+            # This prevents "customers" from absorbing "customer_segments".
+            if len(shorter_words) == 1 and len(longer_words) == 1:
+                return False
+            for sw in shorter_words:
+                # Exact match
+                if sw in longer_words:
+                    continue
+                # Stem match: check if any longer word shares a prefix (min 4 chars)
+                stem = sw[:max(4, len(sw) - 3)]
+                if any(lw.startswith(stem) for lw in longer_words):
+                    continue
+                return False
+            return True
+
+        # Build a mapping: long_name -> canonical short_name
+        canonical = {}
+        for i, name in enumerate(entity_names):
+            for shorter in entity_names[:i]:
+                if shorter != name and _is_absorbed(shorter, name):
+                    canonical[name] = shorter
+                    break
+
+        if not canonical:
+            return pairs
+
+        # Apply the mapping — redirect long entity names to their canonical form
+        deduped = []
+        for p in pairs:
+            norm = _normalize_entity(p["entity"])
+            if norm in canonical:
+                p = {**p, "entity": canonical[norm]}
+            if p.get("value"):
+                norm_val = _normalize_entity(p["value"])
+                if norm_val in canonical:
+                    p = {**p, "value": canonical[norm_val]}
+            deduped.append(p)
+
+        # Remove exact duplicate pairs that may have been created by canonicalization
+        seen = set()
+        unique = []
+        for p in deduped:
+            key = (_normalize_entity(p["entity"]), p.get("relation"), _normalize_entity(p.get("value") or ""))
+            if key not in seen:
+                seen.add(key)
+                unique.append(p)
+        return unique
 
     def _extract_entities_heuristic(self, content: str) -> List[dict]:
         """Extract entities via regex patterns (no LLM cost).

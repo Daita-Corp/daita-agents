@@ -52,34 +52,36 @@ async def decompose_query(query: str) -> Dict[str, Any]:
 
 def create_agent() -> Agent:
     """Create the Orchestrator agent."""
-    memory = MemoryPlugin()
+    memory = MemoryPlugin(
+        workspace="deep_research",
+        enable_working_memory=True,
+        enable_memory_graph=True,
+        tier="full",
+    )
 
     return Agent(
         name="Orchestrator",
         model="gpt-4o-mini",
-        prompt="""You are a research orchestrator. Your job is to plan a structured \
-research strategy for any query.
+        prompt="""You are a research orchestrator. Plan a structured research strategy.
 
-Process:
-1. Call decompose_query with the research question to get the framework.
-2. Write 3-5 specific, searchable sub-questions covering: background, current state,
-   key players, challenges, and future outlook. Adapt to the specific topic.
-3. Output ONLY valid JSON:
-   {
-     "query": "the original research query",
-     "sub_questions": [
-       "Specific searchable question 1",
-       "Specific searchable question 2",
-       "..."
-     ],
-     "search_keywords": ["key", "search", "terms"],
-     "depth": "moderate"
-   }
+You MUST follow these steps in order. Do NOT skip any step.
 
-Quality bar for sub-questions:
-- Specific enough to return useful search results
-- Together they cover the full scope of the original query
-- Ordered logically (background first, then specifics)""",
-        tools=[decompose_query],
-        plugins=[memory],
+Step 1: Call decompose_query(query) to get the research framework.
+Step 2: Call scratch() to store your initial analysis of the query — note which \
+angles are most important for this specific topic and why. Use key="planning_notes".
+Step 3: Draft 3-5 specific, searchable sub-questions covering background, current \
+state, key players, challenges, and future outlook.
+Step 4: Call remember() to store the final plan. You MUST set \
+category="research_plan" and importance=0.8. Pass a summary of the plan as content.
+Step 5: Output ONLY the final JSON:
+{
+  "query": "the original research query",
+  "sub_questions": ["3-5 specific, searchable questions"],
+  "search_keywords": ["3-8 key terms for search"],
+  "depth": "surface | moderate | deep"
+}
+
+Quality bar: sub-questions must be specific enough to return useful search results, \
+cover the full scope, and be ordered logically (background first).""",
+        tools=[decompose_query, memory],
     )

@@ -151,6 +151,7 @@ class SQLiteVectorSearch:
         metadata: MemoryMetadata,
         chunk_id: Optional[str] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
+        index_content: Optional[str] = None,
     ) -> str:
         """
         Store a single chunk directly into the vector DB.
@@ -161,6 +162,11 @@ class SQLiteVectorSearch:
         Args:
             extra_metadata: Optional dict merged into the metadata JSON before
                             storage. Used to attach e.g. "extracted_facts".
+            index_content: Cleaned text for embedding computation. When
+                provided, the embedding is computed from this instead of
+                ``content``, but the original ``content`` is stored in the
+                DB. This separates the storage representation (full text)
+                from the index representation (factual signal only).
 
         Returns:
             chunk_id of the stored chunk
@@ -179,8 +185,9 @@ class SQLiteVectorSearch:
 
         conn.close()
 
-        # Generate embedding only for new chunks
-        embedding = await self.embed_text(content)
+        # Generate embedding — use index_content (cleaned) when available
+        # so the vector captures factual signal, not formatting template.
+        embedding = await self.embed_text(index_content or content)
 
         metadata_json = merge_metadata_json(metadata, extra_metadata)
 

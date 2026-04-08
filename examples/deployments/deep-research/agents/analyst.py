@@ -48,43 +48,52 @@ async def extract_scope(findings_json: str) -> Dict[str, Any]:
 
 def create_agent() -> Agent:
     """Create the Analyst agent."""
-    memory = MemoryPlugin()
+    memory = MemoryPlugin(
+        workspace="deep_research",
+        enable_working_memory=True,
+        enable_fact_extraction=True,
+        enable_memory_graph=True,
+        enable_reinforcement=True,
+        tier="full",
+    )
     lineage_plugin = LineagePlugin()
 
     return Agent(
         name="Analyst",
         model="gpt-4o-mini",
-        prompt="""You are a research analyst synthesising web search findings.
+        prompt="""You are a research analyst. You receive raw findings and must \
+synthesise them into structured insights.
 
-Process:
-1. Call extract_scope to understand the full scope of the research.
-2. Analyse all findings holistically — look for patterns across sub-questions.
-3. Output a synthesis JSON:
+You MUST follow these steps in order. Do NOT skip any step.
+
+Step 1: Call extract_scope(findings_json) with the raw findings to understand scope.
+Step 2: Call recall(query="research findings", category="finding", limit=10) to \
+retrieve all findings stored by the Researcher.
+Step 3: Call query_facts() to find structured entity-relation-value triples. Try \
+query_facts(entity=None) to see all extracted facts. This surfaces connections \
+the raw text may not make obvious.
+Step 4: Pick 2-3 key entities from the findings (e.g. company names, technologies). \
+For each one, call traverse_memory(entity="entity name") to discover connections \
+across findings.
+Step 5: Call scratch() to write your analysis notes — what themes, contradictions, \
+and knowledge gaps you identified. Use key="analysis".
+Step 6: Call reinforce() on the findings. Pass the chunk IDs from Step 2's recall \
+results. Use outcome="positive" for findings with strong evidence, \
+outcome="negative" for weak or contradictory ones.
+Step 7: Call remember() to store your synthesis. You MUST set category="synthesis" \
+and importance=0.9.
+Step 8: Output ONLY the final JSON:
 {
   "query": "...",
-  "executive_summary": "2-3 sentences capturing the most important takeaways",
-  "key_findings": [
-    "Specific finding with supporting data point [source title]"
-  ],
-  "themes": {
-    "theme_name": "description of the theme and supporting evidence"
-  },
-  "contradictions": [
-    "Description of conflicting information between sources"
-  ],
-  "knowledge_gaps": [
-    "Important aspect not covered by the research"
-  ],
-  "key_entities": {
-    "entity_name": "why it is significant"
-  },
-  "sources": [
-    {"title": "...", "url": "..."}
-  ]
+  "executive_summary": "2-3 sentences with the most important takeaways",
+  "key_findings": ["finding with data point [source title]"],
+  "themes": {"theme_name": "description and evidence"},
+  "contradictions": ["conflicting information between sources"],
+  "knowledge_gaps": ["important unanswered questions"],
+  "key_entities": {"entity_name": "why it is significant"},
+  "sources": [{"title": "...", "url": "..."}]
 }
 
-Be analytical, not just summarising. Aim to produce genuine insight — what
-patterns emerge? What is surprising or counterintuitive? What remains uncertain?""",
-        tools=[extract_scope],
-        plugins=[memory, lineage_plugin],
+Be analytical, not just summarising. What patterns emerge? What is surprising?""",
+        tools=[extract_scope, memory, lineage_plugin],
     )

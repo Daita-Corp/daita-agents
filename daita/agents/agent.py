@@ -1135,6 +1135,15 @@ class Agent(BaseAgent):
         """Get list of all tool names"""
         return self.tool_registry.tool_names
 
+    async def __aenter__(self):
+        """Support ``async with agent:`` for automatic lifecycle management."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Call stop() on exit to flush plugins and release resources."""
+        await self.stop()
+        return False
+
     async def stop(self) -> None:
         """Stop agent and clean up all resources including MCP connections."""
         # Trigger auto-curation in memory plugins

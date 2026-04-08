@@ -63,23 +63,32 @@ class LocalGraphBackend:
             )
         if self._graph is not None:
             return self._graph
+        self._graph = self._read_from_disk()
+        return self._graph
+
+    def _read_from_disk(self) -> nx.MultiDiGraph:
+        """Always read from disk, ignoring the in-memory cache.
+
+        Used by flush() to get the current disk state before merging, and by
+        _load() on first access.
+        """
+        import networkx as nx
+
         if not self._graph_path.exists():
-            self._graph = nx.MultiDiGraph()
-            return self._graph
+            return nx.MultiDiGraph()
         try:
             with open(self._graph_path, "r") as f:
                 data = json.load(f)
             # directed=True, multigraph=True ensures correct type even when
             # loading legacy files that were saved as DiGraph (multigraph=false).
-            self._graph = nx.node_link_graph(
+            return nx.node_link_graph(
                 data, directed=True, multigraph=True, edges="links"
             )
         except (json.JSONDecodeError, KeyError) as exc:
             logger.warning(
                 f"Could not load graph from {self._graph_path}: {exc}. Starting fresh."
             )
-            self._graph = nx.MultiDiGraph()
-        return self._graph
+            return nx.MultiDiGraph()
 
     def _save(self, graph: nx.MultiDiGraph) -> None:
         """Persist graph to disk."""
@@ -197,11 +206,54 @@ class LocalGraphBackend:
         batch operations (register_flow, register_pipeline) can amortize the JSON
         serialization cost over multiple writes. Call flush() at the end of a
         logical batch to guarantee durability.
+
+        Uses a read-merge-write cycle so that multiple backend instances
+        writing to the same graph file (e.g. shared memory graph across
+        agents) accumulate rather than overwrite each other's data.
         """
         async with self._lock:
-            if self._dirty:
-                self._save(self._load())
-                self._dirty = False
+            if not self._dirty:
+                return
+
+            disk_graph = self._read_from_disk()
+
+            # Merge in-memory nodes into the disk state
+            for node_id, node_data in self._graph.nodes(data=True):
+                if node_id in disk_graph:
+                    existing = disk_graph.nodes[node_id].get("data", {})
+                    incoming = dict(node_data.get("data", {}))
+                    # Preserve created_at from first registration
+                    existing_created = existing.get("created_at")
+                    if existing_created:
+                        incoming["created_at"] = existing_created
+                    # Merge properties
+                    merged_props = dict(existing.get("properties", {}))
+                    merged_props.update(incoming.get("properties", {}))
+                    incoming["properties"] = merged_props
+                    disk_graph.nodes[node_id]["data"] = incoming
+                else:
+                    disk_graph.add_node(node_id, **node_data)
+
+            # Merge in-memory edges into the disk state
+            for u, v, key, edge_data in self._graph.edges(keys=True, data=True):
+                if disk_graph.has_edge(u, v, key=key):
+                    existing = disk_graph.edges[u, v, key].get("data", {})
+                    incoming = dict(edge_data.get("data", {}))
+                    # Preserve original timestamp
+                    existing_ts = existing.get("timestamp")
+                    if existing_ts:
+                        incoming["timestamp"] = existing_ts
+                    # Merge properties
+                    merged_props = dict(existing.get("properties", {}))
+                    merged_props.update(incoming.get("properties", {}))
+                    incoming["properties"] = merged_props
+                    disk_graph.edges[u, v, key]["data"] = incoming
+                else:
+                    disk_graph.add_edge(u, v, key=key, **edge_data)
+
+            self._save(disk_graph)
+            self._graph = disk_graph
+            self._dirty = False
 
     async def delete_node(self, node_id: str) -> None:
         async with self._lock:

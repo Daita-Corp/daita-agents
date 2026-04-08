@@ -5,33 +5,25 @@ Provides production-ready memory for DAITA agents.
 Project-scoped by default, global as opt-in.
 """
 
+import logging
 import os
-import re
-from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from ..base import LifecyclePlugin
 from ...core.tools import AgentTool, tool
-from .metadata import MemoryMetadata
-from .utils import serialize_results
 
 if TYPE_CHECKING:
     from ...embeddings.base import BaseEmbeddingProvider
 
+logger = logging.getLogger(__name__)
 
-def _parse_time_param(value: Optional[str]) -> Optional[str]:
-    """Parse a time parameter into an ISO datetime string.
-
-    Accepts ISO datetimes directly or relative shorthand: "24h", "7d", "30d".
-    """
-    if value is None:
-        return None
-    match = re.fullmatch(r"(\d+)([hd])", value.strip())
-    if match:
-        amount, unit = int(match.group(1)), match.group(2)
-        delta = timedelta(hours=amount) if unit == "h" else timedelta(days=amount)
-        return (datetime.now() - delta).isoformat()
-    # Assume ISO format
-    return value
+_TOOL_TIERS = {
+    "basic": {"remember", "recall", "read_memory", "list_memories"},
+    "analysis": {
+        "remember", "recall", "read_memory", "list_memories",
+        "query_facts", "traverse_memory", "reinforce", "list_by_category",
+    },
+    "full": None,  # None means all tools
+}
 
 
 class MemoryPlugin(LifecyclePlugin):
@@ -80,6 +72,9 @@ class MemoryPlugin(LifecyclePlugin):
         enable_memory_graph: bool = False,
         max_chunks: int = 2000,
         default_ttl_days: Optional[int] = None,
+        tier: str = "basic",
+        memory_tools: Optional[List[str]] = None,
+        dedup_threshold: float = 0.95,
     ):
         """
         Args:
@@ -96,10 +91,13 @@ class MemoryPlugin(LifecyclePlugin):
             embedder: Pre-constructed BaseEmbeddingProvider instance.
                 Takes precedence over embedding_provider/embedding_model strings.
             enable_reranking: Rerank top recall results with an LLM call for
-                higher accuracy at the cost of latency. Requires curator LLM.
+                higher accuracy at the cost of latency. Uses curator LLM if
+                available, otherwise creates a standalone LLM via
+                curation_provider/curation_model.
             enable_fact_extraction: Extract structured facts from memories at
                 ingestion time for richer temporal and relational recall.
-                Requires curator LLM.
+                Uses curator LLM if available, otherwise creates a standalone
+                LLM via curation_provider/curation_model.
             enable_working_memory: Enable session-scoped scratchpad. Adds
                 scratch() and think() tools. Working memory auto-evicts on
                 agent stop unless promoted via remember(promote_key=...).
@@ -112,6 +110,19 @@ class MemoryPlugin(LifecyclePlugin):
             max_chunks: Maximum stored chunks before eviction (default: 2000).
             default_ttl_days: Default time-to-live in days for new memories.
                 None means no expiry (default). Can be overridden per-memory.
+            tier: Tool tier controlling which tools are exposed to the LLM.
+                "basic" (default): remember, recall, read_memory, list_memories
+                "analysis": basic + query_facts, traverse_memory, reinforce,
+                    list_by_category
+                "full": all tools including scratch, think, update_memory
+                Tier only controls which tools are registered; feature flags
+                still control whether optional backends are initialized.
+            memory_tools: Explicit whitelist of tool names to expose.
+                Overrides tier when provided. Use for fine-grained control.
+            dedup_threshold: Minimum raw semantic similarity (cosine) to
+                consider a new memory a duplicate of an existing one
+                (default: 0.95). Dedup is also scoped by category — a
+                memory is only deduped against others in the same category.
         """
         self.workspace = workspace
         self.scope = scope
@@ -129,15 +140,40 @@ class MemoryPlugin(LifecyclePlugin):
         self.enable_memory_graph = enable_memory_graph
         self.max_chunks = max_chunks
         self.default_ttl_days = default_ttl_days
+        self.tier = tier
+        self.memory_tools = memory_tools
+        self.dedup_threshold = dedup_threshold
 
         self._agent_id = None
         self.backend = None
         self.curator = None
         self.environment = None
+        self._curation_llm = None
         self._reranker = None
         self._fact_extractor = None
+        self._checker = None
         self._working_memory = None
         self._memory_graph = None
+        self._pending_contradiction_checks: list = []
+        self._background_tasks: list = []
+
+    def _ensure_curation_llm(self):
+        """Return the curator LLM if available, else create a standalone one.
+
+        Cached so all consumers (fact extractor, reranker, contradiction
+        checker) share a single instance.
+        """
+        if self.curator is not None:
+            return self.curator.llm
+        if self._curation_llm is None:
+            from ...llm.factory import create_llm_provider
+
+            self._curation_llm = create_llm_provider(
+                provider=self.curation_provider or "openai",
+                model=self.curation_model or "gpt-4o-mini",
+                api_key=self.curation_api_key,
+            )
+        return self._curation_llm
 
     def initialize(self, agent_id: str):
         """Called by Agent.add_plugin() to inject agent context."""
@@ -240,16 +276,22 @@ class MemoryPlugin(LifecyclePlugin):
             print(
                 f"  Auto-curation: {self.auto_curate} (provider: {self.curator.llm_provider}, model: {self.curator.llm_model})"
             )
+        elif self.auto_curate != "manual" and self.curator is None:
+            logger.info(
+                "Auto-curation set to '%s' but no curator available. "
+                "MEMORY.md will be regenerated from vector DB on stop instead.",
+                self.auto_curate,
+            )
 
-        if self.enable_reranking and self.curator is not None:
+        if self.enable_reranking:
             from .reranker import MemoryReranker
 
-            self._reranker = MemoryReranker(llm=self.curator.llm)
+            self._reranker = MemoryReranker(llm=self._ensure_curation_llm())
 
-        if self.enable_fact_extraction and self.curator is not None:
+        if self.enable_fact_extraction:
             from .fact_extractor import FactExtractor
 
-            self._fact_extractor = FactExtractor(llm=self.curator.llm)
+            self._fact_extractor = FactExtractor(llm=self._ensure_curation_llm())
 
         if self.enable_working_memory:
             from .working_memory import WorkingMemory
@@ -261,10 +303,19 @@ class MemoryPlugin(LifecyclePlugin):
 
             self._memory_graph = MemoryGraph(agent_id=agent_id)
             if not self.enable_fact_extraction:
-                print(
-                    "  Memory graph using keyword heuristics only. "
+                logger.info(
+                    "Memory graph using keyword heuristics only. "
                     "Enable fact_extraction for richer entity graphs."
                 )
+
+        # Contradiction checker for high-importance fact validation
+        from .contradiction import ContradictionChecker
+
+        self._checker = ContradictionChecker(
+            llm=self._ensure_curation_llm(),
+            recall_fn=self.backend.recall,
+            importance_threshold=0.7,
+        )
 
     def get_tools(self) -> List[AgentTool]:
         """Get memory tools for the LLM to use."""
@@ -273,24 +324,21 @@ class MemoryPlugin(LifecyclePlugin):
                 "MemoryPlugin not initialized. Add via agent.add_plugin()."
             )
 
-        backend = self.backend
-        _reranker = self._reranker
-        _fact_extractor = self._fact_extractor
-        _working_memory = self._working_memory
-        _memory_graph = self._memory_graph
+        from .memory_tools import (
+            handle_remember,
+            handle_recall,
+            handle_list_by_category,
+            handle_update_memory,
+            handle_read_memory,
+            handle_list_memories,
+            handle_query_facts,
+            handle_scratch,
+            handle_think,
+            handle_reinforce,
+            handle_traverse_memory,
+        )
 
-        # Instantiate contradiction checker if curation LLM is available.
-        _checker = None
-        if self.curator is not None:
-            from .contradiction import ContradictionChecker
-
-            _checker = ContradictionChecker(
-                llm=self.curator.llm,
-                recall_fn=backend.recall,
-                importance_threshold=0.7,
-            )
-
-        _default_ttl = self.default_ttl_days
+        plugin = self
 
         @tool
         async def remember(
@@ -328,131 +376,9 @@ class MemoryPlugin(LifecyclePlugin):
             Returns:
                 Confirmation with chunk_id (single) or batch summary (batch)
             """
-            from .auto_classify import infer_category, infer_importance
-
-            # --- Promote from working memory ---
-            if promote_key and _working_memory:
-                promoted = _working_memory.promote(promote_key)
-                if promoted is None:
-                    return {
-                        "status": "not_found",
-                        "message": f"No scratch item with key '{promote_key}'",
-                    }
-                content = promoted["content"]
-
-            # --- Batch path ---
-            if isinstance(content, list):
-                items = content
-
-                # Auto-classify items with default values
-                for item in items:
-                    if item.get("category") is None:
-                        item["category"] = infer_category(item["content"])
-                    if item.get("importance", 0.5) == 0.5:
-                        item["importance"] = infer_importance(item["content"], 0.5)
-
-                # Lazy fact extraction: mark for later extraction
-                extra_metadata_list = None
-                if _fact_extractor is not None:
-                    extra_metadata_list = [{"_facts_extracted": False} for _ in items]
-
-                return await backend.remember_batch(
-                    items, extra_metadata_list=extra_metadata_list
-                )
-
-            # --- Single-item path ---
-            importance = max(0.0, min(1.0, importance))
-
-            # Auto-classify when agent uses defaults
-            if category is None:
-                category = infer_category(content)
-            if importance == 0.5:
-                importance = infer_importance(content, importance)
-
-            # Semantic dedup: skip if a near-identical memory already exists.
-            # Compare against raw_semantic_score (not the hybrid score) to prevent
-            # importance-boost inflation from falsely flagging distinct facts as
-            # duplicates. E.g. "FK: api_keys.org_id → org" and
-            # "FK: agents.org_id → org" share template tokens (raw ~0.80) but
-            # score above 0.92 after a 0.9-importance boost — they are NOT duplicates.
-            existing = await backend.recall(content, limit=1, score_threshold=0.6)
-            if existing:
-                raw_sim = (
-                    existing[0].get("raw_semantic_score")
-                    or existing[0].get("score_breakdown", {}).get("semantic")
-                    or existing[0].get("score", 0)
-                )
-                if raw_sim >= 0.92:
-                    return {
-                        "status": "duplicate_skipped",
-                        "message": "A near-identical memory already exists",
-                        "chunk_id": existing[0].get("chunk_id"),
-                        "existing_score": round(float(raw_sim), 3),
-                    }
-
-            # Contradiction/evolution check for important facts (importance >= 0.7).
-            # - CONTRADICTION: new fact is a reasoning error conflicting with an
-            #   established memory — block storage and explain what conflicts.
-            # - EVOLUTION: a real-world change (e.g. FK dropped, constraint removed)
-            #   that makes an existing memory outdated — auto-replace it so memory
-            #   stays accurate without forcing the agent to call update_memory().
-            if importance >= 0.7 and _checker is not None:
-                conflict = await _checker.check(content, importance)
-                if conflict.status == "contradiction":
-                    return {
-                        "status": "conflict_detected",
-                        "message": (
-                            "New fact contradicts an existing high-importance memory. "
-                            "If this is a real change, use update_memory() to explicitly "
-                            "replace the old fact."
-                        ),
-                        "conflicting_chunk_id": conflict.conflicting_chunk_id,
-                        "conflicting_content": conflict.conflicting_content,
-                        "conflict_reason": conflict.conflict_reason,
-                    }
-                elif conflict.status == "evolution":
-                    # Real-world change: replace the stale fact automatically.
-                    await backend.update_memory(
-                        conflict.conflicting_content,
-                        content,
-                        importance,
-                    )
-                    return {
-                        "status": "evolution_replaced",
-                        "message": "Existing memory was outdated and has been replaced.",
-                        "replaced_chunk_id": conflict.conflicting_chunk_id,
-                        "conflict_reason": conflict.conflict_reason,
-                    }
-
-            metadata = MemoryMetadata(
-                content=content,
-                importance=importance,
-                source="agent_inferred",
-                category=category,
-                ttl_days=ttl_days or _default_ttl,
+            return await handle_remember(
+                plugin, content, importance, category, ttl_days, promote_key
             )
-
-            # Lazy fact extraction: mark for later extraction on query_facts()
-            extra_metadata = None
-            if _fact_extractor is not None:
-                extra_metadata = {"_facts_extracted": False}
-
-            result = await backend.remember(
-                content,
-                category=category,
-                metadata=metadata,
-                extra_metadata=extra_metadata,
-            )
-
-            # Index in memory graph if enabled (uses keyword heuristics;
-            # fact extraction is lazy so facts aren't available at remember-time)
-            if _memory_graph and result.get("chunk_id"):
-                try:
-                    await _memory_graph.index_memory(result["chunk_id"], content)
-                except Exception:
-                    pass  # Graph indexing is best-effort
-
-            return result
 
         @tool
         async def recall(
@@ -495,45 +421,10 @@ class MemoryPlugin(LifecyclePlugin):
             Returns:
                 Ranked list of relevant memories with scores and metadata
             """
-            results = await backend.recall(
-                query=query,
-                limit=limit,
-                score_threshold=score_threshold,
-                min_importance=min_importance,
-                max_importance=max_importance,
-                category=category,
-                reranker=_reranker,
-                since=_parse_time_param(since),
-                before=_parse_time_param(before),
+            return await handle_recall(
+                plugin, query, limit, score_threshold,
+                min_importance, max_importance, category, since, before,
             )
-
-            # Track access for usage-based pruning signals
-            chunk_ids = [r["chunk_id"] for r in results if r.get("chunk_id")]
-            if chunk_ids:
-                backend.search.track_access(chunk_ids)
-
-            # Graph expansion: pull in connected memories for high-confidence hits
-            if _memory_graph and results:
-                try:
-                    seen = {r["chunk_id"] for r in results if r.get("chunk_id")}
-                    graph_results = []
-                    for r in results[:3]:
-                        if r.get("score", 0) >= 0.7:
-                            connected = await _memory_graph.get_connected_memories(
-                                r["chunk_id"]
-                            )
-                            for cid in connected:
-                                if cid not in seen:
-                                    chunk = await backend.get_chunk(cid)
-                                    if chunk:
-                                        chunk["source"] = "graph"
-                                        graph_results.append(chunk)
-                                        seen.add(cid)
-                    results.extend(graph_results[:limit])
-                except Exception:
-                    pass  # Graph expansion is best-effort
-
-            return serialize_results(results)
 
         @tool
         async def list_by_category(
@@ -561,10 +452,7 @@ class MemoryPlugin(LifecyclePlugin):
             Returns:
                 All matching memories ordered by importance descending
             """
-            results = await backend.list_by_category(
-                category=category, min_importance=min_importance, limit=limit
-            )
-            return serialize_results(results)
+            return await handle_list_by_category(plugin, category, min_importance, limit)
 
         @tool
         async def update_memory(query: str, new_content: str, importance: float = 0.5):
@@ -582,7 +470,7 @@ class MemoryPlugin(LifecyclePlugin):
             Returns:
                 Result with count of memories replaced
             """
-            return await backend.update_memory(query, new_content, importance)
+            return await handle_update_memory(plugin, query, new_content, importance)
 
         @tool
         async def read_memory(file: str = "MEMORY.md"):
@@ -597,12 +485,7 @@ class MemoryPlugin(LifecyclePlugin):
             Returns:
                 Full file contents
             """
-            if file == "MEMORY.md":
-                return await backend.read_memory_md()
-            elif file == "today":
-                return await backend.read_today_log()
-            else:
-                return await backend.read_memory(file)
+            return await handle_read_memory(plugin, file)
 
         @tool
         async def list_memories(include_stats: bool = False):
@@ -621,37 +504,7 @@ class MemoryPlugin(LifecyclePlugin):
                   total_memories, categories (with count and avg_importance),
                   oldest/newest timestamps, and pinned_count.
             """
-            from datetime import date as _date
-
-            today = _date.today().isoformat()
-            files = []
-            try:
-                content = await backend.read_memory_md()
-                if content and not content.startswith("# Long-Term Memory\n\n(No"):
-                    files.append(
-                        {"file": "MEMORY.md", "size_bytes": len(content.encode())}
-                    )
-            except Exception:
-                pass
-            try:
-                log_content = await backend.read_today_log()
-                if log_content and not log_content.startswith(
-                    f"# Daily Log - {today}\n\n(No"
-                ):
-                    files.append(
-                        {
-                            "file": f"logs/{today}.md",
-                            "size_bytes": len(log_content.encode()),
-                        }
-                    )
-            except Exception:
-                pass
-
-            if not include_stats:
-                return files
-
-            stats = await backend.get_stats()
-            return {"files": files, "stats": stats}
+            return await handle_list_memories(plugin, include_stats)
 
         tools = [
             remember,
@@ -663,7 +516,7 @@ class MemoryPlugin(LifecyclePlugin):
         ]
 
         # Conditionally add query_facts when fact extraction is enabled.
-        if _fact_extractor is not None:
+        if self._fact_extractor is not None:
 
             @tool
             async def query_facts(
@@ -693,34 +546,12 @@ class MemoryPlugin(LifecyclePlugin):
                 Returns:
                     List of structured facts with source content and metadata
                 """
-                # Lazy extraction: extract facts for chunks that need them
-                unextracted = await backend.get_unextracted_chunks(limit=50)
-                if unextracted:
-                    from .fact_extractor import FactExtractor
-
-                    for chunk_id, chunk_content in unextracted:
-                        facts = await _fact_extractor.extract(chunk_content)
-                        await backend.update_chunk_metadata(
-                            chunk_id,
-                            {
-                                "_facts_extracted": True,
-                                "extracted_facts": (
-                                    FactExtractor.facts_to_metadata(facts)
-                                    if facts
-                                    else []
-                                ),
-                            },
-                        )
-
-                results = await backend.query_facts(
-                    entity=entity, relation=relation, value=value, limit=limit
-                )
-                return serialize_results(results)
+                return await handle_query_facts(plugin, entity, relation, value, limit)
 
             tools.append(query_facts)
 
         # Working memory tools
-        if _working_memory is not None:
+        if self._working_memory is not None:
 
             @tool
             async def scratch(content: str, key: Optional[str] = None):
@@ -740,12 +571,7 @@ class MemoryPlugin(LifecyclePlugin):
                 Returns:
                     The key assigned to this scratch item
                 """
-                assigned_key = _working_memory.scratch(content, key)
-                return {
-                    "status": "stored",
-                    "key": assigned_key,
-                    "message": f"Stored in working memory as '{assigned_key}'",
-                }
+                return await handle_scratch(plugin, content, key)
 
             @tool
             async def think(query: str, limit: int = 5):
@@ -762,7 +588,7 @@ class MemoryPlugin(LifecyclePlugin):
                 Returns:
                     Matching scratch items from this session
                 """
-                return _working_memory.think(query, limit)
+                return await handle_think(plugin, query, limit)
 
             tools.extend([scratch, think])
 
@@ -793,52 +619,14 @@ class MemoryPlugin(LifecyclePlugin):
                 Returns:
                     Summary of reinforcement applied
                 """
-                if outcome not in ("positive", "negative", "neutral"):
-                    return {
-                        "status": "error",
-                        "message": "outcome must be 'positive', 'negative', or 'neutral'",
-                    }
-                signal_strength = max(0.0, min(1.0, signal_strength))
-
-                if isinstance(memory_ids, str):
-                    memory_ids = [memory_ids]
-
-                reinforcement = {
-                    "outcome": outcome,
-                    "signal": signal_strength,
-                    "timestamp": datetime.now().isoformat(),
-                    "context": context,
-                }
-
-                importance_delta = (
-                    signal_strength * 0.1 if outcome == "positive" else 0.0
+                return await handle_reinforce(
+                    plugin, memory_ids, outcome, signal_strength, context
                 )
-
-                updated = 0
-                for chunk_id in memory_ids:
-                    try:
-                        await backend.append_reinforcement(
-                            chunk_id, reinforcement, importance_delta
-                        )
-                        if outcome == "negative":
-                            await backend.update_chunk_metadata(
-                                chunk_id, {"flagged_for_review": True}
-                            )
-                        updated += 1
-                    except Exception:
-                        pass
-
-                return {
-                    "status": "success",
-                    "reinforced": updated,
-                    "outcome": outcome,
-                    "message": f"Reinforced {updated} memories as {outcome}",
-                }
 
             tools.append(reinforce)
 
         # Memory graph traversal tool
-        if _memory_graph is not None:
+        if self._memory_graph is not None:
 
             @tool
             async def traverse_memory(entity: str, max_depth: int = 2):
@@ -857,11 +645,18 @@ class MemoryPlugin(LifecyclePlugin):
                 Returns:
                     Connected entities and the memories that reference them
                 """
-                return await _memory_graph.traverse_entity(
-                    entity, direction="both", max_depth=max_depth
-                )
+                return await handle_traverse_memory(plugin, entity, max_depth)
 
             tools.append(traverse_memory)
+
+        # Filter tools by tier or explicit whitelist
+        allowed = self.memory_tools
+        if allowed is None:
+            tier_set = _TOOL_TIERS.get(self.tier)
+            if tier_set is not None:
+                allowed = tier_set
+        if allowed is not None:
+            tools = [t for t in tools if t.name in allowed]
 
         return tools
 
@@ -958,9 +753,7 @@ class MemoryPlugin(LifecyclePlugin):
 
             return "\n".join(lines)
         except Exception as e:
-            import logging as _logging
-
-            _logging.getLogger(__name__).warning(
+            logger.warning(
                 "Memory recall failed in on_before_run: %s. "
                 "Agent will proceed without memory context.",
                 e,
@@ -976,8 +769,78 @@ class MemoryPlugin(LifecyclePlugin):
             )
         return await self.curator.curate()
 
+    async def _process_deferred_contradictions(self):
+        """Batch-process queued contradiction checks concurrently.
+
+        Called during on_agent_stop(). Memories are already stored — if a
+        contradiction is found the chunk is flagged (not deleted) so the
+        next session or a human can resolve it. Evolutions trigger the same
+        auto-replace as the former synchronous path.
+        """
+        import asyncio
+
+        sem = asyncio.Semaphore(3)
+
+        async def _check_one(chunk_id: str, content: str, importance: float):
+            async with sem:
+                try:
+                    conflict = await self._checker.check(content, importance)
+                    if conflict.status == "contradiction":
+                        await self.backend.update_chunk_metadata(
+                            chunk_id,
+                            {
+                                "_contradiction_checked": True,
+                                "flagged_contradiction": True,
+                                "conflict_reason": conflict.conflict_reason,
+                                "conflicting_chunk_id": conflict.conflicting_chunk_id,
+                            },
+                        )
+                    elif conflict.status == "evolution":
+                        # Delete the specific stale chunk by ID — not a broad
+                        # recall-and-delete which can cascade into collateral
+                        # deletions of unrelated memories that happen to share
+                        # similar embeddings (e.g. template-identical schemas).
+                        if conflict.conflicting_chunk_id:
+                            await self.backend.delete_chunks(
+                                [conflict.conflicting_chunk_id]
+                            )
+                        await self.backend.update_chunk_metadata(
+                            chunk_id, {"_contradiction_checked": True}
+                        )
+                    else:
+                        await self.backend.update_chunk_metadata(
+                            chunk_id, {"_contradiction_checked": True}
+                        )
+                except Exception:
+                    pass  # Non-fatal — check will be skipped
+
+        await asyncio.gather(
+            *[
+                _check_one(cid, content, imp)
+                for cid, content, imp in self._pending_contradiction_checks
+                if cid is not None
+            ]
+        )
+
     async def on_agent_stop(self):
-        """Flush pending changes, prune stale memories, and auto-curate."""
+        """Flush pending changes, prune stale memories, and auto-curate.
+
+        MEMORY.md is a human-readable artifact for inspecting what the agent
+        has learned. Agent context injection uses semantic recall via
+        on_before_run(), not MEMORY.md.
+        """
+        import asyncio
+
+        # Await background extraction tasks
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            self._background_tasks.clear()
+
+        # Process deferred contradiction checks
+        if self._pending_contradiction_checks and self._checker:
+            await self._process_deferred_contradictions()
+        self._pending_contradiction_checks.clear()
+
         # Clear working memory (session-scoped)
         if self._working_memory:
             self._working_memory.clear()
@@ -1014,7 +877,8 @@ class MemoryPlugin(LifecyclePlugin):
                     print(msg)
             elif hasattr(self.backend, "regenerate_memory_md"):
                 path = await self.backend.regenerate_memory_md()
-                print(f"Memory summary written to: {path}")
+                if path is not None:
+                    print(f"Memory summary written to: {path}")
 
     def get_pending_metrics(self) -> dict:
         if self.backend is None:

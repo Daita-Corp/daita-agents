@@ -17,7 +17,8 @@ import pytest
 
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.memory.local_backend import LocalMemoryBackend
-from daita.plugins.memory.memory_plugin import MemoryPlugin, _parse_time_param
+from daita.plugins.memory.memory_plugin import MemoryPlugin
+from daita.plugins.memory.memory_tools import _parse_time_param
 from daita.plugins.memory.metadata import MemoryMetadata
 from daita.plugins.memory.search import SQLiteVectorSearch
 
