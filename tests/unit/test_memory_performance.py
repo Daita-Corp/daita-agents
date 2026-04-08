@@ -149,9 +149,7 @@ class TestParallelFactExtraction:
 
         chunk_ids = []
         for i in range(3):
-            meta = MemoryMetadata(
-                content=f"fact {i}", importance=0.7, source="test"
-            )
+            meta = MemoryMetadata(content=f"fact {i}", importance=0.7, source="test")
             result = await backend.remember(
                 f"fact {i}",
                 category="test",
@@ -254,9 +252,7 @@ class TestDeferredContradictionChecking:
         real_plugin = MagicMock(spec=MemoryPlugin)
         real_plugin.backend = backend
         real_plugin._checker = checker
-        real_plugin._pending_contradiction_checks = (
-            plugin._pending_contradiction_checks
-        )
+        real_plugin._pending_contradiction_checks = plugin._pending_contradiction_checks
         await MemoryPlugin._process_deferred_contradictions(real_plugin)
 
         # Chunk should be flagged, not deleted
@@ -275,12 +271,8 @@ class TestDeferredContradictionChecking:
         backend = plugin.backend
 
         # Store the "old" memory that will be the evolution target
-        old_meta = MemoryMetadata(
-            content="old content", importance=0.8, source="test"
-        )
-        await backend.remember(
-            "old content", category="test", metadata=old_meta
-        )
+        old_meta = MemoryMetadata(content="old content", importance=0.8, source="test")
+        await backend.remember("old content", category="test", metadata=old_meta)
 
         # Store the new memory
         result = await handle_remember(
@@ -292,9 +284,7 @@ class TestDeferredContradictionChecking:
         real_plugin = MagicMock(spec=MemoryPlugin)
         real_plugin.backend = backend
         real_plugin._checker = checker
-        real_plugin._pending_contradiction_checks = (
-            plugin._pending_contradiction_checks
-        )
+        real_plugin._pending_contradiction_checks = plugin._pending_contradiction_checks
         await MemoryPlugin._process_deferred_contradictions(real_plugin)
 
         # The new chunk should be marked as checked
@@ -321,9 +311,7 @@ class TestDeferredContradictionChecking:
         real_plugin = MagicMock(spec=MemoryPlugin)
         real_plugin.backend = plugin.backend
         real_plugin._checker = checker
-        real_plugin._pending_contradiction_checks = (
-            plugin._pending_contradiction_checks
-        )
+        real_plugin._pending_contradiction_checks = plugin._pending_contradiction_checks
 
         # Should not raise
         await MemoryPlugin._process_deferred_contradictions(real_plugin)

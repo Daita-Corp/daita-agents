@@ -22,7 +22,6 @@ from daita.embeddings.factory import (
 )
 from daita.embeddings.mock import MockEmbeddingProvider
 
-
 # ---------------------------------------------------------------------------
 # MockEmbeddingProvider
 # ---------------------------------------------------------------------------
@@ -172,9 +171,7 @@ class TestDimensionValidation:
 
         conn = sqlite3.connect(str(tmp_path / "test.db"))
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT value FROM embedding_meta WHERE key = 'embedding_dim'"
-        )
+        cursor.execute("SELECT value FROM embedding_meta WHERE key = 'embedding_dim'")
         row = cursor.fetchone()
         conn.close()
 

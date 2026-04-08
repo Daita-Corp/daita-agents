@@ -31,7 +31,9 @@ class VoyageEmbeddingProvider(BaseEmbeddingProvider):
         api_key: Optional[str] = None,
         **kwargs,
     ):
-        api_key = api_key or os.getenv("VOYAGE_API_KEY") or os.getenv("VOYAGEAI_API_KEY")
+        api_key = (
+            api_key or os.getenv("VOYAGE_API_KEY") or os.getenv("VOYAGEAI_API_KEY")
+        )
         super().__init__(model=model, api_key=api_key, **kwargs)
         self._client = None
 
@@ -62,13 +64,9 @@ class VoyageEmbeddingProvider(BaseEmbeddingProvider):
         return 1024
 
     async def _embed_text_impl(self, text: str) -> List[float]:
-        result = await self.client.embed(
-            texts=[text], model=self.model
-        )
+        result = await self.client.embed(texts=[text], model=self.model)
         return result.embeddings[0]
 
     async def _embed_texts_impl(self, texts: List[str]) -> List[List[float]]:
-        result = await self.client.embed(
-            texts=texts, model=self.model
-        )
+        result = await self.client.embed(texts=texts, model=self.model)
         return result.embeddings

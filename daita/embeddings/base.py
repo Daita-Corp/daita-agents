@@ -42,7 +42,9 @@ class BaseEmbeddingProvider(EmbeddingProvider):
         self._cache: OrderedDict[str, List[float]] = OrderedDict()
 
         self.trace_manager = get_trace_manager()
-        self.provider_name = self.__class__.__name__.replace("EmbeddingProvider", "").lower()
+        self.provider_name = self.__class__.__name__.replace(
+            "EmbeddingProvider", ""
+        ).lower()
         self.agent_id: Optional[str] = None
 
         # Accumulated metrics

@@ -133,7 +133,9 @@ class TestBackendAppendReinforcement:
             "timestamp": datetime.now().isoformat(),
             "context": "query succeeded",
         }
-        await backend.append_reinforcement(chunk_id, reinforcement, importance_delta=0.07)
+        await backend.append_reinforcement(
+            chunk_id, reinforcement, importance_delta=0.07
+        )
 
         # Verify metadata was updated
         conn = sqlite3.connect(str(backend.vector_db))

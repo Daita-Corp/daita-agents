@@ -154,9 +154,7 @@ async def handle_remember(
         async def _bg_extract():
             try:
                 facts = await _fact_extractor.extract(index_content)
-                facts_meta = (
-                    FactExtractor.facts_to_metadata(facts) if facts else []
-                )
+                facts_meta = FactExtractor.facts_to_metadata(facts) if facts else []
                 await backend.update_chunk_metadata(
                     result["chunk_id"],
                     {
@@ -179,11 +177,7 @@ async def handle_remember(
 
     # Index in memory graph (skip heuristic indexing when fact extraction
     # is enabled — facts will populate the graph on query_facts() instead)
-    if (
-        _memory_graph
-        and not plugin.enable_fact_extraction
-        and result.get("chunk_id")
-    ):
+    if _memory_graph and not plugin.enable_fact_extraction and result.get("chunk_id"):
         try:
             await _memory_graph.index_memory(result["chunk_id"], index_content)
         except Exception:
@@ -295,9 +289,7 @@ async def handle_list_memories(plugin: MemoryPlugin, include_stats: bool = False
         pass
     try:
         log_content = await backend.read_today_log()
-        if log_content and not log_content.startswith(
-            f"# Daily Log - {today}\n\n(No"
-        ):
+        if log_content and not log_content.startswith(f"# Daily Log - {today}\n\n(No"):
             files.append(
                 {
                     "file": f"logs/{today}.md",
@@ -337,9 +329,7 @@ async def handle_query_facts(
             async with sem:
                 try:
                     facts = await _fact_extractor.extract(text)
-                    facts_meta = (
-                        FactExtractor.facts_to_metadata(facts) if facts else []
-                    )
+                    facts_meta = FactExtractor.facts_to_metadata(facts) if facts else []
                     await backend.update_chunk_metadata(
                         cid,
                         {
@@ -357,9 +347,7 @@ async def handle_query_facts(
                 except Exception:
                     pass  # Chunk stays unextracted, retried on next call
 
-        await asyncio.gather(
-            *[_extract_one(cid, text) for cid, text in unextracted]
-        )
+        await asyncio.gather(*[_extract_one(cid, text) for cid, text in unextracted])
 
     results = await backend.query_facts(
         entity=entity, relation=relation, value=value, limit=limit
@@ -367,9 +355,7 @@ async def handle_query_facts(
     return serialize_results(results)
 
 
-async def handle_scratch(
-    plugin: MemoryPlugin, content: str, key: Optional[str] = None
-):
+async def handle_scratch(plugin: MemoryPlugin, content: str, key: Optional[str] = None):
     """Store temporary info in session working memory."""
     assigned_key = plugin._working_memory.scratch(content, key)
     return {
@@ -434,9 +420,7 @@ async def handle_reinforce(
     }
 
 
-async def handle_traverse_memory(
-    plugin: MemoryPlugin, entity: str, max_depth: int = 2
-):
+async def handle_traverse_memory(plugin: MemoryPlugin, entity: str, max_depth: int = 2):
     """Walk the memory knowledge graph to find all connected knowledge."""
     return await plugin._memory_graph.traverse_entity(
         entity, direction="both", max_depth=max_depth

@@ -38,7 +38,7 @@ class TestFencedCodeStripping:
     def test_strips_multiple_code_blocks(self):
         content = (
             "Step 1:\n```sql\nSELECT 1;\n```\n"
-            "Step 2:\n```json\n{\"key\": \"val\"}\n```\n"
+            'Step 2:\n```json\n{"key": "val"}\n```\n'
             "Done."
         )
         _, index = preprocess_content(content)
@@ -129,7 +129,9 @@ class TestStoragePreserved:
         assert index is None
 
     def test_plain_text_unchanged(self):
-        content = "Pipeline etl_orders_agg reads from orders and writes to revenue_daily."
+        content = (
+            "Pipeline etl_orders_agg reads from orders and writes to revenue_daily."
+        )
         storage, index = preprocess_content(content)
         assert storage == content
         assert index == content

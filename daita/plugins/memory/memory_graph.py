@@ -64,12 +64,32 @@ def _is_technical_identifier(name: str) -> bool:
     if _ALL_CAPS_RE.match(stripped):
         return True
     return False
-_GENERIC_ENTITIES = frozenset({
-    "challenges", "challenges and limitations", "efforts", "r&d efforts",
-    "companies", "companies and research institutions", "issues", "problems",
-    "advantages", "benefits", "features", "results", "findings", "data",
-    "information", "details", "aspects", "factors", "elements", "things",
-})
+
+
+_GENERIC_ENTITIES = frozenset(
+    {
+        "challenges",
+        "challenges and limitations",
+        "efforts",
+        "r&d efforts",
+        "companies",
+        "companies and research institutions",
+        "issues",
+        "problems",
+        "advantages",
+        "benefits",
+        "features",
+        "results",
+        "findings",
+        "data",
+        "information",
+        "details",
+        "aspects",
+        "factors",
+        "elements",
+        "things",
+    }
+)
 
 
 class MemoryGraph:
@@ -241,9 +261,7 @@ class MemoryGraph:
         return False
 
     @staticmethod
-    def _filter_entity_pairs(
-        pairs: List[dict], from_facts: bool = False
-    ) -> List[dict]:
+    def _filter_entity_pairs(pairs: List[dict], from_facts: bool = False) -> List[dict]:
         """Remove pairs whose entity or value fails quality checks.
 
         Args:
@@ -307,7 +325,7 @@ class MemoryGraph:
                 if sw in longer_words:
                     continue
                 # Stem match: check if any longer word shares a prefix (min 4 chars)
-                stem = sw[:max(4, len(sw) - 3)]
+                stem = sw[: max(4, len(sw) - 3)]
                 if any(lw.startswith(stem) for lw in longer_words):
                     continue
                 return False
@@ -340,7 +358,11 @@ class MemoryGraph:
         seen = set()
         unique = []
         for p in deduped:
-            key = (_normalize_entity(p["entity"]), p.get("relation"), _normalize_entity(p.get("value") or ""))
+            key = (
+                _normalize_entity(p["entity"]),
+                p.get("relation"),
+                _normalize_entity(p.get("value") or ""),
+            )
             if key not in seen:
                 seen.add(key)
                 unique.append(p)

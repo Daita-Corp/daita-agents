@@ -19,8 +19,14 @@ logger = logging.getLogger(__name__)
 _TOOL_TIERS = {
     "basic": {"remember", "recall", "read_memory", "list_memories"},
     "analysis": {
-        "remember", "recall", "read_memory", "list_memories",
-        "query_facts", "traverse_memory", "reinforce", "list_by_category",
+        "remember",
+        "recall",
+        "read_memory",
+        "list_memories",
+        "query_facts",
+        "traverse_memory",
+        "reinforce",
+        "list_by_category",
     },
     "full": None,  # None means all tools
 }
@@ -422,8 +428,15 @@ class MemoryPlugin(LifecyclePlugin):
                 Ranked list of relevant memories with scores and metadata
             """
             return await handle_recall(
-                plugin, query, limit, score_threshold,
-                min_importance, max_importance, category, since, before,
+                plugin,
+                query,
+                limit,
+                score_threshold,
+                min_importance,
+                max_importance,
+                category,
+                since,
+                before,
             )
 
         @tool
@@ -452,7 +465,9 @@ class MemoryPlugin(LifecyclePlugin):
             Returns:
                 All matching memories ordered by importance descending
             """
-            return await handle_list_by_category(plugin, category, min_importance, limit)
+            return await handle_list_by_category(
+                plugin, category, min_importance, limit
+            )
 
         @tool
         async def update_memory(query: str, new_content: str, importance: float = 0.5):
@@ -710,7 +725,9 @@ class MemoryPlugin(LifecyclePlugin):
                         results.append(r)
                         seen.add(r["chunk_id"])
 
-            if not results and not (self._working_memory and len(self._working_memory) > 0):
+            if not results and not (
+                self._working_memory and len(self._working_memory) > 0
+            ):
                 return None
 
             # Always inject pinned memories — these are org rules / critical
@@ -747,9 +764,7 @@ class MemoryPlugin(LifecyclePlugin):
                 lines.append("## Working Memory (session scratchpad)")
                 for item in self._working_memory.dump():
                     status = " [promoted]" if item["promoted"] else ""
-                    lines.append(
-                        f"- [{item['key']}] {item['content'].strip()}{status}"
-                    )
+                    lines.append(f"- [{item['key']}] {item['content'].strip()}{status}")
 
             return "\n".join(lines)
         except Exception as e:

@@ -111,9 +111,7 @@ class SQLiteVectorSearch:
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
 
-        cursor.execute(
-            "SELECT value FROM embedding_meta WHERE key = 'embedding_dim'"
-        )
+        cursor.execute("SELECT value FROM embedding_meta WHERE key = 'embedding_dim'")
         row = cursor.fetchone()
 
         expected_dim = self.embedder.dimensions
@@ -409,12 +407,8 @@ class SQLiteVectorSearch:
         # Reinforcement signal: net positive boosts up to +0.05, net negative penalizes
         reinforcements = metadata_dict.get("reinforcements")
         if reinforcements:
-            positives = sum(
-                1 for r in reinforcements if r.get("outcome") == "positive"
-            )
-            negatives = sum(
-                1 for r in reinforcements if r.get("outcome") == "negative"
-            )
+            positives = sum(1 for r in reinforcements if r.get("outcome") == "positive")
+            negatives = sum(1 for r in reinforcements if r.get("outcome") == "negative")
             net = (positives - negatives) / len(reinforcements)
             importance_boost += net * 0.05
 

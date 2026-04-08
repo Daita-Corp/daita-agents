@@ -14,7 +14,6 @@ from daita.core.graph.local_backend import LocalGraphBackend
 from daita.core.graph.models import AgentGraphEdge, AgentGraphNode, EdgeType, NodeType
 from daita.plugins.memory.memory_graph import MemoryGraph, _normalize_entity
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -196,7 +195,10 @@ class TestEntityQualityFiltering:
         assert MemoryGraph._is_low_quality_entity("challenges") is True
         assert MemoryGraph._is_low_quality_entity("challenges and limitations") is True
         assert MemoryGraph._is_low_quality_entity("r&d efforts") is True
-        assert MemoryGraph._is_low_quality_entity("companies and research institutions") is True
+        assert (
+            MemoryGraph._is_low_quality_entity("companies and research institutions")
+            is True
+        )
 
     def test_rejects_currency_values(self):
         assert MemoryGraph._is_low_quality_entity("$500 million") is True
@@ -237,9 +239,12 @@ class TestEntityQualityFiltering:
         assert MemoryGraph._is_low_quality_entity("Samsung") is False
 
     def test_rejects_long_phrases(self):
-        assert MemoryGraph._is_low_quality_entity(
-            "technical hurdles like dendrite formation during charging"
-        ) is True
+        assert (
+            MemoryGraph._is_low_quality_entity(
+                "technical hurdles like dendrite formation during charging"
+            )
+            is True
+        )
 
     def test_accepts_good_entities(self):
         assert MemoryGraph._is_low_quality_entity("Toyota") is False
@@ -258,7 +263,11 @@ class TestEntityQualityFiltering:
             {"entity": "customers", "relation": "has column", "value": "tier"},
             {"entity": "etl_orders_agg", "relation": "reads from", "value": "orders"},
             {"entity": "orders.total", "relation": "type", "value": "DECIMAL(10,2)"},
-            {"entity": "customer_segments", "relation": "written by", "value": "etl_customer_segments"},
+            {
+                "entity": "customer_segments",
+                "relation": "written by",
+                "value": "etl_customer_segments",
+            },
         ]
         graph = MemoryGraph()
         pairs = graph._entities_from_facts(facts)
@@ -303,7 +312,11 @@ class TestEntityQualityFiltering:
 
     def test_filter_drops_bad_value_but_keeps_entity(self):
         pairs = [
-            {"entity": "market growth", "value": "$500 million", "relation": "projected"},
+            {
+                "entity": "market growth",
+                "value": "$500 million",
+                "relation": "projected",
+            },
         ]
         filtered = MemoryGraph._filter_entity_pairs(pairs)
         assert len(filtered) == 1
@@ -319,8 +332,16 @@ class TestEntityQualityFiltering:
 class TestEntityDeduplication:
     def test_shorter_absorbs_longer(self):
         pairs = [
-            {"entity": "solid-state batteries", "value": "high density", "relation": "have"},
-            {"entity": "solid-state battery technology", "value": "advancing", "relation": "is"},
+            {
+                "entity": "solid-state batteries",
+                "value": "high density",
+                "relation": "have",
+            },
+            {
+                "entity": "solid-state battery technology",
+                "value": "advancing",
+                "relation": "is",
+            },
         ]
         deduped = MemoryGraph._deduplicate_entities(pairs)
         entities = [_normalize_entity(p["entity"]) for p in deduped]

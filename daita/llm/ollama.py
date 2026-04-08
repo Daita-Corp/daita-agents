@@ -47,9 +47,7 @@ class OllamaProvider(BaseLLMProvider):
         super().__init__(model=model, api_key=api_key or "ollama", **kwargs)
 
         self._base_url = (
-            base_url
-            or os.getenv("OLLAMA_BASE_URL")
-            or "http://localhost:11434/v1"
+            base_url or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434/v1"
         )
         self._client = None
 
@@ -193,7 +191,9 @@ class OllamaProvider(BaseLLMProvider):
                         if tc_delta.function and tc_delta.function.name:
                             tool_call_buffers[index]["name"] = tc_delta.function.name
                         if tc_delta.function and tc_delta.function.arguments:
-                            tool_call_buffers[index]["arguments"] += tc_delta.function.arguments
+                            tool_call_buffers[index][
+                                "arguments"
+                            ] += tc_delta.function.arguments
 
                 if choice.finish_reason == "tool_calls":
                     for tool_call in tool_call_buffers.values():
@@ -231,9 +231,7 @@ class OllamaProvider(BaseLLMProvider):
             f"Is Ollama running? Start it with: ollama serve"
         )
 
-    def _convert_messages(
-        self, messages: list[Dict[str, Any]]
-    ) -> list[Dict[str, Any]]:
+    def _convert_messages(self, messages: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
         """Convert internal flat tool_calls format to OpenAI nested format."""
 
         converted = []

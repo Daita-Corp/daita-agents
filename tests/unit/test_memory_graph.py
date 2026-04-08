@@ -12,7 +12,6 @@ from daita.plugins.memory.memory_graph import (
     _make_memory_id,
 )
 
-
 # ---------------------------------------------------------------------------
 # ID helpers
 # ---------------------------------------------------------------------------
@@ -101,7 +100,11 @@ class TestFactsToEntities:
 
     def test_basic_fact(self):
         facts = [
-            {"entity": "PostgreSQL", "relation": "has_limit", "value": "100 connections"},
+            {
+                "entity": "PostgreSQL",
+                "relation": "has_limit",
+                "value": "100 connections",
+            },
         ]
         pairs = self.mg._entities_from_facts(facts)
         assert len(pairs) == 1
@@ -135,7 +138,11 @@ class TestMemoryGraphIndexing:
         mg = MemoryGraph(agent_id="test")
 
         facts = [
-            {"entity": "PostgreSQL", "relation": "has_limit", "value": "100 connections"},
+            {
+                "entity": "PostgreSQL",
+                "relation": "has_limit",
+                "value": "100 connections",
+            },
             {"entity": "Project Orion", "relation": "uses", "value": "PostgreSQL"},
         ]
         await mg.index_memory("chunk_1", "test content", facts)
@@ -182,7 +189,11 @@ class TestMemoryGraphIndexing:
         mg = MemoryGraph(agent_id="test")
 
         facts = [
-            {"entity": "PostgreSQL", "relation": "has_limit", "value": "100 connections"},
+            {
+                "entity": "PostgreSQL",
+                "relation": "has_limit",
+                "value": "100 connections",
+            },
             {"entity": "Project Orion", "relation": "uses", "value": "PostgreSQL"},
         ]
         await mg.index_memory("chunk_t1", "test content", facts)

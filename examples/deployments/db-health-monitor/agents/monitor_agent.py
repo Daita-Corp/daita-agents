@@ -23,7 +23,6 @@ from daita.core.tools import tool
 from daita.core.watch import WatchEvent
 from daita.plugins import postgresql
 
-
 # ---------------------------------------------------------------------------
 # Tools — give the agent the ability to investigate further when a watch fires
 # ---------------------------------------------------------------------------
@@ -135,9 +134,9 @@ async def get_table_bloat(min_dead_tuples: int = 10000) -> Dict[str, Any]:
                     "live_tuples": r["n_live_tup"],
                     "dead_tuples": r["n_dead_tup"],
                     "dead_pct": float(r["dead_pct"]),
-                    "last_autovacuum": str(r["last_autovacuum"])
-                    if r["last_autovacuum"]
-                    else None,
+                    "last_autovacuum": (
+                        str(r["last_autovacuum"]) if r["last_autovacuum"] else None
+                    ),
                 }
                 for r in rows
             ],
@@ -168,15 +167,13 @@ async def get_connection_stats() -> Dict[str, Any]:
 
     conn = await asyncpg.connect(url)
     try:
-        row = await conn.fetchrow(
-            """
+        row = await conn.fetchrow("""
             SELECT
                 (SELECT count(*) FROM pg_stat_activity WHERE state = 'active') AS active,
                 (SELECT count(*) FROM pg_stat_activity WHERE state = 'idle') AS idle,
                 (SELECT count(*) FROM pg_stat_activity) AS total,
                 (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_conn
-            """
-        )
+            """)
         return {
             "active": row["active"],
             "idle": row["idle"],

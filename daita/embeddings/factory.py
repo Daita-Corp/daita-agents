@@ -66,9 +66,7 @@ def create_embedding_provider(
         return provider_class(**build_kwargs)
     except Exception as e:
         logger.error(f"Failed to create {provider} embedding provider: {e}")
-        raise ConfigError(
-            f"Failed to create {provider} embedding provider: {e}"
-        )
+        raise ConfigError(f"Failed to create {provider} embedding provider: {e}")
 
 
 def register_embedding_provider(name: str, provider_class) -> None:

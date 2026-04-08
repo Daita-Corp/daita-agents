@@ -44,7 +44,9 @@ def _print_tool_usage(result: dict, agent, stage_elapsed: float) -> None:
 
     total_tool_ms = sum(s["total_ms"] for s in stats.values())
     llm_ms = (stage_elapsed * 1000) - total_tool_ms
-    print(f"  LLM thinking: {llm_ms / 1000:.1f}s, tool execution: {total_tool_ms / 1000:.1f}s")
+    print(
+        f"  LLM thinking: {llm_ms / 1000:.1f}s, tool execution: {total_tool_ms / 1000:.1f}s"
+    )
 
     # LLM cost if available
     cost = result.get("cost", 0)
@@ -52,7 +54,9 @@ def _print_tool_usage(result: dict, agent, stage_elapsed: float) -> None:
     if cost or tokens:
         prompt_t = tokens.get("prompt_tokens", 0)
         comp_t = tokens.get("completion_tokens", 0)
-        print(f"  Tokens: {prompt_t + comp_t} ({prompt_t} prompt, {comp_t} completion), cost: ${cost:.4f}")
+        print(
+            f"  Tokens: {prompt_t + comp_t} ({prompt_t} prompt, {comp_t} completion), cost: ${cost:.4f}"
+        )
 
 
 async def run_workflow(query: str) -> dict:

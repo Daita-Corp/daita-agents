@@ -46,8 +46,6 @@ def _make_search(db_path: Path) -> SQLiteVectorSearch:
     return SQLiteVectorSearch(db_path, _test_embedder)
 
 
-
-
 # ---------------------------------------------------------------------------
 # _parse_time_param
 # ---------------------------------------------------------------------------

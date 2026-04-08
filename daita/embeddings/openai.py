@@ -62,13 +62,9 @@ class OpenAIEmbeddingProvider(BaseEmbeddingProvider):
         return 1536
 
     async def _embed_text_impl(self, text: str) -> List[float]:
-        response = await self.client.embeddings.create(
-            model=self.model, input=text
-        )
+        response = await self.client.embeddings.create(model=self.model, input=text)
         return response.data[0].embedding
 
     async def _embed_texts_impl(self, texts: List[str]) -> List[List[float]]:
-        response = await self.client.embeddings.create(
-            model=self.model, input=texts
-        )
+        response = await self.client.embeddings.create(model=self.model, input=texts)
         return [item.embedding for item in response.data]

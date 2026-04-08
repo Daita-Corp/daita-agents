@@ -60,7 +60,10 @@ def create_agent(
     # --- AWS discoverer ---
     regions = aws_regions or _csv_env("AWS_REGIONS", ["us-east-1"])
     role_arn = aws_role_arn or os.getenv("AWS_ROLE_ARN")
-    services = _csv_env("AWS_SERVICES", ["rds", "dynamodb", "s3", "elasticache", "redshift", "apigateway"])
+    services = _csv_env(
+        "AWS_SERVICES",
+        ["rds", "dynamodb", "s3", "elasticache", "redshift", "apigateway"],
+    )
 
     aws = AWSDiscoverer(
         regions=regions,

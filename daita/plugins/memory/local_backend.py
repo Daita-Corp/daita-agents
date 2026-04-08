@@ -112,7 +112,9 @@ class LocalMemoryBackend:
             )
 
         chunk_id = await self.search.store_chunk(
-            content, metadata, extra_metadata=extra_metadata,
+            content,
+            metadata,
+            extra_metadata=extra_metadata,
             index_content=index_content,
         )
 

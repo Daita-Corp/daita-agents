@@ -49,9 +49,7 @@ class SentenceTransformersEmbeddingProvider(BaseEmbeddingProvider):
                 )
             self._model = SentenceTransformer(self.model)
             self._dimensions = self._model.get_sentence_embedding_dimension()
-            logger.debug(
-                f"Loaded {self.model} ({self._dimensions} dimensions)"
-            )
+            logger.debug(f"Loaded {self.model} ({self._dimensions} dimensions)")
         return self._model
 
     @property

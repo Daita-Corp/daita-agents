@@ -61,7 +61,9 @@ async def run(fast: bool = False):
     print("DATABASE HEALTH MONITOR")
     print("=" * 65)
     print(f"Database: {os.getenv('DATABASE_URL', '').split('@')[-1]}")
-    print(f"Mode: {'fast (10-15s intervals)' if fast else 'standard (30s-5m intervals)'}")
+    print(
+        f"Mode: {'fast (10-15s intervals)' if fast else 'standard (30s-5m intervals)'}"
+    )
     print(f"Watches: slow_queries, connection_pressure, table_bloat")
     print("=" * 65)
     print("Monitoring... press Ctrl-C to stop.\n")
