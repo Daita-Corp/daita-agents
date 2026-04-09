@@ -76,6 +76,9 @@ class MemoryPlugin(LifecyclePlugin):
         enable_working_memory: bool = False,
         enable_reinforcement: bool = False,
         enable_memory_graph: bool = False,
+        graph_auto_promote_specificity: float = 0.7,
+        graph_mention_promote_specificity: float = 0.3,
+        graph_mention_promote_count: int = 2,
         max_chunks: int = 2000,
         default_ttl_days: Optional[int] = None,
         tier: str = "basic",
@@ -113,6 +116,15 @@ class MemoryPlugin(LifecyclePlugin):
             enable_memory_graph: Enable knowledge graph over memories. Adds
                 traverse_memory() tool and auto-expands recall results via
                 graph traversal. Works best with enable_fact_extraction=True.
+            graph_auto_promote_specificity: Minimum specificity score (0.0-1.0)
+                for an entity to be promoted on first mention (default: 0.7).
+                Proper nouns and technical identifiers typically score >= 0.7.
+            graph_mention_promote_specificity: Minimum specificity score for
+                mention-based promotion (default: 0.3). Entities scoring
+                between this and auto_promote need multiple mentions.
+            graph_mention_promote_count: Number of distinct memory mentions
+                required to promote an entity below auto_promote_specificity
+                (default: 2).
             max_chunks: Maximum stored chunks before eviction (default: 2000).
             default_ttl_days: Default time-to-live in days for new memories.
                 None means no expiry (default). Can be overridden per-memory.
@@ -144,6 +156,9 @@ class MemoryPlugin(LifecyclePlugin):
         self.enable_working_memory = enable_working_memory
         self.enable_reinforcement = enable_reinforcement
         self.enable_memory_graph = enable_memory_graph
+        self._graph_auto_promote_specificity = graph_auto_promote_specificity
+        self._graph_mention_promote_specificity = graph_mention_promote_specificity
+        self._graph_mention_promote_count = graph_mention_promote_count
         self.max_chunks = max_chunks
         self.default_ttl_days = default_ttl_days
         self.tier = tier
@@ -307,7 +322,13 @@ class MemoryPlugin(LifecyclePlugin):
         if self.enable_memory_graph:
             from .memory_graph import MemoryGraph
 
-            self._memory_graph = MemoryGraph(agent_id=agent_id)
+            self._memory_graph = MemoryGraph(
+                agent_id=agent_id,
+                default_properties={"workspace": workspace},
+                auto_promote_specificity=self._graph_auto_promote_specificity,
+                mention_promote_specificity=self._graph_mention_promote_specificity,
+                mention_promote_count=self._graph_mention_promote_count,
+            )
             if not self.enable_fact_extraction:
                 logger.info(
                     "Memory graph using keyword heuristics only. "

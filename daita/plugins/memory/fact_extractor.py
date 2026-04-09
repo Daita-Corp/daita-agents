@@ -53,6 +53,9 @@ Example output:
 ]
 
 WRONG — do NOT produce entities like these:
+  "true", "false", "null", "enabled"        → boolean/status literals, not entities
+  "unauthorized access"                     → vague state description, use the specific system or resource
+  "error handling", "best practices"        → abstract process nouns, not entities
   "as of 2023"                              → this is a temporal_context
   "challenges and limitations"              → too generic
   "technical hurdles like dendrite formation"→ too long, use "dendrite formation"

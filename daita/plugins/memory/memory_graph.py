@@ -47,8 +47,7 @@ _BARE_NUMBER_RE = re.compile(r"^[\d,.%/]+$")
 _MAX_ENTITY_WORDS = 5
 
 # Technical identifier patterns — these are code/data names, not English prose.
-# They bypass the single-lowercase-word filter because "customers", "etl_orders_agg",
-# and "orders.total" are high-value entities in data/engineering domains.
+# They contribute high specificity scores during entity scoring.
 _SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")  # customer_segments
 _DOT_NOTATION_RE = re.compile(r"^\w+\.\w+$")  # orders.total
 _ALL_CAPS_RE = re.compile(r"^[A-Z][A-Z0-9_(),.]+$")  # DECIMAL(10,2), INTEGER
@@ -66,32 +65,6 @@ def _is_technical_identifier(name: str) -> bool:
     return False
 
 
-_GENERIC_ENTITIES = frozenset(
-    {
-        "challenges",
-        "challenges and limitations",
-        "efforts",
-        "r&d efforts",
-        "companies",
-        "companies and research institutions",
-        "issues",
-        "problems",
-        "advantages",
-        "benefits",
-        "features",
-        "results",
-        "findings",
-        "data",
-        "information",
-        "details",
-        "aspects",
-        "factors",
-        "elements",
-        "things",
-    }
-)
-
-
 class MemoryGraph:
     """Lightweight graph layer for memory relationships.
 
@@ -100,9 +73,25 @@ class MemoryGraph:
     (from FactExtractor) and zero-LLM keyword heuristics.
     """
 
-    def __init__(self, agent_id: Optional[str] = None):
+    # Default promotion thresholds
+    DEFAULT_AUTO_PROMOTE_SPECIFICITY = 0.7
+    DEFAULT_MENTION_PROMOTE_SPECIFICITY = 0.3
+    DEFAULT_MENTION_PROMOTE_COUNT = 2
+
+    def __init__(
+        self,
+        agent_id: Optional[str] = None,
+        default_properties: Optional[Dict[str, Any]] = None,
+        auto_promote_specificity: float = DEFAULT_AUTO_PROMOTE_SPECIFICITY,
+        mention_promote_specificity: float = DEFAULT_MENTION_PROMOTE_SPECIFICITY,
+        mention_promote_count: int = DEFAULT_MENTION_PROMOTE_COUNT,
+    ):
         self._backend = None
         self._agent_id = agent_id
+        self._default_properties = default_properties or {}
+        self._auto_promote_specificity = auto_promote_specificity
+        self._mention_promote_specificity = mention_promote_specificity
+        self._mention_promote_count = mention_promote_count
 
     @property
     def backend(self):
@@ -132,7 +121,7 @@ class MemoryGraph:
             node_type=NodeType.MEMORY,
             name=chunk_id,
             created_by_agent=self._agent_id,
-            properties={"content_preview": content[:200]},
+            properties={"content_preview": content[:200], **self._default_properties},
         )
         await self.backend.add_node(memory_node)
 
@@ -147,13 +136,8 @@ class MemoryGraph:
             entity_name = entity_info["entity"]
             entity_id = _make_entity_id(entity_name)
 
-            # Upsert ENTITY node
-            entity_node = AgentGraphNode(
-                node_id=entity_id,
-                node_type=NodeType.ENTITY,
-                name=entity_name,
-                created_by_agent=self._agent_id,
-            )
+            # Upsert ENTITY node with specificity scoring and mention tracking
+            entity_node = await self._make_scored_entity_node(entity_id, entity_name)
             await self.backend.add_node(entity_node)
 
             # MEMORY --MENTIONS--> ENTITY
@@ -172,12 +156,7 @@ class MemoryGraph:
             value = entity_info.get("value")
             if value and value != entity_name:
                 value_id = _make_entity_id(value)
-                value_node = AgentGraphNode(
-                    node_id=value_id,
-                    node_type=NodeType.ENTITY,
-                    name=value,
-                    created_by_agent=self._agent_id,
-                )
+                value_node = await self._make_scored_entity_node(value_id, value)
                 await self.backend.add_node(value_node)
 
                 # MEMORY --MENTIONS--> VALUE_ENTITY
@@ -207,13 +186,7 @@ class MemoryGraph:
                 await self.backend.add_edge(rel_edge)
 
     def _entities_from_facts(self, facts: List[dict]) -> List[dict]:
-        """Convert FactExtractor output to entity pairs with quality filtering.
-
-        Uses relaxed filtering (``from_facts=True``) because the LLM was
-        explicitly asked to extract entities — single lowercase words like
-        ``customers`` or ``orders`` are legitimate table/column names, not
-        English prose noise.
-        """
+        """Convert FactExtractor output to entity pairs with quality filtering."""
         pairs = []
         for fact in facts:
             entity = fact.get("entity") or fact.get("subject")
@@ -222,61 +195,107 @@ class MemoryGraph:
             value = fact.get("value") or fact.get("object")
             relation = fact.get("relation") or fact.get("predicate", "related_to")
             pairs.append({"entity": entity, "value": value, "relation": relation})
-        pairs = self._filter_entity_pairs(pairs, from_facts=True)
+        pairs = self._filter_entity_pairs(pairs)
         return self._deduplicate_entities(pairs)
 
-    @staticmethod
-    def _is_low_quality_entity(name: str, from_facts: bool = False) -> bool:
-        """Return True if the entity name is too generic, temporal, or numeric.
+    async def _make_scored_entity_node(
+        self, entity_id: str, entity_name: str
+    ) -> AgentGraphNode:
+        """Create an entity node with specificity score and mention count.
 
-        Args:
-            name: Entity name to check.
-            from_facts: When True, skip the single-lowercase-word filter.
-                LLM-extracted facts have already been curated for relevance,
-                so single lowercase words like ``customers`` or ``orders``
-                are legitimate domain entities, not English prose noise.
+        Reads the existing node (if any) to increment mention_count.
+        Entities are promoted (surfaced in traversal) when they have high
+        specificity or enough mentions to demonstrate real importance.
         """
+        specificity = self._score_entity_specificity(entity_name)
+
+        mention_count = 1
+        existing = await self.backend.get_node(entity_id)
+        if existing:
+            existing_props = (
+                existing.properties if hasattr(existing, "properties") else {}
+            )
+            mention_count = existing_props.get("mention_count", 1) + 1
+
+        promoted = specificity >= self._auto_promote_specificity or (
+            specificity >= self._mention_promote_specificity
+            and mention_count >= self._mention_promote_count
+        )
+
+        return AgentGraphNode(
+            node_id=entity_id,
+            node_type=NodeType.ENTITY,
+            name=entity_name,
+            created_by_agent=self._agent_id,
+            properties={
+                "specificity": round(specificity, 2),
+                "mention_count": mention_count,
+                "promoted": promoted,
+                **self._default_properties,
+            },
+        )
+
+    @staticmethod
+    def _score_entity_specificity(name: str) -> float:
+        """Score 0.0-1.0 based on how likely this is a real domain entity.
+
+        High scores: proper nouns, technical identifiers, specific multi-word terms.
+        Low scores: generic lowercase words, vague phrases, boolean literals.
+        """
+        score = 0.3  # baseline
+        words = name.split()
+        has_hyphen = "-" in name and len(words) <= 3
+
+        # Proper noun (capitalized first word or any capitalized word in phrase)
+        if name[0].isupper():
+            score += 0.4
+        elif any(w[0].isupper() for w in words):
+            score += 0.2
+
+        # Technical identifier (snake_case, dot.notation, ALL_CAPS)
+        if any(_is_technical_identifier(w) for w in words):
+            score += 0.4
+
+        # Hyphenated compound term (e.g. "solid-state batteries")
+        if has_hyphen:
+            score += 0.4
+
+        # Penalize: very short single lowercase words (likely noise)
+        if len(words) == 1 and len(name) <= 5 and not name[0].isupper():
+            if not _is_technical_identifier(name):
+                score -= 0.2
+
+        # Penalize: all-lowercase multi-word with no technical component or hyphen
+        if len(words) > 1 and not any(w[0].isupper() for w in words):
+            if not any(_is_technical_identifier(w) for w in words) and not has_hyphen:
+                score -= 0.2
+
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _is_low_quality_entity(name: str) -> bool:
+        """Return True if the entity is structurally invalid (always reject)."""
         if not name or len(name) < 2:
-            return True
-        normalized = name.strip().lower()
-        if normalized in _GENERIC_ENTITIES:
             return True
         if _TEMPORAL_RE.match(name):
             return True
         if _CURRENCY_RE.search(name):
             return True
-        if _BARE_NUMBER_RE.match(normalized):
+        if _BARE_NUMBER_RE.match(name.strip().lower()):
             return True
         if len(name.split()) > _MAX_ENTITY_WORDS:
             return True
-        # Single words must be proper nouns (capitalized) or technical identifiers
-        # to be useful entities. English words like "rapidly", "advancements",
-        # "production" create low-value graph connections, but code/data names
-        # like "customer_segments", "orders.total", "INTEGER" are high-value.
-        # When from_facts=True, the LLM already filtered for relevance so we
-        # trust single lowercase words as legitimate domain entities.
-        if not from_facts and len(name.split()) == 1 and not name[0].isupper():
-            if not _is_technical_identifier(name):
-                return True
         return False
 
     @staticmethod
-    def _filter_entity_pairs(pairs: List[dict], from_facts: bool = False) -> List[dict]:
-        """Remove pairs whose entity or value fails quality checks.
-
-        Args:
-            pairs: Entity pairs to filter.
-            from_facts: Pass True when pairs come from LLM-extracted facts
-                to apply relaxed filtering (see ``_is_low_quality_entity``).
-        """
+    def _filter_entity_pairs(pairs: List[dict]) -> List[dict]:
+        """Remove pairs whose entity or value is structurally invalid."""
         filtered = []
         for p in pairs:
-            if MemoryGraph._is_low_quality_entity(p["entity"], from_facts):
+            if MemoryGraph._is_low_quality_entity(p["entity"]):
                 continue
             # Filter value too — if low quality, keep the entity but drop the value
-            if p.get("value") and MemoryGraph._is_low_quality_entity(
-                p["value"], from_facts
-            ):
+            if p.get("value") and MemoryGraph._is_low_quality_entity(p["value"]):
                 p = {**p, "value": None}
             filtered.append(p)
         return filtered
@@ -480,8 +499,13 @@ class MemoryGraph:
                     )
                     continue  # Don't traverse past memory nodes
                 elif node_id.startswith("entity:"):
-                    name = node_data.get("name", node_id.removeprefix("entity:"))
-                    # Collect edge relation if available
+                    # Skip unpromoted entities (default True for legacy nodes)
+                    node_props = node_data.get("data", node_data).get("properties", {})
+                    if not node_props.get("promoted", True):
+                        continue
+                    name = node_data.get("data", node_data).get(
+                        "name", node_id.removeprefix("entity:")
+                    )
                     entities.append({"name": name, "depth": depth})
 
             # Traverse both directions
