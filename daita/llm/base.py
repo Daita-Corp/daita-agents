@@ -131,7 +131,26 @@ class BaseLLMProvider(LLMProvider, ABC):
         if stream:
             return self._stream_impl(messages, tool_specs, **params)
         else:
-            return await self._generate_impl(messages, tool_specs, **params)
+            async with self.trace_manager.span(
+                operation_name=f"llm_{self.provider_name}",
+                trace_type=TraceType.LLM_CALL,
+                agent_id=self.agent_id,
+                model=self.model,
+            ) as span_id:
+                result = await self._generate_impl(messages, tool_specs, **params)
+
+                # Record token usage on the span
+                token_usage = self._get_last_token_usage()
+                if token_usage.get("total_tokens"):
+                    self.trace_manager.record_llm_call(
+                        span_id=span_id,
+                        model=self.model,
+                        prompt_tokens=token_usage.get("prompt_tokens", 0),
+                        completion_tokens=token_usage.get("completion_tokens", 0),
+                        total_tokens=token_usage.get("total_tokens", 0),
+                    )
+
+                return result
 
     @abstractmethod
     async def _generate_impl(

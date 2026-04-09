@@ -186,19 +186,17 @@ class TestMergeOnFlush:
 
 
 class TestEntityQualityFiltering:
+    """Tests for structural quality checks (_is_low_quality_entity).
+
+    These are hard rejections for structurally invalid entities
+    (temporal, currency, numbers, too long). Semantic quality is
+    handled by specificity scoring — see TestEntityScoring.
+    """
+
     def test_rejects_temporal_entities(self):
         assert MemoryGraph._is_low_quality_entity("as of 2023") is True
         assert MemoryGraph._is_low_quality_entity("before 2024") is True
         assert MemoryGraph._is_low_quality_entity("since 2020") is True
-
-    def test_rejects_generic_entities(self):
-        assert MemoryGraph._is_low_quality_entity("challenges") is True
-        assert MemoryGraph._is_low_quality_entity("challenges and limitations") is True
-        assert MemoryGraph._is_low_quality_entity("r&d efforts") is True
-        assert (
-            MemoryGraph._is_low_quality_entity("companies and research institutions")
-            is True
-        )
 
     def test_rejects_currency_values(self):
         assert MemoryGraph._is_low_quality_entity("$500 million") is True
@@ -210,34 +208,6 @@ class TestEntityQualityFiltering:
         assert MemoryGraph._is_low_quality_entity("99.9%") is True
         assert MemoryGraph._is_low_quality_entity("1,359.18") is True
 
-    def test_rejects_single_lowercase_english_words(self):
-        assert MemoryGraph._is_low_quality_entity("rapidly") is True
-        assert MemoryGraph._is_low_quality_entity("advancements") is True
-        assert MemoryGraph._is_low_quality_entity("production") is True
-
-    def test_accepts_snake_case_identifiers(self):
-        assert MemoryGraph._is_low_quality_entity("customer_segments") is False
-        assert MemoryGraph._is_low_quality_entity("etl_orders_agg") is False
-        assert MemoryGraph._is_low_quality_entity("revenue_daily") is False
-        assert MemoryGraph._is_low_quality_entity("order_items") is False
-        assert MemoryGraph._is_low_quality_entity("total_cents") is False
-
-    def test_accepts_dot_notation_identifiers(self):
-        assert MemoryGraph._is_low_quality_entity("orders.total") is False
-        assert MemoryGraph._is_low_quality_entity("customers.tier") is False
-        assert MemoryGraph._is_low_quality_entity("payments.amount") is False
-
-    def test_accepts_all_caps_type_names(self):
-        assert MemoryGraph._is_low_quality_entity("INTEGER") is False
-        assert MemoryGraph._is_low_quality_entity("DECIMAL(10,2)") is False
-        assert MemoryGraph._is_low_quality_entity("NOT_NULL") is False
-        assert MemoryGraph._is_low_quality_entity("TEXT") is False
-
-    def test_accepts_single_proper_nouns(self):
-        assert MemoryGraph._is_low_quality_entity("Toyota") is False
-        assert MemoryGraph._is_low_quality_entity("QuantumScape") is False
-        assert MemoryGraph._is_low_quality_entity("Samsung") is False
-
     def test_rejects_long_phrases(self):
         assert (
             MemoryGraph._is_low_quality_entity(
@@ -246,19 +216,40 @@ class TestEntityQualityFiltering:
             is True
         )
 
-    def test_accepts_good_entities(self):
+    def test_accepts_structurally_valid_entities(self):
+        """Structural filter passes everything that isn't temporal/currency/number/long."""
         assert MemoryGraph._is_low_quality_entity("Toyota") is False
         assert MemoryGraph._is_low_quality_entity("solid-state batteries") is False
-        assert MemoryGraph._is_low_quality_entity("QuantumScape") is False
-        assert MemoryGraph._is_low_quality_entity("energy density") is False
-        assert MemoryGraph._is_low_quality_entity("dendrite formation") is False
+        assert MemoryGraph._is_low_quality_entity("customer_segments") is False
+        assert MemoryGraph._is_low_quality_entity("orders.total") is False
+        assert MemoryGraph._is_low_quality_entity("customers") is False
+        assert MemoryGraph._is_low_quality_entity("true") is False  # structural pass, scored low
+
+    def test_filter_removes_structurally_invalid(self):
+        pairs = [
+            {"entity": "Toyota", "value": "R&D leader", "relation": "is"},
+            {"entity": "as of 2023", "value": "breakthrough", "relation": "saw"},
+        ]
+        filtered = MemoryGraph._filter_entity_pairs(pairs)
+        entities = [p["entity"] for p in filtered]
+        assert "Toyota" in entities
+        assert "as of 2023" not in entities
+
+    def test_filter_drops_bad_value_but_keeps_entity(self):
+        pairs = [
+            {
+                "entity": "market growth",
+                "value": "$500 million",
+                "relation": "projected",
+            },
+        ]
+        filtered = MemoryGraph._filter_entity_pairs(pairs)
+        assert len(filtered) == 1
+        assert filtered[0]["entity"] == "market growth"
+        assert filtered[0]["value"] is None
 
     def test_data_domain_facts_produce_entities(self):
-        """LLM-extracted facts from data domains should produce entity pairs.
-
-        Single lowercase words like 'customers' and 'orders' are legitimate
-        table names when they come from fact extraction (from_facts=True).
-        """
+        """LLM-extracted facts from data domains should pass structural filter."""
         facts = [
             {"entity": "customers", "relation": "has column", "value": "tier"},
             {"entity": "etl_orders_agg", "relation": "reads from", "value": "orders"},
@@ -281,47 +272,196 @@ class TestEntityQualityFiltering:
         assert "orders" in values
         assert "DECIMAL(10,2)" in values
 
-    def test_heuristic_still_rejects_single_lowercase(self):
-        """Heuristic path (from_facts=False) should still reject single lowercase words."""
-        assert MemoryGraph._is_low_quality_entity("customers", from_facts=False) is True
-        assert MemoryGraph._is_low_quality_entity("orders", from_facts=False) is True
 
-    def test_facts_path_accepts_single_lowercase(self):
-        """Facts path (from_facts=True) should accept single lowercase words."""
-        assert MemoryGraph._is_low_quality_entity("customers", from_facts=True) is False
-        assert MemoryGraph._is_low_quality_entity("orders", from_facts=True) is False
-        assert MemoryGraph._is_low_quality_entity("tier", from_facts=True) is False
+# ---------------------------------------------------------------------------
+# Entity specificity scoring
+# ---------------------------------------------------------------------------
 
-    def test_facts_path_still_rejects_generic_terms(self):
-        """Even from_facts=True should reject known generic English words."""
-        assert MemoryGraph._is_low_quality_entity("challenges", from_facts=True) is True
-        assert MemoryGraph._is_low_quality_entity("data", from_facts=True) is True
-        assert MemoryGraph._is_low_quality_entity("results", from_facts=True) is True
 
-    def test_filter_removes_bad_entities(self):
-        pairs = [
-            {"entity": "Toyota", "value": "R&D leader", "relation": "is"},
-            {"entity": "as of 2023", "value": "breakthrough", "relation": "saw"},
-            {"entity": "challenges", "value": "scalability", "relation": "include"},
-        ]
-        filtered = MemoryGraph._filter_entity_pairs(pairs)
-        entities = [p["entity"] for p in filtered]
-        assert "Toyota" in entities
-        assert "as of 2023" not in entities
-        assert "challenges" not in entities
+class TestEntityScoring:
+    """Tests for _score_entity_specificity — the scoring system that
+    replaces the old blocklist + from_facts approach.
+    """
 
-    def test_filter_drops_bad_value_but_keeps_entity(self):
-        pairs = [
-            {
-                "entity": "market growth",
-                "value": "$500 million",
-                "relation": "projected",
-            },
-        ]
-        filtered = MemoryGraph._filter_entity_pairs(pairs)
-        assert len(filtered) == 1
-        assert filtered[0]["entity"] == "market growth"
-        assert filtered[0]["value"] is None
+    def test_proper_nouns_score_high(self):
+        assert MemoryGraph._score_entity_specificity("Toyota") >= 0.7
+        assert MemoryGraph._score_entity_specificity("QuantumScape") >= 0.7
+        assert MemoryGraph._score_entity_specificity("Samsung") >= 0.7
+
+    def test_technical_identifiers_score_high(self):
+        assert MemoryGraph._score_entity_specificity("customer_segments") >= 0.7
+        assert MemoryGraph._score_entity_specificity("etl_orders_agg") >= 0.7
+        assert MemoryGraph._score_entity_specificity("orders.total") >= 0.7
+        assert MemoryGraph._score_entity_specificity("INTEGER") >= 0.7
+        assert MemoryGraph._score_entity_specificity("DECIMAL(10,2)") >= 0.7
+        assert MemoryGraph._score_entity_specificity("NOT_NULL") >= 0.7
+
+    def test_junk_literals_score_low(self):
+        assert MemoryGraph._score_entity_specificity("true") < 0.3
+        assert MemoryGraph._score_entity_specificity("false") < 0.3
+        assert MemoryGraph._score_entity_specificity("null") < 0.3
+        assert MemoryGraph._score_entity_specificity("data") < 0.3
+        assert MemoryGraph._score_entity_specificity("ok") < 0.3
+
+    def test_vague_phrases_score_low(self):
+        assert MemoryGraph._score_entity_specificity("unauthorized access") < 0.3
+        assert MemoryGraph._score_entity_specificity("error handling") < 0.3
+        assert MemoryGraph._score_entity_specificity("best practices") < 0.3
+        assert MemoryGraph._score_entity_specificity("data processing") < 0.3
+
+    def test_legitimate_lowercase_scores_medium(self):
+        """Single lowercase domain words pass structural filter but need mentions to promote."""
+        score = MemoryGraph._score_entity_specificity("customers")
+        assert 0.3 <= score < 0.7
+        score = MemoryGraph._score_entity_specificity("orders")
+        assert 0.3 <= score < 0.7
+
+    def test_hyphenated_terms_score_well(self):
+        assert MemoryGraph._score_entity_specificity("solid-state batteries") >= 0.7
+        assert MemoryGraph._score_entity_specificity("real-time") >= 0.3
+
+    def test_capitalized_multi_word_scores_high(self):
+        assert MemoryGraph._score_entity_specificity("Project Orion") >= 0.5
+        assert MemoryGraph._score_entity_specificity("Amazon Web Services") >= 0.5
+
+    def test_mixed_case_multi_word_gets_boost(self):
+        """Multi-word with at least one capitalized word scores higher than all-lowercase."""
+        mixed = MemoryGraph._score_entity_specificity("OAuth tokens")
+        lower = MemoryGraph._score_entity_specificity("oauth tokens")
+        assert mixed > lower
+
+
+# ---------------------------------------------------------------------------
+# Entity promotion (integration with graph backend)
+# ---------------------------------------------------------------------------
+
+
+class TestEntityPromotion:
+    """Tests for the mention_count + specificity promotion system."""
+
+    async def test_high_specificity_immediately_promoted(self, tmp_path):
+        """Proper nouns are promoted on first mention."""
+        graph_path = tmp_path / ".daita" / "graph" / "memory.json"
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+
+        mg = MemoryGraph(agent_id="test-agent")
+        backend = LocalGraphBackend(graph_type="memory")
+        backend._graph_path = graph_path
+        mg._backend = backend
+
+        await mg.index_memory("chunk-1", "Toyota is investing in solid-state batteries.", facts=[
+            {"entity": "Toyota", "relation": "investing in", "value": "solid-state batteries"},
+        ])
+
+        node = await backend.get_node("entity:toyota")
+        assert node is not None
+        assert node.properties["promoted"] is True
+        assert node.properties["specificity"] >= 0.7
+        assert node.properties["mention_count"] == 1
+
+    async def test_low_specificity_not_immediately_promoted(self, tmp_path):
+        """Generic lowercase words are not promoted on first mention."""
+        graph_path = tmp_path / ".daita" / "graph" / "memory.json"
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+
+        mg = MemoryGraph(agent_id="test-agent")
+        backend = LocalGraphBackend(graph_type="memory")
+        backend._graph_path = graph_path
+        mg._backend = backend
+
+        await mg.index_memory("chunk-1", "The customers table has a tier column.", facts=[
+            {"entity": "customers", "relation": "has column", "value": "tier"},
+        ])
+
+        node = await backend.get_node("entity:customers")
+        assert node is not None
+        assert node.properties["promoted"] is False
+        assert node.properties["mention_count"] == 1
+
+    async def test_low_specificity_promotes_after_second_mention(self, tmp_path):
+        """Generic words promote after being mentioned in multiple memories."""
+        graph_path = tmp_path / ".daita" / "graph" / "memory.json"
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+
+        mg = MemoryGraph(agent_id="test-agent")
+        backend = LocalGraphBackend(graph_type="memory")
+        backend._graph_path = graph_path
+        mg._backend = backend
+
+        await mg.index_memory("chunk-1", "customers table", facts=[
+            {"entity": "customers", "relation": "is", "value": "table"},
+        ])
+        node = await backend.get_node("entity:customers")
+        assert node.properties["promoted"] is False
+
+        await mg.index_memory("chunk-2", "customers table has tier", facts=[
+            {"entity": "customers", "relation": "has column", "value": "tier"},
+        ])
+        node = await backend.get_node("entity:customers")
+        assert node.properties["promoted"] is True
+        assert node.properties["mention_count"] == 2
+
+    async def test_junk_stays_unpromoted(self, tmp_path):
+        """Very low specificity entities don't promote even with one mention."""
+        graph_path = tmp_path / ".daita" / "graph" / "memory.json"
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+
+        mg = MemoryGraph(agent_id="test-agent")
+        backend = LocalGraphBackend(graph_type="memory")
+        backend._graph_path = graph_path
+        mg._backend = backend
+
+        await mg.index_memory("chunk-1", "The value is true.", facts=[
+            {"entity": "true", "relation": "is", "value": "enabled"},
+        ])
+
+        node = await backend.get_node("entity:true")
+        assert node is not None
+        assert node.properties["promoted"] is False
+        assert node.properties["specificity"] < 0.3
+
+    async def test_traverse_excludes_unpromoted(self, tmp_path):
+        """traverse_entity() should not include unpromoted entities in results."""
+        graph_path = tmp_path / ".daita" / "graph" / "memory.json"
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+
+        mg = MemoryGraph(agent_id="test-agent")
+        backend = LocalGraphBackend(graph_type="memory")
+        backend._graph_path = graph_path
+        mg._backend = backend
+
+        # Index with a promoted entity and an unpromoted one
+        await mg.index_memory("chunk-1", "Toyota uses dark mode.", facts=[
+            {"entity": "Toyota", "relation": "uses", "value": "dark mode"},
+        ])
+
+        result = await mg.traverse_entity("Toyota")
+        entity_names = [e["name"] for e in result["connected_entities"]]
+        # "dark mode" is all lowercase multi-word, scores low, first mention → unpromoted
+        assert "dark mode" not in entity_names
+
+    async def test_default_properties_on_nodes(self, tmp_path):
+        """default_properties should appear on both MEMORY and ENTITY nodes."""
+        graph_path = tmp_path / ".daita" / "graph" / "memory.json"
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+
+        mg = MemoryGraph(
+            agent_id="test-agent",
+            default_properties={"workspace": "test-ws"},
+        )
+        backend = LocalGraphBackend(graph_type="memory")
+        backend._graph_path = graph_path
+        mg._backend = backend
+
+        await mg.index_memory("chunk-1", "Toyota is great.", facts=[
+            {"entity": "Toyota", "relation": "is", "value": "great"},
+        ])
+
+        memory_node = await backend.get_node("memory:chunk-1")
+        assert memory_node.properties["workspace"] == "test-ws"
+
+        entity_node = await backend.get_node("entity:toyota")
+        assert entity_node.properties["workspace"] == "test-ws"
 
 
 # ---------------------------------------------------------------------------

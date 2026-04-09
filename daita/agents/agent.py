@@ -762,33 +762,42 @@ class Agent(BaseAgent):
         """Execute tool and emit result event."""
         from ..core.streaming import EventType
 
-        # Track execution time
-        start_time = time.time()
+        tool_name = tool_call["name"]
 
-        result = await _execute_tool_call(tool_call, tools)
+        async with self.trace_manager.span(
+            operation_name=f"tool_{tool_name}",
+            trace_type=TraceType.TOOL_EXECUTION,
+            agent_id=self.agent_id,
+            tool_name=tool_name,
+            input_data=tool_call.get("arguments"),
+        ):
+            # Track execution time
+            start_time = time.time()
 
-        # Calculate duration
-        duration_ms = int((time.time() - start_time) * 1000)
+            result = await _execute_tool_call(tool_call, tools)
 
-        # Track this tool call in history
-        tool_call_record = {
-            "name": tool_call["name"],
-            "duration_ms": duration_ms,
-            "input": tool_call.get("arguments"),
-            "output": result,
-        }
-        self._tool_call_history.append(tool_call_record)
+            # Calculate duration
+            duration_ms = int((time.time() - start_time) * 1000)
 
-        # Emit result event
-        self._emit_event(
-            on_event, EventType.TOOL_RESULT, tool_name=tool_call["name"], result=result
-        )
+            # Track this tool call in history
+            tool_call_record = {
+                "name": tool_name,
+                "duration_ms": duration_ms,
+                "input": tool_call.get("arguments"),
+                "output": result,
+            }
+            self._tool_call_history.append(tool_call_record)
 
-        return {
-            "tool": tool_call["name"],
-            "arguments": tool_call["arguments"],
-            "result": result,
-        }
+            # Emit result event
+            self._emit_event(
+                on_event, EventType.TOOL_RESULT, tool_name=tool_name, result=result
+            )
+
+            return {
+                "tool": tool_name,
+                "arguments": tool_call["arguments"],
+                "result": result,
+            }
 
     def _append_tool_messages(
         self, conversation: List[Dict], tool_calls: List[Dict], results: List[Any]
