@@ -12,12 +12,13 @@ import sqlite3
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.memory.local_backend import LocalMemoryBackend
-from daita.plugins.memory.memory_plugin import MemoryPlugin, _parse_time_param
+from daita.plugins.memory.memory_plugin import MemoryPlugin
+from daita.plugins.memory.memory_tools import _parse_time_param
 from daita.plugins.memory.metadata import MemoryMetadata
 from daita.plugins.memory.search import SQLiteVectorSearch
 
@@ -25,47 +26,24 @@ from daita.plugins.memory.search import SQLiteVectorSearch
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Shared mock embedder for tests — small dimension for speed
+_test_embedder = MockEmbeddingProvider(dim=8)
+
 
 def _make_backend(tmp_path: Path) -> LocalMemoryBackend:
-    """Create a LocalMemoryBackend with mocked embeddings (no OpenAI calls)."""
-    with patch.object(SQLiteVectorSearch, "__init__", lambda self, *a, **kw: None):
-        backend = LocalMemoryBackend(
-            workspace="test",
-            agent_id="test_agent",
-            scope="project",
-            base_dir=tmp_path,
-        )
-    # Re-init the search object manually with a real DB but mock embedder
-    backend.search = _make_search(backend.vector_db)
-    return backend
+    """Create a LocalMemoryBackend with mock embeddings (no OpenAI calls)."""
+    return LocalMemoryBackend(
+        workspace="test",
+        agent_id="test_agent",
+        scope="project",
+        base_dir=tmp_path,
+        embedder=_test_embedder,
+    )
 
 
 def _make_search(db_path: Path) -> SQLiteVectorSearch:
-    """Create a SQLiteVectorSearch with mocked embedding calls."""
-    with patch.object(SQLiteVectorSearch, "__init__", lambda self, *a, **kw: None):
-        search = SQLiteVectorSearch.__new__(SQLiteVectorSearch)
-    search.db_path = db_path
-    search.embedding_provider = "openai"
-    search.embedding_model = "text-embedding-3-small"
-    search._embed_cache = {}
-    search._init_database()
-    return search
-
-
-def _fake_embedding(text: str, dim: int = 8) -> list:
-    """Deterministic fake embedding based on text hash."""
-    import hashlib
-
-    h = hashlib.md5(text.encode()).hexdigest()
-    return [int(c, 16) / 15.0 for c in h[:dim]]
-
-
-async def _mock_embed_text(self, text):
-    return _fake_embedding(text)
-
-
-async def _mock_embed_texts(self, texts):
-    return [_fake_embedding(t) for t in texts]
+    """Create a SQLiteVectorSearch with mock embedding calls."""
+    return SQLiteVectorSearch(db_path, _test_embedder)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +77,6 @@ class TestParseTimeParam:
 
 
 class TestRememberBatch:
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_batch_stores_multiple(self, tmp_path):
         backend = _make_backend(tmp_path)
         items = [
@@ -113,7 +90,6 @@ class TestRememberBatch:
         assert result["skipped"] == 0
         assert len(result["items"]) == 3
 
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_batch_skips_existing(self, tmp_path):
         backend = _make_backend(tmp_path)
         items = [{"content": "duplicate fact"}]
@@ -122,7 +98,6 @@ class TestRememberBatch:
         assert result["stored"] == 0
         assert result["skipped"] == 1
 
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_batch_with_extra_metadata(self, tmp_path):
         backend = _make_backend(tmp_path)
         items = [{"content": "fact with extras", "importance": 0.7}]
@@ -146,7 +121,6 @@ class TestRememberBatch:
 
 
 class TestQueryFacts:
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_query_by_entity(self, tmp_path):
         backend = _make_backend(tmp_path)
         items = [
@@ -182,7 +156,6 @@ class TestQueryFacts:
         assert results[0]["entity"] == "users"
         assert results[0]["value"] == "email"
 
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_query_by_relation(self, tmp_path):
         backend = _make_backend(tmp_path)
         items = [{"content": "FK: orders.user_id -> users.id", "importance": 0.8}]
@@ -204,13 +177,11 @@ class TestQueryFacts:
         assert len(results) == 1
         assert results[0]["relation"] == "FK references"
 
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_query_no_facts(self, tmp_path):
         backend = _make_backend(tmp_path)
         results = await backend.query_facts(entity="nonexistent")
         assert results == []
 
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_query_combined_filters(self, tmp_path):
         backend = _make_backend(tmp_path)
         items = [{"content": "schema info", "importance": 0.7}]
@@ -245,7 +216,6 @@ class TestQueryFacts:
 
 
 class TestGetStats:
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_stats_empty(self, tmp_path):
         backend = _make_backend(tmp_path)
         stats = await backend.get_stats()
@@ -253,7 +223,6 @@ class TestGetStats:
         assert stats["categories"] == {}
         assert stats["pinned_count"] == 0
 
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_stats_with_data(self, tmp_path):
         backend = _make_backend(tmp_path)
         items = [
@@ -279,7 +248,6 @@ class TestGetStats:
 
 
 class TestGetPinnedMemories:
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_no_pinned(self, tmp_path):
         backend = _make_backend(tmp_path)
         items = [{"content": "not pinned", "importance": 0.5}]
@@ -287,8 +255,6 @@ class TestGetPinnedMemories:
         pinned = await backend.get_pinned_memories()
         assert pinned == []
 
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
-    @patch.object(SQLiteVectorSearch, "embed_text", _mock_embed_text)
     async def test_pinned_returned(self, tmp_path):
         backend = _make_backend(tmp_path)
         # Store a memory and then pin it via metadata update
@@ -312,8 +278,6 @@ class TestGetPinnedMemories:
 
 
 class TestTemporalFiltering:
-    @patch.object(SQLiteVectorSearch, "embed_text", _mock_embed_text)
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_since_filters_old(self, tmp_path):
         backend = _make_backend(tmp_path)
 
@@ -342,8 +306,6 @@ class TestTemporalFiltering:
         assert "new fact" in contents
         assert "old fact" not in contents
 
-    @patch.object(SQLiteVectorSearch, "embed_text", _mock_embed_text)
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_before_filters_new(self, tmp_path):
         backend = _make_backend(tmp_path)
 
@@ -382,47 +344,19 @@ class TestTemporalFiltering:
 
 
 class TestEmbedTextsBatch:
-    async def test_batch_uses_cache(self, tmp_path):
+    async def test_batch_delegates_to_provider(self, tmp_path):
         search = _make_search(tmp_path / "test_batch.db")
 
-        # Mock the embedder
-        mock_embedder = AsyncMock()
-        mock_embedder.embeddings.create = AsyncMock(
-            return_value=MagicMock(
-                data=[MagicMock(embedding=[0.1, 0.2]) for _ in range(2)]
-            )
-        )
-        search.embedder = mock_embedder
-
-        # First call embeds both
         results = await search.embed_texts(["hello", "world"])
         assert len(results) == 2
-        assert mock_embedder.embeddings.create.call_count == 1
+        assert all(len(v) == 8 for v in results)
 
-        # Second call — both cached, no API call
-        results = await search.embed_texts(["hello", "world"])
-        assert len(results) == 2
-        assert mock_embedder.embeddings.create.call_count == 1  # still 1
+    async def test_batch_deterministic(self, tmp_path):
+        search = _make_search(tmp_path / "test_deterministic.db")
 
-    async def test_batch_partial_cache(self, tmp_path):
-        search = _make_search(tmp_path / "test_partial.db")
-
-        mock_embedder = AsyncMock()
-        search.embedder = mock_embedder
-
-        # Pre-populate cache
-        search._embed_cache["cached"] = [0.5, 0.5]
-
-        mock_embedder.embeddings.create = AsyncMock(
-            return_value=MagicMock(data=[MagicMock(embedding=[0.1, 0.2])])
-        )
-
-        results = await search.embed_texts(["cached", "new_text"])
-        assert results[0] == [0.5, 0.5]  # from cache
-        assert results[1] == [0.1, 0.2]  # from API
-        # Only 1 text sent to API
-        call_args = mock_embedder.embeddings.create.call_args
-        assert call_args.kwargs["input"] == ["new_text"]
+        r1 = await search.embed_texts(["hello", "world"])
+        r2 = await search.embed_texts(["hello", "world"])
+        assert r1 == r2
 
 
 # ---------------------------------------------------------------------------
@@ -544,8 +478,6 @@ class TestTTL:
 
 
 class TestPruning:
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
-    @patch.object(SQLiteVectorSearch, "embed_text", _mock_embed_text)
     async def test_prune_expired_deletes_ttl_chunks(self, tmp_path):
         backend = _make_backend(tmp_path)
 
@@ -576,7 +508,6 @@ class TestPruning:
         stats = await backend.get_stats()
         assert stats["total_memories"] == 1
 
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_enforce_size_limit(self, tmp_path):
         backend = _make_backend(tmp_path)
         backend.max_chunks = 3  # Low limit for testing
@@ -593,8 +524,6 @@ class TestPruning:
         stats = await backend.get_stats()
         assert stats["total_memories"] == 3
 
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
-    @patch.object(SQLiteVectorSearch, "embed_text", _mock_embed_text)
     async def test_prune_combines_both(self, tmp_path):
         backend = _make_backend(tmp_path)
         backend.max_chunks = 10
@@ -627,8 +556,6 @@ class TestPruning:
 
 
 class TestVectorizedSearch:
-    @patch.object(SQLiteVectorSearch, "embed_text", _mock_embed_text)
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_search_returns_results(self, tmp_path):
         """Vectorized search should produce valid results."""
         backend = _make_backend(tmp_path)
@@ -648,8 +575,6 @@ class TestVectorizedSearch:
         scores = [r["score"] for r in results]
         assert scores == sorted(scores, reverse=True)
 
-    @patch.object(SQLiteVectorSearch, "embed_text", _mock_embed_text)
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_norm_column_stored(self, tmp_path):
         """store_chunk should persist pre-computed norms."""
         backend = _make_backend(tmp_path)
@@ -674,7 +599,6 @@ class TestVectorizedSearch:
 
 
 class TestLazyFactExtraction:
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_get_unextracted_chunks(self, tmp_path):
         backend = _make_backend(tmp_path)
 
@@ -688,7 +612,6 @@ class TestLazyFactExtraction:
         assert len(unextracted) == 1
         assert unextracted[0][1] == "some fact"
 
-    @patch.object(SQLiteVectorSearch, "embed_texts", _mock_embed_texts)
     async def test_already_extracted_not_returned(self, tmp_path):
         backend = _make_backend(tmp_path)
 

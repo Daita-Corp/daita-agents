@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daita-agents"
-version = "0.14.0"
+version = "0.15.0"
 description = "Daita Agents - Data focused AI agent framework with free local use and premium hosted enterprise features"
 readme = "README.md"
 authors = [{name = "Daita", email = "support@daita-tech.io"}]
@@ -74,6 +74,16 @@ recommended = [
 # Memory plugin - persistent semantic memory for agents
 memory = [
     "openai>=1.0.0",             # Embeddings (text-embedding-3-small)
+]
+
+# Voyage AI embeddings
+voyage = [
+    "voyageai>=0.3.0",
+]
+
+# Local embeddings via HuggingFace (not supported in Daita Cloud)
+sentence-transformers = [
+    "sentence-transformers>=2.2.0",
 ]
 
 # Data-focused agents (analysis, ETL, reporting)

@@ -33,7 +33,9 @@ class TestAgentCreation:
     def test_agent_with_custom_regions(self):
         from agents.catalog_agent import create_agent
 
-        agent = create_agent(aws_regions=["us-west-2", "eu-west-1"], enable_memory=False)
+        agent = create_agent(
+            aws_regions=["us-west-2", "eu-west-1"], enable_memory=False
+        )
         assert agent is not None
 
     def test_agent_with_github_repos(self):
@@ -80,16 +82,21 @@ class TestCatalogConfiguration:
         from daita.plugins.catalog.profiler import PostgresProfiler, MySQLProfiler
 
         catalog = CatalogPlugin()
-        catalog.add_discoverer(AWSDiscoverer(
-            regions=kwargs.get("regions", ["us-east-1"]),
-        ))
+        catalog.add_discoverer(
+            AWSDiscoverer(
+                regions=kwargs.get("regions", ["us-east-1"]),
+            )
+        )
         if kwargs.get("github_org") or kwargs.get("github_repos"):
             from daita.plugins.catalog.github import GitHubScanner
-            catalog.add_discoverer(GitHubScanner(
-                token="fake-token",
-                org=kwargs.get("github_org"),
-                repos=kwargs.get("github_repos"),
-            ))
+
+            catalog.add_discoverer(
+                GitHubScanner(
+                    token="fake-token",
+                    org=kwargs.get("github_org"),
+                    repos=kwargs.get("github_repos"),
+                )
+            )
         catalog.add_profiler(PostgresProfiler())
         catalog.add_profiler(MySQLProfiler())
         return catalog
@@ -239,7 +246,11 @@ class TestAPIGatewayIntegration:
             },
             "get_authorizers": {
                 "items": [
-                    {"id": "auth1", "name": "cognito-auth", "type": "COGNITO_USER_POOLS"},
+                    {
+                        "id": "auth1",
+                        "name": "cognito-auth",
+                        "type": "COGNITO_USER_POOLS",
+                    },
                 ]
             },
             "get_stage": {
@@ -358,7 +369,9 @@ class TestAPIGatewayIntegration:
                 },
             ],
             "endpoint_count": 4,
-            "authorizers": [{"id": "auth1", "name": "cognito-auth", "type": "COGNITO_USER_POOLS"}],
+            "authorizers": [
+                {"id": "auth1", "name": "cognito-auth", "type": "COGNITO_USER_POOLS"}
+            ],
             "stage_variables": {"env": "production"},
         }
 
@@ -376,7 +389,10 @@ class TestAPIGatewayIntegration:
         # Every endpoint becomes a column
         col_names = [c["name"] for c in table["columns"]]
         assert col_names == [
-            "GET /orders", "POST /orders", "GET /orders/{id}", "DELETE /orders/{id}"
+            "GET /orders",
+            "POST /orders",
+            "GET /orders/{id}",
+            "DELETE /orders/{id}",
         ]
 
         # Column comments contain auth + Lambda ARN
@@ -384,12 +400,17 @@ class TestAPIGatewayIntegration:
         assert "COGNITO_USER_POOLS" in get_col["column_comment"]
         assert "arn:aws:lambda" in get_col["column_comment"]
 
-        delete_col = next(c for c in table["columns"] if c["name"] == "DELETE /orders/{id}")
+        delete_col = next(
+            c for c in table["columns"] if c["name"] == "DELETE /orders/{id}"
+        )
         assert "IAM" in delete_col["column_comment"]
 
         # Metadata has full integration map for lineage
         meta = result["metadata"]
-        assert meta["endpoint"] == "https://abc123.execute-api.us-east-1.amazonaws.com/prod"
+        assert (
+            meta["endpoint"]
+            == "https://abc123.execute-api.us-east-1.amazonaws.com/prod"
+        )
         assert meta["stage"] == "prod"
         assert meta["region"] == "us-east-1"
         assert meta["protocol_type"] == "REST"
@@ -409,7 +430,9 @@ class TestAPIGatewayIntegration:
             "tables": [{"name": "orders-api", "row_count": 4, "columns": []}],
             "metadata": {
                 "endpoint": "https://abc123.execute-api.us-east-1.amazonaws.com/prod",
-                "integrations": {"GET /orders": {"type": "AWS_PROXY", "uri": "arn:..."}},
+                "integrations": {
+                    "GET /orders": {"type": "AWS_PROXY", "uri": "arn:..."}
+                },
             },
         }
 
@@ -447,8 +470,11 @@ class TestAPIGatewayIntegration:
         from daita.plugins.catalog import CatalogPlugin
         from daita.plugins.catalog.aws import AWSDiscoverer
         from daita.plugins.catalog.profiler import (
-            PostgresProfiler, MySQLProfiler, DynamoDBProfiler,
-            S3Profiler, APIGatewayProfiler,
+            PostgresProfiler,
+            MySQLProfiler,
+            DynamoDBProfiler,
+            S3Profiler,
+            APIGatewayProfiler,
         )
 
         # Replicate what create_agent does
@@ -478,6 +504,7 @@ class TestAPIGatewayIntegration:
 def _fake_embedding(text, dim=8):
     """Deterministic fake embedding from text hash."""
     import hashlib
+
     h = hashlib.md5(text.encode()).hexdigest()
     return [int(c, 16) / 15.0 for c in h[:dim]]
 
@@ -513,18 +540,42 @@ class TestMemoryIntegration:
         backend.search = search
         return backend
 
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text)
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
+    )
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text
+    )
     async def test_batch_store_infrastructure_discoveries(self, tmp_path):
         """Simulate batch-storing discovered stores — tests batch remember."""
         backend = self._make_backend(tmp_path)
 
         discoveries = [
-            {"content": "RDS: orders-db (PostgreSQL) in us-east-1, environment=production", "importance": 0.8, "category": "store"},
-            {"content": "RDS: users-db (PostgreSQL) in us-east-1, environment=production", "importance": 0.8, "category": "store"},
-            {"content": "DynamoDB: sessions in us-east-1, environment=production", "importance": 0.8, "category": "store"},
-            {"content": "S3: data-lake-staging in us-west-2, environment=staging", "importance": 0.6, "category": "store"},
-            {"content": "ElastiCache: cache-dev in us-east-1, environment=dev", "importance": 0.4, "category": "store"},
+            {
+                "content": "RDS: orders-db (PostgreSQL) in us-east-1, environment=production",
+                "importance": 0.8,
+                "category": "store",
+            },
+            {
+                "content": "RDS: users-db (PostgreSQL) in us-east-1, environment=production",
+                "importance": 0.8,
+                "category": "store",
+            },
+            {
+                "content": "DynamoDB: sessions in us-east-1, environment=production",
+                "importance": 0.8,
+                "category": "store",
+            },
+            {
+                "content": "S3: data-lake-staging in us-west-2, environment=staging",
+                "importance": 0.6,
+                "category": "store",
+            },
+            {
+                "content": "ElastiCache: cache-dev in us-east-1, environment=dev",
+                "importance": 0.4,
+                "category": "store",
+            },
         ]
 
         result = await backend.remember_batch(discoveries)
@@ -532,18 +583,34 @@ class TestMemoryIntegration:
         assert result["stored"] == 5
         assert result["skipped"] == 0
 
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text)
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
+    )
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text
+    )
     async def test_memory_stats_after_discovery(self, tmp_path):
         """After batch-storing, stats should reflect categories."""
         backend = self._make_backend(tmp_path)
 
         stores = [
-            {"content": "RDS: orders-db in us-east-1", "importance": 0.8, "category": "store"},
-            {"content": "RDS: users-db in us-east-1", "importance": 0.8, "category": "store"},
+            {
+                "content": "RDS: orders-db in us-east-1",
+                "importance": 0.8,
+                "category": "store",
+            },
+            {
+                "content": "RDS: users-db in us-east-1",
+                "importance": 0.8,
+                "category": "store",
+            },
         ]
         rules = [
-            {"content": "Production databases must have encryption enabled", "importance": 0.9, "category": "rule"},
+            {
+                "content": "Production databases must have encryption enabled",
+                "importance": 0.9,
+                "category": "rule",
+            },
         ]
         await backend.remember_batch(stores)
         await backend.remember_batch(rules)
@@ -554,17 +621,35 @@ class TestMemoryIntegration:
         assert stats["categories"]["rule"]["count"] == 1
         assert stats["categories"]["rule"]["avg_importance"] == 0.9
 
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text)
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
+    )
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text
+    )
     async def test_recall_by_category(self, tmp_path):
         """list_by_category should enumerate all stores without semantic search."""
         backend = self._make_backend(tmp_path)
 
-        await backend.remember_batch([
-            {"content": "RDS: orders-db (production)", "importance": 0.8, "category": "store"},
-            {"content": "RDS: users-db (production)", "importance": 0.8, "category": "store"},
-            {"content": "Encryption must be enabled", "importance": 0.9, "category": "rule"},
-        ])
+        await backend.remember_batch(
+            [
+                {
+                    "content": "RDS: orders-db (production)",
+                    "importance": 0.8,
+                    "category": "store",
+                },
+                {
+                    "content": "RDS: users-db (production)",
+                    "importance": 0.8,
+                    "category": "store",
+                },
+                {
+                    "content": "Encryption must be enabled",
+                    "importance": 0.9,
+                    "category": "rule",
+                },
+            ]
+        )
 
         stores = await backend.list_by_category("store")
         assert len(stores) == 2
@@ -574,8 +659,12 @@ class TestMemoryIntegration:
         assert len(rules) == 1
         assert "Encryption" in rules[0]["content"]
 
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text)
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
+    )
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text
+    )
     async def test_temporal_recall(self, tmp_path):
         """Recall with since should filter to recent discoveries."""
         from datetime import datetime, timedelta
@@ -595,19 +684,31 @@ class TestMemoryIntegration:
         )
 
         # Store a recent discovery
-        await backend.remember_batch([
-            {"content": "New RDS instance discovered today", "importance": 0.8, "category": "store"},
-        ])
+        await backend.remember_batch(
+            [
+                {
+                    "content": "New RDS instance discovered today",
+                    "importance": 0.8,
+                    "category": "store",
+                },
+            ]
+        )
 
         # Recall since 7 days ago
         since = (datetime.now() - timedelta(days=7)).isoformat()
-        results = await backend.recall("store", limit=10, score_threshold=0.0, since=since)
+        results = await backend.recall(
+            "store", limit=10, score_threshold=0.0, since=since
+        )
         contents = [r["content"] for r in results]
         assert "New RDS instance discovered today" in contents
         assert "Old S3 bucket from last month" not in contents
 
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text)
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
+    )
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text
+    )
     async def test_pinned_rules_always_injected(self, tmp_path):
         """Pinned org rules should appear in on_before_run regardless of query."""
         from daita.plugins.memory.metadata import MemoryMetadata
@@ -632,8 +733,12 @@ class TestMemoryIntegration:
         assert len(pinned) == 1
         assert "encryption" in pinned[0]["content"]
 
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text)
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
+    )
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text
+    )
     async def test_query_facts_infrastructure(self, tmp_path):
         """query_facts should find structured facts about infrastructure."""
         backend = self._make_backend(tmp_path)
@@ -644,14 +749,38 @@ class TestMemoryIntegration:
                 {"content": "users-db is in us-west-2", "importance": 0.8},
             ],
             extra_metadata_list=[
-                {"extracted_facts": [
-                    {"entity": "orders-db", "relation": "hosted in", "value": "us-east-1", "temporal_context": None},
-                    {"entity": "orders-db", "relation": "type", "value": "PostgreSQL", "temporal_context": None},
-                ]},
-                {"extracted_facts": [
-                    {"entity": "users-db", "relation": "hosted in", "value": "us-west-2", "temporal_context": None},
-                    {"entity": "users-db", "relation": "type", "value": "PostgreSQL", "temporal_context": None},
-                ]},
+                {
+                    "extracted_facts": [
+                        {
+                            "entity": "orders-db",
+                            "relation": "hosted in",
+                            "value": "us-east-1",
+                            "temporal_context": None,
+                        },
+                        {
+                            "entity": "orders-db",
+                            "relation": "type",
+                            "value": "PostgreSQL",
+                            "temporal_context": None,
+                        },
+                    ]
+                },
+                {
+                    "extracted_facts": [
+                        {
+                            "entity": "users-db",
+                            "relation": "hosted in",
+                            "value": "us-west-2",
+                            "temporal_context": None,
+                        },
+                        {
+                            "entity": "users-db",
+                            "relation": "type",
+                            "value": "PostgreSQL",
+                            "temporal_context": None,
+                        },
+                    ]
+                },
             ],
         )
 
@@ -675,14 +804,24 @@ class TestMemoryIntegration:
         assert len(results) == 1
         assert results[0]["value"] == "PostgreSQL"
 
-    @patch("daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts)
+    @patch(
+        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
+    )
     async def test_batch_dedup_on_rescan(self, tmp_path):
         """Re-scanning should skip already-stored discoveries."""
         backend = self._make_backend(tmp_path)
 
         scan1 = [
-            {"content": "RDS: orders-db in us-east-1", "importance": 0.8, "category": "store"},
-            {"content": "RDS: users-db in us-east-1", "importance": 0.8, "category": "store"},
+            {
+                "content": "RDS: orders-db in us-east-1",
+                "importance": 0.8,
+                "category": "store",
+            },
+            {
+                "content": "RDS: users-db in us-east-1",
+                "importance": 0.8,
+                "category": "store",
+            },
         ]
 
         result1 = await backend.remember_batch(scan1)
@@ -695,8 +834,16 @@ class TestMemoryIntegration:
 
         # Partial overlap
         scan2 = [
-            {"content": "RDS: orders-db in us-east-1", "importance": 0.8, "category": "store"},
-            {"content": "S3: data-lake in us-west-2", "importance": 0.6, "category": "store"},
+            {
+                "content": "RDS: orders-db in us-east-1",
+                "importance": 0.8,
+                "category": "store",
+            },
+            {
+                "content": "S3: data-lake in us-west-2",
+                "importance": 0.6,
+                "category": "store",
+            },
         ]
         result3 = await backend.remember_batch(scan2)
         assert result3["stored"] == 1

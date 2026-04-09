@@ -38,11 +38,13 @@ def check_environment():
         missing.append("OPENAI_API_KEY=sk-...")
 
     # AWS: check for at least one auth method
-    has_aws = any([
-        os.getenv("AWS_ACCESS_KEY_ID"),
-        os.getenv("AWS_PROFILE"),
-        os.getenv("AWS_ROLE_ARN"),
-    ])
+    has_aws = any(
+        [
+            os.getenv("AWS_ACCESS_KEY_ID"),
+            os.getenv("AWS_PROFILE"),
+            os.getenv("AWS_ROLE_ARN"),
+        ]
+    )
     if not has_aws:
         missing.append("AWS credentials (AWS_ACCESS_KEY_ID/AWS_PROFILE/AWS_ROLE_ARN)")
 
@@ -55,7 +57,9 @@ def check_environment():
         print("  GITHUB_ORG       — GitHub org to scan (all repos)")
         print("  GITHUB_REPOS     — comma-separated owner/repo list")
         print("  AWS_REGIONS      — comma-separated (default: us-east-1)")
-        print("  AWS_SERVICES     — comma-separated (default: rds,dynamodb,s3,elasticache,redshift)")
+        print(
+            "  AWS_SERVICES     — comma-separated (default: rds,dynamodb,s3,elasticache,redshift)"
+        )
         sys.exit(1)
 
 
@@ -64,21 +68,17 @@ DEMO_QUESTIONS = [
     "Discover all our data stores. Batch-store each discovery in memory with "
     "category='store' and appropriate importance (0.8 for production, 0.6 for "
     "staging, 0.4 for dev). Then give me a summary grouped by environment.",
-
     # Q2: Query from memory without re-scanning (tests recall, list_by_category)
     "What production databases do we have? Check memory first — don't re-scan "
     "unless memory is empty. Show me their types and regions.",
-
     # Q3: Store an org rule + check memory stats (tests pinned rules, stats)
     "Remember this org rule: 'All production databases must have encryption "
     "enabled and automated backups configured.' Store it with importance=0.9 "
     "and category='rule'. Then show me memory stats (list_memories with "
     "include_stats=True) so I can see what we've cataloged.",
-
     # Q4: Temporal query (tests since/before filtering)
     "What infrastructure discoveries have been made in the last 24 hours? "
     "Use recall with since='24h'.",
-
     # Q5: Cross-reference memory (tests recall + list_by_category together)
     "Are there any stores discovered from GitHub that look like they might "
     "have real credentials? Cross-reference with our stored rules.",

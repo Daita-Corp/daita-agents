@@ -11,13 +11,16 @@ curator-generated human-readable summary, never written by the agent directly.
 
 import json
 import sqlite3
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import aiofiles
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 from .metadata import MemoryMetadata
 from .utils import build_where_clause, parse_metadata_json
+
+if TYPE_CHECKING:
+    from ...embeddings.base import BaseEmbeddingProvider
 
 
 def _find_project_root(start_path: Optional[Path] = None) -> Optional[Path]:
@@ -44,11 +47,10 @@ class LocalMemoryBackend:
     def __init__(
         self,
         workspace: str,
+        embedder: "BaseEmbeddingProvider",
         agent_id: Optional[str] = None,
         scope: str = "project",
         base_dir: Optional[Path] = None,
-        embedding_provider: str = "openai",
-        embedding_model: str = "text-embedding-3-small",
         max_chunks: int = 2000,
     ):
         self.workspace = workspace
@@ -76,9 +78,7 @@ class LocalMemoryBackend:
 
         self.max_chunks = max_chunks
         self.storage = FileStorage(self.workspace_dir, agent_id=agent_id)
-        self.search = SQLiteVectorSearch(
-            self.vector_db, embedding_provider, embedding_model
-        )
+        self.search = SQLiteVectorSearch(self.vector_db, embedder)
 
     async def remember(
         self,
@@ -86,6 +86,7 @@ class LocalMemoryBackend:
         category: Optional[str] = None,
         metadata: Optional[MemoryMetadata] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
+        index_content: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Store a memory: appends to today's daily log and indexes in the vector DB.
@@ -94,6 +95,9 @@ class LocalMemoryBackend:
         Args:
             extra_metadata: Optional dict merged into the stored metadata JSON.
                             Used by FactExtractor to attach "extracted_facts".
+            index_content: Cleaned text for embedding computation. When
+                provided, the embedding is computed from this instead of
+                ``content``. The original ``content`` is stored in the DB.
         """
         # Always write to daily log (human-readable history + curator input)
         await self.storage.append_to_daily_log(content, category)
@@ -108,7 +112,10 @@ class LocalMemoryBackend:
             )
 
         chunk_id = await self.search.store_chunk(
-            content, metadata, extra_metadata=extra_metadata
+            content,
+            metadata,
+            extra_metadata=extra_metadata,
+            index_content=index_content,
         )
 
         return {
@@ -704,14 +711,31 @@ class LocalMemoryBackend:
 
     async def regenerate_memory_md(self, min_importance: float = 0.4) -> str:
         """
-        Regenerate MEMORY.md from the vector DB. Curator-only write path.
+        Regenerate MEMORY.md from the vector DB.
 
         Groups memories by category, sorts by importance descending.
-        This replaces the old append-only approach - MEMORY.md is always
-        a clean, current snapshot of what's worth remembering.
+        Skips regeneration if the DB hasn't changed since the last call
+        (shared-workspace safe: multiple plugin instances calling stop()
+        on the same workspace won't redundantly rewrite the file).
         """
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
+
+        # Quick fingerprint: skip if DB unchanged since last regeneration.
+        # Stored on disk so multiple plugin instances sharing a workspace
+        # don't redundantly rewrite the same file.
+        cursor.execute("SELECT COUNT(*), MAX(rowid) FROM chunks")
+        row = cursor.fetchone()
+        fingerprint = f"{row[0]}:{row[1]}" if row else "0:0"
+        fingerprint_file = self.workspace_dir / ".regen_fingerprint"
+        if fingerprint_file.exists():
+            try:
+                if fingerprint_file.read_text().strip() == fingerprint:
+                    conn.close()
+                    return None  # DB unchanged, skip regeneration
+            except Exception:
+                pass
+
         cursor.execute(
             "SELECT content, metadata FROM chunks WHERE file_path = 'memory://direct' OR file_path LIKE '%MEMORY%'"
         )
@@ -744,6 +768,12 @@ class LocalMemoryBackend:
         async with aiofiles.open(self.memory_file, "w", encoding="utf-8") as f:
             await f.write("".join(lines))
 
+        # Persist fingerprint so other instances sharing this workspace skip
+        try:
+            fingerprint_file.write_text(fingerprint)
+        except Exception:
+            pass
+
         return str(self.memory_file)
 
     async def update_chunk_metadata(self, chunk_id: str, updates: dict):
@@ -764,6 +794,56 @@ class LocalMemoryBackend:
                 pass
         conn.commit()
         conn.close()
+
+    async def append_reinforcement(
+        self, chunk_id: str, reinforcement: dict, importance_delta: float = 0.0
+    ):
+        """Append a reinforcement record and optionally adjust importance.
+
+        Unlike update_chunk_metadata() which overwrites keys, this appends
+        to the reinforcements list and applies an importance delta atomically.
+        """
+        conn = sqlite3.connect(str(self.vector_db))
+        cursor = conn.cursor()
+        cursor.execute("SELECT metadata FROM chunks WHERE chunk_id = ?", (chunk_id,))
+        row = cursor.fetchone()
+        if row and row[0]:
+            try:
+                meta = json.loads(row[0])
+                if "reinforcements" not in meta or meta["reinforcements"] is None:
+                    meta["reinforcements"] = []
+                meta["reinforcements"].append(reinforcement)
+                if importance_delta != 0.0:
+                    current = meta.get("importance", 0.5)
+                    meta["importance"] = max(0.0, min(1.0, current + importance_delta))
+                cursor.execute(
+                    "UPDATE chunks SET metadata = ? WHERE chunk_id = ?",
+                    (json.dumps(meta), chunk_id),
+                )
+            except Exception:
+                pass
+        conn.commit()
+        conn.close()
+
+    async def get_chunk(self, chunk_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single memory chunk by ID. Used by graph expansion."""
+        conn = sqlite3.connect(str(self.vector_db))
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT chunk_id, content, metadata FROM chunks WHERE chunk_id = ?",
+            (chunk_id,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        metadata = parse_metadata_json(row[2]) if row[2] else {}
+        return {
+            "chunk_id": row[0],
+            "content": row[1],
+            "metadata": metadata,
+            "score": 0.0,
+        }
 
     async def delete_chunks(self, chunk_ids: list):
         """Hard-delete chunks from the local vector DB."""

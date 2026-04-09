@@ -1,5 +1,5 @@
 # Daita Agents Framework
-daita-agents==0.9.0
+daita-agents==0.14.0
 
 # LLM provider
 openai>=1.0.0

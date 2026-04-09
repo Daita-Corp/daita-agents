@@ -15,7 +15,11 @@ receive a structured markdown report with key findings, analysis, and citations.
 
 - Full relay pipeline across four specialised agents
 - `WebSearchPlugin` (Tavily) for live web search
-- `MemoryPlugin` for shared research context
+- `MemoryPlugin` with shared `deep_research` workspace across all agents
+- **Working memory** on Orchestrator, Researcher, and Analyst for session-scoped scratch notes
+- **Fact extraction** on Researcher and Analyst — auto-extracts entity-relation-value triples
+- **Memory graph** on Analyst and Report Writer — traverse entity connections across findings
+- **Reinforcement learning** on Analyst — mark findings as positive/negative to improve recall
 - `LineagePlugin` on the Analyst for data flow tracking
 - Pure-Python tools fully tested without any API keys
 
@@ -57,12 +61,12 @@ pytest tests/ -v
 
 ## How it works
 
-| Agent | Input | Output | Tools / Plugins |
-|---|---|---|---|
-| Orchestrator | Research query | Research plan (JSON) | `decompose_query`, MemoryPlugin |
-| Web Researcher | Research plan | Raw findings (JSON) | WebSearchPlugin, MemoryPlugin |
-| Analyst | Raw findings | Synthesis (JSON) | `extract_scope`, MemoryPlugin, LineagePlugin |
-| Report Writer | Synthesis | Markdown report | `format_citation`, `build_report_structure`, MemoryPlugin |
+| Agent | Input | Output | Tools / Plugins | Memory Features |
+|---|---|---|---|---|
+| Orchestrator | Research query | Research plan (JSON) | `decompose_query`, MemoryPlugin | working memory |
+| Web Researcher | Research plan | Raw findings (JSON) | WebSearchPlugin, MemoryPlugin | working memory, fact extraction |
+| Analyst | Raw findings | Synthesis (JSON) | `extract_scope`, MemoryPlugin, LineagePlugin | working memory, fact extraction, memory graph, reinforcement |
+| Report Writer | Synthesis | Markdown report | `format_citation`, `build_report_structure`, MemoryPlugin | memory graph |
 
 ## Project structure
 

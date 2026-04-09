@@ -19,7 +19,7 @@ Key components:
 - AgentConfig           — Configure retry policies, LLM settings, and more
 """
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 # ---------------------------------------------------------------------------
 # Core
@@ -86,6 +86,11 @@ from .core.assertions import ItemAssertion
 from .llm.factory import create_llm_provider
 
 # ---------------------------------------------------------------------------
+# Embedding providers — subclass BaseEmbeddingProvider for custom providers
+# ---------------------------------------------------------------------------
+from .embeddings import BaseEmbeddingProvider
+
+# ---------------------------------------------------------------------------
 # Advanced — reliability, scaling, tracing (importable from submodules too)
 # ---------------------------------------------------------------------------
 # from daita.core.reliability import TaskManager, CircuitBreaker, BackpressureController
@@ -146,6 +151,8 @@ __all__ = [
     "ItemAssertion",
     # LLM
     "create_llm_provider",
+    # Embeddings
+    "BaseEmbeddingProvider",
     # Version
     "__version__",
 ]

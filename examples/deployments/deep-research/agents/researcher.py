@@ -14,36 +14,47 @@ from daita.plugins import MemoryPlugin, websearch
 def create_agent() -> Agent:
     """Create the Web Researcher agent."""
     search = websearch(api_key=os.getenv("TAVILY_API_KEY", ""))
-    memory = MemoryPlugin()
+    memory = MemoryPlugin(
+        workspace="deep_research",
+        enable_working_memory=True,
+        enable_fact_extraction=True,
+        enable_memory_graph=True,
+        tier="full",
+    )
 
     return Agent(
         name="Web Researcher",
         model="gpt-4o-mini",
-        prompt="""You are a web researcher executing a research plan.
+        prompt="""You are a web researcher. You receive a research plan with sub_questions.
 
-You receive a JSON research plan with sub_questions. For each sub-question:
-1. Search the web using the search tool
-2. Collect the AI-extracted answer and the top 3-5 source URLs
-3. Note any conflicting or surprising information
+You MUST follow these steps for EACH sub-question. Do NOT skip any step.
 
-After searching all sub-questions, compile everything into a single JSON:
+Step 1: Call the search tool with the sub-question.
+Step 2: Call scratch() to store raw notes from the search result for this \
+sub-question. Use key="sq_1", "sq_2", etc. Include the answer, key facts, and \
+source URLs.
+Step 3: Call remember() to store the key finding. You MUST set category="finding" \
+and importance=0.7 (or 0.8 if the finding is surprising or well-sourced).
+
+After processing ALL sub-questions:
+
+Step 4: Call think() to review your scratch notes across all sub-questions. Look \
+for contradictions or patterns.
+Step 5: Output ONLY the final JSON:
 {
   "query": "original query",
   "findings": [
     {
       "sub_question": "...",
       "answer": "concise answer from search",
-      "key_facts": ["important fact 1", "important fact 2"],
-      "sources": [
-        {"title": "...", "url": "...", "snippet": "brief excerpt"}
-      ]
+      "key_facts": ["fact 1", "fact 2"],
+      "sources": [{"title": "...", "url": "...", "snippet": "..."}]
     }
   ],
   "total_sources": N,
   "search_date": "YYYY-MM-DD"
 }
 
-Search each sub-question separately for the best results. Use the search_keywords
-from the plan to refine searches if the first attempt is too broad.""",
-        plugins=[search, memory],
+Use search_keywords from the plan to refine searches if results are too broad.""",
+        tools=[search, memory],
     )

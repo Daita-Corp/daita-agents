@@ -25,14 +25,22 @@ EXTRACTION_PROMPT = """Extract structured facts from the memory text below.
 MEMORY: {content}
 
 Return a JSON array of fact objects. Each object must have:
-  "entity"           — the subject (person, system, concept, table, etc.)
+  "entity"           — the subject (person, company, technology, material, table, etc.)
   "relation"         — the relationship or property (e.g. "prefers", "has FK", "changed to")
   "value"            — the object or value (specific and concrete)
   "temporal_context" — time qualifier if present, or null (e.g. "as of 2024-01", "before migration v5")
 
 Rules:
 - Extract every distinct fact; a single sentence may yield multiple objects.
-- Be concise: entity and value should be specific identifiers, not full sentences.
+- Entities must be specific nouns — companies, technologies, materials, standards, people. \
+NOT descriptive phrases or clauses.
+- Values must be specific attributes or states, NOT raw dollar amounts or large numbers \
+on their own.
+- Time expressions ("as of 2023", "before Q2", "since March") go in temporal_context, \
+NEVER in entity or value.
+- Generic words like "challenges", "efforts", "companies", "advantages" are NOT entities. \
+Use the specific name instead.
+- Be concise: entity and value should be 1-3 words, not full sentences.
 - If there is no time qualifier, set temporal_context to null.
 - Return [] if the text contains no extractable facts (e.g. it is purely procedural).
 - Return JSON only, no explanation.
@@ -42,7 +50,13 @@ Example output:
 [
   {{"entity": "user", "relation": "prefers", "value": "dark mode", "temporal_context": null}},
   {{"entity": "API rate limit", "relation": "raised to", "value": "1000/min", "temporal_context": "as of January"}}
-]"""
+]
+
+WRONG — do NOT produce entities like these:
+  "as of 2023"                              → this is a temporal_context
+  "challenges and limitations"              → too generic
+  "technical hurdles like dendrite formation"→ too long, use "dendrite formation"
+  "USD 1,359.18 million"                    → raw number, not an entity"""
 
 
 @dataclass

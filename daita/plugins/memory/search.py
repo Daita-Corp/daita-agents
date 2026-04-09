@@ -6,12 +6,11 @@ Supports importance-weighted scoring and temporal decay.
 """
 
 import json
-import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 
@@ -22,6 +21,9 @@ from .utils import (
     merge_metadata_json,
     parse_metadata_json,
 )
+
+if TYPE_CHECKING:
+    from ...embeddings.base import BaseEmbeddingProvider
 
 
 @dataclass
@@ -42,29 +44,13 @@ class SQLiteVectorSearch:
     def __init__(
         self,
         db_path: Path,
-        embedding_provider: str = "openai",
-        embedding_model: str = "text-embedding-3-small",
+        embedder: "BaseEmbeddingProvider",
     ):
         self.db_path = db_path
-        self.embedding_provider = embedding_provider
-        self.embedding_model = embedding_model
-        self._embed_cache: Dict[str, List[float]] = {}
-
-        if embedding_provider == "openai":
-            from openai import AsyncOpenAI
-
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                raise ValueError(
-                    "OPENAI_API_KEY environment variable required for embeddings"
-                )
-            self.embedder = AsyncOpenAI(api_key=api_key)
-        else:
-            raise NotImplementedError(
-                f"Provider {embedding_provider} not yet supported"
-            )
+        self.embedder = embedder
 
         self._init_database()
+        self._validate_embedding_dimensions()
 
     def _init_database(self):
         conn = sqlite3.connect(str(self.db_path))
@@ -105,46 +91,57 @@ class SQLiteVectorSearch:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # Metadata table for embedding config tracking
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS embedding_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
         conn.commit()
         conn.close()
 
+    def _validate_embedding_dimensions(self):
+        """Validate that the configured embedding dimensions match stored data.
+
+        On first run, stores the dimension. On subsequent runs, raises
+        ValueError if the configured provider has a different dimension.
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT value FROM embedding_meta WHERE key = 'embedding_dim'")
+        row = cursor.fetchone()
+
+        expected_dim = self.embedder.dimensions
+
+        if row is None:
+            # First run — record the dimension
+            cursor.execute(
+                "INSERT INTO embedding_meta (key, value) VALUES (?, ?)",
+                ("embedding_dim", str(expected_dim)),
+            )
+            conn.commit()
+        else:
+            stored_dim = int(row[0])
+            if stored_dim != expected_dim:
+                conn.close()
+                raise ValueError(
+                    f"Embedding dimension mismatch: stored data has {stored_dim} dimensions "
+                    f"but the configured provider ({self.embedder.provider_name}/{self.embedder.model}) "
+                    f"produces {expected_dim} dimensions. To switch providers, re-index your "
+                    f"memory by deleting {self.db_path} and re-ingesting."
+                )
+
+        conn.close()
+
     async def embed_text(self, text: str) -> List[float]:
-        if text in self._embed_cache:
-            return self._embed_cache[text]
-        response = await self.embedder.embeddings.create(
-            model=self.embedding_model, input=text
-        )
-        embedding = response.data[0].embedding
-        self._embed_cache[text] = embedding
-        return embedding
+        return await self.embedder.embed_text(text)
 
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        """Batch embed multiple texts in a single API call.
-
-        Returns embeddings in the same order as the input texts.
-        Leverages the cache for already-seen texts.
-        """
-        results: List[Optional[List[float]]] = [None] * len(texts)
-        uncached_indices = []
-        uncached_texts = []
-
-        for i, text in enumerate(texts):
-            if text in self._embed_cache:
-                results[i] = self._embed_cache[text]
-            else:
-                uncached_indices.append(i)
-                uncached_texts.append(text)
-
-        if uncached_texts:
-            response = await self.embedder.embeddings.create(
-                model=self.embedding_model, input=uncached_texts
-            )
-            for j, data in enumerate(response.data):
-                idx = uncached_indices[j]
-                self._embed_cache[uncached_texts[j]] = data.embedding
-                results[idx] = data.embedding
-
-        return results
+        """Batch embed multiple texts, delegating caching to the provider."""
+        return await self.embedder.embed_texts(texts)
 
     async def store_chunk(
         self,
@@ -152,6 +149,7 @@ class SQLiteVectorSearch:
         metadata: MemoryMetadata,
         chunk_id: Optional[str] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
+        index_content: Optional[str] = None,
     ) -> str:
         """
         Store a single chunk directly into the vector DB.
@@ -162,6 +160,11 @@ class SQLiteVectorSearch:
         Args:
             extra_metadata: Optional dict merged into the metadata JSON before
                             storage. Used to attach e.g. "extracted_facts".
+            index_content: Cleaned text for embedding computation. When
+                provided, the embedding is computed from this instead of
+                ``content``, but the original ``content`` is stored in the
+                DB. This separates the storage representation (full text)
+                from the index representation (factual signal only).
 
         Returns:
             chunk_id of the stored chunk
@@ -180,8 +183,9 @@ class SQLiteVectorSearch:
 
         conn.close()
 
-        # Generate embedding only for new chunks
-        embedding = await self.embed_text(content)
+        # Generate embedding — use index_content (cleaned) when available
+        # so the vector captures factual signal, not formatting template.
+        embedding = await self.embed_text(index_content or content)
 
         metadata_json = merge_metadata_json(metadata, extra_metadata)
 
@@ -399,6 +403,14 @@ class SQLiteVectorSearch:
         # Importance boost: range [-0.1, +0.1]
         importance = metadata_dict.get("importance", 0.5)
         importance_boost = (importance - 0.5) * 0.2
+
+        # Reinforcement signal: net positive boosts up to +0.05, net negative penalizes
+        reinforcements = metadata_dict.get("reinforcements")
+        if reinforcements:
+            positives = sum(1 for r in reinforcements if r.get("outcome") == "positive")
+            negatives = sum(1 for r in reinforcements if r.get("outcome") == "negative")
+            net = (positives - negatives) / len(reinforcements)
+            importance_boost += net * 0.05
 
         # Temporal decay (pinned memories are exempt)
         decay = 1.0

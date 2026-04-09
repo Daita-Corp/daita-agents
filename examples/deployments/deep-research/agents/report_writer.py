@@ -61,18 +61,31 @@ async def build_report_structure(query: str, section_count: int) -> Dict[str, An
 
 def create_agent() -> Agent:
     """Create the Report Writer agent."""
-    memory = MemoryPlugin()
+    memory = MemoryPlugin(
+        workspace="deep_research",
+        enable_memory_graph=True,
+        tier="analysis",
+    )
 
     return Agent(
         name="Report Writer",
         model="gpt-4o-mini",
-        prompt="""You are a research report writer. Your job is to turn synthesis \
-JSON into a clear, professional markdown report with inline citations.
+        prompt="""You are a research report writer. Turn synthesis JSON into a \
+professional markdown report with inline citations.
 
-Process:
-1. Call build_report_structure to get the template and style guidance.
-2. Call format_citation for each source to build the References section.
-3. Write the full report in markdown:
+You MUST follow these steps in order. Do NOT skip any step.
+
+Step 1: Call build_report_structure(query, section_count) to get the template.
+Step 2: Call recall(query="synthesis", category="synthesis") to retrieve the \
+Analyst's synthesis from shared memory.
+Step 3: Call recall(query="research findings", category="finding", limit=10) to \
+retrieve all key findings from shared memory.
+Step 4: Pick 2-3 key entities (companies, technologies) from the synthesis. For \
+each one, call traverse_memory(entity="entity name") to discover additional \
+context and connections that enrich the report.
+Step 5: Call format_citation(title, url, index) for each source to build the \
+References section. Number them starting at 1.
+Step 6: Write and output the full report in markdown:
 
 # [Research Query]
 
@@ -80,22 +93,19 @@ Process:
 [2-3 paragraphs — the most important findings]
 
 ## Key Findings
-[Numbered list of major findings with inline citations like [1]]
+[Numbered list with inline citations like [1]]
 
 ## Detailed Analysis
-[Thematic sections — one H3 per major theme, with evidence and citations]
+[Thematic sections — one H3 per theme, with evidence and citations. Use \
+information from traverse_memory to add depth.]
 
 ## Knowledge Gaps & Limitations
 [What remains uncertain or was not covered]
 
 ## References
-[Numbered list of formatted citations from format_citation]
+[Numbered list from format_citation]
 
-Style rules:
-- Use [N] inline citations immediately after the claim they support
-- Lead each Key Finding with the most important number or fact
-- Write for a reader who is smart but not a domain expert
-- Do not pad — every sentence should add value""",
-        tools=[format_citation, build_report_structure],
-        plugins=[memory],
+Style: use [N] inline citations after claims, lead findings with the key number \
+or fact, write for informed non-specialists, every sentence adds value.""",
+        tools=[format_citation, build_report_structure, memory],
     )
