@@ -137,9 +137,7 @@ class MemoryGraph:
             entity_id = _make_entity_id(entity_name)
 
             # Upsert ENTITY node with specificity scoring and mention tracking
-            entity_node = await self._make_scored_entity_node(
-                entity_id, entity_name
-            )
+            entity_node = await self._make_scored_entity_node(entity_id, entity_name)
             await self.backend.add_node(entity_node)
 
             # MEMORY --MENTIONS--> ENTITY
@@ -158,9 +156,7 @@ class MemoryGraph:
             value = entity_info.get("value")
             if value and value != entity_name:
                 value_id = _make_entity_id(value)
-                value_node = await self._make_scored_entity_node(
-                    value_id, value
-                )
+                value_node = await self._make_scored_entity_node(value_id, value)
                 await self.backend.add_node(value_node)
 
                 # MEMORY --MENTIONS--> VALUE_ENTITY
@@ -221,12 +217,9 @@ class MemoryGraph:
             )
             mention_count = existing_props.get("mention_count", 1) + 1
 
-        promoted = (
-            specificity >= self._auto_promote_specificity
-            or (
-                specificity >= self._mention_promote_specificity
-                and mention_count >= self._mention_promote_count
-            )
+        promoted = specificity >= self._auto_promote_specificity or (
+            specificity >= self._mention_promote_specificity
+            and mention_count >= self._mention_promote_count
         )
 
         return AgentGraphNode(
@@ -507,9 +500,7 @@ class MemoryGraph:
                     continue  # Don't traverse past memory nodes
                 elif node_id.startswith("entity:"):
                     # Skip unpromoted entities (default True for legacy nodes)
-                    node_props = node_data.get("data", node_data).get(
-                        "properties", {}
-                    )
+                    node_props = node_data.get("data", node_data).get("properties", {})
                     if not node_props.get("promoted", True):
                         continue
                     name = node_data.get("data", node_data).get(

@@ -223,7 +223,9 @@ class TestEntityQualityFiltering:
         assert MemoryGraph._is_low_quality_entity("customer_segments") is False
         assert MemoryGraph._is_low_quality_entity("orders.total") is False
         assert MemoryGraph._is_low_quality_entity("customers") is False
-        assert MemoryGraph._is_low_quality_entity("true") is False  # structural pass, scored low
+        assert (
+            MemoryGraph._is_low_quality_entity("true") is False
+        )  # structural pass, scored low
 
     def test_filter_removes_structurally_invalid(self):
         pairs = [
@@ -349,9 +351,17 @@ class TestEntityPromotion:
         backend._graph_path = graph_path
         mg._backend = backend
 
-        await mg.index_memory("chunk-1", "Toyota is investing in solid-state batteries.", facts=[
-            {"entity": "Toyota", "relation": "investing in", "value": "solid-state batteries"},
-        ])
+        await mg.index_memory(
+            "chunk-1",
+            "Toyota is investing in solid-state batteries.",
+            facts=[
+                {
+                    "entity": "Toyota",
+                    "relation": "investing in",
+                    "value": "solid-state batteries",
+                },
+            ],
+        )
 
         node = await backend.get_node("entity:toyota")
         assert node is not None
@@ -369,9 +379,13 @@ class TestEntityPromotion:
         backend._graph_path = graph_path
         mg._backend = backend
 
-        await mg.index_memory("chunk-1", "The customers table has a tier column.", facts=[
-            {"entity": "customers", "relation": "has column", "value": "tier"},
-        ])
+        await mg.index_memory(
+            "chunk-1",
+            "The customers table has a tier column.",
+            facts=[
+                {"entity": "customers", "relation": "has column", "value": "tier"},
+            ],
+        )
 
         node = await backend.get_node("entity:customers")
         assert node is not None
@@ -388,15 +402,23 @@ class TestEntityPromotion:
         backend._graph_path = graph_path
         mg._backend = backend
 
-        await mg.index_memory("chunk-1", "customers table", facts=[
-            {"entity": "customers", "relation": "is", "value": "table"},
-        ])
+        await mg.index_memory(
+            "chunk-1",
+            "customers table",
+            facts=[
+                {"entity": "customers", "relation": "is", "value": "table"},
+            ],
+        )
         node = await backend.get_node("entity:customers")
         assert node.properties["promoted"] is False
 
-        await mg.index_memory("chunk-2", "customers table has tier", facts=[
-            {"entity": "customers", "relation": "has column", "value": "tier"},
-        ])
+        await mg.index_memory(
+            "chunk-2",
+            "customers table has tier",
+            facts=[
+                {"entity": "customers", "relation": "has column", "value": "tier"},
+            ],
+        )
         node = await backend.get_node("entity:customers")
         assert node.properties["promoted"] is True
         assert node.properties["mention_count"] == 2
@@ -411,9 +433,13 @@ class TestEntityPromotion:
         backend._graph_path = graph_path
         mg._backend = backend
 
-        await mg.index_memory("chunk-1", "The value is true.", facts=[
-            {"entity": "true", "relation": "is", "value": "enabled"},
-        ])
+        await mg.index_memory(
+            "chunk-1",
+            "The value is true.",
+            facts=[
+                {"entity": "true", "relation": "is", "value": "enabled"},
+            ],
+        )
 
         node = await backend.get_node("entity:true")
         assert node is not None
@@ -431,9 +457,13 @@ class TestEntityPromotion:
         mg._backend = backend
 
         # Index with a promoted entity and an unpromoted one
-        await mg.index_memory("chunk-1", "Toyota uses dark mode.", facts=[
-            {"entity": "Toyota", "relation": "uses", "value": "dark mode"},
-        ])
+        await mg.index_memory(
+            "chunk-1",
+            "Toyota uses dark mode.",
+            facts=[
+                {"entity": "Toyota", "relation": "uses", "value": "dark mode"},
+            ],
+        )
 
         result = await mg.traverse_entity("Toyota")
         entity_names = [e["name"] for e in result["connected_entities"]]
@@ -453,9 +483,13 @@ class TestEntityPromotion:
         backend._graph_path = graph_path
         mg._backend = backend
 
-        await mg.index_memory("chunk-1", "Toyota is great.", facts=[
-            {"entity": "Toyota", "relation": "is", "value": "great"},
-        ])
+        await mg.index_memory(
+            "chunk-1",
+            "Toyota is great.",
+            facts=[
+                {"entity": "Toyota", "relation": "is", "value": "great"},
+            ],
+        )
 
         memory_node = await backend.get_node("memory:chunk-1")
         assert memory_node.properties["workspace"] == "test-ws"

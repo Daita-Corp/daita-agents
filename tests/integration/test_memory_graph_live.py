@@ -143,8 +143,12 @@ class TestFactExtractionQuality:
         print(f"  Extracted {len(facts)} facts: {[f.entity for f in facts]}")
 
         # Should find real entities
-        assert any("postgresql" in n for n in all_names), f"Missing PostgreSQL in {all_names}"
-        assert any("orders" in n or "etl" in n for n in all_names), f"Missing orders/ETL in {all_names}"
+        assert any(
+            "postgresql" in n for n in all_names
+        ), f"Missing PostgreSQL in {all_names}"
+        assert any(
+            "orders" in n or "etl" in n for n in all_names
+        ), f"Missing orders/ETL in {all_names}"
 
         # Should not produce junk
         junk = {"true", "false", "null", "error", "status", "active"}
@@ -167,7 +171,9 @@ class TestFactExtractionQuality:
         # Company names should appear
         entity_lower = {e.lower() for e in entities}
         assert any("toyota" in e for e in entity_lower), f"Missing Toyota in {entities}"
-        assert any("quantumscape" in e for e in entity_lower), f"Missing QuantumScape in {entities}"
+        assert any(
+            "quantumscape" in e for e in entity_lower
+        ), f"Missing QuantumScape in {entities}"
 
     async def test_noisy_content_minimal_facts(self, extractor):
         """Vague/noisy content should produce few or no facts."""
@@ -178,7 +184,13 @@ class TestFactExtractionQuality:
 
         # Even if LLM extracts some, the scoring system will handle them
         # But the prompt should suppress most junk at source
-        junk = {"true", "false", "error handling", "best practices", "unauthorized access"}
+        junk = {
+            "true",
+            "false",
+            "error handling",
+            "best practices",
+            "unauthorized access",
+        }
         found_junk = entities & junk
         assert len(found_junk) <= 1, f"Too much junk from noisy content: {found_junk}"
 
@@ -198,9 +210,7 @@ class TestEntityScoringAndPromotion:
         # Check promoted entities
         g = await graph.backend.load_graph()
         entity_nodes = {
-            nid: g.nodes[nid]
-            for nid in g.nodes
-            if nid.startswith("entity:")
+            nid: g.nodes[nid] for nid in g.nodes if nid.startswith("entity:")
         }
 
         promoted = []
@@ -225,19 +235,25 @@ class TestEntityScoringAndPromotion:
 
         # Technical identifiers and proper nouns should be promoted
         promoted_names = {e["name"].lower() for e in promoted}
-        assert any("postgresql" in n for n in promoted_names) or \
-               any("etl" in n or "customer_segments" in n or "orders" in n for n in promoted_names), \
-            f"Expected technical entities promoted, got: {promoted_names}"
+        assert any("postgresql" in n for n in promoted_names) or any(
+            "etl" in n or "customer_segments" in n or "orders" in n
+            for n in promoted_names
+        ), f"Expected technical entities promoted, got: {promoted_names}"
 
         # All nodes should have workspace metadata
         for entry in promoted + unpromoted:
-            assert entry["workspace"] == "integration-test", \
-                f"Missing workspace on {entry['name']}"
+            assert (
+                entry["workspace"] == "integration-test"
+            ), f"Missing workspace on {entry['name']}"
 
         # All should have scoring metadata
         for entry in promoted + unpromoted:
-            assert entry["specificity"] is not None, f"Missing specificity on {entry['name']}"
-            assert entry["mention_count"] is not None, f"Missing mention_count on {entry['name']}"
+            assert (
+                entry["specificity"] is not None
+            ), f"Missing specificity on {entry['name']}"
+            assert (
+                entry["mention_count"] is not None
+            ), f"Missing mention_count on {entry['name']}"
             assert entry["promoted"] is not None, f"Missing promoted on {entry['name']}"
 
         # Timing sanity
@@ -260,8 +276,9 @@ class TestEntityScoringAndPromotion:
                 promoted_names.add(name.lower())
 
         print(f"  Promoted: {promoted_names}")
-        assert any("toyota" in n for n in promoted_names), \
-            f"Toyota should be promoted, got: {promoted_names}"
+        assert any(
+            "toyota" in n for n in promoted_names
+        ), f"Toyota should be promoted, got: {promoted_names}"
 
     async def test_noisy_entities_not_promoted(self, extractor, graph):
         """Junk entities from noisy content should not be promoted."""
@@ -285,8 +302,12 @@ class TestEntityScoringAndPromotion:
 
         # Junk should not be promoted on first mention
         junk_promoted = promoted_names & {
-            "true", "false", "null", "error handling",
-            "best practices", "unauthorized access",
+            "true",
+            "false",
+            "null",
+            "error handling",
+            "best practices",
+            "unauthorized access",
         }
         assert not junk_promoted, f"Junk was promoted: {junk_promoted}"
 
@@ -309,26 +330,30 @@ class TestEntityScoringAndPromotion:
             props = data.get("data", data).get("properties", {})
             mc = props.get("mention_count", 0)
             if mc >= 2:
-                multi_mention.append({
-                    "name": data.get("data", data).get("name", nid),
-                    "mention_count": mc,
-                    "specificity": props.get("specificity"),
-                    "promoted": props.get("promoted"),
-                })
+                multi_mention.append(
+                    {
+                        "name": data.get("data", data).get("name", nid),
+                        "mention_count": mc,
+                        "specificity": props.get("specificity"),
+                        "promoted": props.get("promoted"),
+                    }
+                )
 
         print(f"  Multi-mention entities: {multi_mention}")
 
         # At least one entity should have been mentioned twice
         # (customer_segments or postgresql appear in both memories)
-        assert len(multi_mention) >= 1, \
-            "Expected at least one entity with mention_count >= 2"
+        assert (
+            len(multi_mention) >= 1
+        ), "Expected at least one entity with mention_count >= 2"
 
         # Multi-mention entities with specificity >= 0.3 should be promoted
         for entry in multi_mention:
             if entry["specificity"] >= 0.3:
-                assert entry["promoted"], \
-                    f"{entry['name']} has mention_count={entry['mention_count']} " \
+                assert entry["promoted"], (
+                    f"{entry['name']} has mention_count={entry['mention_count']} "
                     f"and specificity={entry['specificity']} but is not promoted"
+                )
 
 
 class TestPromotionLifecycle:
@@ -348,18 +373,23 @@ class TestPromotionLifecycle:
         facts_1 = [
             {"entity": "customers", "relation": "has column", "value": "tier"},
         ]
-        await graph.index_memory("chunk-a", "The customers table has a tier column.", facts=facts_1)
+        await graph.index_memory(
+            "chunk-a", "The customers table has a tier column.", facts=facts_1
+        )
 
         node = await graph.backend.get_node("entity:customers")
         assert node.properties["mention_count"] == 1
-        assert node.properties["promoted"] is False, "Should not promote on first mention"
+        assert (
+            node.properties["promoted"] is False
+        ), "Should not promote on first mention"
         specificity = node.properties["specificity"]
         assert 0.3 <= specificity < 0.7, f"Unexpected specificity: {specificity}"
 
         # Traversal from a connected promoted entity should NOT show "customers"
         result = await graph.traverse_entity("tier")
         unpromoted_in_result = [
-            e for e in result.get("connected_entities", [])
+            e
+            for e in result.get("connected_entities", [])
             if e["name"].lower() == "customers"
         ]
         assert not unpromoted_in_result, "Unpromoted 'customers' leaked into traversal"
@@ -368,7 +398,9 @@ class TestPromotionLifecycle:
         facts_2 = [
             {"entity": "customers", "relation": "joined with", "value": "orders"},
         ]
-        await graph.index_memory("chunk-b", "Joining customers with orders.", facts=facts_2)
+        await graph.index_memory(
+            "chunk-b", "Joining customers with orders.", facts=facts_2
+        )
 
         node = await graph.backend.get_node("entity:customers")
         assert node.properties["mention_count"] == 2
@@ -385,20 +417,29 @@ class TestPromotionLifecycle:
         assert node.properties["specificity"] < 0.3
 
         facts_2 = [{"entity": "data", "relation": "processed by", "value": "Spark"}]
-        await graph.index_memory("chunk-b", "Data is processed by Spark.", facts=facts_2)
+        await graph.index_memory(
+            "chunk-b", "Data is processed by Spark.", facts=facts_2
+        )
 
         node = await graph.backend.get_node("entity:data")
         assert node.properties["mention_count"] == 2
-        assert node.properties["promoted"] is False, \
-            "Very low specificity should not promote even with 2 mentions"
+        assert (
+            node.properties["promoted"] is False
+        ), "Very low specificity should not promote even with 2 mentions"
 
     async def test_high_specificity_promoted_immediately(self, graph):
         """Proper nouns and technical IDs don't need multiple mentions."""
         facts = [
             {"entity": "PostgreSQL", "relation": "version", "value": "16.2"},
-            {"entity": "etl_orders_agg", "relation": "writes to", "value": "customer_segments"},
+            {
+                "entity": "etl_orders_agg",
+                "relation": "writes to",
+                "value": "customer_segments",
+            },
         ]
-        await graph.index_memory("chunk-a", "PostgreSQL 16.2 runs etl_orders_agg.", facts=facts)
+        await graph.index_memory(
+            "chunk-a", "PostgreSQL 16.2 runs etl_orders_agg.", facts=facts
+        )
 
         pg = await graph.backend.get_node("entity:postgresql")
         assert pg.properties["promoted"] is True
@@ -439,8 +480,16 @@ class TestPromotionLifecycle:
     async def test_mention_count_increments_correctly_across_many_memories(self, graph):
         """Mention count should increment for each distinct memory, not each fact."""
         for i in range(5):
-            facts = [{"entity": "customers", "relation": "queried in", "value": f"pipeline_{i}"}]
-            await graph.index_memory(f"chunk-{i}", f"Query customers in pipeline_{i}.", facts=facts)
+            facts = [
+                {
+                    "entity": "customers",
+                    "relation": "queried in",
+                    "value": f"pipeline_{i}",
+                }
+            ]
+            await graph.index_memory(
+                f"chunk-{i}", f"Query customers in pipeline_{i}.", facts=facts
+            )
 
         node = await graph.backend.get_node("entity:customers")
         assert node.properties["mention_count"] == 5
@@ -487,8 +536,9 @@ class TestTraversalWithPromotion:
             entity_id = f"entity:{entity['name'].strip().lower()}"
             node = await graph.backend.get_node(entity_id)
             if node:
-                assert node.properties.get("promoted", True), \
-                    f"Unpromoted entity '{entity['name']}' leaked into traversal"
+                assert node.properties.get(
+                    "promoted", True
+                ), f"Unpromoted entity '{entity['name']}' leaked into traversal"
 
         assert t.elapsed < 1.0, f"Traversal too slow: {t.elapsed:.1f}s"
 
@@ -516,8 +566,9 @@ class TestTraversalWithPromotion:
         for mem in result["memories"]:
             node = await graph.backend.get_node(f"memory:{mem['chunk_id']}")
             assert node is not None
-            assert node.properties.get("workspace") == "integration-test", \
-                f"Memory node {mem['chunk_id']} missing workspace"
+            assert (
+                node.properties.get("workspace") == "integration-test"
+            ), f"Memory node {mem['chunk_id']} missing workspace"
 
 
 @pytest.mark.requires_llm
@@ -541,12 +592,14 @@ class TestNodeCountAndTiming:
                 extractor, graph, content, chunk_id
             )
             total_facts += len(facts_meta)
-            timings.append({
-                "chunk_id": chunk_id,
-                "facts": len(facts_meta),
-                "extract_s": round(t_ext, 3),
-                "index_s": round(t_idx, 3),
-            })
+            timings.append(
+                {
+                    "chunk_id": chunk_id,
+                    "facts": len(facts_meta),
+                    "extract_s": round(t_ext, 3),
+                    "index_s": round(t_idx, 3),
+                }
+            )
 
         await graph.flush()
 
@@ -590,8 +643,10 @@ class TestNodeCountAndTiming:
         print(f"  Edges:               {edge_count}")
         print(f"\nPer-chunk timing:")
         for t in timings:
-            print(f"  {t['chunk_id']:12s}: {t['facts']} facts, "
-                  f"extract={t['extract_s']:.3f}s, index={t['index_s']:.3f}s")
+            print(
+                f"  {t['chunk_id']:12s}: {t['facts']} facts, "
+                f"extract={t['extract_s']:.3f}s, index={t['index_s']:.3f}s"
+            )
         avg_extract = sum(t["extract_s"] for t in timings) / len(timings)
         avg_index = sum(t["index_s"] for t in timings) / len(timings)
         print(f"\nAverage timing:")
@@ -600,21 +655,25 @@ class TestNodeCountAndTiming:
         print("=" * 60)
 
         # Assertions
-        assert memory_nodes == len(memories), \
-            f"Expected {len(memories)} memory nodes, got {memory_nodes}"
-        assert entity_total >= 5, \
-            f"Expected at least 5 entity nodes across all memories, got {entity_total}"
-        assert entity_promoted >= 3, \
-            f"Expected at least 3 promoted entities (proper nouns + technical IDs), got {entity_promoted}"
-        assert total_facts >= 5, \
-            f"Expected at least 5 total facts, got {total_facts}"
+        assert memory_nodes == len(
+            memories
+        ), f"Expected {len(memories)} memory nodes, got {memory_nodes}"
+        assert (
+            entity_total >= 5
+        ), f"Expected at least 5 entity nodes across all memories, got {entity_total}"
+        assert (
+            entity_promoted >= 3
+        ), f"Expected at least 3 promoted entities (proper nouns + technical IDs), got {entity_promoted}"
+        assert total_facts >= 5, f"Expected at least 5 total facts, got {total_facts}"
 
         # No single extraction should take > 15s
         for t in timings:
-            assert t["extract_s"] < 15.0, \
-                f"Extraction for {t['chunk_id']} too slow: {t['extract_s']:.1f}s"
+            assert (
+                t["extract_s"] < 15.0
+            ), f"Extraction for {t['chunk_id']} too slow: {t['extract_s']:.1f}s"
 
         # Indexing should be fast (local backend, no network)
         for t in timings:
-            assert t["index_s"] < 2.0, \
-                f"Indexing for {t['chunk_id']} too slow: {t['index_s']:.1f}s"
+            assert (
+                t["index_s"] < 2.0
+            ), f"Indexing for {t['chunk_id']} too slow: {t['index_s']:.1f}s"
