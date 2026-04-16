@@ -17,18 +17,36 @@ from ._sns import SNSProfiler
 from ._opensearch import OpenSearchProfiler
 from ._documentdb import DocumentDBProfiler
 from ._kinesis import KinesisProfiler
+from ._gcs import GCSProfiler
+from ._bigquery import BigQueryProfiler
+from ._firestore import FirestoreProfiler
+from ._bigtable import BigtableProfiler
+from ._pubsub import PubSubSubscriptionProfiler, PubSubTopicProfiler
+from ._memorystore import MemorystoreProfiler
+from ._gcp_apigateway import GCPAPIGatewayProfiler
 
 __all__ = [
     "_dict_to_normalized_schema",
+    # Relational / NoSQL / APIs
     "PostgresProfiler",
     "MySQLProfiler",
     "MongoDBProfiler",
+    "APIGatewayProfiler",
+    # AWS
     "DynamoDBProfiler",
     "S3Profiler",
-    "APIGatewayProfiler",
     "SQSProfiler",
     "SNSProfiler",
     "OpenSearchProfiler",
     "DocumentDBProfiler",
     "KinesisProfiler",
+    # GCP
+    "GCSProfiler",
+    "BigQueryProfiler",
+    "FirestoreProfiler",
+    "BigtableProfiler",
+    "PubSubTopicProfiler",
+    "PubSubSubscriptionProfiler",
+    "MemorystoreProfiler",
+    "GCPAPIGatewayProfiler",
 ]

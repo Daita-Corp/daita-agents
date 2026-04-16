@@ -98,123 +98,139 @@ async def persist_schema_to_graph(
     """
     Write discovered schema entities as nodes into the graph backend.
 
-    TABLE nodes are written with column metadata stored in properties so
-    LineagePlugin flows can reference the same node_ids (e.g. "table:users").
-    MongoDB collections are treated as TABLE nodes. OpenAPI services are
-    written as API nodes.
+    Every entry in :data:`_NODE_HANDLERS` is a (mode, NodeType) pair where:
+
+      * ``mode="fan_out"`` fans ``schema["tables"]`` out into one node per
+        table. Used for relational-shaped sources (Postgres/MySQL/BigQuery/
+        MongoDB/Firestore/Bigtable) so individual tables become referenceable
+        by ``table:<name>`` for LineagePlugin edges.
+      * ``mode="single"`` writes one parent node for the whole schema.
+        Used for bucket/API/stream/queue/topic-shaped sources where the store
+        itself is the atomic unit.
+
+    Unknown ``database_type`` values are silently skipped — the schema has
+    already been persisted to local JSON or the catalog backend by the caller.
     """
-    from daita.core.graph.models import AgentGraphNode, NodeType
+    from daita.core.graph.models import NodeType
 
     db_type = schema.get("database_type") or schema.get("api_type", "unknown")
     schema_name = schema.get("database_name") or schema.get("schema") or "default"
 
-    # --- Relational databases (postgres, mysql) ---
-    if db_type in ("postgresql", "mysql"):
-        for table in schema.get("tables", []):
-            tname = table["name"]
-            node = AgentGraphNode(
-                node_id=AgentGraphNode.make_id(NodeType.TABLE, tname),
-                node_type=NodeType.TABLE,
-                name=tname,
-                created_by_agent=agent_id,
-                properties={
-                    "database_type": db_type,
-                    "schema": schema_name,
-                    "row_count": table.get("row_count"),
-                    "columns": table.get("columns", []),
-                },
-            )
-            await graph_backend.add_node(node)
+    spec = _NODE_HANDLERS.get(db_type)
+    if spec is not None:
+        mode, node_type = spec
+        if mode == "fan_out":
+            await _write_tables_as_nodes(schema, graph_backend, agent_id, node_type)
+        else:
+            await _write_single_node(schema, graph_backend, agent_id, node_type)
 
-    # --- MongoDB ---
-    elif db_type == "mongodb":
-        for table in schema.get("tables", []):
-            tname = table["name"]
-            node = AgentGraphNode(
-                node_id=AgentGraphNode.make_id(NodeType.TABLE, tname),
-                node_type=NodeType.TABLE,
-                name=tname,
-                created_by_agent=agent_id,
-                properties={
-                    "database_type": "mongodb",
-                    "database": schema_name,
-                    "row_count": table.get("row_count"),
-                    "columns": table.get("columns", []),
-                },
-            )
-            await graph_backend.add_node(node)
-
-    # --- OpenAPI services ---
-    elif db_type == "openapi":
-        svc_name = schema.get("service_name", "unknown_api")
-        node = AgentGraphNode(
-            node_id=AgentGraphNode.make_id(NodeType.API, svc_name),
-            node_type=NodeType.API,
-            name=svc_name,
-            created_by_agent=agent_id,
-            properties={
-                "base_url": schema.get("base_url", ""),
-                "version": schema.get("version", ""),
-                "endpoint_count": schema.get("endpoint_count", 0),
-            },
-        )
-        await graph_backend.add_node(node)
-
-    # --- DynamoDB ---
-    elif db_type == "dynamodb":
-        table_name = schema.get("database_name") or schema.get("table_name", "unknown")
-        node = AgentGraphNode(
-            node_id=AgentGraphNode.make_id(NodeType.DATABASE, table_name),
-            node_type=NodeType.DATABASE,
-            name=table_name,
-            created_by_agent=agent_id,
-            properties={
-                "database_type": "dynamodb",
-                "table_count": schema.get("table_count", 1),
-                "tables": schema.get("tables", []),
-            },
-        )
-        await graph_backend.add_node(node)
-
-    # --- API Gateway ---
-    elif db_type == "apigateway":
-        api_name = schema.get("database_name") or "unknown"
-        node = AgentGraphNode(
-            node_id=AgentGraphNode.make_id(NodeType.API, api_name),
-            node_type=NodeType.API,
-            name=api_name,
-            created_by_agent=agent_id,
-            properties={
-                "database_type": "apigateway",
-                "tables": schema.get("tables", []),
-                "metadata": schema.get("metadata", {}),
-            },
-        )
-        await graph_backend.add_node(node)
-
-    # --- S3 ---
-    elif db_type == "s3":
-        bucket_name = schema.get("database_name") or schema.get("bucket", "unknown")
-        node = AgentGraphNode(
-            node_id=AgentGraphNode.make_id(NodeType.BUCKET, bucket_name),
-            node_type=NodeType.BUCKET,
-            name=bucket_name,
-            created_by_agent=agent_id,
-            properties={
-                "database_type": "s3",
-                "tables": schema.get("tables", []),
-                "metadata": schema.get("metadata", {}),
-            },
-        )
-        await graph_backend.add_node(node)
-
-    # Flush to disk — LocalGraphBackend uses lazy writes
+    # LocalGraphBackend uses lazy writes — flush at the boundary of a logical unit.
     if hasattr(graph_backend, "flush"):
         await graph_backend.flush()
 
     logger.debug(
-        f"CatalogPlugin: persisted {db_type}:{schema_name} entities to graph backend"
+        "CatalogPlugin: persisted %s:%s entities to graph backend", db_type, schema_name
     )
+
+
+# Dispatch table: database_type -> (mode, NodeType).
+#   mode = "fan_out" | "single"  — see persist_schema_to_graph() docstring.
+_NODE_HANDLERS: Dict[str, tuple] = {
+    # Relational / document / warehouse sources — one node per table/collection.
+    "postgresql": ("fan_out", "TABLE"),
+    "mysql": ("fan_out", "TABLE"),
+    "mongodb": ("fan_out", "TABLE"),
+    "bigquery": ("fan_out", "TABLE"),
+    "firestore": ("fan_out", "TABLE"),
+    "bigtable": ("fan_out", "TABLE"),
+    # API services — single node for the service.
+    "openapi": ("single", "API"),
+    "apigateway": ("single", "API"),
+    "gcp_apigateway": ("single", "API"),
+    # Object stores — single node for the bucket.
+    "s3": ("single", "BUCKET"),
+    "gcs": ("single", "BUCKET"),
+    # Single-entity databases.
+    "dynamodb": ("single", "DATABASE"),
+    "memorystore": ("single", "DATABASE"),
+    # Streaming / messaging — single node for the topic or subscription.
+    "pubsub_topic": ("single", "SERVICE"),
+    "pubsub_subscription": ("single", "SERVICE"),
+}
+
+
+def _build_schema_name(schema: Dict[str, Any]) -> str:
+    """Resolve the human-facing name for a schema across varied source shapes."""
+    for key in ("database_name", "schema", "bucket", "table_name", "service_name"):
+        value = schema.get(key)
+        if value:
+            return value
+    return "unknown"
+
+
+async def _write_tables_as_nodes(
+    schema: Dict[str, Any],
+    graph_backend: Any,
+    agent_id: Optional[str],
+    node_type_name: str,
+) -> None:
+    """Fan schema['tables'] out into one node per table."""
+    from daita.core.graph.models import AgentGraphNode, NodeType
+
+    node_type = NodeType[node_type_name]
+    db_type = schema.get("database_type", "unknown")
+    parent_name = _build_schema_name(schema)
+
+    for table in schema.get("tables", []):
+        tname = table["name"]
+        node = AgentGraphNode(
+            node_id=AgentGraphNode.make_id(node_type, tname),
+            node_type=node_type,
+            name=tname,
+            created_by_agent=agent_id,
+            properties={
+                "database_type": db_type,
+                "parent": parent_name,
+                "row_count": table.get("row_count"),
+                "columns": table.get("columns", []),
+            },
+        )
+        await graph_backend.add_node(node)
+
+
+async def _write_single_node(
+    schema: Dict[str, Any],
+    graph_backend: Any,
+    agent_id: Optional[str],
+    node_type_name: str,
+) -> None:
+    """Write the whole schema as a single parent node."""
+    from daita.core.graph.models import AgentGraphNode, NodeType
+
+    node_type = NodeType[node_type_name]
+    name = _build_schema_name(schema)
+    properties: Dict[str, Any] = {
+        "database_type": schema.get("database_type", "unknown"),
+        "tables": schema.get("tables", []),
+        "metadata": schema.get("metadata", {}),
+    }
+
+    # OpenAPI carries service-level fields that don't fit under "metadata".
+    if schema.get("database_type") == "openapi" or schema.get("api_type") == "openapi":
+        properties.update(
+            base_url=schema.get("base_url", ""),
+            version=schema.get("version", ""),
+            endpoint_count=schema.get("endpoint_count", 0),
+        )
+
+    node = AgentGraphNode(
+        node_id=AgentGraphNode.make_id(node_type, name),
+        node_type=node_type,
+        name=name,
+        created_by_agent=agent_id,
+        properties=properties,
+    )
+    await graph_backend.add_node(node)
 
 
 async def prune_stale_catalog(max_age_seconds: int) -> dict:

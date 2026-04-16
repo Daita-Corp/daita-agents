@@ -65,9 +65,13 @@ class CatalogPlugin(LifecyclePlugin):
 
     Supports:
     - PostgreSQL, MySQL, MongoDB schema discovery
-    - GraphQL introspection
     - OpenAPI/Swagger spec parsing
-    - Multi-cloud infrastructure discovery (AWS, GCP, Azure)
+    - Multi-cloud infrastructure discovery:
+        * AWS — RDS, DynamoDB, S3, ElastiCache, Redshift, API Gateway,
+          SQS, SNS, OpenSearch, DocumentDB, Kinesis
+        * GCP — Cloud SQL, GCS, BigQuery, Firestore, Bigtable, Pub/Sub,
+          Memorystore (Redis), API Gateway
+        * GitHub — connection-string scanning in config files
     - Schema comparison and validation
     - Pluggable discoverers and profilers
     """
