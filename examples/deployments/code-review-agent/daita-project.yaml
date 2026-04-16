@@ -1,0 +1,12 @@
+name: code-review-agent
+version: 1.0.0
+description: Code review agent powered by composable skills (security + code quality)
+created_at: '2026-04-15T00:00:00'
+
+agents:
+  - name: code_reviewer
+    description: Reviews Python code for security vulnerabilities and quality issues using skills
+    file: agents/reviewer.py
+    enabled: true
+
+workflows: []

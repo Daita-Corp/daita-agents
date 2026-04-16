@@ -126,6 +126,12 @@ class PluginError(DaitaError):
         self.plugin_name = plugin_name
 
 
+class SkillError(PluginError):
+    """Exception raised by skills (configuration, dependency resolution, etc.)."""
+
+    pass
+
+
 class WorkflowError(DaitaError):
     """Exception raised by workflow operations."""
 

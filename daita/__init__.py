@@ -41,6 +41,11 @@ from .plugins.redis_messaging import redis_messaging
 from .plugins.base import BasePlugin, LifecyclePlugin
 
 # ---------------------------------------------------------------------------
+# Skills — composable units of agent capability
+# ---------------------------------------------------------------------------
+from .skills import BaseSkill, Skill
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 from .config.base import AgentConfig, RetryPolicy, RetryStrategy
@@ -64,6 +69,7 @@ from .core.exceptions import (
     LLMError,
     ConfigError,
     PluginError,
+    SkillError,
     WorkflowError,
     TransientError,
     RetryableError,
@@ -124,6 +130,8 @@ __all__ = [
     "redis_messaging",
     "BasePlugin",
     "LifecyclePlugin",
+    "BaseSkill",
+    "Skill",
     # Configuration
     "AgentConfig",
     "RetryPolicy",
@@ -138,6 +146,7 @@ __all__ = [
     "LLMError",
     "ConfigError",
     "PluginError",
+    "SkillError",
     "WorkflowError",
     "TransientError",
     "RetryableError",
