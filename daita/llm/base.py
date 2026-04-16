@@ -5,13 +5,18 @@ All LLM calls are automatically traced (tokens, cost, latency) without any
 configuration required. Subclass this to add a new LLM provider.
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List
+from typing import TYPE_CHECKING, Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 import logging
 
 from ..core.tracing import get_trace_manager, TraceType
 from ..core.interfaces import LLMProvider
+
+if TYPE_CHECKING:
+    from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +84,7 @@ class BaseLLMProvider(LLMProvider, ABC):
     async def generate(
         self,
         messages,
-        tools: Optional[List["AgentTool"]] = None,
+        tools: Optional[List[AgentTool]] = None,
         stream: bool = False,
         **kwargs,
     ):
@@ -193,36 +198,28 @@ class BaseLLMProvider(LLMProvider, ABC):
         """
         pass
 
-    def _get_last_token_usage(self) -> Dict[str, int]:
-        """
-        Get token usage from the last API call.
+    @staticmethod
+    def _extract_tokens(usage) -> Dict[str, int]:
+        """Extract token counts from an OpenAI or Anthropic usage object."""
+        if not usage:
+            return {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0}
 
-        This should be overridden by each provider to return actual
-        token usage from their last API response.
-        """
-        if self._last_usage:
-            # Try to extract from stored usage object
-            if hasattr(self._last_usage, "total_tokens"):
-                # OpenAI format
-                return {
-                    "total_tokens": getattr(self._last_usage, "total_tokens", 0),
-                    "prompt_tokens": getattr(self._last_usage, "prompt_tokens", 0),
-                    "completion_tokens": getattr(
-                        self._last_usage, "completion_tokens", 0
-                    ),
-                }
-            elif hasattr(self._last_usage, "input_tokens"):
-                # Anthropic format
-                input_tokens = getattr(self._last_usage, "input_tokens", 0)
-                output_tokens = getattr(self._last_usage, "output_tokens", 0)
-                return {
-                    "total_tokens": input_tokens + output_tokens,
-                    "prompt_tokens": input_tokens,
-                    "completion_tokens": output_tokens,
-                }
+        if hasattr(usage, "total_tokens"):
+            return {
+                "total_tokens": getattr(usage, "total_tokens", 0),
+                "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                "completion_tokens": getattr(usage, "completion_tokens", 0),
+            }
+        if hasattr(usage, "input_tokens"):
+            inp = getattr(usage, "input_tokens", 0)
+            out = getattr(usage, "output_tokens", 0)
+            return {"total_tokens": inp + out, "prompt_tokens": inp, "completion_tokens": out}
 
-        # Default fallback
         return {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0}
+
+    def _get_last_token_usage(self) -> Dict[str, int]:
+        """Get token usage from the last API call."""
+        return self._extract_tokens(self._last_usage)
 
     def _estimate_cost(self, token_usage: Dict[str, int]) -> Optional[float]:
         """
@@ -300,7 +297,7 @@ class BaseLLMProvider(LLMProvider, ABC):
         }
 
     def _convert_tools_to_format(
-        self, tools: List["AgentTool"]
+        self, tools: List[AgentTool]
     ) -> List[Dict[str, Any]]:
         """
         Convert AgentTool list to provider-specific format.

@@ -72,17 +72,3 @@ class EmbeddingProvider(ABC):
         pass
 
 
-class DatabaseBackend(ABC):
-    """Interface for database operations."""
-
-    @abstractmethod
-    async def connect(self) -> None:
-        """Establish database connection."""
-        pass
-
-    @abstractmethod
-    async def execute_query(
-        self, query: str, params: Optional[Dict[str, Any]] = None
-    ) -> Any:
-        """Execute database query."""
-        pass

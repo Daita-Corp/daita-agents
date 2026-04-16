@@ -1199,7 +1199,12 @@ class Agent(BaseAgent):
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Call stop() on exit to flush plugins and release resources."""
-        await self.stop()
+        try:
+            await self.stop()
+        except Exception as e:
+            if exc_type is None:
+                raise
+            logger.error("Error during agent stop: %s", e, exc_info=True)
         return False
 
     async def stop(self) -> None:

@@ -14,54 +14,13 @@ if TYPE_CHECKING:
     from .base_discoverer import DiscoveredStore
 
 
-def normalize_postgresql(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize CatalogPlugin PostgreSQL discovery output."""
-    col_by_table: Dict[str, List[Dict[str, Any]]] = {}
-    for col in raw.get("columns", []):
-        col_by_table.setdefault(col["table_name"], []).append(col)
-
-    pk_set = {
-        (pk["table_name"], pk["column_name"]) for pk in raw.get("primary_keys", [])
-    }
-
-    tables = []
-    for t in raw.get("tables", []):
-        tname = t["table_name"]
-        cols = []
-        for c in col_by_table.get(tname, []):
-            col: Dict[str, Any] = {
-                "name": c["column_name"],
-                "type": c["data_type"],
-                "nullable": c.get("is_nullable", "YES") == "YES",
-                "is_primary_key": (tname, c["column_name"]) in pk_set,
-            }
-            if c.get("column_comment"):
-                col["column_comment"] = c["column_comment"]
-            cols.append(col)
-        tables.append({"name": tname, "row_count": t.get("row_count"), "columns": cols})
-
-    fks = [
-        {
-            "source_table": fk["source_table"],
-            "source_column": fk["source_column"],
-            "target_table": fk["target_table"],
-            "target_column": fk["target_column"],
-        }
-        for fk in raw.get("foreign_keys", [])
-    ]
-
-    db_name = raw.get("schema", "public")
-    return {
-        "database_type": "postgresql",
-        "database_name": db_name,
-        "tables": tables,
-        "foreign_keys": fks,
-        "table_count": len(tables),
-    }
-
-
-def normalize_mysql(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize CatalogPlugin MySQL discovery output."""
+def _normalize_relational(
+    raw: Dict[str, Any],
+    db_type: str,
+    is_primary_key_fn,
+    default_schema: str = "",
+) -> Dict[str, Any]:
+    """Shared normalizer for relational databases (PostgreSQL, MySQL)."""
     col_by_table: Dict[str, List[Dict[str, Any]]] = {}
     for col in raw.get("columns", []):
         col_by_table.setdefault(col["table_name"], []).append(col)
@@ -75,7 +34,7 @@ def normalize_mysql(raw: Dict[str, Any]) -> Dict[str, Any]:
                 "name": c["column_name"],
                 "type": c.get("data_type", ""),
                 "nullable": c.get("is_nullable", "YES") == "YES",
-                "is_primary_key": c.get("column_key", "") == "PRI",
+                "is_primary_key": is_primary_key_fn(tname, c),
             }
             if c.get("column_comment"):
                 col["column_comment"] = c["column_comment"]
@@ -92,14 +51,33 @@ def normalize_mysql(raw: Dict[str, Any]) -> Dict[str, Any]:
         for fk in raw.get("foreign_keys", [])
     ]
 
-    db_name = raw.get("schema", "")
     return {
-        "database_type": "mysql",
-        "database_name": db_name,
+        "database_type": db_type,
+        "database_name": raw.get("schema", default_schema),
         "tables": tables,
         "foreign_keys": fks,
         "table_count": len(tables),
     }
+
+
+def normalize_postgresql(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize CatalogPlugin PostgreSQL discovery output."""
+    pk_set = {
+        (pk["table_name"], pk["column_name"]) for pk in raw.get("primary_keys", [])
+    }
+    return _normalize_relational(
+        raw, "postgresql",
+        is_primary_key_fn=lambda tname, c: (tname, c["column_name"]) in pk_set,
+        default_schema="public",
+    )
+
+
+def normalize_mysql(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize CatalogPlugin MySQL discovery output."""
+    return _normalize_relational(
+        raw, "mysql",
+        is_primary_key_fn=lambda _tname, c: c.get("column_key", "") == "PRI",
+    )
 
 
 def normalize_mongodb(raw: Dict[str, Any]) -> Dict[str, Any]:

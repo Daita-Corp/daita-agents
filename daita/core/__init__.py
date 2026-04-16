@@ -56,7 +56,6 @@ from .exceptions import (
 # Core interfaces - Define contracts for framework components
 from .interfaces import (
     LLMProvider,
-    DatabaseBackend,
 )
 
 # Focus system - DSL-based data filtering before LLM sees results
@@ -157,9 +156,7 @@ __all__ = [
     "classify_exception",
     "create_contextual_error",
     # Core interfaces
-    "Agent",
     "LLMProvider",
-    "DatabaseBackend",
     # Focus system
     "apply_focus",
     "FocusQuery",
