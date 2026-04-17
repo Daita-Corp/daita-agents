@@ -1,6 +1,4 @@
 """
-Simplified Relay System for Daita Agents.
-
 Provides simple message passing between agents in a workflow.
 Focus on essential communication functionality without complex features.
 

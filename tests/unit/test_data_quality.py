@@ -446,7 +446,7 @@ async def test_report_has_no_contract_field():
 
 
 async def test_report_persists_stable_metric_node_id():
-    """Metric node ID must be quality_latest:{table}, not timestamp-based (DQ-12)."""
+    """Metric node ID must be quality_latest:<qualified-table>, not timestamp-based (DQ-12)."""
 
     async def mock_query(sql, params=None):
         if "information_schema" in sql.lower() or "pragma_table_info" in sql.lower():
@@ -465,14 +465,19 @@ async def test_report_persists_stable_metric_node_id():
     backend.add_node = AsyncMock()
     backend.add_edge = AsyncMock()
     backend.flush = AsyncMock()
+    backend.find_nodes = AsyncMock(return_value=[])
 
     plugin = make_dq(db=db, backend=backend)
-    result = await plugin.report(db, "orders")
+    # Explicit store qualifier so the metric ID is predictable.
+    result = await plugin.report(db, "orders", store="postgresql:host/db")
 
     assert result["graph_persisted"] is True
-    # Node ID must contain quality_latest:orders, not a timestamp
+    # Metric node ID is qualified against the Table ID so the same table name
+    # in different stores keeps distinct reports.
     metric_node_id = result["metric_node_id"]
-    assert "quality_latest:orders" in metric_node_id
+    assert metric_node_id == (
+        "metric:quality_latest:postgresql:host/db.orders"
+    )
     assert "T" not in metric_node_id.split("quality_latest")[-1]  # no ISO timestamp
 
 
@@ -496,10 +501,11 @@ async def test_report_metric_node_id_is_stable_across_calls():
     backend.add_node = AsyncMock()
     backend.add_edge = AsyncMock()
     backend.flush = AsyncMock()
+    backend.find_nodes = AsyncMock(return_value=[])
 
     plugin = make_dq(db=db, backend=backend)
-    r1 = await plugin.report(db, "orders")
-    r2 = await plugin.report(db, "orders")
+    r1 = await plugin.report(db, "orders", store="postgresql:host/db")
+    r2 = await plugin.report(db, "orders", store="postgresql:host/db")
     assert r1["metric_node_id"] == r2["metric_node_id"]
 
 

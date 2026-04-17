@@ -34,14 +34,22 @@ async def discover_pubsub_topic(
 
     kms_key = ""
     message_retention = ""
+    schema_ref = ""
+    schema_encoding = ""
     try:
         t = publisher.get_topic(request={"topic": topic_path})
         kms_key = t.kms_key_name or ""
         message_retention = (
             str(t.message_retention_duration) if t.message_retention_duration else ""
         )
+        ss = getattr(t, "schema_settings", None)
+        if ss and ss.schema and ss.schema != "_deleted-schema_":
+            schema_ref = ss.schema
+            schema_encoding = ss.encoding.name if ss.encoding else ""
     except Exception as exc:
         logger.debug("Pub/Sub get_topic failed for %s: %s", topic_path, exc)
+
+    schema = _resolve_pubsub_schema(creds, schema_ref) if schema_ref else None
 
     subscriptions: list[str] = []
     try:
@@ -62,7 +70,38 @@ async def discover_pubsub_topic(
         "kms_key": kms_key,
         "message_retention": message_retention,
         "subscriptions": subscriptions,
+        "schema_encoding": schema_encoding,
+        "schema": schema,
     }
+
+
+def _resolve_pubsub_schema(creds: Any, schema_name: str) -> Optional[dict[str, Any]]:
+    """Fetch the full schema definition from Pub/Sub Schema Registry.
+
+    Returns a dict shaped ``{name, type, definition, revision_id}`` or None on
+    failure. Type is ``PROTOCOL_BUFFER`` or ``AVRO``. Failure paths are
+    intentionally quiet — discovery degrades gracefully to "no schema".
+    """
+    try:
+        from google.cloud import pubsub_v1
+        from google.pubsub_v1 import types as pstypes
+    except ImportError:
+        return None
+
+    try:
+        client = pubsub_v1.SchemaServiceClient(credentials=creds)
+        s = client.get_schema(
+            request={"name": schema_name, "view": pstypes.SchemaView.FULL}
+        )
+        return {
+            "name": s.name,
+            "type": s.type_.name if s.type_ else "",
+            "definition": s.definition or "",
+            "revision_id": s.revision_id or "",
+        }
+    except Exception as exc:
+        logger.debug("Pub/Sub get_schema failed for %s: %s", schema_name, exc)
+        return None
 
 
 async def discover_pubsub_subscription(

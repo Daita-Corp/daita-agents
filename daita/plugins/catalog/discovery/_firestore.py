@@ -41,7 +41,7 @@ async def discover_firestore(
     same normalizer path can be reused.
     """
     try:
-        from google.cloud import firestore
+        from google.cloud import firestore, firestore_admin_v1
     except ImportError:
         raise ImportError(
             "google-cloud-firestore is required. "
@@ -55,6 +55,7 @@ async def discover_firestore(
         impersonate_service_account=impersonate_service_account,
     )
     client = firestore.Client(project=project, credentials=creds, database=database)
+    admin = firestore_admin_v1.FirestoreAdminClient(credentials=creds)
 
     collections_out: list[dict[str, Any]] = []
     try:
@@ -84,6 +85,7 @@ async def discover_firestore(
                     {"field_name": name, "types": sorted(types)}
                     for name, types in sorted(fields_by_name.items())
                 ],
+                "indexes": _list_firestore_indexes(admin, project, database, coll.id),
             }
         )
 
@@ -94,3 +96,42 @@ async def discover_firestore(
         "collections": collections_out,
         "sample_size": sample_size,
     }
+
+
+def _list_firestore_indexes(
+    admin: Any, project: str, database: str, collection_id: str
+) -> list[dict[str, Any]]:
+    """List composite indexes for a Firestore collection group.
+
+    Each index becomes ``{name, query_scope, state, fields: [{field_path,
+    order, array_config}]}``. Errors (permission / legacy DB) degrade to ``[]``.
+    """
+    parent = (
+        f"projects/{project}/databases/{database}"
+        f"/collectionGroups/{collection_id}"
+    )
+    out: list[dict[str, Any]] = []
+    try:
+        for idx in admin.list_indexes(parent=parent):
+            out.append(
+                {
+                    "name": idx.name.rsplit("/", 1)[-1] if idx.name else "",
+                    "query_scope": idx.query_scope.name if idx.query_scope else "",
+                    "state": idx.state.name if idx.state else "",
+                    "fields": [
+                        {
+                            "field_path": f.field_path,
+                            "order": f.order.name if f.order else "",
+                            "array_config": (
+                                f.array_config.name if f.array_config else ""
+                            ),
+                        }
+                        for f in idx.fields
+                    ],
+                }
+            )
+    except Exception as exc:
+        logger.debug(
+            "Firestore list_indexes failed for %s: %s", collection_id, exc
+        )
+    return out

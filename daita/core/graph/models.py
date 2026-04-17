@@ -19,6 +19,7 @@ def _utcnow() -> datetime:
 class NodeType(str, Enum):
     TABLE = "table"
     COLUMN = "column"
+    INDEX = "index"
     AGENT = "agent"
     PIPELINE = "pipeline"
     TRANSFORMATION = "transformation"
@@ -45,6 +46,9 @@ class EdgeType(str, Enum):
     SYNCS_TO = "syncs_to"
     DERIVED_FROM = "derived_from"
     HAS_COLUMN = "has_column"
+    INDEXED_BY = "indexed_by"
+    COVERS = "covers"
+    REFERENCES = "references"
     PART_OF = "part_of"
     # Memory graph types
     MENTIONS = "mentions"

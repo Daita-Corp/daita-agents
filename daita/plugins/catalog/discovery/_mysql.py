@@ -94,6 +94,8 @@ async def discover_mysql(
         return {
             "database_type": "mysql",
             "schema": db_name,
+            "host": creds["host"],
+            "port": creds["port"] or 3306,
             "tables": tables,
             "columns": columns,
             "foreign_keys": fkeys,

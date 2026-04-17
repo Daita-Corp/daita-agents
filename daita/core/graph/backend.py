@@ -15,12 +15,12 @@ Developers never call auto_select_backend() directly. LineagePlugin and CatalogP
 call it during initialize() if no backend was provided at construction time.
 """
 
-from typing import TYPE_CHECKING, Callable, List, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     import networkx as nx
 
-from .models import AgentGraphNode, AgentGraphEdge
+from .models import AgentGraphNode, AgentGraphEdge, NodeType
 
 # Module-level registry. Set once at startup via register_backend_factory().
 # None means use LocalGraphBackend.
@@ -86,6 +86,30 @@ class GraphBackend(Protocol):
         scan interval and gets removed.
 
         Returns a summary: {"removed_nodes": [...], "removed_edges": [...]}
+        """
+        ...
+
+    async def find_nodes(
+        self,
+        node_type: NodeType,
+        properties_match: Optional[dict[str, Any]] = None,
+    ) -> List[AgentGraphNode]:
+        """
+        Return every node of ``node_type`` whose properties match all key/value
+        pairs in ``properties_match``. Used by the resolution layer to look up
+        Table nodes by bare name across stores.
+        """
+        ...
+
+    async def promote_node(self, old_id: str, new_id: str) -> None:
+        """
+        Rewrite every edge pointing at ``old_id`` to point at ``new_id`` and
+        delete the node at ``old_id``. No-op if ``old_id`` does not exist.
+
+        Used by unresolved-reference reconciliation: when a placeholder
+        ``table:__unresolved__.<name>`` node is replaced by a canonical
+        ``table:<store>.<name>`` node, its incident edges migrate atomically
+        so downstream traversals see the canonical node.
         """
         ...
 

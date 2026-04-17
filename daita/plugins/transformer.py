@@ -456,15 +456,11 @@ class TransformerPlugin(BasePlugin):
             )
             await self._graph_backend.add_node(node)
 
+            from daita.core.graph.resolution import resolve_or_placeholder
+
             for src in source_tables:
-                src_node_id = AgentGraphNode.make_id(NodeType.TABLE, src)
-                await self._graph_backend.add_node(
-                    AgentGraphNode(
-                        node_id=src_node_id,
-                        node_type=NodeType.TABLE,
-                        name=src,
-                        created_by_agent=self._agent_id,
-                    )
+                src_node_id = await resolve_or_placeholder(
+                    self._graph_backend, src, agent_id=self._agent_id
                 )
                 await self._graph_backend.add_edge(
                     AgentGraphEdge(
@@ -479,14 +475,8 @@ class TransformerPlugin(BasePlugin):
                 )
 
             for tgt in target_tables:
-                tgt_node_id = AgentGraphNode.make_id(NodeType.TABLE, tgt)
-                await self._graph_backend.add_node(
-                    AgentGraphNode(
-                        node_id=tgt_node_id,
-                        node_type=NodeType.TABLE,
-                        name=tgt,
-                        created_by_agent=self._agent_id,
-                    )
+                tgt_node_id = await resolve_or_placeholder(
+                    self._graph_backend, tgt, agent_id=self._agent_id
                 )
                 await self._graph_backend.add_edge(
                     AgentGraphEdge(

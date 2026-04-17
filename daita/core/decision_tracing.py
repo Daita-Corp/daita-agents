@@ -4,13 +4,6 @@ Agent Decision Tracing Utilities for Daita Agents - Fixed Complete Version
 Provides simple tools for agents to trace their decision-making process,
 reasoning chains, and confidence scores. Integrates seamlessly with the
 TraceManager for automatic decision observability.
-
-FIXED ISSUES:
-- Completed the trace_decision decorator implementation
-- Fixed async context manager issues
-- Added missing helper functions
-- Improved error handling
-- Fixed circular import issues
 """
 
 import asyncio

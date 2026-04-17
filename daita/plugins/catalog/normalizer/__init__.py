@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict
 # Shared helpers and dedup utilities — kept at package level for stable import paths.
 from ._common import (
     _normalize_relational,
+    build_store_metadata,
     deduplicate_stores,
     infer_environment,
     merge_store_sources,
@@ -139,4 +140,5 @@ __all__ = [
     "infer_environment",
     # Shared internal helper (used by tests and future relational normalizers)
     "_normalize_relational",
+    "build_store_metadata",
 ]

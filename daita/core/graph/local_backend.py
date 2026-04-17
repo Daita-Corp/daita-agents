@@ -17,12 +17,12 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 if TYPE_CHECKING:
     import networkx as nx
 
-from .models import AgentGraphNode, AgentGraphEdge
+from .models import AgentGraphNode, AgentGraphEdge, NodeType
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,12 @@ class LocalGraphBackend:
         self._graph: Optional[nx.MultiDiGraph] = None
         self._lock = asyncio.Lock()
         self._dirty = False
+        # Deletions queued since the last flush. flush() re-reads disk and
+        # accumulates in-memory additions, so we need an explicit tombstone
+        # list to propagate node / edge removals (e.g. promote_node) through
+        # the read-merge-write cycle.
+        self._deleted_nodes: set[str] = set()
+        self._deleted_edges: set[tuple[str, str, str]] = set()
 
     def _load(self) -> nx.MultiDiGraph:
         """Load graph from disk into memory. Returns empty graph if file missing."""
@@ -210,6 +216,8 @@ class LocalGraphBackend:
         Uses a read-merge-write cycle so that multiple backend instances
         writing to the same graph file (e.g. shared memory graph across
         agents) accumulate rather than overwrite each other's data.
+        Tombstones from ``delete_node`` / ``promote_node`` are applied after
+        the merge so deletions propagate through the same cycle.
         """
         async with self._lock:
             if not self._dirty:
@@ -251,15 +259,31 @@ class LocalGraphBackend:
                 else:
                     disk_graph.add_edge(u, v, key=key, **edge_data)
 
+            # Apply tombstones — deletions must survive the read-merge cycle.
+            for u, v, key in self._deleted_edges:
+                if disk_graph.has_edge(u, v, key=key):
+                    disk_graph.remove_edge(u, v, key=key)
+            for node_id in self._deleted_nodes:
+                if node_id in disk_graph:
+                    disk_graph.remove_node(node_id)
+
             self._save(disk_graph)
             self._graph = disk_graph
             self._dirty = False
+            self._deleted_nodes.clear()
+            self._deleted_edges.clear()
 
     async def delete_node(self, node_id: str) -> None:
         async with self._lock:
             graph = self._load()
             if node_id in graph:
+                # Record incident edges so flush() drops them on disk too.
+                for u, v, key in list(graph.edges(node_id, keys=True)):
+                    self._deleted_edges.add((u, v, key))
+                for u, v, key in list(graph.in_edges(node_id, keys=True)):
+                    self._deleted_edges.add((u, v, key))
                 graph.remove_node(node_id)
+                self._deleted_nodes.add(node_id)
                 self._dirty = True
 
     async def update_node_properties(self, node_id: str, properties: dict) -> None:
@@ -271,6 +295,92 @@ class LocalGraphBackend:
                 existing["updated_at"] = datetime.now(timezone.utc)
                 graph.nodes[node_id]["data"] = existing
                 self._dirty = True
+
+    async def find_nodes(
+        self,
+        node_type: NodeType,
+        properties_match: Optional[dict[str, Any]] = None,
+    ) -> List[AgentGraphNode]:
+        async with self._lock:
+            graph = self._load()
+            matches: List[AgentGraphNode] = []
+            wanted_type = node_type.value
+            for node_id in graph.nodes():
+                raw = graph.nodes[node_id].get("data", {})
+                if raw.get("node_type") != wanted_type:
+                    continue
+                if properties_match:
+                    node_props = raw.get("properties", {}) or {}
+                    name = raw.get("name")
+                    ok = True
+                    for key, expected in properties_match.items():
+                        actual = (
+                            name if key == "name" else node_props.get(key)
+                        )
+                        if actual != expected:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                try:
+                    matches.append(AgentGraphNode(**raw))
+                except (TypeError, ValueError):
+                    continue
+            return matches
+
+    async def promote_node(self, old_id: str, new_id: str) -> None:
+        if old_id == new_id:
+            return
+        async with self._lock:
+            graph = self._load()
+            if old_id not in graph:
+                return
+
+            now = datetime.now(timezone.utc)
+
+            # Rewrite outbound edges (old_id -> X) onto (new_id -> X).
+            for _u, v, key, edata in list(
+                graph.out_edges(old_id, keys=True, data=True)
+            ):
+                raw = dict(edata.get("data", {}))
+                old_edge_id = raw.get("edge_id", key)
+                new_edge_id = old_edge_id.replace(old_id, new_id, 1)
+                raw["edge_id"] = new_edge_id
+                raw["from_node_id"] = new_id
+                self._deleted_edges.add((old_id, v, key))
+                graph.remove_edge(old_id, v, key)
+                if new_id not in graph:
+                    graph.add_node(new_id, data={"node_id": new_id})
+                graph.add_edge(new_id, v, key=new_edge_id, data=raw)
+
+            # Rewrite inbound edges (X -> old_id) onto (X -> new_id).
+            for u, _v, key, edata in list(
+                graph.in_edges(old_id, keys=True, data=True)
+            ):
+                raw = dict(edata.get("data", {}))
+                old_edge_id = raw.get("edge_id", key)
+                new_edge_id = old_edge_id.replace(old_id, new_id, 1)
+                raw["edge_id"] = new_edge_id
+                raw["to_node_id"] = new_id
+                self._deleted_edges.add((u, old_id, key))
+                graph.remove_edge(u, old_id, key)
+                if new_id not in graph:
+                    graph.add_node(new_id, data={"node_id": new_id})
+                graph.add_edge(u, new_id, key=new_edge_id, data=raw)
+
+            # Drop the placeholder node itself.
+            graph.remove_node(old_id)
+            self._deleted_nodes.add(old_id)
+
+            # Refresh updated_at on the canonical node if present.
+            if new_id in graph:
+                data = graph.nodes[new_id].get("data") or {}
+                if data:
+                    data["updated_at"] = now
+                    graph.nodes[new_id]["data"] = data
+
+            self._dirty = True
+            logger.debug("Graph: promoted %s -> %s", old_id, new_id)
 
     async def prune_stale(self, max_age_seconds: int) -> dict:
         """

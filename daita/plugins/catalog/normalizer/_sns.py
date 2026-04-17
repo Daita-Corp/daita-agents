@@ -2,6 +2,8 @@
 
 from typing import Any, Dict, List
 
+from ._common import build_store_metadata
+
 
 def normalize_sns(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize SNS discover output.
@@ -63,8 +65,13 @@ def normalize_sns(raw: Dict[str, Any]) -> Dict[str, Any]:
         ],
         "foreign_keys": [],
         "table_count": 1,
-        "metadata": {
-            "is_fifo": raw.get("is_fifo", False),
-            "display_name": raw.get("display_name", ""),
-        },
+        "metadata": build_store_metadata(
+            # discover_sns uses ``topic_arn``; alias so the canonical ``arn``
+            # key reaches the persister.
+            {**raw, "arn": raw.get("topic_arn")},
+            extra={
+                "is_fifo": raw.get("is_fifo", False),
+                "display_name": raw.get("display_name") or None,
+            },
+        ),
     }

@@ -49,6 +49,7 @@ from .base import BasePlugin
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
     from ..core.graph.models import EdgeType
+    from ..core.graph.resolution import AmbiguousReferencePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,7 @@ class LineagePlugin(BasePlugin):
         organization_id: Optional[int] = None,
         backend: Optional[Any] = None,
         risk_thresholds: Optional[Dict[str, int]] = None,
+        ambiguity_policy: Optional["AmbiguousReferencePolicy"] = None,
     ):
         """
         Initialize LineagePlugin.
@@ -86,12 +88,22 @@ class LineagePlugin(BasePlugin):
             risk_thresholds: Optional dict with "HIGH" and "MEDIUM" integer thresholds
                              used by the in-memory analyze_impact() fallback.
                              Defaults to {"HIGH": 20, "MEDIUM": 5}.
+            ambiguity_policy: How to resolve a bare table name that matches
+                              multiple stores. Defaults to STRICT — raises on
+                              ambiguity so cross-store collisions fail loudly.
+                              Set to LENIENT to pick the most-recently-touched
+                              candidate with a warning, or UNRESOLVED_SENTINEL
+                              to route every reference through a placeholder
+                              that reconciles on the next catalog run.
         """
+        from daita.core.graph.resolution import AmbiguousReferencePolicy
+
         self._storage = storage
         self._organization_id = organization_id
         self._graph_backend = backend  # None until initialize() resolves it
         self._agent_id: Optional[str] = None
         self._risk_thresholds = risk_thresholds or {"HIGH": 20, "MEDIUM": 5}
+        self._ambiguity_policy = ambiguity_policy or AmbiguousReferencePolicy.STRICT
 
         # In-memory storage for standalone mode
         self._flows = []  # List of registered flows
@@ -534,6 +546,26 @@ class LineagePlugin(BasePlugin):
             source_id, target_id, flow_type, transformation, schedule, metadata
         )
         return result
+
+    async def _resolve_table_ref(
+        self, value: str, store: Optional[str] = None
+    ) -> str:
+        """Resolve a bare table name (or ``table:<name>``) to a qualified node ID.
+
+        Non-table entity IDs (``api:...``, ``column:...``, ``pipeline:...``,
+        etc.) pass through unchanged. Honours ``self._ambiguity_policy`` for
+        multi-store matches; unknown tables fall through to an
+        ``__unresolved__`` placeholder that reconciles on the next catalog run.
+        """
+        from daita.core.graph.resolution import resolve_or_placeholder
+
+        return await resolve_or_placeholder(
+            self._graph_backend,
+            value,
+            store=store,
+            agent_id=self._agent_id,
+            policy=self._ambiguity_policy,
+        )
 
     async def register_flow(
         self,
@@ -1015,6 +1047,7 @@ class LineagePlugin(BasePlugin):
         sql: str,
         context_table: Optional[str] = None,
         transformation: Optional[str] = None,
+        default_store: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Automatically capture lineage from SQL query execution.
@@ -1023,21 +1056,25 @@ class LineagePlugin(BasePlugin):
             sql: SQL query that was executed
             context_table: Optional table being written to
             transformation: Optional description of the operation
+            default_store: Optional store identifier used to qualify bare
+                table names parsed out of SQL (e.g. ``postgres:db/schema``).
+                When omitted, bare names go through the resolution layer:
+                unambiguous matches resolve normally; unknown or ambiguous
+                names follow the plugin's ``ambiguity_policy``.
 
         Returns:
             Result with registered flows
         """
-        # Parse SQL to extract dependencies
         parsed = self.parse_sql_lineage(sql, context_table)
-
         flows_registered = []
 
-        # Create flows for each source -> target combination
         for target in parsed["target_tables"]:
+            tgt_id = await self._resolve_table_ref(target, store=default_store)
             for source in parsed["source_tables"]:
+                src_id = await self._resolve_table_ref(source, store=default_store)
                 flow_result = await self.register_flow(
-                    source_id=f"table:{source}",
-                    target_id=f"table:{target}",
+                    source_id=src_id,
+                    target_id=tgt_id,
                     flow_type="SQL_TRANSFORM",
                     transformation=transformation or f"SQL: {sql[:100]}",
                     metadata={"sql_query": sql, "is_read_only": parsed["is_read_only"]},
@@ -1056,6 +1093,7 @@ class LineagePlugin(BasePlugin):
         source: Optional[str] = None,
         target: Optional[str] = None,
         transformation: Optional[str] = None,
+        store: Optional[str] = None,
     ) -> Callable:
         """
         Decorator for automatic function-based lineage tracking.
@@ -1063,13 +1101,23 @@ class LineagePlugin(BasePlugin):
         Usage:
             @lineage.track(source="raw_data", target="processed_data")
             async def transform_data(input_df):
-                # Function logic
-                return output_df
+                ...
+
+            # Explicit disambiguation:
+            @lineage.track(
+                source="raw_data",
+                target="processed_data",
+                store="postgres:prod-host/warehouse",
+            )
 
         Args:
-            source: Source entity ID or name
-            target: Target entity ID or name
+            source: Source entity name or ``table:<name>`` / typed-prefix ID.
+                Bare names are routed through the resolution layer.
+            target: Target entity name (same rules as ``source``).
             transformation: Description of transformation
+            store: Optional store qualifier applied to any bare table
+                references in ``source`` / ``target``. Non-table entity IDs
+                (``api:...``, ``column:...``) ignore ``store``.
 
         Returns:
             Decorated function with automatic lineage capture
@@ -1091,9 +1139,19 @@ class LineagePlugin(BasePlugin):
                 actual_target = target or func.__name__
                 actual_transformation = transformation or f"Function: {func.__name__}"
 
+                # Resolve at call time, not decoration time. Ambiguity
+                # errors surface when the function actually runs so imports
+                # stay clean.
+                resolved_source = await self._resolve_table_ref(
+                    actual_source, store=store
+                )
+                resolved_target = await self._resolve_table_ref(
+                    actual_target, store=store
+                )
+
                 await self.register_flow(
-                    source_id=actual_source,
-                    target_id=actual_target,
+                    source_id=resolved_source,
+                    target_id=resolved_target,
                     flow_type="FUNCTION_TRANSFORM",
                     transformation=actual_transformation,
                     metadata={"function": func.__name__, "module": func.__module__},

@@ -2,15 +2,63 @@
 Shared helpers for normalizers.
 
 Holds:
+  * ``build_store_metadata`` — canonical mapping from raw-discovery keys
+    (``host`` / ``port`` / ``region`` / ``arn`` / ``project`` / ``instance``)
+    to the ``metadata`` dict the persister's ``_derive_store`` reads.
+    Every normalizer that wants collision-safe store IDs goes through here.
   * ``_normalize_relational`` — body shared by Postgres and MySQL normalizers.
   * Store-level dedup + environment inference utilities used after discovery.
 """
 
 import re
-from typing import Any, Callable, Dict, List, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterable, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..base_discoverer import DiscoveredStore
+
+
+# ---------------------------------------------------------------------------
+# Store metadata builder — canonical place the persister's _derive_store
+# reads from. Keep the key names in sync with persistence._derive_store.
+# ---------------------------------------------------------------------------
+
+# Keys the persister cares about when building store identifiers. Anything
+# outside this list is normalizer-specific context (e.g. Kinesis shard count,
+# S3 storage classes) and goes in the normalizer's own metadata merge.
+_STORE_ID_KEYS: tuple[str, ...] = (
+    "host",
+    "port",
+    "region",
+    "arn",
+    "project",
+    "instance",
+)
+
+
+def build_store_metadata(
+    raw: Dict[str, Any],
+    *,
+    keys: Iterable[str] = _STORE_ID_KEYS,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return a metadata dict containing only truthy values for the given keys.
+
+    Empty strings, ``None``, and missing keys are dropped so downstream
+    ``_derive_store`` can use simple ``meta.get("host")`` truthiness checks
+    without worrying about sentinel empty values.
+
+    ``extra`` is merged last and takes precedence — normalizers use it to
+    attach store-type-specific context (version, shard count, etc.) without
+    polluting the canonical key set.
+    """
+    result: Dict[str, Any] = {}
+    for key in keys:
+        value = raw.get(key)
+        if value not in (None, ""):
+            result[key] = value
+    if extra:
+        result.update({k: v for k, v in extra.items() if v not in (None, "")})
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -55,13 +103,17 @@ def _normalize_relational(
         for fk in raw.get("foreign_keys", [])
     ]
 
-    return {
+    result: Dict[str, Any] = {
         "database_type": db_type,
         "database_name": raw.get("schema", default_schema),
         "tables": tables,
         "foreign_keys": fks,
         "table_count": len(tables),
     }
+    metadata = build_store_metadata(raw)
+    if metadata:
+        result["metadata"] = metadata
+    return result
 
 
 # ---------------------------------------------------------------------------

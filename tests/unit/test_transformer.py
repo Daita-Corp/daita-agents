@@ -21,6 +21,10 @@ def make_backend(existing_node=None):
     backend.add_edge = AsyncMock()
     backend.flush = AsyncMock()
     backend.get_node = AsyncMock(return_value=existing_node)
+    # resolve_or_placeholder (used by transform_create for source / target
+    # table refs) looks up candidates via find_nodes. Default: no matches,
+    # so bare names fall through to the __unresolved__ sentinel path.
+    backend.find_nodes = AsyncMock(return_value=[])
 
     mock_graph = MagicMock()
     mock_graph.nodes.return_value = []

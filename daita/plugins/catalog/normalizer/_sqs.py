@@ -2,6 +2,8 @@
 
 from typing import Any, Dict, List
 
+from ._common import build_store_metadata
+
 
 def normalize_sqs(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize SQS discover output.
@@ -68,9 +70,12 @@ def normalize_sqs(raw: Dict[str, Any]) -> Dict[str, Any]:
         ],
         "foreign_keys": [],
         "table_count": 1,
-        "metadata": {
-            "is_fifo": raw.get("is_fifo", False),
-            "visibility_timeout": raw.get("visibility_timeout", 30),
-            "retention_seconds": raw.get("retention_seconds", 345600),
-        },
+        "metadata": build_store_metadata(
+            raw,
+            extra={
+                "is_fifo": raw.get("is_fifo", False),
+                "visibility_timeout": raw.get("visibility_timeout", 30),
+                "retention_seconds": raw.get("retention_seconds", 345600),
+            },
+        ),
     }

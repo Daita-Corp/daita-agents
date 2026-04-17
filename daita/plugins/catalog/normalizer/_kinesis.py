@@ -2,6 +2,8 @@
 
 from typing import Any, Dict, List
 
+from ._common import build_store_metadata
+
 
 def normalize_kinesis(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize Kinesis discover output.
@@ -56,9 +58,12 @@ def normalize_kinesis(raw: Dict[str, Any]) -> Dict[str, Any]:
         ],
         "foreign_keys": [],
         "table_count": 1,
-        "metadata": {
-            "shard_count": raw.get("shard_count", 0),
-            "retention_hours": raw.get("retention_hours", 24),
-            "stream_mode": raw.get("stream_mode", "PROVISIONED"),
-        },
+        "metadata": build_store_metadata(
+            raw,
+            extra={
+                "shard_count": raw.get("shard_count", 0),
+                "retention_hours": raw.get("retention_hours", 24),
+                "stream_mode": raw.get("stream_mode", "PROVISIONED"),
+            },
+        ),
     }
