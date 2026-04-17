@@ -7,7 +7,7 @@ Daita Agents gives you a clean, minimal API for autonomous tool-calling agents t
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
 [![PyPI](https://img.shields.io/badge/pypi-daita--agents-orange)](https://pypi.org/project/daita-agents/)
-[![Version](https://img.shields.io/badge/version-0.15.1-green)](https://pypi.org/project/daita-agents/)
+[![Version](https://img.shields.io/badge/version-0.16.0-green)](https://pypi.org/project/daita-agents/)
 
 ---
 
@@ -445,15 +445,15 @@ asyncio.run(main())
 
 ### Databases
 
-| Plugin          | Description                          | Extra             |
-| --------------- | ------------------------------------ | ----------------- |
+| Plugin          | Description                           | Extra             |
+| --------------- | ------------------------------------- | ----------------- |
 | `postgresql`    | Query and write PostgreSQL (pgvector) | `[postgresql]`    |
-| `mysql`         | Query and write MySQL                | `[mysql]`         |
-| `mongodb`       | Query MongoDB collections            | `[mongodb]`       |
-| `sqlite`        | Query and write SQLite               | `[sqlite]`        |
-| `snowflake`     | Query Snowflake data warehouse       | `[snowflake]`     |
-| `bigquery`      | Query Google BigQuery                | `[bigquery]`      |
-| `elasticsearch` | Search Elasticsearch indices         | `[elasticsearch]` |
+| `mysql`         | Query and write MySQL                 | `[mysql]`         |
+| `mongodb`       | Query MongoDB collections             | `[mongodb]`       |
+| `sqlite`        | Query and write SQLite                | `[sqlite]`        |
+| `snowflake`     | Query Snowflake data warehouse        | `[snowflake]`     |
+| `bigquery`      | Query Google BigQuery                 | `[bigquery]`      |
+| `elasticsearch` | Search Elasticsearch indices          | `[elasticsearch]` |
 
 ### Vector Databases
 
@@ -467,10 +467,10 @@ asyncio.run(main())
 
 | Plugin            | Description                      | Extra            |
 | ----------------- | -------------------------------- | ---------------- |
-| `rest`            | Call REST APIs                   | *(included)*     |
+| `rest`            | Call REST APIs                   | _(included)_     |
 | `s3`              | Read/write S3 objects            | `[aws]`          |
 | `slack`           | Send Slack messages              | `[slack]`        |
-| `email`           | Send/receive email (SMTP/IMAP)   | *(included)*     |
+| `email`           | Send/receive email (SMTP/IMAP)   | _(included)_     |
 | `google_drive`    | Read files from Google Drive     | `[google-drive]` |
 | `websearch`       | AI-optimized web search (Tavily) | `[websearch]`    |
 | `mcp`             | Model Context Protocol servers   | `[mcp]`          |
@@ -480,14 +480,14 @@ asyncio.run(main())
 
 ### Knowledge & Orchestration
 
-| Plugin         | Description                                     |
-| -------------- | ----------------------------------------------- |
-| `memory`       | Persistent semantic agent memory                |
-| `catalog`      | Schema discovery and metadata management        |
-| `lineage`      | Data lineage tracking and impact analysis       |
-| `orchestrator` | Multi-agent coordination and task routing       |
-| `data_quality` | Data profiling and quality checks               |
-| `transformer`  | SQL transformation management and execution    |
+| Plugin         | Description                                 |
+| -------------- | ------------------------------------------- |
+| `memory`       | Persistent semantic agent memory            |
+| `catalog`      | Schema discovery and metadata management    |
+| `lineage`      | Data lineage tracking and impact analysis   |
+| `orchestrator` | Multi-agent coordination and task routing   |
+| `data_quality` | Data profiling and quality checks           |
+| `transformer`  | SQL transformation management and execution |
 
 ---
 
