@@ -81,25 +81,6 @@ from .tracing import (
     TraceContext,
 )
 
-# Plugin Tracing System - Automatic tool execution monitoring
-from .plugin_tracing import (
-    # Main plugin tracing function
-    trace_plugin,
-    # Traced plugin factories
-    traced_postgresql,
-    traced_mysql,
-    traced_mongodb,
-    traced_rest,
-    # Context managers for batch operations
-    traced_transaction,
-    traced_api_batch,
-    # Query and statistics functions
-    get_plugin_traces,
-    get_plugin_stats,
-    # Advanced plugin tracing class
-    TracedPlugin,
-)
-
 # Decision Tracing System - Agent reasoning and confidence capture
 from .decision_tracing import (
     # Main decision tracing interfaces
@@ -174,22 +155,6 @@ __all__ = [
     # Core tracing components
     "TraceSpan",
     "TraceContext",
-    # === Plugin Tracing System ===
-    # Main plugin tracing
-    "trace_plugin",
-    # Traced plugin factories
-    "traced_postgresql",
-    "traced_mysql",
-    "traced_mongodb",
-    "traced_rest",
-    # Plugin batch operations
-    "traced_transaction",
-    "traced_api_batch",
-    # Plugin analytics
-    "get_plugin_traces",
-    "get_plugin_stats",
-    # Advanced plugin tracing
-    "TracedPlugin",
     # === Decision Tracing System ===
     # Main decision tracing
     "record_decision_point",
@@ -215,7 +180,6 @@ CORE_INFO = {
         "interfaces",
         "focus",
         "tracing",
-        "plugin_tracing",
         "decision_tracing",
     ],
     "description": "Core abstractions and utilities for the Daita framework",

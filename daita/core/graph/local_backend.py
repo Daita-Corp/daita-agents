@@ -17,12 +17,12 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, List, Optional
 
 if TYPE_CHECKING:
     import networkx as nx
 
-from .models import AgentGraphNode, AgentGraphEdge, NodeType
+from .models import AgentGraphNode, AgentGraphEdge, EdgeType, NodeType
 
 logger = logging.getLogger(__name__)
 
@@ -185,20 +185,69 @@ class LocalGraphBackend:
         self,
         from_node_id: Optional[str] = None,
         to_node_id: Optional[str] = None,
+        edge_types: Optional[Iterable[EdgeType]] = None,
+        properties_match: Optional[dict[str, Any]] = None,
     ) -> List[AgentGraphEdge]:
+        edges: List[AgentGraphEdge] = []
+        async for edge in self.iter_edges(
+            from_node_id=from_node_id,
+            to_node_id=to_node_id,
+            edge_types=edge_types,
+            properties_match=properties_match,
+        ):
+            edges.append(edge)
+        return edges
+
+    async def iter_edges(
+        self,
+        from_node_id: Optional[str] = None,
+        to_node_id: Optional[str] = None,
+        edge_types: Optional[Iterable[EdgeType]] = None,
+        properties_match: Optional[dict[str, Any]] = None,
+        page_size: int = 500,
+    ) -> AsyncIterator[AgentGraphEdge]:
+        wanted_types = {
+            et.value if isinstance(et, EdgeType) else str(et) for et in edge_types
+        } if edge_types else None
+
         async with self._lock:
             graph = self._load()
-            edges = []
-            for u, v, _key, edge_data in graph.edges(keys=True, data=True):
-                raw = edge_data.get("data", {})
-                if not raw:
+            # Snapshot under the lock so yields outside don't race mutations.
+            snapshot = [
+                (u, v, dict(edge_data.get("data", {}) or {}))
+                for u, v, _key, edge_data in graph.edges(keys=True, data=True)
+            ]
+
+        for u, v, raw in snapshot:
+            if not raw:
+                continue
+            if from_node_id and u != from_node_id:
+                continue
+            if to_node_id and v != to_node_id:
+                continue
+            if wanted_types and raw.get("edge_type") not in wanted_types:
+                continue
+            if properties_match:
+                edge_props = raw.get("properties", {}) or {}
+                if not all(edge_props.get(k) == v for k, v in properties_match.items()):
                     continue
-                if from_node_id and u != from_node_id:
-                    continue
-                if to_node_id and v != to_node_id:
-                    continue
-                edges.append(AgentGraphEdge(**raw))
-            return edges
+            try:
+                yield AgentGraphEdge(**raw)
+            except (TypeError, ValueError):
+                continue
+
+    async def subgraph(
+        self,
+        root: str,
+        direction: str = "both",
+        edge_types: Optional[Iterable[EdgeType]] = None,
+        max_depth: int = 5,
+    ) -> nx.MultiDiGraph:
+        from .algorithms import default_subgraph
+
+        return await default_subgraph(
+            self, root, direction=direction, edge_types=edge_types, max_depth=max_depth
+        )
 
     async def load_graph(self) -> nx.MultiDiGraph:
         async with self._lock:
@@ -301,32 +350,47 @@ class LocalGraphBackend:
         node_type: NodeType,
         properties_match: Optional[dict[str, Any]] = None,
     ) -> List[AgentGraphNode]:
+        matches: List[AgentGraphNode] = []
+        async for node in self.iter_nodes(
+            node_type, properties_match=properties_match
+        ):
+            matches.append(node)
+        return matches
+
+    async def iter_nodes(
+        self,
+        node_type: NodeType,
+        properties_match: Optional[dict[str, Any]] = None,
+        page_size: int = 500,
+    ) -> AsyncIterator[AgentGraphNode]:
+        wanted_type = node_type.value
         async with self._lock:
             graph = self._load()
-            matches: List[AgentGraphNode] = []
-            wanted_type = node_type.value
-            for node_id in graph.nodes():
-                raw = graph.nodes[node_id].get("data", {})
-                if raw.get("node_type") != wanted_type:
+            # Snapshot node data under the lock so async yielding can't race
+            # a concurrent add_node mutation.
+            snapshot = [
+                (node_id, dict(graph.nodes[node_id].get("data", {}) or {}))
+                for node_id in graph.nodes()
+            ]
+
+        for _node_id, raw in snapshot:
+            if raw.get("node_type") != wanted_type:
+                continue
+            if properties_match:
+                node_props = raw.get("properties", {}) or {}
+                name = raw.get("name")
+                ok = True
+                for key, expected in properties_match.items():
+                    actual = name if key == "name" else node_props.get(key)
+                    if actual != expected:
+                        ok = False
+                        break
+                if not ok:
                     continue
-                if properties_match:
-                    node_props = raw.get("properties", {}) or {}
-                    name = raw.get("name")
-                    ok = True
-                    for key, expected in properties_match.items():
-                        actual = (
-                            name if key == "name" else node_props.get(key)
-                        )
-                        if actual != expected:
-                            ok = False
-                            break
-                    if not ok:
-                        continue
-                try:
-                    matches.append(AgentGraphNode(**raw))
-                except (TypeError, ValueError):
-                    continue
-            return matches
+            try:
+                yield AgentGraphNode(**raw)
+            except (TypeError, ValueError):
+                continue
 
     async def promote_node(self, old_id: str, new_id: str) -> None:
         if old_id == new_id:
