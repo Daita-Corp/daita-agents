@@ -307,15 +307,19 @@ async def test_public_accessor_api():
     assert plugin.get_store("nonexistent") is None
 
 
-async def test_get_tools_returns_10():
+async def test_get_tools_returns_expected_set():
     plugin = CatalogPlugin()
     tools = plugin.get_tools()
-    assert len(tools) == 10
     names = {t.name for t in tools}
-    assert "discover_infrastructure" in names
-    assert "profile_store" in names
-    assert "compare_store_to_baseline" in names
-    assert "find_store" in names
+    assert names == {
+        "discover_infrastructure",
+        "discover_schema",
+        "profile_store",
+        "get_table_schema",
+        "find_store",
+        "compare_schemas",
+        "export_diagram",
+    }
 
 
 async def test_lifecycle_on_before_run_empty():

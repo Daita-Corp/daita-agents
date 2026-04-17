@@ -29,6 +29,10 @@ from typing import Dict, List
 
 import pytest
 
+pytest.importorskip(
+    "networkx", reason="networkx required: pip install 'daita-agents[lineage]'"
+)
+
 from daita.core.graph import LocalGraphBackend, LINEAGE_EDGE_TYPES
 from daita.core.graph.models import (
     AgentGraphEdge,
