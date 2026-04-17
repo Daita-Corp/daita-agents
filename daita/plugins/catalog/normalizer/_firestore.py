@@ -17,7 +17,9 @@ def _normalize_firestore_indexes(
     """
     out: List[Dict[str, Any]] = []
     for idx in raw_indexes:
-        columns = [f["field_path"] for f in idx.get("fields", []) if f.get("field_path")]
+        columns = [
+            f["field_path"] for f in idx.get("fields", []) if f.get("field_path")
+        ]
         out.append(
             {
                 "name": idx.get("name", ""),

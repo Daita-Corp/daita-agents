@@ -45,7 +45,6 @@ from ._harness import (
     timed,
 )
 
-
 # ---------------------------------------------------------------------------
 # Ground-truth graph
 # ---------------------------------------------------------------------------
@@ -233,9 +232,10 @@ class TestLineageAgentLive:
         # Either trace_lineage or find_lineage_paths is acceptable here — both
         # can answer. We want to confirm the agent did NOT fall back to guessing.
         tool_names = {c.get("tool") for c in result.get("tool_calls", [])}
-        assert tool_names & {"find_lineage_paths", "trace_lineage"}, (
-            f"Agent answered without a lineage tool call: {tool_names}"
-        )
+        assert tool_names & {
+            "find_lineage_paths",
+            "trace_lineage",
+        }, f"Agent answered without a lineage tool call: {tool_names}"
         assert_answer_mentions(result, ["raw_orders", "stg_orders", "fact_orders"])
 
     async def test_agent_analyzes_impact(self, lineage_plugin):
@@ -256,14 +256,13 @@ class TestLineageAgentLive:
         # The ideal tool is analyze_impact; accept trace_lineage downstream
         # as a functionally-correct fallback some models pick.
         tool_names = {c.get("tool") for c in result.get("tool_calls", [])}
-        assert tool_names & {"analyze_impact", "trace_lineage"}, (
-            f"No relevant tool called: {tool_names}"
-        )
+        assert tool_names & {
+            "analyze_impact",
+            "trace_lineage",
+        }, f"No relevant tool called: {tool_names}"
         assert_answer_mentions(result, ["fact_orders"])
         # revenue_daily is 2 hops downstream — agent should surface it
-        assert_answer_mentions(
-            result, ["revenue_daily", "fact_orders"], any_of=True
-        )
+        assert_answer_mentions(result, ["revenue_daily", "fact_orders"], any_of=True)
 
     async def test_agent_respects_edge_type_scope(self, lineage_plugin):
         """Agent must NOT return structural (HAS_COLUMN) reachability when
@@ -282,6 +281,6 @@ class TestLineageAgentLive:
                 detailed=True,
             )
 
-        text = (result.get("result") or "")
+        text = result.get("result") or ""
         assert "revenue_daily" in text
         assert "fact_orders.amount" not in text

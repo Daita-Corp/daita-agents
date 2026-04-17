@@ -131,8 +131,7 @@ async def _resolve_schema_target(
     schema = plugin.get_schema(target)
     if schema is None:
         raise ValidationError(
-            f"No profiled schema for store '{target}'. "
-            f"Run profile_store first."
+            f"No profiled schema for store '{target}'. " f"Run profile_store first."
         )
     return _schema_dict(schema)
 
@@ -181,8 +180,7 @@ async def _handle_discover_schema(
     store_type = args["store_type"].lower()
     if store_type not in _STORE_TYPE_ENUM:
         raise ValidationError(
-            f"Unsupported store_type '{store_type}'. "
-            f"Use one of: {_STORE_TYPE_ENUM}"
+            f"Unsupported store_type '{store_type}'. " f"Use one of: {_STORE_TYPE_ENUM}"
         )
 
     options = args.get("options") or {}
@@ -206,9 +204,7 @@ async def _handle_discover_schema(
     elif store_type == "mongodb":
         database = options.get("database")
         if not database:
-            raise ValidationError(
-                "mongodb requires options.database"
-            )
+            raise ValidationError("mongodb requires options.database")
         result = await plugin.discover_mongodb(
             connection_string=connection_string,
             database=database,
@@ -371,8 +367,7 @@ async def _handle_export_diagram(
     schema = plugin.get_schema(store_id)
     if schema is None:
         raise ValidationError(
-            f"No profiled schema for store '{store_id}'. "
-            f"Run profile_store first."
+            f"No profiled schema for store '{store_id}'. " f"Run profile_store first."
         )
     return await _export_diagram(_schema_dict(schema), fmt)
 

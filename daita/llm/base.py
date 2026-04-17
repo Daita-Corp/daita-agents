@@ -213,7 +213,11 @@ class BaseLLMProvider(LLMProvider, ABC):
         if hasattr(usage, "input_tokens"):
             inp = getattr(usage, "input_tokens", 0)
             out = getattr(usage, "output_tokens", 0)
-            return {"total_tokens": inp + out, "prompt_tokens": inp, "completion_tokens": out}
+            return {
+                "total_tokens": inp + out,
+                "prompt_tokens": inp,
+                "completion_tokens": out,
+            }
 
         return {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0}
 
@@ -296,9 +300,7 @@ class BaseLLMProvider(LLMProvider, ABC):
             "avg_latency_ms": metrics.get("avg_latency_ms", 0),
         }
 
-    def _convert_tools_to_format(
-        self, tools: List[AgentTool]
-    ) -> List[Dict[str, Any]]:
+    def _convert_tools_to_format(self, tools: List[AgentTool]) -> List[Dict[str, Any]]:
         """
         Convert AgentTool list to provider-specific format.
 

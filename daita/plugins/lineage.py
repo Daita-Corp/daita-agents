@@ -604,9 +604,7 @@ class LineagePlugin(BasePlugin):
         )
         return result
 
-    async def _resolve_table_ref(
-        self, value: str, store: Optional[str] = None
-    ) -> str:
+    async def _resolve_table_ref(self, value: str, store: Optional[str] = None) -> str:
         """Resolve a bare table name (or ``table:<name>``) to a qualified node ID.
 
         Non-table entity IDs (``api:...``, ``column:...``, ``pipeline:...``,
@@ -762,9 +760,7 @@ class LineagePlugin(BasePlugin):
                 edge_types=effective_edge_types,
                 max_depth=max_depth,
             )
-            result = impact_analysis(
-                graph, entity_id, edge_types=effective_edge_types
-            )
+            result = impact_analysis(graph, entity_id, edge_types=effective_edge_types)
 
             # Nodes with path_length == 1 are directly connected
             directly_affected = sum(

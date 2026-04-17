@@ -120,9 +120,7 @@ class TestSecuritySkill:
         from skills.security import check_input_validation
 
         result = await check_input_validation.execute({"code": SAMPLE_CODE})
-        func_names = [
-            f["function"] for f in result["functions_without_validation"]
-        ]
+        func_names = [f["function"] for f in result["functions_without_validation"]]
         assert "getUserData" in func_names
 
     @pytest.mark.asyncio

@@ -49,7 +49,6 @@ from ._harness import (
     timed,
 )
 
-
 POSTGRES_IMAGE = "postgres:16-alpine"
 POSTGRES_USER = "daita"
 POSTGRES_PASSWORD = "daita_test_pw"
@@ -143,8 +142,10 @@ def seeded_postgres(postgres_url) -> str:
                 await asyncio.sleep(0.5)
         raise RuntimeError(f"Could not seed Postgres: {last_err}")
 
-    asyncio.get_event_loop().run_until_complete(_seed()) if False else asyncio.run(
-        _seed()
+    (
+        asyncio.get_event_loop().run_until_complete(_seed())
+        if False
+        else asyncio.run(_seed())
     )
     return postgres_url
 
@@ -189,9 +190,9 @@ class TestCatalogPluginPostgres:
         # sibling array keyed by table_name + column_name.
         schema = result.get("schema") or result
         table_names = {t["table_name"] for t in schema.get("tables", [])}
-        assert EXPECTED_TABLES <= table_names, (
-            f"Expected {EXPECTED_TABLES} in {table_names}"
-        )
+        assert (
+            EXPECTED_TABLES <= table_names
+        ), f"Expected {EXPECTED_TABLES} in {table_names}"
 
         orders_cols = {
             c["column_name"]
@@ -341,9 +342,9 @@ class TestAgentPostgresLive:
             )
 
         tool_names = {c.get("tool") for c in result.get("tool_calls", [])}
-        assert "get_table_schema" in tool_names or "profile_store" in tool_names, (
-            f"Agent used neither get_table_schema nor profile_store: {tool_names}"
-        )
+        assert (
+            "get_table_schema" in tool_names or "profile_store" in tool_names
+        ), f"Agent used neither get_table_schema nor profile_store: {tool_names}"
         assert_answer_mentions(
             result, ["order_id", "customer_id", "amount"], any_of=True
         )

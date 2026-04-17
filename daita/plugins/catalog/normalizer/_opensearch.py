@@ -38,7 +38,5 @@ def normalize_opensearch(raw: Dict[str, Any]) -> Dict[str, Any]:
         "tables": tables,
         "foreign_keys": [],
         "table_count": len(tables),
-        "metadata": build_store_metadata(
-            raw, extra={"version": raw.get("version")}
-        ),
+        "metadata": build_store_metadata(raw, extra={"version": raw.get("version")}),
     }

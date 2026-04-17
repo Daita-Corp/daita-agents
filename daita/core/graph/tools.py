@@ -309,9 +309,7 @@ def register_graph_tools(
 
     registry = getattr(agent, "tool_registry", None)
     if registry is None or not hasattr(registry, "register_many"):
-        raise TypeError(
-            "register_graph_tools requires an agent with a tool_registry."
-        )
+        raise TypeError("register_graph_tools requires an agent with a tool_registry.")
     registry.register_many(tools)
     logger.info("Registered %d graph-query tools on agent", len(tools))
     return tools

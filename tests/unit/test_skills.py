@@ -15,7 +15,6 @@ from daita.llm.mock import MockLLMProvider
 from daita.plugins.base import BasePlugin, LifecyclePlugin
 from daita.skills.base import BaseSkill, Skill
 
-
 # ===========================================================================
 # Helpers
 # ===========================================================================

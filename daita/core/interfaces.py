@@ -70,5 +70,3 @@ class EmbeddingProvider(ABC):
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
         """Embed multiple text strings in a batch."""
         pass
-
-

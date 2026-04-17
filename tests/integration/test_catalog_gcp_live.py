@@ -41,7 +41,6 @@ from daita.agents.agent import Agent
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.gcp import GCPDiscoverer
 
-
 # ---------------------------------------------------------------------------
 # Environment guards
 # ---------------------------------------------------------------------------
@@ -263,9 +262,7 @@ def firestore_collection_with_index() -> dict[str, str]:
         )
 
     admin = firestore_admin_v1.FirestoreAdminClient()
-    parent = (
-        f"projects/{project}/databases/(default)/collectionGroups/{collection}"
-    )
+    parent = f"projects/{project}/databases/(default)/collectionGroups/{collection}"
     index = ftypes.Index(
         query_scope=ftypes.Index.QueryScope.COLLECTION,
         fields=[
@@ -310,9 +307,7 @@ class TestGCPDiscovererLive:
         """test_access() returns True when credentials are valid."""
         assert await gcp_discoverer.test_access() is True
 
-    async def test_enumerate_yields_stores(
-        self, gcp_discoverer: GCPDiscoverer, capsys
-    ):
+    async def test_enumerate_yields_stores(self, gcp_discoverer: GCPDiscoverer, capsys):
         """
         enumerate() iterates across all configured services and yields
         DiscoveredStore instances. Empty accounts are allowed, but no
@@ -345,8 +340,7 @@ class TestCatalogPluginWithGCP:
         result = await catalog_with_gcp.discover_all()
 
         print(
-            f"\n[CATALOG] stores={result.store_count} "
-            f"errors={result.error_count}"
+            f"\n[CATALOG] stores={result.store_count} " f"errors={result.error_count}"
         )
         for err in result.errors:
             print(f"  ! {err.discoverer_name}: {err.error}")
@@ -355,9 +349,7 @@ class TestCatalogPluginWithGCP:
         # Populates the plugin's in-memory catalog
         assert len(catalog_with_gcp.get_stores()) == result.store_count
 
-    async def test_find_store_by_type(
-        self, catalog_with_gcp: CatalogPlugin
-    ):
+    async def test_find_store_by_type(self, catalog_with_gcp: CatalogPlugin):
         """get_stores(store_type=...) filters correctly after a live scan."""
         await catalog_with_gcp.discover_all()
         all_stores = catalog_with_gcp.get_stores()
@@ -438,7 +430,9 @@ class TestBigQueryConstraints:
             "customer_id",
             "customers",
             "customer_id",
-        ) in fk_shapes, f"FK orders.customer_id → customers.customer_id missing: {fk_shapes}"
+        ) in fk_shapes, (
+            f"FK orders.customer_id → customers.customer_id missing: {fk_shapes}"
+        )
 
 
 @pytest.mark.integration
@@ -462,12 +456,8 @@ class TestPubSubSchemaRegistry:
         fx = pubsub_topic_with_avro_schema
 
         # Discovery returns raw topic metadata including the resolved schema.
-        raw = await discover_pubsub_topic(
-            project=fx["project"], topic=fx["topic_id"]
-        )
-        assert raw.get("schema"), (
-            f"Topic should be bound to a schema: {raw}"
-        )
+        raw = await discover_pubsub_topic(project=fx["project"], topic=fx["topic_id"])
+        assert raw.get("schema"), f"Topic should be bound to a schema: {raw}"
         assert raw["schema"]["type"] == "AVRO"
         assert "DaitaEvent" in raw["schema"]["definition"]
 
@@ -522,9 +512,7 @@ class TestFirestoreIndexes:
         plugin.add_profiler(FirestoreProfiler())
         await plugin.discover_and_profile()
 
-        fs_store = next(
-            (s for s in plugin.get_stores(store_type="firestore")), None
-        )
+        fs_store = next((s for s in plugin.get_stores(store_type="firestore")), None)
         assert fs_store, "Firestore database was not discovered"
 
         schema = plugin.get_schema(fs_store.id)
@@ -545,8 +533,7 @@ class TestFirestoreIndexes:
         )
         # At least one index must cover the seeded (user_id, timestamp) pair.
         pair_found = any(
-            "user_id" in idx.columns and "timestamp" in idx.columns
-            for idx in composite
+            "user_id" in idx.columns and "timestamp" in idx.columns for idx in composite
         )
         assert pair_found, (
             f"Expected composite index covering user_id + timestamp; "
@@ -657,9 +644,9 @@ class TestGraphEmissionLive:
 
         events_id = f"table:{store}.{collection}"
         events_node = await backend.get_node(events_id)
-        assert events_node is not None, (
-            f"events Table node missing; searched {events_id}"
-        )
+        assert (
+            events_node is not None
+        ), f"events Table node missing; searched {events_id}"
 
         indexed_by = [
             e
@@ -692,9 +679,9 @@ class TestGraphEmissionLive:
                 matching_index = (idx_node, covers)
                 break
 
-        assert matching_index is not None, (
-            "No composite index covers (user_id, timestamp) with positions 0, 1"
-        )
+        assert (
+            matching_index is not None
+        ), "No composite index covers (user_id, timestamp) with positions 0, 1"
         _, covers = matching_index
         assert [e.properties["position"] for e in covers] == [0, 1]
 
@@ -803,21 +790,30 @@ class TestAgentWithGCPCatalog:
         print(f"\n[AGENT] tools={tool_names}")
         print(f"[AGENT] answer={answer[:300]}")
 
-        assert "discover_infrastructure" in tool_names, (
-            f"Agent did not call discover_infrastructure; saw: {tool_names}"
-        )
+        assert (
+            "discover_infrastructure" in tool_names
+        ), f"Agent did not call discover_infrastructure; saw: {tool_names}"
         assert answer, "Agent returned an empty answer"
         # Agent must reflect the real store count it observed — accept digits
         # or English word form (LLMs switch between "2" and "two" freely).
         expected_count = len(catalog_with_gcp.get_stores())
         word_forms = {
-            0: "zero", 1: "one", 2: "two", 3: "three", 4: "four",
-            5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
+            0: "zero",
+            1: "one",
+            2: "two",
+            3: "three",
+            4: "four",
+            5: "five",
+            6: "six",
+            7: "seven",
+            8: "eight",
+            9: "nine",
+            10: "ten",
         }
         forms = {str(expected_count), word_forms.get(expected_count, "")}
-        assert any(f and f.lower() in answer.lower() for f in forms), (
-            f"Expected count {expected_count} (digit or word) in answer: {answer}"
-        )
+        assert any(
+            f and f.lower() in answer.lower() for f in forms
+        ), f"Expected count {expected_count} (digit or word) in answer: {answer}"
 
     async def test_agent_finds_store_by_type(
         self, catalog_with_gcp: CatalogPlugin, capsys

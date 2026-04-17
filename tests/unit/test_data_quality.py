@@ -475,9 +475,7 @@ async def test_report_persists_stable_metric_node_id():
     # Metric node ID is qualified against the Table ID so the same table name
     # in different stores keeps distinct reports.
     metric_node_id = result["metric_node_id"]
-    assert metric_node_id == (
-        "metric:quality_latest:postgresql:host/db.orders"
-    )
+    assert metric_node_id == ("metric:quality_latest:postgresql:host/db.orders")
     assert "T" not in metric_node_id.split("quality_latest")[-1]  # no ISO timestamp
 
 

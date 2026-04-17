@@ -206,9 +206,11 @@ class LocalGraphBackend:
         properties_match: Optional[dict[str, Any]] = None,
         page_size: int = 500,
     ) -> AsyncIterator[AgentGraphEdge]:
-        wanted_types = {
-            et.value if isinstance(et, EdgeType) else str(et) for et in edge_types
-        } if edge_types else None
+        wanted_types = (
+            {et.value if isinstance(et, EdgeType) else str(et) for et in edge_types}
+            if edge_types
+            else None
+        )
 
         async with self._lock:
             graph = self._load()
@@ -351,9 +353,7 @@ class LocalGraphBackend:
         properties_match: Optional[dict[str, Any]] = None,
     ) -> List[AgentGraphNode]:
         matches: List[AgentGraphNode] = []
-        async for node in self.iter_nodes(
-            node_type, properties_match=properties_match
-        ):
+        async for node in self.iter_nodes(node_type, properties_match=properties_match):
             matches.append(node)
         return matches
 
@@ -418,9 +418,7 @@ class LocalGraphBackend:
                 graph.add_edge(new_id, v, key=new_edge_id, data=raw)
 
             # Rewrite inbound edges (X -> old_id) onto (X -> new_id).
-            for u, _v, key, edata in list(
-                graph.in_edges(old_id, keys=True, data=True)
-            ):
+            for u, _v, key, edata in list(graph.in_edges(old_id, keys=True, data=True)):
                 raw = dict(edata.get("data", {}))
                 old_edge_id = raw.get("edge_id", key)
                 new_edge_id = old_edge_id.replace(old_id, new_id, 1)

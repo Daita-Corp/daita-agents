@@ -11,7 +11,6 @@ from typing import Any, Dict, List
 from daita.core.tools import AgentTool, tool
 from daita.skills import BaseSkill
 
-
 # -- Vulnerability patterns (regex) ------------------------------------------
 
 SECURITY_PATTERNS = {

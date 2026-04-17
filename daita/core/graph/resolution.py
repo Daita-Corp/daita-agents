@@ -142,9 +142,7 @@ async def resolve_table_unique(
     if not candidates:
         if policy is AmbiguousReferencePolicy.UNRESOLVED_SENTINEL:
             return ResolvedTable.from_parts(UNRESOLVED_STORE, bare)
-        raise LookupError(
-            f"No Table node found for name={bare!r} store={store!r}"
-        )
+        raise LookupError(f"No Table node found for name={bare!r} store={store!r}")
 
     # Ambiguous — multiple matches, no store filter.
     if policy is AmbiguousReferencePolicy.STRICT:
@@ -241,9 +239,7 @@ async def resolve_or_placeholder(
             graph_backend, bare, store=store, policy=policy
         )
         if resolved.store == UNRESOLVED_STORE:
-            await ensure_unresolved_placeholder(
-                graph_backend, bare, agent_id=agent_id
-            )
+            await ensure_unresolved_placeholder(graph_backend, bare, agent_id=agent_id)
         return resolved.node_id
     except LookupError:
         if store:

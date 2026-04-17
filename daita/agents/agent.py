@@ -903,14 +903,10 @@ class Agent(BaseAgent):
                             system_parts.append(context)
                 except Exception as e:
                     source_name = getattr(source, "name", source.__class__.__name__)
-                    logger.warning(
-                        "on_before_run failed for '%s': %s", source_name, e
-                    )
+                    logger.warning("on_before_run failed for '%s': %s", source_name, e)
 
         if skill_parts:
-            system_parts.append(
-                "## Skills & Expertise\n" + "\n\n".join(skill_parts)
-            )
+            system_parts.append("## Skills & Expertise\n" + "\n\n".join(skill_parts))
 
         if system_parts:
             conversation.append(
@@ -1151,14 +1147,10 @@ class Agent(BaseAgent):
         """
         requirements = skill.requires()
         if requirements:
-            available = [
-                s for s in self.tool_sources if isinstance(s, BasePlugin)
-            ]
+            available = [s for s in self.tool_sources if isinstance(s, BasePlugin)]
             unmet = []
             for key, plugin_type in requirements.items():
-                match = next(
-                    (p for p in available if isinstance(p, plugin_type)), None
-                )
+                match = next((p for p in available if isinstance(p, plugin_type)), None)
                 if match is None:
                     unmet.append(f"'{key}' ({plugin_type.__name__})")
                 else:

@@ -3,7 +3,6 @@
 import json
 from typing import Any, Dict, List, Optional
 
-
 _DEFAULT_ENVELOPE_COLUMNS: List[Dict[str, Any]] = [
     {"name": "message_id", "type": "string", "nullable": False, "is_primary_key": True},
     {"name": "data", "type": "bytes", "nullable": False, "is_primary_key": False},

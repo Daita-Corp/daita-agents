@@ -46,7 +46,6 @@ from ._harness import (
     timed,
 )
 
-
 # ---------------------------------------------------------------------------
 # Read-only enforcement
 # ---------------------------------------------------------------------------
@@ -224,11 +223,20 @@ class TestAgentAWSLive:
         text = (result.get("result") or "").lower()
         expected_count = len(plugin.get_stores())
         word_forms = {
-            0: "zero", 1: "one", 2: "two", 3: "three", 4: "four",
-            5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
+            0: "zero",
+            1: "one",
+            2: "two",
+            3: "three",
+            4: "four",
+            5: "five",
+            6: "six",
+            7: "seven",
+            8: "eight",
+            9: "nine",
+            10: "ten",
         }
         # Accept either the digit or the English word form; LLMs switch.
         forms = {str(expected_count), word_forms.get(expected_count, "")}
-        assert any(f and f in text for f in forms), (
-            f"Agent reported wrong count. Expected {expected_count}; answer: {text[:300]!r}"
-        )
+        assert any(
+            f and f in text for f in forms
+        ), f"Agent reported wrong count. Expected {expected_count}; answer: {text[:300]!r}"

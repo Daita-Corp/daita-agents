@@ -288,9 +288,7 @@ async def _emit_table(
 
     for col in table.get("columns", []):
         col_name = col["name"]
-        col_id = AgentGraphNode.make_id(
-            NodeType.COLUMN, f"{store}.{tname}.{col_name}"
-        )
+        col_id = AgentGraphNode.make_id(NodeType.COLUMN, f"{store}.{tname}.{col_name}")
         col_props: Dict[str, Any] = {
             "type": col.get("type", ""),
             "nullable": col.get("nullable", True),
@@ -312,9 +310,7 @@ async def _emit_table(
         )
         await graph_backend.add_edge(
             AgentGraphEdge(
-                edge_id=AgentGraphEdge.make_id(
-                    table_id, EdgeType.HAS_COLUMN, col_id
-                ),
+                edge_id=AgentGraphEdge.make_id(table_id, EdgeType.HAS_COLUMN, col_id),
                 from_node_id=table_id,
                 to_node_id=col_id,
                 edge_type=EdgeType.HAS_COLUMN,
@@ -326,9 +322,7 @@ async def _emit_table(
         idx_name = idx.get("name") or ""
         if not idx_name:
             continue
-        idx_id = AgentGraphNode.make_id(
-            NodeType.INDEX, f"{store}.{tname}.{idx_name}"
-        )
+        idx_id = AgentGraphNode.make_id(NodeType.INDEX, f"{store}.{tname}.{idx_name}")
         idx_props: Dict[str, Any] = {
             "type": idx.get("type", ""),
             "unique": idx.get("unique", False),
@@ -349,9 +343,7 @@ async def _emit_table(
         )
         await graph_backend.add_edge(
             AgentGraphEdge(
-                edge_id=AgentGraphEdge.make_id(
-                    table_id, EdgeType.INDEXED_BY, idx_id
-                ),
+                edge_id=AgentGraphEdge.make_id(table_id, EdgeType.INDEXED_BY, idx_id),
                 from_node_id=table_id,
                 to_node_id=idx_id,
                 edge_type=EdgeType.INDEXED_BY,
@@ -367,9 +359,7 @@ async def _emit_table(
             )
             await graph_backend.add_edge(
                 AgentGraphEdge(
-                    edge_id=AgentGraphEdge.make_id(
-                        idx_id, EdgeType.COVERS, col_id
-                    ),
+                    edge_id=AgentGraphEdge.make_id(idx_id, EdgeType.COVERS, col_id),
                     from_node_id=idx_id,
                     to_node_id=col_id,
                     edge_type=EdgeType.COVERS,
@@ -390,7 +380,12 @@ async def _emit_foreign_keys(
     Cross-store FKs are out of scope for this PR; every FK is assumed to be
     intra-store (same ``store`` qualifier on both endpoints).
     """
-    from daita.core.graph.models import AgentGraphEdge, AgentGraphNode, EdgeType, NodeType
+    from daita.core.graph.models import (
+        AgentGraphEdge,
+        AgentGraphNode,
+        EdgeType,
+        NodeType,
+    )
 
     for fk in schema.get("foreign_keys", []):
         try:

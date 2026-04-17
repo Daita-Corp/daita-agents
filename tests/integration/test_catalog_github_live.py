@@ -156,8 +156,17 @@ class TestAgentGitHubLive:
         text = (result.get("result") or "").lower()
         expected_count = len(plugin.get_stores())
         word_forms = {
-            0: "zero", 1: "one", 2: "two", 3: "three", 4: "four",
-            5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
+            0: "zero",
+            1: "one",
+            2: "two",
+            3: "three",
+            4: "four",
+            5: "five",
+            6: "six",
+            7: "seven",
+            8: "eight",
+            9: "nine",
+            10: "ten",
         }
         forms = {str(expected_count), word_forms.get(expected_count, "")}
         # When zero, accept "no" as a synonym for the count.

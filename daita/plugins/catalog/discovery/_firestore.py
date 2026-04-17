@@ -107,8 +107,7 @@ def _list_firestore_indexes(
     order, array_config}]}``. Errors (permission / legacy DB) degrade to ``[]``.
     """
     parent = (
-        f"projects/{project}/databases/{database}"
-        f"/collectionGroups/{collection_id}"
+        f"projects/{project}/databases/{database}" f"/collectionGroups/{collection_id}"
     )
     out: list[dict[str, Any]] = []
     try:
@@ -131,7 +130,5 @@ def _list_firestore_indexes(
                 }
             )
     except Exception as exc:
-        logger.debug(
-            "Firestore list_indexes failed for %s: %s", collection_id, exc
-        )
+        logger.debug("Firestore list_indexes failed for %s: %s", collection_id, exc)
     return out

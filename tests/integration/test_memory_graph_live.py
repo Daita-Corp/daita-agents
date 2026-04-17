@@ -13,7 +13,9 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("networkx", reason="networkx required: pip install 'daita-agents[lineage]'")
+pytest.importorskip(
+    "networkx", reason="networkx required: pip install 'daita-agents[lineage]'"
+)
 
 from daita.core.graph.local_backend import LocalGraphBackend
 from daita.plugins.memory.fact_extractor import FactExtractor

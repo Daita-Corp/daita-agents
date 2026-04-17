@@ -185,7 +185,9 @@ class AWSDiscoverer(BaseDiscoverer):
                         },
                         source="aws_rds",
                         region=region,
-                        tags=[f"{t['Key']}={t['Value']}" for t in db.get("TagList", [])],
+                        tags=[
+                            f"{t['Key']}={t['Value']}" for t in db.get("TagList", [])
+                        ],
                         metadata={
                             "arn": db.get("DBInstanceArn", ""),
                             "engine_version": db.get("EngineVersion", ""),
@@ -264,7 +266,9 @@ class AWSDiscoverer(BaseDiscoverer):
         except Exception as exc:
             logger.warning("S3 enumeration failed: %s", exc)
 
-    async def _enumerate_elasticache(self, region: str) -> AsyncIterator[DiscoveredStore]:
+    async def _enumerate_elasticache(
+        self, region: str
+    ) -> AsyncIterator[DiscoveredStore]:
         client = self._session.client("elasticache", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
@@ -329,7 +333,9 @@ class AWSDiscoverer(BaseDiscoverer):
         except Exception as exc:
             logger.warning("Redshift enumeration failed in %s: %s", region, exc)
 
-    async def _enumerate_apigateway(self, region: str) -> AsyncIterator[DiscoveredStore]:
+    async def _enumerate_apigateway(
+        self, region: str
+    ) -> AsyncIterator[DiscoveredStore]:
         now = datetime.now(timezone.utc).isoformat()
 
         # --- REST APIs (apigateway v1) ---
@@ -342,13 +348,18 @@ class AWSDiscoverer(BaseDiscoverer):
                     api_name = api.get("name", api_id)
 
                     try:
-                        stages = [s["stageName"] for s in client.get_stages(restApiId=api_id).get("item", [])]
+                        stages = [
+                            s["stageName"]
+                            for s in client.get_stages(restApiId=api_id).get("item", [])
+                        ]
                     except Exception:
                         stages = ["(no stage)"]
 
                     resource_count = 0
                     try:
-                        for res in client.get_resources(restApiId=api_id).get("items", []):
+                        for res in client.get_resources(restApiId=api_id).get(
+                            "items", []
+                        ):
                             resource_count += len(res.get("resourceMethods", {}))
                     except Exception:
                         pass
@@ -390,13 +401,18 @@ class AWSDiscoverer(BaseDiscoverer):
                     protocol = api.get("ProtocolType", "HTTP")
 
                     try:
-                        stages = [s["StageName"] for s in v2_client.get_stages(ApiId=api_id).get("Items", [])]
+                        stages = [
+                            s["StageName"]
+                            for s in v2_client.get_stages(ApiId=api_id).get("Items", [])
+                        ]
                     except Exception:
                         stages = ["$default"]
 
                     route_count = 0
                     try:
-                        route_count = len(v2_client.get_routes(ApiId=api_id).get("Items", []))
+                        route_count = len(
+                            v2_client.get_routes(ApiId=api_id).get("Items", [])
+                        )
                     except Exception:
                         pass
 
@@ -436,13 +452,16 @@ class AWSDiscoverer(BaseDiscoverer):
                 for queue_url in page.get("QueueUrls", []):
                     try:
                         attrs = client.get_queue_attributes(
-                            QueueUrl=queue_url, AttributeNames=["All"],
+                            QueueUrl=queue_url,
+                            AttributeNames=["All"],
                         )["Attributes"]
                     except Exception:
                         attrs = {}
 
                     arn = attrs.get("QueueArn", "")
-                    queue_name = arn.rsplit(":", 1)[-1] if arn else queue_url.rsplit("/", 1)[-1]
+                    queue_name = (
+                        arn.rsplit(":", 1)[-1] if arn else queue_url.rsplit("/", 1)[-1]
+                    )
 
                     yield self._build_store(
                         store_type="sqs",
@@ -452,9 +471,15 @@ class AWSDiscoverer(BaseDiscoverer):
                         region=region,
                         metadata={
                             "arn": arn,
-                            "approximate_message_count": int(attrs.get("ApproximateNumberOfMessages", 0)),
-                            "approximate_not_visible": int(attrs.get("ApproximateNumberOfMessagesNotVisible", 0)),
-                            "visibility_timeout": int(attrs.get("VisibilityTimeout", 30)),
+                            "approximate_message_count": int(
+                                attrs.get("ApproximateNumberOfMessages", 0)
+                            ),
+                            "approximate_not_visible": int(
+                                attrs.get("ApproximateNumberOfMessagesNotVisible", 0)
+                            ),
+                            "visibility_timeout": int(
+                                attrs.get("VisibilityTimeout", 30)
+                            ),
                             "created_timestamp": attrs.get("CreatedTimestamp", ""),
                             "is_fifo": queue_name.endswith(".fifo"),
                         },
@@ -475,7 +500,9 @@ class AWSDiscoverer(BaseDiscoverer):
                     topic_name = topic_arn.rsplit(":", 1)[-1]
 
                     try:
-                        attrs = client.get_topic_attributes(TopicArn=topic_arn)["Attributes"]
+                        attrs = client.get_topic_attributes(TopicArn=topic_arn)[
+                            "Attributes"
+                        ]
                     except Exception:
                         attrs = {}
 
@@ -487,8 +514,12 @@ class AWSDiscoverer(BaseDiscoverer):
                         region=region,
                         metadata={
                             "arn": topic_arn,
-                            "subscription_count": int(attrs.get("SubscriptionsConfirmed", 0)),
-                            "subscriptions_pending": int(attrs.get("SubscriptionsPending", 0)),
+                            "subscription_count": int(
+                                attrs.get("SubscriptionsConfirmed", 0)
+                            ),
+                            "subscriptions_pending": int(
+                                attrs.get("SubscriptionsPending", 0)
+                            ),
                             "display_name": attrs.get("DisplayName", ""),
                             "is_fifo": topic_name.endswith(".fifo"),
                         },
@@ -497,26 +528,37 @@ class AWSDiscoverer(BaseDiscoverer):
         except Exception as exc:
             logger.warning("SNS enumeration failed in %s: %s", region, exc)
 
-    async def _enumerate_opensearch(self, region: str) -> AsyncIterator[DiscoveredStore]:
+    async def _enumerate_opensearch(
+        self, region: str
+    ) -> AsyncIterator[DiscoveredStore]:
         client = self._session.client("opensearch", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
         try:
-            domain_names = [d["DomainName"] for d in client.list_domain_names().get("DomainNames", [])]
+            domain_names = [
+                d["DomainName"]
+                for d in client.list_domain_names().get("DomainNames", [])
+            ]
             if not domain_names:
                 return
 
             for i in range(0, len(domain_names), 5):
-                resp = client.describe_domains(DomainNames=domain_names[i:i + 5])
+                resp = client.describe_domains(DomainNames=domain_names[i : i + 5])
                 for domain in resp.get("DomainStatusList", []):
                     domain_name = domain["DomainName"]
-                    endpoint = domain.get("Endpoint") or domain.get("Endpoints", {}).get("vpc", "")
+                    endpoint = domain.get("Endpoint") or domain.get(
+                        "Endpoints", {}
+                    ).get("vpc", "")
                     cluster_config = domain.get("ClusterConfig", {})
 
                     yield self._build_store(
                         store_type="opensearch",
                         display_name=f"{domain_name} ({region})",
-                        connection_hint={"host": endpoint, "port": 443, "region": region},
+                        connection_hint={
+                            "host": endpoint,
+                            "port": 443,
+                            "region": region,
+                        },
                         source="aws_opensearch",
                         region=region,
                         metadata={
@@ -524,22 +566,32 @@ class AWSDiscoverer(BaseDiscoverer):
                             "engine_version": domain.get("EngineVersion", ""),
                             "instance_type": cluster_config.get("InstanceType", ""),
                             "instance_count": cluster_config.get("InstanceCount", 1),
-                            "dedicated_master": cluster_config.get("DedicatedMasterEnabled", False),
-                            "zone_awareness": cluster_config.get("ZoneAwarenessEnabled", False),
-                            "status": "processing" if domain.get("Processing") else "active",
+                            "dedicated_master": cluster_config.get(
+                                "DedicatedMasterEnabled", False
+                            ),
+                            "zone_awareness": cluster_config.get(
+                                "ZoneAwarenessEnabled", False
+                            ),
+                            "status": (
+                                "processing" if domain.get("Processing") else "active"
+                            ),
                         },
                         now=now,
                     )
         except Exception as exc:
             logger.warning("OpenSearch enumeration failed in %s: %s", region, exc)
 
-    async def _enumerate_documentdb(self, region: str) -> AsyncIterator[DiscoveredStore]:
+    async def _enumerate_documentdb(
+        self, region: str
+    ) -> AsyncIterator[DiscoveredStore]:
         client = self._session.client("docdb", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
         try:
             paginator = client.get_paginator("describe_db_clusters")
-            for page in paginator.paginate(Filters=[{"Name": "engine", "Values": ["docdb"]}]):
+            for page in paginator.paginate(
+                Filters=[{"Name": "engine", "Values": ["docdb"]}]
+            ):
                 for cluster in page.get("DBClusters", []):
                     cluster_id = cluster["DBClusterIdentifier"]
                     yield self._build_store(
@@ -574,7 +626,9 @@ class AWSDiscoverer(BaseDiscoverer):
             for page in paginator.paginate():
                 for stream_name in page.get("StreamNames", []):
                     try:
-                        summary = client.describe_stream_summary(StreamName=stream_name)["StreamDescriptionSummary"]
+                        summary = client.describe_stream_summary(
+                            StreamName=stream_name
+                        )["StreamDescriptionSummary"]
                     except Exception:
                         summary = {}
 
@@ -593,7 +647,9 @@ class AWSDiscoverer(BaseDiscoverer):
                             "shard_count": summary.get("OpenShardCount", 0),
                             "retention_hours": summary.get("RetentionPeriodHours", 24),
                             "status": summary.get("StreamStatus", ""),
-                            "stream_mode": summary.get("StreamModeDetails", {}).get("StreamMode", "PROVISIONED"),
+                            "stream_mode": summary.get("StreamModeDetails", {}).get(
+                                "StreamMode", "PROVISIONED"
+                            ),
                             "consumer_count": summary.get("ConsumerCount", 0),
                         },
                         now=now,

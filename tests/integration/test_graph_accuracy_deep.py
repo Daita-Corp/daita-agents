@@ -63,7 +63,6 @@ from ._harness import (
     timed,
 )
 
-
 # ---------------------------------------------------------------------------
 # Pure-graph fixtures (no docker, no LLM)
 # ---------------------------------------------------------------------------
@@ -248,9 +247,7 @@ class TestMaxDepthBoundary:
             (100, {"table:B", "table:C", "table:D", "table:E"}),
         ],
     )
-    async def test_downstream_depth_bound_is_exact(
-        self, chain_plugin, depth, expected
-    ):
+    async def test_downstream_depth_bound_is_exact(self, chain_plugin, depth, expected):
         result = await chain_plugin.trace_lineage(
             "table:A", direction="downstream", max_depth=depth
         )
@@ -406,7 +403,9 @@ class TestStoreQualifiedIDs:
 
         tables = await backend.find_nodes(NodeType.TABLE)
         assert tables, "No Table nodes persisted"
-        bare_ids = [t for t in tables if t.node_id in {"table:customers", "table:orders"}]
+        bare_ids = [
+            t for t in tables if t.node_id in {"table:customers", "table:orders"}
+        ]
         assert not bare_ids, (
             f"Found unqualified Table node_ids: {[t.node_id for t in bare_ids]} — "
             f"store qualifier regressed"
@@ -414,17 +413,17 @@ class TestStoreQualifiedIDs:
 
         for t in tables:
             prefix = f"table:postgresql:"
-            assert t.node_id.startswith(prefix), (
-                f"Table node_id {t.node_id!r} missing store prefix {prefix!r}"
-            )
+            assert t.node_id.startswith(
+                prefix
+            ), f"Table node_id {t.node_id!r} missing store prefix {prefix!r}"
 
         # Every Column node must be prefixed the same way.
         columns = await backend.find_nodes(NodeType.COLUMN)
         assert columns, "No Column nodes persisted"
         for c in columns:
-            assert c.node_id.startswith("column:postgresql:"), (
-                f"Column node_id {c.node_id!r} missing store prefix"
-            )
+            assert c.node_id.startswith(
+                "column:postgresql:"
+            ), f"Column node_id {c.node_id!r} missing store prefix"
 
 
 # ---------------------------------------------------------------------------
@@ -439,17 +438,17 @@ class TestIndexesPersist:
         self, catalog_plugin_with_fresh_backend, seeded_pg
     ):
         """``orders_customer_idx`` must become an Index node with:
-          * ``INDEXED_BY`` edge Table→Index
-          * ``COVERS`` edge Index→Column(customer_id) with position=0
+        * ``INDEXED_BY`` edge Table→Index
+        * ``COVERS`` edge Index→Column(customer_id) with position=0
         """
         plugin, backend = catalog_plugin_with_fresh_backend
         await _profile_seeded_pg(plugin, seeded_pg)
 
         indexes = await backend.find_nodes(NodeType.INDEX)
         idx_names = {i.name for i in indexes}
-        assert "orders_customer_idx" in idx_names, (
-            f"Seeded index not persisted. Found: {idx_names}"
-        )
+        assert (
+            "orders_customer_idx" in idx_names
+        ), f"Seeded index not persisted. Found: {idx_names}"
 
         idx = next(i for i in indexes if i.name == "orders_customer_idx")
 
@@ -467,9 +466,9 @@ class TestIndexesPersist:
         )
         assert len(covers) == 1, f"Expected 1 COVERS edge, got {len(covers)}"
         cov = covers[0]
-        assert cov.to_node_id.endswith("orders.customer_id"), (
-            f"COVERS points to wrong column: {cov.to_node_id}"
-        )
+        assert cov.to_node_id.endswith(
+            "orders.customer_id"
+        ), f"COVERS points to wrong column: {cov.to_node_id}"
         assert cov.properties.get("position") == 0
 
 
@@ -543,22 +542,26 @@ class TestNegativeLLM:
 
         text = (result.get("result") or "").lower()
         # Accept any of the standard "empty" phrasings.
-        empty_tokens = ["no upstream", "none", "no sources", "no upstream sources", "zero"]
-        assert any(tok in text for tok in empty_tokens), (
-            f"Agent did not report an empty answer. Got: {text[:300]!r}"
-        )
+        empty_tokens = [
+            "no upstream",
+            "none",
+            "no sources",
+            "no upstream sources",
+            "zero",
+        ]
+        assert any(
+            tok in text for tok in empty_tokens
+        ), f"Agent did not report an empty answer. Got: {text[:300]!r}"
         # Hallucination guard: neither child nor island should appear as upstream.
         for bogus in ["table:child", "island"]:
-            assert bogus not in text, (
-                f"Agent invented upstream '{bogus}' for table:root. Answer: {text[:300]!r}"
-            )
+            assert (
+                bogus not in text
+            ), f"Agent invented upstream '{bogus}' for table:root. Answer: {text[:300]!r}"
 
     async def test_agent_reports_unreachable_path(self, disconnected_plugin):
         """No path exists from ``table:root`` to ``table:island`` — agent must
         not claim one."""
-        agent = build_live_agent(
-            name="NegLLMPathAgent", tools=[disconnected_plugin]
-        )
+        agent = build_live_agent(name="NegLLMPathAgent", tools=[disconnected_plugin])
         async with timed("agent.run negative path"):
             result = await agent.run(
                 "Using the lineage tools, find every path from `table:root` "
@@ -567,11 +570,19 @@ class TestNegativeLLM:
             )
 
         text = (result.get("result") or "").lower()
-        empty_tokens = ["no path", "unreachable", "none", "no route", "not connected",
-                        "does not exist", "no direct", "no lineage"]
-        assert any(tok in text for tok in empty_tokens), (
-            f"Agent didn't report unreachable. Got: {text[:300]!r}"
-        )
+        empty_tokens = [
+            "no path",
+            "unreachable",
+            "none",
+            "no route",
+            "not connected",
+            "does not exist",
+            "no direct",
+            "no lineage",
+        ]
+        assert any(
+            tok in text for tok in empty_tokens
+        ), f"Agent didn't report unreachable. Got: {text[:300]!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -617,9 +628,7 @@ class TestCrossPluginTraversal:
         )
 
         # Step 3: Agent with BOTH plugins must surface the cross-plugin lineage.
-        agent = build_live_agent(
-            name="CrossPluginAgent", tools=[plugin, lineage]
-        )
+        agent = build_live_agent(name="CrossPluginAgent", tools=[plugin, lineage])
         async with timed("agent.run cross-plugin"):
             agent_result = await agent.run(
                 f"Using the lineage tools, list the upstream sources of "

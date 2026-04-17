@@ -18,8 +18,7 @@ def normalize_bigquery(raw: Dict[str, Any]) -> Dict[str, Any]:
         col_by_table.setdefault(col["table_name"], []).append(col)
 
     pk_set = {
-        (pk["table_name"], pk["column_name"])
-        for pk in raw.get("primary_keys", [])
+        (pk["table_name"], pk["column_name"]) for pk in raw.get("primary_keys", [])
     }
 
     tables = []

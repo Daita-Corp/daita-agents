@@ -75,9 +75,7 @@ async def analyze_complexity(code: str) -> Dict[str, Any]:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
 
-        branches = sum(
-            1 for child in ast.walk(node) if isinstance(child, branch_types)
-        )
+        branches = sum(1 for child in ast.walk(node) if isinstance(child, branch_types))
         complexity = 1 + branches  # base path + branches
 
         end_line = getattr(node, "end_lineno", node.lineno)

@@ -38,19 +38,40 @@ from ._harness import (
     timed,
 )
 
-
 MONGO_IMAGE = "mongo:7"
 MONGO_DB = "daita_test"
 
 
 SEED_DOCS = {
     "customers": [
-        {"customer_id": 1, "name": "Alice", "email": "alice@example.com", "signup_date": "2026-01-01"},
-        {"customer_id": 2, "name": "Bob",   "email": "bob@example.com",   "signup_date": "2026-01-02"},
+        {
+            "customer_id": 1,
+            "name": "Alice",
+            "email": "alice@example.com",
+            "signup_date": "2026-01-01",
+        },
+        {
+            "customer_id": 2,
+            "name": "Bob",
+            "email": "bob@example.com",
+            "signup_date": "2026-01-02",
+        },
     ],
     "orders": [
-        {"order_id": 1, "customer_id": 1, "amount": 50.0,  "status": "shipped", "items": 2},
-        {"order_id": 2, "customer_id": 2, "amount": 150.0, "status": "pending", "items": 5},
+        {
+            "order_id": 1,
+            "customer_id": 1,
+            "amount": 50.0,
+            "status": "shipped",
+            "items": 2,
+        },
+        {
+            "order_id": 2,
+            "customer_id": 2,
+            "amount": 150.0,
+            "status": "pending",
+            "items": 5,
+        },
     ],
 }
 
@@ -145,16 +166,15 @@ class TestCatalogPluginMongoDB:
         schema = result.get("schema") or result
         collections = schema.get("collections", [])
         collection_names = {c["collection_name"] for c in collections}
-        assert {"customers", "orders"} <= collection_names, (
-            f"Expected collections in: {collection_names}"
-        )
+        assert {
+            "customers",
+            "orders",
+        } <= collection_names, f"Expected collections in: {collection_names}"
 
         orders = next(c for c in collections if c["collection_name"] == "orders")
         orders_fields = {f["field_name"] for f in orders.get("fields", [])}
         for f in ["order_id", "customer_id", "amount", "status", "items"]:
-            assert f in orders_fields, (
-                f"Missing inferred field {f} in {orders_fields}"
-            )
+            assert f in orders_fields, f"Missing inferred field {f} in {orders_fields}"
 
 
 # ---------------------------------------------------------------------------
@@ -197,9 +217,7 @@ class TestMongoDBGraphCorrectness:
 @pytest.mark.integration
 @pytest.mark.requires_db
 class TestAgentMongoDBLive:
-    async def test_agent_describes_collections(
-        self, plugin_with_backend, seeded_mongo
-    ):
+    async def test_agent_describes_collections(self, plugin_with_backend, seeded_mongo):
         plugin, _ = plugin_with_backend
 
         agent = build_live_agent(name="MongoCatalogAgent", tools=[plugin])

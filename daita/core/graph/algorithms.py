@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 
 from .models import EdgeType
 
-
 # Default edge-type set for lineage-semantic traversals. Excludes structural
 # edges (HAS_COLUMN, INDEXED_BY, COVERS, REFERENCES, PART_OF) so lineage tools
 # don't accidentally walk into Column / Index nodes. REFERENCES is structural
@@ -415,9 +414,7 @@ async def default_subgraph(
                     if edge.from_node_id not in g:
                         nbr = await backend.get_node(edge.from_node_id)
                         data = (
-                            nbr.model_dump()
-                            if nbr
-                            else {"node_id": edge.from_node_id}
+                            nbr.model_dump() if nbr else {"node_id": edge.from_node_id}
                         )
                         g.add_node(edge.from_node_id, data=data)
                     g.add_edge(

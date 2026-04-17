@@ -257,7 +257,15 @@ def start_container(
 
     host_port = _free_port()
     name = f"{tag_prefix}-{uuid.uuid4().hex[:8]}"
-    args = ["docker", "run", "-d", "--name", name, "-p", f"{host_port}:{container_port}"]
+    args = [
+        "docker",
+        "run",
+        "-d",
+        "--name",
+        name,
+        "-p",
+        f"{host_port}:{container_port}",
+    ]
     for k, v in (env or {}).items():
         args += ["-e", f"{k}={v}"]
     args.append(image)

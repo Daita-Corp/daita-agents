@@ -5,11 +5,12 @@ from typing import Any, Dict, List
 
 from ._common import _normalize_relational
 
-
 # Match the column list of a CREATE INDEX statement. Postgres appends optional
 # `WHERE <predicate>` at the end for partial indexes, so grab the last fully
 # parenthesized group that isn't followed by another open paren.
-_INDEX_COL_LIST = re.compile(r"\(([^()]+)\)\s*(?:WHERE\b.*)?$", re.IGNORECASE | re.DOTALL)
+_INDEX_COL_LIST = re.compile(
+    r"\(([^()]+)\)\s*(?:WHERE\b.*)?$", re.IGNORECASE | re.DOTALL
+)
 _INDEX_USING = re.compile(r"\bUSING\s+(\w+)", re.IGNORECASE)
 
 

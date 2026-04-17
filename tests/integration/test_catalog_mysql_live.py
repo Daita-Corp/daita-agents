@@ -38,7 +38,6 @@ from ._harness import (
     timed,
 )
 
-
 MYSQL_IMAGE = "mysql:8.0"
 MYSQL_ROOT_PASSWORD = "daita_root_pw"
 MYSQL_USER = "daita"
@@ -188,9 +187,9 @@ class TestCatalogPluginMySQL:
         # Raw discover_* shape: tables[].table_name, columns in a flat sibling array.
         schema = result.get("schema") or result
         table_names = {t["table_name"] for t in schema.get("tables", [])}
-        assert EXPECTED_TABLES <= table_names, (
-            f"Expected {EXPECTED_TABLES} in {table_names}"
-        )
+        assert (
+            EXPECTED_TABLES <= table_names
+        ), f"Expected {EXPECTED_TABLES} in {table_names}"
 
         fk_triples = {
             (fk["source_table"], fk["source_column"], fk["target_table"])

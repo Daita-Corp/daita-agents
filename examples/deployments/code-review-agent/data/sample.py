@@ -5,7 +5,6 @@ import pickle
 import sqlite3
 import subprocess
 
-
 DB_PASSWORD = "super_secret_password_123"
 
 
