@@ -15,12 +15,22 @@ Developers never call auto_select_backend() directly. LineagePlugin and CatalogP
 call it during initialize() if no backend was provided at construction time.
 """
 
-from typing import TYPE_CHECKING, Callable, List, Optional, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Callable,
+    Iterable,
+    List,
+    Optional,
+    Protocol,
+    runtime_checkable,
+)
 
 if TYPE_CHECKING:
     import networkx as nx
 
-from .models import AgentGraphNode, AgentGraphEdge
+from .models import AgentGraphNode, AgentGraphEdge, EdgeType, NodeType
 
 # Module-level registry. Set once at startup via register_backend_factory().
 # None means use LocalGraphBackend.
@@ -35,6 +45,12 @@ class GraphBackend(Protocol):
     Implement this protocol to provide a custom storage backend.
     All graph traversal logic runs on top of NetworkX regardless of
     which backend is used for persistence.
+
+    Core primitives are ``iter_nodes`` and ``iter_edges`` (streaming).
+    ``find_nodes`` and ``get_edges`` have default implementations that
+    materialize the iterators into lists — backends may override either
+    form, but only the iterators are strictly required beyond the basic
+    CRUD methods.
     """
 
     async def add_node(self, node: AgentGraphNode) -> None:
@@ -49,23 +65,69 @@ class GraphBackend(Protocol):
         """Retrieve a single node by ID. Returns None if not found."""
         ...
 
+    async def iter_edges(
+        self,
+        from_node_id: Optional[str] = None,
+        to_node_id: Optional[str] = None,
+        edge_types: Optional[Iterable[EdgeType]] = None,
+        properties_match: Optional[dict[str, Any]] = None,
+        page_size: int = 500,
+    ) -> AsyncIterator[AgentGraphEdge]:
+        """
+        Streaming variant of get_edges. Yields one edge at a time; the
+        backend handles pagination internally.
+
+        Filter semantics:
+          * ``from_node_id`` / ``to_node_id`` — endpoint constraints (either or both).
+          * ``edge_types`` — accept only edges whose ``edge_type`` is in this set.
+          * ``properties_match`` — accept only edges whose ``properties`` map
+            contains all the given key/value pairs.
+
+        Use ``get_edges`` when the result set is known to fit in memory.
+        """
+        ...
+
     async def get_edges(
         self,
         from_node_id: Optional[str] = None,
         to_node_id: Optional[str] = None,
+        edge_types: Optional[Iterable[EdgeType]] = None,
+        properties_match: Optional[dict[str, Any]] = None,
     ) -> List[AgentGraphEdge]:
         """
-        Retrieve edges filtered by from_node_id and/or to_node_id.
-        Both parameters are optional — omitting both returns all edges.
+        Retrieve edges matching the given filters.
+
+        Default implementation materializes ``iter_edges`` into a list;
+        backends may override for bulk-fetch optimizations.
         """
         ...
 
     async def load_graph(self) -> "nx.MultiDiGraph":
         """
         Load the full graph into a NetworkX MultiDiGraph for algorithm execution.
-        Each node carries its AgentGraphNode as the 'data' attribute.
-        Each edge carries its AgentGraphEdge as the 'data' attribute.
-        Multiple edge types between the same node pair are stored as distinct edges.
+
+        This is the "offline analytics" path — prune passes, diagram export,
+        full-graph reporting. Per-call traversal should use ``subgraph``
+        instead, which touches only the nodes reachable within ``max_depth``.
+        """
+        ...
+
+    async def subgraph(
+        self,
+        root: str,
+        direction: str = "both",
+        edge_types: Optional[Iterable[EdgeType]] = None,
+        max_depth: int = 5,
+    ) -> "nx.MultiDiGraph":
+        """
+        Load a bounded-radius subgraph around ``root`` into NetworkX.
+
+        Replaces the ``load_graph()`` + in-memory BFS pattern for per-call
+        traversals. Backend-native implementations (DynamoDB) can perform a
+        breadth-first expansion with per-level edge filtering, pulling only
+        the nodes reachable within ``max_depth`` rather than the whole
+        partition. The default implementation in ``algorithms.subgraph`` is
+        correct for any backend, just not the most efficient one.
         """
         ...
 
@@ -86,6 +148,45 @@ class GraphBackend(Protocol):
         scan interval and gets removed.
 
         Returns a summary: {"removed_nodes": [...], "removed_edges": [...]}
+        """
+        ...
+
+    async def iter_nodes(
+        self,
+        node_type: NodeType,
+        properties_match: Optional[dict[str, Any]] = None,
+        page_size: int = 500,
+    ) -> AsyncIterator[AgentGraphNode]:
+        """
+        Streaming variant of find_nodes. Yields one node at a time;
+        the backend handles pagination internally. Use when the result
+        set may exceed memory (e.g. "every Column node in the graph").
+        """
+        ...
+
+    async def find_nodes(
+        self,
+        node_type: NodeType,
+        properties_match: Optional[dict[str, Any]] = None,
+    ) -> List[AgentGraphNode]:
+        """
+        Return every node of ``node_type`` whose properties match all key/value
+        pairs in ``properties_match``. Used by the resolution layer to look up
+        Table nodes by bare name across stores.
+
+        Default implementation materializes ``iter_nodes`` into a list.
+        """
+        ...
+
+    async def promote_node(self, old_id: str, new_id: str) -> None:
+        """
+        Rewrite every edge pointing at ``old_id`` to point at ``new_id`` and
+        delete the node at ``old_id``. No-op if ``old_id`` does not exist.
+
+        Used by unresolved-reference reconciliation: when a placeholder
+        ``table:__unresolved__.<name>`` node is replaced by a canonical
+        ``table:<store>.<name>`` node, its incident edges migrate atomically
+        so downstream traversals see the canonical node.
         """
         ...
 

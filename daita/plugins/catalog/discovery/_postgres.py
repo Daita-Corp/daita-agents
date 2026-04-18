@@ -137,6 +137,9 @@ async def discover_postgres(
         return {
             "database_type": "postgresql",
             "schema": schema,
+            "host": creds["host"],
+            "port": creds["port"] or 5432,
+            "database": creds["database"] or "postgres",
             "tables": [dict(row) for row in tables],
             "columns": [dict(row) for row in columns],
             "primary_keys": [dict(row) for row in pkeys],

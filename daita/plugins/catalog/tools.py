@@ -3,6 +3,23 @@ Catalog tool definitions and handlers.
 
 Builds the list of AgentTool instances exposed by CatalogPlugin and
 provides all tool handler functions.
+
+The agent-facing surface is organised along a two-plane split:
+
+  * Control plane — "what stores exist?"
+        discover_infrastructure
+
+  * Data plane (known endpoint) — "here is a connection string, profile it"
+        discover_schema (dispatches by store_type)
+
+  * Data plane (discovered store) — "profile a store I already found"
+        profile_store
+        get_table_schema (point lookup for a single table)
+
+  * Cross-cutting
+        find_store
+        compare_schemas (live vs live, or live vs persisted baseline)
+        export_diagram
 """
 
 import fnmatch
@@ -12,16 +29,21 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ...core.exceptions import ValidationError
 from .comparator import compare_schemas as _compare_schemas
+from .diagram import export_diagram as _export_diagram
 
 if TYPE_CHECKING:
     from ...core.tools import AgentTool
     from .base_discoverer import DiscoveredStore
+    from .base_profiler import NormalizedSchema
     from .catalog import CatalogPlugin
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+_STORE_TYPE_ENUM = ["postgresql", "mysql", "mongodb", "openapi"]
 
 
 def store_to_dict(store: "DiscoveredStore") -> Dict[str, Any]:
@@ -55,99 +77,68 @@ def apply_table_filter(
     schema["truncated"] = total_tables > max_tables
 
 
+def _require(args: Dict[str, Any], *keys: str) -> None:
+    """Raise ValidationError if any required key is missing from args."""
+    for key in keys:
+        if not args.get(key):
+            raise ValidationError(f"{key} is required")
+
+
+def _schema_dict(schema: "NormalizedSchema") -> Dict[str, Any]:
+    """NormalizedSchema → dict, accepting both dataclass and dict inputs."""
+    if hasattr(schema, "to_dict"):
+        return schema.to_dict()
+    return dict(schema)
+
+
+def _load_baseline_for_store(store_id: str) -> Optional[Dict[str, Any]]:
+    """Return the persisted baseline schema for ``store_id`` or None."""
+    catalog_path = Path(".daita") / "catalog.json"
+    if not catalog_path.exists():
+        return None
+    try:
+        with open(catalog_path, "r") as f:
+            existing = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    return next(
+        (val for val in existing.values() if val.get("store_id") == store_id),
+        None,
+    )
+
+
+async def _resolve_schema_target(
+    plugin: "CatalogPlugin", target: str
+) -> Dict[str, Any]:
+    """
+    Resolve a schema reference to a concrete schema dict.
+
+    ``target`` is either a store_id (returns the live profiled schema) or the
+    literal ``"baseline:<store_id>"`` (returns the last persisted baseline for
+    that store).
+    """
+    if target.startswith("baseline:"):
+        store_id = target[len("baseline:") :]
+        baseline = _load_baseline_for_store(store_id)
+        if baseline is None:
+            raise ValidationError(
+                f"No baseline found for store '{store_id}'. "
+                f"Profile the store first with profile_store."
+            )
+        return baseline
+
+    # Assume plain store_id — require it to be profiled already.
+    schema = plugin.get_schema(target)
+    if schema is None:
+        raise ValidationError(
+            f"No profiled schema for store '{target}'. " f"Run profile_store first."
+        )
+    return _schema_dict(schema)
+
+
 # ---------------------------------------------------------------------------
-# Tool handlers
+# Tool handlers — discovery / profiling
 # ---------------------------------------------------------------------------
-
-
-async def _handle_discover_postgres(
-    plugin: "CatalogPlugin", args: Dict[str, Any]
-) -> Dict[str, Any]:
-    connection_string = args.get("connection_string")
-    if not connection_string:
-        raise ValidationError("connection_string is required")
-
-    result = await plugin.discover_postgres(
-        connection_string=connection_string,
-        schema=args.get("schema", "public"),
-        persist=args.get("persist", plugin._auto_persist),
-        ssl_mode=args.get("ssl_mode", "verify-full"),
-    )
-
-    apply_table_filter(
-        result.get("schema", result),
-        args.get("table_filter"),
-        int(args.get("max_tables") or 50),
-    )
-    return result
-
-
-async def _handle_discover_mysql(
-    plugin: "CatalogPlugin", args: Dict[str, Any]
-) -> Dict[str, Any]:
-    connection_string = args.get("connection_string")
-    if not connection_string:
-        raise ValidationError("connection_string is required")
-
-    result = await plugin.discover_mysql(
-        connection_string=connection_string,
-        schema=args.get("schema"),
-        persist=args.get("persist", plugin._auto_persist),
-    )
-
-    apply_table_filter(
-        result.get("schema", result),
-        args.get("table_filter"),
-        int(args.get("max_tables") or 50),
-    )
-    return result
-
-
-async def _handle_discover_mongodb(
-    plugin: "CatalogPlugin", args: Dict[str, Any]
-) -> Dict[str, Any]:
-    connection_string = args.get("connection_string")
-    if not connection_string:
-        raise ValidationError("connection_string is required")
-
-    database = args.get("database")
-    if not database:
-        raise ValidationError("database is required")
-
-    return await plugin.discover_mongodb(
-        connection_string=connection_string,
-        database=database,
-        sample_size=args.get("sample_size", 100),
-        persist=args.get("persist", plugin._auto_persist),
-    )
-
-
-async def _handle_discover_openapi(
-    plugin: "CatalogPlugin", args: Dict[str, Any]
-) -> Dict[str, Any]:
-    spec_url = args.get("spec_url")
-    if not spec_url:
-        raise ValidationError("spec_url is required")
-
-    return await plugin.discover_openapi(
-        spec_url=spec_url,
-        service_name=args.get("service_name"),
-        persist=args.get("persist", plugin._auto_persist),
-    )
-
-
-async def _handle_compare_schemas(
-    plugin: "CatalogPlugin", args: Dict[str, Any]
-) -> Dict[str, Any]:
-    return await plugin.compare_schemas(args.get("schema_a"), args.get("schema_b"))
-
-
-async def _handle_export_diagram(
-    plugin: "CatalogPlugin", args: Dict[str, Any]
-) -> Dict[str, Any]:
-    return await plugin.export_diagram(
-        args.get("schema"), args.get("format", "mermaid")
-    )
 
 
 async def _handle_discover_infrastructure(
@@ -158,7 +149,6 @@ async def _handle_discover_infrastructure(
     limit = int(args.get("limit") or 50)
     refresh = args.get("refresh", False)
 
-    # Reuse cached results for pagination; only re-scan on first call or explicit refresh
     if refresh or not plugin._discovered_stores:
         result = await plugin.discover_all(concurrency=concurrency)
         errors = result.errors
@@ -178,12 +168,70 @@ async def _handle_discover_infrastructure(
     }
 
 
+async def _handle_discover_schema(
+    plugin: "CatalogPlugin", args: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Dispatch a connection-string profile to the correct discoverer.
+
+    Replaces the per-database discover_postgres / discover_mysql / etc. tools
+    with a single entry point parameterised by ``store_type``.
+    """
+    _require(args, "store_type", "connection_string")
+    store_type = args["store_type"].lower()
+    if store_type not in _STORE_TYPE_ENUM:
+        raise ValidationError(
+            f"Unsupported store_type '{store_type}'. " f"Use one of: {_STORE_TYPE_ENUM}"
+        )
+
+    options = args.get("options") or {}
+    connection_string = args["connection_string"]
+    persist = args.get("persist", plugin._auto_persist)
+
+    if store_type == "postgresql":
+        result = await plugin.discover_postgres(
+            connection_string=connection_string,
+            schema=options.get("schema", "public"),
+            persist=persist,
+            ssl_mode=options.get("ssl_mode", "verify-full"),
+        )
+    elif store_type == "mysql":
+        result = await plugin.discover_mysql(
+            connection_string=connection_string,
+            schema=options.get("schema"),
+            persist=persist,
+            ssl_mode=options.get("ssl_mode", "verify-full"),
+        )
+    elif store_type == "mongodb":
+        database = options.get("database")
+        if not database:
+            raise ValidationError("mongodb requires options.database")
+        result = await plugin.discover_mongodb(
+            connection_string=connection_string,
+            database=database,
+            sample_size=int(options.get("sample_size") or 100),
+            persist=persist,
+        )
+    elif store_type == "openapi":
+        # connection_string is treated as the spec URL for OpenAPI.
+        result = await plugin.discover_openapi(
+            spec_url=connection_string,
+            service_name=options.get("service_name"),
+            persist=persist,
+        )
+
+    apply_table_filter(
+        result.get("schema", result),
+        options.get("table_filter"),
+        int(options.get("max_tables") or 50),
+    )
+    return result
+
+
 async def _handle_profile_store(
     plugin: "CatalogPlugin", args: Dict[str, Any]
 ) -> Dict[str, Any]:
-    store_id = args.get("store_id")
-    if not store_id:
-        raise ValidationError("store_id is required")
+    _require(args, "store_id")
+    store_id = args["store_id"]
 
     store = plugin.get_store(store_id)
     if not store:
@@ -195,49 +243,65 @@ async def _handle_profile_store(
 
     schema = await profiler.profile(store)
     plugin._schemas[store_id] = schema
-
-    # Persist to catalog.json and graph backend
     await plugin._persist_schema(schema.to_dict())
 
     return {"store_id": store_id, "schema": schema.to_dict()}
 
 
-async def _handle_compare_store_to_baseline(
+async def _handle_get_table_schema(
     plugin: "CatalogPlugin", args: Dict[str, Any]
 ) -> Dict[str, Any]:
-    store_id = args.get("store_id")
-    if not store_id:
-        raise ValidationError("store_id is required")
+    """Point lookup for a single table within a profiled store.
 
-    current = plugin._schemas.get(store_id)
-    if not current:
+    Avoids shipping a 1000-table store schema back to the LLM when the agent
+    only needs one table's columns / indexes / FKs.
+    """
+    _require(args, "store_id", "table_name")
+    store_id = args["store_id"]
+    table_name = args["table_name"]
+    include_indexes = args.get("include_indexes", True)
+    include_foreign_keys = args.get("include_foreign_keys", True)
+
+    schema = plugin.get_schema(store_id)
+    if schema is None:
         return {
-            "error": f"No profiled schema for store {store_id}. Run profile_store first."
+            "error": (
+                f"No profiled schema for store '{store_id}'. "
+                f"Run profile_store first."
+            )
         }
 
-    # Load baseline from persistence
-    catalog_path = Path(".daita") / "catalog.json"
-    if not catalog_path.exists():
-        return {"error": "No baseline catalog found"}
+    schema_dict = _schema_dict(schema)
+    table = next(
+        (t for t in schema_dict.get("tables", []) if t.get("name") == table_name),
+        None,
+    )
+    if table is None:
+        known = [t.get("name") for t in schema_dict.get("tables", [])][:20]
+        return {
+            "error": f"Table '{table_name}' not found in store '{store_id}'",
+            "known_tables_sample": known,
+        }
 
-    try:
-        with open(catalog_path, "r") as f:
-            existing = json.load(f)
-    except json.JSONDecodeError:
-        return {"error": "Baseline catalog is corrupt"}
-
-    # Find the baseline schema for this store
-    baseline = None
-    for key, val in existing.items():
-        if val.get("store_id") == store_id:
-            baseline = val
-            break
-
-    if not baseline:
-        return {"error": f"No baseline found for store {store_id}"}
-
-    current_dict = current.to_dict()
-    return await _compare_schemas(baseline, current_dict)
+    response: Dict[str, Any] = {
+        "store_id": store_id,
+        "table_name": table_name,
+        "columns": table.get("columns", []),
+        "row_count": table.get("row_count"),
+    }
+    if include_indexes:
+        response["indexes"] = table.get("indexes", [])
+    if include_foreign_keys:
+        fks = [
+            fk
+            for fk in schema_dict.get("foreign_keys", [])
+            if fk.get("source_table") == table_name
+            or fk.get("target_table") == table_name
+        ]
+        response["foreign_keys"] = fks
+    if table.get("metadata"):
+        response["metadata"] = table["metadata"]
+    return response
 
 
 async def _handle_find_store(
@@ -270,299 +334,304 @@ async def _handle_find_store(
     }
 
 
+async def _handle_compare_schemas(
+    plugin: "CatalogPlugin", args: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Compare two schemas. Each of ``source`` / ``target`` is either:
+
+    * A store_id (uses the live profiled schema — call profile_store first)
+    * ``"baseline:<store_id>"`` (uses the last persisted baseline)
+
+    Covers drift detection (``target="baseline:<id>"``) and cross-store diffs
+    (``source=<id_a>, target=<id_b>``) through a single tool.
+    """
+    _require(args, "source", "target")
+    source_dict = await _resolve_schema_target(plugin, args["source"])
+    target_dict = await _resolve_schema_target(plugin, args["target"])
+    result = await _compare_schemas(source_dict, target_dict)
+    return {
+        "source": args["source"],
+        "target": args["target"],
+        "comparison": result,
+    }
+
+
+async def _handle_export_diagram(
+    plugin: "CatalogPlugin", args: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Export a visual diagram for a profiled store, by store_id."""
+    _require(args, "store_id")
+    store_id = args["store_id"]
+    fmt = args.get("format", "mermaid")
+
+    schema = plugin.get_schema(store_id)
+    if schema is None:
+        raise ValidationError(
+            f"No profiled schema for store '{store_id}'. " f"Run profile_store first."
+        )
+    return await _export_diagram(_schema_dict(schema), fmt)
+
+
 # ---------------------------------------------------------------------------
 # Tool builder
 # ---------------------------------------------------------------------------
 
+# Common kwargs shared by all catalog tools
+_CATALOG_TOOL_DEFAULTS = {
+    "category": "catalog",
+    "source": "plugin",
+    "plugin_name": "Catalog",
+}
 
-def build_catalog_tools(plugin: "CatalogPlugin") -> List["AgentTool"]:
-    """Build the list of AgentTool instances for CatalogPlugin."""
+
+def _catalog_tool(
+    name: str,
+    description: str,
+    parameters: Dict[str, Any],
+    handler_fn,
+    plugin: "CatalogPlugin",
+    timeout_seconds: int = 60,
+) -> "AgentTool":
+    """Create an AgentTool with catalog defaults and bound handler."""
     from ...core.tools import AgentTool
 
+    return AgentTool(
+        name=name,
+        description=description,
+        parameters=parameters,
+        handler=lambda args, p=plugin: handler_fn(p, args),
+        timeout_seconds=timeout_seconds,
+        **_CATALOG_TOOL_DEFAULTS,
+    )
+
+
+def build_catalog_tools(plugin: "CatalogPlugin") -> List["AgentTool"]:
+    """Build the 7 agent-facing CatalogPlugin tools."""
+    t = lambda **kw: _catalog_tool(plugin=plugin, **kw)
+
     return [
-        AgentTool(
-            name="discover_postgres",
-            description="Discover PostgreSQL database schema including tables, columns, foreign keys, and indexes",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "connection_string": {
-                        "type": "string",
-                        "description": "PostgreSQL connection string (e.g., postgresql://user:pass@host:port/db)",
-                    },
-                    "schema": {
-                        "type": "string",
-                        "description": "Schema name to introspect (default: 'public')",
-                    },
-                    "persist": {
-                        "type": "boolean",
-                        "description": "Whether to persist schema to graph storage if available (default: auto_persist setting)",
-                    },
-                    "ssl_mode": {
-                        "type": "string",
-                        "description": "SSL mode: 'verify-full' (default, validates cert) or 'require' (encrypt only, for pgbouncer poolers)",
-                    },
-                    "table_filter": {
-                        "type": "string",
-                        "description": "Glob pattern to filter tables (e.g. 'sales_*', 'orders*'). Leave empty for all tables.",
-                    },
-                    "max_tables": {
-                        "type": "integer",
-                        "description": "Maximum number of tables to include (default: 50)",
-                    },
-                },
-                "required": ["connection_string"],
-            },
-            handler=lambda args, p=plugin: _handle_discover_postgres(p, args),
-            category="catalog",
-            source="plugin",
-            plugin_name="Catalog",
-            timeout_seconds=120,
-        ),
-        AgentTool(
-            name="discover_mysql",
-            description="Discover MySQL/MariaDB database schema including tables, columns, and relationships",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "connection_string": {
-                        "type": "string",
-                        "description": "MySQL connection string (e.g., mysql://user:pass@host:port/db)",
-                    },
-                    "schema": {
-                        "type": "string",
-                        "description": "Schema/database name to introspect",
-                    },
-                    "persist": {
-                        "type": "boolean",
-                        "description": "Whether to persist schema to graph storage if available",
-                    },
-                    "table_filter": {
-                        "type": "string",
-                        "description": "Glob pattern to filter tables (e.g. 'sales_*'). Leave empty for all tables.",
-                    },
-                    "max_tables": {
-                        "type": "integer",
-                        "description": "Maximum number of tables to include (default: 50)",
-                    },
-                },
-                "required": ["connection_string"],
-            },
-            handler=lambda args, p=plugin: _handle_discover_mysql(p, args),
-            category="catalog",
-            source="plugin",
-            plugin_name="Catalog",
-            timeout_seconds=120,
-        ),
-        AgentTool(
-            name="discover_mongodb",
-            description="Discover MongoDB schema by sampling documents to infer structure",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "connection_string": {
-                        "type": "string",
-                        "description": "MongoDB connection string (e.g., mongodb://user:pass@host:port/db)",
-                    },
-                    "database": {
-                        "type": "string",
-                        "description": "Database name to introspect",
-                    },
-                    "sample_size": {
-                        "type": "integer",
-                        "description": "Number of documents to sample per collection (default: 100)",
-                    },
-                    "persist": {
-                        "type": "boolean",
-                        "description": "Whether to persist schema to graph storage if available",
-                    },
-                },
-                "required": ["connection_string", "database"],
-            },
-            handler=lambda args, p=plugin: _handle_discover_mongodb(p, args),
-            category="catalog",
-            source="plugin",
-            plugin_name="Catalog",
-            timeout_seconds=120,
-        ),
-        AgentTool(
-            name="discover_openapi",
-            description="Discover API structure from OpenAPI/Swagger specification",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "spec_url": {
-                        "type": "string",
-                        "description": "URL to OpenAPI spec (JSON or YAML)",
-                    },
-                    "service_name": {
-                        "type": "string",
-                        "description": "Optional service name override",
-                    },
-                    "persist": {
-                        "type": "boolean",
-                        "description": "Whether to persist schema to graph storage if available",
-                    },
-                },
-                "required": ["spec_url"],
-            },
-            handler=lambda args, p=plugin: _handle_discover_openapi(p, args),
-            category="catalog",
-            source="plugin",
-            plugin_name="Catalog",
-            timeout_seconds=60,
-        ),
-        AgentTool(
-            name="compare_schemas",
-            description="Compare two schemas to identify differences for migration planning",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "schema_a": {
-                        "type": "object",
-                        "description": "First schema (from discover_* tools)",
-                    },
-                    "schema_b": {
-                        "type": "object",
-                        "description": "Second schema to compare against",
-                    },
-                },
-                "required": ["schema_a", "schema_b"],
-            },
-            handler=lambda args, p=plugin: _handle_compare_schemas(p, args),
-            category="catalog",
-            source="plugin",
-            plugin_name="Catalog",
-            timeout_seconds=30,
-        ),
-        AgentTool(
-            name="export_diagram",
-            description="Export schema as a visual diagram in Mermaid, DBDiagram, or JSON Schema format",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "schema": {
-                        "type": "object",
-                        "description": "Schema object (from discover_* tools)",
-                    },
-                    "format": {
-                        "type": "string",
-                        "description": "Output format: 'mermaid', 'dbdiagram', or 'json_schema' (default: 'mermaid')",
-                    },
-                },
-                "required": ["schema"],
-            },
-            handler=lambda args, p=plugin: _handle_export_diagram(p, args),
-            category="catalog",
-            source="plugin",
-            plugin_name="Catalog",
-            timeout_seconds=30,
-        ),
-        # --- New discovery tools ---
-        AgentTool(
+        t(
             name="discover_infrastructure",
-            description="Run all registered infrastructure discoverers to find data stores across cloud providers, config files, and service registries",
+            description=(
+                "Control plane: find every data store reachable from registered "
+                "discoverers (AWS, GCP, GitHub, config files, service registries). "
+                "Use when you don't yet know what stores exist. Stores returned "
+                "here can be profiled with profile_store."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "concurrency": {
                         "type": "integer",
-                        "description": "Max concurrent discoverers (default: 5)",
+                        "description": "Max concurrent discoverers (default 5).",
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Skip first N results (default: 0)",
+                        "description": "Skip first N results (default 0).",
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max results to return (default: 50)",
+                        "description": "Max results to return (default 50).",
                     },
                     "refresh": {
                         "type": "boolean",
-                        "description": "Force a fresh discovery sweep (default: false, reuses cached results)",
+                        "description": "Force a fresh discovery sweep (default false — reuses cached results).",
                     },
                 },
             },
-            handler=lambda args, p=plugin: _handle_discover_infrastructure(p, args),
-            category="catalog",
-            source="plugin",
-            plugin_name="Catalog",
+            handler_fn=_handle_discover_infrastructure,
             timeout_seconds=300,
         ),
-        AgentTool(
+        t(
+            name="discover_schema",
+            description=(
+                "Data plane: profile a single known endpoint from a connection "
+                "string. Dispatches by store_type (postgresql, mysql, mongodb, "
+                "openapi). Use when the user hands you a connection string and "
+                "you haven't run discover_infrastructure."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "store_type": {
+                        "type": "string",
+                        "enum": _STORE_TYPE_ENUM,
+                        "description": "The kind of endpoint to profile.",
+                    },
+                    "connection_string": {
+                        "type": "string",
+                        "description": (
+                            "Connection string (postgresql/mysql/mongodb URL, "
+                            "or OpenAPI spec URL for store_type='openapi')."
+                        ),
+                    },
+                    "options": {
+                        "type": "object",
+                        "description": (
+                            "Store-type-specific options. "
+                            "postgresql: {schema, ssl_mode ('disable'|'require'|"
+                            "'verify-full'; pass 'disable' for local/127.0.0.1 "
+                            "or containerized instances that don't speak TLS), "
+                            "table_filter, max_tables}. "
+                            "mysql: {schema, ssl_mode ('disable'|'require'|"
+                            "'verify-full'; 'disable' for local containers), "
+                            "table_filter, max_tables}. "
+                            "mongodb: {database (required), sample_size}. "
+                            "openapi: {service_name}."
+                        ),
+                    },
+                    "persist": {
+                        "type": "boolean",
+                        "description": "Persist the resulting schema to the catalog backend (default: plugin's auto_persist setting).",
+                    },
+                },
+                "required": ["store_type", "connection_string"],
+            },
+            handler_fn=_handle_discover_schema,
+            timeout_seconds=120,
+        ),
+        t(
             name="profile_store",
-            description="Profile a discovered store by ID to extract its full schema (tables, columns, foreign keys)",
+            description=(
+                "Extract the full schema (tables, columns, indexes, foreign "
+                "keys) from a store previously found by discover_infrastructure. "
+                "Persists the profile so subsequent calls to get_table_schema / "
+                "compare_schemas / export_diagram can reference it by store_id."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "store_id": {
                         "type": "string",
-                        "description": "The store fingerprint ID (from discover_infrastructure)",
+                        "description": "Store fingerprint ID from discover_infrastructure or find_store.",
                     },
                 },
                 "required": ["store_id"],
             },
-            handler=lambda args, p=plugin: _handle_profile_store(p, args),
-            category="catalog",
-            source="plugin",
-            plugin_name="Catalog",
+            handler_fn=_handle_profile_store,
             timeout_seconds=120,
         ),
-        AgentTool(
-            name="compare_store_to_baseline",
-            description="Compare a store's current schema against its last persisted baseline",
+        t(
+            name="get_table_schema",
+            description=(
+                "Return the columns, indexes, and foreign keys for a single "
+                "table inside a profiled store. Use this instead of pulling a "
+                "full profile_store response when you only need one table — "
+                "avoids shipping a large schema payload to the LLM."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "store_id": {
                         "type": "string",
-                        "description": "The store fingerprint ID",
+                        "description": "Store ID that has already been profiled.",
+                    },
+                    "table_name": {
+                        "type": "string",
+                        "description": "Name of the table to inspect.",
+                    },
+                    "include_indexes": {
+                        "type": "boolean",
+                        "description": "Include index definitions (default true).",
+                    },
+                    "include_foreign_keys": {
+                        "type": "boolean",
+                        "description": "Include foreign keys touching this table (default true).",
                     },
                 },
-                "required": ["store_id"],
+                "required": ["store_id", "table_name"],
             },
-            handler=lambda args, p=plugin: _handle_compare_store_to_baseline(p, args),
-            category="catalog",
-            source="plugin",
-            plugin_name="Catalog",
-            timeout_seconds=120,
+            handler_fn=_handle_get_table_schema,
+            timeout_seconds=30,
         ),
-        AgentTool(
+        t(
             name="find_store",
-            description="Search the catalog for stores by name, type, environment, or tags",
+            description=(
+                "Search the catalog of discovered stores by display name, "
+                "store type, environment, or tag. Returns matching stores with "
+                "their store_ids for use with profile_store / get_table_schema."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query (matches display name)",
+                        "description": "Substring match against store display name.",
                     },
                     "store_type": {
                         "type": "string",
-                        "description": "Filter by store type (postgresql, mysql, mongodb, s3, etc.)",
+                        "description": "Filter by store type (postgresql, mysql, mongodb, s3, ...).",
                     },
                     "environment": {
                         "type": "string",
-                        "description": "Filter by environment (production, staging, development)",
+                        "description": "Filter by environment (production, staging, development).",
                     },
                     "tag": {
                         "type": "string",
-                        "description": "Filter by tag",
+                        "description": "Filter by tag.",
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Skip first N results (default: 0)",
+                        "description": "Skip first N results (default 0).",
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max results to return (default: 50)",
+                        "description": "Max results to return (default 50).",
                     },
                 },
             },
-            handler=lambda args, p=plugin: _handle_find_store(p, args),
-            category="catalog",
-            source="plugin",
-            plugin_name="Catalog",
+            handler_fn=_handle_find_store,
+            timeout_seconds=30,
+        ),
+        t(
+            name="compare_schemas",
+            description=(
+                "Diff two schemas. Each of 'source' / 'target' is either a "
+                "store_id (for the live profiled schema) or 'baseline:<store_id>' "
+                "for the last persisted baseline. Covers drift detection "
+                "(target='baseline:<id>') and cross-store diffs "
+                "(source=<id_a>, target=<id_b>) in one tool."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Left side of the diff. store_id or 'baseline:<store_id>'.",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Right side of the diff. store_id or 'baseline:<store_id>'.",
+                    },
+                },
+                "required": ["source", "target"],
+            },
+            handler_fn=_handle_compare_schemas,
+            timeout_seconds=30,
+        ),
+        t(
+            name="export_diagram",
+            description=(
+                "Render a profiled store's schema as a visual diagram "
+                "(Mermaid, DBDiagram, or JSON Schema). Takes a store_id that "
+                "has already been profiled — no need to pass a schema dict."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "store_id": {
+                        "type": "string",
+                        "description": "Store ID that has already been profiled.",
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["mermaid", "dbdiagram", "json_schema"],
+                        "description": "Output format (default 'mermaid').",
+                    },
+                },
+                "required": ["store_id"],
+            },
+            handler_fn=_handle_export_diagram,
             timeout_seconds=30,
         ),
     ]

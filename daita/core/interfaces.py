@@ -70,19 +70,3 @@ class EmbeddingProvider(ABC):
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
         """Embed multiple text strings in a batch."""
         pass
-
-
-class DatabaseBackend(ABC):
-    """Interface for database operations."""
-
-    @abstractmethod
-    async def connect(self) -> None:
-        """Establish database connection."""
-        pass
-
-    @abstractmethod
-    async def execute_query(
-        self, query: str, params: Optional[Dict[str, Any]] = None
-    ) -> Any:
-        """Execute database query."""
-        pass

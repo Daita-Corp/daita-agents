@@ -24,12 +24,38 @@ class NormalizedColumn:
 
 
 @dataclass
+class NormalizedIndex:
+    """
+    A declared access path over one or more columns.
+
+    Unifies every store's notion of "secondary structure":
+      * SQL         — ``btree`` / ``hash`` / ``gin`` / ``partial``
+      * BigQuery    — ``partition`` / ``cluster``
+      * DynamoDB    — ``gsi`` / ``lsi``
+      * Firestore   — ``composite``
+      * MongoDB     — ``composite`` / ``text`` / ``geo``
+      * Elasticsearch — ``text`` / ``keyword``
+
+    Agents can reason uniformly: ``tables[].indexes`` is the queryable surface
+    for "what access patterns are efficient on this store".
+    """
+
+    name: str
+    type: str
+    columns: List[str] = field(default_factory=list)
+    unique: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class NormalizedTable:
     """A table (or collection, bucket, etc.) in a normalized schema."""
 
     name: str
     row_count: Optional[int]
     columns: List[NormalizedColumn] = field(default_factory=list)
+    indexes: List[NormalizedIndex] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -79,6 +105,17 @@ class NormalizedSchema:
                         }
                         for c in t.columns
                     ],
+                    "indexes": [
+                        {
+                            "name": i.name,
+                            "type": i.type,
+                            "columns": i.columns,
+                            "unique": i.unique,
+                            **({"metadata": i.metadata} if i.metadata else {}),
+                        }
+                        for i in t.indexes
+                    ],
+                    **({"metadata": t.metadata} if t.metadata else {}),
                 }
                 for t in self.tables
             ],

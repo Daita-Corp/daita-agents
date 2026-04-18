@@ -3,7 +3,7 @@
 import logging
 from typing import Any, Dict
 
-from ._utils import redact_url
+from ._utils import parse_conn_url, redact_url
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,7 @@ async def discover_mongodb(
         )
 
     logger.debug("discover_mongodb: connecting to %s", redact_url(connection_string))
+    creds = parse_conn_url(connection_string)
     client = AsyncIOMotorClient(connection_string)
     db = client[database]
 
@@ -69,6 +70,8 @@ async def discover_mongodb(
         return {
             "database_type": "mongodb",
             "database": database,
+            "host": creds["host"],
+            "port": creds["port"],
             "collections": collections_schema,
             "collection_count": len(collections_schema),
             "sample_size": sample_size,

@@ -23,7 +23,8 @@ import asyncio
 
 from ..config.base import AgentConfig, AgentType, RetryPolicy
 from ..core.interfaces import LLMProvider
-from ..core.exceptions import AgentError
+from ..core.exceptions import AgentError, SkillError
+from ..skills.base import BaseSkill
 from ..core.tracing import TraceType
 from .base import BaseAgent
 
@@ -91,7 +92,7 @@ def _json_serializer(obj):
 
 # Import unified plugin access
 from ..plugins import PluginAccess
-from ..plugins.base import LifecyclePlugin
+from ..plugins.base import BasePlugin, LifecyclePlugin
 from ..llm.factory import create_llm_provider
 from ..config.settings import settings
 from ..core.tools import AgentTool, ToolRegistry
@@ -890,14 +891,22 @@ class Agent(BaseAgent):
         if self.prompt:
             system_parts.append(self.prompt)
 
+        skill_parts = []
         for source in self.tool_sources:
             if isinstance(source, LifecyclePlugin):
                 try:
                     context = await source.on_before_run(prompt)
                     if context:
-                        system_parts.append(context)
-                except Exception:
-                    pass
+                        if isinstance(source, BaseSkill):
+                            skill_parts.append(f"### {source.name}\n{context}")
+                        else:
+                            system_parts.append(context)
+                except Exception as e:
+                    source_name = getattr(source, "name", source.__class__.__name__)
+                    logger.warning("on_before_run failed for '%s': %s", source_name, e)
+
+        if skill_parts:
+            system_parts.append("## Skills & Expertise\n" + "\n\n".join(skill_parts))
 
         if system_parts:
             conversation.append(
@@ -1129,6 +1138,38 @@ class Agent(BaseAgent):
         self._register_tool_source(plugin)
         logger.debug(f"Added plugin: {plugin.__class__.__name__}")
 
+    def add_skill(self, skill: "BaseSkill"):
+        """Add a skill to the agent.
+
+        Plugin dependencies declared in ``skill.requires()`` are resolved
+        against already-registered plugins. Add plugins before skills that
+        need them.
+        """
+        requirements = skill.requires()
+        if requirements:
+            available = [s for s in self.tool_sources if isinstance(s, BasePlugin)]
+            unmet = []
+            for key, plugin_type in requirements.items():
+                match = next((p for p in available if isinstance(p, plugin_type)), None)
+                if match is None:
+                    unmet.append(f"'{key}' ({plugin_type.__name__})")
+                else:
+                    skill._resolved_plugins[key] = match
+            if unmet:
+                raise SkillError(
+                    f"Skill '{skill.name}' requires plugins not yet added: "
+                    f"{', '.join(unmet)}. Add the required plugin(s) before "
+                    f"adding this skill.",
+                    plugin_name=skill.name,
+                )
+
+        self.add_plugin(skill)
+
+    @property
+    def skills(self) -> List["BaseSkill"]:
+        """Return all attached skills."""
+        return [s for s in self.tool_sources if isinstance(s, BaseSkill)]
+
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
         """Execute a tool by name with arguments."""
         await self._setup_tools()
@@ -1150,7 +1191,12 @@ class Agent(BaseAgent):
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Call stop() on exit to flush plugins and release resources."""
-        await self.stop()
+        try:
+            await self.stop()
+        except Exception as e:
+            if exc_type is None:
+                raise
+            logger.error("Error during agent stop: %s", e, exc_info=True)
         return False
 
     async def stop(self) -> None:

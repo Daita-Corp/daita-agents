@@ -196,14 +196,27 @@ async def from_db(
 
         agent.add_plugin(lineage_plugin)
 
+        # Derive the same store identifier the catalog persister uses so FK
+        # lineage flows attach to the canonical Table nodes.
+        from ...core.graph.models import AgentGraphNode, NodeType
+        from ...plugins.catalog.persistence import _derive_store
+
+        store = _derive_store(schema)
         for fk in schema.get("foreign_keys", []):
+            src_id = AgentGraphNode.make_id(
+                NodeType.TABLE, f"{store}.{fk['source_table']}"
+            )
+            tgt_id = AgentGraphNode.make_id(
+                NodeType.TABLE, f"{store}.{fk['target_table']}"
+            )
             await lineage_plugin.register_flow(
-                source_id=f"table:{fk['source_table']}",
-                target_id=f"table:{fk['target_table']}",
+                source_id=src_id,
+                target_id=tgt_id,
                 flow_type="FLOWS_TO",
                 transformation=f"{fk['source_column']} → {fk['target_column']}",
                 metadata={
                     "source": "schema_discovery",
+                    "store": store,
                     "fk_source_column": fk["source_column"],
                     "fk_target_column": fk["target_column"],
                 },

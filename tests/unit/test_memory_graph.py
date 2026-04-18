@@ -4,7 +4,9 @@ Tests for memory knowledge graph.
 
 import pytest
 
-pytest.importorskip("networkx", reason="networkx required: pip install 'daita-agents[lineage]'")
+pytest.importorskip(
+    "networkx", reason="networkx required: pip install 'daita-agents[lineage]'"
+)
 
 from daita.core.graph.models import NodeType, EdgeType
 from daita.plugins.memory.memory_graph import (

@@ -10,6 +10,7 @@ Start simple and work up to multi-agent pipelines:
 ```
 csv-data-analyst         → single agent, no external services
 sql-data-agent           → single agent + database plugin
+code-review-agent        → single agent + skills (security + code quality)
 infrastructure-catalog   → single agent + catalog plugin (AWS + GitHub discovery)
 slack-reporter           → single agent + two plugins + scheduling
 etl-pipeline             → multi-agent linear workflow
@@ -57,6 +58,28 @@ schema, generates the right SQL, runs it, and summarises the output.
 ```
 OPENAI_API_KEY
 DATABASE_URL   # postgresql://user:pass@host:5432/dbname
+```
+
+---
+
+### [`code-review-agent`](./code-review-agent/)
+
+A single agent that reviews Python code for security vulnerabilities and quality
+issues using the **skills system**.
+
+**Use case:** Point it at any Python file and get a structured review covering
+SQL injection, command injection, hardcoded secrets, cyclomatic complexity,
+naming conventions, and more.
+
+**Highlights:**
+- `BaseSkill` subclass with `instructions_file` (security review)
+- `Skill()` factory with inline instructions (code quality)
+- AST-based analysis tools (complexity, naming) + regex vulnerability scanning
+- Demonstrates composable agent capabilities via skills
+
+**Required env vars:**
+```
+OPENAI_API_KEY
 ```
 
 ---

@@ -603,8 +603,12 @@ class TestFromDbLineage:
         mock_agent.add_plugin.assert_any_call(mock_lineage)
         mock_lineage.register_flow.assert_awaited_once()
         call_kwargs = mock_lineage.register_flow.call_args[1]
-        assert call_kwargs["source_id"] == "table:orders"
-        assert call_kwargs["target_id"] == "table:customers"
+        # IDs are fully qualified by store — see docs/catalog_graph_tier2.md.
+        # Schema has db_type="postgresql", db_name="public", no host metadata,
+        # so the derived store is "postgresql:public".
+        assert call_kwargs["source_id"] == "table:postgresql:public.orders"
+        assert call_kwargs["target_id"] == "table:postgresql:public.customers"
+        assert call_kwargs["metadata"]["store"] == "postgresql:public"
         assert mock_agent._db_lineage is mock_lineage
 
     async def test_lineage_plugin_instance_used_directly(self):

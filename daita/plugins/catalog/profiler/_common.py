@@ -5,6 +5,7 @@ from typing import Optional
 from ..base_profiler import (
     NormalizedColumn,
     NormalizedForeignKey,
+    NormalizedIndex,
     NormalizedSchema,
     NormalizedTable,
 )
@@ -26,11 +27,23 @@ def _dict_to_normalized_schema(
             )
             for c in t.get("columns", [])
         ]
+        indexes = [
+            NormalizedIndex(
+                name=i["name"],
+                type=i.get("type", ""),
+                columns=list(i.get("columns", [])),
+                unique=bool(i.get("unique", False)),
+                metadata=dict(i.get("metadata", {})),
+            )
+            for i in t.get("indexes", [])
+        ]
         tables.append(
             NormalizedTable(
                 name=t["name"],
                 row_count=t.get("row_count"),
                 columns=columns,
+                indexes=indexes,
+                metadata=dict(t.get("metadata", {})),
             )
         )
 

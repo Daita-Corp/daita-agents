@@ -19,7 +19,7 @@ Key components:
 - AgentConfig           — Configure retry policies, LLM settings, and more
 """
 
-__version__ = "0.15.1"
+__version__ = "0.16.0"
 
 # ---------------------------------------------------------------------------
 # Core
@@ -39,6 +39,11 @@ from .core.relay import RelayManager
 from .plugins import postgresql, mysql, mongodb, rest, s3, slack, elasticsearch, sqlite
 from .plugins.redis_messaging import redis_messaging
 from .plugins.base import BasePlugin, LifecyclePlugin
+
+# ---------------------------------------------------------------------------
+# Skills — composable units of agent capability
+# ---------------------------------------------------------------------------
+from .skills import BaseSkill, Skill
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -64,6 +69,7 @@ from .core.exceptions import (
     LLMError,
     ConfigError,
     PluginError,
+    SkillError,
     WorkflowError,
     TransientError,
     RetryableError,
@@ -124,6 +130,8 @@ __all__ = [
     "redis_messaging",
     "BasePlugin",
     "LifecyclePlugin",
+    "BaseSkill",
+    "Skill",
     # Configuration
     "AgentConfig",
     "RetryPolicy",
@@ -138,6 +146,7 @@ __all__ = [
     "LLMError",
     "ConfigError",
     "PluginError",
+    "SkillError",
     "WorkflowError",
     "TransientError",
     "RetryableError",

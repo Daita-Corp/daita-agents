@@ -20,6 +20,13 @@ from ._sns import discover_sns
 from ._opensearch import discover_opensearch
 from ._documentdb import discover_documentdb
 from ._kinesis import discover_kinesis
+from ._gcs import discover_gcs
+from ._bigquery import discover_bigquery
+from ._firestore import discover_firestore
+from ._bigtable import discover_bigtable
+from ._pubsub import discover_pubsub_topic, discover_pubsub_subscription
+from ._memorystore import discover_memorystore
+from ._gcp_apigateway import discover_gcp_apigateway
 
 __all__ = [
     # Utilities
@@ -27,11 +34,12 @@ __all__ = [
     "parse_conn_url",
     "validate_openapi_url",
     "ssl_context",
-    # Discovery functions
+    # Discovery functions — databases and APIs
     "discover_postgres",
     "discover_mysql",
     "discover_mongodb",
     "discover_openapi",
+    # Discovery functions — AWS
     "discover_dynamodb",
     "discover_s3",
     "discover_apigateway",
@@ -40,4 +48,13 @@ __all__ = [
     "discover_opensearch",
     "discover_documentdb",
     "discover_kinesis",
+    # Discovery functions — GCP
+    "discover_gcs",
+    "discover_bigquery",
+    "discover_firestore",
+    "discover_bigtable",
+    "discover_pubsub_topic",
+    "discover_pubsub_subscription",
+    "discover_memorystore",
+    "discover_gcp_apigateway",
 ]

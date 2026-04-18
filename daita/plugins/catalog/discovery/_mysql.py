@@ -11,11 +11,17 @@ logger = logging.getLogger(__name__)
 async def discover_mysql(
     connection_string: str,
     schema: Optional[str] = None,
+    ssl_mode: str = "verify-full",
 ) -> Dict[str, Any]:
     """
     Connect to a MySQL/MariaDB database and extract its schema.
 
     Returns a raw result dict with tables, columns, and foreign keys.
+
+    ``ssl_mode`` mirrors ``discover_postgres``:
+      * ``verify-full`` — default, full chain verification
+      * ``require`` — encrypt but skip cert verification
+      * ``disable`` — no TLS (local containers, non-prod tooling)
     """
     try:
         import aiomysql
@@ -24,9 +30,14 @@ async def discover_mysql(
             "aiomysql is required. Install with: pip install 'daita-agents[mysql]'"
         )
 
-    logger.debug("discover_mysql: connecting to %s", redact_url(connection_string))
+    logger.debug(
+        "discover_mysql: connecting to %s (ssl_mode=%s)",
+        redact_url(connection_string),
+        ssl_mode,
+    )
     creds = parse_conn_url(connection_string)
     db_name = schema or creds["database"] or "mysql"
+    ssl_arg: Any = None if ssl_mode == "disable" else ssl_context(ssl_mode)
 
     conn = await aiomysql.connect(
         host=creds["host"],
@@ -34,7 +45,7 @@ async def discover_mysql(
         user=creds["user"],
         password=creds["password"],
         db=db_name,
-        ssl=ssl_context(),
+        ssl=ssl_arg,
     )
 
     try:
@@ -94,6 +105,8 @@ async def discover_mysql(
         return {
             "database_type": "mysql",
             "schema": db_name,
+            "host": creds["host"],
+            "port": creds["port"] or 3306,
             "tables": tables,
             "columns": columns,
             "foreign_keys": fkeys,

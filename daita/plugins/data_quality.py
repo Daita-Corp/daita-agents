@@ -127,6 +127,23 @@ class DataQualityPlugin(BasePlugin):
             )
         return self._db
 
+    async def _resolve_table_node_id(
+        self, table: str, store: Optional[str] = None
+    ) -> str:
+        """Return the qualified Table node ID for ``table``.
+
+        Ambiguous references (multiple stores, no ``store`` arg) raise
+        ``AmbiguousReferenceError``. Unknown tables fall through to a
+        canonical qualified ID when ``store`` is provided, otherwise to the
+        ``__unresolved__`` sentinel which the catalog promotes on next
+        discovery.
+        """
+        from daita.core.graph.resolution import resolve_or_placeholder
+
+        return await resolve_or_placeholder(
+            self._graph_backend, table, store=store, agent_id=self._agent_id
+        )
+
     def get_tools(self) -> List["AgentTool"]:
         from ..core.tools import AgentTool
 
@@ -235,6 +252,15 @@ class DataQualityPlugin(BasePlugin):
                             "type": "integer",
                             "description": "Optional row sample size passed to profiling.",
                         },
+                        "store": {
+                            "type": "string",
+                            "description": (
+                                "Optional store qualifier (e.g. "
+                                "'postgres:host/db') used to disambiguate the "
+                                "table when the same name exists in multiple "
+                                "stores."
+                            ),
+                        },
                     },
                     "required": ["table"],
                 },
@@ -281,8 +307,9 @@ class DataQualityPlugin(BasePlugin):
     async def _tool_report(self, args: Dict[str, Any]) -> Dict[str, Any]:
         db = self._validate_db()
         table = _validate_identifier(args["table"])
+        store = args.get("store")
         sample_size = args.get("sample_size")
-        return await self.report(db, table, sample_size=sample_size)
+        return await self.report(db, table, sample_size=sample_size, store=store)
 
     # -------------------------------------------------------------------------
     # Core methods
@@ -550,6 +577,7 @@ class DataQualityPlugin(BasePlugin):
         db: Any,
         table: str,
         sample_size: Optional[int] = None,
+        store: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate a consolidated quality report: column profiles + completeness score.
@@ -557,6 +585,17 @@ class DataQualityPlugin(BasePlugin):
         Persists results to the graph backend using a stable, upsertable node ID
         (quality_latest:{table}) so callers can always retrieve the latest report
         without scanning the full graph.
+
+        Args:
+            db: Database plugin to profile against.
+            table: Bare table name. Qualified against ``store`` (or the
+                resolution layer if ``store`` is None) so the METRIC node
+                attaches to the correct multi-store Table.
+            sample_size: Optional row sample passed to profiling.
+            store: Optional store qualifier (e.g. ``postgres:host/db``). When
+                omitted, the resolution layer picks the matching Table node;
+                ambiguous names raise unless the graph contains exactly one
+                match.
         """
         profile_result = await self.profile(db, table, sample_size=sample_size)
 
@@ -591,7 +630,7 @@ class DataQualityPlugin(BasePlugin):
                     EdgeType,
                 )
 
-                table_node_id = AgentGraphNode.make_id(NodeType.TABLE, table)
+                table_node_id = await self._resolve_table_node_id(table, store=store)
                 table_node = AgentGraphNode(
                     node_id=table_node_id,
                     node_type=NodeType.TABLE,
@@ -600,8 +639,11 @@ class DataQualityPlugin(BasePlugin):
                 )
                 await self._graph_backend.add_node(table_node)
 
-                # Stable node ID — upsertable, always points to latest report
-                metric_name = f"quality_latest:{table}"
+                # Stable node ID — upsertable, always points to latest report.
+                # Qualified against the resolved Table so reports for the same
+                # table name in different stores don't collide.
+                qualified = table_node_id.split(":", 1)[1]
+                metric_name = f"quality_latest:{qualified}"
                 metric_node_id = AgentGraphNode.make_id(NodeType.METRIC, metric_name)
                 metric_node = AgentGraphNode(
                     node_id=metric_node_id,

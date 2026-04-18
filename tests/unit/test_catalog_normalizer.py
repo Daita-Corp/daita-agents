@@ -156,6 +156,36 @@ def test_normalize_postgresql():
     assert result["tables"][0]["columns"][0]["is_primary_key"] is True
 
 
+def test_normalize_postgresql_propagates_host_metadata():
+    """host + port from discovery must reach metadata so _derive_store can
+    build a collision-safe store identifier."""
+    raw = {
+        "database_type": "postgresql",
+        "schema": "public",
+        "host": "prod-pg.internal",
+        "port": 5432,
+        "tables": [],
+        "columns": [],
+        "primary_keys": [],
+        "foreign_keys": [],
+    }
+    result = normalize_postgresql(raw)
+    assert result["metadata"] == {"host": "prod-pg.internal", "port": 5432}
+
+
+def test_normalize_postgresql_omits_metadata_when_absent():
+    raw = {
+        "database_type": "postgresql",
+        "schema": "public",
+        "tables": [],
+        "columns": [],
+        "primary_keys": [],
+        "foreign_keys": [],
+    }
+    result = normalize_postgresql(raw)
+    assert "metadata" not in result
+
+
 def test_normalize_mysql():
     raw = {
         "database_type": "mysql",
@@ -174,6 +204,20 @@ def test_normalize_mysql():
     result = normalize_mysql(raw)
     assert result["database_type"] == "mysql"
     assert result["tables"][0]["columns"][0]["is_primary_key"] is True
+
+
+def test_normalize_mysql_propagates_host_metadata():
+    raw = {
+        "database_type": "mysql",
+        "schema": "mydb",
+        "host": "mysql-prod.internal",
+        "port": 3306,
+        "tables": [],
+        "columns": [],
+        "foreign_keys": [],
+    }
+    result = normalize_mysql(raw)
+    assert result["metadata"] == {"host": "mysql-prod.internal", "port": 3306}
 
 
 def test_normalize_mongodb():
@@ -196,6 +240,30 @@ def test_normalize_mongodb():
     assert result["tables"][0]["name"] == "users"
     assert result["tables"][0]["columns"][0]["is_primary_key"] is True
     assert result["tables"][0]["columns"][1]["is_primary_key"] is False
+
+
+def test_normalize_mongodb_propagates_host_metadata():
+    """``host`` / ``port`` from discovery must reach ``metadata`` so the
+    persister can build a collision-safe store identifier.
+    """
+    raw = {
+        "database_type": "mongodb",
+        "database": "orders_db",
+        "host": "mongo-a.internal",
+        "port": 27017,
+        "collections": [],
+    }
+    result = normalize_mongodb(raw)
+    assert result["metadata"] == {"host": "mongo-a.internal", "port": 27017}
+
+
+def test_normalize_mongodb_omits_metadata_when_absent():
+    """Schema dict should not carry an empty ``metadata`` key when discovery
+    didn't provide host/port — callers check ``metadata in schema``.
+    """
+    raw = {"database_type": "mongodb", "database": "testdb", "collections": []}
+    result = normalize_mongodb(raw)
+    assert "metadata" not in result
 
 
 def test_normalize_dynamodb():

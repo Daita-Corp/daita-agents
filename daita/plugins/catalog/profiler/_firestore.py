@@ -1,0 +1,27 @@
+"""Firestore profiler."""
+
+from ..base_discoverer import DiscoveredStore
+from ..base_profiler import BaseProfiler, NormalizedSchema
+from ..normalizer import normalize_firestore
+from ._common import _dict_to_normalized_schema
+
+
+class FirestoreProfiler(BaseProfiler):
+    """Profiles Firestore databases by sampling documents."""
+
+    def supports(self, store_type: str) -> bool:
+        return store_type == "firestore"
+
+    async def profile(self, store: DiscoveredStore) -> NormalizedSchema:
+        from ..discovery import discover_firestore
+
+        hint = store.connection_hint
+        result = await discover_firestore(
+            project=hint.get("project", ""),
+            database=hint.get("database", "(default)"),
+            credentials_path=hint.get("credentials_path"),
+            impersonate_service_account=hint.get("impersonate_service_account"),
+        )
+        return _dict_to_normalized_schema(
+            normalize_firestore(result), store_id=store.id
+        )

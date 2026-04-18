@@ -65,9 +65,13 @@ class CatalogPlugin(LifecyclePlugin):
 
     Supports:
     - PostgreSQL, MySQL, MongoDB schema discovery
-    - GraphQL introspection
     - OpenAPI/Swagger spec parsing
-    - Multi-cloud infrastructure discovery (AWS, GCP, Azure)
+    - Multi-cloud infrastructure discovery:
+        * AWS — RDS, DynamoDB, S3, ElastiCache, Redshift, API Gateway,
+          SQS, SNS, OpenSearch, DocumentDB, Kinesis
+        * GCP — Cloud SQL, GCS, BigQuery, Firestore, Bigtable, Pub/Sub,
+          Memorystore (Redis), API Gateway
+        * GitHub — connection-string scanning in config files
     - Schema comparison and validation
     - Pluggable discoverers and profilers
     """
@@ -298,11 +302,12 @@ class CatalogPlugin(LifecyclePlugin):
         connection_string: str,
         schema: Optional[str] = None,
         persist: bool = False,
+        ssl_mode: str = "verify-full",
     ) -> Dict[str, Any]:
         """Discover MySQL/MariaDB database schema."""
         from .discovery import discover_mysql
 
-        result = await discover_mysql(connection_string, schema)
+        result = await discover_mysql(connection_string, schema, ssl_mode)
         persisted = await self._persist_schema(result) if persist else False
         return self._persist_response(result, persisted)
 
@@ -359,9 +364,17 @@ class CatalogPlugin(LifecyclePlugin):
         return await _export_diagram(schema, format)
 
     async def _persist_schema(self, schema: Dict[str, Any]) -> bool:
-        """Persist schema to the catalog store and graph backend."""
+        """Persist schema to the catalog store and graph backend.
+
+        Raw ``discover_*`` output uses a flat shape (``table_name`` keys,
+        columns as a sibling array). The graph persistence layer expects the
+        *normalized* shape (``tables[].name`` + nested ``tables[].columns``).
+        Apply ``normalize_discovery`` at the boundary so both the catalog JSON
+        and the graph backend see the same normalized form.
+        """
+        normalized = _normalize_discovery(schema)
         return await _persist_schema(
-            schema, self._catalog_backend, self._graph_backend, self._agent_id
+            normalized, self._catalog_backend, self._graph_backend, self._agent_id
         )
 
     async def prune_stale_catalog(self, max_age_seconds: int) -> dict:

@@ -20,6 +20,7 @@ from .base_profiler import (
     BaseProfiler,
     NormalizedColumn,
     NormalizedForeignKey,
+    NormalizedIndex,
     NormalizedSchema,
     NormalizedTable,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "BaseProfiler",
     "NormalizedColumn",
     "NormalizedForeignKey",
+    "NormalizedIndex",
     "NormalizedSchema",
     "NormalizedTable",
 ]

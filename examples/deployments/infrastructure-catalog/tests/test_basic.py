@@ -501,51 +501,21 @@ class TestAPIGatewayIntegration:
 # ---------------------------------------------------------------------------
 
 
-def _fake_embedding(text, dim=8):
-    """Deterministic fake embedding from text hash."""
-    import hashlib
-
-    h = hashlib.md5(text.encode()).hexdigest()
-    return [int(c, 16) / 15.0 for c in h[:dim]]
-
-
-async def _mock_embed_text(self, text):
-    return _fake_embedding(text)
-
-
-async def _mock_embed_texts(self, texts):
-    return [_fake_embedding(t) for t in texts]
-
-
 class TestMemoryIntegration:
     """Test memory plugin features using the infrastructure catalog context."""
 
     def _make_backend(self, tmp_path):
+        from daita.embeddings.mock import MockEmbeddingProvider
         from daita.plugins.memory.local_backend import LocalMemoryBackend
-        from daita.plugins.memory.search import SQLiteVectorSearch
 
-        with patch.object(SQLiteVectorSearch, "__init__", lambda self, *a, **kw: None):
-            backend = LocalMemoryBackend(
-                workspace="test-infra-catalog",
-                agent_id="catalog_agent",
-                scope="project",
-                base_dir=tmp_path,
-            )
-        search = SQLiteVectorSearch.__new__(SQLiteVectorSearch)
-        search.db_path = backend.vector_db
-        search.embedding_provider = "openai"
-        search.embedding_model = "test"
-        search._embed_cache = {}
-        search._init_database()
-        backend.search = search
-        return backend
+        return LocalMemoryBackend(
+            workspace="test-infra-catalog",
+            agent_id="catalog_agent",
+            scope="project",
+            base_dir=tmp_path,
+            embedder=MockEmbeddingProvider(dim=8),
+        )
 
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
-    )
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text
-    )
     async def test_batch_store_infrastructure_discoveries(self, tmp_path):
         """Simulate batch-storing discovered stores — tests batch remember."""
         backend = self._make_backend(tmp_path)
@@ -583,12 +553,6 @@ class TestMemoryIntegration:
         assert result["stored"] == 5
         assert result["skipped"] == 0
 
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
-    )
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text
-    )
     async def test_memory_stats_after_discovery(self, tmp_path):
         """After batch-storing, stats should reflect categories."""
         backend = self._make_backend(tmp_path)
@@ -621,12 +585,6 @@ class TestMemoryIntegration:
         assert stats["categories"]["rule"]["count"] == 1
         assert stats["categories"]["rule"]["avg_importance"] == 0.9
 
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
-    )
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text
-    )
     async def test_recall_by_category(self, tmp_path):
         """list_by_category should enumerate all stores without semantic search."""
         backend = self._make_backend(tmp_path)
@@ -659,12 +617,6 @@ class TestMemoryIntegration:
         assert len(rules) == 1
         assert "Encryption" in rules[0]["content"]
 
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
-    )
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text
-    )
     async def test_temporal_recall(self, tmp_path):
         """Recall with since should filter to recent discoveries."""
         from datetime import datetime, timedelta
@@ -703,12 +655,6 @@ class TestMemoryIntegration:
         assert "New RDS instance discovered today" in contents
         assert "Old S3 bucket from last month" not in contents
 
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
-    )
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text
-    )
     async def test_pinned_rules_always_injected(self, tmp_path):
         """Pinned org rules should appear in on_before_run regardless of query."""
         from daita.plugins.memory.metadata import MemoryMetadata
@@ -733,12 +679,6 @@ class TestMemoryIntegration:
         assert len(pinned) == 1
         assert "encryption" in pinned[0]["content"]
 
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
-    )
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_text", _mock_embed_text
-    )
     async def test_query_facts_infrastructure(self, tmp_path):
         """query_facts should find structured facts about infrastructure."""
         backend = self._make_backend(tmp_path)
@@ -804,9 +744,6 @@ class TestMemoryIntegration:
         assert len(results) == 1
         assert results[0]["value"] == "PostgreSQL"
 
-    @patch(
-        "daita.plugins.memory.search.SQLiteVectorSearch.embed_texts", _mock_embed_texts
-    )
     async def test_batch_dedup_on_rescan(self, tmp_path):
         """Re-scanning should skip already-stored discoveries."""
         backend = self._make_backend(tmp_path)
