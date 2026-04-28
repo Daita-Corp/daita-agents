@@ -6,12 +6,17 @@ is abstract. Tests cover shared behaviour that every provider inherits.
 """
 
 import asyncio
-from typing import Dict, Any
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from daita.core.tools import AgentTool
+from daita.llm.anthropic import AnthropicProvider
+from daita.llm.gemini import GeminiProvider
+from daita.llm.grok import GrokProvider
 from daita.llm.mock import MockLLMProvider
+from daita.llm.openai import OpenAIProvider, _build_token_param
 
 # ===========================================================================
 # Helpers
@@ -50,6 +55,95 @@ def _make_slow_tool(name: str, sleep: float = 10.0):
         handler=h,
         timeout_seconds=0.01,
     )
+
+
+# ===========================================================================
+# Provider defaults
+# ===========================================================================
+
+
+class TestProviderDefaults:
+    def test_openai_default_model_is_current_cost_sensitive_model(self):
+        assert OpenAIProvider().model == "gpt-5.4-mini"
+
+    def test_anthropic_default_model_is_current_cost_sensitive_model(self):
+        assert AnthropicProvider().model == "claude-haiku-4-5"
+
+    def test_gemini_default_model_is_current_cost_sensitive_model(self):
+        assert GeminiProvider().model == "gemini-2.5-flash-lite"
+
+    def test_grok_default_model_is_current_cost_sensitive_model(self):
+        assert GrokProvider().model == "grok-4.20"
+
+
+# ===========================================================================
+# OpenAI-compatible helper behavior
+# ===========================================================================
+
+
+class TestOpenAICompatibleHelpers:
+    def test_openai_max_tokens_alias_uses_modern_parameter(self):
+        assert _build_token_param(max_tokens=100) == {"max_completion_tokens": 100}
+
+    def test_openai_explicit_max_completion_tokens_wins(self):
+        assert _build_token_param(max_tokens=100, max_completion_tokens=200) == {
+            "max_completion_tokens": 200
+        }
+
+    def test_openai_legacy_max_tokens_is_opt_in(self):
+        assert _build_token_param(max_tokens=100, use_legacy_max_tokens=True) == {
+            "max_tokens": 100
+        }
+
+    def test_converts_flat_tool_calls_to_openai_message_shape(self):
+        p = OpenAIProvider(api_key="test")
+        converted = p._convert_messages_to_openai(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "search",
+                            "arguments": {"query": "daita"},
+                        }
+                    ],
+                }
+            ]
+        )
+
+        assert converted == [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "arguments": '{"query": "daita"}',
+                        },
+                    }
+                ],
+            }
+        ]
+
+    def test_safe_parse_tool_arguments_handles_bad_json(self):
+        p = GrokProvider(api_key="test")
+        assert p._safe_parse_tool_arguments("{bad json") == {}
+
+    def test_gemini_usage_metadata_extracts_token_counts(self):
+        p = GeminiProvider(api_key="test")
+        usage = SimpleNamespace(
+            total_token_count=12,
+            prompt_token_count=5,
+            candidates_token_count=7,
+        )
+        assert p._extract_tokens(usage) == {
+            "total_tokens": 12,
+            "prompt_tokens": 5,
+            "completion_tokens": 7,
+        }
 
 
 # ===========================================================================

@@ -189,7 +189,7 @@ class Agent(BaseAgent):
 
     # Class-level defaults for smart constructor
     _default_llm_provider = "openai"
-    _default_model = "gpt-4"
+    _default_model = "gpt-5.4-mini"
     _ALLOWED_DEFAULTS = frozenset({"llm_provider", "model"})
 
     @classmethod

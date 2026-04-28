@@ -52,16 +52,16 @@ def create_llm_provider(
 
     Examples:
         >>> # Create OpenAI provider with token tracking
-        >>> llm = create_llm_provider('openai', 'gpt-4', api_key='sk-...', agent_id='my_agent')
+        >>> llm = create_llm_provider('openai', 'gpt-5.4-mini', api_key='sk-...', agent_id='my_agent')
 
         >>> # Create Anthropic provider with token tracking
-        >>> llm = create_llm_provider('anthropic', 'claude-3-sonnet-20240229', agent_id='my_agent')
+        >>> llm = create_llm_provider('anthropic', 'claude-haiku-4-5', agent_id='my_agent')
 
         >>> # Create Grok provider
-        >>> llm = create_llm_provider('grok', 'grok-beta', api_key='xai-...', agent_id='my_agent')
+        >>> llm = create_llm_provider('grok', 'grok-4.20', api_key='xai-...', agent_id='my_agent')
 
         >>> # Create Gemini provider
-        >>> llm = create_llm_provider('gemini', 'gemini-1.5-pro', api_key='AIza...', agent_id='my_agent')
+        >>> llm = create_llm_provider('gemini', 'gemini-2.5-flash-lite', api_key='AIza...', agent_id='my_agent')
 
         >>> # Create mock provider for testing
         >>> llm = create_llm_provider('mock', 'test-model', agent_id='test_agent')

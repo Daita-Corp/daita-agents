@@ -3,13 +3,18 @@ Google Gemini LLM provider implementation with integrated tracing.
 Uses the new google.genai package (replaces deprecated google.generativeai).
 """
 
+from __future__ import annotations
+
 import os
 import logging
 import asyncio
-from typing import Dict, Any, Optional, List
+from typing import TYPE_CHECKING, Dict, Any, Optional, List
 
 from ..core.exceptions import LLMError
 from .base import BaseLLMProvider
+
+if TYPE_CHECKING:
+    from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +24,7 @@ class GeminiProvider(BaseLLMProvider):
 
     def __init__(
         self,
-        model: str = "gemini-2.0-flash-exp",
+        model: str = "gemini-2.5-flash-lite",
         api_key: Optional[str] = None,
         **kwargs,
     ):
@@ -27,7 +32,7 @@ class GeminiProvider(BaseLLMProvider):
         Initialize Gemini provider.
 
         Args:
-            model: Gemini model name (e.g., "gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash")
+            model: Gemini model name (e.g., "gemini-2.5-flash-lite", "gemini-2.5-flash")
             api_key: Google AI API key
             **kwargs: Additional Gemini-specific parameters
         """
@@ -42,6 +47,11 @@ class GeminiProvider(BaseLLMProvider):
                 "timeout": kwargs.get("timeout", 60),
                 "safety_settings": kwargs.get("safety_settings", None),
                 "generation_config": kwargs.get("generation_config", None),
+                "top_k": kwargs.get("top_k", None),
+                "stop_sequences": kwargs.get("stop_sequences", None),
+                "response_mime_type": kwargs.get("response_mime_type", None),
+                "response_schema": kwargs.get("response_schema", None),
+                "thinking_config": kwargs.get("thinking_config", None),
             }
         )
 
@@ -61,10 +71,79 @@ class GeminiProvider(BaseLLMProvider):
                 self._client = genai.Client(api_key=self.api_key)
                 logger.debug("Gemini client initialized with google.genai")
             except ImportError:
-                raise LLMError(
+                raise ImportError(
                     "Google Genai package not installed. Install with: pip install 'daita-agents[google]'"
-                )
+                ) from None
         return self._client
+
+    def _prepare_api_params(
+        self,
+        types,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        **kwargs,
+    ) -> Dict[str, Any]:
+        system_instruction = "\n\n".join(
+            msg.get("content", "") for msg in messages if msg.get("role") == "system"
+        )
+        conversation_messages = [msg for msg in messages if msg.get("role") != "system"]
+        api_params = {
+            "model": self.model,
+            "contents": self._convert_messages_to_gemini(conversation_messages),
+        }
+
+        config = self._build_generation_config(
+            types, tools=tools, system_instruction=system_instruction, **kwargs
+        )
+        if config:
+            api_params["config"] = config
+        return api_params
+
+    def _build_generation_config(
+        self,
+        types,
+        tools: Optional[List[Dict[str, Any]]],
+        system_instruction: str = "",
+        **kwargs,
+    ):
+        config = kwargs.get("generation_config")
+        config_params = {}
+
+        if isinstance(config, dict):
+            config_params.update(config)
+            config = None
+
+        option_map = {
+            "max_tokens": "max_output_tokens",
+            "temperature": "temperature",
+            "top_p": "top_p",
+            "top_k": "top_k",
+            "stop_sequences": "stop_sequences",
+            "response_mime_type": "response_mime_type",
+            "response_schema": "response_schema",
+            "thinking_config": "thinking_config",
+        }
+        for source_key, config_key in option_map.items():
+            value = kwargs.get(source_key)
+            if value is not None:
+                config_params[config_key] = value
+
+        if system_instruction:
+            config_params["system_instruction"] = system_instruction
+
+        safety_settings = kwargs.get("safety_settings")
+        if safety_settings is not None:
+            config_params["safety_settings"] = safety_settings
+
+        if tools:
+            config_params["tools"] = self._convert_tools_to_gemini_format(tools)
+
+        if config is not None:
+            for key, value in config_params.items():
+                setattr(config, key, value)
+            return config
+
+        return types.GenerateContentConfig(**config_params) if config_params else None
 
     async def _generate_impl(
         self,
@@ -87,40 +166,7 @@ class GeminiProvider(BaseLLMProvider):
         try:
             from google.genai import types
 
-            # Convert to Gemini format
-            gemini_contents = self._convert_messages_to_gemini(messages)
-
-            # Build generation config
-            generation_config_params = {}
-            if kwargs.get("max_tokens"):
-                generation_config_params["max_output_tokens"] = kwargs["max_tokens"]
-            if kwargs.get("temperature") is not None:
-                generation_config_params["temperature"] = kwargs["temperature"]
-            if kwargs.get("top_p") is not None:
-                generation_config_params["top_p"] = kwargs["top_p"]
-
-            generation_config = (
-                types.GenerateContentConfig(**generation_config_params)
-                if generation_config_params
-                else None
-            )
-
-            # Prepare API call params
-            api_params = {
-                "model": self.model,
-                "contents": gemini_contents,
-            }
-
-            if generation_config:
-                api_params["config"] = generation_config
-
-            # Add tools if provided
-            if tools:
-                gemini_tools = self._convert_tools_to_gemini_format(tools)
-                api_params["config"] = (
-                    api_params.get("config") or types.GenerateContentConfig()
-                )
-                api_params["config"].tools = gemini_tools
+            api_params = self._prepare_api_params(types, messages, tools, **kwargs)
 
             # Generate response
             response = await asyncio.to_thread(
@@ -129,14 +175,7 @@ class GeminiProvider(BaseLLMProvider):
 
             # Store usage metadata
             if hasattr(response, "usage_metadata") and response.usage_metadata:
-                self._last_usage = response.usage_metadata
-                token_usage = {
-                    "total_tokens": response.usage_metadata.total_token_count or 0,
-                    "prompt_tokens": response.usage_metadata.prompt_token_count or 0,
-                    "completion_tokens": response.usage_metadata.candidates_token_count
-                    or 0,
-                }
-                self._update_accumulated_metrics(token_usage)
+                self._record_usage(response.usage_metadata)
 
             # Check for function calls - collect ALL of them
             tool_calls = []
@@ -195,39 +234,7 @@ class GeminiProvider(BaseLLMProvider):
 
         try:
             # Convert to Gemini format
-            gemini_contents = self._convert_messages_to_gemini(messages)
-
-            # Build generation config
-            generation_config_params = {}
-            if kwargs.get("max_tokens"):
-                generation_config_params["max_output_tokens"] = kwargs["max_tokens"]
-            if kwargs.get("temperature") is not None:
-                generation_config_params["temperature"] = kwargs["temperature"]
-            if kwargs.get("top_p") is not None:
-                generation_config_params["top_p"] = kwargs["top_p"]
-
-            generation_config = (
-                types.GenerateContentConfig(**generation_config_params)
-                if generation_config_params
-                else None
-            )
-
-            # Prepare API call params
-            api_params = {
-                "model": self.model,
-                "contents": gemini_contents,
-            }
-
-            if generation_config:
-                api_params["config"] = generation_config
-
-            # Add tools if provided
-            if tools:
-                gemini_tools = self._convert_tools_to_gemini_format(tools)
-                api_params["config"] = (
-                    api_params.get("config") or types.GenerateContentConfig()
-                )
-                api_params["config"].tools = gemini_tools
+            api_params = self._prepare_api_params(types, messages, tools, **kwargs)
 
             # Stream response
             response_stream = await asyncio.to_thread(
@@ -262,41 +269,11 @@ class GeminiProvider(BaseLLMProvider):
 
                 # Usage metadata (typically in last chunk)
                 if hasattr(chunk, "usage_metadata") and chunk.usage_metadata:
-                    self._last_usage = chunk.usage_metadata
-                    token_usage = {
-                        "total_tokens": chunk.usage_metadata.total_token_count or 0,
-                        "prompt_tokens": chunk.usage_metadata.prompt_token_count or 0,
-                        "completion_tokens": chunk.usage_metadata.candidates_token_count
-                        or 0,
-                    }
-                    self._update_accumulated_metrics(token_usage)
+                    self._record_usage(chunk.usage_metadata)
 
         except Exception as e:
             logger.error(f"Gemini streaming failed: {str(e)}")
             raise LLMError(f"Gemini streaming failed: {str(e)}")
-
-    def _get_last_token_usage(self) -> Dict[str, int]:
-        """
-        Override base class method to handle Gemini's token format.
-
-        Gemini uses different token field names in usage_metadata.
-        """
-        if self._last_usage:
-            # Gemini format
-            prompt_tokens = getattr(self._last_usage, "prompt_token_count", 0)
-            completion_tokens = getattr(self._last_usage, "candidates_token_count", 0)
-            total_tokens = getattr(
-                self._last_usage, "total_token_count", prompt_tokens + completion_tokens
-            )
-
-            return {
-                "total_tokens": total_tokens,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-            }
-
-        # Fallback to base class estimation
-        return super()._get_last_token_usage()
 
     def _convert_tools_to_format(
         self, tools: List["AgentTool"]
