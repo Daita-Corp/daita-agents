@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 Guide for AI assistants (and humans) working on this codebase.
 
@@ -48,6 +48,25 @@ pytest tests/unit/test_agent_tools.py -v
 `asyncio_mode = "auto"` is set in `pyproject.toml` — do not add `@pytest.mark.asyncio` to individual tests.
 
 Available markers: `requires_llm`, `requires_db`, `slow`, `stress`, `unit`, `integration`, `performance`.
+
+## Refactoring discipline
+
+Before introducing any new helper, abstraction, module, base class, builder, registry, or shared utility:
+
+1. Check whether an existing module already owns that responsibility.
+2. Prefer extending the existing owner over creating a parallel abstraction.
+3. If the change only reduces repetition, do not add a new abstraction unless at least 3 current call sites need it and the abstraction removes more complexity than it adds.
+4. For broad standardization, implement one representative file first, run tests, then pause and explain whether the pattern should become project-wide before touching additional files.
+5. Avoid churn-only consistency changes. Refactor where the existing code is actively large, complex, buggy, or hard to test.
+6. Never create a private framework inside one package when a broader framework layer already exists.
+
+Before editing during a refactor, briefly identify:
+
+- Existing owner of this behavior
+- Why the current code is painful
+- Smallest change that fixes it
+- Why the change is not adding a parallel abstraction
+- Tests that will catch behavior drift
 
 ## Critical: the lazy import rule
 
