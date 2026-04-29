@@ -9,15 +9,13 @@ Run: OPENAI_API_KEY=sk-... pytest tests/integration/test_memory_graph_live.py -v
 
 import os
 import time
-from pathlib import Path
 
 import pytest
 
 pytest.importorskip(
-    "networkx", reason="networkx required: pip install 'daita-agents[lineage]'"
+    "networkx", reason="networkx required: pip install 'daita-agents[memory]'"
 )
 
-from daita.core.graph.local_backend import LocalGraphBackend
 from daita.plugins.memory.fact_extractor import FactExtractor
 from daita.plugins.memory.memory_graph import MemoryGraph
 
@@ -49,17 +47,13 @@ def extractor(llm):
 @pytest.fixture
 def graph(tmp_path):
     """MemoryGraph backed by a local graph file with workspace metadata."""
-    graph_path = tmp_path / ".daita" / "graph" / "memory.json"
-    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    graph_storage_dir = tmp_path / "memory-workspace" / "graph"
 
-    mg = MemoryGraph(
+    return MemoryGraph(
         agent_id="test-agent",
         default_properties={"workspace": "integration-test"},
+        storage_dir=graph_storage_dir,
     )
-    backend = LocalGraphBackend(graph_type="memory")
-    backend._graph_path = graph_path
-    mg._backend = backend
-    return mg
 
 
 # ---------------------------------------------------------------------------

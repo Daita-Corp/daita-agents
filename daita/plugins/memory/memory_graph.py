@@ -5,15 +5,23 @@ Creates entity nodes from stored memories and connects them via relationships,
 enabling traversal queries like "what are all the infrastructure constraints
 for Project Orion?" that pure cosine similarity would miss.
 
-Uses the existing GraphBackend infrastructure with graph_type='memory'
-(separate from the lineage graph).
+Uses memory-owned graph models and a store adapter over the shared graph
+persistence backend. Memory semantics stay in the memory plugin; storage
+mechanics stay in the core graph layer.
 """
 
 import re
 from collections import deque
+from os import PathLike
 from typing import Any, Dict, List, Optional
 
-from ...core.graph.models import AgentGraphEdge, AgentGraphNode, EdgeType, NodeType
+from .graph_models import (
+    MemoryEdgeType,
+    MemoryGraphEdge,
+    MemoryGraphNode,
+    MemoryNodeType,
+)
+from .graph_store import GraphBackendMemoryGraphStore, MemoryGraphStore
 
 
 def _normalize_entity(name: str) -> str:
@@ -68,9 +76,9 @@ def _is_technical_identifier(name: str) -> bool:
 class MemoryGraph:
     """Lightweight graph layer for memory relationships.
 
-    Uses the existing GraphBackend with graph_type='memory' so it doesn't
-    interfere with lineage graphs. Supports both LLM-extracted facts
-    (from FactExtractor) and zero-LLM keyword heuristics.
+    Uses a memory-domain store over a pluggable GraphBackend by default.
+    Supports both LLM-extracted facts (from FactExtractor) and zero-LLM
+    keyword heuristics.
     """
 
     # Default promotion thresholds
@@ -82,11 +90,20 @@ class MemoryGraph:
         self,
         agent_id: Optional[str] = None,
         default_properties: Optional[Dict[str, Any]] = None,
+        store: Optional[MemoryGraphStore] = None,
+        backend: Optional[Any] = None,
+        storage_dir: Optional[str | PathLike[str]] = None,
+        graph_type: str = "memory",
         auto_promote_specificity: float = DEFAULT_AUTO_PROMOTE_SPECIFICITY,
         mention_promote_specificity: float = DEFAULT_MENTION_PROMOTE_SPECIFICITY,
         mention_promote_count: int = DEFAULT_MENTION_PROMOTE_COUNT,
     ):
-        self._backend = None
+        self._store = store
+        # Kept as a compatibility injection point for tests and users who
+        # previously set MemoryGraph._backend directly.
+        self._backend = backend
+        self._storage_dir = storage_dir
+        self._graph_type = graph_type
         self._agent_id = agent_id
         self._default_properties = default_properties or {}
         self._auto_promote_specificity = auto_promote_specificity
@@ -94,13 +111,20 @@ class MemoryGraph:
         self._mention_promote_count = mention_promote_count
 
     @property
-    def backend(self):
-        """Lazy-init graph backend."""
-        if self._backend is None:
-            from ...core.graph.backend import auto_select_backend
+    def store(self) -> MemoryGraphStore:
+        """Lazy-init the memory-domain graph store."""
+        if self._store is None:
+            self._store = GraphBackendMemoryGraphStore(
+                backend=self._backend,
+                storage_dir=self._storage_dir,
+                graph_type=self._graph_type,
+            )
+        return self._store
 
-            self._backend = auto_select_backend(graph_type="memory")
-        return self._backend
+    @property
+    def backend(self):
+        """Return the underlying graph backend for compatibility."""
+        return getattr(self.store, "backend", None)
 
     async def index_memory(
         self,
@@ -116,14 +140,14 @@ class MemoryGraph:
         memory_node_id = _make_memory_id(chunk_id)
 
         # Create MEMORY node
-        memory_node = AgentGraphNode(
+        memory_node = MemoryGraphNode(
             node_id=memory_node_id,
-            node_type=NodeType.MEMORY,
+            node_type=MemoryNodeType.MEMORY,
             name=chunk_id,
             created_by_agent=self._agent_id,
             properties={"content_preview": content[:200], **self._default_properties},
         )
-        await self.backend.add_node(memory_node)
+        await self.store.add_node(memory_node)
 
         # Extract entities from facts or heuristics
         if facts:
@@ -138,52 +162,52 @@ class MemoryGraph:
 
             # Upsert ENTITY node with specificity scoring and mention tracking
             entity_node = await self._make_scored_entity_node(entity_id, entity_name)
-            await self.backend.add_node(entity_node)
+            await self.store.add_node(entity_node)
 
             # MEMORY --MENTIONS--> ENTITY
-            mention_edge = AgentGraphEdge(
-                edge_id=AgentGraphEdge.make_id(
-                    memory_node_id, EdgeType.MENTIONS, entity_id
+            mention_edge = MemoryGraphEdge(
+                edge_id=MemoryGraphEdge.make_id(
+                    memory_node_id, MemoryEdgeType.MENTIONS, entity_id
                 ),
                 from_node_id=memory_node_id,
                 to_node_id=entity_id,
-                edge_type=EdgeType.MENTIONS,
+                edge_type=MemoryEdgeType.MENTIONS,
                 created_by_agent=self._agent_id,
             )
-            await self.backend.add_edge(mention_edge)
+            await self.store.add_edge(mention_edge)
 
             # If there's a related entity (value), create ENTITY --RELATED_TO--> ENTITY
             value = entity_info.get("value")
             if value and value != entity_name:
                 value_id = _make_entity_id(value)
                 value_node = await self._make_scored_entity_node(value_id, value)
-                await self.backend.add_node(value_node)
+                await self.store.add_node(value_node)
 
                 # MEMORY --MENTIONS--> VALUE_ENTITY
-                value_mention = AgentGraphEdge(
-                    edge_id=AgentGraphEdge.make_id(
-                        memory_node_id, EdgeType.MENTIONS, value_id
+                value_mention = MemoryGraphEdge(
+                    edge_id=MemoryGraphEdge.make_id(
+                        memory_node_id, MemoryEdgeType.MENTIONS, value_id
                     ),
                     from_node_id=memory_node_id,
                     to_node_id=value_id,
-                    edge_type=EdgeType.MENTIONS,
+                    edge_type=MemoryEdgeType.MENTIONS,
                     created_by_agent=self._agent_id,
                 )
-                await self.backend.add_edge(value_mention)
+                await self.store.add_edge(value_mention)
 
                 # ENTITY --RELATED_TO--> VALUE_ENTITY
                 relation = entity_info.get("relation", "related_to")
-                rel_edge = AgentGraphEdge(
-                    edge_id=AgentGraphEdge.make_id(
-                        entity_id, EdgeType.RELATED_TO, value_id
+                rel_edge = MemoryGraphEdge(
+                    edge_id=MemoryGraphEdge.make_id(
+                        entity_id, MemoryEdgeType.RELATED_TO, value_id
                     ),
                     from_node_id=entity_id,
                     to_node_id=value_id,
-                    edge_type=EdgeType.RELATED_TO,
+                    edge_type=MemoryEdgeType.RELATED_TO,
                     created_by_agent=self._agent_id,
                     properties={"relation": relation},
                 )
-                await self.backend.add_edge(rel_edge)
+                await self.store.add_edge(rel_edge)
 
     def _entities_from_facts(self, facts: List[dict]) -> List[dict]:
         """Convert FactExtractor output to entity pairs with quality filtering."""
@@ -200,7 +224,7 @@ class MemoryGraph:
 
     async def _make_scored_entity_node(
         self, entity_id: str, entity_name: str
-    ) -> AgentGraphNode:
+    ) -> MemoryGraphNode:
         """Create an entity node with specificity score and mention count.
 
         Reads the existing node (if any) to increment mention_count.
@@ -210,7 +234,7 @@ class MemoryGraph:
         specificity = self._score_entity_specificity(entity_name)
 
         mention_count = 1
-        existing = await self.backend.get_node(entity_id)
+        existing = await self.store.get_node(entity_id)
         if existing:
             existing_props = (
                 existing.properties if hasattr(existing, "properties") else {}
@@ -222,9 +246,9 @@ class MemoryGraph:
             and mention_count >= self._mention_promote_count
         )
 
-        return AgentGraphNode(
+        return MemoryGraphNode(
             node_id=entity_id,
-            node_type=NodeType.ENTITY,
+            node_type=MemoryNodeType.ENTITY,
             name=entity_name,
             created_by_agent=self._agent_id,
             properties={
@@ -423,7 +447,12 @@ class MemoryGraph:
         Traversal: memory -> entity -> memory (2 hops = 1 shared entity).
         """
         memory_node_id = _make_memory_id(chunk_id)
-        graph = await self.backend.load_graph()
+        graph = await self.store.subgraph(
+            root=memory_node_id,
+            direction="both",
+            edge_types=[MemoryEdgeType.MENTIONS],
+            max_depth=max_depth,
+        )
 
         if memory_node_id not in graph:
             return []
@@ -463,15 +492,20 @@ class MemoryGraph:
     ) -> Dict[str, Any]:
         """Walk graph from an entity. Returns connected entities and their memories."""
         entity_id = _make_entity_id(entity_name)
-        graph = await self.backend.load_graph()
-
-        if entity_id not in graph:
+        if await self.store.get_node(entity_id) is None:
             return {
                 "entity": entity_name,
                 "found": False,
                 "connected_entities": [],
                 "memories": [],
             }
+
+        graph = await self.store.subgraph(
+            root=entity_id,
+            direction=direction,
+            edge_types=[MemoryEdgeType.MENTIONS, MemoryEdgeType.RELATED_TO],
+            max_depth=max_depth,
+        )
 
         visited = set()
         queue = deque([(entity_id, 0)])
@@ -484,7 +518,7 @@ class MemoryGraph:
                 continue
             visited.add(node_id)
 
-            node_data = graph.nodes.get(node_id, {})
+            node_data = _node_payload(graph, node_id)
 
             if node_id != entity_id:
                 if node_id.startswith("memory:"):
@@ -500,12 +534,10 @@ class MemoryGraph:
                     continue  # Don't traverse past memory nodes
                 elif node_id.startswith("entity:"):
                     # Skip unpromoted entities (default True for legacy nodes)
-                    node_props = node_data.get("data", node_data).get("properties", {})
+                    node_props = node_data.get("properties", {})
                     if not node_props.get("promoted", True):
                         continue
-                    name = node_data.get("data", node_data).get(
-                        "name", node_id.removeprefix("entity:")
-                    )
+                    name = node_data.get("name", node_id.removeprefix("entity:"))
                     entities.append({"name": name, "depth": depth})
 
             # Traverse both directions
@@ -525,5 +557,11 @@ class MemoryGraph:
 
     async def flush(self):
         """Persist pending graph mutations."""
-        if hasattr(self.backend, "flush"):
-            await self.backend.flush()
+        await self.store.flush()
+
+
+def _node_payload(graph: Any, node_id: str) -> Dict[str, Any]:
+    """Return the stored node payload from a NetworkX node."""
+    node_data = graph.nodes.get(node_id, {})
+    payload = node_data.get("data", node_data)
+    return payload or {}

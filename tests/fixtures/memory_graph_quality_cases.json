@@ -1,0 +1,203 @@
+{
+  "description": "Deterministic memory graph quality cases. Facts are pre-labeled so tests evaluate graph construction, filtering, promotion, and traversal without LLM variance.",
+  "cases": [
+    {
+      "id": "orion_postgres_architecture",
+      "content": "Project Orion uses PostgreSQL behind the payment-gateway service. PostgreSQL connection pool is limited to 100 connections.",
+      "facts": [
+        {
+          "entity": "Project Orion",
+          "relation": "uses",
+          "value": "PostgreSQL"
+        },
+        {
+          "entity": "payment-gateway",
+          "relation": "depends_on",
+          "value": "PostgreSQL"
+        },
+        {
+          "entity": "PostgreSQL",
+          "relation": "has_limit",
+          "value": "100 connections"
+        }
+      ],
+      "expected_entities": [
+        "Project Orion",
+        "PostgreSQL",
+        "payment-gateway",
+        "100 connections"
+      ],
+      "expected_promoted": [
+        "Project Orion",
+        "PostgreSQL",
+        "payment-gateway"
+      ],
+      "expected_unpromoted": [
+        "100 connections"
+      ],
+      "expected_relationships": [
+        ["Project Orion", "uses", "PostgreSQL"],
+        ["payment-gateway", "depends_on", "PostgreSQL"],
+        ["PostgreSQL", "has_limit", "100 connections"]
+      ]
+    },
+    {
+      "id": "postgres_operational_constraints",
+      "content": "PostgreSQL serves Project Orion. The etl_orders_agg pipeline reads orders.customer_id and writes customer_segments.",
+      "facts": [
+        {
+          "entity": "PostgreSQL",
+          "relation": "serves",
+          "value": "Project Orion"
+        },
+        {
+          "entity": "etl_orders_agg",
+          "relation": "reads",
+          "value": "orders.customer_id"
+        },
+        {
+          "entity": "etl_orders_agg",
+          "relation": "writes",
+          "value": "customer_segments"
+        }
+      ],
+      "expected_entities": [
+        "PostgreSQL",
+        "Project Orion",
+        "etl_orders_agg",
+        "orders.customer_id",
+        "customer_segments"
+      ],
+      "expected_promoted": [
+        "PostgreSQL",
+        "Project Orion",
+        "etl_orders_agg",
+        "orders.customer_id",
+        "customer_segments"
+      ],
+      "expected_relationships": [
+        ["PostgreSQL", "serves", "Project Orion"],
+        ["etl_orders_agg", "reads", "orders.customer_id"],
+        ["etl_orders_agg", "writes", "customer_segments"]
+      ]
+    },
+    {
+      "id": "low_signal_deployment_noise",
+      "content": "The setting was changed to true as of 2024. The budget was $500 million. Best practices were followed during deployment.",
+      "facts": [
+        {
+          "entity": "true",
+          "relation": "is",
+          "value": "enabled"
+        },
+        {
+          "entity": "as of 2024",
+          "relation": "observed",
+          "value": "status"
+        },
+        {
+          "entity": "budget",
+          "relation": "is",
+          "value": "$500 million"
+        },
+        {
+          "entity": "best practices",
+          "relation": "followed",
+          "value": "deployment"
+        }
+      ],
+      "expected_entities": [
+        "true",
+        "enabled",
+        "budget",
+        "best practices",
+        "deployment"
+      ],
+      "expected_absent_entities": [
+        "as of 2024",
+        "status",
+        "$500 million"
+      ],
+      "expected_unpromoted": [
+        "true",
+        "enabled",
+        "budget",
+        "best practices",
+        "deployment"
+      ],
+      "forbidden_promoted": [
+        "true",
+        "enabled",
+        "budget",
+        "best practices",
+        "deployment",
+        "as of 2024",
+        "status",
+        "$500 million"
+      ]
+    },
+    {
+      "id": "customer_segments_refresh",
+      "content": "The customer_segments table is refreshed daily by etl_orders_agg. PostgreSQL handles customer_segments writes for Project Orion.",
+      "facts": [
+        {
+          "entity": "customer_segments",
+          "relation": "refreshed_by",
+          "value": "etl_orders_agg"
+        },
+        {
+          "entity": "PostgreSQL",
+          "relation": "writes",
+          "value": "customer_segments"
+        },
+        {
+          "entity": "Project Orion",
+          "relation": "uses",
+          "value": "customer_segments"
+        }
+      ],
+      "expected_entities": [
+        "customer_segments",
+        "etl_orders_agg",
+        "PostgreSQL",
+        "Project Orion"
+      ],
+      "expected_promoted": [
+        "customer_segments",
+        "etl_orders_agg",
+        "PostgreSQL",
+        "Project Orion"
+      ],
+      "expected_relationships": [
+        ["customer_segments", "refreshed_by", "etl_orders_agg"],
+        ["PostgreSQL", "writes", "customer_segments"],
+        ["Project Orion", "uses", "customer_segments"]
+      ]
+    }
+  ],
+  "traversal_expectations": [
+    {
+      "entity": "Project Orion",
+      "max_depth": 3,
+      "expected_memory_ids": [
+        "orion_postgres_architecture",
+        "postgres_operational_constraints",
+        "customer_segments_refresh"
+      ],
+      "expected_connected_entities": [
+        "PostgreSQL",
+        "customer_segments"
+      ],
+      "forbidden_connected_entities": [
+        "true",
+        "best practices",
+        "budget"
+      ]
+    }
+  ],
+  "quality_thresholds": {
+    "entity_recall_min": 1.0,
+    "promoted_forbidden_max": 0,
+    "multi_mention_min": 3
+  }
+}

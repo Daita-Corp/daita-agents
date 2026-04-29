@@ -7,12 +7,14 @@ Project-scoped by default, global as opt-in.
 
 import logging
 import os
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from ..base import LifecyclePlugin
 from ...core.tools import AgentTool, tool
 
 if TYPE_CHECKING:
     from ...embeddings.base import BaseEmbeddingProvider
+    from .graph_store import MemoryGraphStore
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,17 @@ _TOOL_TIERS = {
     },
     "full": None,  # None means all tools
 }
+
+
+def _memory_graph_type(scope: str, workspace: str, project_name: Optional[str]) -> str:
+    """Return a safe graph namespace matching memory's isolation boundary."""
+    parts = ["memory", scope]
+    if project_name:
+        parts.append(project_name)
+    parts.append(workspace)
+    raw = "_".join(parts)
+    safe = re.sub(r"[^a-zA-Z0-9_]+", "_", raw).strip("_").lower()
+    return safe or "memory"
 
 
 class MemoryPlugin(LifecyclePlugin):
@@ -79,6 +92,9 @@ class MemoryPlugin(LifecyclePlugin):
         graph_auto_promote_specificity: float = 0.7,
         graph_mention_promote_specificity: float = 0.3,
         graph_mention_promote_count: int = 2,
+        memory_graph_store: Optional["MemoryGraphStore"] = None,
+        memory_graph_backend: Optional[Any] = None,
+        memory_graph_type: Optional[str] = None,
         max_chunks: int = 2000,
         default_ttl_days: Optional[int] = None,
         tier: str = "basic",
@@ -125,6 +141,13 @@ class MemoryPlugin(LifecyclePlugin):
             graph_mention_promote_count: Number of distinct memory mentions
                 required to promote an entity below auto_promote_specificity
                 (default: 2).
+            memory_graph_store: Optional memory graph store implementation.
+                Use this for fully custom memory graph persistence/traversal.
+            memory_graph_backend: Optional core GraphBackend instance for the
+                memory graph. Ignored when ``memory_graph_store`` is provided.
+            memory_graph_type: Optional graph namespace passed to registered
+                graph backends. Defaults to a workspace-scoped namespace in
+                cloud and "memory" locally.
             max_chunks: Maximum stored chunks before eviction (default: 2000).
             default_ttl_days: Default time-to-live in days for new memories.
                 None means no expiry (default). Can be overridden per-memory.
@@ -159,6 +182,9 @@ class MemoryPlugin(LifecyclePlugin):
         self._graph_auto_promote_specificity = graph_auto_promote_specificity
         self._graph_mention_promote_specificity = graph_mention_promote_specificity
         self._graph_mention_promote_count = graph_mention_promote_count
+        self._memory_graph_store = memory_graph_store
+        self._memory_graph_backend = memory_graph_backend
+        self._memory_graph_type = memory_graph_type
         self.max_chunks = max_chunks
         self.default_ttl_days = default_ttl_days
         self.tier = tier
@@ -320,15 +346,7 @@ class MemoryPlugin(LifecyclePlugin):
             self._working_memory = WorkingMemory()
 
         if self.enable_memory_graph:
-            from .memory_graph import MemoryGraph
-
-            self._memory_graph = MemoryGraph(
-                agent_id=agent_id,
-                default_properties={"workspace": workspace},
-                auto_promote_specificity=self._graph_auto_promote_specificity,
-                mention_promote_specificity=self._graph_mention_promote_specificity,
-                mention_promote_count=self._graph_mention_promote_count,
-            )
+            self._memory_graph = self._build_memory_graph(agent_id, workspace)
             if not self.enable_fact_extraction:
                 logger.info(
                     "Memory graph using keyword heuristics only. "
@@ -342,6 +360,34 @@ class MemoryPlugin(LifecyclePlugin):
             llm=self._ensure_curation_llm(),
             recall_fn=self.backend.recall,
             importance_threshold=0.7,
+        )
+
+    def _build_memory_graph(self, agent_id: str, workspace: str):
+        """Build the optional memory graph without coupling to a backend."""
+        from .memory_graph import MemoryGraph
+
+        graph_storage_dir = None
+        graph_type = self._memory_graph_type or "memory"
+
+        if self.environment == "local" and hasattr(self.backend, "workspace_dir"):
+            graph_storage_dir = self.backend.workspace_dir / "graph"
+        elif self.environment == "cloud" and self._memory_graph_type is None:
+            graph_type = _memory_graph_type(
+                self.scope,
+                workspace,
+                os.getenv("DAITA_PROJECT_NAME") if self.scope != "global" else None,
+            )
+
+        return MemoryGraph(
+            agent_id=agent_id,
+            default_properties={"workspace": workspace},
+            store=self._memory_graph_store,
+            backend=self._memory_graph_backend,
+            storage_dir=graph_storage_dir,
+            graph_type=graph_type,
+            auto_promote_specificity=self._graph_auto_promote_specificity,
+            mention_promote_specificity=self._graph_mention_promote_specificity,
+            mention_promote_count=self._graph_mention_promote_count,
         )
 
     def get_tools(self) -> List[AgentTool]:

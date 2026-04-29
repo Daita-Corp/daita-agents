@@ -11,10 +11,11 @@ To use a different backend, register a factory once at application startup:
 
     register_backend_factory(lambda graph_type: Neo4jBackend(graph_type))
 
-Developers never call auto_select_backend() directly. LineagePlugin and CatalogPlugin
-call it during initialize() if no backend was provided at construction time.
+Developers usually do not call auto_select_backend() directly. Graph-backed
+plugins call it when no backend was provided at construction time.
 """
 
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -24,6 +25,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    TypeAlias,
     runtime_checkable,
 )
 
@@ -31,6 +33,9 @@ if TYPE_CHECKING:
     import networkx as nx
 
 from .models import AgentGraphNode, AgentGraphEdge, EdgeType, NodeType
+
+GraphNodeType: TypeAlias = NodeType | Enum | str
+GraphEdgeType: TypeAlias = EdgeType | Enum | str
 
 # Module-level registry. Set once at startup via register_backend_factory().
 # None means use LocalGraphBackend.
@@ -47,10 +52,12 @@ class GraphBackend(Protocol):
     which backend is used for persistence.
 
     Core primitives are ``iter_nodes`` and ``iter_edges`` (streaming).
-    ``find_nodes`` and ``get_edges`` have default implementations that
-    materialize the iterators into lists — backends may override either
-    form, but only the iterators are strictly required beyond the basic
-    CRUD methods.
+    ``find_nodes`` and ``get_edges`` should preserve the same filter
+    semantics, but backends may implement them as optimized bulk reads.
+
+    Backends should persist ``node_type`` and ``edge_type`` as their canonical
+    string values. Domain layers may pass core enums, plugin-owned enums, or
+    plain strings through this protocol.
     """
 
     async def add_node(self, node: AgentGraphNode) -> None:
@@ -69,7 +76,7 @@ class GraphBackend(Protocol):
         self,
         from_node_id: Optional[str] = None,
         to_node_id: Optional[str] = None,
-        edge_types: Optional[Iterable[EdgeType]] = None,
+        edge_types: Optional[Iterable[GraphEdgeType]] = None,
         properties_match: Optional[dict[str, Any]] = None,
         page_size: int = 500,
     ) -> AsyncIterator[AgentGraphEdge]:
@@ -91,7 +98,7 @@ class GraphBackend(Protocol):
         self,
         from_node_id: Optional[str] = None,
         to_node_id: Optional[str] = None,
-        edge_types: Optional[Iterable[EdgeType]] = None,
+        edge_types: Optional[Iterable[GraphEdgeType]] = None,
         properties_match: Optional[dict[str, Any]] = None,
     ) -> List[AgentGraphEdge]:
         """
@@ -116,7 +123,7 @@ class GraphBackend(Protocol):
         self,
         root: str,
         direction: str = "both",
-        edge_types: Optional[Iterable[EdgeType]] = None,
+        edge_types: Optional[Iterable[GraphEdgeType]] = None,
         max_depth: int = 5,
     ) -> "nx.MultiDiGraph":
         """
@@ -153,7 +160,7 @@ class GraphBackend(Protocol):
 
     async def iter_nodes(
         self,
-        node_type: NodeType,
+        node_type: GraphNodeType,
         properties_match: Optional[dict[str, Any]] = None,
         page_size: int = 500,
     ) -> AsyncIterator[AgentGraphNode]:
@@ -166,7 +173,7 @@ class GraphBackend(Protocol):
 
     async def find_nodes(
         self,
-        node_type: NodeType,
+        node_type: GraphNodeType,
         properties_match: Optional[dict[str, Any]] = None,
     ) -> List[AgentGraphNode]:
         """
@@ -218,8 +225,8 @@ def auto_select_backend(graph_type: str = "lineage") -> "GraphBackend":
     Uses the factory registered via register_backend_factory() if one has been
     set, otherwise returns LocalGraphBackend (the default for local development).
 
-    Developers never call this directly. LineagePlugin and CatalogPlugin call
-    it during initialize() if no backend was passed to the constructor.
+    Developers usually do not call this directly. Graph-backed plugins call it
+    when no backend was passed to the constructor.
     """
     if _BACKEND_FACTORY is not None:
         return _BACKEND_FACTORY(graph_type)

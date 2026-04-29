@@ -11,20 +11,27 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip(
-    "networkx", reason="networkx required: pip install 'daita-agents[lineage]'"
+    "networkx", reason="networkx required: pip install 'daita-agents[memory]'"
 )
 
 from daita.core.graph.local_backend import LocalGraphBackend
-from daita.core.graph.models import AgentGraphEdge, AgentGraphNode, EdgeType, NodeType
+from daita.plugins.memory.graph_models import (
+    MemoryEdgeType,
+    MemoryGraphEdge,
+    MemoryGraphNode,
+    MemoryNodeType,
+)
+from daita.plugins.memory.graph_store import GraphBackendMemoryGraphStore
 from daita.plugins.memory.memory_graph import MemoryGraph, _normalize_entity
+from daita.plugins.memory.memory_plugin import MemoryPlugin, _memory_graph_type
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_node(node_id: str, name: str, node_type=NodeType.ENTITY, **kwargs):
-    return AgentGraphNode(
+def _make_node(node_id: str, name: str, node_type=MemoryNodeType.ENTITY, **kwargs):
+    return MemoryGraphNode(
         node_id=node_id,
         node_type=node_type,
         name=name,
@@ -32,8 +39,8 @@ def _make_node(node_id: str, name: str, node_type=NodeType.ENTITY, **kwargs):
     )
 
 
-def _make_edge(from_id: str, to_id: str, edge_type=EdgeType.MENTIONS, **kwargs):
-    return AgentGraphEdge(
+def _make_edge(from_id: str, to_id: str, edge_type=MemoryEdgeType.MENTIONS, **kwargs):
+    return MemoryGraphEdge(
         edge_id=f"{from_id}:{edge_type.value}:{to_id}",
         from_node_id=from_id,
         to_node_id=to_id,
@@ -50,6 +57,65 @@ def _read_graph_json(path: Path) -> dict:
 # ---------------------------------------------------------------------------
 # Fix 1: Merge-on-flush
 # ---------------------------------------------------------------------------
+
+
+class TestMemoryGraphStore:
+    async def test_get_node_delegates_to_backend_get_node(self):
+        """Single-node reads should not materialize the whole graph."""
+
+        class Backend:
+            async def get_node(self, node_id):
+                return _make_node(node_id, "Toyota")
+
+            async def load_graph(self):
+                raise AssertionError("load_graph should not be used for get_node")
+
+        store = GraphBackendMemoryGraphStore(backend=Backend())
+
+        node = await store.get_node("entity:toyota")
+
+        assert node.node_id == "entity:toyota"
+
+    def test_memory_graph_type_is_workspace_scoped_and_safe(self):
+        assert (
+            _memory_graph_type("project", "Research Team", "Acme/App")
+            == "memory_project_acme_app_research_team"
+        )
+        assert (
+            _memory_graph_type("global", "shared-team", None)
+            == "memory_global_shared_team"
+        )
+
+    def test_memory_plugin_uses_custom_memory_graph_store(self):
+        class Store:
+            pass
+
+        store = Store()
+        plugin = MemoryPlugin(enable_memory_graph=True, memory_graph_store=store)
+        plugin.environment = "cloud"
+        plugin.backend = object()
+
+        graph = plugin._build_memory_graph("agent-1", "workspace-a")
+
+        assert graph.store is store
+
+    def test_memory_plugin_uses_custom_memory_graph_backend_and_type(self):
+        class Backend:
+            pass
+
+        backend = Backend()
+        plugin = MemoryPlugin(
+            enable_memory_graph=True,
+            memory_graph_backend=backend,
+            memory_graph_type="custom_memory_graph",
+        )
+        plugin.environment = "cloud"
+        plugin.backend = object()
+
+        graph = plugin._build_memory_graph("agent-1", "workspace-a")
+
+        assert graph.backend is backend
+        assert graph._graph_type == "custom_memory_graph"
 
 
 class TestMergeOnFlush:
@@ -120,13 +186,13 @@ class TestMergeOnFlush:
         backend_b._graph_path = graph_path
 
         # A adds a node + edge
-        await backend_a.add_node(_make_node("memory:m1", "m1", NodeType.MEMORY))
+        await backend_a.add_node(_make_node("memory:m1", "m1", MemoryNodeType.MEMORY))
         await backend_a.add_node(_make_node("entity:toyota", "Toyota"))
         await backend_a.add_edge(_make_edge("memory:m1", "entity:toyota"))
         await backend_a.flush()
 
         # B adds a different node + edge to the same entity
-        await backend_b.add_node(_make_node("memory:m2", "m2", NodeType.MEMORY))
+        await backend_b.add_node(_make_node("memory:m2", "m2", MemoryNodeType.MEMORY))
         await backend_b.add_node(_make_node("entity:toyota", "Toyota"))
         await backend_b.add_edge(_make_edge("memory:m2", "entity:toyota"))
         await backend_b.flush()
@@ -345,15 +411,34 @@ class TestEntityScoring:
 class TestEntityPromotion:
     """Tests for the mention_count + specificity promotion system."""
 
+    async def test_storage_dir_is_workspace_scoped(self, tmp_path):
+        """Memory graph files can live under the memory workspace."""
+        storage_dir = tmp_path / "workspace" / "graph"
+        mg = MemoryGraph(agent_id="test-agent", storage_dir=storage_dir)
+
+        await mg.index_memory(
+            "chunk-1",
+            "Toyota is investing in solid-state batteries.",
+            facts=[
+                {
+                    "entity": "Toyota",
+                    "relation": "investing in",
+                    "value": "solid-state batteries",
+                },
+            ],
+        )
+        await mg.flush()
+
+        assert (storage_dir / "memory.json").exists()
+
     async def test_high_specificity_immediately_promoted(self, tmp_path):
         """Proper nouns are promoted on first mention."""
         graph_path = tmp_path / ".daita" / "graph" / "memory.json"
         graph_path.parent.mkdir(parents=True, exist_ok=True)
 
-        mg = MemoryGraph(agent_id="test-agent")
         backend = LocalGraphBackend(graph_type="memory")
         backend._graph_path = graph_path
-        mg._backend = backend
+        mg = MemoryGraph(agent_id="test-agent", backend=backend)
 
         await mg.index_memory(
             "chunk-1",
@@ -378,10 +463,9 @@ class TestEntityPromotion:
         graph_path = tmp_path / ".daita" / "graph" / "memory.json"
         graph_path.parent.mkdir(parents=True, exist_ok=True)
 
-        mg = MemoryGraph(agent_id="test-agent")
         backend = LocalGraphBackend(graph_type="memory")
         backend._graph_path = graph_path
-        mg._backend = backend
+        mg = MemoryGraph(agent_id="test-agent", backend=backend)
 
         await mg.index_memory(
             "chunk-1",
@@ -401,10 +485,9 @@ class TestEntityPromotion:
         graph_path = tmp_path / ".daita" / "graph" / "memory.json"
         graph_path.parent.mkdir(parents=True, exist_ok=True)
 
-        mg = MemoryGraph(agent_id="test-agent")
         backend = LocalGraphBackend(graph_type="memory")
         backend._graph_path = graph_path
-        mg._backend = backend
+        mg = MemoryGraph(agent_id="test-agent", backend=backend)
 
         await mg.index_memory(
             "chunk-1",
@@ -432,10 +515,9 @@ class TestEntityPromotion:
         graph_path = tmp_path / ".daita" / "graph" / "memory.json"
         graph_path.parent.mkdir(parents=True, exist_ok=True)
 
-        mg = MemoryGraph(agent_id="test-agent")
         backend = LocalGraphBackend(graph_type="memory")
         backend._graph_path = graph_path
-        mg._backend = backend
+        mg = MemoryGraph(agent_id="test-agent", backend=backend)
 
         await mg.index_memory(
             "chunk-1",
@@ -455,10 +537,9 @@ class TestEntityPromotion:
         graph_path = tmp_path / ".daita" / "graph" / "memory.json"
         graph_path.parent.mkdir(parents=True, exist_ok=True)
 
-        mg = MemoryGraph(agent_id="test-agent")
         backend = LocalGraphBackend(graph_type="memory")
         backend._graph_path = graph_path
-        mg._backend = backend
+        mg = MemoryGraph(agent_id="test-agent", backend=backend)
 
         # Index with a promoted entity and an unpromoted one
         await mg.index_memory(
@@ -479,13 +560,13 @@ class TestEntityPromotion:
         graph_path = tmp_path / ".daita" / "graph" / "memory.json"
         graph_path.parent.mkdir(parents=True, exist_ok=True)
 
+        backend = LocalGraphBackend(graph_type="memory")
+        backend._graph_path = graph_path
         mg = MemoryGraph(
             agent_id="test-agent",
             default_properties={"workspace": "test-ws"},
+            backend=backend,
         )
-        backend = LocalGraphBackend(graph_type="memory")
-        backend._graph_path = graph_path
-        mg._backend = backend
 
         await mg.index_memory(
             "chunk-1",
