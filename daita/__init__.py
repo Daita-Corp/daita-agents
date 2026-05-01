@@ -19,7 +19,7 @@ Key components:
 - AgentConfig           — Configure retry policies, LLM settings, and more
 """
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 
 # ---------------------------------------------------------------------------
 # Core

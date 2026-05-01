@@ -26,6 +26,14 @@ from ._common import (
 
 # Per-store normalizers
 from ._apigateway import normalize_apigateway
+from ._azure_apim import normalize_azure_apim
+from ._azure_blob import normalize_azure_blob
+from ._azure_cosmosdb import normalize_azure_cosmosdb
+from ._azure_eventhub import normalize_azure_eventhub
+from ._azure_servicebus import (
+    normalize_azure_servicebus_queue,
+    normalize_azure_servicebus_topic,
+)
 from ._bigquery import normalize_bigquery
 from ._bigtable import normalize_bigtable
 from ._documentdb import normalize_documentdb
@@ -73,6 +81,13 @@ _NORMALIZERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "pubsub_subscription": normalize_pubsub_subscription,
     "memorystore": normalize_memorystore,
     "gcp_apigateway": normalize_gcp_apigateway,
+    # Azure
+    "azure_blob": normalize_azure_blob,
+    "cosmosdb": normalize_azure_cosmosdb,
+    "eventhub": normalize_azure_eventhub,
+    "servicebus_queue": normalize_azure_servicebus_queue,
+    "servicebus_topic": normalize_azure_servicebus_topic,
+    "azure_apim": normalize_azure_apim,
 }
 
 
@@ -134,6 +149,13 @@ __all__ = [
     "normalize_pubsub_subscription",
     "normalize_memorystore",
     "normalize_gcp_apigateway",
+    # Azure
+    "normalize_azure_blob",
+    "normalize_azure_cosmosdb",
+    "normalize_azure_eventhub",
+    "normalize_azure_servicebus_queue",
+    "normalize_azure_servicebus_topic",
+    "normalize_azure_apim",
     # Store-level utilities
     "deduplicate_stores",
     "merge_store_sources",

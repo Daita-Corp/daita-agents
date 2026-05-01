@@ -400,3 +400,27 @@ async def test_discover_and_profile():
     assert schema is not None
     assert schema.database_type == "postgresql"
     assert schema.store_id == "s1"
+
+
+async def test_discover_and_profile_auto_persists_to_graph(tmp_path, monkeypatch):
+    from daita.core.graph import LocalGraphBackend
+    from daita.core.graph.models import NodeType
+
+    monkeypatch.chdir(tmp_path)
+    backend = LocalGraphBackend(graph_type="catalog_auto_persist_test")
+    plugin = CatalogPlugin(backend=backend, auto_persist=True)
+    stores = [_make_store(id="s1", store_type="postgresql")]
+    plugin.add_discoverer(FakeDiscoverer(stores=stores))
+    plugin.add_profiler(FakeProfiler(supported_types=["postgresql"]))
+    plugin.initialize("catalog-auto-persist-test")
+
+    await plugin.discover_and_profile()
+
+    table = await backend.get_node("table:postgresql:test_db.users")
+    assert table is not None
+    assert table.node_type == NodeType.TABLE
+    assert table.properties["database_type"] == "postgresql"
+
+    columns = await backend.find_nodes(NodeType.COLUMN)
+    column_names = {column.name for column in columns}
+    assert {"id", "email"} <= column_names

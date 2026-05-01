@@ -414,7 +414,7 @@ def build_catalog_tools(plugin: "CatalogPlugin") -> List["AgentTool"]:
             name="discover_infrastructure",
             description=(
                 "Control plane: find every data store reachable from registered "
-                "discoverers (AWS, GCP, GitHub, config files, service registries). "
+                "discoverers (AWS, GCP, Azure, GitHub, config files, service registries). "
                 "Use when you don't yet know what stores exist. Stores returned "
                 "here can be profiled with profile_store."
             ),

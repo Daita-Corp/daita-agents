@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daita-agents"
-version = "0.16.0"
+version = "0.17.0"
 description = "Daita Agents - Data focused AI agent framework with free local use and premium hosted enterprise features"
 readme = "README.md"
 authors = [{name = "Daita", email = "support@daita-tech.io"}]
@@ -175,6 +175,19 @@ vectordb = [
 # =============================================================================
 
 aws = ["boto3>=1.38.0"]
+azure = [
+    "azure-identity>=1.16.0",
+    "azure-mgmt-apimanagement>=4.0.0",
+    "azure-mgmt-cosmosdb>=9.0.0",
+    "azure-mgmt-eventhub>=11.0.0",
+    "azure-mgmt-rdbms>=10.0.0",
+    "azure-mgmt-redis>=14.0.0",
+    "azure-mgmt-servicebus>=8.0.0",
+    "azure-mgmt-sql>=3.0.0",
+    "azure-mgmt-storage>=21.0.0",
+    "azure-mgmt-subscription>=3.0.0",
+    "azure-storage-blob>=12.0.0",
+]
 gcp = [
     "google-auth>=2.0.0",
     "google-cloud-resource-manager>=1.0.0",
@@ -203,6 +216,17 @@ lineage = ["networkx>=3.0"]
 # Convenience bundle - cloud services
 cloud = [
     "boto3>=1.38.0",
+    "azure-identity>=1.16.0",
+    "azure-mgmt-apimanagement>=4.0.0",
+    "azure-mgmt-cosmosdb>=9.0.0",
+    "azure-mgmt-eventhub>=11.0.0",
+    "azure-mgmt-rdbms>=10.0.0",
+    "azure-mgmt-redis>=14.0.0",
+    "azure-mgmt-servicebus>=8.0.0",
+    "azure-mgmt-sql>=3.0.0",
+    "azure-mgmt-storage>=21.0.0",
+    "azure-mgmt-subscription>=3.0.0",
+    "azure-storage-blob>=12.0.0",
     "google-api-python-client>=2.0.0",
     "google-auth>=2.0.0",
     "google-auth-oauthlib>=1.0.0",

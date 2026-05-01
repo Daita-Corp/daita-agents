@@ -71,6 +71,8 @@ class CatalogPlugin(LifecyclePlugin):
           SQS, SNS, OpenSearch, DocumentDB, Kinesis
         * GCP — Cloud SQL, GCS, BigQuery, Firestore, Bigtable, Pub/Sub,
           Memorystore (Redis), API Gateway
+        * Azure — SQL, PostgreSQL, MySQL, Cosmos DB, Blob Storage, Redis,
+          Event Hubs, Service Bus, API Management
         * GitHub — connection-string scanning in config files
     - Schema comparison and validation
     - Pluggable discoverers and profilers
@@ -225,6 +227,13 @@ class CatalogPlugin(LifecyclePlugin):
                 try:
                     schema = await profiler.profile(store)
                     self._schemas[store.id] = schema
+                    if self._auto_persist:
+                        await _persist_schema(
+                            schema.to_dict(),
+                            self._catalog_backend,
+                            self._graph_backend,
+                            self._agent_id,
+                        )
                 except Exception as exc:
                     logger.warning(
                         "Failed to profile store %s (%s): %s",

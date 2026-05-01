@@ -166,18 +166,24 @@ _NODE_HANDLERS: Dict[str, tuple] = {
     "openapi": ("single", "API"),
     "apigateway": ("single", "API"),
     "gcp_apigateway": ("single", "API"),
+    "azure_apim": ("single", "API"),
     # Object stores — single node for the bucket.
     "s3": ("single", "BUCKET"),
     "gcs": ("single", "BUCKET"),
+    "azure_blob": ("single", "BUCKET"),
     # Single-entity databases.
     "dynamodb": ("single", "DATABASE"),
     "memorystore": ("single", "DATABASE"),
+    "cosmosdb": ("fan_out", "TABLE"),
     # Streaming / messaging — single node for the topic / queue / stream.
     "pubsub_topic": ("single", "SERVICE"),
     "pubsub_subscription": ("single", "SERVICE"),
     "sns": ("single", "SERVICE"),
     "sqs": ("single", "SERVICE"),
     "kinesis": ("single", "SERVICE"),
+    "eventhub": ("single", "SERVICE"),
+    "servicebus_queue": ("single", "SERVICE"),
+    "servicebus_topic": ("single", "SERVICE"),
 }
 
 
