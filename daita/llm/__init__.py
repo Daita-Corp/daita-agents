@@ -2,7 +2,7 @@
 LLM provider integrations for Daita Agents.
 
 This module provides a unified interface for different LLM providers:
-- OpenAI (GPT-4, GPT-3.5-turbo, etc.)
+- OpenAI (GPT-5.4 mini, GPT-5.5, etc.)
 - Anthropic (Claude models)
 - Google Gemini
 - xAI Grok
@@ -16,11 +16,11 @@ Usage:
     from daita.llm import create_llm_provider
 
     # Create OpenAI provider
-    llm = create_llm_provider("openai", "gpt-4", api_key="sk-...")
+    llm = create_llm_provider("openai", "gpt-5.4-mini", api_key="sk-...")
     response = await llm.generate("Hello, world!")
 
     # Create Anthropic provider
-    llm = create_llm_provider("anthropic", "claude-3-sonnet-20240229")
+    llm = create_llm_provider("anthropic", "claude-haiku-4-5")
     response = await llm.generate("Analyze this data...")
     ```
 """

@@ -14,6 +14,7 @@ implemented once in ``_filter_by_edge_types`` as a NetworkX edge-subgraph view
 from __future__ import annotations
 
 from collections import deque
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -60,7 +61,7 @@ def _normalize_edge_types(
         return None
     out: Set[str] = set()
     for et in edge_types:
-        if isinstance(et, EdgeType):
+        if isinstance(et, Enum):
             out.add(et.value)
         else:
             out.add(str(et))

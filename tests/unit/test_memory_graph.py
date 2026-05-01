@@ -5,10 +5,10 @@ Tests for memory knowledge graph.
 import pytest
 
 pytest.importorskip(
-    "networkx", reason="networkx required: pip install 'daita-agents[lineage]'"
+    "networkx", reason="networkx required: pip install 'daita-agents[memory]'"
 )
 
-from daita.core.graph.models import NodeType, EdgeType
+from daita.plugins.memory.graph_models import MemoryEdgeType, MemoryNodeType
 from daita.plugins.memory.memory_graph import (
     MemoryGraph,
     _normalize_entity,
@@ -38,15 +38,15 @@ class TestIdHelpers:
 # ---------------------------------------------------------------------------
 
 
-class TestGraphModelExtensions:
+class TestMemoryGraphDomainModels:
     def test_memory_node_type(self):
-        assert NodeType.MEMORY == "memory"
-        assert NodeType.ENTITY == "entity"
+        assert MemoryNodeType.MEMORY == "memory"
+        assert MemoryNodeType.ENTITY == "entity"
 
     def test_memory_edge_types(self):
-        assert EdgeType.MENTIONS == "mentions"
-        assert EdgeType.RELATED_TO == "related_to"
-        assert EdgeType.SUPERSEDES == "supersedes"
+        assert MemoryEdgeType.MENTIONS == "mentions"
+        assert MemoryEdgeType.RELATED_TO == "related_to"
+        assert MemoryEdgeType.SUPERSEDES == "supersedes"
 
 
 # ---------------------------------------------------------------------------

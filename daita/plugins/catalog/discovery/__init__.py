@@ -27,6 +27,14 @@ from ._bigtable import discover_bigtable
 from ._pubsub import discover_pubsub_topic, discover_pubsub_subscription
 from ._memorystore import discover_memorystore
 from ._gcp_apigateway import discover_gcp_apigateway
+from ._azure_blob import discover_azure_blob
+from ._azure_cosmosdb import discover_azure_cosmosdb
+from ._azure_eventhub import discover_azure_eventhub
+from ._azure_servicebus import (
+    discover_azure_servicebus_queue,
+    discover_azure_servicebus_topic,
+)
+from ._azure_apim import discover_azure_apim
 
 __all__ = [
     # Utilities
@@ -57,4 +65,11 @@ __all__ = [
     "discover_pubsub_subscription",
     "discover_memorystore",
     "discover_gcp_apigateway",
+    # Discovery functions — Azure
+    "discover_azure_blob",
+    "discover_azure_cosmosdb",
+    "discover_azure_eventhub",
+    "discover_azure_servicebus_queue",
+    "discover_azure_servicebus_topic",
+    "discover_azure_apim",
 ]

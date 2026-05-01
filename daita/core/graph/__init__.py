@@ -20,9 +20,10 @@ from .algorithms import (
     shortest_path,
     traverse,
 )
-from .backend import GraphBackend, auto_select_backend
+from .backend import GraphBackend, GraphEdgeType, GraphNodeType, auto_select_backend
 from .local_backend import LocalGraphBackend
 from .models import AgentGraphEdge, AgentGraphNode, EdgeType, NodeType
+from .records import GraphEdgeRecord, GraphNodeRecord
 from .tools import build_graph_tools, register_graph_tools
 
 __all__ = [
@@ -31,6 +32,10 @@ __all__ = [
     "NodeType",
     "EdgeType",
     "GraphBackend",
+    "GraphNodeType",
+    "GraphEdgeType",
+    "GraphNodeRecord",
+    "GraphEdgeRecord",
     "auto_select_backend",
     "LocalGraphBackend",
     "traverse",

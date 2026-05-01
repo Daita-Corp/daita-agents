@@ -24,6 +24,14 @@ from ._bigtable import BigtableProfiler
 from ._pubsub import PubSubSubscriptionProfiler, PubSubTopicProfiler
 from ._memorystore import MemorystoreProfiler
 from ._gcp_apigateway import GCPAPIGatewayProfiler
+from ._azure_blob import AzureBlobProfiler
+from ._azure_cosmosdb import AzureCosmosDBProfiler
+from ._azure_eventhub import AzureEventHubProfiler
+from ._azure_servicebus import (
+    AzureServiceBusQueueProfiler,
+    AzureServiceBusTopicProfiler,
+)
+from ._azure_apim import AzureAPIMProfiler
 
 __all__ = [
     "_dict_to_normalized_schema",
@@ -49,4 +57,11 @@ __all__ = [
     "PubSubSubscriptionProfiler",
     "MemorystoreProfiler",
     "GCPAPIGatewayProfiler",
+    # Azure
+    "AzureBlobProfiler",
+    "AzureCosmosDBProfiler",
+    "AzureEventHubProfiler",
+    "AzureServiceBusQueueProfiler",
+    "AzureServiceBusTopicProfiler",
+    "AzureAPIMProfiler",
 ]

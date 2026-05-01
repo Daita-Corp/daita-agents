@@ -2,7 +2,7 @@
 Ollama LLM provider for running local models.
 
 Uses Ollama's OpenAI-compatible API, so any model available via
-``ollama pull`` works: llama3.1, mistral, gemma2, codestral, phi3, etc.
+``ollama pull`` works: llama3.1, mistral, gemma2, codestral, phi4, etc.
 
 Requires Ollama running locally (https://ollama.com).
 Default endpoint: http://localhost:11434
@@ -15,18 +15,18 @@ Usage:
     )
 """
 
-import json
 import os
 import logging
 from typing import Dict, Any, Optional
 
 from ..core.exceptions import LLMError
 from .base import BaseLLMProvider
+from .openai_compatible import OpenAICompatibleMixin, compact_params
 
 logger = logging.getLogger(__name__)
 
 
-class OllamaProvider(BaseLLMProvider):
+class OllamaProvider(OpenAICompatibleMixin, BaseLLMProvider):
     """Ollama LLM provider using the OpenAI-compatible API."""
 
     def __init__(
@@ -38,7 +38,7 @@ class OllamaProvider(BaseLLMProvider):
     ):
         """
         Args:
-            model: Ollama model name (e.g. "llama3.1", "mistral", "codestral")
+            model: Ollama model name (e.g. "llama3.1", "llama3.2", "mistral")
             api_key: Not required for Ollama. Passed through for compatibility.
             base_url: Ollama server URL (default: http://localhost:11434/v1)
             **kwargs: Additional parameters (temperature, max_tokens, etc.)
@@ -83,14 +83,16 @@ class OllamaProvider(BaseLLMProvider):
     ):
         """Non-streaming generation via Ollama's OpenAI-compatible endpoint."""
         try:
-            api_params = {
-                "model": self.model,
-                "messages": self._convert_messages(messages),
-                "max_tokens": kwargs.get("max_tokens"),
-                "temperature": kwargs.get("temperature"),
-                "top_p": kwargs.get("top_p"),
-                "timeout": kwargs.get("timeout"),
-            }
+            api_params = compact_params(
+                {
+                    "model": self.model,
+                    "messages": self._convert_messages_to_openai(messages),
+                    "max_tokens": kwargs.get("max_tokens"),
+                    "temperature": kwargs.get("temperature"),
+                    "top_p": kwargs.get("top_p"),
+                    "timeout": kwargs.get("timeout"),
+                }
+            )
 
             if tools:
                 api_params["tools"] = tools
@@ -98,30 +100,14 @@ class OllamaProvider(BaseLLMProvider):
 
             response = await self.client.chat.completions.create(**api_params)
 
-            self._last_usage = response.usage
-            if response.usage:
-                token_usage = {
-                    "total_tokens": response.usage.total_tokens,
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                }
-                self._update_accumulated_metrics(token_usage)
+            self._record_usage(response.usage)
 
             message = response.choices[0].message
 
-            if message.tool_calls:
-                return {
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "name": tc.function.name,
-                            "arguments": json.loads(tc.function.arguments),
-                        }
-                        for tc in message.tool_calls
-                    ]
-                }
-            else:
-                return message.content
+            tool_calls = self._tool_calls_from_openai_message(message)
+            if tool_calls:
+                return {"tool_calls": tool_calls}
+            return message.content
 
         except Exception as e:
             error_msg = str(e)
@@ -139,15 +125,17 @@ class OllamaProvider(BaseLLMProvider):
         from ..core.streaming import LLMChunk
 
         try:
-            api_params = {
-                "model": self.model,
-                "messages": self._convert_messages(messages),
-                "max_tokens": kwargs.get("max_tokens"),
-                "temperature": kwargs.get("temperature"),
-                "top_p": kwargs.get("top_p"),
-                "timeout": kwargs.get("timeout"),
-                "stream": True,
-            }
+            api_params = compact_params(
+                {
+                    "model": self.model,
+                    "messages": self._convert_messages_to_openai(messages),
+                    "max_tokens": kwargs.get("max_tokens"),
+                    "temperature": kwargs.get("temperature"),
+                    "top_p": kwargs.get("top_p"),
+                    "timeout": kwargs.get("timeout"),
+                    "stream": True,
+                }
+            )
 
             if tools:
                 api_params["tools"] = tools
@@ -160,13 +148,7 @@ class OllamaProvider(BaseLLMProvider):
             async for chunk in stream:
                 if not chunk.choices:
                     if hasattr(chunk, "usage") and chunk.usage:
-                        self._last_usage = chunk.usage
-                        token_usage = {
-                            "total_tokens": chunk.usage.total_tokens,
-                            "prompt_tokens": chunk.usage.prompt_tokens,
-                            "completion_tokens": chunk.usage.completion_tokens,
-                        }
-                        self._update_accumulated_metrics(token_usage)
+                        self._record_usage(chunk.usage)
                     continue
 
                 choice = chunk.choices[0]
@@ -175,44 +157,22 @@ class OllamaProvider(BaseLLMProvider):
                 if delta.content:
                     yield LLMChunk(type="text", content=delta.content, model=self.model)
 
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        index = tc_delta.index
-
-                        if index not in tool_call_buffers:
-                            tool_call_buffers[index] = {
-                                "id": "",
-                                "name": "",
-                                "arguments": "",
-                            }
-
-                        if tc_delta.id:
-                            tool_call_buffers[index]["id"] = tc_delta.id
-                        if tc_delta.function and tc_delta.function.name:
-                            tool_call_buffers[index]["name"] = tc_delta.function.name
-                        if tc_delta.function and tc_delta.function.arguments:
-                            tool_call_buffers[index][
-                                "arguments"
-                            ] += tc_delta.function.arguments
+                self._apply_openai_tool_call_deltas(tool_call_buffers, delta.tool_calls)
 
                 if choice.finish_reason == "tool_calls":
                     for tool_call in tool_call_buffers.values():
                         yield LLMChunk(
                             type="tool_call_complete",
                             tool_name=tool_call["name"],
-                            tool_args=json.loads(tool_call["arguments"]),
+                            tool_args=self._safe_parse_tool_arguments(
+                                tool_call["arguments"]
+                            ),
                             tool_call_id=tool_call["id"],
                             model=self.model,
                         )
 
                 if hasattr(chunk, "usage") and chunk.usage:
-                    self._last_usage = chunk.usage
-                    token_usage = {
-                        "total_tokens": chunk.usage.total_tokens,
-                        "prompt_tokens": chunk.usage.prompt_tokens,
-                        "completion_tokens": chunk.usage.completion_tokens,
-                    }
-                    self._update_accumulated_metrics(token_usage)
+                    self._record_usage(chunk.usage)
 
         except Exception as e:
             error_msg = str(e)
@@ -230,35 +190,6 @@ class OllamaProvider(BaseLLMProvider):
             f"Cannot connect to Ollama at {self._base_url}. "
             f"Is Ollama running? Start it with: ollama serve"
         )
-
-    def _convert_messages(self, messages: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
-        """Convert internal flat tool_calls format to OpenAI nested format."""
-
-        converted = []
-        for msg in messages:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                converted_tool_calls = []
-                for tc in msg["tool_calls"]:
-                    converted_tool_calls.append(
-                        {
-                            "id": tc.get("id", ""),
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": (
-                                    json.dumps(tc["arguments"])
-                                    if isinstance(tc["arguments"], dict)
-                                    else tc["arguments"]
-                                ),
-                            },
-                        }
-                    )
-                converted.append(
-                    {"role": "assistant", "tool_calls": converted_tool_calls}
-                )
-            else:
-                converted.append(msg)
-        return converted
 
     @property
     def info(self) -> Dict[str, Any]:

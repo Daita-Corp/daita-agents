@@ -218,8 +218,24 @@ class BaseLLMProvider(LLMProvider, ABC):
                 "prompt_tokens": inp,
                 "completion_tokens": out,
             }
+        if hasattr(usage, "total_token_count"):
+            prompt = getattr(usage, "prompt_token_count", 0) or 0
+            completion = getattr(usage, "candidates_token_count", 0) or 0
+            total = getattr(usage, "total_token_count", prompt + completion) or 0
+            return {
+                "total_tokens": total,
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+            }
 
         return {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0}
+
+    def _record_usage(self, usage) -> None:
+        """Store provider usage and update accumulated token/cost metrics."""
+        self._last_usage = usage
+        token_usage = self._extract_tokens(usage)
+        if token_usage.get("total_tokens"):
+            self._update_accumulated_metrics(token_usage)
 
     def _get_last_token_usage(self) -> Dict[str, int]:
         """Get token usage from the last API call."""

@@ -88,6 +88,37 @@ class FakeProfiler(BaseProfiler):
         )
 
 
+class FakeGraphBackend:
+    """Minimal graph backend for catalog persistence tests."""
+
+    def __init__(self):
+        self.nodes = {}
+        self.edges = {}
+        self.flushed = False
+
+    async def add_node(self, node):
+        self.nodes[node.node_id] = node
+
+    async def add_edge(self, edge):
+        self.edges[edge.edge_id] = edge
+
+    async def get_node(self, node_id):
+        return self.nodes.get(node_id)
+
+    async def find_nodes(self, node_type=None, **kwargs):
+        if node_type is None:
+            return list(self.nodes.values())
+        return [node for node in self.nodes.values() if node.node_type == node_type]
+
+    async def promote_node(self, old_id, new_id):
+        node = self.nodes.pop(old_id, None)
+        if node is not None:
+            self.nodes[new_id] = node.model_copy(update={"node_id": new_id})
+
+    async def flush(self):
+        self.flushed = True
+
+
 def _make_store(
     id: str = "abc123",
     store_type: str = "postgresql",
@@ -400,3 +431,27 @@ async def test_discover_and_profile():
     assert schema is not None
     assert schema.database_type == "postgresql"
     assert schema.store_id == "s1"
+
+
+async def test_discover_and_profile_auto_persists_to_graph(tmp_path, monkeypatch):
+    from daita.core.graph.models import NodeType
+
+    monkeypatch.chdir(tmp_path)
+    backend = FakeGraphBackend()
+    plugin = CatalogPlugin(backend=backend, auto_persist=True)
+    stores = [_make_store(id="s1", store_type="postgresql")]
+    plugin.add_discoverer(FakeDiscoverer(stores=stores))
+    plugin.add_profiler(FakeProfiler(supported_types=["postgresql"]))
+    plugin.initialize("catalog-auto-persist-test")
+
+    await plugin.discover_and_profile()
+
+    table = await backend.get_node("table:postgresql:test_db.users")
+    assert table is not None
+    assert table.node_type == NodeType.TABLE
+    assert table.properties["database_type"] == "postgresql"
+    assert backend.flushed is True
+
+    columns = await backend.find_nodes(NodeType.COLUMN)
+    column_names = {column.name for column in columns}
+    assert {"id", "email"} <= column_names

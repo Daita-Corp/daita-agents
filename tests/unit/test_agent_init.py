@@ -16,7 +16,7 @@ import re
 import pytest
 
 from daita.agents.agent import Agent
-from daita.config.base import AgentConfig, AgentType
+from daita.config.settings import settings
 from daita.core.tools import AgentTool
 from daita.llm.mock import MockLLMProvider
 
@@ -100,7 +100,9 @@ class TestAgentIdentity:
 
 
 class TestLazyLLM:
-    def test_llm_is_none_without_api_key(self):
+    def test_llm_is_none_without_api_key(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(settings, "openai_api_key", None)
         # No API key, string provider — LLM should stay None
         agent = Agent(name="X", llm_provider="openai")
         assert agent._llm is None
@@ -110,6 +112,10 @@ class TestLazyLLM:
         # for lazy creation (no actual LLM object yet).
         agent = Agent(name="X", llm_provider="openai")
         assert agent._llm_provider_name == "openai"
+
+    def test_default_model_is_current_cost_sensitive_openai_model(self):
+        agent = Agent(name="X", llm_provider="openai")
+        assert agent._llm_model == "gpt-5.4-mini"
 
     def test_llm_instance_is_stored_directly(self, mock_llm):
         agent = Agent(name="X", llm_provider=mock_llm)

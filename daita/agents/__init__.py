@@ -13,7 +13,7 @@ Usage:
     from daita.agents import Agent
 
     # Direct instantiation (recommended)
-    agent = Agent(name="My Agent", llm_provider="openai", model="gpt-4")
+    agent = Agent(name="My Agent", llm_provider="openai", model="gpt-5.4-mini")
 
     # Or with configuration object (backward compatibility)
     from daita.config.base import AgentConfig

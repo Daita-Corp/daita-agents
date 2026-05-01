@@ -66,7 +66,7 @@ class Settings(BaseModel):
     grok_api_key: Optional[str] = None
 
     # LLM settings
-    default_model: str = "gpt-4"
+    default_model: str = "gpt-5.4-mini"
     default_provider: str = "openai"
     default_temperature: float = 0.7
 

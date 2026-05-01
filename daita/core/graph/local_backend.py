@@ -2,11 +2,12 @@
 Local graph backend using NetworkX with JSON file persistence.
 
 Stores the graph at .daita/graph/{graph_type}.json relative to the current
-working directory (the daita project root). The file is created automatically
-on first write.
+working directory by default, or at {storage_dir}/{graph_type}.json when an
+explicit storage directory is provided. The file is created automatically on
+first write.
 
 Not suitable for concurrent writes from multiple processes. This is acceptable
-for local development. Use DynamoGraphBackend in production (when available).
+for local development. Register a remote GraphBackend for production workloads.
 """
 
 from __future__ import annotations
@@ -16,13 +17,16 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
+from enum import Enum
+from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, List, Optional
 
 if TYPE_CHECKING:
     import networkx as nx
 
-from .models import AgentGraphNode, AgentGraphEdge, EdgeType, NodeType
+from .backend import GraphEdgeType, GraphNodeType
+from .models import AgentGraphNode, AgentGraphEdge
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +45,20 @@ class LocalGraphBackend:
     so state survives across agent runs.
     """
 
-    def __init__(self, graph_type: str = "lineage"):
+    def __init__(
+        self,
+        graph_type: str = "lineage",
+        storage_dir: str | PathLike[str] | None = None,
+    ):
         if not re.fullmatch(r"[a-zA-Z0-9_]+", graph_type):
             raise ValueError(
                 f"Invalid graph_type {graph_type!r}. Only alphanumeric characters and underscores are allowed."
             )
         self.graph_type = graph_type
-        self._graph_path = Path(".daita") / "graph" / f"{graph_type}.json"
+        graph_dir = (
+            Path(storage_dir) if storage_dir is not None else Path(".daita") / "graph"
+        )
+        self._graph_path = graph_dir / f"{graph_type}.json"
         self._graph_path.parent.mkdir(parents=True, exist_ok=True)
         self._graph: Optional[nx.MultiDiGraph] = None
         self._lock = asyncio.Lock()
@@ -185,7 +196,7 @@ class LocalGraphBackend:
         self,
         from_node_id: Optional[str] = None,
         to_node_id: Optional[str] = None,
-        edge_types: Optional[Iterable[EdgeType]] = None,
+        edge_types: Optional[Iterable[GraphEdgeType]] = None,
         properties_match: Optional[dict[str, Any]] = None,
     ) -> List[AgentGraphEdge]:
         edges: List[AgentGraphEdge] = []
@@ -202,12 +213,12 @@ class LocalGraphBackend:
         self,
         from_node_id: Optional[str] = None,
         to_node_id: Optional[str] = None,
-        edge_types: Optional[Iterable[EdgeType]] = None,
+        edge_types: Optional[Iterable[GraphEdgeType]] = None,
         properties_match: Optional[dict[str, Any]] = None,
         page_size: int = 500,
     ) -> AsyncIterator[AgentGraphEdge]:
         wanted_types = (
-            {et.value if isinstance(et, EdgeType) else str(et) for et in edge_types}
+            {et.value if isinstance(et, Enum) else str(et) for et in edge_types}
             if edge_types
             else None
         )
@@ -242,7 +253,7 @@ class LocalGraphBackend:
         self,
         root: str,
         direction: str = "both",
-        edge_types: Optional[Iterable[EdgeType]] = None,
+        edge_types: Optional[Iterable[GraphEdgeType]] = None,
         max_depth: int = 5,
     ) -> nx.MultiDiGraph:
         from .algorithms import default_subgraph
@@ -349,7 +360,7 @@ class LocalGraphBackend:
 
     async def find_nodes(
         self,
-        node_type: NodeType,
+        node_type: GraphNodeType,
         properties_match: Optional[dict[str, Any]] = None,
     ) -> List[AgentGraphNode]:
         matches: List[AgentGraphNode] = []
@@ -359,11 +370,11 @@ class LocalGraphBackend:
 
     async def iter_nodes(
         self,
-        node_type: NodeType,
+        node_type: GraphNodeType,
         properties_match: Optional[dict[str, Any]] = None,
         page_size: int = 500,
     ) -> AsyncIterator[AgentGraphNode]:
-        wanted_type = node_type.value
+        wanted_type = node_type.value if isinstance(node_type, Enum) else str(node_type)
         async with self._lock:
             graph = self._load()
             # Snapshot node data under the lock so async yielding can't race

@@ -5,15 +5,11 @@ AgentGraphNode and AgentGraphEdge are agent-native graph primitives that carry
 provenance, confidence, and impact metadata not found in generic graph libraries.
 """
 
-from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import field_validator
 
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+from .records import GraphEdgeRecord, GraphNodeRecord
 
 
 class NodeType(str, Enum):
@@ -31,7 +27,8 @@ class NodeType(str, Enum):
     DATABASE = "database"
     BUCKET = "bucket"
     SERVICE = "service"
-    # Memory graph types
+    # Compatibility only. Memory graph code owns its domain types in
+    # daita.plugins.memory.graph_models.
     MEMORY = "memory"
     ENTITY = "entity"
 
@@ -50,67 +47,32 @@ class EdgeType(str, Enum):
     COVERS = "covers"
     REFERENCES = "references"
     PART_OF = "part_of"
-    # Memory graph types
+    # Compatibility only. Memory graph code owns its domain types in
+    # daita.plugins.memory.graph_models. Will be removed in future updates.
     MENTIONS = "mentions"
     RELATED_TO = "related_to"
     SUPERSEDES = "supersedes"
 
 
-class AgentGraphNode(BaseModel):
-    # Identity
-    node_id: str
-    node_type: NodeType
-    name: str
+class AgentGraphNode(GraphNodeRecord):
+    node_type: NodeType | str
 
-    # Agent provenance
-    created_by_agent: Optional[str] = None
-    created_at_execution: Optional[str] = None
-
-    # Confidence: 1.0 = directly observed, <1.0 = agent-inferred
-    confidence: float = 1.0
-
-    # Health: None = not assessed, 0.0 = broken, 1.0 = healthy
-    health_score: Optional[float] = None
-
-    # Temporal
-    last_seen: Optional[datetime] = None
-    created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
-
-    # Categorization
-    tags: List[str] = []
-
-    # Type-specific data (row count, schema info, agent config, etc.)
-    properties: Dict[str, Any] = {}
-
+    @field_validator("node_type", mode="before")
     @classmethod
-    def make_id(cls, node_type: NodeType, name: str) -> str:
-        """Generate a deterministic node_id from type and name."""
-        return f"{node_type.value}:{name}"
+    def _coerce_known_node_type(cls, value):
+        try:
+            return NodeType(value)
+        except ValueError:
+            return value
 
 
-class AgentGraphEdge(BaseModel):
-    # Identity — deterministic ID prevents duplicate edges
-    edge_id: str
-    from_node_id: str
-    to_node_id: str
-    edge_type: EdgeType
+class AgentGraphEdge(GraphEdgeRecord):
+    edge_type: EdgeType | str
 
-    # Agent provenance
-    created_by_agent: Optional[str] = None
-    execution_id: Optional[str] = None
-    confidence: float = 1.0
-
-    # Impact weight: 1.0 = critical dependency, 0.0 = loose coupling
-    impact_weight: float = Field(default=1.0, ge=0.0, le=1.0)
-
-    # Temporal
-    timestamp: datetime = Field(default_factory=_utcnow)
-
-    # Edge-specific metadata (transformation SQL, sync frequency, etc.)
-    properties: Dict[str, Any] = {}
-
+    @field_validator("edge_type", mode="before")
     @classmethod
-    def make_id(cls, from_node_id: str, edge_type: EdgeType, to_node_id: str) -> str:
-        """Generate a deterministic edge_id."""
-        return f"{from_node_id}:{edge_type.value}:{to_node_id}"
+    def _coerce_known_edge_type(cls, value):
+        try:
+            return EdgeType(value)
+        except ValueError:
+            return value

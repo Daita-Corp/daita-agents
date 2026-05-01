@@ -8,19 +8,36 @@ from typing import Dict, Any, Optional
 
 from ..core.exceptions import LLMError
 from .base import BaseLLMProvider
+from .openai_compatible import OpenAICompatibleMixin, compact_params
 
 logger = logging.getLogger(__name__)
 
 
-class OpenAIProvider(BaseLLMProvider):
+def _build_token_param(
+    max_tokens: Any = None,
+    max_completion_tokens: Any = None,
+    use_legacy_max_tokens: bool = False,
+) -> Dict[str, Any]:
+    """Build OpenAI's token-cap parameter while preserving Daita's max_tokens alias."""
+    if max_completion_tokens is not None:
+        return {"max_completion_tokens": max_completion_tokens}
+    if max_tokens is None:
+        return {}
+    key = "max_tokens" if use_legacy_max_tokens else "max_completion_tokens"
+    return {key: max_tokens}
+
+
+class OpenAIProvider(OpenAICompatibleMixin, BaseLLMProvider):
     """OpenAI LLM provider implementation with automatic call tracing."""
 
-    def __init__(self, model: str = "gpt-4", api_key: Optional[str] = None, **kwargs):
+    def __init__(
+        self, model: str = "gpt-5.4-mini", api_key: Optional[str] = None, **kwargs
+    ):
         """
         Initialize OpenAI provider.
 
         Args:
-            model: OpenAI model name (e.g., "gpt-4", "gpt-3.5-turbo")
+            model: OpenAI model name (e.g., "gpt-5.4-mini", "gpt-5.4", "gpt-5.5")
             api_key: OpenAI API key
             **kwargs: Additional OpenAI-specific parameters
         """
@@ -34,6 +51,11 @@ class OpenAIProvider(BaseLLMProvider):
             {
                 "frequency_penalty": kwargs.get("frequency_penalty", 0.0),
                 "presence_penalty": kwargs.get("presence_penalty", 0.0),
+                "reasoning_effort": kwargs.get("reasoning_effort"),
+                "service_tier": kwargs.get("service_tier"),
+                "parallel_tool_calls": kwargs.get("parallel_tool_calls"),
+                "max_completion_tokens": kwargs.get("max_completion_tokens"),
+                "use_legacy_max_tokens": kwargs.get("use_legacy_max_tokens", False),
                 "timeout": kwargs.get("timeout", 60),
             }
         )
@@ -75,20 +97,29 @@ class OpenAIProvider(BaseLLMProvider):
             - If no tools or LLM returns text: str
             - If LLM wants to call tools: {"tool_calls": [...]}
         """
-        import json
-
         try:
             # Build API call params
-            api_params = {
-                "model": self.model,
-                "messages": self._convert_messages_to_openai(messages),
-                "max_tokens": kwargs.get("max_tokens"),
-                "temperature": kwargs.get("temperature"),
-                "top_p": kwargs.get("top_p"),
-                "frequency_penalty": kwargs.get("frequency_penalty"),
-                "presence_penalty": kwargs.get("presence_penalty"),
-                "timeout": kwargs.get("timeout"),
-            }
+            api_params = compact_params(
+                {
+                    "model": self.model,
+                    "messages": self._convert_messages_to_openai(messages),
+                    "temperature": kwargs.get("temperature"),
+                    "top_p": kwargs.get("top_p"),
+                    "frequency_penalty": kwargs.get("frequency_penalty"),
+                    "presence_penalty": kwargs.get("presence_penalty"),
+                    "reasoning_effort": kwargs.get("reasoning_effort"),
+                    "service_tier": kwargs.get("service_tier"),
+                    "parallel_tool_calls": kwargs.get("parallel_tool_calls"),
+                    "timeout": kwargs.get("timeout"),
+                    **_build_token_param(
+                        max_tokens=kwargs.get("max_tokens"),
+                        max_completion_tokens=kwargs.get("max_completion_tokens"),
+                        use_legacy_max_tokens=kwargs.get(
+                            "use_legacy_max_tokens", False
+                        ),
+                    ),
+                }
+            )
 
             # Add tools if provided
             if tools:
@@ -98,34 +129,15 @@ class OpenAIProvider(BaseLLMProvider):
             # Make API call
             response = await self.client.chat.completions.create(**api_params)
 
-            # Store usage
-            self._last_usage = response.usage
-
-            # Update accumulated metrics for cost tracking
-            if response.usage:
-                token_usage = {
-                    "total_tokens": response.usage.total_tokens,
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                }
-                self._update_accumulated_metrics(token_usage)
+            self._record_usage(response.usage)
 
             message = response.choices[0].message
 
             # Check if tool calls
-            if message.tool_calls:
-                return {
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "name": tc.function.name,
-                            "arguments": json.loads(tc.function.arguments),
-                        }
-                        for tc in message.tool_calls
-                    ]
-                }
-            else:
-                return message.content
+            tool_calls = self._tool_calls_from_openai_message(message)
+            if tool_calls:
+                return {"tool_calls": tool_calls}
+            return message.content
 
         except Exception as e:
             logger.error(f"OpenAI generation failed: {str(e)}")
@@ -149,24 +161,34 @@ class OpenAIProvider(BaseLLMProvider):
             LLMChunk objects with type "text" or "tool_call_complete"
         """
         from ..core.streaming import LLMChunk
-        import json
 
         try:
             # Build API call params
-            api_params = {
-                "model": self.model,
-                "messages": self._convert_messages_to_openai(messages),
-                "max_tokens": kwargs.get("max_tokens"),
-                "temperature": kwargs.get("temperature"),
-                "top_p": kwargs.get("top_p"),
-                "frequency_penalty": kwargs.get("frequency_penalty"),
-                "presence_penalty": kwargs.get("presence_penalty"),
-                "timeout": kwargs.get("timeout"),
-                "stream": True,
-                "stream_options": {
-                    "include_usage": True
-                },  # Get token usage in streaming
-            }
+            api_params = compact_params(
+                {
+                    "model": self.model,
+                    "messages": self._convert_messages_to_openai(messages),
+                    "temperature": kwargs.get("temperature"),
+                    "top_p": kwargs.get("top_p"),
+                    "frequency_penalty": kwargs.get("frequency_penalty"),
+                    "presence_penalty": kwargs.get("presence_penalty"),
+                    "reasoning_effort": kwargs.get("reasoning_effort"),
+                    "service_tier": kwargs.get("service_tier"),
+                    "parallel_tool_calls": kwargs.get("parallel_tool_calls"),
+                    "timeout": kwargs.get("timeout"),
+                    "stream": True,
+                    "stream_options": {
+                        "include_usage": True
+                    },  # Get token usage in streaming
+                    **_build_token_param(
+                        max_tokens=kwargs.get("max_tokens"),
+                        max_completion_tokens=kwargs.get("max_completion_tokens"),
+                        use_legacy_max_tokens=kwargs.get(
+                            "use_legacy_max_tokens", False
+                        ),
+                    ),
+                }
+            )
 
             # Add tools if provided
             if tools:
@@ -183,14 +205,7 @@ class OpenAIProvider(BaseLLMProvider):
                 # Handle usage-only chunks (from stream_options={"include_usage": True})
                 if not chunk.choices:
                     if hasattr(chunk, "usage") and chunk.usage:
-                        self._last_usage = chunk.usage
-                        # Update accumulated metrics for cost tracking
-                        token_usage = {
-                            "total_tokens": chunk.usage.total_tokens,
-                            "prompt_tokens": chunk.usage.prompt_tokens,
-                            "completion_tokens": chunk.usage.completion_tokens,
-                        }
-                        self._update_accumulated_metrics(token_usage)
+                        self._record_usage(chunk.usage)
                     continue
 
                 choice = chunk.choices[0]
@@ -201,27 +216,7 @@ class OpenAIProvider(BaseLLMProvider):
                     yield LLMChunk(type="text", content=delta.content, model=self.model)
 
                 # Handle tool calls (streamed as deltas)
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        index = tc_delta.index
-
-                        # Initialize buffer for this tool call
-                        if index not in tool_call_buffers:
-                            tool_call_buffers[index] = {
-                                "id": "",
-                                "name": "",
-                                "arguments": "",
-                            }
-
-                        # Accumulate partial data
-                        if tc_delta.id:
-                            tool_call_buffers[index]["id"] = tc_delta.id
-                        if tc_delta.function and tc_delta.function.name:
-                            tool_call_buffers[index]["name"] = tc_delta.function.name
-                        if tc_delta.function and tc_delta.function.arguments:
-                            tool_call_buffers[index][
-                                "arguments"
-                            ] += tc_delta.function.arguments
+                self._apply_openai_tool_call_deltas(tool_call_buffers, delta.tool_calls)
 
                 # On stream end, emit complete tool calls
                 if choice.finish_reason == "tool_calls":
@@ -229,69 +224,20 @@ class OpenAIProvider(BaseLLMProvider):
                         yield LLMChunk(
                             type="tool_call_complete",
                             tool_name=tool_call["name"],
-                            tool_args=json.loads(tool_call["arguments"]),
+                            tool_args=self._safe_parse_tool_arguments(
+                                tool_call["arguments"]
+                            ),
                             tool_call_id=tool_call["id"],
                             model=self.model,
                         )
 
                 # Store usage if available
                 if hasattr(chunk, "usage") and chunk.usage:
-                    self._last_usage = chunk.usage
-                    # Update accumulated metrics for cost tracking
-                    token_usage = {
-                        "total_tokens": chunk.usage.total_tokens,
-                        "prompt_tokens": chunk.usage.prompt_tokens,
-                        "completion_tokens": chunk.usage.completion_tokens,
-                    }
-                    self._update_accumulated_metrics(token_usage)
+                    self._record_usage(chunk.usage)
 
         except Exception as e:
             logger.error(f"OpenAI streaming failed: {str(e)}")
             raise LLMError(f"OpenAI streaming failed: {str(e)}")
-
-    def _convert_messages_to_openai(
-        self, messages: list[Dict[str, Any]]
-    ) -> list[Dict[str, Any]]:
-        """
-        Convert universal flat format to OpenAI's nested format.
-
-        OpenAI expects tool_calls in nested format:
-        {"id": "x", "type": "function", "function": {"name": "...", "arguments": "..."}}
-
-        Our internal format is flat:
-        {"id": "x", "name": "...", "arguments": {...}}
-        """
-        import json
-
-        openai_messages = []
-        for msg in messages:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                # Convert flat format to OpenAI's nested format
-                converted_tool_calls = []
-                for tc in msg["tool_calls"]:
-                    converted_tool_calls.append(
-                        {
-                            "id": tc.get("id", ""),
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": (
-                                    json.dumps(tc["arguments"])
-                                    if isinstance(tc["arguments"], dict)
-                                    else tc["arguments"]
-                                ),
-                            },
-                        }
-                    )
-
-                openai_messages.append(
-                    {"role": "assistant", "tool_calls": converted_tool_calls}
-                )
-            else:
-                # Pass through other messages unchanged
-                openai_messages.append(msg)
-
-        return openai_messages
 
     @property
     def info(self) -> Dict[str, Any]:

@@ -2,12 +2,17 @@
 Anthropic LLM provider implementation with integrated tracing.
 """
 
+from __future__ import annotations
+
 import os
 import logging
-from typing import Dict, Any, Optional
+from typing import TYPE_CHECKING, Dict, Any, Optional
 
 from ..core.exceptions import LLMError
 from .base import BaseLLMProvider
+
+if TYPE_CHECKING:
+    from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +22,7 @@ class AnthropicProvider(BaseLLMProvider):
 
     def __init__(
         self,
-        model: str = "claude-3-sonnet-20240229",
+        model: str = "claude-haiku-4-5",
         api_key: Optional[str] = None,
         **kwargs,
     ):
@@ -64,9 +69,9 @@ class AnthropicProvider(BaseLLMProvider):
                     f"Anthropic client initialized with {timeout_seconds}s timeout"
                 )
             except ImportError:
-                raise LLMError(
+                raise ImportError(
                     "Anthropic package not installed. Install with: pip install 'daita-agents[anthropic]'"
-                )
+                ) from None
         return self._client
 
     def _build_api_params(
@@ -138,18 +143,7 @@ class AnthropicProvider(BaseLLMProvider):
             # Make API call
             response = await self.client.messages.create(**api_params)
 
-            # Store usage
-            self._last_usage = response.usage
-
-            # Update accumulated metrics for cost tracking
-            if response.usage:
-                token_usage = {
-                    "total_tokens": response.usage.input_tokens
-                    + response.usage.output_tokens,
-                    "prompt_tokens": response.usage.input_tokens,
-                    "completion_tokens": response.usage.output_tokens,
-                }
-                self._update_accumulated_metrics(token_usage)
+            self._record_usage(response.usage)
 
             # Check response content
             # First pass: collect all tool_use blocks (takes priority over text)
@@ -254,15 +248,7 @@ class AnthropicProvider(BaseLLMProvider):
                     elif event.type == "message_stop":
                         final_message = await stream.get_final_message()
                         if hasattr(final_message, "usage"):
-                            self._last_usage = final_message.usage
-                            # Update accumulated metrics for cost tracking
-                            token_usage = {
-                                "total_tokens": final_message.usage.input_tokens
-                                + final_message.usage.output_tokens,
-                                "prompt_tokens": final_message.usage.input_tokens,
-                                "completion_tokens": final_message.usage.output_tokens,
-                            }
-                            self._update_accumulated_metrics(token_usage)
+                            self._record_usage(final_message.usage)
 
         except Exception as e:
             logger.error(f"Anthropic streaming failed: {str(e)}")
@@ -300,45 +286,13 @@ class AnthropicProvider(BaseLLMProvider):
                 timeout=params.get("timeout"),
             )
 
-            # Store usage for potential token extraction
-            self._last_usage = response.usage
-
-            # Update accumulated metrics for cost tracking
-            if response.usage:
-                token_usage = {
-                    "total_tokens": response.usage.input_tokens
-                    + response.usage.output_tokens,
-                    "prompt_tokens": response.usage.input_tokens,
-                    "completion_tokens": response.usage.output_tokens,
-                }
-                self._update_accumulated_metrics(token_usage)
+            self._record_usage(response.usage)
 
             return response.content[0].text
 
         except Exception as e:
             logger.error(f"Anthropic generation with system message failed: {str(e)}")
             raise LLMError(f"Anthropic generation failed: {str(e)}")
-
-    def _get_last_token_usage(self) -> Dict[str, int]:
-        """
-        Override base class method to handle Anthropic's token format.
-
-        Anthropic uses input_tokens and output_tokens format, different from OpenAI.
-        """
-        if self._last_usage:
-            # Anthropic format: input_tokens + output_tokens
-            input_tokens = getattr(self._last_usage, "input_tokens", 0)
-            output_tokens = getattr(self._last_usage, "output_tokens", 0)
-            total_tokens = input_tokens + output_tokens
-
-            return {
-                "total_tokens": total_tokens,
-                "prompt_tokens": input_tokens,  # Map input_tokens to prompt_tokens
-                "completion_tokens": output_tokens,  # Map output_tokens to completion_tokens
-            }
-
-        # Fallback to base class estimation
-        return super()._get_last_token_usage()
 
     def _convert_tools_to_format(
         self, tools: list["AgentTool"]
