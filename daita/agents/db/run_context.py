@@ -1,0 +1,152 @@
+"""
+Compact per-run context for agents created by ``Agent.from_db()``.
+"""
+
+from typing import Any, Callable, Dict, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..agent import Agent
+
+
+DEFAULT_CONTEXT_MAX_CHARS = 1600
+_ANALYST_TOOL_PREFIXES = (
+    "pivot_",
+    "correlate",
+    "detect_",
+    "compare_",
+    "find_",
+    "forecast_",
+)
+
+
+def build_db_run_context(
+    agent: "Agent",
+    *,
+    max_chars: int = DEFAULT_CONTEXT_MAX_CHARS,
+) -> str:
+    """Build a small DB runtime context block without querying external systems."""
+    schema = getattr(agent, "_db_schema", {}) or {}
+    plugin = getattr(agent, "_db_plugin", None)
+    tool_names = list(getattr(agent.tool_registry, "tool_names", []))
+    drift = getattr(agent, "_db_schema_drift", None)
+    tables = schema.get("tables", [])
+    foreign_keys = schema.get("foreign_keys", [])
+
+    lines = [
+        "<db_runtime_context>",
+        "Use this compact DB context for the current question. The full schema is already in the system prompt.",
+        (
+            "Database: "
+            f"type={schema.get('database_type', getattr(plugin, 'sql_dialect', 'unknown'))}, "
+            f"name={schema.get('database_name') or _plugin_database_name(plugin) or 'unknown'}, "
+            f"tables={schema.get('table_count', len(tables))}, "
+            f"columns={sum(len(table.get('columns', [])) for table in tables)}, "
+            f"relationships={len(foreign_keys)}"
+        ),
+        "Query policy: " + _query_policy_summary(plugin),
+        "Capabilities: " + _capability_summary(agent, tool_names),
+        "Drift: " + _drift_summary(drift),
+        "Memory guidance: use memory for business rules, metric definitions, units, exclusions, and query corrections; do not use memory for row lookup.",
+        "</db_runtime_context>",
+    ]
+    return _truncate_context("\n".join(lines), max_chars)
+
+
+def make_db_context_run(agent: "Agent", original_run: Callable) -> Callable:
+    """Return a run wrapper that adds compact DB context to each prompt."""
+
+    async def _db_context_run(prompt: str, **kwargs: Any):
+        context = build_db_run_context(agent)
+        return await original_run(_augment_prompt(prompt, context), **kwargs)
+
+    return _db_context_run
+
+
+def make_db_context_stream(agent: "Agent", original_stream: Callable) -> Callable:
+    """Return a stream wrapper that adds compact DB context to each prompt."""
+
+    async def _db_context_stream(prompt: str, **kwargs: Any):
+        context = build_db_run_context(agent)
+        async for event in original_stream(_augment_prompt(prompt, context), **kwargs):
+            yield event
+
+    return _db_context_stream
+
+
+def _augment_prompt(prompt: str, context: str) -> str:
+    return f"{context}\n\nUser question:\n{prompt}"
+
+
+def _query_policy_summary(plugin: Any) -> str:
+    if plugin is None:
+        return "unknown"
+
+    parts = [
+        "read_only=true" if getattr(plugin, "read_only", True) else "read_only=false",
+        f"default_limit={getattr(plugin, 'query_default_limit', None)}",
+        f"max_rows={getattr(plugin, 'query_max_rows', None)}",
+        f"max_chars={getattr(plugin, 'query_max_chars', None)}",
+        f"timeout={getattr(plugin, 'query_timeout', None)}",
+    ]
+    if getattr(plugin, "allowed_tables", None):
+        parts.append("table_allowlist=true")
+    if getattr(plugin, "blocked_tables", None):
+        parts.append("table_blocklist=true")
+    if getattr(plugin, "blocked_columns", None):
+        parts.append("column_blocklist=true")
+    return ", ".join(parts)
+
+
+def _capability_summary(agent: "Agent", tool_names: List[str]) -> str:
+    capabilities = ["sql", "schema"]
+    if any(name.startswith(_ANALYST_TOOL_PREFIXES) for name in tool_names):
+        capabilities.append("analyst_tools")
+    if hasattr(agent, "_db_memory"):
+        capabilities.append("memory")
+    if hasattr(agent, "_db_lineage"):
+        capabilities.append("lineage")
+    if hasattr(agent, "_db_history"):
+        capabilities.append("history")
+    return ", ".join(capabilities)
+
+
+def _drift_summary(drift: Any) -> str:
+    if not drift:
+        return "none"
+    if isinstance(drift, dict):
+        items = []
+        for key, value in drift.items():
+            if not value:
+                continue
+            if isinstance(value, list):
+                items.append(f"{key}={len(value)}")
+            else:
+                items.append(f"{key}=changed")
+            if len(items) >= 5:
+                break
+        return ", ".join(items) if items else "changed"
+    return _truncate_line(str(drift), 240)
+
+
+def _plugin_database_name(plugin: Any) -> Any:
+    if plugin is None:
+        return None
+    return (
+        getattr(plugin, "database_name", None)
+        or getattr(plugin, "database", None)
+        or getattr(plugin, "db", None)
+        or getattr(plugin, "path", None)
+    )
+
+
+def _truncate_line(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[: max_chars - 3].rstrip() + "..."
+
+
+def _truncate_context(context: str, max_chars: int) -> str:
+    if len(context) <= max_chars:
+        return context
+    suffix = "\n...context truncated\n</db_runtime_context>"
+    return context[: max_chars - len(suffix)].rstrip() + suffix

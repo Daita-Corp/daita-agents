@@ -8,8 +8,11 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
 from .audit import make_audited_run, make_audited_stream
 from .cache import cache_key, detect_drift, load_cached_schema, save_schema_cache
 from .calibration import calibrate_numerics
+from .context import attach_db_context
+from .describe import attach_db_describe
 from .prompt import build_prompt, infer_domain
 from .resolve import resolve_plugin
+from .run_context import make_db_context_run, make_db_context_stream
 from .sampling import sample_numeric_columns
 from .schema import discover_schema
 
@@ -48,6 +51,13 @@ async def from_db(
     history: Union[bool, Any, None] = None,
     cache_ttl: Optional[int] = None,
     read_only: bool = True,
+    query_default_limit: int = 50,
+    query_max_rows: int = 200,
+    query_max_chars: int = 50000,
+    query_timeout: Optional[float] = None,
+    allowed_tables: Optional[List[str]] = None,
+    blocked_tables: Optional[List[str]] = None,
+    blocked_columns: Optional[List[str]] = None,
     toolkit: Optional[str] = "analyst",
     **agent_kwargs: Any,
 ) -> "Agent":
@@ -76,6 +86,13 @@ async def from_db(
             an instance. Enables conversational drilldown across ``run()`` calls.
         cache_ttl: Schema cache TTL in seconds. ``None`` disables caching.
         read_only: When ``True`` (default), write tools are omitted.
+        query_default_limit: LIMIT injected into DB query tools when omitted.
+        query_max_rows: Maximum rows returned from DB query tools after execution.
+        query_max_chars: Maximum serialized characters returned from DB query tools.
+        query_timeout: Timeout in seconds for DB query tool execution.
+        allowed_tables: Optional table allowlist enforced by DB query tools.
+        blocked_tables: Optional table blocklist enforced by DB query tools.
+        blocked_columns: Optional column blocklist enforced by DB query tools.
         toolkit: Which analyst toolkit to register. ``"analyst"`` (default) registers
             6 analysis tools (pivot, correlate, anomalies, compare, similar, forecast).
             ``"all"`` is an alias for ``"analyst"``. ``None`` registers no toolkit.
@@ -91,6 +108,15 @@ async def from_db(
     from ...core.exceptions import AgentError
 
     plugin, was_created = resolve_plugin(source, read_only=read_only)
+    plugin.read_only = read_only
+    plugin.query_default_limit = query_default_limit
+    plugin.query_max_rows = query_max_rows
+    plugin.query_max_chars = query_max_chars
+    if query_timeout is not None:
+        plugin.query_timeout = query_timeout
+    plugin.allowed_tables = set(allowed_tables or [])
+    plugin.blocked_tables = set(blocked_tables or [])
+    plugin.blocked_columns = set(blocked_columns or [])
 
     try:
         await plugin.connect()
@@ -278,7 +304,11 @@ async def from_db(
     # Access via agent._db_audit_log after any number of run() calls.
     # ------------------------------------------------------------------
     agent._db_audit_log: List[Dict[str, Any]] = []
-    agent.run = make_audited_run(agent, agent.run)
-    agent.stream = make_audited_stream(agent, agent.stream)
+    agent.run = make_audited_run(agent, make_db_context_run(agent, agent.run))
+    agent.stream = make_audited_stream(
+        agent, make_db_context_stream(agent, agent.stream)
+    )
+    attach_db_context(agent)
+    attach_db_describe(agent)
 
     return agent

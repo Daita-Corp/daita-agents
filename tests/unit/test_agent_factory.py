@@ -8,6 +8,7 @@ Run with: pytest tests/unit/test_agent_factory.py -v
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
@@ -555,6 +556,208 @@ class TestFromDbIntegration:
             await from_db("postgresql://localhost/testdb")
 
         assert mock_agent._db_schema["tables"][0]["name"] == "users"
+
+    async def test_from_db_attaches_db_only_describe(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        normalized = _make_normalized_schema(
+            tables=[
+                _table(
+                    "orders",
+                    columns=[
+                        {"name": "id", "type": "integer"},
+                        {"name": "total", "type": "numeric"},
+                    ],
+                ),
+                _table("customers"),
+            ],
+            fks=[
+                {
+                    "source_table": "orders",
+                    "source_column": "customer_id",
+                    "target_table": "customers",
+                    "target_column": "id",
+                }
+            ],
+            db_type="postgresql",
+            db_name="warehouse",
+        )
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        mock_plugin.sql_dialect = "postgresql"
+        mock_plugin.database_name = "warehouse"
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=normalized)),
+        ):
+            agent = await from_db(
+                "postgresql://localhost/testdb",
+                name="Warehouse",
+                query_default_limit=25,
+                query_max_rows=100,
+                query_max_chars=1000,
+                query_timeout=12,
+                allowed_tables=["orders"],
+                blocked_tables=["payments"],
+                blocked_columns=["email"],
+            )
+
+        description = agent.describe()
+        assert description["kind"] == "database"
+        assert description["name"] == "Warehouse"
+        assert {"sql", "schema", "analyst_tools", "audit"}.issubset(
+            description["capabilities"]
+        )
+        assert description["db"]["database_type"] == "postgresql"
+        assert description["db"]["database_name"] == "warehouse"
+        assert description["db"]["table_count"] == 2
+        assert description["db"]["column_count"] == 3
+        assert description["db"]["relationship_count"] == 1
+        assert description["db"]["drift_status"] == "none"
+        assert description["db"]["query_policy"] == {
+            "read_only": True,
+            "default_limit": 25,
+            "max_rows": 100,
+            "max_chars": 1000,
+            "timeout": 12,
+            "has_table_allowlist": True,
+            "has_table_blocklist": True,
+            "has_column_blocklist": True,
+        }
+
+    async def test_from_db_attaches_db_context_without_profile_surface(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        normalized = _make_normalized_schema(
+            tables=[_table("orders")],
+            db_type="postgresql",
+            db_name="warehouse",
+        )
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=normalized)),
+        ):
+            agent = await from_db("postgresql://localhost/testdb")
+
+        assert agent.db.schema is agent._db_schema
+        assert agent.db.plugin is mock_plugin
+        assert agent.db.drift is None
+        assert agent.db.memory is None
+        assert agent.db.lineage is None
+        assert agent.db.history is None
+        assert not hasattr(agent.db, "profile")
+        assert not hasattr(agent.db, "describe")
+
+    async def test_from_db_audit_context(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(
+                fac,
+                "discover_schema",
+                AsyncMock(return_value=_make_normalized_schema()),
+            ),
+        ):
+            agent = await from_db("postgresql://localhost/testdb")
+
+        assert agent.db.audit.entries == []
+        assert agent.db.audit.last() is None
+
+        agent._db_audit_log.append({"prompt": "hello", "tool_calls": []})
+
+        assert agent.db.audit.entries == [{"prompt": "hello", "tool_calls": []}]
+        assert agent.db.audit.last() == {"prompt": "hello", "tool_calls": []}
+        assert agent.db.audit.export_json() == '[{"prompt": "hello", "tool_calls": []}]'
+
+    def test_db_run_context_is_compact_and_policy_aware(self):
+        from daita.agents.db.run_context import build_db_run_context
+
+        agent = SimpleNamespace(
+            tool_registry=SimpleNamespace(tool_names=["postgres_query", "pivot_table"]),
+            _db_schema=_make_normalized_schema(
+                tables=[_table("orders"), _table("customers")],
+                fks=[
+                    {
+                        "source_table": "orders",
+                        "source_column": "customer_id",
+                        "target_table": "customers",
+                        "target_column": "id",
+                    }
+                ],
+                db_type="postgresql",
+                db_name="warehouse",
+            ),
+            _db_schema_drift=None,
+            _db_plugin=SimpleNamespace(
+                read_only=True,
+                query_default_limit=25,
+                query_max_rows=100,
+                query_max_chars=1000,
+                query_timeout=12,
+                allowed_tables={"orders"},
+                blocked_tables={"payments"},
+                blocked_columns={"email"},
+                sql_dialect="postgresql",
+            ),
+        )
+
+        context = build_db_run_context(agent, max_chars=500)
+
+        assert len(context) <= 500
+        assert context.startswith("<db_runtime_context>")
+        assert context.endswith("</db_runtime_context>")
+        assert "tables=2" in context
+        assert "relationships=1" in context
+        assert "default_limit=25" in context
+        assert "analyst_tools" in context
+        assert "Memory guidance:" in context
+
+    async def test_db_context_run_augments_prompt_but_audit_keeps_original(self):
+        from daita.agents.db.audit import make_audited_run
+        from daita.agents.db.run_context import make_db_context_run
+
+        agent = SimpleNamespace(
+            tool_registry=SimpleNamespace(tool_names=["postgres_query"]),
+            _db_schema=_make_normalized_schema(
+                tables=[_table("orders")], db_type="postgresql", db_name="warehouse"
+            ),
+            _db_schema_drift=None,
+            _db_plugin=SimpleNamespace(
+                read_only=True,
+                query_default_limit=50,
+                query_max_rows=200,
+                query_max_chars=50000,
+                query_timeout=30,
+            ),
+            _db_audit_log=[],
+            _tool_call_history=[],
+        )
+        seen = {}
+
+        async def original_run(prompt, **kwargs):
+            seen["prompt"] = prompt
+            seen["kwargs"] = kwargs
+            return {"result": "ok", "tool_calls": []}
+
+        wrapped = make_audited_run(agent, make_db_context_run(agent, original_run))
+        result = await wrapped("How much revenue?", detailed=True)
+
+        assert result["result"] == "ok"
+        assert seen["prompt"].startswith("<db_runtime_context>")
+        assert "User question:\nHow much revenue?" in seen["prompt"]
+        assert seen["kwargs"]["detailed"] is True
+        assert agent._db_audit_log[0]["prompt"] == "How much revenue?"
 
 
 # ---------------------------------------------------------------------------
