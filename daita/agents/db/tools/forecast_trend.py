@@ -7,7 +7,13 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from ....core.tools import AgentTool
-from ._helpers import ensure_pandas, ensure_numpy, safe_query, to_serializable
+from ._helpers import (
+    ensure_pandas,
+    ensure_numpy,
+    safe_query,
+    source_metadata,
+    to_serializable,
+)
 
 if TYPE_CHECKING:
     from ....plugins.base_db import BaseDatabasePlugin
@@ -56,13 +62,15 @@ def create_forecast_trend_tool(
             return {"success": False, "error": "metric_column parameter is required"}
 
         try:
-            rows = await safe_query(plugin, sql)
+            query_result = await safe_query(plugin, sql)
+            rows = query_result.rows
             if not rows:
                 return {
                     "success": True,
                     "historical": [],
                     "forecast": [],
                     "trend": None,
+                    **source_metadata(query_result),
                 }
 
             df = pd.DataFrame(
@@ -162,6 +170,7 @@ def create_forecast_trend_tool(
                 "historical": historical,
                 "forecast": forecast,
                 "growth_rate_pct": round(total_growth, 2),
+                **source_metadata(query_result),
             }
 
         except Exception as e:

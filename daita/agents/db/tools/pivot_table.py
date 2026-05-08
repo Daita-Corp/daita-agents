@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Any, Dict, TYPE_CHECKING
 
 from ....core.tools import AgentTool
-from ._helpers import ensure_pandas, safe_query, to_serializable
+from ._helpers import ensure_pandas, safe_query, source_metadata, to_serializable
 
 if TYPE_CHECKING:
     from ....plugins.base_db import BaseDatabasePlugin
@@ -40,9 +40,16 @@ def create_pivot_table_tool(
             }
 
         try:
-            rows = await safe_query(plugin, sql)
+            query_result = await safe_query(plugin, sql)
+            rows = query_result.rows
             if not rows:
-                return {"success": True, "pivot": [], "row_count": 0, "column_count": 0}
+                return {
+                    "success": True,
+                    "pivot": [],
+                    "row_count": 0,
+                    "column_count": 0,
+                    **source_metadata(query_result),
+                }
 
             df = pd.DataFrame(
                 [{k: to_serializable(v) for k, v in r.items()} for r in rows]
@@ -82,6 +89,7 @@ def create_pivot_table_tool(
                     "values": values_col,
                     "aggfunc": aggfunc,
                 },
+                **source_metadata(query_result),
             }
         except Exception as e:
             return {"success": False, "error": f"Pivot failed: {e}"}

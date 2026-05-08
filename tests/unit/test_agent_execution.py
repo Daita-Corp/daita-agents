@@ -243,6 +243,7 @@ class TestToolCallingLoop:
         result = await agent.run("add 1 and 1", detailed=True)
         assert len(result["tool_calls"]) == 1
         assert result["tool_calls"][0]["tool"] == "add"
+        assert result["tool_calls"][0]["duration_ms"] >= 0
 
     async def test_iterations_incremented_per_llm_call(self):
         tool = _add_tool()

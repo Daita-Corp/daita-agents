@@ -46,6 +46,8 @@ def _capabilities(agent: "Agent", tool_names: List[str]) -> List[str]:
     capabilities = ["sql", "schema"]
     if any(name.startswith(_ANALYST_TOOL_PREFIXES) for name in tool_names):
         capabilities.append("analyst_tools")
+    if hasattr(agent, "_db_quality"):
+        capabilities.append("data_quality")
     if hasattr(agent, "_db_memory"):
         capabilities.append("memory")
     if hasattr(agent, "_db_lineage"):
@@ -70,12 +72,19 @@ def _db_metadata(agent: "Agent", tool_names: List[str]) -> Dict[str, Any]:
     tables = schema.get("tables", [])
     foreign_keys = schema.get("foreign_keys", [])
     drift = getattr(agent, "_db_schema_drift", None)
+    summary = getattr(agent, "_db_summary", {}) or {}
+    candidate_metrics = summary.get("candidate_metrics", [])
+    suggested_questions = summary.get("suggested_questions", [])
+    signals = summary.get("signals", [])
+    findings = getattr(agent, "_db_findings", []) or []
+    open_findings = [f for f in findings if f.get("status") == "open"]
 
     metadata: Dict[str, Any] = {
         "database_type": schema.get(
             "database_type", getattr(plugin, "sql_dialect", None)
         ),
         "database_name": schema.get("database_name") or _plugin_database_name(plugin),
+        "mode": getattr(agent, "_db_mode", None),
         "read_only": bool(getattr(plugin, "read_only", True)),
         "table_count": schema.get("table_count", len(tables)),
         "column_count": sum(len(table.get("columns", [])) for table in tables),
@@ -85,9 +94,17 @@ def _db_metadata(agent: "Agent", tool_names: List[str]) -> Dict[str, Any]:
         "memory_enabled": hasattr(agent, "_db_memory"),
         "lineage_enabled": hasattr(agent, "_db_lineage"),
         "history_enabled": hasattr(agent, "_db_history"),
+        "quality_enabled": hasattr(agent, "_db_quality"),
         "audit_enabled": hasattr(agent, "_db_audit_log"),
+        "metric_count": len(candidate_metrics),
+        "suggested_question_count": len(suggested_questions),
+        "finding_count": len(findings),
+        "open_finding_count": len(open_findings),
+        "quality_status": "warning" if signals else "ok",
         "tools": tool_names,
     }
+    if summary:
+        metadata["summary"] = summary
     if drift:
         metadata["drift"] = drift
     if plugin is not None:

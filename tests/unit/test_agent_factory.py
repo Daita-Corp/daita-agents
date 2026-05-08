@@ -25,6 +25,16 @@ from daita.agents.db.prompt import (
 )
 from daita.agents.db.resolve import resolve_plugin as _db_resolve_plugin
 from daita.agents.db.schema import normalize_schema as _db_normalize_schema
+from daita.agents.db.summary import build_db_summary as _db_build_summary
+from daita.agents.db.monitors import normalize_monitor_definition
+from daita.agents.db.findings import normalize_finding
+from daita.agents.db.memory import (
+    DBMemory,
+    DBMemoryRecord,
+    calibrate_db_memory,
+    normalize_db_memory_record,
+    recall_db_memory_context,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -386,6 +396,60 @@ class TestBuildDbPrompt:
         assert "postgresql" in prompt
 
 
+class TestDbSummary:
+    def test_summary_derives_health_questions_and_metrics(self):
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "orders",
+                    columns=[
+                        {"name": "id", "type": "integer", "is_primary_key": True},
+                        {"name": "customer_id", "type": "integer"},
+                        {"name": "total_amount", "type": "numeric"},
+                        {"name": "updated_at", "type": "timestamp"},
+                    ],
+                    row_count=100,
+                ),
+                _table(
+                    "customers",
+                    columns=[
+                        {"name": "id", "type": "integer", "is_primary_key": True},
+                        {"name": "email", "type": "text"},
+                    ],
+                    row_count=20,
+                ),
+            ],
+            fks=[
+                {
+                    "source_table": "orders",
+                    "source_column": "customer_id",
+                    "target_table": "customers",
+                    "target_column": "id",
+                }
+            ],
+        )
+
+        summary = _db_build_summary(schema)
+
+        assert "orders" in summary["fact_tables"]
+        assert "customers" in summary["entity_tables"]
+        assert summary["candidate_metrics"][0]["column"] == "total_amount"
+        assert summary["suggested_questions"]
+        assert "suggested_monitors" not in summary
+
+    def test_monitor_definition_validation_rejects_incomplete_definition(self):
+        with pytest.raises(ValueError, match="requires sql"):
+            normalize_monitor_definition(
+                {
+                    "name": "orders freshness",
+                    "type": "freshness",
+                    "severity": "warning",
+                    "entity": {"table": "orders", "column": "updated_at"},
+                    "threshold": {"max_age_hours": 24},
+                }
+            )
+
+
 # ---------------------------------------------------------------------------
 # Integration tests (fully mocked)
 # ---------------------------------------------------------------------------
@@ -557,6 +621,30 @@ class TestFromDbIntegration:
 
         assert mock_agent._db_schema["tables"][0]["name"] == "users"
 
+    async def test_from_db_does_not_sample_values_by_default(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        normalized = _make_normalized_schema(
+            tables=[
+                _table(
+                    "orders",
+                    columns=[{"name": "amount", "type": "numeric"}],
+                )
+            ]
+        )
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=normalized)),
+            patch.object(fac, "sample_numeric_columns", AsyncMock()) as sample,
+        ):
+            await from_db("postgresql://localhost/testdb")
+
+        sample.assert_not_awaited()
+
     async def test_from_db_attaches_db_only_describe(self):
         from daita.agents.db import from_db
         import daita.agents.db.builder as fac
@@ -612,10 +700,18 @@ class TestFromDbIntegration:
         )
         assert description["db"]["database_type"] == "postgresql"
         assert description["db"]["database_name"] == "warehouse"
+        assert description["db"]["mode"] == "analyst"
         assert description["db"]["table_count"] == 2
         assert description["db"]["column_count"] == 3
         assert description["db"]["relationship_count"] == 1
         assert description["db"]["drift_status"] == "none"
+        assert description["db"]["metric_count"] == 1
+        assert description["db"]["suggested_question_count"] > 0
+        assert "suggested_monitor_count" not in description["db"]
+        assert description["db"]["finding_count"] == 0
+        assert description["db"]["open_finding_count"] == 0
+        assert description["db"]["quality_status"] in {"ok", "warning"}
+        assert "summary" in description["db"]
         assert description["db"]["query_policy"] == {
             "read_only": True,
             "default_limit": 25,
@@ -647,12 +743,244 @@ class TestFromDbIntegration:
 
         assert agent.db.schema is agent._db_schema
         assert agent.db.plugin is mock_plugin
+        assert agent.db.mode == "analyst"
         assert agent.db.drift is None
         assert agent.db.memory is None
         assert agent.db.lineage is None
         assert agent.db.history is None
+        assert agent.db.quality is None
+        assert agent.db.summary is agent._db_summary
+        assert isinstance(agent.db.suggested_questions, list)
+        assert not hasattr(agent.db, "suggest_monitors")
+        assert agent.db.monitor_events == []
+        assert agent.db.findings.all == []
+        assert agent.db.findings.open == []
+        assert agent.db.findings.resolved == []
         assert not hasattr(agent.db, "profile")
         assert not hasattr(agent.db, "describe")
+        assert not hasattr(agent.db, "diagram")
+
+    async def test_from_db_registers_explicit_monitors_as_local_watches(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        normalized = _make_normalized_schema(
+            tables=[
+                _table(
+                    "orders",
+                    columns=[
+                        {"name": "id", "type": "integer", "is_primary_key": True},
+                        {"name": "updated_at", "type": "timestamp"},
+                        {"name": "total_amount", "type": "numeric"},
+                    ],
+                    row_count=100,
+                )
+            ],
+            db_type="postgresql",
+            db_name="warehouse",
+        )
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=normalized)),
+        ):
+            agent = await from_db("postgresql://localhost/testdb")
+
+        monitor = {
+            "name": "orders freshness",
+            "type": "freshness",
+            "severity": "warning",
+            "entity": {"table": "orders", "column": "updated_at"},
+            "sql": 'SELECT MAX("updated_at") AS latest FROM "orders"',
+            "threshold": {"max_age_hours": 24},
+            "interval": "1h",
+        }
+        registered = agent.db.register_monitors([monitor])
+
+        assert registered
+        assert registered[0]["watch_name"].startswith("db:")
+        assert len(agent._watches) == len(registered)
+        assert agent._watches[0].source._plugin is mock_plugin
+        assert agent._watches[0].source._condition == registered[0]["sql"]
+
+    async def test_from_db_registers_custom_monitor_handler(self):
+        from daita.agents.db import from_db
+        from daita.core.watch import WatchEvent
+        import daita.agents.db.builder as fac
+
+        normalized = _make_normalized_schema(tables=[_table("orders")])
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        seen = []
+
+        async def handler(event, monitor):
+            seen.append((event.value, monitor["name"]))
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=normalized)),
+        ):
+            agent = await from_db("postgresql://localhost/testdb")
+
+        monitor = {
+            "name": "orders non-empty",
+            "type": "row_count",
+            "severity": "info",
+            "entity": {"table": "orders"},
+            "sql": 'SELECT COUNT(*) AS row_count FROM "orders"',
+            "threshold": {"min_rows": 1},
+            "interval": "1h",
+        }
+        agent.db.register_monitors([monitor], handler=handler)
+        event = WatchEvent(
+            value=0,
+            triggered_at=datetime.now(timezone.utc),
+            source_type="polling",
+        )
+
+        await agent._watches[0].handler(event)
+
+        assert seen == [(0, "orders non-empty")]
+        assert agent.db.findings.open[0]["title"] == "orders non-empty"
+        assert (
+            agent.db.monitor_events[0]["finding_id"] == agent.db.findings.open[0]["id"]
+        )
+
+    async def test_from_db_default_monitor_handler_records_local_events(self):
+        from daita.agents.db import from_db
+        from daita.core.watch import WatchEvent
+        import daita.agents.db.builder as fac
+
+        normalized = _make_normalized_schema(tables=[_table("orders")])
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=normalized)),
+        ):
+            agent = await from_db("postgresql://localhost/testdb")
+
+        monitor = {
+            "name": "orders non-empty",
+            "type": "row_count",
+            "severity": "info",
+            "entity": {"table": "orders"},
+            "sql": 'SELECT COUNT(*) AS row_count FROM "orders"',
+            "threshold": {"min_rows": 1},
+            "interval": "1h",
+        }
+        agent.db.register_monitors([monitor])
+        event = WatchEvent(
+            value=0,
+            previous_value=2,
+            triggered_at=datetime.now(timezone.utc),
+            source_type="polling",
+        )
+
+        await agent._watches[0].handler(event)
+
+        assert agent.db.monitor_events[0]["monitor"]["name"] == "orders non-empty"
+        assert agent.db.monitor_events[0]["value"] == 0
+        assert agent.db.monitor_events[0]["previous_value"] == 2
+        assert (
+            agent.db.monitor_events[0]["finding_id"] == agent.db.findings.open[0]["id"]
+        )
+        assert agent.db.findings.open[0]["title"] == "orders non-empty"
+        assert agent.db.findings.open[0]["kind"] == "db_monitor.row_count"
+        assert agent.db.findings.open[0]["observed"]["value"] == 0
+
+    async def test_from_db_resolve_event_marks_active_finding_resolved(self):
+        from daita.agents.db import from_db
+        from daita.core.watch import WatchEvent
+        import daita.agents.db.builder as fac
+
+        normalized = _make_normalized_schema(tables=[_table("orders")])
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=normalized)),
+        ):
+            agent = await from_db("postgresql://localhost/testdb")
+
+        monitor = {
+            "name": "orders non-empty",
+            "type": "row_count",
+            "severity": "info",
+            "entity": {"table": "orders"},
+            "sql": 'SELECT COUNT(*) AS row_count FROM "orders"',
+            "threshold": {"min_rows": 1},
+            "interval": "1h",
+        }
+        agent.db.register_monitors([monitor])
+        opened = WatchEvent(
+            value=0,
+            triggered_at=datetime.now(timezone.utc),
+            source_type="polling",
+        )
+        resolved = WatchEvent(
+            value=2,
+            previous_value=0,
+            triggered_at=datetime.now(timezone.utc),
+            source_type="polling",
+            resolved=True,
+        )
+
+        await agent._watches[0].handler(opened)
+        opened_id = agent.db.findings.open[0]["id"]
+        await agent._watches[0].handler(resolved)
+
+        assert agent.db.findings.open == []
+        assert agent.db.findings.resolved[0]["id"] == opened_id
+        assert agent.db.findings.resolved[0]["observed"]["resolved"] is True
+
+    async def test_db_findings_contract_is_json_safe_and_exportable(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        normalized = _make_normalized_schema(tables=[_table("orders")])
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=normalized)),
+        ):
+            agent = await from_db("postgresql://localhost/testdb")
+
+        finding = agent.db.findings.add(
+            {
+                "title": "Revenue dropped",
+                "severity": "critical",
+                "status": "open",
+                "kind": "metric_regression",
+                "source": {"type": "manual"},
+                "entity": {"table": "orders", "column": "total"},
+                "observed": {"value": datetime(2026, 5, 6, tzinfo=timezone.utc)},
+            }
+        )
+
+        assert finding["id"].startswith("fnd_")
+        assert finding["observed"]["value"] == "2026-05-06T00:00:00+00:00"
+        assert agent.db.findings.last()["title"] == "Revenue dropped"
+        assert (
+            json.loads(agent.db.findings.export_json())[0]["title"] == "Revenue dropped"
+        )
+
+    def test_finding_validation_rejects_bad_status(self):
+        with pytest.raises(ValueError, match="Unsupported finding status"):
+            normalize_finding(
+                {
+                    "title": "Bad finding",
+                    "severity": "warning",
+                    "status": "ignored",
+                    "kind": "db_observation",
+                }
+            )
 
     async def test_from_db_audit_context(self):
         from daita.agents.db import from_db
@@ -712,16 +1040,18 @@ class TestFromDbIntegration:
             ),
         )
 
-        context = build_db_run_context(agent, max_chars=500)
+        context = build_db_run_context(agent, max_chars=700)
 
-        assert len(context) <= 500
+        assert len(context) <= 700
         assert context.startswith("<db_runtime_context>")
         assert context.endswith("</db_runtime_context>")
         assert "tables=2" in context
         assert "relationships=1" in context
         assert "default_limit=25" in context
         assert "analyst_tools" in context
-        assert "Memory guidance:" in context
+        assert "Data health:" in context
+        assert "Candidate metrics:" in context
+        assert "Memory: disabled" in context
 
     async def test_db_context_run_augments_prompt_but_audit_keeps_original(self):
         from daita.agents.db.audit import make_audited_run
@@ -759,6 +1089,69 @@ class TestFromDbIntegration:
         assert seen["kwargs"]["detailed"] is True
         assert agent._db_audit_log[0]["prompt"] == "How much revenue?"
 
+    async def test_stream_audit_records_tool_arguments_and_result_metadata(self):
+        from daita.agents.db.audit import make_audited_stream
+        from daita.core.streaming import AgentEvent, EventType
+
+        agent = SimpleNamespace(_db_audit_log=[])
+
+        async def original_stream(prompt, **kwargs):
+            yield AgentEvent(
+                type=EventType.TOOL_CALL,
+                tool_name="postgres_query",
+                tool_args={"sql": "SELECT COUNT(*) FROM orders"},
+            )
+            yield AgentEvent(
+                type=EventType.TOOL_RESULT,
+                tool_name="postgres_query",
+                result={"rows": [{"count": 12}]},
+            )
+            yield AgentEvent(type=EventType.COMPLETE, final_result="done")
+
+        wrapped = make_audited_stream(agent, original_stream)
+        events = [event async for event in wrapped("Count orders")]
+
+        assert events[-1].type == EventType.COMPLETE
+        assert agent._db_audit_log == [
+            {
+                "timestamp": agent._db_audit_log[0]["timestamp"],
+                "prompt": "Count orders",
+                "tool_calls": [
+                    {
+                        "tool": "postgres_query",
+                        "arguments": {"sql": "SELECT COUNT(*) FROM orders"},
+                        "result": {"row_count": 1},
+                    }
+                ],
+            }
+        ]
+
+    async def test_stream_audit_keeps_arguments_on_error(self):
+        from daita.agents.db.audit import make_audited_stream
+        from daita.core.streaming import AgentEvent, EventType
+
+        agent = SimpleNamespace(_db_audit_log=[])
+
+        async def original_stream(prompt, **kwargs):
+            yield AgentEvent(
+                type=EventType.TOOL_CALL,
+                tool_name="postgres_query",
+                tool_args={"sql": "SELECT * FROM blocked_table"},
+            )
+            yield AgentEvent(type=EventType.ERROR, error="blocked table")
+
+        wrapped = make_audited_stream(agent, original_stream)
+        events = [event async for event in wrapped("Show blocked table")]
+
+        assert events[-1].type == EventType.ERROR
+        assert agent._db_audit_log[0]["tool_calls"] == [
+            {
+                "tool": "postgres_query",
+                "arguments": {"sql": "SELECT * FROM blocked_table"},
+            }
+        ]
+        assert agent._db_audit_log[0]["error"] == "blocked table"
+
 
 # ---------------------------------------------------------------------------
 # Lineage integration tests
@@ -784,6 +1177,7 @@ class TestFromDbLineage:
         mock_plugin.connect = AsyncMock()
         mock_agent = MagicMock()
         mock_agent.add_plugin = MagicMock()
+        mock_agent.run = AsyncMock(return_value="[]")
         return mock_plugin, mock_agent
 
     async def test_lineage_true_seeds_fks(self):
@@ -912,6 +1306,7 @@ class TestFromDbMemory:
         mock_plugin.connect = AsyncMock()
         mock_agent = MagicMock()
         mock_agent.add_plugin = MagicMock()
+        mock_agent.run = AsyncMock(return_value="[]")
         return mock_plugin, mock_agent
 
     async def test_memory_true_creates_with_workspace(self):
@@ -923,6 +1318,9 @@ class TestFromDbMemory:
         )
         mock_plugin, mock_agent = self._base_mocks()
         mock_memory = MagicMock()
+        mock_memory.backend = None
+        mock_memory.recall = AsyncMock(return_value=[])
+        mock_memory.remember = AsyncMock(return_value={"status": "ok"})
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
@@ -940,6 +1338,7 @@ class TestFromDbMemory:
         assert call_kwargs["workspace"]  # non-empty
         mock_agent.add_plugin.assert_any_call(mock_memory)
         assert mock_agent._db_memory is mock_memory
+        assert mock_agent._db_memory_semantics.plugin is mock_memory
 
     async def test_memory_plugin_instance_used_directly(self):
         import daita.agents.db.builder as fac
@@ -948,6 +1347,9 @@ class TestFromDbMemory:
         schema = _make_normalized_schema(tables=[_table("users")])
         mock_plugin, mock_agent = self._base_mocks()
         custom_memory = MagicMock()
+        custom_memory.backend = None
+        custom_memory.recall = AsyncMock(return_value=[])
+        custom_memory.remember = AsyncMock(return_value={"status": "ok"})
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
@@ -958,6 +1360,7 @@ class TestFromDbMemory:
 
         mock_agent.add_plugin.assert_any_call(custom_memory)
         assert mock_agent._db_memory is custom_memory
+        assert mock_agent._db_memory_semantics.plugin is custom_memory
 
     async def test_memory_none_skipped(self):
         import daita.agents.db.builder as fac
@@ -974,6 +1377,418 @@ class TestFromDbMemory:
             await from_db("postgresql://localhost/testdb")
 
         assert mock_agent.add_plugin.call_count == 1  # only DB plugin
+
+    async def test_memory_calibration_stores_structured_unit_conventions(self):
+        import daita.agents.db.builder as fac
+        from daita.agents.db import from_db
+
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "orders",
+                    columns=[
+                        {"name": "total_cents", "type": "numeric"},
+                    ],
+                )
+            ]
+        )
+        mock_plugin, mock_agent = self._base_mocks()
+        mock_agent.run = AsyncMock(
+            return_value=json.dumps(
+                [
+                    {
+                        "table": "orders",
+                        "column": "total_cents",
+                        "unit": "cents",
+                        "confidence": "high",
+                        "reason": "column name contains cents",
+                    }
+                ]
+            )
+        )
+        mock_memory = MagicMock()
+        mock_memory.backend = None
+        mock_memory.recall = AsyncMock(return_value=[])
+        mock_memory.remember = AsyncMock(return_value={"status": "ok"})
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            await from_db(
+                "postgresql://localhost/testdb",
+                memory=mock_memory,
+                calibrate_memory=True,
+            )
+
+        categories = [
+            call.kwargs["category"] for call in mock_memory.remember.call_args_list
+        ]
+        contents = [call.args[0] for call in mock_memory.remember.call_args_list]
+
+        assert "db_semantics" in categories
+        assert "db_cache_marker" in categories
+        assert any("orders.total_cents is stored as cents" in c for c in contents)
+        assert all("numeric_column_units" not in c for c in contents)
+
+    async def test_memory_calibration_skips_when_exact_marker_exists(self):
+        import daita.agents.db.builder as fac
+        from daita.agents.db import from_db
+
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "orders",
+                    columns=[{"name": "total_cents", "type": "numeric"}],
+                )
+            ]
+        )
+        mock_plugin, mock_agent = self._base_mocks()
+        original_run = mock_agent.run
+        mock_memory = MagicMock()
+        backend = MagicMock()
+        backend.list_by_category = AsyncMock(
+            return_value=[
+                {
+                    "content": "DB exact cache marker: numeric_unit_calibration:postgresql://localhost/testdb"
+                }
+            ]
+        )
+        backend.recall = AsyncMock(return_value=[])
+        mock_memory.backend = backend
+        mock_memory.recall = AsyncMock(return_value=[])
+        mock_memory.remember = AsyncMock()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+            patch.object(
+                fac, "cache_key", return_value="postgresql://localhost/testdb"
+            ),
+        ):
+            await from_db(
+                "postgresql://localhost/testdb",
+                memory=mock_memory,
+                calibrate_memory=True,
+            )
+
+        original_run.assert_not_awaited()
+        backend.recall.assert_not_awaited()
+        mock_memory.recall.assert_not_awaited()
+        mock_memory.remember.assert_not_awaited()
+
+    async def test_db_memory_recall_uses_single_semantic_category_and_filters_kind(
+        self,
+    ):
+        backend = MagicMock()
+        backend.recall = AsyncMock(
+            return_value=[
+                {
+                    "chunk_id": "1",
+                    "content": 'DB memory record:\n{"kind": "unit_convention", "text": "orders.total_cents is stored as cents"}',
+                },
+                {
+                    "chunk_id": "2",
+                    "content": 'DB memory record:\n{"kind": "business_rule", "text": "exclude refunds"}',
+                },
+            ]
+        )
+        plugin = SimpleNamespace(backend=backend)
+        db_memory = DBMemory(plugin)
+
+        results = await db_memory.recall(
+            "How much revenue?",
+            kinds=["unit_convention"],
+            limit=5,
+        )
+
+        backend.recall.assert_awaited_once()
+        assert backend.recall.call_args.kwargs["category"] == "db_semantics"
+        assert [r["chunk_id"] for r in results] == ["1"]
+
+    async def test_db_memory_stores_metric_definitions_and_business_rules(self):
+        backend = MagicMock()
+        backend.remember = AsyncMock(side_effect=lambda *args, **kwargs: kwargs)
+        db_memory = DBMemory(SimpleNamespace(backend=backend))
+
+        await db_memory.remember_many(
+            [
+                DBMemoryRecord(
+                    kind="metric_definition",
+                    key="metric:revenue",
+                    text="Revenue excludes refunded orders.",
+                    metadata={"metric": "revenue"},
+                ),
+                {
+                    "kind": "business_rule",
+                    "key": "rule:refunds",
+                    "text": "Refunded orders must be excluded from revenue.",
+                    "metadata": {"table": "orders"},
+                },
+            ]
+        )
+
+        assert backend.remember.await_count == 2
+        first_call = backend.remember.await_args_list[0]
+        second_call = backend.remember.await_args_list[1]
+        assert first_call.kwargs["category"] == "db_semantics"
+        assert first_call.kwargs["index_content"] == "Revenue excludes refunded orders."
+        assert (
+            first_call.kwargs["extra_metadata"]["db_memory"]["kind"]
+            == "metric_definition"
+        )
+        assert (
+            second_call.kwargs["extra_metadata"]["db_memory"]["kind"] == "business_rule"
+        )
+
+    async def test_db_memory_recalls_relevant_business_rules(self):
+        backend = MagicMock()
+        backend.recall = AsyncMock(
+            return_value=[
+                {
+                    "chunk_id": "rule-1",
+                    "content": (
+                        'DB memory record:\n{"kind": "business_rule", '
+                        '"text": "Revenue excludes refunded orders."}'
+                    ),
+                },
+                {
+                    "chunk_id": "metric-1",
+                    "content": (
+                        'DB memory record:\n{"kind": "metric_definition", '
+                        '"text": "Revenue is SUM(total_amount)."}'
+                    ),
+                },
+            ]
+        )
+        db_memory = DBMemory(SimpleNamespace(backend=backend))
+
+        results = await db_memory.recall(
+            "How should revenue be calculated?",
+            kinds=["business_rule"],
+            limit=5,
+        )
+
+        assert [r["chunk_id"] for r in results] == ["rule-1"]
+        backend.recall.assert_awaited_once()
+        assert backend.recall.call_args.kwargs["category"] == "db_semantics"
+
+    async def test_row_level_questions_do_not_recall_memory_context(self):
+        class FailingIfCalledMemory:
+            async def recall(self, *args, **kwargs):
+                raise AssertionError("row-level prompt should not recall DB memory")
+
+        agent = SimpleNamespace(_db_memory_semantics=FailingIfCalledMemory())
+
+        snippets = await recall_db_memory_context(
+            agent, "Show me the email for customer_id 1"
+        )
+
+        assert snippets == []
+
+    async def test_db_memory_marker_lookup_uses_exact_category_listing(self):
+        backend = MagicMock()
+        backend.list_by_category = AsyncMock(
+            return_value=[
+                {"content": "DB exact cache marker: numeric_unit_calibration:abc"}
+            ]
+        )
+        backend.recall = AsyncMock(return_value=[])
+        db_memory = DBMemory(SimpleNamespace(backend=backend))
+
+        assert await db_memory.has_marker("numeric_unit_calibration:abc") is True
+
+        backend.list_by_category.assert_awaited_once_with(
+            category="db_cache_marker",
+            limit=1000,
+        )
+        backend.recall.assert_not_awaited()
+
+    async def test_db_context_run_includes_recalled_db_memory(self):
+        from daita.agents.db.run_context import make_db_context_run
+
+        class FakeDBMemory:
+            async def recall(self, *args, **kwargs):
+                return [
+                    {
+                        "content": 'DB memory record:\n{"text": "orders.total_cents is stored as cents"}'
+                    }
+                ]
+
+        captured = {}
+
+        async def original_run(prompt, **kwargs):
+            captured["prompt"] = prompt
+            return "ok"
+
+        agent = SimpleNamespace(
+            tool_registry=SimpleNamespace(tool_names=["postgres_query"]),
+            _db_schema=_make_normalized_schema(tables=[_table("orders")]),
+            _db_schema_drift=None,
+            _db_plugin=SimpleNamespace(
+                read_only=True,
+                query_default_limit=50,
+                query_max_rows=200,
+                query_max_chars=50000,
+                query_timeout=30,
+            ),
+            _db_memory=object(),
+            _db_memory_semantics=FakeDBMemory(),
+        )
+
+        wrapped = make_db_context_run(agent, original_run)
+        await wrapped("How much revenue did we make?")
+
+        assert (
+            "Memory: relevant=orders.total_cents is stored as cents"
+            in captured["prompt"]
+        )
+
+    async def test_db_context_run_omits_memory_for_row_level_questions(self):
+        from daita.agents.db.run_context import make_db_context_run
+
+        class FailingIfCalledMemory:
+            async def recall(self, *args, **kwargs):
+                raise AssertionError("row-level prompt should not recall DB memory")
+
+        captured = {}
+
+        async def original_run(prompt, **kwargs):
+            captured["prompt"] = prompt
+            return "ok"
+
+        agent = SimpleNamespace(
+            tool_registry=SimpleNamespace(tool_names=["postgres_query"]),
+            _db_schema=_make_normalized_schema(tables=[_table("customers")]),
+            _db_schema_drift=None,
+            _db_plugin=SimpleNamespace(
+                read_only=True,
+                query_default_limit=50,
+                query_max_rows=200,
+                query_max_chars=50000,
+                query_timeout=30,
+            ),
+            _db_memory=object(),
+            _db_memory_semantics=FailingIfCalledMemory(),
+        )
+
+        wrapped = make_db_context_run(agent, original_run)
+        await wrapped("Look up customer_id 1 email")
+
+        assert "Memory: enabled;" in captured["prompt"]
+        assert "relevant=" not in captured["prompt"]
+
+    async def test_memory_recall_failure_does_not_break_agent_run(self):
+        from daita.agents.db.run_context import make_db_context_run
+
+        class BrokenDBMemory:
+            async def recall(self, *args, **kwargs):
+                raise RuntimeError("memory backend unavailable")
+
+        captured = {}
+
+        async def original_run(prompt, **kwargs):
+            captured["prompt"] = prompt
+            return "ok"
+
+        agent = SimpleNamespace(
+            tool_registry=SimpleNamespace(tool_names=["postgres_query"]),
+            _db_schema=_make_normalized_schema(tables=[_table("orders")]),
+            _db_schema_drift=None,
+            _db_plugin=SimpleNamespace(
+                read_only=True,
+                query_default_limit=50,
+                query_max_rows=200,
+                query_max_chars=50000,
+                query_timeout=30,
+            ),
+            _db_memory=object(),
+            _db_memory_semantics=BrokenDBMemory(),
+        )
+
+        wrapped = make_db_context_run(agent, original_run)
+        result = await wrapped("How is revenue defined?")
+
+        assert result == "ok"
+        assert "Memory: enabled;" in captured["prompt"]
+        assert "relevant=" not in captured["prompt"]
+
+    async def test_unit_calibration_marker_prevents_repeated_calibration(self):
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "orders",
+                    columns=[{"name": "total_cents", "type": "numeric"}],
+                )
+            ]
+        )
+        agent = SimpleNamespace(
+            run=AsyncMock(
+                return_value=json.dumps(
+                    [
+                        {
+                            "table": "orders",
+                            "column": "total_cents",
+                            "unit": "cents",
+                            "confidence": "high",
+                        }
+                    ]
+                )
+            )
+        )
+
+        class RecordingDBMemory:
+            def __init__(self):
+                self.markers = set()
+                self.records = []
+
+            async def has_marker(self, key):
+                return key in self.markers
+
+            async def remember_many(self, records):
+                self.records.extend(records)
+                return [{"ok": True} for _ in records]
+
+            async def mark(self, key):
+                self.markers.add(key)
+                return {"ok": True}
+
+        db_memory = RecordingDBMemory()
+
+        await calibrate_db_memory(
+            agent,
+            schema,
+            db_memory,
+            marker_key="numeric_unit_calibration:test",
+        )
+        await calibrate_db_memory(
+            agent,
+            schema,
+            db_memory,
+            marker_key="numeric_unit_calibration:test",
+        )
+
+        agent.run.assert_awaited_once()
+        assert len(db_memory.records) == 1
+        assert db_memory.records[0].key == "unit_convention:orders.total_cents"
+
+    def test_db_memory_record_validation(self):
+        record = normalize_db_memory_record(
+            {
+                "kind": "metric_definition",
+                "key": "metric:revenue",
+                "text": "Revenue excludes refunded orders.",
+                "importance": 2,
+            }
+        )
+
+        assert record.importance == 1.0
+        assert record.category == "db_semantics"
+
+        with pytest.raises(ValueError, match="Unsupported DB memory kind"):
+            normalize_db_memory_record({"kind": "row", "key": "x", "text": "bad"})
 
 
 # ---------------------------------------------------------------------------
@@ -1211,9 +2026,75 @@ class TestFromDbAuditLog:
 
         assert len(agent._db_audit_log) == 2
         assert agent._db_audit_log[0]["prompt"] == "first question"
-        assert agent._db_audit_log[0]["tool_calls"] == tool_calls_run1
+        assert agent._db_audit_log[0]["tool_calls"] == [
+            {
+                "tool": "postgres_query",
+                "arguments": {"sql": "SELECT 1"},
+                "result": {"result_type": "dict"},
+            }
+        ]
         assert agent._db_audit_log[1]["prompt"] == "second question"
-        assert agent._db_audit_log[1]["tool_calls"] == tool_calls_run2
+        assert agent._db_audit_log[1]["tool_calls"] == [
+            {
+                "tool": "postgres_query",
+                "arguments": {"sql": "SELECT 2"},
+                "result": {"result_type": "dict"},
+            }
+        ]
+
+    async def test_audit_log_redacts_raw_db_rows(self):
+        import daita.agents.db.builder as fac
+        from daita.agents.db import from_db
+
+        schema = _make_normalized_schema(tables=[_table("users")])
+        mock_plugin, mock_agent = self._base_mocks()
+        mock_agent.run = AsyncMock(
+            return_value={
+                "result": "ok",
+                "tool_calls": [
+                    {
+                        "tool": "postgres_query",
+                        "arguments": {
+                            "sql": "SELECT email FROM users WHERE id = $1",
+                            "params": ["secret@example.com"],
+                        },
+                        "result": {
+                            "rows": [{"email": "secret@example.com"}],
+                            "total_rows": 1,
+                            "truncated": False,
+                            "sql": "SELECT email FROM users WHERE id = $1 LIMIT 50",
+                        },
+                    }
+                ],
+            }
+        )
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            agent = await from_db("postgresql://localhost/testdb")
+
+        await agent.run("show email")
+
+        serialized = json.dumps(agent._db_audit_log)
+        assert "secret@example.com" not in serialized
+        assert agent._db_audit_log[0]["tool_calls"] == [
+            {
+                "tool": "postgres_query",
+                "arguments": {
+                    "sql": "SELECT email FROM users WHERE id = $1",
+                    "param_count": 1,
+                },
+                "result": {
+                    "sql": "SELECT email FROM users WHERE id = $1 LIMIT 50",
+                    "total_rows": 1,
+                    "truncated": False,
+                    "row_count": 1,
+                },
+            }
+        ]
 
     async def test_audit_log_entry_has_timestamp(self):
         import daita.agents.db.builder as fac
@@ -1799,3 +2680,157 @@ class TestToolkitParam:
         assert analyst_tools.isdisjoint(
             registered
         ), f"Expected no analyst tools but found: {analyst_tools & registered}"
+
+
+class TestFromDbModePresets:
+    async def test_simple_mode_skips_analyst_tools(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+        from daita.core.tools import ToolRegistry
+
+        schema = _analyst_schema()
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        mock_agent = MagicMock()
+        mock_agent.add_plugin = MagicMock()
+        mock_agent.tool_registry = ToolRegistry()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            agent = await from_db("postgresql://localhost/testdb", mode="simple")
+
+        assert agent._db_mode == "simple"
+        assert "pivot_table" not in agent.tool_registry.tool_names
+        assert mock_plugin.query_max_rows == 100
+        assert mock_plugin.query_max_chars == 25000
+
+    async def test_mode_explicit_toolkit_override_wins(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+        from daita.core.tools import ToolRegistry
+
+        schema = _analyst_schema()
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        mock_agent = MagicMock()
+        mock_agent.add_plugin = MagicMock()
+        mock_agent.tool_registry = ToolRegistry()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            agent = await from_db(
+                "postgresql://localhost/testdb",
+                mode="simple",
+                toolkit="analyst",
+            )
+
+        assert agent._db_mode == "simple"
+        assert "pivot_table" in agent.tool_registry.tool_names
+
+    async def test_data_team_mode_registers_quality_tools(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "orders",
+                    columns=[
+                        {"name": "id", "type": "integer", "is_primary_key": True},
+                        {"name": "total", "type": "numeric"},
+                        {"name": "updated_at", "type": "timestamp"},
+                    ],
+                )
+            ]
+        )
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        mock_plugin.sql_dialect = "postgresql"
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch(
+                "daita.core.graph.backend.auto_select_backend", return_value=MagicMock()
+            ),
+        ):
+            agent = await from_db("postgresql://localhost/testdb", mode="data_team")
+
+        assert agent.db.mode == "data_team"
+        assert agent.db.quality is not None
+        assert "dq_profile" in agent.tool_registry.tool_names
+        description = agent.describe()
+        assert "data_quality" in description["capabilities"]
+        assert description["db"]["quality_enabled"] is True
+        assert description["db"]["query_policy"]["timeout"] == 60
+
+    async def test_data_team_mode_can_enable_db_memory_semantics(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "orders",
+                    columns=[{"name": "total_cents", "type": "numeric"}],
+                )
+            ]
+        )
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        mock_plugin.sql_dialect = "postgresql"
+        mock_memory = MagicMock()
+        mock_memory.backend = None
+        mock_memory.recall = AsyncMock(return_value=[])
+        mock_memory.remember = AsyncMock(return_value={"status": "ok"})
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch(
+                "daita.core.graph.backend.auto_select_backend", return_value=MagicMock()
+            ),
+        ):
+            agent = await from_db(
+                "postgresql://localhost/testdb",
+                mode="data_team",
+                memory=mock_memory,
+            )
+
+        assert agent.db.mode == "data_team"
+        assert agent.db.memory is mock_memory
+        assert agent.db.memory_semantics.plugin is mock_memory
+
+    async def test_mode_quality_override_wins(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        schema = _analyst_schema()
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+        ):
+            agent = await from_db(
+                "postgresql://localhost/testdb",
+                mode="data_team",
+                quality=False,
+            )
+
+        assert agent.db.mode == "data_team"
+        assert agent.db.quality is None
+        assert "dq_profile" not in agent.tool_registry.tool_names
+
+    async def test_invalid_mode_raises_value_error(self):
+        from daita.agents.db import from_db
+
+        with pytest.raises(ValueError, match="Unknown from_db mode"):
+            await from_db("postgresql://localhost/testdb", mode="nope")

@@ -77,6 +77,35 @@ class TestSqlGuardrails:
         with pytest.raises(ValidationError, match="read-only mode"):
             plugin._prepare_tool_execute_sql("UPDATE users SET active = false")
 
+    def test_read_only_rejects_explain_analyze_mutation(self):
+        plugin = make_plugin(read_only=True)
+        with pytest.raises(ValidationError, match="read-only mode: DELETE"):
+            plugin._prepare_tool_query_sql(
+                "EXPLAIN ANALYZE DELETE FROM users WHERE id = 1"
+            )
+
+    def test_read_only_rejects_data_modifying_cte(self):
+        plugin = make_plugin(read_only=True)
+        with pytest.raises(ValidationError, match="read-only mode: DELETE"):
+            plugin._prepare_tool_query_sql(
+                "WITH deleted AS (DELETE FROM users WHERE id = 1 RETURNING *) "
+                "SELECT * FROM deleted"
+            )
+
+    def test_mutating_words_in_strings_and_comments_are_allowed(self):
+        plugin = make_plugin(read_only=True)
+        sql = (
+            "SELECT 'DELETE FROM users' AS note "
+            "FROM audit_log -- UPDATE users\n"
+            "WHERE message = 'INSERT'"
+        )
+        assert plugin._prepare_tool_query_sql(sql).endswith("LIMIT 50")
+
+    def test_read_only_allows_explain_analyze_select(self):
+        plugin = make_plugin(read_only=True)
+        sql = plugin._prepare_tool_query_sql("EXPLAIN ANALYZE SELECT id FROM users")
+        assert sql == "EXPLAIN ANALYZE SELECT id FROM users LIMIT 50"
+
     def test_injects_configured_default_limit(self):
         plugin = make_plugin(query_default_limit=25)
         sql = plugin._prepare_tool_query_sql("SELECT id FROM users")

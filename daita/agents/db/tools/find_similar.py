@@ -8,12 +8,12 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ....core.tools import AgentTool
 from ._helpers import (
-    ensure_pandas,
     ensure_numpy,
+    build_entity_profiles,
+    combined_source_metadata,
     safe_query,
     to_serializable,
     get_pk_column,
-    infer_dimensions,
 )
 
 if TYPE_CHECKING:
@@ -27,7 +27,6 @@ def create_find_similar_tool(
 
     async def handler(args: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            pd = ensure_pandas()
             np = ensure_numpy()
         except ImportError as e:
             return {"success": False, "error": str(e)}
@@ -37,6 +36,8 @@ def create_find_similar_tool(
         id_column = args.get("id_column") or get_pk_column(schema, entity_table)
         custom_dimensions: Optional[List[Dict]] = args.get("dimensions")
         top_k = int(args.get("top_k", 5))
+        candidate_sql = (args.get("candidate_sql") or "").strip()
+        candidate_limit = int(args.get("candidate_limit", 1000))
 
         if not entity_table:
             return {"success": False, "error": "entity_table parameter is required"}
@@ -49,84 +50,59 @@ def create_find_similar_tool(
                 "Pass id_column explicitly.",
             }
 
-        dims = custom_dimensions or infer_dimensions(schema, entity_table)
-        if not dims:
-            return {
-                "success": False,
-                "error": (
-                    f"No FK relationships found for '{entity_table}'. "
-                    "Pass explicit dimensions as [{expression, alias, child_table}]."
-                ),
-            }
-
-        # Build one query per child_table, fetching ALL entities
-        child_tables = list(dict.fromkeys(d["child_table"] for d in dims))
-        all_profiles: Dict[Any, Dict[str, float]] = {}
-
-        for child in child_tables:
-            child_dims = [d for d in dims if d["child_table"] == child]
-            fk_col = child_dims[0].get("fk_col")
-            if not fk_col:
-                continue
-
-            # Collect any grandchild joins required by 2-hop dims
-            gc_joins: Dict[str, tuple] = {}
-            for d in child_dims:
-                if d.get("grandchild_table"):
-                    gc_alias = d["grandchild_alias"]
-                    if gc_alias not in gc_joins:
-                        gc_joins[gc_alias] = (
-                            d["grandchild_table"],
-                            d["grandchild_fk_col"],
-                            d.get("child_pk") or get_pk_column(schema, child),
-                        )
-
-            exprs = ", ".join(f"{d['expression']} AS {d['alias']}" for d in child_dims)
-            join_clause = (
-                f"FROM {entity_table} e "
-                f"LEFT JOIN {child} c ON e.{id_column} = c.{fk_col}"
-            )
-            for gc_alias, (gc_table, gc_fk_col, child_pk_col) in gc_joins.items():
-                join_clause += (
-                    f" LEFT JOIN {gc_table} {gc_alias}"
-                    f" ON c.{child_pk_col} = {gc_alias}.{gc_fk_col}"
+        query_results = []
+        try:
+            candidate_ids = None
+            candidate_scope = "limited"
+            if candidate_sql:
+                candidate_result = await safe_query(plugin, candidate_sql)
+                query_results.append(candidate_result)
+                candidate_ids = _candidate_ids_from_rows(
+                    candidate_result.rows,
+                    id_column=id_column,
                 )
-            sql = (
-                f"SELECT e.{id_column} AS _entity_id, {exprs} "
-                f"{join_clause} "
-                f"GROUP BY e.{id_column}"
-            )
+                if entity_id not in candidate_ids:
+                    candidate_ids.append(entity_id)
+                candidate_scope = "candidate_sql"
 
-            try:
-                rows = await safe_query(plugin, sql)
-                for row in rows:
-                    eid = row.get("_entity_id")
-                    if eid not in all_profiles:
-                        all_profiles[eid] = {}
-                    for d in child_dims:
-                        raw = row.get(d["alias"])
-                        try:
-                            all_profiles[eid][d["alias"]] = float(
-                                to_serializable(raw) or 0
-                            )
-                        except (TypeError, ValueError):
-                            all_profiles[eid][d["alias"]] = 0.0
-            except Exception:
-                continue
+            profile_result = await build_entity_profiles(
+                plugin,
+                schema,
+                entity_table=entity_table,
+                id_column=id_column,
+                dimensions=custom_dimensions,
+                entity_ids=candidate_ids,
+                candidate_limit=max(top_k + 1, candidate_limit),
+            )
+            query_results.extend(profile_result.query_results)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+        all_profiles: Dict[Any, Dict[str, float]] = {}
+        for eid, profile in profile_result.profiles.items():
+            all_profiles[eid] = {}
+            for key, value in profile.items():
+                try:
+                    all_profiles[eid][key] = float(to_serializable(value) or 0)
+                except (TypeError, ValueError):
+                    all_profiles[eid][key] = 0.0
 
         if not all_profiles:
-            return {"success": False, "error": "Could not retrieve dimension data"}
+            return {
+                "success": False,
+                "error": "Could not retrieve dimension data",
+                **combined_source_metadata(query_results),
+            }
 
         if entity_id not in all_profiles:
             return {
                 "success": False,
                 "error": f"Entity '{entity_id}' not found in '{entity_table}'",
+                **combined_source_metadata(query_results),
             }
 
         # Build matrix
-        all_dim_names = list(
-            dict.fromkeys(alias for d in dims for alias in [d["alias"]])
-        )
+        all_dim_names = profile_result.dimensions
 
         eids = list(all_profiles.keys())
         matrix = np.array(
@@ -173,6 +149,10 @@ def create_find_similar_tool(
             "similar": similar,
             "dimensions_used": all_dim_names,
             "top_k": top_k,
+            "candidate_count": len(eids),
+            "candidate_scope": candidate_scope,
+            "skipped_dimensions": profile_result.skipped_dimensions,
+            **combined_source_metadata(query_results),
         }
 
     return AgentTool(
@@ -213,6 +193,14 @@ def create_find_similar_tool(
                     "type": "integer",
                     "description": "Number of similar entities to return (default: 5)",
                 },
+                "candidate_sql": {
+                    "type": "string",
+                    "description": "Optional SQL returning candidate entity IDs to compare against.",
+                },
+                "candidate_limit": {
+                    "type": "integer",
+                    "description": "Maximum candidate entities to profile when candidate_sql is omitted (default: 1000).",
+                },
             },
             "required": ["entity_table", "entity_id"],
         },
@@ -220,3 +208,17 @@ def create_find_similar_tool(
         category="analysis",
         source="analyst_toolkit",
     )
+
+
+def _candidate_ids_from_rows(
+    rows: List[Dict[str, Any]], *, id_column: str
+) -> List[Any]:
+    ids = []
+    for row in rows:
+        if "_entity_id" in row:
+            ids.append(row["_entity_id"])
+        elif id_column in row:
+            ids.append(row[id_column])
+        elif row:
+            ids.append(next(iter(row.values())))
+    return list(dict.fromkeys(ids))

@@ -49,3 +49,14 @@ def register_analyst_tools(
 
     for tool in tools:
         agent.tool_registry.register(tool)
+
+
+def register_schema_navigation_tools(
+    agent: "Agent",
+    plugin: "BaseDatabasePlugin",
+    schema: Dict[str, Any],
+) -> None:
+    """Register metadata-only schema navigation tools."""
+    from .schema_navigation import register_schema_navigation_tools as _register
+
+    _register(agent, plugin, schema)

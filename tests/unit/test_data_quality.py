@@ -304,6 +304,23 @@ async def test_detect_anomaly_insufficient_data():
     assert "Insufficient data" in result["note"]
 
 
+async def test_detect_anomaly_uses_db_guarded_query_when_available():
+    db = MagicMock()
+    db.sql_dialect = "postgresql"
+    db._run_guarded_tool_query = AsyncMock(
+        return_value={"rows": [{"amount": 1.0}, {"amount": 2.0}], "truncated": False}
+    )
+    plugin = make_dq(db=db)
+
+    result = await plugin.detect_anomaly(db, "orders", "amount")
+
+    assert result["success"] is True
+    db._run_guarded_tool_query.assert_awaited_once()
+    guarded_sql = db._run_guarded_tool_query.await_args.args[0]
+    assert '"orders"' in guarded_sql
+    assert '"amount"' in guarded_sql
+
+
 async def test_detect_anomaly_zscore_detects_outlier():
     values = [0.0] * 99 + [1000.0]
     rows = [{"amount": v} for v in values]

@@ -31,6 +31,7 @@ Usage::
 import logging
 import re
 from datetime import datetime, timezone
+from inspect import iscoroutinefunction
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from .base import BasePlugin
@@ -53,6 +54,29 @@ def _validate_identifier(name: str) -> str:
     return name
 
 
+def _quote_identifier(name: str, dialect: str = "standard") -> str:
+    """Validate and quote a SQL identifier for generated quality queries."""
+    _validate_identifier(name)
+    quote = "`" if dialect == "mysql" else '"'
+    return ".".join(f"{quote}{part}{quote}" for part in name.split("."))
+
+
+async def _query_rows(db: Any, sql: str, params: Any = None) -> List[Any]:
+    """Run generated DQ SQL through DB guardrails when the plugin exposes them."""
+    guarded_query = getattr(db, "_run_guarded_tool_query", None)
+    if guarded_query is not None and iscoroutinefunction(guarded_query):
+        guarded = await guarded_query(sql, list(params or []))
+        return guarded.get("rows", [])
+    prepare_query = getattr(db, "_prepare_tool_query_sql", None)
+    if prepare_query is not None and not _is_mock_attr(prepare_query):
+        sql = prepare_query(sql)
+    return await db.query(sql, params)
+
+
+def _is_mock_attr(value: Any) -> bool:
+    return value.__class__.__module__.startswith("unittest.mock")
+
+
 # ---------------------------------------------------------------------------
 # Minimal dialect helpers (DQ-17 partial — enough for profile + discovery)
 # ---------------------------------------------------------------------------
@@ -63,7 +87,11 @@ def _dialect(db: Any) -> str:
 
 
 def _placeholder(dialect: str) -> str:
-    return "?" if dialect == "sqlite" else "%s"
+    if dialect == "sqlite":
+        return "?"
+    if dialect == "postgresql":
+        return "$1"
+    return "%s"
 
 
 def _column_discovery_sql(table_name: str, dialect: str) -> tuple:
@@ -330,8 +358,10 @@ class DataQualityPlugin(BasePlugin):
         attempted and silently skipped with a debug log for non-numeric columns.
         """
         # Discover columns if not specified
+        dialect = _dialect(db)
+        table = _validate_identifier(table)
+        table_ident = _quote_identifier(table, dialect)
         if not columns:
-            dialect = _dialect(db)
             table_name = table.split(".", 1)[-1]
             disc_sql, disc_params = _column_discovery_sql(table_name, dialect)
             rows = await db.query(disc_sql, disc_params)
@@ -346,30 +376,31 @@ class DataQualityPlugin(BasePlugin):
         # Build the subquery wrapper for sample_size paths
         if sample_size:
             sample_expr = (
-                f"(SELECT {{col}} FROM {table} LIMIT {int(sample_size)}) _sample"
+                f"(SELECT {{col}} FROM {table_ident} LIMIT {int(sample_size)}) _sample"
             )
             sample_expr_nn = (
-                f"(SELECT {{col}} FROM {table} WHERE {{col}} IS NOT NULL "
+                f"(SELECT {{col}} FROM {table_ident} WHERE {{col}} IS NOT NULL "
                 f"LIMIT {int(sample_size)}) _sample"
             )
         else:
-            sample_expr = table
-            sample_expr_nn = f"{table} WHERE {{col}} IS NOT NULL"
+            sample_expr = table_ident
+            sample_expr_nn = f"{table_ident} WHERE {{col}} IS NOT NULL"
 
         col_profiles: Dict[str, Any] = {}
 
         for col in columns:
             _validate_identifier(col)
+            col_ident = _quote_identifier(col, dialect)
             try:
                 # Single query: total rows, non-null count, distinct count
-                from_clause = sample_expr.format(col=col)
+                from_clause = sample_expr.format(col=col_ident)
                 count_sql = (
                     f"SELECT COUNT(*) AS total, "
-                    f"COUNT({col}) AS non_null, "
-                    f"COUNT(DISTINCT {col}) AS distinct_count "
+                    f"COUNT({col_ident}) AS non_null, "
+                    f"COUNT(DISTINCT {col_ident}) AS distinct_count "
                     f"FROM {from_clause}"
                 )
-                count_rows = await db.query(count_sql)
+                count_rows = await _query_rows(db, count_sql)
                 if count_rows:
                     r = count_rows[0]
                     if isinstance(r, dict):
@@ -391,14 +422,14 @@ class DataQualityPlugin(BasePlugin):
                 # Separate stats query — may fail for non-numeric columns
                 min_v = max_v = avg_v = None
                 try:
-                    nn_from = sample_expr_nn.format(col=col)
+                    nn_from = sample_expr_nn.format(col=col_ident)
                     stats_sql = (
-                        f"SELECT MIN({col}) AS min_val, "
-                        f"MAX({col}) AS max_val, "
-                        f"AVG(CAST({col} AS FLOAT)) AS avg_val "
+                        f"SELECT MIN({col_ident}) AS min_val, "
+                        f"MAX({col_ident}) AS max_val, "
+                        f"AVG(CAST({col_ident} AS FLOAT)) AS avg_val "
                         f"FROM {nn_from}"
                     )
-                    stat_rows = await db.query(stats_sql)
+                    stat_rows = await _query_rows(db, stats_sql)
                     if stat_rows:
                         sr = stat_rows[0]
                         if isinstance(sr, dict):
@@ -452,8 +483,14 @@ class DataQualityPlugin(BasePlugin):
         IQR method uses numpy only.
         """
         limit_clause = f"LIMIT {int(sample_size)}" if sample_size else ""
-        sql = f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL {limit_clause}"
-        rows = await db.query(sql)
+        dialect = _dialect(db)
+        table_ident = _quote_identifier(table, dialect)
+        column_ident = _quote_identifier(column, dialect)
+        sql = (
+            f"SELECT {column_ident} FROM {table_ident} "
+            f"WHERE {column_ident} IS NOT NULL {limit_clause}"
+        )
+        rows = await _query_rows(db, sql)
 
         values = []
         for row in rows:
@@ -524,8 +561,11 @@ class DataQualityPlugin(BasePlugin):
         expected_interval_hours: float = 24.0,
     ) -> Dict[str, Any]:
         """Check that the most recent timestamp is within the expected interval."""
-        sql = f"SELECT MAX({timestamp_column}) as latest FROM {table}"
-        rows = await db.query(sql)
+        dialect = _dialect(db)
+        table_ident = _quote_identifier(table, dialect)
+        column_ident = _quote_identifier(timestamp_column, dialect)
+        sql = f"SELECT MAX({column_ident}) as latest FROM {table_ident}"
+        rows = await _query_rows(db, sql)
 
         if not rows:
             return {

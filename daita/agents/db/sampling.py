@@ -5,6 +5,8 @@ Numeric column sampling and PII-column redaction patterns.
 import logging
 from typing import Any, Dict, List, TYPE_CHECKING
 
+from .tools._helpers import quote_id, quote_path, safe_query
+
 if TYPE_CHECKING:
     from ...plugins.base_db import BaseDatabasePlugin
 
@@ -94,23 +96,14 @@ async def sample_numeric_columns(
                     continue
 
             try:
-                if db_type == "postgresql":
-                    sql = (
-                        f'SELECT "{col_name}" FROM "{tname}" '
-                        f'WHERE "{col_name}" IS NOT NULL LIMIT {sample_size}'
-                    )
-                elif db_type == "mysql":
-                    sql = (
-                        f"SELECT `{col_name}` FROM `{tname}` "
-                        f"WHERE `{col_name}` IS NOT NULL LIMIT {sample_size}"
-                    )
-                else:
-                    sql = (
-                        f'SELECT "{col_name}" FROM "{tname}" '
-                        f'WHERE "{col_name}" IS NOT NULL LIMIT {sample_size}'
-                    )
+                dialect = getattr(plugin, "sql_dialect", db_type)
+                quoted_col = quote_id(col_name, dialect)
+                sql = (
+                    f"SELECT {quoted_col} FROM {quote_path(tname, dialect)} "
+                    f"WHERE {quoted_col} IS NOT NULL LIMIT {sample_size}"
+                )
 
-                rows = await plugin.query(sql)
+                rows = (await safe_query(plugin, sql)).rows
                 if rows:
                     samples = [row[col_name] for row in rows if col_name in row]
                     if samples:

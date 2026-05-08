@@ -260,6 +260,40 @@ class BaseDatabasePlugin(BasePlugin):
         return match.group(1).upper() if match else ""
 
     @staticmethod
+    def _sql_keyword_tokens(sql: str) -> list[str]:
+        """Return SQL identifier tokens outside comments and quoted strings."""
+        cleaned = BaseDatabasePlugin._strip_sql_comments(sql)
+        tokens = []
+        i = 0
+        quote = None
+        while i < len(cleaned):
+            ch = cleaned[i]
+            nxt = cleaned[i + 1] if i + 1 < len(cleaned) else ""
+            if quote:
+                if ch == quote:
+                    if nxt == quote:
+                        i += 2
+                        continue
+                    quote = None
+                i += 1
+                continue
+            if ch in ("'", '"', "`"):
+                quote = ch
+                i += 1
+                continue
+            if ch.isalpha() or ch == "_":
+                start = i
+                i += 1
+                while i < len(cleaned) and (
+                    cleaned[i].isalnum() or cleaned[i] in ("_", "$")
+                ):
+                    i += 1
+                tokens.append(cleaned[start:i].upper())
+                continue
+            i += 1
+        return tokens
+
+    @staticmethod
     def _sql_has_limit(sql: str) -> bool:
         return bool(
             re.search(
@@ -272,15 +306,17 @@ class BaseDatabasePlugin(BasePlugin):
     @staticmethod
     def _sql_identifiers_after(sql: str, keywords: tuple[str, ...]) -> set[str]:
         keyword_re = "|".join(re.escape(k) for k in keywords)
-        pattern = rf"\b(?:{keyword_re})\s+([A-Za-z_][\w.$]*|\"[^\"]+\"|`[^`]+`)"
+        ident = r'(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`)'
+        pattern = rf"\b(?:{keyword_re})\s+({ident}(?:\.{ident})*)"
         identifiers = set()
         for match in re.finditer(
             pattern,
             BaseDatabasePlugin._strip_sql_comments(sql),
             re.IGNORECASE,
         ):
-            raw = match.group(1).strip('"`')
-            identifiers.add(raw.split(".")[-1])
+            raw = match.group(1)
+            parts = [part.strip('"`') for part in raw.split(".")]
+            identifiers.add(parts[-1])
         return identifiers
 
     def _validate_sql_policy(self, sql: str, *, operation: str) -> None:
@@ -308,6 +344,18 @@ class BaseDatabasePlugin(BasePlugin):
                 f"SQL guardrail rejected mutating statement in read-only mode: {keyword}",
                 field="sql",
             )
+        if self.read_only:
+            mutating_tokens = [
+                token
+                for token in self._sql_keyword_tokens(sql)
+                if token in self._MUTATING_SQL_KEYWORDS
+            ]
+            if mutating_tokens:
+                raise ValidationError(
+                    "SQL guardrail rejected mutating statement in read-only mode: "
+                    f"{mutating_tokens[0]}",
+                    field="sql",
+                )
 
         referenced_tables = self._sql_identifiers_after(
             sql, ("FROM", "JOIN", "UPDATE", "INTO", "TABLE")

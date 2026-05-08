@@ -7,7 +7,13 @@ from __future__ import annotations
 from typing import Any, Dict, TYPE_CHECKING
 
 from ....core.tools import AgentTool
-from ._helpers import ensure_pandas, ensure_numpy, safe_query, to_serializable
+from ._helpers import (
+    ensure_pandas,
+    ensure_numpy,
+    safe_query,
+    source_metadata,
+    to_serializable,
+)
 
 if TYPE_CHECKING:
     from ....plugins.base_db import BaseDatabasePlugin
@@ -42,13 +48,15 @@ def create_detect_anomalies_tool(
             threshold = 2.5 if method == "zscore" else 1.5
 
         try:
-            rows = await safe_query(plugin, sql)
+            query_result = await safe_query(plugin, sql)
+            rows = query_result.rows
             if not rows:
                 return {
                     "success": True,
                     "anomalies": [],
                     "anomaly_count": 0,
                     "total_rows": 0,
+                    **source_metadata(query_result),
                 }
 
             df = pd.DataFrame(
@@ -91,6 +99,7 @@ def create_detect_anomalies_tool(
                             "min": min_val,
                             "max": max_val,
                         },
+                        **source_metadata(query_result),
                     }
                 zscores = (values - mean) / std
                 anomaly_mask = np.abs(zscores) > threshold
@@ -119,6 +128,7 @@ def create_detect_anomalies_tool(
                         "min": min_val,
                         "max": max_val,
                     },
+                    **source_metadata(query_result),
                 }
 
             elif method == "iqr":
@@ -165,6 +175,7 @@ def create_detect_anomalies_tool(
                         "min": min_val,
                         "max": max_val,
                     },
+                    **source_metadata(query_result),
                 }
 
             else:

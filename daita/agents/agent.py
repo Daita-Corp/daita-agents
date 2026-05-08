@@ -798,6 +798,7 @@ class Agent(BaseAgent):
                 "tool": tool_name,
                 "arguments": tool_call["arguments"],
                 "result": result,
+                "duration_ms": duration_ms,
             }
 
     def _append_tool_messages(
@@ -893,6 +894,11 @@ class Agent(BaseAgent):
 
         skill_parts = []
         for source in self.tool_sources:
+            disabled_for = getattr(
+                source, "_daita_disable_lifecycle_context_for_agent_ids", set()
+            )
+            if self.agent_id in disabled_for:
+                continue
             if isinstance(source, LifecyclePlugin):
                 try:
                     context = await source.on_before_run(prompt)
