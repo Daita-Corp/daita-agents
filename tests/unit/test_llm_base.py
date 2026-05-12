@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from daita.core.tools import AgentTool
+from daita.core.tracing import get_trace_manager
 from daita.llm.anthropic import AnthropicProvider
 from daita.llm.gemini import GeminiProvider
 from daita.llm.grok import GrokProvider
@@ -57,6 +58,18 @@ def _make_slow_tool(name: str, sleep: float = 10.0):
     )
 
 
+def _latest_llm_events():
+    tm = get_trace_manager()
+    tm.flush(timeout_millis=2000)
+    spans = [
+        s
+        for s in tm._memory_exporter.get_finished_spans()
+        if (s.attributes or {}).get("daita.trace.type") == "llm_call"
+    ]
+    assert spans
+    return spans[-1].events
+
+
 # ===========================================================================
 # Provider defaults
 # ===========================================================================
@@ -74,6 +87,39 @@ class TestProviderDefaults:
 
     def test_grok_default_model_is_current_cost_sensitive_model(self):
         assert GrokProvider().model == "grok-4.20"
+
+
+class TestLLMTracing:
+    async def test_non_streaming_records_input_and_output_events(self):
+        tm = get_trace_manager()
+        tm._memory_exporter.clear()
+        p = _make_provider()
+        p.set_agent_id("trace-agent")
+
+        result = await p.generate("hello")
+
+        events = _latest_llm_events()
+        input_event = next(e for e in events if e.name == "daita.input")
+        output_event = next(e for e in events if e.name == "daita.output")
+        assert "hello" in input_event.attributes["data"]
+        assert result in output_event.attributes["data"]
+
+    async def test_streaming_records_input_and_aggregated_output_events(self):
+        tm = get_trace_manager()
+        tm._memory_exporter.clear()
+        p = _make_provider()
+        p.set_agent_id("trace-agent")
+
+        chunks = []
+        stream = await p.generate("stream this", stream=True)
+        async for chunk in stream:
+            chunks.append(chunk.content or "")
+
+        events = _latest_llm_events()
+        input_event = next(e for e in events if e.name == "daita.input")
+        output_event = next(e for e in events if e.name == "daita.output")
+        assert "stream this" in input_event.attributes["data"]
+        assert "".join(chunks) in output_event.attributes["data"]
 
 
 # ===========================================================================

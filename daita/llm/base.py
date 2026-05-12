@@ -132,17 +132,25 @@ class BaseLLMProvider(LLMProvider, ABC):
         if tools:
             tool_specs = self._convert_tools_to_format(tools)
 
+        trace_input = {
+            "messages": messages,
+            "tools": tool_specs,
+            "params": params,
+        }
+
         # Route to streaming or non-streaming
         if stream:
-            return self._stream_impl(messages, tool_specs, **params)
+            return self._stream_with_tracing(messages, tool_specs, trace_input, **params)
         else:
             async with self.trace_manager.span(
                 operation_name=f"llm_{self.provider_name}",
                 trace_type=TraceType.LLM_CALL,
                 agent_id=self.agent_id,
                 model=self.model,
+                input_data=trace_input,
             ) as span_id:
                 result = await self._generate_impl(messages, tool_specs, **params)
+                self.trace_manager.record_output(span_id, result)
 
                 # Record token usage on the span
                 token_usage = self._get_last_token_usage()
@@ -156,6 +164,50 @@ class BaseLLMProvider(LLMProvider, ABC):
                     )
 
                 return result
+
+    async def _stream_with_tracing(self, messages, tool_specs, trace_input, **params):
+        """Wrap provider streaming with one LLM span and aggregate output events."""
+        text_parts = []
+        tool_calls = []
+
+        async with self.trace_manager.span(
+            operation_name=f"llm_{self.provider_name}",
+            trace_type=TraceType.LLM_CALL,
+            agent_id=self.agent_id,
+            model=self.model,
+            input_data=trace_input,
+        ) as span_id:
+            try:
+                async for chunk in self._stream_impl(messages, tool_specs, **params):
+                    if getattr(chunk, "type", None) == "text" and chunk.content:
+                        text_parts.append(chunk.content)
+                    elif getattr(chunk, "type", None) == "tool_call_complete":
+                        tool_calls.append(
+                            {
+                                "id": chunk.tool_call_id,
+                                "name": chunk.tool_name,
+                                "arguments": chunk.tool_args,
+                            }
+                        )
+                    yield chunk
+            finally:
+                output: Dict[str, Any] = {}
+                if text_parts:
+                    output["content"] = "".join(text_parts)
+                if tool_calls:
+                    output["tool_calls"] = tool_calls
+                if output:
+                    self.trace_manager.record_output(span_id, output)
+
+                token_usage = self._get_last_token_usage()
+                if token_usage.get("total_tokens"):
+                    self.trace_manager.record_llm_call(
+                        span_id=span_id,
+                        model=self.model,
+                        prompt_tokens=token_usage.get("prompt_tokens", 0),
+                        completion_tokens=token_usage.get("completion_tokens", 0),
+                        total_tokens=token_usage.get("total_tokens", 0),
+                    )
 
     @abstractmethod
     async def _generate_impl(

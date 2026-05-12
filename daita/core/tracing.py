@@ -25,6 +25,7 @@ async context manager) and by ``start_span()`` / ``end_span()``.
 """
 
 import atexit
+import dataclasses
 import json
 import logging
 import os
@@ -34,7 +35,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.resources import Resource
@@ -49,6 +50,8 @@ if TYPE_CHECKING:
     from opentelemetry.sdk.trace.export import SpanExporter
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_TRACE_PAYLOAD_MAX_CHARS = 12000
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +389,9 @@ class TraceManager:
             with self._otel_spans_lock:
                 self._otel_spans[hex_span_id] = span
 
+            if metadata.get("input_data") is not None:
+                _add_data_event(span, "daita.input", metadata["input_data"])
+
             # Mirror to custom contextvars (only update span_id; trace_id stays from context)
             _trace_id_var.set(hex_trace_id)
             _span_id_var.set(hex_span_id)
@@ -460,6 +466,26 @@ class TraceManager:
             logger.error(f"Failed to end span {span_id}: {e}")
             with self._otel_spans_lock:
                 self._otel_spans.pop(span_id, None)
+
+    def record_event_data(self, span_id: str, event_name: str, data: Any) -> None:
+        """Record structured data on a live span as a bounded OTel event."""
+        try:
+            with self._otel_spans_lock:
+                span = self._otel_spans.get(span_id)
+            if span:
+                _add_data_event(span, event_name, data)
+            else:
+                logger.debug(f"Cannot record {event_name} for unknown span: {span_id}")
+        except Exception as e:
+            logger.error(f"Failed to record {event_name} for span {span_id}: {e}")
+
+    def record_input(self, span_id: str, data: Any) -> None:
+        """Record input data on a live span."""
+        self.record_event_data(span_id, "daita.input", data)
+
+    def record_output(self, span_id: str, data: Any) -> None:
+        """Record output data on a live span."""
+        self.record_event_data(span_id, "daita.output", data)
 
     def record_decision(
         self,
@@ -548,6 +574,9 @@ class TraceManager:
             # Also register in _otel_spans so callers who stash the span_id can use it
             with self._otel_spans_lock:
                 self._otel_spans[hex_span_id] = otel_span
+
+            if metadata.get("input_data") is not None:
+                _add_data_event(otel_span, "daita.input", metadata["input_data"])
 
             self._metrics["total_spans"] += 1
 
@@ -839,18 +868,57 @@ def _get_version() -> str:
         return "unknown"
 
 
-def _add_data_event(span: otel_trace.Span, event_name: str, data: Any) -> None:
-    """Add input/output data as a span event (truncated to 2000 chars)."""
+def _trace_payload_limit() -> int:
+    raw = os.getenv("DAITA_TRACE_PAYLOAD_MAX_CHARS")
+    if raw is None:
+        return DEFAULT_TRACE_PAYLOAD_MAX_CHARS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_TRACE_PAYLOAD_MAX_CHARS
+
+
+def _serialize_trace_data(data: Any) -> Tuple[str, bool, int]:
+    """Serialize trace data into a bounded string payload."""
     try:
         if isinstance(data, str):
             preview = data
-        elif isinstance(data, dict):
-            preview = json.dumps(data, separators=(",", ":"))
+        elif dataclasses.is_dataclass(data):
+            preview = json.dumps(
+                dataclasses.asdict(data), default=str, separators=(",", ":")
+            )
+        elif hasattr(data, "model_dump"):
+            preview = json.dumps(data.model_dump(), default=str, separators=(",", ":"))
+        elif hasattr(data, "dict") and callable(data.dict):
+            preview = json.dumps(data.dict(), default=str, separators=(",", ":"))
+        elif isinstance(data, (dict, list, tuple)):
+            preview = json.dumps(data, default=str, separators=(",", ":"))
         else:
             preview = str(data)
-        if len(preview) > 2000:
-            preview = preview[:2000] + "..."
-        span.add_event(event_name, {"data": preview})
+    except Exception:
+        preview = f"<{type(data).__name__}>"
+
+    original_length = len(preview)
+    limit = _trace_payload_limit()
+    truncated = original_length > limit
+    if truncated:
+        preview = preview[:limit] + "..."
+    return preview, truncated, original_length
+
+
+def _add_data_event(span: otel_trace.Span, event_name: str, data: Any) -> None:
+    """Add input/output data as a span event with a 12k default payload cap."""
+    try:
+        preview, truncated, original_length = _serialize_trace_data(data)
+        span.add_event(
+            event_name,
+            {
+                "data": preview,
+                "truncated": truncated,
+                "original_length": original_length,
+                "max_length": _trace_payload_limit(),
+            },
+        )
     except Exception:
         pass
 

@@ -40,6 +40,7 @@ async def discover_postgres(
         password=creds["password"],
         database=creds["database"] or "postgres",
         ssl=ssl_arg,
+        statement_cache_size=0,
     )
 
     try:

@@ -588,16 +588,23 @@ class Agent(BaseAgent):
         start_time = time.time()
 
         # Create agent-level trace span (automatic, invisible to users)
+        tools_requested = None
+        if tools is not None:
+            tools_requested = [
+                t if isinstance(t, str) else getattr(t, "name", str(t)) for t in tools
+            ]
+
         async with self.trace_manager.span(
             operation_name="agent_run",
             trace_type=TraceType.AGENT_EXECUTION,
             agent_id=self.agent_id,
             agent_name=self.name,
             prompt=prompt[:200],  # Truncate for storage
-            tools_requested=tools,
+            tools_requested=tools_requested,
             max_iterations=max_iterations,
             entry_point="run",  # Distinguishes from _process() calls
-        ):
+            input_data={"prompt": prompt, "tools_requested": tools_requested},
+        ) as span_id:
             # Start watches lazily on first run (idempotent)
             await self._start_watches()
 
@@ -640,6 +647,7 @@ class Agent(BaseAgent):
             if history is not None:
                 await history.add_turn(prompt, result.get("result", ""))
 
+            self.trace_manager.record_output(span_id, result)
             return result
 
     def _resolve_tools(
@@ -771,11 +779,12 @@ class Agent(BaseAgent):
             agent_id=self.agent_id,
             tool_name=tool_name,
             input_data=tool_call.get("arguments"),
-        ):
+        ) as span_id:
             # Track execution time
             start_time = time.time()
 
             result = await _execute_tool_call(tool_call, tools)
+            self.trace_manager.record_output(span_id, result)
 
             # Calculate duration
             duration_ms = int((time.time() - start_time) * 1000)
