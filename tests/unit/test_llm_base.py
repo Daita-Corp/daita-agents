@@ -185,11 +185,28 @@ class TestOpenAICompatibleHelpers:
             prompt_token_count=5,
             candidates_token_count=7,
         )
-        assert p._extract_tokens(usage) == {
-            "total_tokens": 12,
-            "prompt_tokens": 5,
-            "completion_tokens": 7,
+        tokens = p._extract_tokens(usage)
+        assert tokens["total_tokens"] == 12
+        assert tokens["prompt_tokens"] == 5
+        assert tokens["completion_tokens"] == 7
+
+    def test_dict_usage_extracts_extended_token_counts(self):
+        p = OpenAIProvider(api_key="test")
+        usage = {
+            "total_tokens": 20,
+            "prompt_tokens": 12,
+            "completion_tokens": 8,
+            "prompt_tokens_details": {"cached_tokens": 4},
+            "completion_tokens_details": {"reasoning_tokens": 2},
         }
+
+        tokens = p._extract_tokens(usage)
+
+        assert tokens["total_tokens"] == 20
+        assert tokens["prompt_tokens"] == 12
+        assert tokens["completion_tokens"] == 8
+        assert tokens["cached_input_tokens"] == 4
+        assert tokens["reasoning_tokens"] == 2
 
 
 # ===========================================================================
@@ -231,17 +248,28 @@ class TestEstimateCost:
         p = _make_provider()
         assert p._estimate_cost({"total_tokens": 0}) is None
 
-    def test_positive_tokens_returns_positive_float(self):
-        p = _make_provider()
-        cost = p._estimate_cost({"total_tokens": 1000})
-        assert isinstance(cost, float)
-        assert cost > 0.0
+    def test_known_model_uses_model_pricing(self):
+        p = OpenAIProvider(model="gpt-4o-mini", api_key="test")
+        cost = p._estimate_cost(
+            {
+                "total_tokens": 2_000_000,
+                "prompt_tokens": 1_000_000,
+                "completion_tokens": 1_000_000,
+            }
+        )
+        assert cost == pytest.approx(0.75)
 
-    def test_cost_scales_with_tokens(self):
+    def test_unknown_model_uses_low_confidence_fallback(self):
         p = _make_provider()
-        cost_1k = p._estimate_cost({"total_tokens": 1000})
-        cost_2k = p._estimate_cost({"total_tokens": 2000})
-        assert cost_2k == pytest.approx(cost_1k * 2, rel=1e-6)
+        estimate = p._estimate_cost_details(
+            {
+                "total_tokens": 2000,
+                "prompt_tokens": 1000,
+                "completion_tokens": 1000,
+            }
+        )
+        assert estimate.as_float() == pytest.approx(0.004)
+        assert estimate.pricing_confidence == "low"
 
 
 # ===========================================================================

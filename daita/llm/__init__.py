@@ -34,6 +34,7 @@ from .factory import (
 
 # Base class for custom providers
 from .base import BaseLLMProvider
+from .pricing import CostEstimate, ModelPricing, TokenUsage, estimate_llm_cost
 
 # Concrete provider implementations
 from .openai import OpenAIProvider
@@ -49,6 +50,10 @@ __all__ = [
     "list_available_providers",
     # Base class
     "BaseLLMProvider",
+    "CostEstimate",
+    "ModelPricing",
+    "TokenUsage",
+    "estimate_llm_cost",
     # Provider implementations
     "OpenAIProvider",
     "AnthropicProvider",
