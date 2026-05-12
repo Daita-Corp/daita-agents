@@ -105,6 +105,9 @@ def _db_metadata(agent: "Agent", tool_names: List[str]) -> Dict[str, Any]:
     }
     if summary:
         metadata["summary"] = summary
+    prompt_metadata = getattr(agent, "_db_prompt_metadata", None)
+    if prompt_metadata:
+        metadata["prompt"] = prompt_metadata
     if drift:
         metadata["drift"] = drift
     if plugin is not None:

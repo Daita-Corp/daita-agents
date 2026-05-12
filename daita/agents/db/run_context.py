@@ -37,7 +37,7 @@ def build_db_run_context(
 
     lines = [
         "<db_runtime_context>",
-        "Use this compact DB context for the current question; full schema is in the system prompt.",
+        "Use this compact DB context for the current question; inspect schema tools when exact tables or columns are ambiguous.",
         (
             "Database: "
             f"type={schema.get('database_type', getattr(plugin, 'sql_dialect', 'unknown'))}, "
@@ -63,9 +63,11 @@ def make_db_context_run(agent: "Agent", original_run: Callable) -> Callable:
 
     async def _db_context_run(prompt: str, **kwargs: Any):
         from .memory import recall_db_memory_context
+        from .tool_profiles import select_db_tools_for_prompt
 
         memory_snippets = await recall_db_memory_context(agent, prompt)
         context = build_db_run_context(agent, memory_snippets=memory_snippets)
+        kwargs.setdefault("tools", select_db_tools_for_prompt(agent, prompt))
         return await original_run(_augment_prompt(prompt, context), **kwargs)
 
     return _db_context_run
@@ -76,9 +78,11 @@ def make_db_context_stream(agent: "Agent", original_stream: Callable) -> Callabl
 
     async def _db_context_stream(prompt: str, **kwargs: Any):
         from .memory import recall_db_memory_context
+        from .tool_profiles import select_db_tools_for_prompt
 
         memory_snippets = await recall_db_memory_context(agent, prompt)
         context = build_db_run_context(agent, memory_snippets=memory_snippets)
+        kwargs.setdefault("tools", select_db_tools_for_prompt(agent, prompt))
         async for event in original_stream(_augment_prompt(prompt, context), **kwargs):
             yield event
 

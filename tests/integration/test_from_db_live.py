@@ -497,24 +497,15 @@ async def _close_agent_db(agent) -> None:
 
 
 def _query_tool_name(database_type: str) -> str:
-    return {
-        "sqlite": "sqlite_query",
-        "postgresql": "postgres_query",
-    }[database_type]
+    return "db_query"
 
 
 def _count_tool_name(database_type: str) -> str:
-    return {
-        "sqlite": "sqlite_count",
-        "postgresql": "postgres_count",
-    }[database_type]
+    return "db_count"
 
 
 def _sample_tool_name(database_type: str) -> str:
-    return {
-        "sqlite": "sqlite_sample",
-        "postgresql": "postgres_sample",
-    }[database_type]
+    return "db_sample"
 
 
 async def _core_build_matrix_result(
@@ -1624,7 +1615,7 @@ class TestFromDbSQLSafety:
         try:
             await _assert_sql_safety(
                 agent,
-                tool_name="sqlite_query",
+                tool_name="db_query",
                 param_sql=(
                     "SELECT SUM(total_amount) AS revenue FROM orders "
                     "WHERE customer_id = ?"
@@ -1653,7 +1644,7 @@ class TestFromDbSQLSafety:
         try:
             await _assert_sql_safety(
                 agent,
-                tool_name="postgres_query",
+                tool_name="db_query",
                 param_sql=(
                     "SELECT SUM(total_amount) AS revenue FROM orders "
                     "WHERE customer_id = $1"
@@ -2254,23 +2245,23 @@ class TestFromDbSQLiteOpenAILive:
         {
             "id": "simple_aggregate",
             "prompt": (
-                "Use sqlite_query to answer from the database: what is the total "
+                "Use db_query to answer from the database: what is the total "
                 "revenue for customer_id 1? Return the numeric total and mention "
                 "customer_id 1."
             ),
-            "expected_tools": ["sqlite_query"],
+            "expected_tools": ["db_query"],
             "answer_all_of": ["125", "1"],
         },
         {
             "id": "relationship_customers_with_orders",
             "prompt": (
-                "Use sqlite_query exactly once with this SQL: "
+                "Use db_query exactly once with this SQL: "
                 "SELECT DISTINCT c.name AS name FROM customers c "
                 "JOIN orders o ON c.customer_id = o.customer_id "
                 "ORDER BY c.name. Which customer names have at least one order? "
                 "Return only names that have orders."
             ),
-            "expected_tools": ["sqlite_query"],
+            "expected_tools": ["db_query"],
             "answer_all_of": ["alice", "bob"],
             "answer_none_of": ["cara"],
         },
@@ -2299,11 +2290,11 @@ class TestFromDbSQLiteOpenAILive:
         {
             "id": "blocked_email_column",
             "prompt": (
-                "Use sqlite_query to try to show customer emails with "
+                "Use db_query to try to show customer emails with "
                 "SELECT email FROM customers. If the database guardrail blocks it, "
                 "say it was blocked and do not reveal any email address."
             ),
-            "expected_tools": ["sqlite_query"],
+            "expected_tools": ["db_query"],
             "answer_any_of": ["blocked", "guardrail", "not allowed"],
             "answer_none_of": [
                 "alice@example.com",
@@ -2327,14 +2318,14 @@ class TestFromDbSQLiteOpenAILive:
         )
         try:
             result = await agent.run(
-                "Use sqlite_query to answer this exactly from the database: "
+                "Use db_query to answer this exactly from the database: "
                 "what is the total revenue for customer_id 1? "
                 "Return the numeric total and mention customer_id 1.",
                 detailed=True,
                 max_iterations=4,
             )
 
-            metrics = _from_db_metrics(result, "sqlite_query", "125")
+            metrics = _from_db_metrics(result, "db_query", "125")
             result["from_db_metrics"] = metrics
             assert metrics["accurate"] is True
             assert metrics["query_duration_ms"] is not None
@@ -2342,10 +2333,10 @@ class TestFromDbSQLiteOpenAILive:
             assert metrics["tokens"]["total_tokens"] > 0
             assert metrics["cost"] >= 0
             assert_answer_mentions(result, ["125"], any_of=True)
-            assert "sqlite_query" in result["tool_calls"][0]["tool"]
+            assert "db_query" in result["tool_calls"][0]["tool"]
 
             audit_json = agent.db.audit.export_json()
-            assert "sqlite_query" in audit_json
+            assert "db_query" in audit_json
             assert "alice@example.com" not in audit_json
         finally:
             await _close_agent_db(agent)
@@ -2423,12 +2414,10 @@ class TestFromDbSQLiteOpenAILive:
                 name in tool_names for name in ("db_search_schema", "db_list_tables")
             ), tool_names
             assert "db_inspect_table" in tool_names, tool_names
-            assert "sqlite_query" in tool_names, tool_names
+            assert "db_query" in tool_names, tool_names
 
             query_call = next(
-                call
-                for call in result["tool_calls"]
-                if call.get("tool") == "sqlite_query"
+                call for call in result["tool_calls"] if call.get("tool") == "db_query"
             )
             rows = query_call.get("result", {}).get("rows") or []
             assert rows
@@ -2481,14 +2470,12 @@ class TestFromDbSQLiteOpenAILive:
                 "feature_249" in json.dumps(call.get("result") or {}, default=str)
                 for call in inspect_calls
             ), inspect_calls
-            assert "sqlite_query" in [
+            assert "db_query" in [
                 call.get("tool") for call in result.get("tool_calls") or []
             ]
 
             query_call = next(
-                call
-                for call in result["tool_calls"]
-                if call.get("tool") == "sqlite_query"
+                call for call in result["tool_calls"] if call.get("tool") == "db_query"
             )
             rows = query_call.get("result", {}).get("rows") or []
             assert rows
@@ -2532,17 +2519,17 @@ class TestFromDbSQLiteOpenAILive:
             first_sql_index = next(
                 index
                 for index, call in enumerate(tool_calls)
-                if call.get("tool") == "sqlite_query"
+                if call.get("tool") == "db_query"
             )
             assert any(
                 call.get("tool")
                 in ("db_search_schema", "db_list_tables", "db_inspect_table")
                 for call in tool_calls[:first_sql_index]
             ), tool_calls
-            assert "sqlite_query" in [call.get("tool") for call in tool_calls]
+            assert "db_query" in [call.get("tool") for call in tool_calls]
 
             query_call = next(
-                call for call in tool_calls if call.get("tool") == "sqlite_query"
+                call for call in tool_calls if call.get("tool") == "db_query"
             )
             sql = query_call.get("arguments", {}).get("sql", "")
             assert "wide_fact_events" in sql
@@ -2581,8 +2568,10 @@ class TestFromDbPostgresLive:
             assert description["db"]["table_count"] == 3
             assert description["db"]["relationship_count"] == 1
             assert description["db"]["query_policy"]["has_column_blocklist"] is True
-            assert "postgres_query" in agent.tool_registry.tool_names
-            assert "postgres_count" in agent.tool_registry.tool_names
+            assert "db_query" in agent.tool_registry.tool_names
+            assert "db_count" in agent.tool_registry.tool_names
+            assert "postgres_query" not in agent.tool_registry.tool_names
+            assert "postgres_count" not in agent.tool_registry.tool_names
             assert "postgres_list_tables" not in agent.tool_registry.tool_names
             assert "postgres_inspect" not in agent.tool_registry.tool_names
 
@@ -2598,7 +2587,7 @@ class TestFromDbPostgresLive:
             ]
 
             query_result = await agent.tool_registry.execute(
-                "postgres_query",
+                "db_query",
                 {
                     "sql": (
                         "SELECT customer_id, SUM(total_amount) AS revenue "
@@ -2612,11 +2601,11 @@ class TestFromDbPostgresLive:
 
             with pytest.raises(Exception, match="blocked column"):
                 await agent.tool_registry.execute(
-                    "postgres_query", {"sql": "SELECT email FROM customers"}
+                    "db_query", {"sql": "SELECT email FROM customers"}
                 )
             with pytest.raises(Exception, match="read-only mode"):
                 await agent.tool_registry.execute(
-                    "postgres_query",
+                    "db_query",
                     {
                         "sql": (
                             "WITH deleted AS (DELETE FROM orders WHERE order_id = 1 "
@@ -2734,7 +2723,7 @@ class TestFromDbPostgresLive:
             }
 
             public_result = await agent.tool_registry.execute(
-                "postgres_query",
+                "db_query",
                 {
                     "sql": (
                         "SELECT SUM(total_amount) AS revenue "
@@ -2743,7 +2732,7 @@ class TestFromDbPostgresLive:
                 },
             )
             analytics_result = await agent.tool_registry.execute(
-                "postgres_query",
+                "db_query",
                 {
                     "sql": (
                         "SELECT SUM(recognized_revenue) AS revenue "
@@ -2805,14 +2794,14 @@ class TestFromDbPostgresOpenAILive:
         )
         try:
             result = await agent.run(
-                "Use postgres_query to answer this exactly from the database: "
+                "Use db_query to answer this exactly from the database: "
                 "what is the total revenue for customer_id 1? "
                 "Return the numeric total and mention customer_id 1.",
                 detailed=True,
                 max_iterations=4,
             )
 
-            metrics = _from_db_metrics(result, "postgres_query", "125")
+            metrics = _from_db_metrics(result, "db_query", "125")
             result["from_db_metrics"] = metrics
             assert metrics["accurate"] is True
             assert metrics["query_duration_ms"] is not None
@@ -2820,10 +2809,10 @@ class TestFromDbPostgresOpenAILive:
             assert metrics["tokens"]["total_tokens"] > 0
             assert metrics["cost"] >= 0
             assert_answer_mentions(result, ["125"], any_of=True)
-            assert "postgres_query" in result["tool_calls"][0]["tool"]
+            assert "db_query" in result["tool_calls"][0]["tool"]
 
             audit_json = agent.db.audit.export_json()
-            assert "postgres_query" in audit_json
+            assert "db_query" in audit_json
             assert "alice@example.com" not in audit_json
         finally:
             await _close_agent_db(agent)

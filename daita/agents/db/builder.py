@@ -11,7 +11,13 @@ from .context import attach_db_context
 from .describe import attach_db_describe
 from .memory import DBMemory, calibrate_db_memory
 from .navigation import should_register_schema_navigation
-from .prompt import build_prompt, infer_domain
+from .policies import (
+    BudgetPreset,
+    SchemaPromptPolicy,
+    ToolResultPolicy,
+    schema_prompt_policy_for_budget,
+)
+from .prompt import build_prompt_result, infer_domain
 from .presets import AUTO_TOOLKIT, resolve_mode_options
 from .resolve import resolve_plugin
 from .run_context import make_db_context_run, make_db_context_stream
@@ -25,16 +31,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DISCOVERY_TOOLS = {
-    "postgres_list_tables",
-    "postgres_get_schema",
-    "postgres_inspect",
-    "mysql_list_tables",
-    "mysql_get_schema",
-    "mysql_inspect",
-    "sqlite_list_tables",
-    "sqlite_get_schema",
-    "sqlite_inspect",
+_GENERIC_DB_TOOLS = {
+    "db_query",
+    "db_count",
+    "db_sample",
+    "db_execute",
+    "db_find",
+    "db_aggregate",
 }
 
 
@@ -65,6 +68,9 @@ async def from_db(
     blocked_columns: Optional[List[str]] = None,
     toolkit: Optional[str] = AUTO_TOOLKIT,
     quality: Optional[bool] = None,
+    budget: BudgetPreset = "auto",
+    schema_prompt_policy: Optional[SchemaPromptPolicy] = None,
+    tool_result_policy: Optional[ToolResultPolicy] = None,
     **agent_kwargs: Any,
 ) -> "Agent":
     """
@@ -108,6 +114,11 @@ async def from_db(
             ``"all"`` is an alias for ``"analyst"``. ``None`` registers no toolkit.
             Defaults to the selected mode's toolkit.
         quality: Register data-quality tools. Defaults to the selected mode's value.
+        budget: Prompt budget preset. Supported values are ``"auto"`` (default),
+            ``"full"``, ``"compact"``, and ``"retrieval"``. Explicit
+            ``schema_prompt_policy`` values override this preset.
+        schema_prompt_policy: Advanced schema prompt budget controls.
+        tool_result_policy: Advanced DB tool result compaction controls.
         **agent_kwargs: Forwarded to :class:`Agent.__init__`.
 
     Returns:
@@ -170,15 +181,30 @@ async def from_db(
         await sample_numeric_columns(plugin, schema, redact_pii=redact_pii_columns)
 
     domain = infer_domain(schema)
-    schema_navigation_enabled = should_register_schema_navigation(schema)
+    prompt_policy = schema_prompt_policy or schema_prompt_policy_for_budget(budget)
+    initial_prompt_result = build_prompt_result(
+        schema,
+        domain,
+        prompt,
+        analyst_tools=_analyst_tool_names(schema, toolkit),
+        schema_navigation_enabled=False,
+        policy=prompt_policy,
+    )
+    schema_navigation_enabled = (
+        should_register_schema_navigation(schema)
+        or initial_prompt_result.strategy != "full"
+        or initial_prompt_result.budget_exceeded
+    )
     analyst_tools = _analyst_tool_names(schema, toolkit)
-    system_prompt = build_prompt(
+    prompt_result = build_prompt_result(
         schema,
         domain,
         prompt,
         analyst_tools=analyst_tools,
         schema_navigation_enabled=schema_navigation_enabled,
+        policy=prompt_policy,
     )
+    system_prompt = prompt_result.prompt
 
     agent = _create_db_agent(
         name=name or f"{domain} database agent",
@@ -189,12 +215,21 @@ async def from_db(
         agent_kwargs=agent_kwargs,
     )
     _attach_db_state(agent, plugin=plugin, schema=schema, mode=mode, drift=drift)
-    _remove_discovery_tools(agent)
+    agent._db_prompt_metadata = {
+        "strategy": prompt_result.strategy,
+        "estimated_tokens": prompt_result.estimated_tokens,
+        "table_count": prompt_result.table_count,
+        "column_count": prompt_result.column_count,
+        "omitted_table_count": len(prompt_result.omitted_tables),
+        "budget_exceeded": prompt_result.budget_exceeded,
+    }
     _remove_focus_from_db_tools(agent)
 
     _register_schema_navigation_tools(
         agent, plugin, schema, enabled=schema_navigation_enabled
     )
+    _register_db_facade_tools(agent, plugin, schema)
+    _remove_provider_db_tools(agent)
     _register_analyst_toolkit(agent, plugin, schema, toolkit=toolkit)
     _register_quality_tools(agent, plugin, enabled=quality)
     await _attach_lineage(agent, schema, lineage=lineage)
@@ -207,7 +242,7 @@ async def from_db(
         calibrate=bool(calibrate_memory),
     )
     _attach_history(agent, history=history)
-    _wrap_db_runtime(agent)
+    _wrap_db_runtime(agent, tool_result_policy=tool_result_policy)
 
     return agent
 
@@ -347,11 +382,6 @@ def _attach_db_state(
     agent._db_active_findings = {}
 
 
-def _remove_discovery_tools(agent: "Agent") -> None:
-    for tool_name in _DISCOVERY_TOOLS:
-        agent.tool_registry.remove(tool_name)
-
-
 def _remove_focus_from_db_tools(agent: "Agent") -> None:
     """Hide and ignore Focus DSL for SQL query tools on from_db agents."""
 
@@ -404,6 +434,30 @@ def _register_schema_navigation_tools(
     from .tools import register_schema_navigation_tools
 
     register_schema_navigation_tools(agent, plugin, schema)
+
+
+def _register_db_facade_tools(
+    agent: "Agent", plugin: Any, schema: Dict[str, Any]
+) -> None:
+    from .tools.query_facade import create_db_query_tools
+
+    for tool in create_db_query_tools(plugin, schema):
+        agent.tool_registry.register(tool)
+
+
+def _remove_provider_db_tools(agent: "Agent") -> None:
+    """Keep provider-owned tools internal to from_db after generic facades exist."""
+
+    for tool_name in list(agent.tool_registry.tool_names):
+        if tool_name in _GENERIC_DB_TOOLS:
+            continue
+        if tool_name.endswith("_vector_search"):
+            continue
+        if tool_name.endswith("_vector_upsert"):
+            continue
+        tool = agent.tool_registry.get(tool_name)
+        if tool is not None and tool.source == "plugin" and tool.category == "database":
+            agent.tool_registry.remove(tool_name)
 
 
 def _analyst_tool_names(schema: Dict[str, Any], toolkit: Optional[str]) -> List[str]:
@@ -536,11 +590,28 @@ def _attach_history(agent: "Agent", *, history: Union[bool, Any, None]) -> None:
     agent._db_history = history_obj
 
 
-def _wrap_db_runtime(agent: "Agent") -> None:
+def _wrap_db_runtime(
+    agent: "Agent", *, tool_result_policy: Optional[ToolResultPolicy]
+) -> None:
     agent._db_audit_log: List[Dict[str, Any]] = []
+    _attach_result_compaction(agent, policy=tool_result_policy)
     agent.run = make_audited_run(agent, make_db_context_run(agent, agent.run))
     agent.stream = make_audited_stream(
         agent, make_db_context_stream(agent, agent.stream)
     )
     attach_db_context(agent)
     attach_db_describe(agent)
+
+
+def _attach_result_compaction(
+    agent: "Agent", *, policy: Optional[ToolResultPolicy]
+) -> None:
+    from .result_compaction import compact_tool_result_for_context
+
+    policy = policy or ToolResultPolicy()
+    agent._db_tool_result_policy = policy
+
+    def _compact(tool_name: str, result: Any) -> Any:
+        return compact_tool_result_for_context(tool_name, result, policy=policy)
+
+    agent._compact_tool_result_for_context = _compact

@@ -35,6 +35,7 @@ from daita.agents.db.memory import (
     normalize_db_memory_record,
     recall_db_memory_context,
 )
+from daita.agents.db.policies import SchemaPromptPolicy, ToolResultPolicy
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -395,6 +396,55 @@ class TestBuildDbPrompt:
         assert "financial" in prompt
         assert "postgresql" in prompt
 
+    def test_prompt_budget_uses_column_count_not_just_table_count(self):
+        from daita.agents.db.prompt import build_prompt_result
+
+        tables = [
+            _table(
+                f"wide_{i}",
+                self._cols([f"col_{i}_{j}" for j in range(15)]),
+            )
+            for i in range(25)
+        ]
+        schema = _make_normalized_schema(tables=tables)
+        schema["table_count"] = 25
+
+        result = build_prompt_result(schema, "analytics", None)
+
+        assert result.strategy == "compact"
+        assert result.column_count == 375
+        assert "| Column | Type | PK | Nullable |" not in result.prompt
+        assert result.estimated_tokens < 3500
+
+    def test_budget_presets_are_publicly_importable(self):
+        from daita.agents.db import SchemaPromptPolicy as PublicSchemaPromptPolicy
+        from daita.agents.db import ToolResultPolicy as PublicToolResultPolicy
+
+        assert PublicSchemaPromptPolicy is SchemaPromptPolicy
+        assert PublicToolResultPolicy is ToolResultPolicy
+
+    def test_budget_preset_retrieval_forces_retrieval_strategy(self):
+        from daita.agents.db.policies import schema_prompt_policy_for_budget
+        from daita.agents.db.prompt import build_prompt_result
+
+        schema = _make_normalized_schema(tables=[_table("orders", self._cols(["id"]))])
+
+        result = build_prompt_result(
+            schema,
+            "e-commerce",
+            None,
+            policy=schema_prompt_policy_for_budget("retrieval"),
+        )
+
+        assert result.strategy == "retrieval"
+        assert "db_search_schema" in result.prompt
+
+    def test_invalid_policy_values_fail_fast(self):
+        with pytest.raises(ValueError, match="max_inline_schema_tokens"):
+            SchemaPromptPolicy(max_inline_schema_tokens=0)
+        with pytest.raises(ValueError, match="max_result_tokens"):
+            ToolResultPolicy(max_result_tokens=0)
+
 
 class TestDbSummary:
     def test_summary_derives_health_questions_and_metrics(self):
@@ -580,6 +630,68 @@ class TestFromDbIntegration:
         assert call_kwargs["model"] == "gpt-4o"
         assert call_kwargs["api_key"] == "sk-test"
         assert call_kwargs["llm_provider"] == "openai"
+
+    async def test_from_db_budget_preset_controls_prompt_strategy(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        normalized = _make_normalized_schema(tables=[_table("orders")])
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        mock_agent = MagicMock()
+        mock_agent.add_plugin = MagicMock()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=normalized)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            await from_db("postgresql://localhost/testdb", budget="retrieval")
+
+        assert mock_agent._db_prompt_metadata["strategy"] == "retrieval"
+
+    async def test_from_db_schema_prompt_policy_overrides_budget_preset(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        normalized = _make_normalized_schema(tables=[_table("orders")])
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        mock_agent = MagicMock()
+        mock_agent.add_plugin = MagicMock()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=normalized)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            await from_db(
+                "postgresql://localhost/testdb",
+                budget="retrieval",
+                schema_prompt_policy=SchemaPromptPolicy(),
+            )
+
+        assert mock_agent._db_prompt_metadata["strategy"] == "full"
+
+    async def test_from_db_tool_result_policy_is_attached(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        normalized = _make_normalized_schema(tables=[_table("orders")])
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        mock_agent = MagicMock()
+        mock_agent.add_plugin = MagicMock()
+        policy = ToolResultPolicy(max_rows_inline=3)
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=normalized)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            await from_db("postgresql://localhost/testdb", tool_result_policy=policy)
+
+        assert mock_agent._db_tool_result_policy is policy
 
     async def test_from_db_plugin_instance_not_disconnected_on_error(self):
         """When user passes a plugin instance, we don't clean it up on error."""
@@ -2366,6 +2478,283 @@ class TestRegisterAnalystTools:
             "forecast_trend",
         }
         assert expected.issubset(registered)
+
+
+class TestFromDbQueryFacadeTools:
+    async def test_sql_facade_tools_delegate_to_plugin_guardrails(self):
+        from daita.agents.db.tools.query_facade import create_db_query_tools
+
+        plugin = MagicMock()
+        plugin.sql_dialect = "postgresql"
+        plugin.read_only = True
+        plugin._tool_query = AsyncMock(return_value={"rows": [{"x": 1}]})
+        plugin._tool_count = AsyncMock(return_value={"count": 3})
+        plugin._tool_sample = AsyncMock(return_value={"rows": [{"x": 2}]})
+        schema = _make_normalized_schema(db_type="postgresql")
+
+        tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+
+        assert set(tools) == {"db_query", "db_count", "db_sample"}
+        result = await tools["db_query"].handler({"sql": "SELECT 1"})
+        assert result == {"rows": [{"x": 1}]}
+        plugin._tool_query.assert_awaited_once_with({"sql": "SELECT 1"})
+
+    async def test_mongo_facade_uses_document_store_capabilities(self):
+        from daita.agents.db.tools.query_facade import create_db_query_tools
+
+        plugin = MagicMock()
+        plugin._tool_find = AsyncMock(return_value={"documents": [{"x": 1}]})
+        plugin._tool_aggregate = AsyncMock(return_value={"documents": [{"x": 2}]})
+        plugin._tool_count = AsyncMock(return_value={"count": 2})
+        schema = _make_normalized_schema(db_type="mongodb")
+
+        tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+
+        assert set(tools) == {"db_find", "db_aggregate", "db_count"}
+        await tools["db_find"].handler({"collection": "events"})
+        plugin._tool_find.assert_awaited_once_with({"collection": "events"})
+
+    async def test_from_db_hides_provider_query_duplicates(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+        from daita.core.tools import AgentTool, ToolRegistry
+
+        async def query_handler(args):
+            return {"rows": []}
+
+        mock_plugin = MagicMock()
+        mock_plugin.sql_dialect = "postgresql"
+        mock_plugin.read_only = True
+        mock_plugin.connect = AsyncMock()
+        mock_plugin._tool_query = AsyncMock(return_value={"rows": []})
+        mock_plugin._tool_count = AsyncMock(return_value={"count": 0})
+        mock_plugin._tool_sample = AsyncMock(return_value={"rows": []})
+        mock_plugin.get_tools.return_value = [
+            AgentTool(
+                name="postgres_query",
+                description="Provider query",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=query_handler,
+                category="database",
+                source="plugin",
+            ),
+            AgentTool(
+                name="postgres_count",
+                description="Provider count",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=query_handler,
+                category="database",
+                source="plugin",
+            ),
+        ]
+        mock_agent = MagicMock()
+        mock_agent.add_plugin = lambda plugin: mock_agent.tool_registry.register_many(
+            plugin.get_tools()
+        )
+        mock_agent.tool_registry = ToolRegistry()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(
+                fac,
+                "discover_schema",
+                AsyncMock(return_value=_make_normalized_schema(db_type="postgresql")),
+            ),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            agent = await from_db("postgresql://localhost/testdb")
+
+        assert "db_query" in agent.tool_registry.tool_names
+        assert "db_count" in agent.tool_registry.tool_names
+        assert "postgres_query" not in agent.tool_registry.tool_names
+        assert "postgres_count" not in agent.tool_registry.tool_names
+
+    async def test_from_db_hides_mongo_write_provider_tools(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+        from daita.core.tools import AgentTool, ToolRegistry
+
+        async def handler(args):
+            return {}
+
+        mock_plugin = MagicMock()
+        mock_plugin.read_only = False
+        mock_plugin.connect = AsyncMock()
+        mock_plugin._tool_find = AsyncMock(return_value={"documents": []})
+        mock_plugin._tool_aggregate = AsyncMock(return_value={"results": []})
+        mock_plugin._tool_count = AsyncMock(return_value={"count": 0})
+        mock_plugin.get_tools.return_value = [
+            AgentTool(
+                name="mongodb_find",
+                description="Provider find",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=handler,
+                category="database",
+                source="plugin",
+            ),
+            AgentTool(
+                name="mongodb_insert",
+                description="Provider insert",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=handler,
+                category="database",
+                source="plugin",
+            ),
+        ]
+        mock_agent = MagicMock()
+        mock_agent.add_plugin = lambda plugin: mock_agent.tool_registry.register_many(
+            plugin.get_tools()
+        )
+        mock_agent.tool_registry = ToolRegistry()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(
+                fac,
+                "discover_schema",
+                AsyncMock(return_value=_make_normalized_schema(db_type="mongodb")),
+            ),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            agent = await from_db("mongodb://localhost/testdb", read_only=False)
+
+        assert "db_find" in agent.tool_registry.tool_names
+        assert "mongodb_find" not in agent.tool_registry.tool_names
+        assert "mongodb_insert" not in agent.tool_registry.tool_names
+
+
+class TestDbResultCompaction:
+    def test_compacts_large_db_rows_for_llm_context(self):
+        from daita.agents.db.result_compaction import compact_tool_result_for_context
+
+        result = {
+            "rows": [
+                {
+                    "id": i,
+                    "status": "ok",
+                    "workflow_context": {"large": "x" * 2000},
+                    "notes": "n" * 500,
+                }
+                for i in range(30)
+            ],
+            "total_rows": 30,
+            "truncated": False,
+            "sql": "SELECT * FROM runs",
+        }
+
+        compacted = compact_tool_result_for_context("db_query", result)
+
+        assert compacted["row_count"] == 30
+        assert compacted["returned_rows"] <= 20
+        assert compacted["truncated"] is True
+        assert "workflow_context" in compacted["omitted_columns"]
+        assert "rows" not in compacted
+        assert len(compacted["rows_preview"][0]["notes"]) <= 300
+
+    def test_non_db_tool_results_are_unchanged(self):
+        from daita.agents.db.result_compaction import compact_tool_result_for_context
+
+        result = {"rows": [{"x": "y" * 1000}]}
+
+        assert compact_tool_result_for_context("send_slack", result) is result
+
+    def test_compacts_mongo_aggregate_results_shape(self):
+        from daita.agents.db.result_compaction import compact_tool_result_for_context
+
+        compacted = compact_tool_result_for_context(
+            "db_aggregate",
+            {"results": [{"bucket": i, "payload": "x" * 500} for i in range(25)]},
+        )
+
+        assert "results" not in compacted
+        assert compacted["row_count"] == 25
+        assert compacted["returned_rows"] <= 20
+        assert compacted["truncated"] is True
+        assert "rows_preview" in compacted
+
+
+class TestFromDbToolProfiles:
+    def test_simple_prompt_selects_core_and_schema_tools_only(self):
+        from types import SimpleNamespace
+        from daita.agents.db.tool_profiles import select_db_tools_for_prompt
+
+        agent = SimpleNamespace(
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_query",
+                    "db_count",
+                    "db_search_schema",
+                    "db_inspect_table",
+                    "pivot_table",
+                    "forecast_trend",
+                ]
+            ),
+            _db_schema={"tables": []},
+        )
+
+        selected = select_db_tools_for_prompt(agent, "What were sales last month?")
+
+        assert selected == [
+            "db_query",
+            "db_count",
+            "db_search_schema",
+            "db_inspect_table",
+        ]
+
+    def test_analysis_prompt_adds_matching_analyst_tool(self):
+        from types import SimpleNamespace
+        from daita.agents.db.tool_profiles import select_db_tools_for_prompt
+
+        agent = SimpleNamespace(
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_query",
+                    "db_search_schema",
+                    "detect_anomalies",
+                    "forecast_trend",
+                ]
+            ),
+            _db_schema={"tables": []},
+        )
+
+        selected = select_db_tools_for_prompt(
+            agent, "Forecast the revenue trend for next quarter"
+        )
+
+        assert "forecast_trend" in selected
+        assert "detect_anomalies" not in selected
+
+    def test_write_prompt_adds_execute_when_available(self):
+        from types import SimpleNamespace
+        from daita.agents.db.tool_profiles import select_db_tools_for_prompt
+
+        agent = SimpleNamespace(
+            tool_registry=SimpleNamespace(
+                tool_names=["db_query", "db_execute", "db_search_schema"]
+            ),
+            _db_schema={"tables": []},
+        )
+
+        selected = select_db_tools_for_prompt(agent, "Update customer status")
+
+        assert "db_execute" in selected
+
+    def test_explicit_tool_name_mentions_are_preserved(self):
+        from types import SimpleNamespace
+        from daita.agents.db.tool_profiles import select_db_tools_for_prompt
+
+        agent = SimpleNamespace(
+            tool_registry=SimpleNamespace(
+                tool_names=["db_query", "dq_detect_anomaly", "detect_anomalies"]
+            ),
+            _db_schema={"tables": []},
+        )
+
+        selected = select_db_tools_for_prompt(
+            agent, "Use dq_detect_anomaly on daily_metrics revenue"
+        )
+
+        assert "dq_detect_anomaly" in selected
 
 
 class TestPivotTableTool:

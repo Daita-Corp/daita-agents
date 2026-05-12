@@ -11,7 +11,6 @@ from ._helpers import (
     build_entity_profiles,
     combined_source_metadata,
     get_pk_column,
-    to_serializable,
 )
 
 if TYPE_CHECKING:

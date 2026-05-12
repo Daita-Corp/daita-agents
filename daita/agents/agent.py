@@ -819,12 +819,16 @@ class Agent(BaseAgent):
 
         # Add tool result messages
         for tool_call, result in zip(tool_calls, results):
+            content_result = result["result"]
+            compactor = getattr(self, "_compact_tool_result_for_context", None)
+            if callable(compactor):
+                content_result = compactor(tool_call["name"], content_result)
             conversation.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "name": tool_call["name"],
-                    "content": json.dumps(result["result"], default=_json_serializer),
+                    "content": json.dumps(content_result, default=_json_serializer),
                 }
             )
 
