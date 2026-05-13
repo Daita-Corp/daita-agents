@@ -26,6 +26,7 @@ from daita.agents.db.prompt import (
 from daita.agents.db.resolve import resolve_plugin as _db_resolve_plugin
 from daita.agents.db.schema import normalize_schema as _db_normalize_schema
 from daita.agents.db.summary import build_db_summary as _db_build_summary
+from daita.agents.db.navigation import find_join_paths as _db_find_join_paths
 from daita.agents.db.monitors import normalize_monitor_definition
 from daita.agents.db.findings import normalize_finding
 from daita.agents.db.memory import (
@@ -61,6 +62,106 @@ def _table(name, columns=None, row_count=None):
         {"name": "id", "type": "integer", "nullable": False, "is_primary_key": True}
     ]
     return {"name": name, "columns": columns, "row_count": row_count}
+
+
+class TestFromDbJoinPathNavigation:
+    def test_find_join_path_returns_sql_ready_predicates(self):
+        schema = _make_normalized_schema(
+            tables=[
+                _table("operations"),
+                _table("api_keys"),
+                _table("users"),
+            ],
+            fks=[
+                {
+                    "source_table": "operations",
+                    "source_column": "api_key_id",
+                    "target_table": "api_keys",
+                    "target_column": "api_key_id",
+                },
+                {
+                    "source_table": "api_keys",
+                    "source_column": "created_by",
+                    "target_table": "users",
+                    "target_column": "user_id",
+                },
+            ],
+        )
+
+        result = _db_find_join_paths(
+            schema,
+            from_tables=["operations"],
+            to_tables=["users"],
+        )
+
+        assert result["success"] is True
+        assert result["reachable"] is True
+        assert result["path_count"] == 1
+        path = result["paths"][0]
+        assert path["tables"] == ["operations", "api_keys", "users"]
+        assert [join["predicate"] for join in path["joins"]] == [
+            "operations.api_key_id = api_keys.api_key_id",
+            "api_keys.created_by = users.user_id",
+        ]
+
+    def test_find_join_path_warns_for_membership_bridge_paths(self):
+        schema = _make_normalized_schema(
+            tables=[
+                _table("operations"),
+                _table("organization"),
+                _table("organization_members"),
+                _table("users"),
+            ],
+            fks=[
+                {
+                    "source_table": "operations",
+                    "source_column": "organization_id",
+                    "target_table": "organization",
+                    "target_column": "organization_id",
+                },
+                {
+                    "source_table": "organization_members",
+                    "source_column": "organization_id",
+                    "target_table": "organization",
+                    "target_column": "organization_id",
+                },
+                {
+                    "source_table": "organization_members",
+                    "source_column": "user_id",
+                    "target_table": "users",
+                    "target_column": "user_id",
+                },
+            ],
+        )
+
+        result = _db_find_join_paths(
+            schema,
+            from_tables=["operations"],
+            to_tables=["users"],
+        )
+
+        assert result["reachable"] is True
+        assert result["paths"][0]["tables"] == [
+            "operations",
+            "organization",
+            "organization_members",
+            "users",
+        ]
+        assert result["paths"][0]["warnings"]
+
+    def test_find_join_path_reports_unknown_tables_with_candidates(self):
+        schema = _make_normalized_schema(tables=[_table("users")])
+
+        result = _db_find_join_paths(
+            schema,
+            from_tables=["user"],
+            to_tables=["users"],
+        )
+
+        assert result["success"] is False
+        assert result["reachable"] is False
+        assert result["errors"][0]["error"] == "table not found"
+        assert result["errors"][0]["candidates"]
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +497,7 @@ class TestBuildDbPrompt:
         assert "financial" in prompt
         assert "postgresql" in prompt
 
-    def test_prompt_budget_uses_column_count_not_just_table_count(self):
+    def test_prompt_budget_uses_retrieval_for_wide_schemas(self):
         from daita.agents.db.prompt import build_prompt_result
 
         tables = [
@@ -411,33 +512,18 @@ class TestBuildDbPrompt:
 
         result = build_prompt_result(schema, "analytics", None)
 
-        assert result.strategy == "compact"
+        assert result.strategy == "retrieval"
         assert result.column_count == 375
+        assert "Columns: col_0_0" not in result.prompt
         assert "| Column | Type | PK | Nullable |" not in result.prompt
-        assert result.estimated_tokens < 3500
+        assert "- wide_0" in result.prompt
 
-    def test_budget_presets_are_publicly_importable(self):
+    def test_prompt_policies_are_publicly_importable(self):
         from daita.agents.db import SchemaPromptPolicy as PublicSchemaPromptPolicy
         from daita.agents.db import ToolResultPolicy as PublicToolResultPolicy
 
         assert PublicSchemaPromptPolicy is SchemaPromptPolicy
         assert PublicToolResultPolicy is ToolResultPolicy
-
-    def test_budget_preset_retrieval_forces_retrieval_strategy(self):
-        from daita.agents.db.policies import schema_prompt_policy_for_budget
-        from daita.agents.db.prompt import build_prompt_result
-
-        schema = _make_normalized_schema(tables=[_table("orders", self._cols(["id"]))])
-
-        result = build_prompt_result(
-            schema,
-            "e-commerce",
-            None,
-            policy=schema_prompt_policy_for_budget("retrieval"),
-        )
-
-        assert result.strategy == "retrieval"
-        assert "db_search_schema" in result.prompt
 
     def test_invalid_policy_values_fail_fast(self):
         with pytest.raises(ValueError, match="max_inline_schema_tokens"):
@@ -630,12 +716,44 @@ class TestFromDbIntegration:
         assert call_kwargs["model"] == "gpt-4o"
         assert call_kwargs["api_key"] == "sk-test"
         assert call_kwargs["llm_provider"] == "openai"
+        assert call_kwargs["temperature"] == 0
 
-    async def test_from_db_budget_preset_controls_prompt_strategy(self):
+    async def test_from_db_preserves_explicit_temperature(self):
         from daita.agents.db import from_db
         import daita.agents.db.builder as fac
 
-        normalized = _make_normalized_schema(tables=[_table("orders")])
+        raw = self._pg_raw_schema()
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        mock_agent = MagicMock()
+        mock_agent.add_plugin = MagicMock()
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(
+                fac,
+                "discover_schema",
+                AsyncMock(return_value=_db_normalize_schema(raw)),
+            ),
+            patch("daita.agents.agent.Agent", return_value=mock_agent) as MockAgent,
+        ):
+            await from_db("postgresql://localhost/testdb", temperature=0.2)
+
+        assert MockAgent.call_args[1]["temperature"] == 0.2
+
+    async def test_from_db_uses_internal_prompt_budgeting(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+
+        normalized = _make_normalized_schema(
+            tables=[
+                _table(
+                    f"wide_{i}",
+                    [{"name": f"col_{j}", "type": "text"} for j in range(15)],
+                )
+                for i in range(25)
+            ]
+        )
         mock_plugin = MagicMock()
         mock_plugin.connect = AsyncMock()
         mock_agent = MagicMock()
@@ -646,11 +764,11 @@ class TestFromDbIntegration:
             patch.object(fac, "discover_schema", AsyncMock(return_value=normalized)),
             patch("daita.agents.agent.Agent", return_value=mock_agent),
         ):
-            await from_db("postgresql://localhost/testdb", budget="retrieval")
+            await from_db("postgresql://localhost/testdb")
 
         assert mock_agent._db_prompt_metadata["strategy"] == "retrieval"
 
-    async def test_from_db_schema_prompt_policy_overrides_budget_preset(self):
+    async def test_from_db_schema_prompt_policy_override_is_preserved(self):
         from daita.agents.db import from_db
         import daita.agents.db.builder as fac
 
@@ -667,7 +785,6 @@ class TestFromDbIntegration:
         ):
             await from_db(
                 "postgresql://localhost/testdb",
-                budget="retrieval",
                 schema_prompt_policy=SchemaPromptPolicy(),
             )
 
@@ -2499,6 +2616,39 @@ class TestFromDbQueryFacadeTools:
         assert result == {"rows": [{"x": 1}]}
         plugin._tool_query.assert_awaited_once_with({"sql": "SELECT 1"})
 
+    async def test_sql_facade_preflights_missing_column_before_query(self):
+        from daita.agents.db.tools.query_facade import create_db_query_tools
+
+        plugin = MagicMock()
+        plugin.sql_dialect = "postgresql"
+        plugin.read_only = True
+        plugin._tool_query = AsyncMock(return_value={"rows": []})
+        plugin._tool_count = AsyncMock(return_value={"count": 3})
+        plugin._tool_sample = AsyncMock(return_value={"rows": []})
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "users",
+                    columns=[
+                        {"name": "user_id", "type": "text"},
+                        {"name": "email", "type": "text"},
+                    ],
+                )
+            ]
+        )
+
+        tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+
+        result = await tools["db_query"].handler(
+            {"sql": "SELECT u.username FROM users u"}
+        )
+
+        assert result["error"] == "SQL preflight failed against known schema"
+        assert result["missing_columns"] == [
+            {"table": "users", "column": "username", "reason": "column not found"}
+        ]
+        plugin._tool_query.assert_not_awaited()
+
     async def test_mongo_facade_uses_document_store_capabilities(self):
         from daita.agents.db.tools.query_facade import create_db_query_tools
 
@@ -2672,8 +2822,51 @@ class TestDbResultCompaction:
         assert compacted["truncated"] is True
         assert "rows_preview" in compacted
 
+    def test_join_path_compaction_preserves_predicates(self):
+        from daita.agents.db.result_compaction import compact_tool_result_for_context
+
+        compacted = compact_tool_result_for_context(
+            "db_find_join_path",
+            {
+                "success": True,
+                "path_count": 1,
+                "paths": [
+                    {
+                        "tables": ["operations", "api_keys", "users"],
+                        "joins": [
+                            {
+                                "left_table": "operations",
+                                "left_column": "api_key_id",
+                                "right_table": "api_keys",
+                                "right_column": "api_key_id",
+                                "predicate": "operations.api_key_id = api_keys.api_key_id",
+                                "extra": "x" * 2000,
+                            }
+                        ],
+                        "predicate": "operations.api_key_id = api_keys.api_key_id",
+                        "confidence": 0.9,
+                        "warnings": ["creator path"],
+                    }
+                ],
+            },
+        )
+
+        path = compacted["paths"][0]
+        assert path["predicate"] == "operations.api_key_id = api_keys.api_key_id"
+        assert path["joins"][0]["predicate"] == (
+            "operations.api_key_id = api_keys.api_key_id"
+        )
+        assert "extra" not in path["joins"][0]
+
 
 class TestFromDbToolProfiles:
+    def test_schema_navigation_tools_are_not_terminal(self):
+        from daita.agents.db.run_context import TERMINAL_DB_TOOLS
+
+        assert "db_query" in TERMINAL_DB_TOOLS
+        assert "db_inspect_table" not in TERMINAL_DB_TOOLS
+        assert "db_find_join_path" not in TERMINAL_DB_TOOLS
+
     def test_simple_prompt_selects_core_and_schema_tools_only(self):
         from types import SimpleNamespace
         from daita.agents.db.tool_profiles import select_db_tools_for_prompt
@@ -2685,6 +2878,7 @@ class TestFromDbToolProfiles:
                     "db_count",
                     "db_search_schema",
                     "db_inspect_table",
+                    "db_find_join_path",
                     "pivot_table",
                     "forecast_trend",
                 ]
@@ -2695,11 +2889,35 @@ class TestFromDbToolProfiles:
         selected = select_db_tools_for_prompt(agent, "What were sales last month?")
 
         assert selected == [
-            "db_query",
-            "db_count",
             "db_search_schema",
             "db_inspect_table",
+            "db_find_join_path",
+            "db_query",
+            "db_count",
         ]
+
+    def test_schema_prompt_selects_schema_tools_only(self):
+        from types import SimpleNamespace
+        from daita.agents.db.tool_profiles import select_db_tools_for_prompt
+
+        agent = SimpleNamespace(
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_query",
+                    "db_count",
+                    "db_list_tables",
+                    "db_search_schema",
+                    "db_inspect_table",
+                ]
+            ),
+            _db_schema={"tables": []},
+        )
+
+        selected = select_db_tools_for_prompt(
+            agent, "What can you tell me about my traces table?"
+        )
+
+        assert selected == ["db_search_schema", "db_inspect_table", "db_list_tables"]
 
     def test_analysis_prompt_adds_matching_analyst_tool(self):
         from types import SimpleNamespace

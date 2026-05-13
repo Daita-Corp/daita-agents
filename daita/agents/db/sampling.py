@@ -5,6 +5,7 @@ Numeric column sampling and PII-column redaction patterns.
 import logging
 from typing import Any, Dict, List, TYPE_CHECKING
 
+from .schema import NUMERIC_TYPES, is_numeric_type
 from .tools._helpers import quote_id, quote_path, safe_query
 
 if TYPE_CHECKING:
@@ -40,28 +41,6 @@ PII_COLUMN_PATTERNS: List[str] = [
     "national_id",
 ]
 
-# Numeric SQL types eligible for sample-value collection
-NUMERIC_TYPES: List[str] = [
-    "integer",
-    "int",
-    "bigint",
-    "smallint",
-    "tinyint",
-    "numeric",
-    "decimal",
-    "float",
-    "double",
-    "real",
-    "number",
-    "money",
-    "smallmoney",
-    "int4",
-    "int8",
-    "int2",
-    "float4",
-    "float8",
-]
-
 
 async def sample_numeric_columns(
     plugin: "BaseDatabasePlugin",
@@ -85,9 +64,8 @@ async def sample_numeric_columns(
         tname = table["name"]
         for col in table.get("columns", []):
             col_name = col["name"]
-            col_type = col.get("type", "").lower()
 
-            if not any(nt in col_type for nt in NUMERIC_TYPES):
+            if not is_numeric_type(col.get("type", "")):
                 continue
 
             if redact_pii:

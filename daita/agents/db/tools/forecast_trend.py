@@ -10,6 +10,7 @@ from ....core.tools import AgentTool
 from ._helpers import (
     ensure_pandas,
     ensure_numpy,
+    make_analysis_tool,
     safe_query,
     source_metadata,
     to_serializable,
@@ -176,7 +177,7 @@ def create_forecast_trend_tool(
         except Exception as e:
             return {"success": False, "error": f"Trend forecast failed: {e}"}
 
-    return AgentTool(
+    return make_analysis_tool(
         name="forecast_trend",
         description=(
             "Fit a linear trend to time-series data and project forward. "
@@ -211,6 +212,4 @@ def create_forecast_trend_tool(
             "required": ["sql", "date_column", "metric_column"],
         },
         handler=handler,
-        category="analysis",
-        source="analyst_toolkit",
     )

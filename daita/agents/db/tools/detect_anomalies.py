@@ -10,6 +10,7 @@ from ....core.tools import AgentTool
 from ._helpers import (
     ensure_pandas,
     ensure_numpy,
+    make_analysis_tool,
     safe_query,
     source_metadata,
     to_serializable,
@@ -187,7 +188,7 @@ def create_detect_anomalies_tool(
         except Exception as e:
             return {"success": False, "error": f"Anomaly detection failed: {e}"}
 
-    return AgentTool(
+    return make_analysis_tool(
         name="detect_anomalies",
         description=(
             "Detect statistical outliers in a numeric column using z-score or IQR method. "
@@ -225,6 +226,4 @@ def create_detect_anomalies_tool(
             "required": ["sql", "column"],
         },
         handler=handler,
-        category="analysis",
-        source="analyst_toolkit",
     )

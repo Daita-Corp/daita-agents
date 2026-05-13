@@ -14,6 +14,7 @@ from ._helpers import (
     safe_query,
     to_serializable,
     get_pk_column,
+    make_analysis_tool,
 )
 
 if TYPE_CHECKING:
@@ -155,7 +156,7 @@ def create_find_similar_tool(
             **combined_source_metadata(query_results),
         }
 
-    return AgentTool(
+    return make_analysis_tool(
         name="find_similar",
         description=(
             "Find entities most similar to a reference entity using normalised Euclidean "
@@ -205,8 +206,6 @@ def create_find_similar_tool(
             "required": ["entity_table", "entity_id"],
         },
         handler=handler,
-        category="analysis",
-        source="analyst_toolkit",
     )
 
 

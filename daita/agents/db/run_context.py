@@ -2,6 +2,7 @@
 Compact per-run context for agents created by ``Agent.from_db()``.
 """
 
+import re
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -9,6 +10,8 @@ if TYPE_CHECKING:
 
 
 DEFAULT_CONTEXT_MAX_CHARS = 1600
+SCHEMA_HINT_MAX_TABLES = 5
+SCHEMA_HINT_MAX_RELATIONSHIPS = 5
 _ANALYST_TOOL_PREFIXES = (
     "pivot_",
     "correlate",
@@ -17,11 +20,26 @@ _ANALYST_TOOL_PREFIXES = (
     "find_",
     "forecast_",
 )
+TERMINAL_DB_TOOLS = (
+    "db_query",
+    "db_count",
+    "db_sample",
+    "db_find",
+    "db_aggregate",
+)
+SCHEMA_NAVIGATION_TOOLS = (
+    "db_list_tables",
+    "db_search_schema",
+    "db_inspect_table",
+    "db_describe_relationships",
+    "db_find_join_path",
+)
 
 
 def build_db_run_context(
     agent: "Agent",
     *,
+    prompt: str = "",
     max_chars: int = DEFAULT_CONTEXT_MAX_CHARS,
     memory_snippets: Optional[List[str]] = None,
 ) -> str:
@@ -37,7 +55,7 @@ def build_db_run_context(
 
     lines = [
         "<db_runtime_context>",
-        "Use this compact DB context for the current question; inspect schema tools when exact tables or columns are ambiguous.",
+        "Use this compact DB context for the current question; inspect schema tools when exact tables or columns are ambiguous. Do not ask for confirmation before read-only schema inspection, join-path lookup, SQL execution, or SQL repair.",
         (
             "Database: "
             f"type={schema.get('database_type', getattr(plugin, 'sql_dialect', 'unknown'))}, "
@@ -50,6 +68,7 @@ def build_db_run_context(
         "Query policy: " + _query_policy_summary(plugin),
         "Data health: " + _summary_line(summary),
         "Candidate metrics: " + _candidate_metrics_summary(summary),
+        "Schema hints: " + _schema_hint_summary(schema, prompt),
         "Capabilities: " + _capability_summary(agent, tool_names),
         "Memory: " + _memory_summary(agent, memory_snippets or []),
         "Drift: " + _drift_summary(drift),
@@ -62,13 +81,8 @@ def make_db_context_run(agent: "Agent", original_run: Callable) -> Callable:
     """Return a run wrapper that adds compact DB context to each prompt."""
 
     async def _db_context_run(prompt: str, **kwargs: Any):
-        from .memory import recall_db_memory_context
-        from .tool_profiles import select_db_tools_for_prompt
-
-        memory_snippets = await recall_db_memory_context(agent, prompt)
-        context = build_db_run_context(agent, memory_snippets=memory_snippets)
-        kwargs.setdefault("tools", select_db_tools_for_prompt(agent, prompt))
-        return await original_run(_augment_prompt(prompt, context), **kwargs)
+        augmented_prompt, kwargs = await _prepare_db_runtime_call(agent, prompt, kwargs)
+        return await original_run(augmented_prompt, **kwargs)
 
     return _db_context_run
 
@@ -77,13 +91,8 @@ def make_db_context_stream(agent: "Agent", original_stream: Callable) -> Callabl
     """Return a stream wrapper that adds compact DB context to each prompt."""
 
     async def _db_context_stream(prompt: str, **kwargs: Any):
-        from .memory import recall_db_memory_context
-        from .tool_profiles import select_db_tools_for_prompt
-
-        memory_snippets = await recall_db_memory_context(agent, prompt)
-        context = build_db_run_context(agent, memory_snippets=memory_snippets)
-        kwargs.setdefault("tools", select_db_tools_for_prompt(agent, prompt))
-        async for event in original_stream(_augment_prompt(prompt, context), **kwargs):
+        augmented_prompt, kwargs = await _prepare_db_runtime_call(agent, prompt, kwargs)
+        async for event in original_stream(augmented_prompt, **kwargs):
             yield event
 
     return _db_context_stream
@@ -91,6 +100,72 @@ def make_db_context_stream(agent: "Agent", original_stream: Callable) -> Callabl
 
 def _augment_prompt(prompt: str, context: str) -> str:
     return f"{context}\n\nUser question:\n{prompt}"
+
+
+async def _prepare_db_runtime_call(
+    agent: "Agent", prompt: str, kwargs: Dict[str, Any]
+) -> tuple[str, Dict[str, Any]]:
+    from .memory import recall_db_memory_context
+    from .tool_profiles import select_db_tools_for_prompt
+
+    memory_snippets = await recall_db_memory_context(agent, prompt)
+    context = build_db_run_context(
+        agent, prompt=prompt, memory_snippets=memory_snippets
+    )
+    selected_tools = select_db_tools_for_prompt(agent, prompt)
+    agent._db_last_context_metadata = _context_metadata(context, selected_tools, prompt)
+    kwargs.setdefault("tools", selected_tools)
+    if kwargs.get("initial_messages"):
+        kwargs["initial_messages"] = _compact_initial_messages(
+            kwargs["initial_messages"]
+        )
+    kwargs.setdefault("final_synthesis_without_tools", True)
+    kwargs.setdefault("terminal_tools", TERMINAL_DB_TOOLS)
+    return _augment_prompt(prompt, context), kwargs
+
+
+def _context_metadata(
+    context: str, selected_tools: List[str], prompt: str
+) -> Dict[str, Any]:
+    return {
+        "runtime_context_chars": len(context),
+        "runtime_context_tokens_estimate": max(1, (len(context) + 3) // 4),
+        "selected_tools": list(selected_tools),
+        "selected_tool_count": len(selected_tools),
+        "prompt_terms": _prompt_terms(prompt),
+    }
+
+
+def _compact_initial_messages(messages: Any) -> Any:
+    if not isinstance(messages, list):
+        return messages
+    compacted: List[Dict[str, Any]] = []
+    for message in messages[-6:]:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            compacted.append(message)
+            continue
+        compacted.append({"role": role, "content": _compact_history_content(content)})
+    return compacted
+
+
+def _compact_history_content(content: str) -> str:
+    content = _strip_runtime_context(content).strip()
+    if len(content) <= 900:
+        return content
+    return content[:897].rstrip() + "..."
+
+
+def _strip_runtime_context(content: str) -> str:
+    return re.sub(
+        r"<db_runtime_context>.*?</db_runtime_context>\s*",
+        "",
+        content,
+        flags=re.DOTALL,
+    )
 
 
 def _query_policy_summary(plugin: Any) -> str:
@@ -175,6 +250,103 @@ def _candidate_metrics_summary(summary: Dict[str, Any]) -> str:
         return "none"
     names = [m.get("name", "") for m in metrics if m.get("name")]
     return _truncate_line(", ".join(names[:5]), 240)
+
+
+def _schema_hint_summary(schema: Dict[str, Any], prompt: str) -> str:
+    if not schema or not prompt:
+        return "use schema tools as needed"
+
+    terms = _prompt_terms(prompt)
+    if not terms:
+        return "use schema tools as needed"
+
+    tables = schema.get("tables", []) or []
+    selected = []
+    for table in tables:
+        name = str(table.get("name", ""))
+        if not name:
+            continue
+        haystack = " ".join(
+            [name.replace("_", " ")]
+            + [
+                str(col.get("name", "")).replace("_", " ")
+                for col in table.get("columns", []) or []
+            ]
+        ).lower()
+        if any(term in haystack for term in terms):
+            selected.append(table)
+        if len(selected) >= SCHEMA_HINT_MAX_TABLES:
+            break
+
+    if not selected:
+        return "use db_search_schema for relevant tables"
+
+    selected_names = {str(table.get("name")) for table in selected}
+    parts = []
+    for table in selected:
+        col_names = [
+            str(col.get("name"))
+            for col in table.get("columns", []) or []
+            if col.get("name")
+            and any(term in str(col.get("name", "")).lower() for term in terms)
+        ][:4]
+        if col_names:
+            parts.append(f"{table.get('name')}({', '.join(col_names)})")
+        else:
+            parts.append(str(table.get("name")))
+
+    relationships = []
+    for fk in schema.get("foreign_keys", []) or []:
+        if (
+            str(fk.get("source_table")) in selected_names
+            or str(fk.get("target_table")) in selected_names
+        ):
+            relationships.append(
+                f"{fk.get('source_table')}.{fk.get('source_column')}->{fk.get('target_table')}.{fk.get('target_column')}"
+            )
+        if len(relationships) >= SCHEMA_HINT_MAX_RELATIONSHIPS:
+            break
+    if relationships:
+        parts.append("rels=" + ", ".join(relationships))
+    return _truncate_line("; ".join(parts), 500)
+
+
+def _prompt_terms(prompt: str) -> List[str]:
+    raw_terms = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{2,}", prompt.lower())
+    stopwords = {
+        "about",
+        "also",
+        "can",
+        "column",
+        "columns",
+        "could",
+        "database",
+        "for",
+        "from",
+        "how",
+        "into",
+        "kind",
+        "tell",
+        "table",
+        "tables",
+        "that",
+        "the",
+        "this",
+        "what",
+        "when",
+        "where",
+        "which",
+        "with",
+        "you",
+        "your",
+    }
+    terms = []
+    for term in raw_terms:
+        singular = term[:-1] if term.endswith("s") and len(term) > 3 else term
+        for candidate in (term, singular):
+            if candidate not in stopwords and candidate not in terms:
+                terms.append(candidate)
+    return terms[:12]
 
 
 def _plugin_database_name(plugin: Any) -> Any:

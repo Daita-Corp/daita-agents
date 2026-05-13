@@ -8,7 +8,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
-from .sampling import NUMERIC_TYPES
+from .schema import is_numeric_type
 
 if TYPE_CHECKING:
     from ..agent import Agent
@@ -285,8 +285,7 @@ def _numeric_columns(schema: Dict[str, Any]) -> List[Dict[str, Any]]:
     numeric_cols: List[Dict[str, Any]] = []
     for table in schema.get("tables", []):
         for col in table.get("columns", []):
-            col_type = str(col.get("type", "")).lower()
-            if any(nt in col_type for nt in NUMERIC_TYPES):
+            if is_numeric_type(col.get("type", "")):
                 entry: Dict[str, Any] = {
                     "table": table["name"],
                     "column": col["name"],

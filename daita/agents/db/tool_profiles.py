@@ -11,6 +11,7 @@ WRITE_QUERY_TOOLS = ("db_execute",)
 SCHEMA_TOOLS = (
     "db_search_schema",
     "db_inspect_table",
+    "db_find_join_path",
     "db_describe_relationships",
     "db_list_tables",
 )
@@ -24,6 +25,55 @@ ANALYST_TOOL_INTENTS = {
 }
 QUALITY_KEYWORDS = ("quality", "freshness", "completeness", "null rate", "profile")
 LINEAGE_KEYWORDS = ("lineage", "dependency", "depends on", "upstream", "downstream")
+SCHEMA_KEYWORDS = (
+    "schema",
+    "table",
+    "tables",
+    "column",
+    "columns",
+    "describe",
+    "structure",
+    "relationship",
+    "relationships",
+)
+QUERY_KEYWORDS = (
+    "how many",
+    "count",
+    "total",
+    "sum",
+    "average",
+    "avg",
+    "minimum",
+    "maximum",
+    "min ",
+    "max ",
+    "list",
+    "show",
+    "find",
+    "lookup",
+    "which",
+    "what is",
+    "who is",
+)
+DATA_QUERY_KEYWORDS = (
+    "row",
+    "rows",
+    "record",
+    "records",
+    "data",
+    "value",
+    "values",
+    "where",
+    "filter",
+)
+INFERENCE_ONLY_KEYWORDS = (
+    "what kind",
+    "what type",
+    "describe this database",
+    "tell me about this database",
+    "company",
+    "business",
+)
 WRITE_KEYWORDS = (
     "insert",
     "update",
@@ -38,11 +88,13 @@ WRITE_KEYWORDS = (
 def select_db_tools_for_prompt(agent: Any, prompt: str) -> List[str]:
     available = set(getattr(agent.tool_registry, "tool_names", []))
     selected: List[str] = []
+    text = prompt.lower()
 
-    _extend_available(selected, available, CORE_QUERY_TOOLS)
     _extend_available(selected, available, SCHEMA_TOOLS)
 
-    text = prompt.lower()
+    if _needs_query_tools(text):
+        _extend_available(selected, available, CORE_QUERY_TOOLS)
+
     selected.extend(_explicitly_mentioned_tools(available, text))
 
     for tool_name, keywords in ANALYST_TOOL_INTENTS.items():
@@ -66,6 +118,18 @@ def select_db_tools_for_prompt(agent: Any, prompt: str) -> List[str]:
         selected.extend(name for name in available if name.endswith("_vector_search"))
 
     return _dedupe([name for name in selected if name in available])
+
+
+def _needs_query_tools(text: str) -> bool:
+    if any(keyword in text for keyword in SCHEMA_KEYWORDS) and not any(
+        keyword in text for keyword in DATA_QUERY_KEYWORDS
+    ):
+        return False
+    if any(keyword in text for keyword in INFERENCE_ONLY_KEYWORDS):
+        return False
+    if any(keyword in text for keyword in QUERY_KEYWORDS):
+        return True
+    return True
 
 
 def _explicitly_mentioned_tools(available: set[str], text: str) -> List[str]:

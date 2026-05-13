@@ -9,32 +9,11 @@ from decimal import Decimal
 from inspect import iscoroutinefunction
 from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
 
+from ....core.tools import AgentTool
+from ..schema import is_numeric_type
+
 if TYPE_CHECKING:
     from ....plugins.base_db import BaseDatabasePlugin
-
-# ---------------------------------------------------------------------------
-# SQL type constants
-# ---------------------------------------------------------------------------
-
-NUMERIC_TYPES = {
-    "int",
-    "integer",
-    "bigint",
-    "smallint",
-    "tinyint",
-    "float",
-    "double",
-    "real",
-    "decimal",
-    "numeric",
-    "number",
-    "money",
-    "currency",
-    "int4",
-    "int8",
-    "float4",
-    "float8",
-}
 
 
 @dataclass
@@ -96,6 +75,23 @@ def ensure_numpy():
         )
 
 
+def make_analysis_tool(
+    *,
+    name: str,
+    description: str,
+    parameters: Dict[str, Any],
+    handler: Any,
+) -> AgentTool:
+    return AgentTool(
+        name=name,
+        description=description,
+        parameters=parameters,
+        handler=handler,
+        category="analysis",
+        source="analyst_toolkit",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Schema introspection helpers
 # ---------------------------------------------------------------------------
@@ -118,7 +114,7 @@ def get_numeric_columns(schema: Dict[str, Any], table: str) -> List[str]:
             return [
                 col["name"]
                 for col in t.get("columns", [])
-                if any(nt in col.get("type", "").lower() for nt in NUMERIC_TYPES)
+                if is_numeric_type(col.get("type", ""))
             ]
     return []
 

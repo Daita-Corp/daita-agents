@@ -12,6 +12,7 @@ from typing import Any, Dict
 from ....core.tools import AgentTool
 from ..navigation import (
     describe_relationships,
+    find_join_paths,
     inspect_table,
     list_tables,
     search_schema,
@@ -23,17 +24,15 @@ def create_db_list_tables_tool(schema: Dict[str, Any]) -> AgentTool:
         return list_tables(
             schema,
             pattern=args.get("pattern"),
-            limit=args.get("limit", 50),
+            limit=args.get("limit", 30),
             offset=args.get("offset", 0),
         )
 
-    return AgentTool(
+    return _schema_tool(
         name="db_list_tables",
         description=(
-            "List bounded table metadata from the discovered schema. Use this before "
-            "writing SQL when the schema is large, omitted from the prompt, or table "
-            "names are ambiguous. Returns table names, row counts, and column counts; "
-            "never returns row data."
+            "List discovered table names with row/column counts. Use when table names "
+            "are ambiguous. Never returns row data."
         ),
         parameters={
             "type": "object",
@@ -44,7 +43,7 @@ def create_db_list_tables_tool(schema: Dict[str, Any]) -> AgentTool:
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum tables to return, capped at 100. Default 50.",
+                    "description": "Maximum tables to return, capped at 100. Default 30.",
                 },
                 "offset": {
                     "type": "integer",
@@ -54,7 +53,6 @@ def create_db_list_tables_tool(schema: Dict[str, Any]) -> AgentTool:
             "required": [],
         },
         handler=handler,
-        category="schema",
     )
 
 
@@ -63,16 +61,14 @@ def create_db_search_schema_tool(schema: Dict[str, Any]) -> AgentTool:
         return search_schema(
             schema,
             query=args.get("query") or "",
-            limit=args.get("limit", 20),
+            limit=args.get("limit", 12),
         )
 
-    return AgentTool(
+    return _schema_tool(
         name="db_search_schema",
         description=(
-            "Search discovered schema metadata by table or column terms. Use this "
-            "to find tables omitted from a large schema prompt before calling query "
-            "tools. Returns bounded table matches and matching columns; never returns "
-            "row data."
+            "Search discovered table and column metadata by terms. Use before SQL when "
+            "the relevant table is unclear. Never returns row data."
         ),
         parameters={
             "type": "object",
@@ -83,13 +79,12 @@ def create_db_search_schema_tool(schema: Dict[str, Any]) -> AgentTool:
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum table matches to return, capped at 50. Default 20.",
+                    "description": "Maximum table matches to return, capped at 50. Default 12.",
                 },
             },
             "required": ["query"],
         },
         handler=handler,
-        category="schema",
     )
 
 
@@ -100,17 +95,16 @@ def create_db_inspect_table_tool(schema: Dict[str, Any], plugin: Any) -> AgentTo
             table_name=args.get("table_name") or "",
             column_pattern=args.get("column_pattern"),
             include_columns=args.get("include_columns", True),
-            limit=args.get("limit", 100),
+            limit=args.get("limit", 40),
             offset=args.get("offset", 0),
             blocked_columns=getattr(plugin, "blocked_columns", set()),
         )
 
-    return AgentTool(
+    return _schema_tool(
         name="db_inspect_table",
         description=(
-            "Inspect bounded metadata for one discovered table, including a paged "
-            "column list and FK relationships. Use after db_search_schema or "
-            "db_list_tables to identify exact columns before SQL. Never returns rows."
+            "Inspect bounded metadata for one table, including columns and FK links. "
+            "Use after db_search_schema. Never returns rows."
         ),
         parameters={
             "type": "object",
@@ -129,7 +123,7 @@ def create_db_inspect_table_tool(schema: Dict[str, Any], plugin: Any) -> AgentTo
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum columns to return, capped at 200. Default 100.",
+                    "description": "Maximum columns to return, capped at 200. Default 40.",
                 },
                 "offset": {
                     "type": "integer",
@@ -139,7 +133,6 @@ def create_db_inspect_table_tool(schema: Dict[str, Any], plugin: Any) -> AgentTo
             "required": ["table_name"],
         },
         handler=handler,
-        category="schema",
     )
 
 
@@ -148,14 +141,13 @@ def create_db_describe_relationships_tool(schema: Dict[str, Any]) -> AgentTool:
         return describe_relationships(
             schema,
             table_name=args.get("table_name"),
-            limit=args.get("limit", 50),
+            limit=args.get("limit", 24),
         )
 
-    return AgentTool(
+    return _schema_tool(
         name="db_describe_relationships",
         description=(
-            "Describe discovered foreign-key relationships, optionally scoped to "
-            "one table. Use this before joins in large or ambiguous schemas."
+            "Describe discovered foreign-key relationships, optionally scoped to one table."
         ),
         parameters={
             "type": "object",
@@ -166,13 +158,57 @@ def create_db_describe_relationships_tool(schema: Dict[str, Any]) -> AgentTool:
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum relationships to return, capped at 100. Default 50.",
+                    "description": "Maximum relationships to return, capped at 100. Default 24.",
                 },
             },
             "required": [],
         },
         handler=handler,
-        category="schema",
+    )
+
+
+def create_db_find_join_path_tool(schema: Dict[str, Any]) -> AgentTool:
+    async def handler(args: Dict[str, Any]) -> Dict[str, Any]:
+        return find_join_paths(
+            schema,
+            from_tables=args.get("from_tables") or [],
+            to_tables=args.get("to_tables") or [],
+            max_hops=args.get("max_hops", 4),
+            max_paths=args.get("max_paths", 5),
+        )
+
+    return _schema_tool(
+        name="db_find_join_path",
+        description=(
+            "Find SQL-ready foreign-key join paths between tables. Use before SQL "
+            "when a question requires joining facts to entities through one or more "
+            "relationships. Returns tables, join predicates, confidence, and warnings."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "from_tables": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Starting table names, usually fact/event tables.",
+                },
+                "to_tables": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Target table names, usually entity/dimension tables.",
+                },
+                "max_hops": {
+                    "type": "integer",
+                    "description": "Maximum FK hops to traverse, capped at 6. Default 4.",
+                },
+                "max_paths": {
+                    "type": "integer",
+                    "description": "Maximum paths to return, capped at 8. Default 5.",
+                },
+            },
+            "required": ["from_tables", "to_tables"],
+        },
+        handler=handler,
     )
 
 
@@ -185,6 +221,23 @@ def register_schema_navigation_tools(
         create_db_list_tables_tool(schema),
         create_db_search_schema_tool(schema),
         create_db_inspect_table_tool(schema, plugin),
+        create_db_find_join_path_tool(schema),
         create_db_describe_relationships_tool(schema),
     ):
         agent.tool_registry.register(tool)
+
+
+def _schema_tool(
+    *,
+    name: str,
+    description: str,
+    parameters: Dict[str, Any],
+    handler: Any,
+) -> AgentTool:
+    return AgentTool(
+        name=name,
+        description=description,
+        parameters=parameters,
+        handler=handler,
+        category="schema",
+    )

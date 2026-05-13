@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+from collections import deque
 from typing import Any, Dict, Iterable, List, Optional
 
 SCHEMA_NAVIGATION_TABLE_THRESHOLD = 30
@@ -18,6 +19,8 @@ MAX_TABLE_LIST_LIMIT = 100
 MAX_SEARCH_LIMIT = 50
 MAX_INSPECT_COLUMNS_LIMIT = 200
 MATCHED_COLUMNS_LIMIT = 12
+MAX_JOIN_HOPS = 6
+MAX_JOIN_PATHS = 8
 
 
 def should_register_schema_navigation(schema: Dict[str, Any]) -> bool:
@@ -173,6 +176,60 @@ def describe_relationships(
     }
 
 
+def find_join_paths(
+    schema: Dict[str, Any],
+    *,
+    from_tables: List[str],
+    to_tables: List[str],
+    max_hops: int = 4,
+    max_paths: int = 5,
+) -> Dict[str, Any]:
+    """Find SQL-ready FK join paths between tables in the discovered schema."""
+    sources, source_errors = _resolve_table_refs(schema, from_tables)
+    targets, target_errors = _resolve_table_refs(schema, to_tables)
+    errors = source_errors + target_errors
+    max_hops = _clamp_int(max_hops, default=4, minimum=1, maximum=MAX_JOIN_HOPS)
+    max_paths = _clamp_int(max_paths, default=5, minimum=1, maximum=MAX_JOIN_PATHS)
+
+    if errors or not sources or not targets:
+        return {
+            "success": False,
+            "from_tables": from_tables,
+            "to_tables": to_tables,
+            "max_hops": max_hops,
+            "path_count": 0,
+            "reachable": False,
+            "errors": errors or ["from_tables and to_tables are required"],
+        }
+
+    adjacency = _join_adjacency(schema)
+    target_set = set(targets)
+    paths = []
+    for source in sources:
+        queue = deque([(source, [source], [])])
+        while queue and len(paths) < max_paths:
+            current, tables, joins = queue.popleft()
+            if current in target_set and joins:
+                paths.append(_join_path_result(tables, joins))
+                continue
+            if len(joins) >= max_hops:
+                continue
+            for next_table, join in adjacency.get(current, []):
+                if next_table in tables:
+                    continue
+                queue.append((next_table, tables + [next_table], joins + [join]))
+
+    return {
+        "success": True,
+        "from_tables": sources,
+        "to_tables": targets,
+        "max_hops": max_hops,
+        "path_count": len(paths),
+        "reachable": bool(paths),
+        "paths": paths,
+    }
+
+
 def _score_table(table: Dict[str, Any], tokens: List[str]) -> tuple[float, list, list]:
     if not tokens:
         return 0.0, [], []
@@ -252,6 +309,113 @@ def _relationship_summary(fk: Dict[str, Any]) -> Dict[str, Any]:
         "source_column": fk.get("source_column"),
         "target_table": fk.get("target_table"),
         "target_column": fk.get("target_column"),
+    }
+
+
+def _resolve_table_refs(
+    schema: Dict[str, Any], table_names: List[str]
+) -> tuple[List[str], List[Dict[str, Any]]]:
+    resolved = []
+    errors = []
+    for raw_name in table_names or []:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        matches = _matching_tables(schema, name)
+        if len(matches) == 1:
+            resolved.append(str(matches[0].get("name")))
+            continue
+        candidates = search_schema(schema, query=name, limit=5)["tables"]
+        errors.append(
+            {
+                "table": name,
+                "error": "ambiguous table" if matches else "table not found",
+                "matches": [_table_summary(match) for match in matches[:5]],
+                "candidates": candidates,
+            }
+        )
+    return _dedupe(resolved), errors
+
+
+def _matching_tables(schema: Dict[str, Any], table_name: str) -> List[Dict[str, Any]]:
+    wanted = table_name.strip().lower()
+    if not wanted:
+        return []
+    exact = [
+        table
+        for table in schema.get("tables", []) or []
+        if str(table.get("name", "")).lower() == wanted
+    ]
+    if exact:
+        return exact
+    return [
+        table
+        for table in schema.get("tables", []) or []
+        if _short_table_name(str(table.get("name", ""))) == wanted
+    ]
+
+
+def _join_adjacency(
+    schema: Dict[str, Any],
+) -> Dict[str, List[tuple[str, Dict[str, Any]]]]:
+    adjacency: Dict[str, List[tuple[str, Dict[str, Any]]]] = {}
+    for fk in schema.get("foreign_keys", []) or []:
+        source_table = str(fk.get("source_table") or "")
+        source_column = str(fk.get("source_column") or "")
+        target_table = str(fk.get("target_table") or "")
+        target_column = str(fk.get("target_column") or "")
+        if not all((source_table, source_column, target_table, target_column)):
+            continue
+        forward = {
+            "left_table": source_table,
+            "left_column": source_column,
+            "right_table": target_table,
+            "right_column": target_column,
+            "predicate": (
+                f"{source_table}.{source_column} = "
+                f"{target_table}.{target_column}"
+            ),
+            "relationship_direction": "forward",
+        }
+        reverse = {
+            "left_table": target_table,
+            "left_column": target_column,
+            "right_table": source_table,
+            "right_column": source_column,
+            "predicate": (
+                f"{target_table}.{target_column} = "
+                f"{source_table}.{source_column}"
+            ),
+            "relationship_direction": "reverse",
+        }
+        adjacency.setdefault(source_table, []).append((target_table, forward))
+        adjacency.setdefault(target_table, []).append((source_table, reverse))
+    return adjacency
+
+
+def _join_path_result(
+    tables: List[str], joins: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    hop_count = len(joins)
+    if hop_count <= 1:
+        confidence = "high"
+    elif hop_count <= 3:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    warnings = []
+    bridge_tables = [table for table in tables[1:-1] if table.endswith("_members")]
+    if bridge_tables:
+        warnings.append(
+            "Path crosses membership-style bridge tables; check whether this "
+            "attributes facts to all members or to a specific actor."
+        )
+    return {
+        "tables": tables,
+        "hop_count": hop_count,
+        "joins": joins,
+        "confidence": confidence,
+        "warnings": warnings,
     }
 
 
@@ -340,3 +504,14 @@ def _truncate(value: str, max_chars: int) -> str:
     if len(value) <= max_chars:
         return value
     return value[: max_chars - 3].rstrip() + "..."
+
+
+def _dedupe(values: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out

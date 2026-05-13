@@ -316,6 +316,44 @@ class TestLoopDetection:
             await agent.run("please call fail_tool")
 
 
+class TestFinalSynthesisWithoutTools:
+    async def test_terminal_tool_can_disable_tools_for_final_turn(self):
+        async def lookup(args):
+            return {"answer": 42}
+
+        lookup_tool = AgentTool(
+            name="lookup",
+            description="look up a value",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=lookup,
+        )
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "c1", "name": "lookup", "arguments": {}}
+                    ],
+                },
+                "The answer is 42.",
+            ]
+        )
+        agent = Agent(name="SynthAgent", llm_provider=llm, tools=[lookup_tool])
+
+        result = await agent.run(
+            "look it up",
+            tools=["lookup"],
+            final_synthesis_without_tools=True,
+            terminal_tools=("lookup",),
+        )
+
+        assert result == "The answer is 42."
+        assert [tool["function"]["name"] for tool in llm.call_history[0]["tools"]] == [
+            "lookup"
+        ]
+        assert llm.call_history[1]["tools"] in (None, [])
+
+
 # ---------------------------------------------------------------------------
 # Run timeout
 # ---------------------------------------------------------------------------

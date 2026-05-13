@@ -11,6 +11,7 @@ from ._helpers import (
     build_entity_profiles,
     combined_source_metadata,
     get_pk_column,
+    make_analysis_tool,
 )
 
 if TYPE_CHECKING:
@@ -102,7 +103,7 @@ def create_compare_entities_tool(
             **combined_source_metadata(profile_result.query_results),
         }
 
-    return AgentTool(
+    return make_analysis_tool(
         name="compare_entities",
         description=(
             "Compare two or more entities (e.g. customers, products, employees) side by side "
@@ -142,6 +143,4 @@ def create_compare_entities_tool(
             "required": ["entity_table", "entity_ids"],
         },
         handler=handler,
-        category="analysis",
-        source="analyst_toolkit",
     )

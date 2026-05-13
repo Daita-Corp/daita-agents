@@ -2,7 +2,9 @@
 Compact schema and data-health summary for agents created by ``from_db()``.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+from .schema import is_numeric_type
 
 _TIMESTAMP_HINTS = (
     "created_at",
@@ -132,7 +134,9 @@ def _classify_tables(
         lowered = name.lower()
         if not any(h in lowered for h in hints):
             continue
-        if require_numeric and not any(_is_numeric(c.get("type", "")) for c in columns):
+        if require_numeric and not any(
+            is_numeric_type(c.get("type", "")) for c in columns
+        ):
             continue
         if require_pk and not any(c.get("is_primary_key") for c in columns):
             continue
@@ -205,23 +209,6 @@ def _candidate_metrics(
             }
         )
     return metrics
-
-
-def _is_numeric(type_name: Optional[str]) -> bool:
-    lowered = (type_name or "").lower()
-    return any(
-        token in lowered
-        for token in (
-            "int",
-            "numeric",
-            "decimal",
-            "float",
-            "double",
-            "real",
-            "number",
-            "money",
-        )
-    )
 
 
 def _dedupe(values: List[str]) -> List[str]:

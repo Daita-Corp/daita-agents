@@ -20,6 +20,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 SCHEMA_FALLBACK_CONCURRENCY = 10
+NUMERIC_TYPES = (
+    "int",
+    "integer",
+    "bigint",
+    "smallint",
+    "tinyint",
+    "float",
+    "double",
+    "real",
+    "decimal",
+    "numeric",
+    "number",
+    "money",
+    "currency",
+    "smallmoney",
+    "int2",
+    "int4",
+    "int8",
+    "float4",
+    "float8",
+)
 
 _DB_NORMALIZERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "postgresql": normalize_postgresql,
@@ -32,6 +53,12 @@ def normalize_schema(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize DB discovery output into the compact ``from_db`` schema shape."""
     handler = _DB_NORMALIZERS.get(raw.get("database_type", "unknown"))
     return handler(raw) if handler else raw
+
+
+def is_numeric_type(type_name: Optional[str]) -> bool:
+    """Return True when a database type string looks numeric."""
+    lowered = (type_name or "").lower()
+    return any(token in lowered for token in NUMERIC_TYPES)
 
 
 # ---------------------------------------------------------------------------

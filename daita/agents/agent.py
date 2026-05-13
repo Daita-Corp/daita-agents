@@ -67,6 +67,22 @@ def _make_error_fingerprint(tool_call: Dict[str, Any]) -> str:
     return f"{tool_call['name']}:{args_hash}"
 
 
+def _has_terminal_tool_result(
+    results: List[Dict[str, Any]], terminal_tools: set[str]
+) -> bool:
+    """Return True when a configured terminal tool completed without an error."""
+    if not terminal_tools:
+        return False
+    for result in results:
+        if result.get("tool") not in terminal_tools:
+            continue
+        raw = result.get("result")
+        if isinstance(raw, dict) and raw.get("error"):
+            continue
+        return True
+    return False
+
+
 def _json_serializer(obj):
     """
     Custom JSON serializer for types commonly returned by database plugins.
@@ -961,6 +977,11 @@ class Agent(BaseAgent):
 
         # Prepare tools with focus wrapping
         resolved_tools = await self._prepare_tools_with_focus(tools)
+        active_tools = resolved_tools
+        final_synthesis_without_tools = bool(
+            kwargs.pop("final_synthesis_without_tools", False)
+        )
+        terminal_tools = set(kwargs.pop("terminal_tools", []) or [])
 
         # Reset tool call history for this execution
         self._tool_call_history = []
@@ -987,11 +1008,11 @@ class Agent(BaseAgent):
             # Get LLM response (streaming or non-streaming based on on_event)
             if on_event:
                 llm_result = await self._stream_llm_turn(
-                    conversation, resolved_tools, on_event, **kwargs
+                    conversation, active_tools, on_event, **kwargs
                 )
             else:
                 llm_result = await self._nonstream_llm_turn(
-                    conversation, resolved_tools, **kwargs
+                    conversation, active_tools, **kwargs
                 )
 
             # Check if LLM wants to call tools
@@ -1000,7 +1021,7 @@ class Agent(BaseAgent):
                 results = []
                 for tool_call in llm_result.tool_calls:
                     result = await self._execute_and_track_tool(
-                        tool_call, resolved_tools, on_event
+                        tool_call, active_tools, on_event
                     )
                     tools_called.append(result)
                     results.append(result)
@@ -1021,6 +1042,12 @@ class Agent(BaseAgent):
 
                 # Add to conversation and continue loop
                 self._append_tool_messages(conversation, llm_result.tool_calls, results)
+                if final_synthesis_without_tools and _has_terminal_tool_result(
+                    results, terminal_tools
+                ):
+                    active_tools = []
+                else:
+                    active_tools = resolved_tools
                 continue
 
             # Final answer received
@@ -1029,8 +1056,17 @@ class Agent(BaseAgent):
             )
 
         # Max iterations reached without final answer
+        token_stats = self.llm.get_token_stats() if self.llm is not None else {}
         raise AgentError(
-            f"Max iterations ({max_iterations}) reached without final answer"
+            f"Max iterations ({max_iterations}) reached without final answer",
+            agent_id=self.agent_id,
+            task=prompt,
+            context={
+                "max_iterations": max_iterations,
+                "iterations": max_iterations,
+                "tool_calls": tools_called,
+                "tokens": token_stats,
+            },
         )
 
     # ========================================================================

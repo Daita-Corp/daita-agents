@@ -18,7 +18,8 @@ class SchemaPromptPolicy:
     max_inline_tables: int = 12
     max_inline_columns: int = 120
     compact_table_limit: int = 80
-    summary_table_limit: int = 200
+    summary_table_limit: int = 40
+    max_inline_relationships: int = 12
     include_column_comments: bool = False
     include_sample_values: bool = False
     relationship_mode: str = "summary"
@@ -30,6 +31,7 @@ class SchemaPromptPolicy:
         _require_positive("max_inline_columns", self.max_inline_columns)
         _require_positive("compact_table_limit", self.compact_table_limit)
         _require_positive("summary_table_limit", self.summary_table_limit)
+        _require_positive("max_inline_relationships", self.max_inline_relationships)
         if self.relationship_mode not in {"summary", "full"}:
             raise ValueError("relationship_mode must be 'summary' or 'full'")
         if self.preferred_strategy not in {"auto", "full", "compact", "retrieval"}:
@@ -55,9 +57,9 @@ class PromptBuildResult:
 class ToolResultPolicy:
     """Controls for compacting DB tool results before LLM synthesis turns."""
 
-    max_result_tokens: int = 1200
-    max_rows_inline: int = 20
-    max_cell_chars: int = 300
+    max_result_tokens: int = 800
+    max_rows_inline: int = 12
+    max_cell_chars: int = 220
     summarize_large_json: bool = True
     omitted_column_patterns: list[str] = field(
         default_factory=lambda: [
@@ -85,23 +87,28 @@ def schema_prompt_policy_for_budget(budget: BudgetPreset) -> SchemaPromptPolicy:
             max_inline_schema_tokens=6000,
             max_inline_tables=30,
             max_inline_columns=300,
+            summary_table_limit=80,
+            max_inline_relationships=50,
             preferred_strategy="full",
         )
     if budget == "compact":
         return SchemaPromptPolicy(
-            max_inline_schema_tokens=2000,
+            max_inline_schema_tokens=1800,
             max_inline_tables=8,
             max_inline_columns=80,
-            compact_table_limit=60,
+            compact_table_limit=30,
+            summary_table_limit=40,
+            max_inline_relationships=16,
             preferred_strategy="compact",
         )
     if budget == "retrieval":
         return SchemaPromptPolicy(
-            max_inline_schema_tokens=1200,
+            max_inline_schema_tokens=1000,
             max_inline_tables=4,
             max_inline_columns=40,
-            compact_table_limit=20,
-            summary_table_limit=120,
+            compact_table_limit=12,
+            summary_table_limit=30,
+            max_inline_relationships=8,
             preferred_strategy="retrieval",
         )
     raise ValueError("budget must be 'auto', 'full', 'compact', or 'retrieval'")

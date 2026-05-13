@@ -7,7 +7,13 @@ from __future__ import annotations
 from typing import Any, Dict, TYPE_CHECKING
 
 from ....core.tools import AgentTool
-from ._helpers import ensure_pandas, safe_query, source_metadata, to_serializable
+from ._helpers import (
+    ensure_pandas,
+    make_analysis_tool,
+    safe_query,
+    source_metadata,
+    to_serializable,
+)
 
 if TYPE_CHECKING:
     from ....plugins.base_db import BaseDatabasePlugin
@@ -94,7 +100,7 @@ def create_pivot_table_tool(
         except Exception as e:
             return {"success": False, "error": f"Pivot failed: {e}"}
 
-    return AgentTool(
+    return make_analysis_tool(
         name="pivot_table",
         description=(
             "Cross-tabulate query results. Provide a SQL query that returns raw data, "
@@ -130,6 +136,4 @@ def create_pivot_table_tool(
             "required": ["sql", "rows", "columns", "values"],
         },
         handler=handler,
-        category="analysis",
-        source="analyst_toolkit",
     )

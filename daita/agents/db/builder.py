@@ -68,7 +68,7 @@ async def from_db(
     blocked_columns: Optional[List[str]] = None,
     toolkit: Optional[str] = AUTO_TOOLKIT,
     quality: Optional[bool] = None,
-    budget: BudgetPreset = "auto",
+    budget: BudgetPreset = "retrieval",
     schema_prompt_policy: Optional[SchemaPromptPolicy] = None,
     tool_result_policy: Optional[ToolResultPolicy] = None,
     **agent_kwargs: Any,
@@ -114,9 +114,11 @@ async def from_db(
             ``"all"`` is an alias for ``"analyst"``. ``None`` registers no toolkit.
             Defaults to the selected mode's toolkit.
         quality: Register data-quality tools. Defaults to the selected mode's value.
-        budget: Prompt budget preset. Supported values are ``"auto"`` (default),
-            ``"full"``, ``"compact"``, and ``"retrieval"``. Explicit
-            ``schema_prompt_policy`` values override this preset.
+        budget: Prompt budget preset. Supported values are ``"auto"``,
+            ``"full"``, ``"compact"``, and ``"retrieval"``. Defaults to
+            ``"retrieval"`` so hosted DB agents keep schema detail behind
+            schema-navigation tools. Explicit ``schema_prompt_policy`` values
+            override this preset.
         schema_prompt_policy: Advanced schema prompt budget controls.
         tool_result_policy: Advanced DB tool result compaction controls.
         **agent_kwargs: Forwarded to :class:`Agent.__init__`.
@@ -182,11 +184,12 @@ async def from_db(
 
     domain = infer_domain(schema)
     prompt_policy = schema_prompt_policy or schema_prompt_policy_for_budget(budget)
+    analyst_tools = _analyst_tool_names(schema, toolkit)
     initial_prompt_result = build_prompt_result(
         schema,
         domain,
         prompt,
-        analyst_tools=_analyst_tool_names(schema, toolkit),
+        analyst_tools=analyst_tools,
         schema_navigation_enabled=False,
         policy=prompt_policy,
     )
@@ -195,14 +198,17 @@ async def from_db(
         or initial_prompt_result.strategy != "full"
         or initial_prompt_result.budget_exceeded
     )
-    analyst_tools = _analyst_tool_names(schema, toolkit)
-    prompt_result = build_prompt_result(
-        schema,
-        domain,
-        prompt,
-        analyst_tools=analyst_tools,
-        schema_navigation_enabled=schema_navigation_enabled,
-        policy=prompt_policy,
+    prompt_result = (
+        build_prompt_result(
+            schema,
+            domain,
+            prompt,
+            analyst_tools=analyst_tools,
+            schema_navigation_enabled=True,
+            policy=prompt_policy,
+        )
+        if schema_navigation_enabled
+        else initial_prompt_result
     )
     system_prompt = prompt_result.prompt
 
@@ -353,6 +359,7 @@ def _create_db_agent(
     from ..agent import Agent
 
     agent_kwargs.pop("focus", None)
+    agent_kwargs.setdefault("temperature", 0)
     return Agent(
         name=name,
         llm_provider=llm_provider,

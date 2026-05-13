@@ -20,6 +20,8 @@ def compact_tool_result_for_context(
     policy = policy or ToolResultPolicy()
     if not _is_db_tool_name(tool_name):
         return result
+    if tool_name == "db_find_join_path":
+        return _compact_join_path_result(result, policy)
     compacted = _compact_value(result, policy=policy)
     if _estimate_tokens(compacted) <= policy.max_result_tokens:
         return compacted
@@ -59,6 +61,61 @@ def _compact_value(value: Any, *, policy: ToolResultPolicy) -> Any:
     if isinstance(value, str):
         return _compact_scalar(value, policy)
     return value
+
+
+def _compact_join_path_result(result: Any, policy: ToolResultPolicy) -> Any:
+    if not isinstance(result, dict):
+        return result
+
+    paths = result.get("paths")
+    if not isinstance(paths, list):
+        return _compact_value(result, policy=policy)
+
+    compact_paths = []
+    for path in paths[:5]:
+        if not isinstance(path, dict):
+            compact_paths.append(path)
+            continue
+        joins = path.get("joins")
+        compact_paths.append(
+            {
+                key: path.get(key)
+                for key in (
+                    "tables",
+                    "joins",
+                    "predicate",
+                    "join_predicate",
+                    "confidence",
+                    "warnings",
+                    "hop_count",
+                )
+                if path.get(key) is not None
+            }
+        )
+        if isinstance(joins, list):
+            compact_paths[-1]["joins"] = [
+                {
+                    join_key: join.get(join_key)
+                    for join_key in (
+                        "left_table",
+                        "left_column",
+                        "right_table",
+                        "right_column",
+                        "predicate",
+                    )
+                    if isinstance(join, dict) and join.get(join_key) is not None
+                }
+                for join in joins
+            ]
+
+    compacted = {
+        key: result.get(key)
+        for key in ("success", "from_tables", "to_tables", "path_count", "warnings")
+        if result.get(key) is not None
+    }
+    compacted["paths"] = compact_paths
+    compacted["truncated"] = len(paths) > len(compact_paths)
+    return compacted
 
 
 def _compact_rows_payload(
