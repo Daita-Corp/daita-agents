@@ -5,11 +5,11 @@ Numeric column sampling and PII-column redaction patterns.
 import logging
 from typing import Any, Dict, List, TYPE_CHECKING
 
-from .schema import NUMERIC_TYPES, is_numeric_type
-from .tools._helpers import quote_id, quote_path, safe_query
+from ..tools._helpers import quote_id, quote_path, safe_query
+from .discovery import NUMERIC_TYPES, is_numeric_type
 
 if TYPE_CHECKING:
-    from ...plugins.base_db import BaseDatabasePlugin
+    from ....plugins.base_db import BaseDatabasePlugin
 
 logger = logging.getLogger(__name__)
 

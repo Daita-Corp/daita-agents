@@ -10,13 +10,13 @@ import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from ...plugins.catalog.normalizer._mongodb import normalize_mongodb
-from ...plugins.catalog.normalizer._mysql import normalize_mysql
-from ...plugins.catalog.normalizer._postgresql import normalize_postgresql
-from .resolve import extract_sslmode
+from ....plugins.catalog.normalizer._mongodb import normalize_mongodb
+from ....plugins.catalog.normalizer._mysql import normalize_mysql
+from ....plugins.catalog.normalizer._postgresql import normalize_postgresql
+from ..resolve import extract_sslmode
 
 if TYPE_CHECKING:
-    from ...plugins.base_db import BaseDatabasePlugin
+    from ....plugins.base_db import BaseDatabasePlugin
 
 logger = logging.getLogger(__name__)
 SCHEMA_FALLBACK_CONCURRENCY = 10
@@ -71,7 +71,7 @@ async def _discover_postgres(
     db_schema: Optional[str],
     plugin: "BaseDatabasePlugin",
 ) -> Dict[str, Any]:
-    from ...plugins.catalog.discovery._postgres import discover_postgres
+    from ....plugins.catalog.discovery._postgres import discover_postgres
 
     return await discover_postgres(
         connection_string,
@@ -85,7 +85,7 @@ async def _discover_mysql(
     db_schema: Optional[str],
     plugin: "BaseDatabasePlugin",
 ) -> Dict[str, Any]:
-    from ...plugins.catalog.discovery._mysql import discover_mysql
+    from ....plugins.catalog.discovery._mysql import discover_mysql
 
     return await discover_mysql(connection_string, db_schema)
 
@@ -95,7 +95,7 @@ async def _discover_mongodb(
     db_schema: Optional[str],
     plugin: "BaseDatabasePlugin",
 ) -> Dict[str, Any]:
-    from ...plugins.catalog.discovery._mongodb import discover_mongodb
+    from ....plugins.catalog.discovery._mongodb import discover_mongodb
 
     return await discover_mongodb(
         connection_string,

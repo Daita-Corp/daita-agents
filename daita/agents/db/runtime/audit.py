@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..agent import Agent
+    from ...agent import Agent
 
 
 def make_audited_run(agent: "Agent", original_run: Callable) -> Callable:
@@ -47,7 +47,7 @@ def make_audited_stream(agent: "Agent", original_stream: Callable) -> Callable:
     async def _audited_stream(prompt: str, **kwargs: Any):
         if "history" not in kwargs and hasattr(agent, "_db_history"):
             kwargs["history"] = agent._db_history
-        from ...core.streaming import EventType
+        from ....core.streaming import EventType
 
         tool_calls_this_run: List[Dict[str, Any]] = []
 

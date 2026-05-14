@@ -4,7 +4,7 @@ System prompt generation and domain inference.
 
 from typing import Any, Dict, List, Optional
 
-from .policies import PromptBuildResult, SchemaPromptPolicy
+from .config.policies import PromptBuildResult, SchemaPromptPolicy
 
 DOMAIN_SIGNALS: Dict[str, List[str]] = {
     "e-commerce": [
@@ -185,7 +185,17 @@ def build_prompt_result(
     lines.append("- Always use LIMIT to keep result sets manageable.")
     lines.append(
         "- For analytic, aggregation, or multi-table questions, use db_plan_query "
-        "to turn the request into a structured plan before writing SQL."
+        "to turn the request into a structured plan before writing SQL. Prefer "
+        "its compiled_sql when validation.ok is true."
+    )
+    lines.append(
+        "- Use catalog/schema tools to traverse tables, columns, and relationships; "
+        "use SQL only for retrieving or aggregating specific values."
+    )
+    lines.append(
+        "- For count questions, use COUNT(*) or COUNT(primary_key) and alias the "
+        "result; do not SUM a similarly named column unless the schema confirms "
+        "that column stores the requested metric."
     )
     lines.append(
         "- Before writing SQL that joins tables, verify the relevant tables, columns, "

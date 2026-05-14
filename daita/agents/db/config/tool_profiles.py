@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from typing import Any, List
 
+from ..utils import unique_preserving_order
+
 CORE_QUERY_TOOLS = (
     "db_plan_query",
     "db_validate_sql",
@@ -125,7 +127,7 @@ def select_db_tools_for_prompt(agent: Any, prompt: str) -> List[str]:
     if _has_vector_columns(getattr(agent, "_db_schema", {}) or {}):
         selected.extend(name for name in available if name.endswith("_vector_search"))
 
-    return _dedupe([name for name in selected if name in available])
+    return unique_preserving_order([name for name in selected if name in available])
 
 
 def _needs_query_tools(text: str) -> bool:
@@ -160,14 +162,3 @@ def _has_vector_columns(schema: dict) -> bool:
             ):
                 return True
     return False
-
-
-def _dedupe(names: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for name in names:
-        if name in seen:
-            continue
-        seen.add(name)
-        out.append(name)
-    return out

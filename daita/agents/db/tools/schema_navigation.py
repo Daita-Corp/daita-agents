@@ -11,14 +11,14 @@ import copy
 from typing import Any, Dict
 
 from ....core.tools import AgentTool
-from ..state import get_db_run_state
-from ..navigation import (
+from ..schema.navigation import (
     describe_relationships,
     find_join_paths,
     inspect_table,
     list_tables,
     search_schema,
 )
+from ..runtime.state import get_db_run_state
 
 
 def create_db_list_tables_tool(schema: Dict[str, Any]) -> AgentTool:

@@ -941,7 +941,7 @@ def _assert_live_tool_result(case: dict, tool_call: dict) -> None:
 
 
 def _fresh_cache_file(source) -> Path:
-    from daita.agents.db.cache import cache_key
+    from daita.agents.db.schema.cache import cache_key
 
     return Path(".daita") / "schema_cache" / f"{cache_key(source)}.json"
 
@@ -1328,15 +1328,15 @@ class TestFromDbSQLiteLive:
             assert description["db"]["mode"] == "data_team"
             assert description["db"]["quality_enabled"] is True
             assert "data_quality" in description["capabilities"]
-            assert "sqlite_query" in agent.tool_registry.tool_names
-            assert "sqlite_count" in agent.tool_registry.tool_names
+            assert "db_query" in agent.tool_registry.tool_names
+            assert "db_count" in agent.tool_registry.tool_names
             assert "sqlite_list_tables" not in agent.tool_registry.tool_names
             assert "sqlite_inspect" not in agent.tool_registry.tool_names
             assert agent.db.summary["candidate_metrics"]
             assert agent.db.suggested_questions
 
             query_result = await agent.tool_registry.execute(
-                "sqlite_query",
+                "db_query",
                 {
                     "sql": (
                         "SELECT customer_id, SUM(total_amount) AS revenue "
@@ -1361,7 +1361,7 @@ class TestFromDbSQLiteLive:
 
             with pytest.raises(Exception, match="read-only mode|non-read query"):
                 await agent.tool_registry.execute(
-                    "sqlite_query", {"sql": "DELETE FROM orders WHERE order_id = 1"}
+                    "db_query", {"sql": "DELETE FROM orders WHERE order_id = 1"}
                 )
         finally:
             await _close_agent_db(agent)
@@ -1438,11 +1438,11 @@ class TestFromDbSQLiteLive:
         )
         try:
             assert agent.default_focus is None
-            tool = agent.tool_registry.get("sqlite_query")
+            tool = agent.tool_registry.get("db_query")
             assert "focus" not in tool.parameters["properties"]
 
             result = await agent.tool_registry.execute(
-                "sqlite_query",
+                "db_query",
                 {
                     "sql": (
                         "SELECT DISTINCT c.name AS name FROM customers c "
@@ -1551,7 +1551,7 @@ class TestFromDbCacheAndDrift:
             assert orders_change["removed_columns"] == ["legacy_note"]
 
             result = await drifted_agent.tool_registry.execute(
-                "sqlite_query",
+                "db_query",
                 {"sql": "SELECT COUNT(*) AS order_count FROM orders"},
             )
             assert result["rows"][0]["order_count"] == 3
@@ -1586,7 +1586,7 @@ class TestFromDbCacheAndDrift:
             assert cached_agent.describe()["db"]["table_count"] == 3
             assert cached_agent.db.drift is None
             result = await cached_agent.tool_registry.execute(
-                "sqlite_query",
+                "db_query",
                 {"sql": "SELECT SUM(total_amount) AS revenue FROM orders"},
             )
             assert result["rows"][0]["revenue"] == 275.0
@@ -1690,7 +1690,7 @@ class TestFromDbLargeGuardrails:
             assert "db_inspect_table" in agent.tool_registry.tool_names
 
             query_result = await agent.tool_registry.execute(
-                "sqlite_query",
+                "db_query",
                 {"sql": "SELECT COUNT(*) AS event_count FROM bulky_events"},
             )
             assert query_result["rows"][0]["event_count"] == 120
@@ -1713,7 +1713,7 @@ class TestFromDbLargeGuardrails:
         )
         try:
             result = await agent.tool_registry.execute(
-                "sqlite_query",
+                "db_query",
                 {
                     "sql": (
                         "SELECT event_id, account_id, payload, created_at "
@@ -1756,8 +1756,8 @@ class TestFromDbLargeGuardrails:
             assert "## Database Schema (1001 tables)" in prompt
             assert "| Column | Type | PK | Nullable |" not in prompt
             assert "Columns:" not in prompt
-            assert prompt.count("- warehouse_table_") == 200
-            assert "- ... 801 additional tables omitted from prompt summary" in prompt
+            assert prompt.count("- warehouse_table_") == 30
+            assert "- ... 971 additional tables omitted from prompt summary" in prompt
             assert "wide_fact_events" not in prompt
             assert "feature_249" not in prompt
             assert len(prompt) < 20000
@@ -1771,7 +1771,7 @@ class TestFromDbLargeGuardrails:
             assert "feature_249" not in user_message
 
             result = await agent.tool_registry.execute(
-                "sqlite_query",
+                "db_query",
                 {
                     "sql": (
                         "SELECT event_id, feature_000, feature_249, event_value "
@@ -1962,7 +1962,7 @@ class TestFromDbAuditAndPrivacy:
                     "tool_calls": [
                         {
                             "id": "call_1",
-                            "name": "sqlite_query",
+                            "name": "db_query",
                             "arguments": {
                                 "sql": (
                                     "SELECT name FROM customers "
@@ -1990,7 +1990,7 @@ class TestFromDbAuditAndPrivacy:
             assert audit["prompt"] == prompt
             assert "<db_runtime_context>" not in audit["prompt"]
             call = audit["tool_calls"][0]
-            assert call["tool"] == "sqlite_query"
+            assert call["tool"] == "db_query"
             assert call["arguments"]["sql"].startswith("SELECT name FROM customers")
             assert call["arguments"]["param_count"] == 2
             assert "params" not in call["arguments"]
@@ -2015,7 +2015,7 @@ class TestFromDbAuditAndPrivacy:
                     "tool_calls": [
                         {
                             "id": "call_1",
-                            "name": "sqlite_query",
+                            "name": "db_query",
                             "arguments": {
                                 "sql": "SELECT email FROM customers WHERE email = ?",
                                 "params": ["alice@example.com"],
@@ -2036,7 +2036,7 @@ class TestFromDbAuditAndPrivacy:
             await agent.run("show customer emails", detailed=True, max_iterations=3)
             audit = agent.db.audit.last()
             call = audit["tool_calls"][0]
-            assert call["result"]["error"].startswith("Tool 'sqlite_query' failed")
+            assert call["result"]["error"].startswith("Tool 'db_query' failed")
             assert "blocked column" in call["result"]["error"]
             assert call["arguments"]["param_count"] == 1
             assert "alice@example.com" not in agent.db.audit.export_json()
@@ -2054,7 +2054,7 @@ class TestFromDbAuditAndPrivacy:
                     "tool_calls": [
                         {
                             "id": "call_1",
-                            "name": "sqlite_query",
+                            "name": "db_query",
                             "arguments": {
                                 "sql": "SELECT name FROM customers WHERE customer_id = ?",
                                 "params": [1],
@@ -2077,7 +2077,7 @@ class TestFromDbAuditAndPrivacy:
                     "stream the safe customer name", max_iterations=3
                 )
             ]
-            assert any(event.tool_name == "sqlite_query" for event in events)
+            assert any(event.tool_name == "db_query" for event in events)
             audit = agent.db.audit.last()
             assert audit["prompt"] == "stream the safe customer name"
             assert audit["tool_calls"][0]["result"]["row_count"] == 1
@@ -2333,7 +2333,10 @@ class TestFromDbSQLiteOpenAILive:
             assert metrics["tokens"]["total_tokens"] > 0
             assert metrics["cost"] >= 0
             assert_answer_mentions(result, ["125"], any_of=True)
-            assert "db_query" in result["tool_calls"][0]["tool"]
+            assert any(
+                call.get("tool") == "db_query"
+                for call in result.get("tool_calls") or []
+            )
 
             audit_json = agent.db.audit.export_json()
             assert "db_query" in audit_json
@@ -2809,7 +2812,10 @@ class TestFromDbPostgresOpenAILive:
             assert metrics["tokens"]["total_tokens"] > 0
             assert metrics["cost"] >= 0
             assert_answer_mentions(result, ["125"], any_of=True)
-            assert "db_query" in result["tool_calls"][0]["tool"]
+            assert any(
+                call.get("tool") == "db_query"
+                for call in result.get("tool_calls") or []
+            )
 
             audit_json = agent.db.audit.export_json()
             assert "db_query" in audit_json

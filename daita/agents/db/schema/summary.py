@@ -4,7 +4,8 @@ Compact schema and data-health summary for agents created by ``from_db()``.
 
 from typing import Any, Dict, List
 
-from .schema import is_numeric_type
+from ..utils import unique_preserving_order
+from .discovery import is_numeric_type
 
 _TIMESTAMP_HINTS = (
     "created_at",
@@ -86,7 +87,7 @@ def suggested_questions(
         questions.append(
             f"What are the most important patterns in {important_tables[0]}?"
         )
-    return _dedupe(questions)[:6]
+    return unique_preserving_order(questions)[:6]
 
 
 def _important_tables(tables: List[Dict[str, Any]]) -> List[str]:
@@ -209,14 +210,3 @@ def _candidate_metrics(
             }
         )
     return metrics
-
-
-def _dedupe(values: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        out.append(value)
-    return out

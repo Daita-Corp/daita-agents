@@ -8,7 +8,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
-from .schema import is_numeric_type
+from .schema.discovery import is_numeric_type
 
 if TYPE_CHECKING:
     from ..agent import Agent

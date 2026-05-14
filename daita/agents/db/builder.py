@@ -5,25 +5,30 @@ from_db() — build a fully configured Agent from a database source.
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING, Tuple, Union
 
-from .audit import make_audited_run, make_audited_stream
-from .cache import cache_key, detect_drift, load_cached_schema, save_schema_cache
-from .context import attach_db_context
 from .describe import attach_db_describe
 from .memory import DBMemory, calibrate_db_memory
-from .navigation import should_register_schema_navigation
-from .policies import (
+from .config.policies import (
     BudgetPreset,
     SchemaPromptPolicy,
     ToolResultPolicy,
     schema_prompt_policy_for_budget,
 )
+from .config.presets import AUTO_TOOLKIT, resolve_mode_options
 from .prompt import build_prompt_result, infer_domain
-from .presets import AUTO_TOOLKIT, resolve_mode_options
 from .resolve import resolve_plugin
-from .run_context import make_db_context_run, make_db_context_stream
-from .sampling import sample_numeric_columns
-from .schema import discover_schema
-from .summary import build_db_summary
+from .runtime.audit import make_audited_run, make_audited_stream
+from .runtime.context import attach_db_context
+from .runtime.run_context import make_db_context_run, make_db_context_stream
+from .schema.cache import (
+    cache_key,
+    detect_drift,
+    load_cached_schema,
+    save_schema_cache,
+)
+from .schema.discovery import discover_schema
+from .schema.navigation import should_register_schema_navigation
+from .schema.sampling import sample_numeric_columns
+from .schema.summary import build_db_summary
 
 if TYPE_CHECKING:
     from ..agent import Agent
@@ -613,7 +618,7 @@ def _wrap_db_runtime(
 def _attach_result_compaction(
     agent: "Agent", *, policy: Optional[ToolResultPolicy]
 ) -> None:
-    from .result_compaction import compact_tool_result_for_context
+    from .runtime.result_compaction import compact_tool_result_for_context
 
     policy = policy or ToolResultPolicy()
     agent._db_tool_result_policy = policy

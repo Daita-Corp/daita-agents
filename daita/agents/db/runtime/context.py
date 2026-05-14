@@ -6,8 +6,8 @@ import json
 from typing import Any, Callable, Dict, Iterable, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..agent import Agent
-    from ...core.watch import WatchEvent
+    from ...agent import Agent
+    from ....core.watch import WatchEvent
 
 
 def attach_db_context(agent: "Agent") -> None:
@@ -39,7 +39,7 @@ class DBContext:
     def __init__(self, agent: "Agent"):
         self._agent = agent
         self.audit = DBAudit(agent)
-        from .findings import DBFindings
+        from ..findings import DBFindings
 
         self.findings = DBFindings(agent)
 
@@ -96,7 +96,7 @@ class DBContext:
         name_prefix: str = "db",
     ) -> List[Dict[str, Any]]:
         """Register structured DB monitor definitions as local watches."""
-        from .monitors import register_local_monitors
+        from ..monitors import register_local_monitors
 
         return register_local_monitors(
             self._agent,

@@ -11,8 +11,17 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from .navigation import find_join_paths, search_schema
-from .state import DbQueryPlan, DbRunState
+from ..runtime.state import DbQueryPlan, DbRunState
+from ..schema.metadata import (
+    matching_tables as _matching_tables,
+    schema_table_columns as _schema_table_columns,
+    split_identifier as _split_identifier,
+)
+from ..schema.navigation import find_join_paths, search_schema
+from .compiler import compile_query_plan
+from .intent import looks_like_count_intent
+from .ir_validator import validate_query_plan
+from .resolver import resolve_query_plan
 
 MAX_CANDIDATE_TABLES = 8
 MAX_FIELD_CANDIDATES = 8
@@ -60,6 +69,38 @@ def build_query_plan(
         candidate_tables=resolved_tables["resolved_tables"],
     )
     join_paths = _required_join_paths(schema, plan)
+    plan_warnings = _aggregation_reference_warnings(schema, plan)
+    query_resolution = resolve_query_plan(plan, schema)
+    query_ir = query_resolution.plan
+    ir_validation = (
+        validate_query_plan(
+            query_ir,
+            schema,
+            dialect=str(schema.get("database_type") or ""),
+        )
+        if query_ir is not None
+        else {"ok": False, "errors": [], "warnings": []}
+    )
+    compiled_sql = None
+    compiler_warning = None
+    if query_ir is not None and ir_validation.get("ok"):
+        dialect = str(schema.get("database_type") or "")
+        if dialect.lower() in {"postgresql", "postgres", "sqlite"}:
+            try:
+                compiled_sql = compile_query_plan(query_ir, dialect).sql
+            except ValueError as exc:
+                compiler_warning = {
+                    "type": "query_ir_compile_failed",
+                    "message": str(exc),
+                }
+        else:
+            compiler_warning = {
+                "type": "query_ir_compiler_unsupported_dialect",
+                "dialect": dialect or "unknown",
+                "supported_dialects": ["postgresql", "sqlite"],
+            }
+    if compiler_warning:
+        plan_warnings.append(compiler_warning)
 
     if not plan.answer_checks:
         plan.answer_checks = [f"include {field}" for field in plan.required_fields]
@@ -74,7 +115,14 @@ def build_query_plan(
         "table_candidates": table_candidates["tables"],
         "field_candidates": field_candidates,
         "join_paths": join_paths,
-        "next_steps": _next_steps(resolved_tables, field_candidates, join_paths),
+        "query_ir_resolution": query_resolution.to_dict(),
+        "query_ir": query_ir.to_dict() if query_ir is not None else None,
+        "compiled_sql": compiled_sql,
+        "validation": ir_validation,
+        "plan_warnings": plan_warnings,
+        "next_steps": _next_steps(
+            resolved_tables, field_candidates, join_paths, compiled_sql
+        ),
     }
 
     if run_state is not None:
@@ -132,7 +180,7 @@ def _field_candidates(
     table_filter = {name.lower() for name in candidate_tables}
     results: Dict[str, List[Dict[str, Any]]] = {}
     for field_name in field_names:
-        tokens = _tokens(field_name)
+        tokens = [token for token in _split_identifier(field_name) if len(token) > 1]
         matches = []
         for table in schema.get("tables", []) or []:
             table_name = str(table.get("name") or "")
@@ -177,12 +225,68 @@ def _required_join_paths(
     return path_results
 
 
+def _aggregation_reference_warnings(
+    schema: Dict[str, Any], plan: DbQueryPlan
+) -> List[Dict[str, Any]]:
+    table_columns = _schema_table_columns(schema)
+    warnings: List[Dict[str, Any]] = []
+    for expression in plan.aggregations:
+        for table, column in re.findall(
+            r"\b([A-Za-z_][\w.]*)\.([A-Za-z_][\w]*)\b", expression
+        ):
+            table_key = table.strip().lower()
+            column_key = column.strip().lower()
+            columns = table_columns.get(table_key)
+            if columns is None and "." in table_key:
+                columns = table_columns.get(table_key.split(".")[-1])
+            if columns is None:
+                warnings.append(
+                    {
+                        "type": "unknown_aggregation_table",
+                        "aggregation": expression,
+                        "table": table,
+                        "suggested_next_tool": "db_search_schema",
+                    }
+                )
+                continue
+            if column_key not in columns:
+                warning = {
+                    "type": "unknown_aggregation_column",
+                    "aggregation": expression,
+                    "table": table,
+                    "column": column,
+                    "suggested_next_tool": "db_inspect_table",
+                }
+                if _looks_like_plan_count_intent(plan, column):
+                    warning["guidance"] = (
+                        "For count-style questions, count stable rows such as "
+                        "COUNT(*) or COUNT(primary_key) and alias the result, "
+                        "instead of summing a similarly named column that is not "
+                        "present in the fact table."
+                    )
+                warnings.append(warning)
+    return warnings
+
+
+def _looks_like_plan_count_intent(plan: DbQueryPlan, column_name: str) -> bool:
+    text = " ".join(
+        [plan.goal, column_name]
+        + plan.required_fields
+        + plan.aggregations
+        + plan.ordering
+    )
+    return looks_like_count_intent(text)
+
+
 def _next_steps(
     resolved_tables: Dict[str, List[Any]],
     field_candidates: Dict[str, List[Dict[str, Any]]],
     join_paths: List[Dict[str, Any]],
+    compiled_sql: Optional[str] = None,
 ) -> List[str]:
     steps = []
+    if compiled_sql:
+        return ["run db_query with compiled_sql"]
     if resolved_tables["unknown_tables"] or resolved_tables["ambiguous_tables"]:
         steps.append("inspect or search unresolved candidate tables")
     missing_fields = [
@@ -208,22 +312,6 @@ def _classify_plan(plan: DbQueryPlan) -> str:
     if any(term in text for term in ("schema", "table", "column", "relationship")):
         return "schema_question"
     return "data_query"
-
-
-def _matching_tables(
-    tables: List[Dict[str, Any]], table_name: str
-) -> List[Dict[str, Any]]:
-    wanted = table_name.strip().lower()
-    if not wanted:
-        return []
-    exact = [table for table in tables if str(table.get("name", "")).lower() == wanted]
-    if exact:
-        return exact
-    return [
-        table
-        for table in tables
-        if str(table.get("name", "")).split(".")[-1].lower() == wanted
-    ]
 
 
 def _table_ref(table: Dict[str, Any]) -> Dict[str, Any]:
@@ -267,14 +355,6 @@ def _optional_int(value: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
-
-
-def _tokens(value: str) -> List[str]:
-    raw = re.findall(r"[a-zA-Z0-9_]+", value.lower())
-    tokens = []
-    for item in raw:
-        tokens.extend(part for part in re.split(r"[_\W]+", item) if part)
-    return [token for token in tokens if len(token) > 1]
 
 
 def _column_score(column_name: str, tokens: List[str]) -> int:

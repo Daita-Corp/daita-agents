@@ -4,18 +4,10 @@ Platform-safe metadata for agents created by ``Agent.from_db()``.
 
 from typing import Any, Dict, List, TYPE_CHECKING
 
+from .utils import ANALYST_TOOL_PREFIXES, plugin_database_name
+
 if TYPE_CHECKING:
     from ..agent import Agent
-
-
-_ANALYST_TOOL_PREFIXES = (
-    "pivot_",
-    "correlate",
-    "detect_",
-    "compare_",
-    "find_",
-    "forecast_",
-)
 
 
 def attach_db_describe(agent: "Agent") -> None:
@@ -44,7 +36,7 @@ def describe_db_agent(agent: "Agent") -> Dict[str, Any]:
 
 def _capabilities(agent: "Agent", tool_names: List[str]) -> List[str]:
     capabilities = ["sql", "schema"]
-    if any(name.startswith(_ANALYST_TOOL_PREFIXES) for name in tool_names):
+    if any(name.startswith(ANALYST_TOOL_PREFIXES) for name in tool_names):
         capabilities.append("analyst_tools")
     if hasattr(agent, "_db_quality"):
         capabilities.append("data_quality")
@@ -83,7 +75,7 @@ def _db_metadata(agent: "Agent", tool_names: List[str]) -> Dict[str, Any]:
         "database_type": schema.get(
             "database_type", getattr(plugin, "sql_dialect", None)
         ),
-        "database_name": schema.get("database_name") or _plugin_database_name(plugin),
+        "database_name": schema.get("database_name") or plugin_database_name(plugin),
         "mode": getattr(agent, "_db_mode", None),
         "read_only": bool(getattr(plugin, "read_only", True)),
         "table_count": schema.get("table_count", len(tables)),
@@ -113,17 +105,6 @@ def _db_metadata(agent: "Agent", tool_names: List[str]) -> Dict[str, Any]:
     if plugin is not None:
         metadata["query_policy"] = _query_policy(plugin)
     return metadata
-
-
-def _plugin_database_name(plugin: Any) -> Any:
-    if plugin is None:
-        return None
-    return (
-        getattr(plugin, "database_name", None)
-        or getattr(plugin, "database", None)
-        or getattr(plugin, "db", None)
-        or getattr(plugin, "path", None)
-    )
 
 
 def _query_policy(plugin: Any) -> Dict[str, Any]:

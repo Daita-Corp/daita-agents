@@ -8,7 +8,7 @@ import fnmatch
 import json
 from typing import Any, Dict, List, Tuple
 
-from .policies import ToolResultPolicy
+from ..config.policies import ToolResultPolicy
 
 
 def compact_tool_result_for_context(

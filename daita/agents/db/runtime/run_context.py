@@ -5,21 +5,15 @@ Compact per-run context for agents created by ``Agent.from_db()``.
 import re
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
+from ..utils import ANALYST_TOOL_PREFIXES, plugin_database_name
+
 if TYPE_CHECKING:
-    from ..agent import Agent
+    from ...agent import Agent
 
 
 DEFAULT_CONTEXT_MAX_CHARS = 1600
 SCHEMA_HINT_MAX_TABLES = 5
 SCHEMA_HINT_MAX_RELATIONSHIPS = 5
-_ANALYST_TOOL_PREFIXES = (
-    "pivot_",
-    "correlate",
-    "detect_",
-    "compare_",
-    "find_",
-    "forecast_",
-)
 TERMINAL_DB_TOOLS = (
     "db_query",
     "db_count",
@@ -59,7 +53,7 @@ def build_db_run_context(
         (
             "Database: "
             f"type={schema.get('database_type', getattr(plugin, 'sql_dialect', 'unknown'))}, "
-            f"name={schema.get('database_name') or _plugin_database_name(plugin) or 'unknown'}, "
+            f"name={schema.get('database_name') or plugin_database_name(plugin) or 'unknown'}, "
             f"mode={mode or 'unknown'}, "
             f"tables={schema.get('table_count', len(tables))}, "
             f"columns={sum(len(table.get('columns', [])) for table in tables)}, "
@@ -105,9 +99,9 @@ def _augment_prompt(prompt: str, context: str) -> str:
 async def _prepare_db_runtime_call(
     agent: "Agent", prompt: str, kwargs: Dict[str, Any]
 ) -> tuple[str, Dict[str, Any]]:
-    from .memory import recall_db_memory_context
+    from ..memory import recall_db_memory_context
+    from ..config.tool_profiles import select_db_tools_for_prompt
     from .state import DbRunState, set_db_run_state
-    from .tool_profiles import select_db_tools_for_prompt
 
     memory_snippets = await recall_db_memory_context(agent, prompt)
     plugin = getattr(agent, "_db_plugin", None)
@@ -197,7 +191,7 @@ def _query_policy_summary(plugin: Any) -> str:
 
 def _capability_summary(agent: "Agent", tool_names: List[str]) -> str:
     capabilities = ["sql", "schema"]
-    if any(name.startswith(_ANALYST_TOOL_PREFIXES) for name in tool_names):
+    if any(name.startswith(ANALYST_TOOL_PREFIXES) for name in tool_names):
         capabilities.append("analyst_tools")
     if hasattr(agent, "_db_memory"):
         capabilities.append("memory")
@@ -354,17 +348,6 @@ def _prompt_terms(prompt: str) -> List[str]:
             if candidate not in stopwords and candidate not in terms:
                 terms.append(candidate)
     return terms[:12]
-
-
-def _plugin_database_name(plugin: Any) -> Any:
-    if plugin is None:
-        return None
-    return (
-        getattr(plugin, "database_name", None)
-        or getattr(plugin, "database", None)
-        or getattr(plugin, "db", None)
-        or getattr(plugin, "path", None)
-    )
 
 
 def _truncate_line(value: str, max_chars: int) -> str:

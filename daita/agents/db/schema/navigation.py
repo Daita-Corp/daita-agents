@@ -13,6 +13,13 @@ import re
 from collections import deque
 from typing import Any, Dict, Iterable, List, Optional
 
+from ..utils import unique_preserving_order
+from .metadata import (
+    matching_tables as _matching_tables,
+    short_table_name as _short_table_name,
+    split_identifier as _split_identifier,
+)
+
 SCHEMA_NAVIGATION_TABLE_THRESHOLD = 30
 SCHEMA_NAVIGATION_WIDE_TABLE_THRESHOLD = 100
 MAX_TABLE_LIST_LIMIT = 100
@@ -334,25 +341,7 @@ def _resolve_table_refs(
                 "candidates": candidates,
             }
         )
-    return _dedupe(resolved), errors
-
-
-def _matching_tables(schema: Dict[str, Any], table_name: str) -> List[Dict[str, Any]]:
-    wanted = table_name.strip().lower()
-    if not wanted:
-        return []
-    exact = [
-        table
-        for table in schema.get("tables", []) or []
-        if str(table.get("name", "")).lower() == wanted
-    ]
-    if exact:
-        return exact
-    return [
-        table
-        for table in schema.get("tables", []) or []
-        if _short_table_name(str(table.get("name", ""))) == wanted
-    ]
+    return unique_preserving_order(resolved), errors
 
 
 def _join_adjacency(
@@ -372,8 +361,7 @@ def _join_adjacency(
             "right_table": target_table,
             "right_column": target_column,
             "predicate": (
-                f"{source_table}.{source_column} = "
-                f"{target_table}.{target_column}"
+                f"{source_table}.{source_column} = " f"{target_table}.{target_column}"
             ),
             "relationship_direction": "forward",
         }
@@ -383,8 +371,7 @@ def _join_adjacency(
             "right_table": source_table,
             "right_column": source_column,
             "predicate": (
-                f"{target_table}.{target_column} = "
-                f"{source_table}.{source_column}"
+                f"{target_table}.{target_column} = " f"{source_table}.{source_column}"
             ),
             "relationship_direction": "reverse",
         }
@@ -393,9 +380,7 @@ def _join_adjacency(
     return adjacency
 
 
-def _join_path_result(
-    tables: List[str], joins: List[Dict[str, Any]]
-) -> Dict[str, Any]:
+def _join_path_result(tables: List[str], joins: List[Dict[str, Any]]) -> Dict[str, Any]:
     hop_count = len(joins)
     if hop_count <= 1:
         confidence = "high"
@@ -443,10 +428,6 @@ def _find_table(schema: Dict[str, Any], table_name: str) -> Optional[Dict[str, A
     return None
 
 
-def _short_table_name(name: str) -> str:
-    return name.split(".")[-1].lower()
-
-
 def _matches_table_pattern(table: Dict[str, Any], pattern: str) -> bool:
     if not pattern:
         return True
@@ -488,10 +469,6 @@ def _query_tokens(query: str) -> List[str]:
     ]
 
 
-def _split_identifier(value: str) -> List[str]:
-    return [part for part in re.split(r"[_\W]+", value.lower()) if part]
-
-
 def _clamp_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
     try:
         parsed = int(value)
@@ -504,14 +481,3 @@ def _truncate(value: str, max_chars: int) -> str:
     if len(value) <= max_chars:
         return value
     return value[: max_chars - 3].rstrip() + "..."
-
-
-def _dedupe(values: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        out.append(value)
-    return out
