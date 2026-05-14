@@ -17,6 +17,7 @@ from .policies import (
     schema_prompt_policy_for_budget,
 )
 from .presets import MODE_PRESETS
+from .state import DbQueryPlan, DbRunState
 from .summary import build_db_summary
 
 __all__ = [
@@ -28,6 +29,8 @@ __all__ = [
     "schema_prompt_policy_for_budget",
     "build_db_summary",
     "MODE_PRESETS",
+    "DbQueryPlan",
+    "DbRunState",
     "Finding",
     "normalize_finding",
     "DBMemoryRecord",

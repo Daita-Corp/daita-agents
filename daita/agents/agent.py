@@ -79,8 +79,27 @@ def _has_terminal_tool_result(
         raw = result.get("result")
         if isinstance(raw, dict) and raw.get("error"):
             continue
+        if isinstance(raw, dict) and (
+            raw.get("repair_required")
+            or raw.get("preflight_failed")
+            or raw.get("blocked_repeat")
+        ):
+            continue
         return True
     return False
+
+
+def _tool_loop_error_message(raw: Any) -> Optional[str]:
+    """Return an error-like message for tool results that should count as loops."""
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("error"):
+        return str(raw["error"])
+    if raw.get("blocked_repeat"):
+        return str(raw.get("message") or raw.get("status") or "blocked repeat")
+    if raw.get("repair_required") or raw.get("preflight_failed"):
+        return str(raw.get("message") or raw.get("guidance") or "repair required")
+    return None
 
 
 def _json_serializer(obj):
@@ -1029,13 +1048,14 @@ class Agent(BaseAgent):
                     # Loop detection: identical (tool, args) producing consecutive errors
                     raw = result.get("result", {})
                     fp = _make_error_fingerprint(tool_call)
-                    if isinstance(raw, dict) and "error" in raw:
+                    loop_error = _tool_loop_error_message(raw)
+                    if loop_error:
                         _error_fingerprints[fp] = _error_fingerprints.get(fp, 0) + 1
                         if _error_fingerprints[fp] >= 3:
                             raise AgentError(
-                                f"Loop detected: '{tool_call['name']}' returned an error "
+                                f"Loop detected: '{tool_call['name']}' returned a repair/error result "
                                 f"{_error_fingerprints[fp]} consecutive times with identical "
-                                f"arguments. Last error: {raw['error']}"
+                                f"arguments. Last result: {loop_error}"
                             )
                     else:
                         _error_fingerprints.pop(fp, None)

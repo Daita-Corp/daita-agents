@@ -55,7 +55,7 @@ def build_db_run_context(
 
     lines = [
         "<db_runtime_context>",
-        "Use this compact DB context for the current question; inspect schema tools when exact tables or columns are ambiguous. Do not ask for confirmation before read-only schema inspection, join-path lookup, SQL execution, or SQL repair.",
+        "Use DB tools autonomously. Plan analytic or multi-table work with db_plan_query; do not retry identical failed SQL.",
         (
             "Database: "
             f"type={schema.get('database_type', getattr(plugin, 'sql_dialect', 'unknown'))}, "
@@ -66,11 +66,11 @@ def build_db_run_context(
             f"relationships={len(foreign_keys)}"
         ),
         "Query policy: " + _query_policy_summary(plugin),
+        "Capabilities: " + _capability_summary(agent, tool_names),
+        "Memory: " + _memory_summary(agent, memory_snippets or []),
         "Data health: " + _summary_line(summary),
         "Candidate metrics: " + _candidate_metrics_summary(summary),
         "Schema hints: " + _schema_hint_summary(schema, prompt),
-        "Capabilities: " + _capability_summary(agent, tool_names),
-        "Memory: " + _memory_summary(agent, memory_snippets or []),
         "Drift: " + _drift_summary(drift),
         "</db_runtime_context>",
     ]
@@ -106,9 +106,16 @@ async def _prepare_db_runtime_call(
     agent: "Agent", prompt: str, kwargs: Dict[str, Any]
 ) -> tuple[str, Dict[str, Any]]:
     from .memory import recall_db_memory_context
+    from .state import DbRunState, set_db_run_state
     from .tool_profiles import select_db_tools_for_prompt
 
     memory_snippets = await recall_db_memory_context(agent, prompt)
+    plugin = getattr(agent, "_db_plugin", None)
+    run_state = DbRunState()
+    set_db_run_state(agent, run_state)
+    if plugin is not None:
+        set_db_run_state(plugin, run_state)
+        setattr(plugin, "_daita_sql_preflight_failures", {})
     context = build_db_run_context(
         agent, prompt=prompt, memory_snippets=memory_snippets
     )

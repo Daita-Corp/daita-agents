@@ -65,6 +65,33 @@ def _table(name, columns=None, row_count=None):
 
 
 class TestFromDbJoinPathNavigation:
+    async def test_inspect_table_uses_per_run_cache(self):
+        from daita.agents.db.state import DbRunState, set_db_run_state
+        from daita.agents.db.tools.schema_navigation import create_db_inspect_table_tool
+
+        plugin = SimpleNamespace(blocked_columns=set())
+        set_db_run_state(plugin, DbRunState())
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "users",
+                    columns=[
+                        {"name": "id", "type": "integer"},
+                        {"name": "email", "type": "text"},
+                    ],
+                )
+            ]
+        )
+        tool = create_db_inspect_table_tool(schema, plugin)
+
+        first = await tool.handler({"table_name": "users"})
+        second = await tool.handler({"table_name": "users"})
+
+        assert first["success"] is True
+        assert "from_run_cache" not in first
+        assert second["from_run_cache"] is True
+        assert second["columns"] == first["columns"]
+
     def test_find_join_path_returns_sql_ready_predicates(self):
         schema = _make_normalized_schema(
             tables=[
@@ -2611,10 +2638,91 @@ class TestFromDbQueryFacadeTools:
 
         tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
 
-        assert set(tools) == {"db_query", "db_count", "db_sample"}
+        assert set(tools) == {
+            "db_plan_query",
+            "db_validate_sql",
+            "db_query",
+            "db_count",
+            "db_sample",
+        }
         result = await tools["db_query"].handler({"sql": "SELECT 1"})
         assert result == {"rows": [{"x": 1}]}
         plugin._tool_query.assert_awaited_once_with({"sql": "SELECT 1"})
+
+    async def test_sql_facade_plan_query_enriches_intent_and_records_run_state(self):
+        from daita.agents.db.state import DbRunState, set_db_run_state
+        from daita.agents.db.tools.query_facade import create_db_query_tools
+
+        plugin = MagicMock()
+        plugin.sql_dialect = "postgresql"
+        plugin.read_only = True
+        plugin._tool_query = AsyncMock(return_value={"rows": []})
+        plugin._tool_count = AsyncMock(return_value={"count": 3})
+        plugin._tool_sample = AsyncMock(return_value={"rows": []})
+        state = DbRunState()
+        set_db_run_state(plugin, state)
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "operations",
+                    columns=[
+                        {"name": "operation_id", "type": "text"},
+                        {"name": "api_key_id", "type": "text"},
+                        {"name": "total_tokens", "type": "integer"},
+                        {"name": "cost", "type": "numeric"},
+                    ],
+                ),
+                _table(
+                    "api_keys",
+                    columns=[
+                        {"name": "api_key_id", "type": "text"},
+                        {"name": "created_by", "type": "text"},
+                    ],
+                ),
+                _table(
+                    "users",
+                    columns=[
+                        {"name": "user_id", "type": "text"},
+                        {"name": "email", "type": "text"},
+                    ],
+                ),
+            ],
+            fks=[
+                {
+                    "source_table": "operations",
+                    "source_column": "api_key_id",
+                    "target_table": "api_keys",
+                    "target_column": "api_key_id",
+                },
+                {
+                    "source_table": "api_keys",
+                    "source_column": "created_by",
+                    "target_table": "users",
+                    "target_column": "user_id",
+                },
+            ],
+        )
+
+        tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+        result = await tools["db_plan_query"].handler(
+            {
+                "goal": "Show operations by user",
+                "required_fields": ["total tokens", "cost", "user email"],
+                "candidate_tables": ["operations", "users"],
+                "required_joins": [
+                    {"from_tables": ["operations"], "to_tables": ["users"]}
+                ],
+                "limit": 10,
+            }
+        )
+
+        assert result["ok"] is True
+        assert result["route"] == "join_query"
+        assert result["resolved_tables"] == ["operations", "users"]
+        assert result["field_candidates"]["total tokens"][0]["column"] == "total_tokens"
+        assert result["join_paths"][0]["reachable"] is True
+        assert state.summary()["planned_query_count"] == 1
+        assert "total tokens" in state.required_answer_fields
 
     async def test_sql_facade_preflights_missing_column_before_query(self):
         from daita.agents.db.tools.query_facade import create_db_query_tools
@@ -2644,8 +2752,195 @@ class TestFromDbQueryFacadeTools:
         )
 
         assert result["error"] == "SQL preflight failed against known schema"
+        assert result["repair_required"] is True
+        assert result["do_not_retry_same_sql"] is True
         assert result["missing_columns"] == [
             {"table": "users", "column": "username", "reason": "column not found"}
+        ]
+        assert result["available_columns"] == {"users": ["email", "user_id"]}
+        plugin._tool_query.assert_not_awaited()
+
+    async def test_sql_facade_records_preflight_failures_in_run_state(self):
+        from daita.agents.db.state import DbRunState, set_db_run_state
+        from daita.agents.db.tools.query_facade import create_db_query_tools
+
+        plugin = MagicMock()
+        plugin.sql_dialect = "postgresql"
+        plugin.read_only = True
+        plugin._tool_query = AsyncMock(return_value={"rows": []})
+        plugin._tool_count = AsyncMock(return_value={"count": 3})
+        plugin._tool_sample = AsyncMock(return_value={"rows": []})
+        state = DbRunState()
+        set_db_run_state(plugin, state)
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "users",
+                    columns=[
+                        {"name": "user_id", "type": "text"},
+                        {"name": "email", "type": "text"},
+                    ],
+                )
+            ]
+        )
+        tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+
+        await tools["db_query"].handler({"sql": "SELECT u.username FROM users u"})
+
+        assert state.summary()["failed_sql_count"] == 1
+        plugin._tool_query.assert_not_awaited()
+
+    async def test_sql_facade_blocks_repeated_invalid_sql_without_generic_error(self):
+        from daita.agents.db.tools.query_facade import create_db_query_tools
+
+        plugin = MagicMock()
+        plugin.sql_dialect = "postgresql"
+        plugin.read_only = True
+        plugin._tool_query = AsyncMock(return_value={"rows": []})
+        plugin._tool_count = AsyncMock(return_value={"count": 3})
+        plugin._tool_sample = AsyncMock(return_value={"rows": []})
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "users",
+                    columns=[
+                        {"name": "user_id", "type": "text"},
+                        {"name": "email", "type": "text"},
+                    ],
+                )
+            ]
+        )
+
+        tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+        args = {"sql": "SELECT u.username FROM users u"}
+
+        first = await tools["db_query"].handler(args)
+        second = await tools["db_query"].handler(args)
+
+        assert first["error"] == "SQL preflight failed against known schema"
+        assert second["blocked_repeat"] is True
+        assert second["repair_required"] is True
+        assert "error" not in second
+        plugin._tool_query.assert_not_awaited()
+
+    async def test_validate_sql_tool_does_not_execute_query(self):
+        from daita.agents.db.tools.query_facade import create_db_query_tools
+
+        plugin = MagicMock()
+        plugin.sql_dialect = "postgresql"
+        plugin.read_only = True
+        plugin._tool_query = AsyncMock(return_value={"rows": []})
+        plugin._tool_count = AsyncMock(return_value={"count": 3})
+        plugin._tool_sample = AsyncMock(return_value={"rows": []})
+        schema = _make_normalized_schema(tables=[_table("users")])
+
+        tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+        result = await tools["db_validate_sql"].handler(
+            {"sql": "SELECT users.id FROM users"}
+        )
+
+        assert result["ok"] is True
+        plugin._tool_query.assert_not_awaited()
+
+    async def test_sql_facade_allows_unaliased_join_table_references(self):
+        from daita.agents.db.tools.query_facade import create_db_query_tools
+
+        plugin = MagicMock()
+        plugin.sql_dialect = "postgresql"
+        plugin.read_only = True
+        plugin._tool_query = AsyncMock(return_value={"rows": []})
+        plugin._tool_count = AsyncMock(return_value={"count": 3})
+        plugin._tool_sample = AsyncMock(return_value={"rows": []})
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "operations",
+                    columns=[
+                        {"name": "agent_id", "type": "text"},
+                        {"name": "total_tokens", "type": "integer"},
+                        {"name": "timestamp", "type": "timestamp"},
+                    ],
+                ),
+                _table(
+                    "agents",
+                    columns=[
+                        {"name": "agent_id", "type": "text"},
+                        {"name": "agent_name", "type": "text"},
+                    ],
+                ),
+            ]
+        )
+
+        tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+        sql = """
+        SELECT agents.agent_id,
+               agents.agent_name,
+               SUM(operations.total_tokens) AS total_tokens_used
+        FROM operations
+        JOIN agents ON operations.agent_id = agents.agent_id
+        WHERE operations.timestamp >= NOW() - INTERVAL '1 month'
+        GROUP BY agents.agent_id, agents.agent_name
+        ORDER BY total_tokens_used DESC
+        LIMIT 10
+        """
+        result = await tools["db_validate_sql"].handler({"sql": sql})
+
+        assert result["ok"] is True
+        plugin._tool_query.assert_not_awaited()
+
+    async def test_sql_facade_blocks_metric_drift_from_required_plan_fields(self):
+        from daita.agents.db.state import DbRunState, set_db_run_state
+        from daita.agents.db.tools.query_facade import create_db_query_tools
+
+        plugin = MagicMock()
+        plugin.sql_dialect = "postgresql"
+        plugin.read_only = True
+        plugin._tool_query = AsyncMock(return_value={"rows": []})
+        plugin._tool_count = AsyncMock(return_value={"count": 3})
+        plugin._tool_sample = AsyncMock(return_value={"rows": []})
+        set_db_run_state(plugin, DbRunState())
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "operations",
+                    columns=[
+                        {"name": "agent_id", "type": "text"},
+                        {"name": "latency_ms", "type": "integer"},
+                        {"name": "total_tokens", "type": "integer"},
+                    ],
+                )
+            ]
+        )
+
+        tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+        await tools["db_plan_query"].handler(
+            {
+                "goal": "Show total tokens by agent",
+                "required_fields": ["total tokens"],
+                "candidate_tables": ["operations"],
+                "aggregations": ["SUM(total_tokens) AS total_tokens_used"],
+            }
+        )
+        sql = """
+        SELECT operations.agent_id,
+               SUM(operations.latency_ms) AS total_tokens_used
+        FROM operations
+        GROUP BY operations.agent_id
+        """
+        result = await tools["db_validate_sql"].handler({"sql": sql})
+
+        assert (
+            result["error"] == "SQL does not preserve required fields from query plan"
+        )
+        assert result["repair_required"] is True
+        assert result["preflight_failed"] is True
+        assert result["suggested_next_tool"] == "db_plan_query"
+        assert result["required_field_warnings"] == [
+            {
+                "required_field": "total tokens",
+                "expected_columns": ["total_tokens"],
+                "reason": "required field not referenced by SQL",
+            }
         ]
         plugin._tool_query.assert_not_awaited()
 
@@ -2874,7 +3169,9 @@ class TestFromDbToolProfiles:
         agent = SimpleNamespace(
             tool_registry=SimpleNamespace(
                 tool_names=[
+                    "db_plan_query",
                     "db_query",
+                    "db_validate_sql",
                     "db_count",
                     "db_search_schema",
                     "db_inspect_table",
@@ -2892,6 +3189,8 @@ class TestFromDbToolProfiles:
             "db_search_schema",
             "db_inspect_table",
             "db_find_join_path",
+            "db_plan_query",
+            "db_validate_sql",
             "db_query",
             "db_count",
         ]

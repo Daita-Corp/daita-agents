@@ -6,7 +6,15 @@ from __future__ import annotations
 
 from typing import Any, List
 
-CORE_QUERY_TOOLS = ("db_query", "db_count", "db_sample", "db_find", "db_aggregate")
+CORE_QUERY_TOOLS = (
+    "db_plan_query",
+    "db_validate_sql",
+    "db_query",
+    "db_count",
+    "db_sample",
+    "db_find",
+    "db_aggregate",
+)
 WRITE_QUERY_TOOLS = ("db_execute",)
 SCHEMA_TOOLS = (
     "db_search_schema",

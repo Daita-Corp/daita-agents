@@ -7,9 +7,11 @@ already discovered. They do not execute SQL or return raw row data.
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict
 
 from ....core.tools import AgentTool
+from ..state import get_db_run_state
 from ..navigation import (
     describe_relationships,
     find_join_paths,
@@ -90,7 +92,14 @@ def create_db_search_schema_tool(schema: Dict[str, Any]) -> AgentTool:
 
 def create_db_inspect_table_tool(schema: Dict[str, Any], plugin: Any) -> AgentTool:
     async def handler(args: Dict[str, Any]) -> Dict[str, Any]:
-        return inspect_table(
+        cache_key = _inspect_cache_key(args)
+        run_state = get_db_run_state(plugin)
+        if run_state is not None:
+            cached = run_state.get_inspected_table(cache_key)
+            if cached is not None:
+                return {**copy.deepcopy(cached), "from_run_cache": True}
+
+        result = inspect_table(
             schema,
             table_name=args.get("table_name") or "",
             column_pattern=args.get("column_pattern"),
@@ -99,6 +108,9 @@ def create_db_inspect_table_tool(schema: Dict[str, Any], plugin: Any) -> AgentTo
             offset=args.get("offset", 0),
             blocked_columns=getattr(plugin, "blocked_columns", set()),
         )
+        if run_state is not None and result.get("success"):
+            run_state.record_inspected_table(cache_key, result)
+        return result
 
     return _schema_tool(
         name="db_inspect_table",
@@ -167,15 +179,19 @@ def create_db_describe_relationships_tool(schema: Dict[str, Any]) -> AgentTool:
     )
 
 
-def create_db_find_join_path_tool(schema: Dict[str, Any]) -> AgentTool:
+def create_db_find_join_path_tool(schema: Dict[str, Any], plugin: Any) -> AgentTool:
     async def handler(args: Dict[str, Any]) -> Dict[str, Any]:
-        return find_join_paths(
+        result = find_join_paths(
             schema,
             from_tables=args.get("from_tables") or [],
             to_tables=args.get("to_tables") or [],
             max_hops=args.get("max_hops", 4),
             max_paths=args.get("max_paths", 5),
         )
+        run_state = get_db_run_state(plugin)
+        if run_state is not None:
+            run_state.record_join_paths(result)
+        return result
 
     return _schema_tool(
         name="db_find_join_path",
@@ -221,10 +237,21 @@ def register_schema_navigation_tools(
         create_db_list_tables_tool(schema),
         create_db_search_schema_tool(schema),
         create_db_inspect_table_tool(schema, plugin),
-        create_db_find_join_path_tool(schema),
+        create_db_find_join_path_tool(schema, plugin),
         create_db_describe_relationships_tool(schema),
     ):
         agent.tool_registry.register(tool)
+
+
+def _inspect_cache_key(args: Dict[str, Any]) -> str:
+    table_name = str(args.get("table_name") or "").strip().lower()
+    column_pattern = str(args.get("column_pattern") or "").strip().lower()
+    include_columns = bool(args.get("include_columns", True))
+    limit = args.get("limit", 40)
+    offset = args.get("offset", 0)
+    return "|".join(
+        [table_name, column_pattern, str(include_columns), str(limit), str(offset)]
+    )
 
 
 def _schema_tool(

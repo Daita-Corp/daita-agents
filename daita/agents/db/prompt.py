@@ -184,12 +184,21 @@ def build_prompt_result(
     )
     lines.append("- Always use LIMIT to keep result sets manageable.")
     lines.append(
+        "- For analytic, aggregation, or multi-table questions, use db_plan_query "
+        "to turn the request into a structured plan before writing SQL."
+    )
+    lines.append(
         "- Before writing SQL that joins tables, verify the relevant tables, columns, "
         "and join path. Use db_find_join_path when the relationship is not direct."
     )
     lines.append(
         "- If SQL fails because a table or column is missing, inspect the schema and "
         "retry with corrected SQL before giving a final answer."
+    )
+    lines.append(
+        "- If db_query returns repair_required or preflight_failed, never call "
+        "db_query again with the same SQL. Use db_inspect_table, db_search_schema, "
+        "or db_find_join_path, then call db_validate_sql or db_query with corrected SQL."
     )
     lines.append(
         "- When multiple business interpretations are valid, choose the most direct "
