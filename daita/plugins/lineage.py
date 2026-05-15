@@ -139,10 +139,16 @@ class LineagePlugin(BasePlugin):
         if self._graph_backend is None:
             from daita.core.graph.backend import auto_select_backend
 
-            self._graph_backend = auto_select_backend(graph_type="lineage")
-            logger.debug(
-                f"LineagePlugin: using graph backend {type(self._graph_backend).__name__}"
-            )
+            try:
+                self._graph_backend = auto_select_backend(graph_type="lineage")
+                logger.debug(
+                    f"LineagePlugin: using graph backend {type(self._graph_backend).__name__}"
+                )
+            except ImportError as exc:
+                logger.debug(
+                    "LineagePlugin: graph backend unavailable; using in-memory flows: %s",
+                    exc,
+                )
 
     def get_tools(self) -> List["AgentTool"]:
         """
@@ -666,7 +672,16 @@ class LineagePlugin(BasePlugin):
             self._flows.append(flow)
 
         if self._graph_backend or self._storage:
-            await self._persist_flow(flow)
+            try:
+                await self._persist_flow(flow)
+            except ImportError as exc:
+                logger.debug(
+                    "LineagePlugin: graph persistence unavailable; keeping flow in memory: %s",
+                    exc,
+                )
+                self._graph_backend = None
+                if not self._storage:
+                    self._flows.append(flow)
 
         return {
             "flow_id": flow_id,

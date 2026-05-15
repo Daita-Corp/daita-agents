@@ -6,7 +6,6 @@ Simple MySQL connection and querying - no over-engineering.
 
 import asyncio
 import logging
-import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from urllib.parse import urlparse, quote
 from .base_db import BaseDatabasePlugin
@@ -401,26 +400,6 @@ class MySQLPlugin(BaseDatabasePlugin):
             )
         return tools
 
-    async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for mysql_query"""
-        sql = self._normalize_sql(args.get("sql"))
-        params = args.get("params") or []
-        focus_dsl = args.get("focus")
-
-        if focus_dsl:
-            results = await self._run_focus_query(sql, params, focus_dsl)
-        else:
-            if not re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
-                sql = f"{sql} LIMIT 50"
-            results = await self.query(sql, params or None)
-
-        truncated = self._truncate_result(results)
-        return {
-            "rows": truncated["rows"],
-            "total_rows": truncated["total_rows"],
-            "truncated": truncated["truncated"],
-        }
-
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mysql_list_tables (kept for backward compat)"""
         tables = await self.tables()
@@ -434,15 +413,6 @@ class MySQLPlugin(BaseDatabasePlugin):
             "table": table_name,
             "columns": [self._compact_column(c) for c in columns],
         }
-
-    async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Tool handler for mysql_execute"""
-        sql = args.get("sql")
-        params = args.get("params")
-
-        affected_rows = await self.execute(sql, params)
-
-        return {"affected_rows": affected_rows}
 
     async def _tool_inspect(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mysql_inspect — fetch all table schemas in parallel."""

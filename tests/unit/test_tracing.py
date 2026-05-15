@@ -42,6 +42,11 @@ def flush(tm: TraceManager) -> None:
     tm.flush(timeout_millis=2000)
 
 
+def span_events(tm: TraceManager):
+    flush(tm)
+    return tm._memory_exporter.get_finished_spans()[-1].events
+
+
 # ---------------------------------------------------------------------------
 # BoundedInMemorySpanExporter
 # ---------------------------------------------------------------------------
@@ -106,6 +111,16 @@ class TestDaitaSpanExporter:
             exp = DaitaSpanExporter()
         assert exp.enabled
 
+    def test_system_api_key_enables_hosted_exporter(self):
+        env = {
+            "DAITA_SYSTEM_API_KEY": "system-test",
+            "DAITA_DASHBOARD_URL": "http://localhost:8000",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            exp = DaitaSpanExporter()
+        assert exp.enabled
+        assert exp.api_key == "system-test"
+
     def test_shutdown_stops_export(self):
         env = {
             "DAITA_API_KEY": "sk-test",
@@ -116,6 +131,89 @@ class TestDaitaSpanExporter:
         exp.shutdown()
         result = exp.export([MagicMock()])
         assert result == SpanExportResult.SUCCESS  # stopped = no-op
+
+    async def test_payload_includes_span_events(self):
+        tm = fresh_manager()
+        async with tm.span(
+            "op",
+            TraceType.AGENT_EXECUTION,
+            agent_id="a1",
+            input_data={"question": "hi"},
+        ) as span_id:
+            tm.record_output(span_id, {"answer": "there"})
+        flush(tm)
+
+        env = {
+            "DAITA_API_KEY": "sk-test",
+            "DAITA_DASHBOARD_URL": "http://localhost:8000",
+        }
+        with patch.dict("os.environ", env):
+            exp = DaitaSpanExporter()
+
+        payload = exp._build_payload(tm._memory_exporter.get_finished_spans()[-1:])
+        event_names = [event["name"] for event in payload["spans"][0]["events"]]
+        assert "daita.input" in event_names
+        assert "daita.output" in event_names
+
+    async def test_payload_includes_hosted_org_context(self):
+        env = {
+            "DAITA_API_KEY": "sk-test",
+            "DAITA_DASHBOARD_URL": "http://localhost:8000",
+            "DAITA_ORGANIZATION_ID": "42",
+            "DAITA_API_KEY_ID": "key-123",
+            "DAITA_EXECUTION_ID": "op-123",
+            "DAITA_DEPLOYMENT_ID": "dep-123",
+            "DAITA_RUNTIME": "lambda",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            tm = fresh_manager()
+            async with tm.span("op", TraceType.AGENT_EXECUTION, agent_id="a1"):
+                pass
+            flush(tm)
+            exp = DaitaSpanExporter()
+            payload = exp._build_payload(tm._memory_exporter.get_finished_spans()[-1:])
+
+        attrs = payload["spans"][0]["attributes"]
+        assert payload["organization_id"] == "42"
+        assert payload["api_key_id"] == "key-123"
+        assert attrs["daita.organization.id"] == "42"
+        assert attrs["daita.operation.id"] == "op-123"
+        assert attrs["daita.execution.id"] == "op-123"
+        assert attrs["deployment.id"] == "dep-123"
+        assert attrs["daita.runtime"] == "lambda"
+
+    async def test_explicit_hosted_config_does_not_require_env(self):
+        with patch.dict("os.environ", {}, clear=True):
+            tm = fresh_manager()
+            tm.configure_exporter(
+                api_key="system-test",
+                dashboard_url="http://localhost:8000",
+                organization_id="42",
+                api_key_id="key-123",
+            )
+            tm.configure_runtime_context(
+                organization_id="42",
+                operation_id="op-123",
+                deployment_id="dep-123",
+                runtime="lambda",
+                environment="production",
+            )
+            async with tm.span("op", TraceType.AGENT_EXECUTION, agent_id="a1"):
+                pass
+            flush(tm)
+            payload = tm._daita_exporter._build_payload(
+                tm._memory_exporter.get_finished_spans()[-1:]
+            )
+
+        attrs = payload["spans"][0]["attributes"]
+        assert tm._daita_exporter.enabled
+        assert tm._daita_exporter.api_key == "system-test"
+        assert payload["organization_id"] == "42"
+        assert payload["api_key_id"] == "key-123"
+        assert attrs["daita.organization.id"] == "42"
+        assert attrs["daita.operation.id"] == "op-123"
+        assert attrs["deployment.id"] == "dep-123"
+        assert attrs["deployment.environment"] == "production"
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +254,20 @@ class TestSpanLifecycle:
         before = tm.get_global_metrics()["total_decisions"]
         tm.end_span(span_id, TraceStatus.SUCCESS)
         assert tm.get_global_metrics()["total_decisions"] == before + 1
+
+    def test_start_span_records_input_event(self):
+        tm = fresh_manager()
+        span_id = tm.start_span(
+            "test_op",
+            TraceType.AGENT_EXECUTION,
+            agent_id="a1",
+            input_data={"task": "inspect"},
+        )
+        tm.end_span(span_id, TraceStatus.SUCCESS)
+
+        events = span_events(tm)
+        input_event = next(e for e in events if e.name == "daita.input")
+        assert json.loads(input_event.attributes["data"]) == {"task": "inspect"}
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +346,47 @@ class TestSpanContextManager:
             ) as inner_id:
                 inner_trace = tm.trace_context.current_trace_id
         assert outer_trace == inner_trace
+
+    async def test_context_manager_records_input_event(self):
+        tm = fresh_manager()
+        async with tm.span(
+            "op",
+            TraceType.AGENT_EXECUTION,
+            agent_id="a1",
+            input_data={"prompt": "hello"},
+        ):
+            pass
+
+        events = span_events(tm)
+        input_event = next(e for e in events if e.name == "daita.input")
+        assert json.loads(input_event.attributes["data"]) == {"prompt": "hello"}
+
+    async def test_record_output_adds_output_event(self):
+        tm = fresh_manager()
+        async with tm.span("op", TraceType.AGENT_EXECUTION, agent_id="a1") as span_id:
+            tm.record_output(span_id, {"answer": "world"})
+
+        events = span_events(tm)
+        output_event = next(e for e in events if e.name == "daita.output")
+        assert json.loads(output_event.attributes["data"]) == {"answer": "world"}
+
+    async def test_trace_payload_default_cap_is_12000(self):
+        tm = fresh_manager()
+        payload = "x" * 12001
+        async with tm.span(
+            "op",
+            TraceType.AGENT_EXECUTION,
+            agent_id="a1",
+            input_data=payload,
+        ):
+            pass
+
+        events = span_events(tm)
+        input_event = next(e for e in events if e.name == "daita.input")
+        assert input_event.attributes["truncated"] is True
+        assert input_event.attributes["original_length"] == 12001
+        assert input_event.attributes["max_length"] == 12000
+        assert len(input_event.attributes["data"]) == 12003
 
 
 # ---------------------------------------------------------------------------

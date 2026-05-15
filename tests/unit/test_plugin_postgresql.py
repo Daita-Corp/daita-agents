@@ -51,6 +51,104 @@ class TestNormalizeSql:
 
 
 # ---------------------------------------------------------------------------
+# BaseDatabasePlugin SQL guardrails
+# ---------------------------------------------------------------------------
+
+
+class TestSqlGuardrails:
+    def test_rejects_multi_statement_sql(self):
+        plugin = make_plugin()
+        with pytest.raises(ValidationError, match="multiple statements"):
+            plugin._prepare_tool_query_sql("SELECT 1; SELECT 2")
+
+    def test_semicolon_inside_string_is_allowed(self):
+        plugin = make_plugin()
+        assert plugin._prepare_tool_query_sql("SELECT ';' AS marker").endswith(
+            "LIMIT 50"
+        )
+
+    def test_rejects_mutation_routed_through_query_tool(self):
+        plugin = make_plugin()
+        with pytest.raises(ValidationError, match="non-read query"):
+            plugin._prepare_tool_query_sql("DELETE FROM users")
+
+    def test_rejects_read_only_execute_mutation(self):
+        plugin = make_plugin(read_only=True)
+        with pytest.raises(ValidationError, match="read-only mode"):
+            plugin._prepare_tool_execute_sql("UPDATE users SET active = false")
+
+    def test_read_only_rejects_explain_analyze_mutation(self):
+        plugin = make_plugin(read_only=True)
+        with pytest.raises(ValidationError, match="read-only mode: DELETE"):
+            plugin._prepare_tool_query_sql(
+                "EXPLAIN ANALYZE DELETE FROM users WHERE id = 1"
+            )
+
+    def test_read_only_rejects_data_modifying_cte(self):
+        plugin = make_plugin(read_only=True)
+        with pytest.raises(ValidationError, match="read-only mode: DELETE"):
+            plugin._prepare_tool_query_sql(
+                "WITH deleted AS (DELETE FROM users WHERE id = 1 RETURNING *) "
+                "SELECT * FROM deleted"
+            )
+
+    def test_mutating_words_in_strings_and_comments_are_allowed(self):
+        plugin = make_plugin(read_only=True)
+        sql = (
+            "SELECT 'DELETE FROM users' AS note "
+            "FROM audit_log -- UPDATE users\n"
+            "WHERE message = 'INSERT'"
+        )
+        assert plugin._prepare_tool_query_sql(sql).endswith("LIMIT 50")
+
+    def test_read_only_allows_explain_analyze_select(self):
+        plugin = make_plugin(read_only=True)
+        sql = plugin._prepare_tool_query_sql("EXPLAIN ANALYZE SELECT id FROM users")
+        assert sql == "EXPLAIN ANALYZE SELECT id FROM users LIMIT 50"
+
+    def test_injects_configured_default_limit(self):
+        plugin = make_plugin(query_default_limit=25)
+        sql = plugin._prepare_tool_query_sql("SELECT id FROM users")
+        assert sql == "SELECT id FROM users LIMIT 25"
+
+    def test_preserves_existing_limit(self):
+        plugin = make_plugin(query_default_limit=25)
+        sql = plugin._prepare_tool_query_sql("SELECT id FROM users LIMIT 10")
+        assert sql == "SELECT id FROM users LIMIT 10"
+
+    def test_rejects_blocked_table(self):
+        plugin = make_plugin(blocked_tables=["payments"])
+        with pytest.raises(ValidationError, match="blocked table"):
+            plugin._prepare_tool_query_sql("SELECT id FROM payments")
+
+    def test_rejects_table_outside_allowlist(self):
+        plugin = make_plugin(allowed_tables=["orders"])
+        with pytest.raises(ValidationError, match="outside allowlist"):
+            plugin._prepare_tool_query_sql("SELECT id FROM customers")
+
+    def test_rejects_blocked_column(self):
+        plugin = make_plugin(blocked_columns=["email"])
+        with pytest.raises(ValidationError, match="blocked column"):
+            plugin._prepare_tool_query_sql("SELECT email FROM users")
+
+    async def test_tool_query_returns_sql_and_uses_configured_caps(self):
+        plugin = make_plugin(query_default_limit=7, query_max_rows=1)
+        seen = {}
+
+        async def fake_query(sql, params=None):
+            seen["sql"] = sql
+            return [{"id": 1}, {"id": 2}]
+
+        plugin.query = fake_query
+        result = await plugin._tool_query({"sql": "SELECT id FROM users"})
+        assert seen["sql"] == "SELECT id FROM users LIMIT 7"
+        assert result["sql"] == "SELECT id FROM users LIMIT 7"
+        assert result["total_rows"] == 2
+        assert result["truncated"] is True
+        assert result["rows"] == [{"id": 1}]
+
+
+# ---------------------------------------------------------------------------
 # BaseDatabasePlugin._compact_column  (static method, no mock needed)
 # ---------------------------------------------------------------------------
 
@@ -259,7 +357,7 @@ class TestToolQueryLimitInjection:
 
 
 class TestToolQueryResultShape:
-    async def test_exact_keys_in_result(self):
+    async def test_result_includes_sql_used(self):
         plugin = make_plugin()
 
         async def fake_query(sql, params=None):
@@ -267,7 +365,8 @@ class TestToolQueryResultShape:
 
         plugin.query = fake_query
         result = await plugin._tool_query({"sql": "SELECT id FROM t LIMIT 10"})
-        assert set(result.keys()) == {"rows", "total_rows", "truncated"}
+        assert set(result.keys()) == {"rows", "total_rows", "truncated", "sql"}
+        assert result["sql"] == "SELECT id FROM t LIMIT 10"
 
     async def test_no_row_count_field(self):
         plugin = make_plugin()

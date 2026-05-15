@@ -19,7 +19,7 @@ Key components:
 - AgentConfig           — Configure retry policies, LLM settings, and more
 """
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 
 # ---------------------------------------------------------------------------
 # Core
@@ -102,7 +102,7 @@ from .embeddings import BaseEmbeddingProvider
 # from daita.core.reliability import TaskManager, CircuitBreaker, BackpressureController
 # from daita.core.scaling import AgentPool, LoadBalancer, create_agent_pool
 # from daita.core.interfaces import AgentABC, LLMProvider
-from .core.tracing import get_trace_manager, configure_tracing
+from .core.tracing import get_trace_manager, configure_tracing, set_trace_context
 
 __all__ = [
     # Primary interfaces
@@ -118,6 +118,7 @@ __all__ = [
     # Tracing
     "configure_tracing",
     "get_trace_manager",
+    "set_trace_context",
     # Plugins
     "postgresql",
     "mysql",

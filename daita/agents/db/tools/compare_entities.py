@@ -8,11 +8,10 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ....core.tools import AgentTool
 from ._helpers import (
-    ensure_pandas,
-    safe_query,
-    to_serializable,
+    build_entity_profiles,
+    combined_source_metadata,
     get_pk_column,
-    infer_dimensions,
+    make_analysis_tool,
 )
 
 if TYPE_CHECKING:
@@ -25,11 +24,6 @@ def create_compare_entities_tool(
     """Return an AgentTool that compares entities side-by-side."""
 
     async def handler(args: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            pd = ensure_pandas()
-        except ImportError as e:
-            return {"success": False, "error": str(e)}
-
         entity_table = args.get("entity_table", "").strip()
         entity_ids = args.get("entity_ids", [])
         id_column = args.get("id_column") or get_pk_column(schema, entity_table)
@@ -46,82 +40,29 @@ def create_compare_entities_tool(
                 "Pass id_column explicitly.",
             }
 
-        dims = custom_dimensions or infer_dimensions(schema, entity_table)
-        if not dims:
-            return {
-                "success": False,
-                "error": (
-                    f"No FK relationships found for '{entity_table}'. "
-                    "Pass explicit dimensions as [{expression, alias, child_table}]."
-                ),
-            }
-
-        # Build one query per unique child_table
-        child_tables = list(dict.fromkeys(d["child_table"] for d in dims))
-        entity_profiles: Dict[Any, Dict[str, Any]] = {eid: {} for eid in entity_ids}
-
-        id_list = ", ".join(
-            f"'{eid}'" if isinstance(eid, str) else str(eid) for eid in entity_ids
-        )
-
-        for child in child_tables:
-            child_dims = [d for d in dims if d["child_table"] == child]
-            fk_col = child_dims[0].get("fk_col")
-            if not fk_col:
-                continue
-
-            # Collect any grandchild joins required by 2-hop dims
-            gc_joins: Dict[str, tuple] = {}
-            for d in child_dims:
-                if d.get("grandchild_table"):
-                    gc_alias = d["grandchild_alias"]
-                    if gc_alias not in gc_joins:
-                        gc_joins[gc_alias] = (
-                            d["grandchild_table"],
-                            d["grandchild_fk_col"],
-                            d.get("child_pk") or get_pk_column(schema, child),
-                        )
-
-            exprs = ", ".join(f"{d['expression']} AS {d['alias']}" for d in child_dims)
-            join_clause = (
-                f"FROM {entity_table} e "
-                f"LEFT JOIN {child} c ON e.{id_column} = c.{fk_col}"
+        try:
+            profile_result = await build_entity_profiles(
+                plugin,
+                schema,
+                entity_table=entity_table,
+                id_column=id_column,
+                dimensions=custom_dimensions,
+                entity_ids=list(entity_ids),
             )
-            for gc_alias, (gc_table, gc_fk_col, child_pk_col) in gc_joins.items():
-                join_clause += (
-                    f" LEFT JOIN {gc_table} {gc_alias}"
-                    f" ON c.{child_pk_col} = {gc_alias}.{gc_fk_col}"
-                )
-            sql = (
-                f"SELECT e.{id_column} AS _entity_id, {exprs} "
-                f"{join_clause} "
-                f"WHERE e.{id_column} IN ({id_list}) "
-                f"GROUP BY e.{id_column}"
-            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
-            try:
-                rows = await safe_query(plugin, sql)
-                for row in rows:
-                    eid = row.get("_entity_id")
-                    if eid in entity_profiles:
-                        for d in child_dims:
-                            entity_profiles[eid][d["alias"]] = to_serializable(
-                                row.get(d["alias"])
-                            )
-            except Exception:
-                # Skip dimension set that fails; don't abort entire comparison
-                continue
+        entity_profiles = profile_result.profiles
 
         if not any(entity_profiles.values()):
             return {
                 "success": False,
                 "error": "Could not retrieve any dimension data for the entities",
+                **combined_source_metadata(profile_result.query_results),
             }
 
         # Build comparison table
-        all_dim_names = list(
-            dict.fromkeys(alias for d in dims for alias in [d["alias"]])
-        )
+        all_dim_names = profile_result.dimensions
 
         comparison = []
         for dim in all_dim_names:
@@ -158,9 +99,11 @@ def create_compare_entities_tool(
             "entities": list(entity_ids),
             "comparison": comparison,
             "biggest_differences": biggest,
+            "skipped_dimensions": profile_result.skipped_dimensions,
+            **combined_source_metadata(profile_result.query_results),
         }
 
-    return AgentTool(
+    return make_analysis_tool(
         name="compare_entities",
         description=(
             "Compare two or more entities (e.g. customers, products, employees) side by side "
@@ -200,6 +143,4 @@ def create_compare_entities_tool(
             "required": ["entity_table", "entity_ids"],
         },
         handler=handler,
-        category="analysis",
-        source="analyst_toolkit",
     )

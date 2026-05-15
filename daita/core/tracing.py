@@ -25,6 +25,7 @@ async context manager) and by ``start_span()`` / ``end_span()``.
 """
 
 import atexit
+import dataclasses
 import json
 import logging
 import os
@@ -34,7 +35,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.resources import Resource
@@ -49,6 +50,8 @@ if TYPE_CHECKING:
     from opentelemetry.sdk.trace.export import SpanExporter
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_TRACE_PAYLOAD_MAX_CHARS = 12000
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +178,9 @@ class TraceSpan:
 _trace_id_var: ContextVar[Optional[str]] = ContextVar("daita_trace_id", default=None)
 _span_id_var: ContextVar[Optional[str]] = ContextVar("daita_span_id", default=None)
 _agent_id_var: ContextVar[Optional[str]] = ContextVar("daita_agent_id", default=None)
+_trace_runtime_context_var: ContextVar[Dict[str, Any]] = ContextVar(
+    "daita_trace_runtime_context", default={}
+)
 
 
 class TraceContext:
@@ -221,6 +227,7 @@ def _map_metadata_to_attributes(
 ) -> Dict[str, Any]:
     """Convert daita metadata kwargs to OTel attribute dict."""
     attrs: Dict[str, Any] = {}
+    runtime_context = _trace_runtime_context_var.get() or {}
 
     # Core daita attributes
     type_val = (
@@ -272,9 +279,48 @@ def _map_metadata_to_attributes(
         attrs["daita.comm.channel"] = str(metadata["channel"])
 
     # Deployment / environment
-    if metadata.get("deployment_id"):
-        attrs["deployment.id"] = str(metadata["deployment_id"])
-    env = metadata.get("environment") or os.getenv("DAITA_ENVIRONMENT", "development")
+    deployment_id = metadata.get("deployment_id") or runtime_context.get(
+        "deployment_id"
+    )
+    if deployment_id:
+        attrs["deployment.id"] = str(deployment_id)
+    # Will remove in future update: env fallback is retained for older hosted
+    # executors. New runtimes should pass deployment_id via configure_tracing().
+    elif os.getenv("DAITA_DEPLOYMENT_ID"):
+        attrs["deployment.id"] = os.getenv("DAITA_DEPLOYMENT_ID", "")
+
+    organization_id = (
+        metadata.get("organization_id")
+        or runtime_context.get("organization_id")
+        # Will remove in future update: env fallback is retained for older
+        # hosted executors. New runtimes should use configure_tracing().
+        or os.getenv("DAITA_ORGANIZATION_ID")
+    )
+    if organization_id:
+        attrs["daita.organization.id"] = str(organization_id)
+
+    operation_id = (
+        metadata.get("operation_id")
+        or metadata.get("execution_id")
+        or runtime_context.get("operation_id")
+        or runtime_context.get("execution_id")
+        # Will remove in future update: env fallback is retained for older
+        # hosted executors. New runtimes should use configure_tracing().
+        or os.getenv("DAITA_EXECUTION_ID")
+    )
+    if operation_id:
+        attrs["daita.operation.id"] = str(operation_id)
+        attrs["daita.execution.id"] = str(operation_id)
+
+    runtime = runtime_context.get("runtime") or os.getenv("DAITA_RUNTIME")
+    if runtime:
+        attrs["daita.runtime"] = str(runtime)
+
+    env = (
+        metadata.get("environment")
+        or runtime_context.get("environment")
+        or os.getenv("DAITA_ENVIRONMENT", "development")
+    )
     attrs["deployment.environment"] = env
 
     # OTel only allows str/bool/int/float (and sequences thereof) as attribute values.
@@ -386,6 +432,9 @@ class TraceManager:
             with self._otel_spans_lock:
                 self._otel_spans[hex_span_id] = span
 
+            if metadata.get("input_data") is not None:
+                _add_data_event(span, "daita.input", metadata["input_data"])
+
             # Mirror to custom contextvars (only update span_id; trace_id stays from context)
             _trace_id_var.set(hex_trace_id)
             _span_id_var.set(hex_span_id)
@@ -460,6 +509,26 @@ class TraceManager:
             logger.error(f"Failed to end span {span_id}: {e}")
             with self._otel_spans_lock:
                 self._otel_spans.pop(span_id, None)
+
+    def record_event_data(self, span_id: str, event_name: str, data: Any) -> None:
+        """Record structured data on a live span as a bounded OTel event."""
+        try:
+            with self._otel_spans_lock:
+                span = self._otel_spans.get(span_id)
+            if span:
+                _add_data_event(span, event_name, data)
+            else:
+                logger.debug(f"Cannot record {event_name} for unknown span: {span_id}")
+        except Exception as e:
+            logger.error(f"Failed to record {event_name} for span {span_id}: {e}")
+
+    def record_input(self, span_id: str, data: Any) -> None:
+        """Record input data on a live span."""
+        self.record_event_data(span_id, "daita.input", data)
+
+    def record_output(self, span_id: str, data: Any) -> None:
+        """Record output data on a live span."""
+        self.record_event_data(span_id, "daita.output", data)
 
     def record_decision(
         self,
@@ -548,6 +617,9 @@ class TraceManager:
             # Also register in _otel_spans so callers who stash the span_id can use it
             with self._otel_spans_lock:
                 self._otel_spans[hex_span_id] = otel_span
+
+            if metadata.get("input_data") is not None:
+                _add_data_event(otel_span, "daita.input", metadata["input_data"])
 
             self._metrics["total_spans"] += 1
 
@@ -771,6 +843,53 @@ class TraceManager:
             self._provider.add_span_processor(BatchSpanProcessor(exporter))
             logger.info(f"Added span exporter: {type(exporter).__name__}")
 
+    def configure_exporter(
+        self,
+        *,
+        api_key: Optional[str] = None,
+        dashboard_url: Optional[str] = None,
+        organization_id: Optional[Any] = None,
+        api_key_id: Optional[Any] = None,
+    ) -> None:
+        """Configure the built-in Daita dashboard exporter explicitly."""
+        self._daita_exporter.configure(
+            api_key=api_key,
+            dashboard_url=dashboard_url,
+            organization_id=(
+                str(organization_id) if organization_id is not None else None
+            ),
+            api_key_id=str(api_key_id) if api_key_id is not None else None,
+        )
+
+    def configure_runtime_context(
+        self,
+        *,
+        organization_id: Optional[Any] = None,
+        api_key_id: Optional[Any] = None,
+        operation_id: Optional[Any] = None,
+        execution_id: Optional[Any] = None,
+        deployment_id: Optional[Any] = None,
+        runtime: Optional[str] = None,
+        environment: Optional[str] = None,
+    ) -> None:
+        """Configure metadata stamped onto subsequently created spans."""
+        context = dict(_trace_runtime_context_var.get() or {})
+        updates = {
+            "organization_id": organization_id,
+            "api_key_id": api_key_id,
+            "operation_id": operation_id,
+            "execution_id": execution_id,
+            "deployment_id": deployment_id,
+            "runtime": runtime,
+            "environment": environment,
+        }
+        for key, value in updates.items():
+            if value is None:
+                context.pop(key, None)
+            else:
+                context[key] = str(value)
+        _trace_runtime_context_var.set(context)
+
 
 # ---------------------------------------------------------------------------
 # Global singleton
@@ -797,15 +916,34 @@ def configure_tracing(
     *,
     exporters: Optional[List["SpanExporter"]] = None,
     resource_attributes: Optional[Dict[str, Any]] = None,
+    api_key: Optional[str] = None,
+    dashboard_url: Optional[str] = None,
+    organization_id: Optional[Any] = None,
+    api_key_id: Optional[Any] = None,
+    operation_id: Optional[Any] = None,
+    execution_id: Optional[Any] = None,
+    deployment_id: Optional[Any] = None,
+    runtime: Optional[str] = None,
+    environment: Optional[str] = None,
 ) -> None:
     """
-    Add custom OTel exporters to the Daita tracing pipeline.
+    Configure the Daita tracing pipeline.
 
-    Call this **before** creating any Agent instances.
+    Custom exporters should still be added before creating Agent instances. Hosted
+    execution context and dashboard exporter credentials may be set at runtime.
 
     Args:
         exporters: List of SpanExporter instances (e.g., OTLPSpanExporter for Datadog).
         resource_attributes: Additional OTel Resource attributes to merge in.
+        api_key: Explicit key for the built-in Daita span exporter.
+        dashboard_url: Explicit backend URL for the built-in Daita span exporter.
+        organization_id: Organization ID stamped on subsequent spans.
+        api_key_id: API key ID included in hosted span ingest payloads.
+        operation_id: Hosted operation ID stamped on subsequent spans.
+        execution_id: Alias for operation_id when callers use execution terminology.
+        deployment_id: Deployment ID stamped on subsequent spans.
+        runtime: Runtime label, such as ``"lambda"``.
+        environment: Deployment environment label.
 
     Example::
 
@@ -817,12 +955,65 @@ def configure_tracing(
     tm = get_trace_manager()
     if exporters:
         tm.configure(exporters)
+    if any(
+        value is not None
+        for value in (api_key, dashboard_url, organization_id, api_key_id)
+    ):
+        tm.configure_exporter(
+            api_key=api_key,
+            dashboard_url=dashboard_url,
+            organization_id=organization_id,
+            api_key_id=api_key_id,
+        )
+    if any(
+        value is not None
+        for value in (
+            organization_id,
+            api_key_id,
+            operation_id,
+            execution_id,
+            deployment_id,
+            runtime,
+            environment,
+        )
+    ):
+        tm.configure_runtime_context(
+            organization_id=organization_id,
+            api_key_id=api_key_id,
+            operation_id=operation_id,
+            execution_id=execution_id,
+            deployment_id=deployment_id,
+            runtime=runtime,
+            environment=environment,
+        )
     if resource_attributes:
         logger.warning(
             "configure_tracing(resource_attributes=...) has no effect after the "
             "TraceManager is initialized.  Pass resource_attributes before the first "
             "agent is created."
         )
+
+
+def set_trace_context(
+    *,
+    organization_id: Optional[Any] = None,
+    api_key_id: Optional[Any] = None,
+    operation_id: Optional[Any] = None,
+    execution_id: Optional[Any] = None,
+    deployment_id: Optional[Any] = None,
+    runtime: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> None:
+    """Set execution metadata stamped onto subsequently created spans."""
+    get_trace_manager().configure_runtime_context(
+        organization_id=organization_id,
+        api_key_id=api_key_id,
+        operation_id=operation_id,
+        execution_id=execution_id,
+        deployment_id=deployment_id,
+        runtime=runtime,
+        environment=environment,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -839,18 +1030,57 @@ def _get_version() -> str:
         return "unknown"
 
 
-def _add_data_event(span: otel_trace.Span, event_name: str, data: Any) -> None:
-    """Add input/output data as a span event (truncated to 2000 chars)."""
+def _trace_payload_limit() -> int:
+    raw = os.getenv("DAITA_TRACE_PAYLOAD_MAX_CHARS")
+    if raw is None:
+        return DEFAULT_TRACE_PAYLOAD_MAX_CHARS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_TRACE_PAYLOAD_MAX_CHARS
+
+
+def _serialize_trace_data(data: Any) -> Tuple[str, bool, int]:
+    """Serialize trace data into a bounded string payload."""
     try:
         if isinstance(data, str):
             preview = data
-        elif isinstance(data, dict):
-            preview = json.dumps(data, separators=(",", ":"))
+        elif dataclasses.is_dataclass(data):
+            preview = json.dumps(
+                dataclasses.asdict(data), default=str, separators=(",", ":")
+            )
+        elif hasattr(data, "model_dump"):
+            preview = json.dumps(data.model_dump(), default=str, separators=(",", ":"))
+        elif hasattr(data, "dict") and callable(data.dict):
+            preview = json.dumps(data.dict(), default=str, separators=(",", ":"))
+        elif isinstance(data, (dict, list, tuple)):
+            preview = json.dumps(data, default=str, separators=(",", ":"))
         else:
             preview = str(data)
-        if len(preview) > 2000:
-            preview = preview[:2000] + "..."
-        span.add_event(event_name, {"data": preview})
+    except Exception:
+        preview = f"<{type(data).__name__}>"
+
+    original_length = len(preview)
+    limit = _trace_payload_limit()
+    truncated = original_length > limit
+    if truncated:
+        preview = preview[:limit] + "..."
+    return preview, truncated, original_length
+
+
+def _add_data_event(span: otel_trace.Span, event_name: str, data: Any) -> None:
+    """Add input/output data as a span event with a 12k default payload cap."""
+    try:
+        preview, truncated, original_length = _serialize_trace_data(data)
+        span.add_event(
+            event_name,
+            {
+                "data": preview,
+                "truncated": truncated,
+                "original_length": original_length,
+                "max_length": _trace_payload_limit(),
+            },
+        )
     except Exception:
         pass
 

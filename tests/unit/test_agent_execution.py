@@ -22,6 +22,7 @@ from daita.agents.agent import Agent
 from daita.core.exceptions import AgentError
 from daita.core.streaming import EventType
 from daita.core.tools import AgentTool
+from daita.core.tracing import get_trace_manager
 from daita.llm.mock import MockLLMProvider
 from daita.plugins.base import LifecyclePlugin
 
@@ -243,6 +244,7 @@ class TestToolCallingLoop:
         result = await agent.run("add 1 and 1", detailed=True)
         assert len(result["tool_calls"]) == 1
         assert result["tool_calls"][0]["tool"] == "add"
+        assert result["tool_calls"][0]["duration_ms"] >= 0
 
     async def test_iterations_incremented_per_llm_call(self):
         tool = _add_tool()
@@ -261,6 +263,54 @@ class TestToolCallingLoop:
         result = await agent.run("go", detailed=True)
         # 1 iteration for tool call + 1 iteration for final answer = 2
         assert result["iterations"] == 2
+
+    async def test_tool_span_records_input_and_output_events(self):
+        tm = get_trace_manager()
+        tm._memory_exporter.clear()
+        tool = _add_tool()
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "Adding.",
+                    "tool_calls": [
+                        {"id": "c1", "name": "add", "arguments": {"a": 2, "b": 4}}
+                    ],
+                },
+                "Done.",
+            ]
+        )
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
+
+        await agent.run("add 2 and 4")
+        tm.flush(timeout_millis=2000)
+
+        tool_spans = [
+            s for s in tm._memory_exporter.get_finished_spans() if s.name == "tool_add"
+        ]
+        assert tool_spans
+        events = tool_spans[-1].events
+        input_event = next(e for e in events if e.name == "daita.input")
+        output_event = next(e for e in events if e.name == "daita.output")
+        assert json.loads(input_event.attributes["data"]) == {"a": 2, "b": 4}
+        assert output_event.attributes["data"] == "6"
+
+    async def test_agent_run_span_records_prompt_and_result_events(self):
+        tm = get_trace_manager()
+        tm._memory_exporter.clear()
+        agent = _make_agent(["Traceable answer."])
+
+        await agent.run("trace this")
+        tm.flush(timeout_millis=2000)
+
+        agent_spans = [
+            s for s in tm._memory_exporter.get_finished_spans() if s.name == "agent_run"
+        ]
+        assert agent_spans
+        events = agent_spans[-1].events
+        input_event = next(e for e in events if e.name == "daita.input")
+        output_event = next(e for e in events if e.name == "daita.output")
+        assert "trace this" in input_event.attributes["data"]
+        assert "Traceable answer." in output_event.attributes["data"]
 
 
 # ===========================================================================

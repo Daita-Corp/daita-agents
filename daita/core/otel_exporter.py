@@ -79,22 +79,27 @@ class DaitaSpanExporter(SpanExporter):
     called synchronously from the OTel ``BatchSpanProcessor`` background
     thread, so we use ``urllib.request`` (stdlib, sync) instead of aiohttp.
 
-    Configuration (via environment variables):
+    Configuration:
+        Prefer explicit configuration through
+        ``daita.core.tracing.configure_tracing(...)``.
+
+    Environment compatibility fallback:
+        Will remove in future update: direct hosted/runtime configuration via
+        environment variables is retained for older deployments.
+
         DAITA_API_KEY           — Bearer token for authentication
+        DAITA_SYSTEM_API_KEY    — Alternate bearer token for hosted executors
+        DAITA_TRACING_API_KEY   — Preferred tracing-only bearer token
         DAITA_DASHBOARD_URL     — Base URL of the Daita backend API
         DAITA_DASHBOARD_API     — Alternate env var for the base URL
         DAITA_DASHBOARD_API_OVERRIDE — Another alternate env var
     """
 
     def __init__(self) -> None:
-        self.api_key: Optional[str] = os.getenv("DAITA_API_KEY")
-        self.dashboard_url: str = (
-            os.getenv("DAITA_DASHBOARD_URL")
-            or os.getenv("DAITA_DASHBOARD_API")
-            or os.getenv("DAITA_DASHBOARD_API_OVERRIDE")
-            or ""
-        )
-        self.enabled: bool = bool(self.api_key and self.dashboard_url)
+        self._api_key: Optional[str] = self._env_api_key()
+        self._dashboard_url: Optional[str] = self._env_dashboard_url()
+        self._organization_id: Optional[str] = None
+        self._api_key_id: Optional[str] = None
         self._stopped: bool = False
 
         if self.enabled:
@@ -103,6 +108,56 @@ class DaitaSpanExporter(SpanExporter):
             logger.debug(
                 "DaitaSpanExporter disabled (DAITA_API_KEY or DAITA_DASHBOARD_URL not set)"
             )
+
+    @property
+    def api_key(self) -> Optional[str]:
+        return self._api_key or self._env_api_key()
+
+    @staticmethod
+    def _env_api_key() -> Optional[str]:
+        return (
+            os.getenv("DAITA_TRACING_API_KEY")
+            # Will remove in future update: DAITA_SYSTEM_API_KEY is a hosted
+            # backend compatibility fallback. Backends should pass api_key
+            # explicitly via configure_tracing(...).
+            or os.getenv("DAITA_SYSTEM_API_KEY")
+            or os.getenv("DAITA_API_KEY")
+        )
+
+    @property
+    def dashboard_url(self) -> str:
+        return self._dashboard_url or self._env_dashboard_url()
+
+    @staticmethod
+    def _env_dashboard_url() -> str:
+        return (
+            os.getenv("DAITA_DASHBOARD_URL")
+            or os.getenv("DAITA_DASHBOARD_API")
+            or os.getenv("DAITA_DASHBOARD_API_OVERRIDE")
+            or ""
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key and self.dashboard_url)
+
+    def configure(
+        self,
+        *,
+        api_key: Optional[str] = None,
+        dashboard_url: Optional[str] = None,
+        organization_id: Optional[str] = None,
+        api_key_id: Optional[str] = None,
+    ) -> None:
+        """Set explicit hosted/exporter configuration without relying on env vars."""
+        if api_key is not None:
+            self._api_key = str(api_key)
+        if dashboard_url is not None:
+            self._dashboard_url = str(dashboard_url)
+        if organization_id is not None:
+            self._organization_id = str(organization_id)
+        if api_key_id is not None:
+            self._api_key_id = str(api_key_id)
 
     # ------------------------------------------------------------------
     # SpanExporter protocol
@@ -182,7 +237,18 @@ class DaitaSpanExporter(SpanExporter):
                 }
             )
 
-        return {"spans": span_dicts}
+        organization_id = (
+            self._organization_id
+            or os.getenv("DAITA_ORGANIZATION_ID")
+            or os.getenv("DAITA_ORG_ID")
+        )
+        api_key_id = self._api_key_id or os.getenv("DAITA_API_KEY_ID")
+        payload = {"spans": span_dicts}
+        if organization_id:
+            payload["organization_id"] = organization_id
+        if api_key_id:
+            payload["api_key_id"] = api_key_id
+        return payload
 
     def _post(self, payload: dict) -> None:
         """POST payload to the Daita ingest endpoint (sync, stdlib)."""

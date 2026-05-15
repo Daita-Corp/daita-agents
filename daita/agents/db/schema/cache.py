@@ -11,6 +11,18 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+_SCHEMA_SNAPSHOT_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _memory_cache_key(cache_key_str: str) -> str:
+    return f"{Path.cwd().resolve()}:{cache_key_str}"
+
+
+def _cache_filename(cache_key_str: str) -> str:
+    """Return a filesystem-safe filename stem for a cache key."""
+    if cache_key_str and all(ch.isalnum() or ch in "._-" for ch in cache_key_str):
+        return cache_key_str
+    return hashlib.sha256(cache_key_str.encode()).hexdigest()[:16]
 
 
 def cache_key(source: Union[str, Any]) -> str:
@@ -43,7 +55,9 @@ def load_cached_schema(
 
     Returns ``(schema, is_expired)`` or ``None`` if no cache file exists.
     """
-    cache_path = Path(".daita") / "schema_cache" / f"{cache_key_str}.json"
+    cache_path = (
+        Path(".daita") / "schema_cache" / f"{_cache_filename(cache_key_str)}.json"
+    )
     if not cache_path.exists():
         return None
 
@@ -52,23 +66,90 @@ def load_cached_schema(
         cached_at = datetime.fromisoformat(data["cached_at"])
         now = datetime.now(timezone.utc)
         is_expired = (now - cached_at).total_seconds() > ttl
-        return data["schema"], is_expired
+        schema = data["schema"]
+        _SCHEMA_SNAPSHOT_MEMORY_CACHE[_memory_cache_key(cache_key_str)] = schema
+        return schema, is_expired
     except Exception as exc:
         logger.debug(f"Failed to load schema cache {cache_path}: {exc}")
         return None
+
+
+def load_schema_snapshot(
+    cache_key_str: str, catalog_keys: Optional[List[str]] = None
+) -> Optional[Dict[str, Any]]:
+    """Load a schema snapshot without applying TTL.
+
+    Lookup order:
+    1. Process memory cache for warm runtimes.
+    2. ``.daita/schema_cache/{cache_key}.json``.
+    3. ``.daita/catalog.json`` by explicit catalog key, or the sole entry when
+       the catalog contains exactly one schema.
+    """
+    memory_key = _memory_cache_key(cache_key_str)
+    if memory_key in _SCHEMA_SNAPSHOT_MEMORY_CACHE:
+        return _SCHEMA_SNAPSHOT_MEMORY_CACHE[memory_key]
+
+    cache_path = (
+        Path(".daita") / "schema_cache" / f"{_cache_filename(cache_key_str)}.json"
+    )
+    if cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text())
+            schema = data.get("schema")
+            if isinstance(schema, dict) and isinstance(schema.get("tables"), list):
+                _SCHEMA_SNAPSHOT_MEMORY_CACHE[memory_key] = schema
+                return schema
+        except Exception as exc:
+            logger.debug(f"Failed to load schema snapshot {cache_path}: {exc}")
+
+    catalog_path = Path(".daita") / "catalog.json"
+    if not catalog_path.exists():
+        return None
+
+    try:
+        catalog = json.loads(catalog_path.read_text())
+    except Exception as exc:
+        logger.debug(f"Failed to load catalog snapshot {catalog_path}: {exc}")
+        return None
+
+    if not isinstance(catalog, dict):
+        return None
+
+    for key in catalog_keys or []:
+        schema = catalog.get(key)
+        if isinstance(schema, dict) and isinstance(schema.get("tables"), list):
+            _SCHEMA_SNAPSHOT_MEMORY_CACHE[memory_key] = schema
+            return schema
+
+    if len(catalog) == 1:
+        schema = next(iter(catalog.values()))
+        if isinstance(schema, dict) and isinstance(schema.get("tables"), list):
+            _SCHEMA_SNAPSHOT_MEMORY_CACHE[memory_key] = schema
+            return schema
+
+    return None
 
 
 def save_schema_cache(cache_key_str: str, schema: Dict[str, Any]) -> None:
     """Persist *schema* to ``.daita/schema_cache/{cache_key_str}.json``."""
     cache_dir = Path(".daita") / "schema_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{cache_key_str}.json"
+    cache_path = cache_dir / f"{_cache_filename(cache_key_str)}.json"
     payload = {
         "schema": schema,
         "cached_at": datetime.now(timezone.utc).isoformat(),
         "cache_key": cache_key_str,
     }
     cache_path.write_text(json.dumps(payload, indent=2))
+    _SCHEMA_SNAPSHOT_MEMORY_CACHE[_memory_cache_key(cache_key_str)] = schema
+
+
+def clear_schema_snapshot(cache_key_str: Optional[str] = None) -> None:
+    """Clear in-memory schema snapshots, optionally for one cache key."""
+    if cache_key_str is None:
+        _SCHEMA_SNAPSHOT_MEMORY_CACHE.clear()
+    else:
+        _SCHEMA_SNAPSHOT_MEMORY_CACHE.pop(_memory_cache_key(cache_key_str), None)
 
 
 def detect_drift(

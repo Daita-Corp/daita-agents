@@ -67,6 +67,41 @@ def _make_error_fingerprint(tool_call: Dict[str, Any]) -> str:
     return f"{tool_call['name']}:{args_hash}"
 
 
+def _has_terminal_tool_result(
+    results: List[Dict[str, Any]], terminal_tools: set[str]
+) -> bool:
+    """Return True when a configured terminal tool completed without an error."""
+    if not terminal_tools:
+        return False
+    for result in results:
+        if result.get("tool") not in terminal_tools:
+            continue
+        raw = result.get("result")
+        if isinstance(raw, dict) and raw.get("error"):
+            continue
+        if isinstance(raw, dict) and (
+            raw.get("repair_required")
+            or raw.get("preflight_failed")
+            or raw.get("blocked_repeat")
+        ):
+            continue
+        return True
+    return False
+
+
+def _tool_loop_error_message(raw: Any) -> Optional[str]:
+    """Return an error-like message for tool results that should count as loops."""
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("error"):
+        return str(raw["error"])
+    if raw.get("blocked_repeat"):
+        return str(raw.get("message") or raw.get("status") or "blocked repeat")
+    if raw.get("repair_required") or raw.get("preflight_failed"):
+        return str(raw.get("message") or raw.get("guidance") or "repair required")
+    return None
+
+
 def _json_serializer(obj):
     """
     Custom JSON serializer for types commonly returned by database plugins.
@@ -588,16 +623,23 @@ class Agent(BaseAgent):
         start_time = time.time()
 
         # Create agent-level trace span (automatic, invisible to users)
+        tools_requested = None
+        if tools is not None:
+            tools_requested = [
+                t if isinstance(t, str) else getattr(t, "name", str(t)) for t in tools
+            ]
+
         async with self.trace_manager.span(
             operation_name="agent_run",
             trace_type=TraceType.AGENT_EXECUTION,
             agent_id=self.agent_id,
             agent_name=self.name,
             prompt=prompt[:200],  # Truncate for storage
-            tools_requested=tools,
+            tools_requested=tools_requested,
             max_iterations=max_iterations,
             entry_point="run",  # Distinguishes from _process() calls
-        ):
+            input_data={"prompt": prompt, "tools_requested": tools_requested},
+        ) as span_id:
             # Start watches lazily on first run (idempotent)
             await self._start_watches()
 
@@ -640,6 +682,7 @@ class Agent(BaseAgent):
             if history is not None:
                 await history.add_turn(prompt, result.get("result", ""))
 
+            self.trace_manager.record_output(span_id, result)
             return result
 
     def _resolve_tools(
@@ -771,11 +814,12 @@ class Agent(BaseAgent):
             agent_id=self.agent_id,
             tool_name=tool_name,
             input_data=tool_call.get("arguments"),
-        ):
+        ) as span_id:
             # Track execution time
             start_time = time.time()
 
             result = await _execute_tool_call(tool_call, tools)
+            self.trace_manager.record_output(span_id, result)
 
             # Calculate duration
             duration_ms = int((time.time() - start_time) * 1000)
@@ -798,6 +842,7 @@ class Agent(BaseAgent):
                 "tool": tool_name,
                 "arguments": tool_call["arguments"],
                 "result": result,
+                "duration_ms": duration_ms,
             }
 
     def _append_tool_messages(
@@ -809,12 +854,16 @@ class Agent(BaseAgent):
 
         # Add tool result messages
         for tool_call, result in zip(tool_calls, results):
+            content_result = result["result"]
+            compactor = getattr(self, "_compact_tool_result_for_context", None)
+            if callable(compactor):
+                content_result = compactor(tool_call["name"], content_result)
             conversation.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "name": tool_call["name"],
-                    "content": json.dumps(result["result"], default=_json_serializer),
+                    "content": json.dumps(content_result, default=_json_serializer),
                 }
             )
 
@@ -893,6 +942,11 @@ class Agent(BaseAgent):
 
         skill_parts = []
         for source in self.tool_sources:
+            disabled_for = getattr(
+                source, "_daita_disable_lifecycle_context_for_agent_ids", set()
+            )
+            if self.agent_id in disabled_for:
+                continue
             if isinstance(source, LifecyclePlugin):
                 try:
                     context = await source.on_before_run(prompt)
@@ -942,6 +996,11 @@ class Agent(BaseAgent):
 
         # Prepare tools with focus wrapping
         resolved_tools = await self._prepare_tools_with_focus(tools)
+        active_tools = resolved_tools
+        final_synthesis_without_tools = bool(
+            kwargs.pop("final_synthesis_without_tools", False)
+        )
+        terminal_tools = set(kwargs.pop("terminal_tools", []) or [])
 
         # Reset tool call history for this execution
         self._tool_call_history = []
@@ -968,11 +1027,11 @@ class Agent(BaseAgent):
             # Get LLM response (streaming or non-streaming based on on_event)
             if on_event:
                 llm_result = await self._stream_llm_turn(
-                    conversation, resolved_tools, on_event, **kwargs
+                    conversation, active_tools, on_event, **kwargs
                 )
             else:
                 llm_result = await self._nonstream_llm_turn(
-                    conversation, resolved_tools, **kwargs
+                    conversation, active_tools, **kwargs
                 )
 
             # Check if LLM wants to call tools
@@ -981,7 +1040,7 @@ class Agent(BaseAgent):
                 results = []
                 for tool_call in llm_result.tool_calls:
                     result = await self._execute_and_track_tool(
-                        tool_call, resolved_tools, on_event
+                        tool_call, active_tools, on_event
                     )
                     tools_called.append(result)
                     results.append(result)
@@ -989,19 +1048,26 @@ class Agent(BaseAgent):
                     # Loop detection: identical (tool, args) producing consecutive errors
                     raw = result.get("result", {})
                     fp = _make_error_fingerprint(tool_call)
-                    if isinstance(raw, dict) and "error" in raw:
+                    loop_error = _tool_loop_error_message(raw)
+                    if loop_error:
                         _error_fingerprints[fp] = _error_fingerprints.get(fp, 0) + 1
                         if _error_fingerprints[fp] >= 3:
                             raise AgentError(
-                                f"Loop detected: '{tool_call['name']}' returned an error "
+                                f"Loop detected: '{tool_call['name']}' returned a repair/error result "
                                 f"{_error_fingerprints[fp]} consecutive times with identical "
-                                f"arguments. Last error: {raw['error']}"
+                                f"arguments. Last result: {loop_error}"
                             )
                     else:
                         _error_fingerprints.pop(fp, None)
 
                 # Add to conversation and continue loop
                 self._append_tool_messages(conversation, llm_result.tool_calls, results)
+                if final_synthesis_without_tools and _has_terminal_tool_result(
+                    results, terminal_tools
+                ):
+                    active_tools = []
+                else:
+                    active_tools = resolved_tools
                 continue
 
             # Final answer received
@@ -1010,8 +1076,17 @@ class Agent(BaseAgent):
             )
 
         # Max iterations reached without final answer
+        token_stats = self.llm.get_token_stats() if self.llm is not None else {}
         raise AgentError(
-            f"Max iterations ({max_iterations}) reached without final answer"
+            f"Max iterations ({max_iterations}) reached without final answer",
+            agent_id=self.agent_id,
+            task=prompt,
+            context={
+                "max_iterations": max_iterations,
+                "iterations": max_iterations,
+                "tool_calls": tools_called,
+                "tokens": token_stats,
+            },
         )
 
     # ========================================================================

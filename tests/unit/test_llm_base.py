@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from daita.core.tools import AgentTool
+from daita.core.tracing import get_trace_manager
 from daita.llm.anthropic import AnthropicProvider
 from daita.llm.gemini import GeminiProvider
 from daita.llm.grok import GrokProvider
@@ -57,6 +58,18 @@ def _make_slow_tool(name: str, sleep: float = 10.0):
     )
 
 
+def _latest_llm_events():
+    tm = get_trace_manager()
+    tm.flush(timeout_millis=2000)
+    spans = [
+        s
+        for s in tm._memory_exporter.get_finished_spans()
+        if (s.attributes or {}).get("daita.trace.type") == "llm_call"
+    ]
+    assert spans
+    return spans[-1].events
+
+
 # ===========================================================================
 # Provider defaults
 # ===========================================================================
@@ -74,6 +87,39 @@ class TestProviderDefaults:
 
     def test_grok_default_model_is_current_cost_sensitive_model(self):
         assert GrokProvider().model == "grok-4.20"
+
+
+class TestLLMTracing:
+    async def test_non_streaming_records_input_and_output_events(self):
+        tm = get_trace_manager()
+        tm._memory_exporter.clear()
+        p = _make_provider()
+        p.set_agent_id("trace-agent")
+
+        result = await p.generate("hello")
+
+        events = _latest_llm_events()
+        input_event = next(e for e in events if e.name == "daita.input")
+        output_event = next(e for e in events if e.name == "daita.output")
+        assert "hello" in input_event.attributes["data"]
+        assert result in output_event.attributes["data"]
+
+    async def test_streaming_records_input_and_aggregated_output_events(self):
+        tm = get_trace_manager()
+        tm._memory_exporter.clear()
+        p = _make_provider()
+        p.set_agent_id("trace-agent")
+
+        chunks = []
+        stream = await p.generate("stream this", stream=True)
+        async for chunk in stream:
+            chunks.append(chunk.content or "")
+
+        events = _latest_llm_events()
+        input_event = next(e for e in events if e.name == "daita.input")
+        output_event = next(e for e in events if e.name == "daita.output")
+        assert "stream this" in input_event.attributes["data"]
+        assert "".join(chunks) in output_event.attributes["data"]
 
 
 # ===========================================================================
@@ -139,11 +185,28 @@ class TestOpenAICompatibleHelpers:
             prompt_token_count=5,
             candidates_token_count=7,
         )
-        assert p._extract_tokens(usage) == {
-            "total_tokens": 12,
-            "prompt_tokens": 5,
-            "completion_tokens": 7,
+        tokens = p._extract_tokens(usage)
+        assert tokens["total_tokens"] == 12
+        assert tokens["prompt_tokens"] == 5
+        assert tokens["completion_tokens"] == 7
+
+    def test_dict_usage_extracts_extended_token_counts(self):
+        p = OpenAIProvider(api_key="test")
+        usage = {
+            "total_tokens": 20,
+            "prompt_tokens": 12,
+            "completion_tokens": 8,
+            "prompt_tokens_details": {"cached_tokens": 4},
+            "completion_tokens_details": {"reasoning_tokens": 2},
         }
+
+        tokens = p._extract_tokens(usage)
+
+        assert tokens["total_tokens"] == 20
+        assert tokens["prompt_tokens"] == 12
+        assert tokens["completion_tokens"] == 8
+        assert tokens["cached_input_tokens"] == 4
+        assert tokens["reasoning_tokens"] == 2
 
 
 # ===========================================================================
@@ -185,17 +248,28 @@ class TestEstimateCost:
         p = _make_provider()
         assert p._estimate_cost({"total_tokens": 0}) is None
 
-    def test_positive_tokens_returns_positive_float(self):
-        p = _make_provider()
-        cost = p._estimate_cost({"total_tokens": 1000})
-        assert isinstance(cost, float)
-        assert cost > 0.0
+    def test_known_model_uses_model_pricing(self):
+        p = OpenAIProvider(model="gpt-4o-mini", api_key="test")
+        cost = p._estimate_cost(
+            {
+                "total_tokens": 2_000_000,
+                "prompt_tokens": 1_000_000,
+                "completion_tokens": 1_000_000,
+            }
+        )
+        assert cost == pytest.approx(0.75)
 
-    def test_cost_scales_with_tokens(self):
+    def test_unknown_model_uses_low_confidence_fallback(self):
         p = _make_provider()
-        cost_1k = p._estimate_cost({"total_tokens": 1000})
-        cost_2k = p._estimate_cost({"total_tokens": 2000})
-        assert cost_2k == pytest.approx(cost_1k * 2, rel=1e-6)
+        estimate = p._estimate_cost_details(
+            {
+                "total_tokens": 2000,
+                "prompt_tokens": 1000,
+                "completion_tokens": 1000,
+            }
+        )
+        assert estimate.as_float() == pytest.approx(0.004)
+        assert estimate.pricing_confidence == "low"
 
 
 # ===========================================================================
