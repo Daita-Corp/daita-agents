@@ -187,6 +187,7 @@ async def from_db(
         db_schema=db_schema,
         cache_ttl=cache_ttl,
         was_created=was_created,
+        use_schema_snapshot=not bool(lineage),
     )
 
     if include_sample_values:
@@ -307,6 +308,7 @@ async def _discover_schema_with_cache(
     db_schema: Optional[str],
     cache_ttl: Optional[int],
     was_created: bool,
+    use_schema_snapshot: bool = True,
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     from ...core.exceptions import AgentError
 
@@ -316,12 +318,13 @@ async def _discover_schema_with_cache(
     drift = None
 
     if cache_ttl is None:
-        cached_schema = load_schema_snapshot(
-            cache_key_val,
-            catalog_keys=_catalog_snapshot_keys(plugin, db_schema),
-        )
-        if cached_schema is not None:
-            return cached_schema, drift
+        if use_schema_snapshot:
+            cached_schema = load_schema_snapshot(
+                cache_key_val,
+                catalog_keys=_catalog_snapshot_keys(plugin, db_schema),
+            )
+            if cached_schema is not None:
+                return cached_schema, drift
     elif cache_ttl == 0:
         cache_result = load_cached_schema(cache_key_val, cache_ttl)
         if cache_result is not None:
@@ -351,7 +354,8 @@ async def _discover_schema_with_cache(
         if drift:
             logger.warning(f"Schema drift detected: {drift}")
 
-    save_schema_cache(cache_key_val, schema)
+    if cache_ttl is not None:
+        save_schema_cache(cache_key_val, schema)
 
     return schema, drift
 

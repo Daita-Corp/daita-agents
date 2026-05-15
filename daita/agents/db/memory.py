@@ -7,6 +7,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
 from .schema.discovery import is_numeric_type
@@ -53,7 +54,9 @@ PII_VALUE_PATTERNS = (
     ),
     (
         "phone number",
-        re.compile(r"(?<!\w)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\w)"),
+        re.compile(
+            r"(?<!\w)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\w)"
+        ),
     ),
 )
 
@@ -290,7 +293,9 @@ def normalize_db_memory_record(raw: Any) -> DBMemoryRecord:
     )
 
 
-def _db_memory_pii_error(*, key: str, text: str, metadata: Dict[str, Any]) -> Optional[str]:
+def _db_memory_pii_error(
+    *, key: str, text: str, metadata: Dict[str, Any]
+) -> Optional[str]:
     violation = _detect_pii_value(text) or _detect_pii_value(key)
     if violation:
         return (
@@ -342,7 +347,9 @@ def _looks_like_credit_card(candidate: str) -> bool:
     return checksum % 10 == 0
 
 
-def _find_sensitive_metadata_key(metadata: Dict[str, Any], prefix: str = "") -> Optional[str]:
+def _find_sensitive_metadata_key(
+    metadata: Dict[str, Any], prefix: str = ""
+) -> Optional[str]:
     for key, value in metadata.items():
         key_text = str(key).lower()
         if key_text in SENSITIVE_METADATA_KEYS or any(
@@ -638,7 +645,10 @@ async def _list_records_by_category(
 ) -> Optional[List[Dict[str, Any]]]:
     backend = getattr(plugin, "backend", None)
     if backend is not None and hasattr(backend, "list_by_category"):
-        return await backend.list_by_category(category=category, limit=limit)
+        result = backend.list_by_category(category=category, limit=limit)
+        if isawaitable(result):
+            result = await result
+        return result if isinstance(result, list) else None
     return None
 
 

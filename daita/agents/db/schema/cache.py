@@ -18,6 +18,13 @@ def _memory_cache_key(cache_key_str: str) -> str:
     return f"{Path.cwd().resolve()}:{cache_key_str}"
 
 
+def _cache_filename(cache_key_str: str) -> str:
+    """Return a filesystem-safe filename stem for a cache key."""
+    if cache_key_str and all(ch.isalnum() or ch in "._-" for ch in cache_key_str):
+        return cache_key_str
+    return hashlib.sha256(cache_key_str.encode()).hexdigest()[:16]
+
+
 def cache_key(source: Union[str, Any]) -> str:
     """Compute a stable cache key for *source*, stripping credentials."""
     if isinstance(source, str):
@@ -48,7 +55,9 @@ def load_cached_schema(
 
     Returns ``(schema, is_expired)`` or ``None`` if no cache file exists.
     """
-    cache_path = Path(".daita") / "schema_cache" / f"{cache_key_str}.json"
+    cache_path = (
+        Path(".daita") / "schema_cache" / f"{_cache_filename(cache_key_str)}.json"
+    )
     if not cache_path.exists():
         return None
 
@@ -80,7 +89,9 @@ def load_schema_snapshot(
     if memory_key in _SCHEMA_SNAPSHOT_MEMORY_CACHE:
         return _SCHEMA_SNAPSHOT_MEMORY_CACHE[memory_key]
 
-    cache_path = Path(".daita") / "schema_cache" / f"{cache_key_str}.json"
+    cache_path = (
+        Path(".daita") / "schema_cache" / f"{_cache_filename(cache_key_str)}.json"
+    )
     if cache_path.exists():
         try:
             data = json.loads(cache_path.read_text())
@@ -123,7 +134,7 @@ def save_schema_cache(cache_key_str: str, schema: Dict[str, Any]) -> None:
     """Persist *schema* to ``.daita/schema_cache/{cache_key_str}.json``."""
     cache_dir = Path(".daita") / "schema_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{cache_key_str}.json"
+    cache_path = cache_dir / f"{_cache_filename(cache_key_str)}.json"
     payload = {
         "schema": schema,
         "cached_at": datetime.now(timezone.utc).isoformat(),
