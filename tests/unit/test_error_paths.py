@@ -315,6 +315,81 @@ class TestLoopDetection:
         with pytest.raises(AgentError, match="Loop detected"):
             await agent.run("please call fail_tool")
 
+    async def test_blocked_repair_results_trigger_loop_detection(self):
+        async def blocked_repair(args):
+            return {
+                "blocked_repeat": True,
+                "repair_required": True,
+                "status": "repeated_invalid_sql_blocked",
+                "message": "same SQL blocked",
+            }
+
+        validate_tool = AgentTool(
+            name="validate",
+            description="validate SQL",
+            parameters={
+                "type": "object",
+                "properties": {"sql": {"type": "string"}},
+                "required": ["sql"],
+            },
+            handler=blocked_repair,
+        )
+        same_call = {
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "name": "validate", "arguments": {"sql": "bad"}}
+            ],
+        }
+        llm = SequentialMockLLM(
+            response_sequence=[
+                same_call,
+                same_call,
+                same_call,
+                same_call,
+                "Final answer",
+            ]
+        )
+        agent = Agent(name="RepairLoopAgent", llm_provider=llm, tools=[validate_tool])
+
+        with pytest.raises(AgentError, match="Loop detected"):
+            await agent.run("please validate this SQL")
+
+
+class TestFinalSynthesisWithoutTools:
+    async def test_terminal_tool_can_disable_tools_for_final_turn(self):
+        async def lookup(args):
+            return {"answer": 42}
+
+        lookup_tool = AgentTool(
+            name="lookup",
+            description="look up a value",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=lookup,
+        )
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "",
+                    "tool_calls": [{"id": "c1", "name": "lookup", "arguments": {}}],
+                },
+                "The answer is 42.",
+            ]
+        )
+        agent = Agent(name="SynthAgent", llm_provider=llm, tools=[lookup_tool])
+
+        result = await agent.run(
+            "look it up",
+            tools=["lookup"],
+            final_synthesis_without_tools=True,
+            terminal_tools=("lookup",),
+        )
+
+        assert result == "The answer is 42."
+        assert [tool["function"]["name"] for tool in llm.call_history[0]["tools"]] == [
+            "lookup"
+        ]
+        assert llm.call_history[1]["tools"] in (None, [])
+
 
 # ---------------------------------------------------------------------------
 # Run timeout

@@ -7,7 +7,7 @@ Daita Agents gives you a clean, minimal API for autonomous tool-calling agents t
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
 [![PyPI](https://img.shields.io/badge/pypi-daita--agents-orange)](https://pypi.org/project/daita-agents/)
-[![Version](https://img.shields.io/badge/version-0.16.0-green)](https://pypi.org/project/daita-agents/)
+[![Version](https://img.shields.io/pypi/v/daita-agents.svg)](https://pypi.org/project/daita-agents/)
 
 ---
 
@@ -54,6 +54,7 @@ asyncio.run(main())
 - **Watch system** — monitor databases and APIs continuously; trigger agent actions when thresholds are crossed
 - **Workflows** — connect multiple agents into pipelines via relay channels
 - **Data quality enforcement** — `ItemAssertion` + `query_checked()` validate every row and fail fast with structured violations
+- **Agent evals** — developer-preview eval suites for checking answers, tools, SQL, data operations, skills, plugins, budgets, baselines, and optional LLM judges
 - **Agent graph** — built-in graph backend powering lineage & catalog; expose traversal tools to agents with `register_graph_tools()`
 - **Zero-config tracing** — every LLM call and tool execution is automatically traced (tokens, latency, cost); optional OTLP export to Datadog, Jaeger, Honeycomb, etc.
 - **Retry & reliability** — configurable exponential backoff with permanent-error detection
@@ -220,6 +221,84 @@ async def main():
 
 asyncio.run(main())
 ```
+
+---
+
+### Agent evals
+
+Agent evals are a developer-preview system for testing runnable Daita agents locally or in CI. An eval suite loads an agent through a Python factory, runs one or more prompts, and writes structured artifacts that show what passed, failed, and changed.
+
+Eval suites can check:
+
+- final-answer text and numeric values
+- required or forbidden tools
+- SQL safety and query shape
+- non-SQL data operations across files, APIs, storage, and vector search
+- skill and plugin usage, latency, and errors
+- cost, latency, token, and iteration budgets
+- repeat-run stability
+- baselines and optional structured LLM judges
+
+```yaml
+name: sales-agent-evals
+version: 1
+
+agent:
+  factory: "myapp.agents:create_sales_agent"
+  kwargs:
+    model: gpt-4o-mini
+
+defaults:
+  runs: 2
+  max_iterations: 8
+
+cases:
+  - id: top-products
+    prompt: What were the top 5 products by revenue?
+    expectations:
+      answer:
+        contains: ["Widget A"]
+        numeric:
+          - label: revenue
+            expected: 12840.50
+            tolerance: 0.01
+      tools:
+        required: ["sqlite_query"]
+        max_calls: 4
+      sql:
+        read_only: true
+        require_limit: true
+        must_include: ["SUM", "GROUP BY"]
+        must_not_include: ["DELETE", "DROP"]
+      skills:
+        required: ["schema_discovery"]
+        max_errors: 0
+      plugins:
+        required: ["sqlite"]
+        max_latency_ms: 3000
+      budgets:
+        max_tokens: 8000
+        max_latency_ms: 15000
+      stability:
+        require_same_tools: true
+        max_answer_variants: 1
+```
+
+Run a suite from Python:
+
+```python
+import asyncio
+from daita.evals import EvalSuite
+from daita.evals.reporters import render_pretty
+
+async def main():
+    report = await EvalSuite.from_file("evals/sales-agent.yaml").run()
+    print(render_pretty(report))
+
+asyncio.run(main())
+```
+
+Eval runs write `report.json`, `summary.md`, JUnit XML, per-case artifacts, per-run artifacts, repeat-run diffs, judge artifacts, and baseline comparisons. The CLI command (`daita eval`) is planned; use the Python API while evals are in developer preview.
 
 ---
 

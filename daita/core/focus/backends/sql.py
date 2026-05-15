@@ -236,7 +236,10 @@ def compile_focus_to_sql(
     # ── WHERE (filter) ────────────────────────────────────────────────────────
     where_sql: Optional[str] = None
     if fq.filter_ast is not None:
-        where_sql = compiler.compile(fq.filter_ast)
+        if _is_predicate_root(fq.filter_ast):
+            where_sql = compiler.compile(fq.filter_ast)
+        else:
+            where_sql = None
         if where_sql is None:
             # Untranslatable — reset any params already emitted by the failed attempt
             compiler.params.clear()
@@ -314,3 +317,16 @@ def compile_focus_to_sql(
         sql += f" LIMIT {limit_sql}"
 
     return sql, compiler.params, applied
+
+
+def _is_predicate_root(node: pyast.expr) -> bool:
+    """Only push SQL filters whose root is clearly boolean.
+
+    A bare identifier such as ``focus="name"`` is legal Python-side Focus DSL
+    and evaluates by truthiness, but SQL dialects disagree on text truthiness.
+    SQLite in particular treats ``WHERE "Alice"`` as false, which can erase
+    otherwise-correct query results. Leave those expressions for the Python
+    evaluator.
+    """
+
+    return isinstance(node, (pyast.Compare, pyast.BoolOp, pyast.UnaryOp))

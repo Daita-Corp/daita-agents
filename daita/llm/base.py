@@ -14,6 +14,7 @@ import logging
 
 from ..core.tracing import get_trace_manager, TraceType
 from ..core.interfaces import LLMProvider
+from .pricing import CostEstimate, TokenUsage, estimate_llm_cost
 
 if TYPE_CHECKING:
     from ..core.tools import AgentTool
@@ -69,12 +70,15 @@ class BaseLLMProvider(LLMProvider, ABC):
 
         # Accumulated cost tracking for operations
         self._accumulated_cost = 0.0
+        self._last_cost_estimate: Optional[CostEstimate] = None
 
         # Accumulated token tracking
         self._accumulated_tokens = {
             "total_tokens": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": 0,
         }
 
         logger.debug(
@@ -132,17 +136,27 @@ class BaseLLMProvider(LLMProvider, ABC):
         if tools:
             tool_specs = self._convert_tools_to_format(tools)
 
+        trace_input = {
+            "messages": messages,
+            "tools": tool_specs,
+            "params": params,
+        }
+
         # Route to streaming or non-streaming
         if stream:
-            return self._stream_impl(messages, tool_specs, **params)
+            return self._stream_with_tracing(
+                messages, tool_specs, trace_input, **params
+            )
         else:
             async with self.trace_manager.span(
                 operation_name=f"llm_{self.provider_name}",
                 trace_type=TraceType.LLM_CALL,
                 agent_id=self.agent_id,
                 model=self.model,
+                input_data=trace_input,
             ) as span_id:
                 result = await self._generate_impl(messages, tool_specs, **params)
+                self.trace_manager.record_output(span_id, result)
 
                 # Record token usage on the span
                 token_usage = self._get_last_token_usage()
@@ -156,6 +170,50 @@ class BaseLLMProvider(LLMProvider, ABC):
                     )
 
                 return result
+
+    async def _stream_with_tracing(self, messages, tool_specs, trace_input, **params):
+        """Wrap provider streaming with one LLM span and aggregate output events."""
+        text_parts = []
+        tool_calls = []
+
+        async with self.trace_manager.span(
+            operation_name=f"llm_{self.provider_name}",
+            trace_type=TraceType.LLM_CALL,
+            agent_id=self.agent_id,
+            model=self.model,
+            input_data=trace_input,
+        ) as span_id:
+            try:
+                async for chunk in self._stream_impl(messages, tool_specs, **params):
+                    if getattr(chunk, "type", None) == "text" and chunk.content:
+                        text_parts.append(chunk.content)
+                    elif getattr(chunk, "type", None) == "tool_call_complete":
+                        tool_calls.append(
+                            {
+                                "id": chunk.tool_call_id,
+                                "name": chunk.tool_name,
+                                "arguments": chunk.tool_args,
+                            }
+                        )
+                    yield chunk
+            finally:
+                output: Dict[str, Any] = {}
+                if text_parts:
+                    output["content"] = "".join(text_parts)
+                if tool_calls:
+                    output["tool_calls"] = tool_calls
+                if output:
+                    self.trace_manager.record_output(span_id, output)
+
+                token_usage = self._get_last_token_usage()
+                if token_usage.get("total_tokens"):
+                    self.trace_manager.record_llm_call(
+                        span_id=span_id,
+                        model=self.model,
+                        prompt_tokens=token_usage.get("prompt_tokens", 0),
+                        completion_tokens=token_usage.get("completion_tokens", 0),
+                        total_tokens=token_usage.get("total_tokens", 0),
+                    )
 
     @abstractmethod
     async def _generate_impl(
@@ -200,23 +258,64 @@ class BaseLLMProvider(LLMProvider, ABC):
 
     @staticmethod
     def _extract_tokens(usage) -> Dict[str, int]:
-        """Extract token counts from an OpenAI or Anthropic usage object."""
+        """Extract token counts from provider usage into legacy framework keys."""
         if not usage:
-            return {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0}
+            return {
+                "total_tokens": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": 0,
+            }
+
+        if isinstance(usage, dict):
+            prompt_details = usage.get("prompt_tokens_details") or {}
+            completion_details = usage.get("completion_tokens_details") or {}
+            prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+            completion_tokens = usage.get(
+                "completion_tokens", usage.get("output_tokens", 0)
+            )
+            total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+            return {
+                "total_tokens": total_tokens,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "cached_input_tokens": usage.get(
+                    "cached_input_tokens",
+                    _get_usage_field(prompt_details, "cached_tokens", 0),
+                ),
+                "reasoning_tokens": usage.get(
+                    "reasoning_tokens",
+                    _get_usage_field(completion_details, "reasoning_tokens", 0),
+                ),
+            }
 
         if hasattr(usage, "total_tokens"):
+            prompt_details = _get_usage_field(usage, "prompt_tokens_details") or {}
+            completion_details = (
+                _get_usage_field(usage, "completion_tokens_details") or {}
+            )
             return {
                 "total_tokens": getattr(usage, "total_tokens", 0),
                 "prompt_tokens": getattr(usage, "prompt_tokens", 0),
                 "completion_tokens": getattr(usage, "completion_tokens", 0),
+                "cached_input_tokens": _get_usage_field(
+                    prompt_details, "cached_tokens", 0
+                ),
+                "reasoning_tokens": _get_usage_field(
+                    completion_details, "reasoning_tokens", 0
+                ),
             }
         if hasattr(usage, "input_tokens"):
             inp = getattr(usage, "input_tokens", 0)
             out = getattr(usage, "output_tokens", 0)
+            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
             return {
                 "total_tokens": inp + out,
                 "prompt_tokens": inp,
                 "completion_tokens": out,
+                "cached_input_tokens": cache_read,
+                "reasoning_tokens": 0,
             }
         if hasattr(usage, "total_token_count"):
             prompt = getattr(usage, "prompt_token_count", 0) or 0
@@ -226,9 +325,18 @@ class BaseLLMProvider(LLMProvider, ABC):
                 "total_tokens": total,
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
+                "cached_input_tokens": getattr(usage, "cached_content_token_count", 0)
+                or 0,
+                "reasoning_tokens": getattr(usage, "thoughts_token_count", 0) or 0,
             }
 
-        return {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0}
+        return {
+            "total_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": 0,
+        }
 
     def _record_usage(self, usage) -> None:
         """Store provider usage and update accumulated token/cost metrics."""
@@ -242,18 +350,39 @@ class BaseLLMProvider(LLMProvider, ABC):
         return self._extract_tokens(self._last_usage)
 
     def _estimate_cost(self, token_usage: Dict[str, int]) -> Optional[float]:
-        """
-        Simple cost estimation for MVP.
+        """Estimate cost using the shared model pricing catalog."""
+        estimate = self._estimate_cost_details(token_usage)
+        return estimate.as_float() if estimate.usd is not None else None
 
-        Providers can override with specific pricing.
-        """
-        total_tokens = token_usage.get("total_tokens", 0)
-        if total_tokens == 0:
-            return None
+    def _estimate_cost_details(self, token_usage: Dict[str, int]) -> CostEstimate:
+        """Return detailed pricing metadata for a token usage payload."""
+        usage = TokenUsage.from_counts(
+            input_tokens=token_usage.get("prompt_tokens", 0),
+            output_tokens=token_usage.get("completion_tokens", 0),
+            total_tokens=token_usage.get("total_tokens", 0),
+            cached_input_tokens=token_usage.get("cached_input_tokens", 0),
+            reasoning_tokens=token_usage.get("reasoning_tokens", 0),
+        )
+        estimate = estimate_llm_cost(self.provider_name, self.model, usage)
+        if estimate.warning:
+            logger.debug(estimate.warning)
+        return estimate
 
-        # Generic estimation for MVP - providers should override
-        cost_per_1k_tokens = 0.002  # $0.002 per 1K tokens
-        return (total_tokens / 1000) * cost_per_1k_tokens
+    def get_last_cost_estimate(self) -> Optional[CostEstimate]:
+        """Return pricing details for the most recent recorded LLM call."""
+        return self._last_cost_estimate
+
+    def get_pricing_metadata(self) -> Dict[str, Any]:
+        """Return pricing metadata for operation reporting and debugging."""
+        if self._last_cost_estimate is None:
+            return {}
+        return {
+            "pricing_provider": self._last_cost_estimate.provider,
+            "pricing_model": self._last_cost_estimate.pricing_model,
+            "pricing_source": self._last_cost_estimate.pricing_source,
+            "pricing_confidence": self._last_cost_estimate.pricing_confidence,
+            "pricing_warning": self._last_cost_estimate.warning,
+        }
 
     def _merge_params(self, override_params: Dict[str, Any]) -> Dict[str, Any]:
         """Merge default parameters with overrides."""
@@ -311,7 +440,10 @@ class BaseLLMProvider(LLMProvider, ABC):
             "total_tokens": accumulated["total_tokens"],  # From ALL API calls
             "prompt_tokens": accumulated["prompt_tokens"],
             "completion_tokens": accumulated["completion_tokens"],
+            "cached_input_tokens": accumulated["cached_input_tokens"],
+            "reasoning_tokens": accumulated["reasoning_tokens"],
             "estimated_cost": self._accumulated_cost,  # Accumulated cost across all calls
+            **self.get_pricing_metadata(),
             "success_rate": metrics.get("success_rate", 0),
             "avg_latency_ms": metrics.get("avg_latency_ms", 0),
         }
@@ -376,11 +508,24 @@ class BaseLLMProvider(LLMProvider, ABC):
         self._accumulated_tokens["completion_tokens"] += token_usage.get(
             "completion_tokens", 0
         )
+        self._accumulated_tokens["cached_input_tokens"] += token_usage.get(
+            "cached_input_tokens", 0
+        )
+        self._accumulated_tokens["reasoning_tokens"] += token_usage.get(
+            "reasoning_tokens", 0
+        )
 
         # Update accumulated cost
         if cost is None:
-            cost = self._estimate_cost(token_usage) or 0.0
+            self._last_cost_estimate = self._estimate_cost_details(token_usage)
+            cost = self._last_cost_estimate.as_float() or 0.0
         self._accumulated_cost += cost
+
+
+def _get_usage_field(value: Any, key: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
 
 
 # Context manager for batch LLM operations

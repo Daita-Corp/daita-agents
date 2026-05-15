@@ -125,6 +125,18 @@ def test_filter_dot_notation_not_pushed():
     assert "_focus_q" in sql
 
 
+def test_bare_identifier_filter_not_pushed():
+    """Bare truthiness filters are dialect-sensitive, so keep them in Python."""
+    sql, params, applied = compile("name", dialect="sqlite")
+    assert "filter" not in applied
+    assert "WHERE" not in sql
+    assert params == []
+
+    rows = [{"name": "Alice"}, {"name": "Bob"}, {"name": ""}]
+    focused = evaluate_remaining(rows, parse("name"), applied)
+    assert focused == [{"name": "Alice"}, {"name": "Bob"}]
+
+
 # ── SELECT pushdown ───────────────────────────────────────────────────────────
 
 

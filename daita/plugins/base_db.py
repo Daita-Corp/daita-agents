@@ -5,6 +5,7 @@ Provides common connection management, error handling, and context manager
 support for all database plugins in the Daita framework.
 """
 
+import asyncio
 import logging
 from abc import abstractmethod
 from typing import Any, Dict
@@ -53,6 +54,13 @@ class BaseDatabasePlugin(BasePlugin):
         self.timeout = kwargs.get("timeout", 30)
         self.max_retries = kwargs.get("max_retries", 3)
         self.read_only = kwargs.get("read_only", False)
+        self.query_default_limit = kwargs.get("query_default_limit", 50)
+        self.query_max_rows = kwargs.get("query_max_rows", 200)
+        self.query_max_chars = kwargs.get("query_max_chars", 50000)
+        self.query_timeout = kwargs.get("query_timeout", self.timeout)
+        self.allowed_tables = set(kwargs.get("allowed_tables") or [])
+        self.blocked_tables = set(kwargs.get("blocked_tables") or [])
+        self.blocked_columns = set(kwargs.get("blocked_columns") or [])
 
         logger.debug(
             f"{self.__class__.__name__} initialized with config keys: {list(kwargs.keys())}"
@@ -156,6 +164,136 @@ class BaseDatabasePlugin(BasePlugin):
         single-statement query/execute calls.
         """
         return sql.rstrip().rstrip(";").rstrip()
+
+    def _validate_sql_policy(self, sql: str, *, operation: str):
+        if not sql or not sql.strip():
+            raise ValidationError("SQL must not be empty", field="sql")
+        from ..agents.db.query.sql_analysis import analyze_sql
+
+        analysis = analyze_sql(sql, dialect=self.sql_dialect)
+        if analysis.has_multiple_statements:
+            raise ValidationError(
+                "SQL guardrail rejected multiple statements", field="sql"
+            )
+
+        if getattr(self, "read_only", False) and (
+            not analysis.is_read or analysis.mutating_statement_types
+        ):
+            statement = (
+                analysis.mutating_statement_types[0]
+                if analysis.mutating_statement_types
+                else analysis.statement_type.upper()
+            )
+            raise ValidationError(
+                "SQL guardrail rejected mutating statement in read-only mode: "
+                f"{statement}",
+                field="sql",
+            )
+
+        if operation == "query" and not analysis.is_read:
+            raise ValidationError(
+                "SQL guardrail rejected non-read query statement: "
+                f"{analysis.statement_type or 'unknown'}",
+                field="sql",
+            )
+
+        blocked_tables = {
+            table.lower() for table in getattr(self, "blocked_tables", set())
+        }
+        allowed_tables = {
+            table.lower() for table in getattr(self, "allowed_tables", set())
+        }
+        blocked = {
+            table.short_key
+            for table in analysis.tables
+            if not table.is_cte
+            and ({table.key, table.short_key, table.name.lower()} & blocked_tables)
+        }
+        if blocked:
+            raise ValidationError(
+                f"SQL guardrail rejected blocked table(s): {', '.join(sorted(blocked))}",
+                field="sql",
+            )
+        if allowed_tables:
+            disallowed = {
+                table.short_key
+                for table in analysis.tables
+                if not table.is_cte
+                and not (
+                    {table.key, table.short_key, table.name.lower()} & allowed_tables
+                )
+            }
+            if disallowed:
+                raise ValidationError(
+                    f"SQL guardrail rejected table(s) outside allowlist: {', '.join(sorted(disallowed))}",
+                    field="sql",
+                )
+
+        referenced_columns = analysis.referenced_column_names
+        blocked_columns = sorted(
+            col
+            for col in getattr(self, "blocked_columns", set())
+            if col.lower() in referenced_columns
+        )
+        if blocked_columns:
+            raise ValidationError(
+                f"SQL guardrail rejected blocked column(s): {', '.join(sorted(blocked_columns))}",
+                field="sql",
+            )
+        return analysis
+
+    def _prepare_tool_query_sql(self, sql: str) -> str:
+        sql = sql or ""
+        sql = self._normalize_sql(sql)
+        analysis = self._validate_sql_policy(sql, operation="query")
+        if (
+            getattr(self, "query_default_limit", 0)
+            and getattr(self, "query_default_limit", 0) > 0
+            and not analysis.has_limit
+        ):
+            sql = f"{sql} LIMIT {int(getattr(self, 'query_default_limit', 0))}"
+        return sql
+
+    def _prepare_tool_execute_sql(self, sql: str) -> str:
+        sql = sql or ""
+        sql = self._normalize_sql(sql)
+        self._validate_sql_policy(sql, operation="execute")
+        return sql
+
+    async def _run_guarded_tool_query(
+        self, sql: str, params: list, focus_dsl: str | None = None
+    ) -> Dict[str, Any]:
+        sql = self._prepare_tool_query_sql(sql)
+        if focus_dsl:
+            coro = self._run_focus_query(sql, params, focus_dsl)
+        else:
+            coro = self.query(sql, params or None)
+        results = await asyncio.wait_for(
+            coro, timeout=getattr(self, "query_timeout", 30)
+        )
+        truncated = self._truncate_result(
+            results,
+            max_rows=getattr(self, "query_max_rows", 200),
+            max_chars=getattr(self, "query_max_chars", 50000),
+        )
+        return {
+            "rows": truncated["rows"],
+            "total_rows": truncated["total_rows"],
+            "truncated": truncated["truncated"],
+            "sql": sql,
+        }
+
+    async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        sql = args.get("sql")
+        params = args.get("params") or []
+        focus_dsl = args.get("focus")
+        return await self._run_guarded_tool_query(sql, params, focus_dsl)
+
+    async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        sql = self._prepare_tool_execute_sql(args.get("sql"))
+        params = args.get("params")
+        affected_rows = await self.execute(sql, params)
+        return {"affected_rows": affected_rows}
 
     async def query_checked(
         self,

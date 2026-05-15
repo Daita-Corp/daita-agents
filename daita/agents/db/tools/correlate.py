@@ -7,7 +7,13 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ....core.tools import AgentTool
-from ._helpers import ensure_pandas, safe_query, to_serializable
+from ._helpers import (
+    ensure_pandas,
+    make_analysis_tool,
+    safe_query,
+    source_metadata,
+    to_serializable,
+)
 
 if TYPE_CHECKING:
     from ....plugins.base_db import BaseDatabasePlugin
@@ -49,13 +55,15 @@ def create_correlate_tool(
             return {"success": False, "error": "sql parameter is required"}
 
         try:
-            rows = await safe_query(plugin, sql)
+            query_result = await safe_query(plugin, sql)
+            rows = query_result.rows
             if not rows:
                 return {
                     "success": True,
                     "correlations": [],
                     "matrix": {},
                     "sample_size": 0,
+                    **source_metadata(query_result),
                 }
 
             df = pd.DataFrame(
@@ -116,11 +124,12 @@ def create_correlate_tool(
                 "matrix": matrix,
                 "method": method,
                 "sample_size": len(df),
+                **source_metadata(query_result),
             }
         except Exception as e:
             return {"success": False, "error": f"Correlation failed: {e}"}
 
-    return AgentTool(
+    return make_analysis_tool(
         name="correlate",
         description=(
             "Compute pairwise correlations between numeric columns in a query result. "
@@ -152,6 +161,4 @@ def create_correlate_tool(
             "required": ["sql"],
         },
         handler=handler,
-        category="analysis",
-        source="analyst_toolkit",
     )

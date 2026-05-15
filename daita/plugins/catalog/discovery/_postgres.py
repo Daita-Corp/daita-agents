@@ -40,28 +40,72 @@ async def discover_postgres(
         password=creds["password"],
         database=creds["database"] or "postgres",
         ssl=ssl_arg,
+        statement_cache_size=0,
     )
 
     try:
+        all_schemas = schema in ("*", "all")
+        schema_filter = (
+            "t.table_schema NOT IN ('pg_catalog', 'information_schema')"
+            if all_schemas
+            else "t.table_schema = $1"
+        )
+        column_schema_filter = (
+            "c.table_schema NOT IN ('pg_catalog', 'information_schema')"
+            if all_schemas
+            else "c.table_schema = $1"
+        )
+        constraint_schema_filter = (
+            "tc.table_schema NOT IN ('pg_catalog', 'information_schema')"
+            if all_schemas
+            else "tc.table_schema = $1"
+        )
+        index_schema_filter = (
+            "schemaname NOT IN ('pg_catalog', 'information_schema')"
+            if all_schemas
+            else "schemaname = $1"
+        )
+        params = [] if all_schemas else [schema]
+        table_name_expr = (
+            "t.table_schema || '.' || t.table_name" if all_schemas else "t.table_name"
+        )
+        column_table_expr = (
+            "c.table_schema || '.' || c.table_name" if all_schemas else "c.table_name"
+        )
+        constraint_table_expr = (
+            "tc.table_schema || '.' || tc.table_name"
+            if all_schemas
+            else "tc.table_name"
+        )
+        fk_target_table_expr = (
+            "ccu.table_schema || '.' || ccu.table_name"
+            if all_schemas
+            else "ccu.table_name"
+        )
+        index_table_expr = (
+            "schemaname || '.' || tablename" if all_schemas else "tablename"
+        )
+
         # Get tables
         tables = await conn.fetch(
-            """
-            SELECT table_name,
+            f"""
+            SELECT {table_name_expr} AS table_name,
                    pg_stat_user_tables.n_live_tup as row_count
-            FROM information_schema.tables
+            FROM information_schema.tables t
             LEFT JOIN pg_stat_user_tables
-                ON table_name = relname
-            WHERE table_schema = $1
+                ON t.table_name = relname AND t.table_schema = schemaname
+            WHERE {schema_filter}
             AND table_type = 'BASE TABLE'
+            ORDER BY t.table_schema, t.table_name
         """,
-            schema,
+            *params,
         )
 
         # Get columns (with optional column-level comments from pg_description)
         columns = await conn.fetch(
-            """
+            f"""
             SELECT
-                c.table_name,
+                {column_table_expr} AS table_name,
                 c.column_name,
                 c.data_type,
                 c.character_maximum_length,
@@ -76,34 +120,35 @@ async def discover_postgres(
                     quote_ident(c.table_schema) || '.' || quote_ident(c.table_name)
                 )::regclass
                 AND d.objsubid = c.ordinal_position
-            WHERE c.table_schema = $1
-            ORDER BY c.table_name, c.ordinal_position
+            WHERE {column_schema_filter}
+            ORDER BY c.table_schema, c.table_name, c.ordinal_position
         """,
-            schema,
+            *params,
         )
 
         # Get primary keys
         pkeys = await conn.fetch(
-            """
+            f"""
             SELECT
-                tc.table_name,
+                {constraint_table_expr} AS table_name,
                 kcu.column_name
             FROM information_schema.table_constraints tc
             JOIN information_schema.key_column_usage kcu
                 ON tc.constraint_name = kcu.constraint_name
+                AND tc.table_schema = kcu.table_schema
             WHERE tc.constraint_type = 'PRIMARY KEY'
-            AND tc.table_schema = $1
+            AND {constraint_schema_filter}
         """,
-            schema,
+            *params,
         )
 
         # Get foreign keys
         fkeys = await conn.fetch(
-            """
+            f"""
             SELECT
-                tc.table_name as source_table,
+                {constraint_table_expr} as source_table,
                 kcu.column_name as source_column,
-                ccu.table_name AS target_table,
+                {fk_target_table_expr} AS target_table,
                 ccu.column_name AS target_column,
                 tc.constraint_name,
                 rc.delete_rule,
@@ -111,32 +156,35 @@ async def discover_postgres(
             FROM information_schema.table_constraints tc
             JOIN information_schema.key_column_usage kcu
                 ON tc.constraint_name = kcu.constraint_name
+                AND tc.table_schema = kcu.table_schema
             JOIN information_schema.constraint_column_usage ccu
                 ON ccu.constraint_name = tc.constraint_name
+                AND ccu.constraint_schema = tc.constraint_schema
             JOIN information_schema.referential_constraints rc
                 ON tc.constraint_name = rc.constraint_name
+                AND tc.constraint_schema = rc.constraint_schema
             WHERE tc.constraint_type = 'FOREIGN KEY'
-            AND tc.table_schema = $1
+            AND {constraint_schema_filter}
         """,
-            schema,
+            *params,
         )
 
         # Get indexes
         indexes = await conn.fetch(
-            """
+            f"""
             SELECT
-                tablename,
+                {index_table_expr} AS tablename,
                 indexname,
                 indexdef
             FROM pg_indexes
-            WHERE schemaname = $1
+            WHERE {index_schema_filter}
         """,
-            schema,
+            *params,
         )
 
         return {
             "database_type": "postgresql",
-            "schema": schema,
+            "schema": "all" if all_schemas else schema,
             "host": creds["host"],
             "port": creds["port"] or 5432,
             "database": creds["database"] or "postgres",
