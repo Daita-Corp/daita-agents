@@ -285,9 +285,7 @@ class TestToolCallingLoop:
         tm.flush(timeout_millis=2000)
 
         tool_spans = [
-            s
-            for s in tm._memory_exporter.get_finished_spans()
-            if s.name == "tool_add"
+            s for s in tm._memory_exporter.get_finished_spans() if s.name == "tool_add"
         ]
         assert tool_spans
         events = tool_spans[-1].events
@@ -305,9 +303,7 @@ class TestToolCallingLoop:
         tm.flush(timeout_millis=2000)
 
         agent_spans = [
-            s
-            for s in tm._memory_exporter.get_finished_spans()
-            if s.name == "agent_run"
+            s for s in tm._memory_exporter.get_finished_spans() if s.name == "agent_run"
         ]
         assert agent_spans
         events = agent_spans[-1].events

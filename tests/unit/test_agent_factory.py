@@ -693,7 +693,9 @@ class TestFromDbIntegration:
         # Disconnect should have been called for cleanup
         mock_plugin.disconnect.assert_awaited_once()
 
-    async def test_from_db_discovery_failure_raises_agent_error(self, tmp_path, monkeypatch):
+    async def test_from_db_discovery_failure_raises_agent_error(
+        self, tmp_path, monkeypatch
+    ):
         monkeypatch.chdir(tmp_path)
         from daita.agents.db import from_db
         from daita.core.exceptions import AgentError
@@ -1975,7 +1977,9 @@ class TestFromDbMemory:
         with (
             patch.object(fac, "resolve_plugin", return_value=(db_plugin, True)),
             patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
-            patch.object(fac, "_register_db_facade_tools", lambda *args, **kwargs: None),
+            patch.object(
+                fac, "_register_db_facade_tools", lambda *args, **kwargs: None
+            ),
         ):
             agent = await from_db(
                 "postgresql://localhost/testdb",
@@ -2080,7 +2084,9 @@ class TestFromDbMemory:
         with (
             patch.object(fac, "resolve_plugin", return_value=(FakeDbPlugin(), True)),
             patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
-            patch.object(fac, "_register_db_facade_tools", lambda *args, **kwargs: None),
+            patch.object(
+                fac, "_register_db_facade_tools", lambda *args, **kwargs: None
+            ),
         ):
             agent = await from_db(
                 "postgresql://localhost/testdb",
@@ -2088,7 +2094,9 @@ class TestFromDbMemory:
                 memory=FakeMemoryPlugin(),
             )
 
-        result = await agent.run("Remember that revenue excludes refunds.", detailed=True)
+        result = await agent.run(
+            "Remember that revenue excludes refunds.", detailed=True
+        )
 
         assert result["result"] == "done"
         assert result["tool_calls"][0]["tool"] == "remember"
@@ -2582,14 +2590,14 @@ class TestSchemaCache:
 
         mock_discover.assert_not_awaited()
 
-    async def test_schema_snapshot_skips_discovery_by_default(self, tmp_path, monkeypatch):
+    async def test_schema_snapshot_skips_discovery_by_default(
+        self, tmp_path, monkeypatch
+    ):
         monkeypatch.chdir(tmp_path)
         import daita.agents.db.builder as fac
         from daita.agents.db import from_db
 
-        schema = _make_normalized_schema(
-            tables=[_table("orders"), _table("customers")]
-        )
+        schema = _make_normalized_schema(tables=[_table("orders"), _table("customers")])
         source = "postgresql://user:pass@host/db"
         cache_key = _db_cache_key(source)
         _db_save_schema_cache(cache_key, schema)

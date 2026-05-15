@@ -144,7 +144,9 @@ class BaseLLMProvider(LLMProvider, ABC):
 
         # Route to streaming or non-streaming
         if stream:
-            return self._stream_with_tracing(messages, tool_specs, trace_input, **params)
+            return self._stream_with_tracing(
+                messages, tool_specs, trace_input, **params
+            )
         else:
             async with self.trace_manager.span(
                 operation_name=f"llm_{self.provider_name}",
@@ -273,9 +275,7 @@ class BaseLLMProvider(LLMProvider, ABC):
             completion_tokens = usage.get(
                 "completion_tokens", usage.get("output_tokens", 0)
             )
-            total_tokens = usage.get(
-                "total_tokens", prompt_tokens + completion_tokens
-            )
+            total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
             return {
                 "total_tokens": total_tokens,
                 "prompt_tokens": prompt_tokens,
@@ -292,7 +292,9 @@ class BaseLLMProvider(LLMProvider, ABC):
 
         if hasattr(usage, "total_tokens"):
             prompt_details = _get_usage_field(usage, "prompt_tokens_details") or {}
-            completion_details = _get_usage_field(usage, "completion_tokens_details") or {}
+            completion_details = (
+                _get_usage_field(usage, "completion_tokens_details") or {}
+            )
             return {
                 "total_tokens": getattr(usage, "total_tokens", 0),
                 "prompt_tokens": getattr(usage, "prompt_tokens", 0),

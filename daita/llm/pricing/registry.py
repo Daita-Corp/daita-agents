@@ -42,7 +42,9 @@ class PricingRegistry:
 
         if model_key in provider_prices:
             return (
-                self._build_pricing(provider_key, model_key, provider_prices[model_key]),
+                self._build_pricing(
+                    provider_key, model_key, provider_prices[model_key]
+                ),
                 "high",
             )
 
@@ -143,4 +145,3 @@ def estimate_llm_cost_from_counts(
         reasoning_tokens=reasoning_tokens,
     )
     return estimate_llm_cost(provider, model, usage)
-
