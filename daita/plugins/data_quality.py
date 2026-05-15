@@ -142,11 +142,17 @@ class DataQualityPlugin(BasePlugin):
         if self._graph_backend is None:
             from daita.core.graph.backend import auto_select_backend
 
-            self._graph_backend = auto_select_backend(graph_type="quality")
-            logger.debug(
-                "DataQualityPlugin: using graph backend %s",
-                type(self._graph_backend).__name__,
-            )
+            try:
+                self._graph_backend = auto_select_backend(graph_type="quality")
+                logger.debug(
+                    "DataQualityPlugin: using graph backend %s",
+                    type(self._graph_backend).__name__,
+                )
+            except ImportError as exc:
+                logger.debug(
+                    "DataQualityPlugin: graph backend unavailable; reports will not be persisted: %s",
+                    exc,
+                )
 
     def _validate_db(self) -> Any:
         if self._db is None:
