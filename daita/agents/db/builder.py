@@ -22,6 +22,7 @@ from .runtime.run_context import make_db_context_run, make_db_context_stream
 from .schema.cache import (
     cache_key,
     detect_drift,
+    load_schema_snapshot,
     load_cached_schema,
     save_schema_cache,
 )
@@ -307,11 +308,21 @@ async def _discover_schema_with_cache(
 
     schema = None
     cached_schema = None
-    cache_key_val = None
+    cache_key_val = cache_key(source)
     drift = None
 
-    if cache_ttl is not None:
-        cache_key_val = cache_key(source)
+    if cache_ttl is None:
+        cached_schema = load_schema_snapshot(
+            cache_key_val,
+            catalog_keys=_catalog_snapshot_keys(plugin, db_schema),
+        )
+        if cached_schema is not None:
+            return cached_schema, drift
+    elif cache_ttl == 0:
+        cache_result = load_cached_schema(cache_key_val, cache_ttl)
+        if cache_result is not None:
+            cached_schema, _ = cache_result
+    elif cache_ttl > 0:
         cache_result = load_cached_schema(cache_key_val, cache_ttl)
         if cache_result is not None:
             cached_schema, is_expired = cache_result
@@ -336,10 +347,30 @@ async def _discover_schema_with_cache(
         if drift:
             logger.warning(f"Schema drift detected: {drift}")
 
-    if cache_key_val is not None:
-        save_schema_cache(cache_key_val, schema)
+    save_schema_cache(cache_key_val, schema)
 
     return schema, drift
+
+
+def _catalog_snapshot_keys(plugin: Any, db_schema: Optional[str]) -> List[str]:
+    dialect = getattr(plugin, "sql_dialect", None) or getattr(
+        plugin, "database_type", None
+    )
+    if not dialect:
+        return []
+
+    keys = []
+    if db_schema:
+        keys.append(f"{dialect}:{db_schema}")
+
+    database_name = getattr(plugin, "database_name", None) or getattr(
+        plugin, "database", None
+    )
+    if database_name:
+        keys.append(f"{dialect}:{database_name}")
+
+    keys.append(f"{dialect}:default")
+    return list(dict.fromkeys(keys))
 
 
 async def _disconnect_if_owned(plugin: Any, *, was_created: bool) -> None:

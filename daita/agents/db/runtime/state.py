@@ -44,6 +44,8 @@ class DbRunState:
     executed_queries: List[Dict[str, Any]] = field(default_factory=list)
     required_answer_fields: List[str] = field(default_factory=list)
     planned_queries: List[Dict[str, Any]] = field(default_factory=list)
+    plans_by_id: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    next_plan_number: int = 1
     final_completeness_status: Optional[Dict[str, Any]] = None
 
     def get_inspected_table(self, cache_key: str) -> Optional[Dict[str, Any]]:
@@ -77,11 +79,19 @@ class DbRunState:
     def record_executed_query(self, metadata: Dict[str, Any]) -> None:
         self.executed_queries.append(dict(metadata))
 
-    def record_plan(self, plan: DbQueryPlan, result: Dict[str, Any]) -> None:
-        self.planned_queries.append({"plan": plan.to_dict(), "result": dict(result)})
+    def record_plan(self, plan: DbQueryPlan, result: Dict[str, Any]) -> str:
+        plan_id = f"plan_{self.next_plan_number}"
+        self.next_plan_number += 1
+        stored = {"plan_id": plan_id, "plan": plan.to_dict(), "result": dict(result)}
+        self.planned_queries.append(stored)
+        self.plans_by_id[plan_id] = stored
         for field_name in plan.required_fields:
             if field_name not in self.required_answer_fields:
                 self.required_answer_fields.append(field_name)
+        return plan_id
+
+    def get_plan(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        return self.plans_by_id.get(plan_id)
 
     def summary(self) -> Dict[str, Any]:
         return {

@@ -7,36 +7,54 @@ import hashlib
 import re
 from typing import Any
 
-from ..schema.metadata import (
-    normalize_identifier,
-    schema_table_columns,
-)
+from ..schema.metadata import normalize_identifier, schema_table_columns
 from .intent import is_count_metric_name
+from .ir import FieldRef, QueryPlan
+from .sql_analysis import SqlAnalysis, SqlAnalysisError, analyze_sql
 
 
-def validate_sql_against_schema(sql: str, schema: dict[str, Any]) -> dict[str, Any]:
+def validate_sql_against_schema(
+    sql: str,
+    schema: dict[str, Any],
+    *,
+    dialect: str = "",
+    analysis: SqlAnalysis | None = None,
+) -> dict[str, Any]:
     if not sql.strip():
-        return {
-            "error": "Missing SQL query",
-            "repair_required": True,
-            "preflight_failed": True,
-            "suggested_next_tool": "db_validate_sql",
-            "sql_fingerprint": sql_fingerprint(sql),
-        }
+        return _validation_error(
+            "Missing SQL query",
+            error_type="dialect_parse_error",
+            sql=sql,
+            suggested_next_tool="db_validate_sql",
+        )
+
+    if analysis is None:
+        try:
+            analysis = analyze_sql(
+                sql, dialect=dialect or str(schema.get("database_type") or "")
+            )
+        except SqlAnalysisError as exc:
+            return _validation_error(
+                str(exc),
+                error_type=exc.error_type,
+                sql=sql,
+                suggested_next_tool="db_validate_sql",
+            )
 
     table_columns = schema_table_columns(schema)
     if not table_columns:
-        return {"ok": True}
+        return {"ok": True, "sql_fingerprint": sql_fingerprint(sql)}
 
-    aliases, unknown_tables = _extract_table_aliases(sql, table_columns)
-    missing_columns = _missing_column_references(sql, aliases, table_columns)
+    unknown_tables = _unknown_tables(analysis, table_columns)
+    missing_columns = _missing_columns(analysis, table_columns)
 
     if not unknown_tables and not missing_columns:
-        return {"ok": True}
+        return {"ok": True, "sql_fingerprint": sql_fingerprint(sql)}
 
     inspect_tables = _tables_to_inspect(unknown_tables, missing_columns)
     return {
         "error": "SQL preflight failed against known schema",
+        "error_type": "schema_reference_error",
         "repair_required": True,
         "preflight_failed": True,
         "sql_fingerprint": sql_fingerprint(sql),
@@ -61,10 +79,53 @@ def validate_sql_against_schema(sql: str, schema: dict[str, Any]) -> dict[str, A
     }
 
 
+def required_field_warnings_for_plan(
+    plan: QueryPlan | None, required_fields: list[str]
+) -> list[dict[str, Any]]:
+    if plan is None or not required_fields:
+        return []
+
+    grain_names = {
+        token for field in plan.grain for token in _field_tokens(field) if token
+    }
+    metric_aliases = {
+        normalize_identifier(metric.name): metric for metric in plan.metrics
+    }
+    warnings: list[dict[str, Any]] = []
+    for field_name in required_fields:
+        normalized = normalize_identifier(field_name)
+        if not normalized:
+            continue
+        if any(normalized in tokens or tokens in normalized for tokens in grain_names):
+            continue
+        metric = metric_aliases.get(normalized)
+        if metric is not None:
+            continue
+        if is_count_metric_name(field_name) and any(
+            metric.kind == "count" and normalize_identifier(metric.name) == normalized
+            for metric in plan.metrics
+        ):
+            continue
+        warnings.append(
+            {
+                "required_field": field_name,
+                "reason": "required field not represented by query plan IR",
+            }
+        )
+    return warnings
+
+
 def apply_required_field_validation(
-    validation: dict[str, Any], sql: str, run_state: Any
+    validation: dict[str, Any],
+    sql: str,
+    run_state: Any,
+    *,
+    dialect: str = "",
+    analysis: SqlAnalysis | None = None,
 ) -> None:
-    warnings = required_field_warnings(sql, run_state)
+    warnings = required_field_warnings(
+        sql, run_state, dialect=dialect, analysis=analysis
+    )
     if not warnings:
         return
     validation["required_field_warnings"] = warnings
@@ -77,6 +138,7 @@ def apply_required_field_validation(
     validation.update(
         {
             "error": "SQL does not preserve required fields from query plan",
+            "error_type": "required_field_error",
             "repair_required": True,
             "preflight_failed": True,
             "sql_fingerprint": sql_fingerprint(sql),
@@ -91,7 +153,13 @@ def apply_required_field_validation(
     )
 
 
-def required_field_warnings(sql: str, run_state: Any) -> list[dict[str, Any]]:
+def required_field_warnings(
+    sql: str,
+    run_state: Any,
+    *,
+    dialect: str = "",
+    analysis: SqlAnalysis | None = None,
+) -> list[dict[str, Any]]:
     if run_state is None:
         return []
     required_fields = getattr(run_state, "required_answer_fields", None) or []
@@ -99,8 +167,14 @@ def required_field_warnings(sql: str, run_state: Any) -> list[dict[str, Any]]:
     if not required_fields or not isinstance(candidate_columns, dict):
         return []
 
-    referenced_columns = _referenced_sql_columns(sql)
-    selected_expressions = _selected_expressions_by_alias(sql)
+    if analysis is None:
+        analysis = analyze_sql(sql, dialect=dialect)
+    referenced_columns = analysis.referenced_column_names
+    selected_by_alias = {
+        normalize_identifier(item.alias): item
+        for item in analysis.select_items
+        if item.alias
+    }
     warnings: list[dict[str, Any]] = []
     for field_name in required_fields:
         candidates = candidate_columns.get(field_name) or []
@@ -109,7 +183,7 @@ def required_field_warnings(sql: str, run_state: Any) -> list[dict[str, Any]]:
             continue
         if referenced_columns & required_columns:
             continue
-        if _count_alias_satisfies_required_field(field_name, selected_expressions):
+        if _count_alias_satisfies_required_field(field_name, selected_by_alias):
             continue
         warnings.append(
             {
@@ -126,83 +200,103 @@ def sql_fingerprint(sql: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
-def _referenced_sql_columns(sql: str) -> set[str]:
-    cleaned = _strip_sql_literals(sql)
-    columns = {
-        column.lower()
-        for column in re.findall(r"\b[A-Za-z_][\w]*\.([A-Za-z_][\w]*)\b", cleaned)
+def _validation_error(
+    message: str, *, error_type: str, sql: str, suggested_next_tool: str
+) -> dict[str, Any]:
+    return {
+        "error": message,
+        "error_type": error_type,
+        "repair_required": True,
+        "preflight_failed": True,
+        "suggested_next_tool": suggested_next_tool,
+        "sql_fingerprint": sql_fingerprint(sql),
     }
-    for function_args in re.findall(r"\b[A-Za-z_][\w]*\s*\(([^)]*)\)", cleaned):
-        for name in re.findall(r"\b([A-Za-z_][\w]*)\b", function_args):
-            if name.lower() not in _SQL_KEYWORDS:
-                columns.add(name.lower())
-    return columns
 
 
-def _selected_expressions_by_alias(sql: str) -> dict[str, str]:
-    select_body = _select_body(sql)
-    if not select_body:
-        return {}
-
-    expressions: dict[str, str] = {}
-    for item in _split_sql_select_items(select_body):
-        alias = _select_item_alias(item)
-        if alias:
-            expressions[normalize_identifier(alias)] = item
-    return expressions
-
-
-def _select_body(sql: str) -> str:
-    cleaned = _strip_sql_literals(sql or "")
-    match = re.search(
-        r"\bselect\b(.*?)\bfrom\b", cleaned, flags=re.IGNORECASE | re.DOTALL
-    )
-    if not match:
-        return ""
-    return match.group(1)
+def _unknown_tables(
+    analysis: SqlAnalysis, table_columns: dict[str, set[str]]
+) -> set[str]:
+    known = {name.lower() for name in table_columns}
+    unknown: set[str] = set()
+    for table in analysis.tables:
+        if table.is_cte:
+            continue
+        if table.key in known or table.short_key in known:
+            continue
+        unknown.add(table.key)
+    return unknown
 
 
-def _split_sql_select_items(select_body: str) -> list[str]:
-    items: list[str] = []
-    start = 0
-    depth = 0
-    for idx, char in enumerate(select_body):
-        if char == "(":
-            depth += 1
-        elif char == ")" and depth:
-            depth -= 1
-        elif char == "," and depth == 0:
-            item = select_body[start:idx].strip()
-            if item:
-                items.append(item)
-            start = idx + 1
-    tail = select_body[start:].strip()
-    if tail:
-        items.append(tail)
-    return items
+def _missing_columns(
+    analysis: SqlAnalysis, table_columns: dict[str, set[str]]
+) -> list[dict[str, str]]:
+    missing: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    table_count = len([table for table in analysis.tables if not table.is_cte])
+    select_aliases = {
+        normalize_identifier(item.alias) for item in analysis.select_items if item.alias
+    }
+    for column in analysis.columns:
+        column_name = column.key
+        if normalize_identifier(column.name) in select_aliases:
+            continue
+        if column.qualifier_key:
+            table_key = _known_table_key(column.qualifier_key, table_columns)
+            if table_key is None:
+                continue
+            if column_name not in table_columns.get(table_key, set()):
+                key = (table_key, column_name)
+                if key not in seen:
+                    missing.append(
+                        {
+                            "table": table_key,
+                            "column": column.name,
+                            "reason": "column not found",
+                        }
+                    )
+                    seen.add(key)
+            continue
+
+        if table_count == 1:
+            table = next(table for table in analysis.tables if not table.is_cte)
+            table_key = _known_table_key(table.key, table_columns)
+            if table_key and column_name not in table_columns.get(table_key, set()):
+                key = (table_key, column_name)
+                if key not in seen:
+                    missing.append(
+                        {
+                            "table": table_key,
+                            "column": column.name,
+                            "reason": "column not found",
+                        }
+                    )
+                    seen.add(key)
+    return missing
 
 
-def _select_item_alias(item: str) -> str:
-    match = re.search(r"\bas\s+([A-Za-z_][\w]*)\s*$", item, flags=re.IGNORECASE)
-    if match:
-        return match.group(1)
+def _known_table_key(table_key: str, table_columns: dict[str, set[str]]) -> str | None:
+    key = table_key.lower()
+    if key in table_columns:
+        return key
+    short = key.split(".")[-1]
+    if short in table_columns:
+        return short
+    return None
 
-    tokens = re.findall(r"[A-Za-z_][\w]*", item)
-    if len(tokens) >= 2 and not item.rstrip().endswith(")"):
-        return tokens[-1]
-    return ""
+
+def _field_tokens(field: FieldRef) -> set[str]:
+    return {
+        normalize_identifier(field.column),
+        normalize_identifier(f"{field.table}.{field.column}"),
+    }
 
 
 def _count_alias_satisfies_required_field(
-    field_name: str, selected_expressions: dict[str, str]
+    field_name: str, selected_expressions: dict[str, Any]
 ) -> bool:
     normalized_field = normalize_identifier(field_name)
-    expression = selected_expressions.get(normalized_field)
-    if not expression:
-        return False
-    if not is_count_metric_name(field_name):
-        return False
-    return bool(re.search(r"\bcount\s*\(", expression, flags=re.IGNORECASE))
+    selected = selected_expressions.get(normalized_field)
+    return bool(selected and is_count_metric_name(field_name) and selected.is_count)
 
 
 def _high_confidence_required_columns(
@@ -225,69 +319,6 @@ def _high_confidence_required_columns(
     return out
 
 
-def _strip_sql_literals(sql: str) -> str:
-    return re.sub(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"", "", sql or "")
-
-
-def _extract_table_aliases(
-    sql: str, table_columns: dict[str, set[str]]
-) -> tuple[dict[str, str], set[str]]:
-    aliases: dict[str, str] = {}
-    unknown_tables: set[str] = set()
-    stop_words = "|".join(sorted(_SQL_TABLE_ALIAS_STOP_WORDS))
-    for match in re.finditer(
-        rf"\b(?:from|join)\s+([A-Za-z_][\w.]*)(?:\s+(?:as\s+)?(?!{stop_words}\b)([A-Za-z_][\w]*))?",
-        sql,
-        flags=re.IGNORECASE,
-    ):
-        table = match.group(1).strip().strip('"`[]').lower()
-        alias = (match.group(2) or table.split(".")[-1]).strip().strip('"`[]').lower()
-        if alias in _SQL_TABLE_ALIAS_STOP_WORDS:
-            alias = table.split(".")[-1]
-        if table not in table_columns:
-            unknown_tables.add(table)
-            continue
-        aliases[alias] = table
-        aliases[table] = table
-        aliases[table.split(".")[-1]] = table
-    return aliases, unknown_tables
-
-
-def _missing_column_references(
-    sql: str, aliases: dict[str, str], table_columns: dict[str, set[str]]
-) -> list[dict[str, str]]:
-    missing: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for alias, column in re.findall(r"\b([A-Za-z_][\w]*)\.([A-Za-z_][\w]*)\b", sql):
-        alias_l = alias.lower()
-        column_l = column.lower()
-        if f"{alias_l}.{column_l}" in table_columns:
-            continue
-        if alias_l in _SQL_QUALIFIER_SKIP:
-            continue
-        table = aliases.get(alias_l)
-        if not table:
-            key = (alias_l, column_l)
-            if key not in seen:
-                missing.append(
-                    {
-                        "table_or_alias": alias,
-                        "column": column,
-                        "reason": "unknown table alias",
-                    }
-                )
-                seen.add(key)
-            continue
-        if column_l not in table_columns.get(table, set()):
-            key = (table, column_l)
-            if key not in seen:
-                missing.append(
-                    {"table": table, "column": column, "reason": "column not found"}
-                )
-                seen.add(key)
-    return missing
-
-
 def _tables_to_inspect(
     unknown_tables: set[str], missing_columns: list[dict[str, str]]
 ) -> list[str]:
@@ -296,7 +327,7 @@ def _tables_to_inspect(
         if table not in tables:
             tables.append(table)
     for item in missing_columns:
-        table = item.get("table") or item.get("table_or_alias")
+        table = item.get("table")
         if table and table not in tables:
             tables.append(table)
     return tables[:5]
@@ -350,53 +381,3 @@ def _table_candidates(
         if matches:
             candidates[table] = matches
     return candidates
-
-
-_SQL_QUALIFIER_SKIP = {
-    "date",
-    "time",
-    "timestamp",
-    "json",
-    "jsonb",
-}
-
-
-_SQL_TABLE_ALIAS_STOP_WORDS = {
-    "cross",
-    "full",
-    "group",
-    "having",
-    "inner",
-    "join",
-    "left",
-    "limit",
-    "on",
-    "order",
-    "outer",
-    "right",
-    "using",
-    "where",
-}
-
-
-_SQL_KEYWORDS = _SQL_TABLE_ALIAS_STOP_WORDS | {
-    "and",
-    "as",
-    "asc",
-    "between",
-    "by",
-    "case",
-    "desc",
-    "distinct",
-    "else",
-    "end",
-    "from",
-    "in",
-    "is",
-    "not",
-    "null",
-    "or",
-    "select",
-    "then",
-    "when",
-}

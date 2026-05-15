@@ -186,7 +186,7 @@ def build_prompt_result(
     lines.append(
         "- For analytic, aggregation, or multi-table questions, use db_plan_query "
         "to turn the request into a structured plan before writing SQL. Prefer "
-        "its compiled_sql when validation.ok is true."
+        "db_query with its plan_id when validation.ok is true."
     )
     lines.append(
         "- Use catalog/schema tools to traverse tables, columns, and relationships; "

@@ -22,6 +22,7 @@ from .compiler import compile_query_plan
 from .intent import looks_like_count_intent
 from .ir_validator import validate_query_plan
 from .resolver import resolve_query_plan
+from .sql_validator import required_field_warnings_for_plan
 
 MAX_CANDIDATE_TABLES = 8
 MAX_FIELD_CANDIDATES = 8
@@ -81,6 +82,22 @@ def build_query_plan(
         if query_ir is not None
         else {"ok": False, "errors": [], "warnings": []}
     )
+    required_field_warnings = required_field_warnings_for_plan(
+        query_ir, plan.required_fields
+    )
+    if required_field_warnings:
+        ir_validation = {
+            **ir_validation,
+            "ok": False,
+            "errors": list(ir_validation.get("errors") or [])
+            + [
+                {
+                    "type": "required_field_error",
+                    "warnings": required_field_warnings,
+                }
+            ],
+            "warnings": list(ir_validation.get("warnings") or []),
+        }
     compiled_sql = None
     compiler_warning = None
     if query_ir is not None and ir_validation.get("ok"):
@@ -107,6 +124,7 @@ def build_query_plan(
 
     result = {
         "ok": True,
+        "plan_id": None,
         "plan": plan.to_dict(),
         "route": _classify_plan(plan),
         "resolved_tables": resolved_tables["resolved_tables"],
@@ -121,7 +139,11 @@ def build_query_plan(
         "validation": ir_validation,
         "plan_warnings": plan_warnings,
         "next_steps": _next_steps(
-            resolved_tables, field_candidates, join_paths, compiled_sql
+            resolved_tables,
+            field_candidates,
+            join_paths,
+            compiled_sql,
+            has_run_state=run_state is not None,
         ),
     }
 
@@ -130,7 +152,11 @@ def build_query_plan(
             run_state.record_candidate_columns(field_name, candidates)
         for path_result in join_paths:
             run_state.record_join_paths(path_result)
-        run_state.record_plan(plan, result)
+        plan_id = run_state.record_plan(plan, result)
+        result["plan_id"] = plan_id
+        stored = run_state.get_plan(plan_id)
+        if stored is not None:
+            stored["result"]["plan_id"] = plan_id
 
     return result
 
@@ -283,10 +309,18 @@ def _next_steps(
     field_candidates: Dict[str, List[Dict[str, Any]]],
     join_paths: List[Dict[str, Any]],
     compiled_sql: Optional[str] = None,
+    *,
+    has_run_state: bool = False,
 ) -> List[str]:
     steps = []
     if compiled_sql:
-        return ["run db_query with compiled_sql"]
+        return [
+            (
+                "run db_query with plan_id"
+                if has_run_state
+                else "run db_query with compiled_sql"
+            )
+        ]
     if resolved_tables["unknown_tables"] or resolved_tables["ambiguous_tables"]:
         steps.append("inspect or search unresolved candidate tables")
     missing_fields = [

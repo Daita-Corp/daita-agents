@@ -693,7 +693,8 @@ class TestFromDbIntegration:
         # Disconnect should have been called for cleanup
         mock_plugin.disconnect.assert_awaited_once()
 
-    async def test_from_db_discovery_failure_raises_agent_error(self):
+    async def test_from_db_discovery_failure_raises_agent_error(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
         from daita.agents.db import from_db
         from daita.core.exceptions import AgentError
         import daita.agents.db.builder as fac
@@ -905,7 +906,8 @@ class TestFromDbIntegration:
 
         sample.assert_not_awaited()
 
-    async def test_from_db_attaches_db_only_describe(self):
+    async def test_from_db_attaches_db_only_describe(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
         from daita.agents.db import from_db
         import daita.agents.db.builder as fac
 
@@ -2108,6 +2110,34 @@ class TestSchemaCache:
 
         mock_discover.assert_not_awaited()
 
+    async def test_schema_snapshot_skips_discovery_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        import daita.agents.db.builder as fac
+        from daita.agents.db import from_db
+
+        schema = _make_normalized_schema(
+            tables=[_table("orders"), _table("customers")]
+        )
+        source = "postgresql://user:pass@host/db"
+        cache_key = _db_cache_key(source)
+        _db_save_schema_cache(cache_key, schema)
+
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        mock_agent = MagicMock()
+        mock_agent.add_plugin = MagicMock()
+        mock_discover = AsyncMock(return_value=_make_normalized_schema())
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", mock_discover),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            await from_db(source, cache_ttl=None)
+
+        mock_discover.assert_not_awaited()
+        assert mock_agent._db_schema == schema
+
     async def test_cache_expired_triggers_rediscovery(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         import daita.agents.db.builder as fac
@@ -2844,6 +2874,92 @@ class TestFromDbQueryFacadeTools:
         )
 
         assert result["ok"] is True
+        plugin._tool_query.assert_not_awaited()
+
+    async def test_sql_facade_normalizes_trailing_semicolon_before_guardrails(self):
+        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.plugins.base_db import BaseDatabasePlugin
+
+        class GuardedPlugin(BaseDatabasePlugin):
+            sql_dialect = "postgresql"
+
+            async def connect(self):
+                return None
+
+            async def disconnect(self):
+                return None
+
+        plugin = GuardedPlugin(read_only=True)
+        plugin._tool_query = AsyncMock(return_value={"rows": [{"agent_id": "a1"}]})
+        plugin._tool_count = AsyncMock(return_value={"count": 3})
+        plugin._tool_sample = AsyncMock(return_value={"rows": []})
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "operations",
+                    columns=[
+                        {"name": "operation_id", "type": "uuid"},
+                        {"name": "agent_id", "type": "text"},
+                        {"name": "created_at", "type": "timestamp"},
+                    ],
+                )
+            ]
+        )
+        sql = """
+        SELECT operations.agent_id, COUNT(operations.operation_id) AS operation_count
+        FROM operations
+        WHERE operations.created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY operations.agent_id
+        ORDER BY operation_count DESC
+        LIMIT 10;
+        """
+        normalized_sql = BaseDatabasePlugin._normalize_sql(sql)
+
+        tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+
+        validation = await tools["db_validate_sql"].handler({"sql": sql})
+        result = await tools["db_query"].handler({"sql": sql})
+
+        assert validation["ok"] is True
+        assert result == {"rows": [{"agent_id": "a1"}]}
+        plugin._tool_query.assert_awaited_once_with({"sql": normalized_sql})
+
+    async def test_sql_facade_still_rejects_internal_semicolon(self):
+        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.core.exceptions import ValidationError
+        from daita.plugins.base_db import BaseDatabasePlugin
+
+        class GuardedPlugin(BaseDatabasePlugin):
+            sql_dialect = "postgresql"
+
+            async def connect(self):
+                return None
+
+            async def disconnect(self):
+                return None
+
+        plugin = GuardedPlugin(read_only=True)
+        plugin._tool_query = AsyncMock(return_value={"rows": []})
+        plugin._tool_count = AsyncMock(return_value={"count": 3})
+        plugin._tool_sample = AsyncMock(return_value={"rows": []})
+        schema = _make_normalized_schema(
+            tables=[
+                _table(
+                    "operations",
+                    columns=[{"name": "operation_id", "type": "uuid"}],
+                )
+            ]
+        )
+        tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+
+        with pytest.raises(ValidationError, match="multiple statements"):
+            await tools["db_validate_sql"].handler(
+                {"sql": "SELECT operation_id FROM operations; SELECT 1"}
+            )
+        with pytest.raises(ValidationError, match="multiple statements"):
+            await tools["db_query"].handler(
+                {"sql": "SELECT operation_id FROM operations; SELECT 1"}
+            )
         plugin._tool_query.assert_not_awaited()
 
     async def test_sql_facade_allows_unaliased_join_table_references(self):

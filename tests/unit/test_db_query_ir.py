@@ -10,6 +10,8 @@ from daita.agents.db.query import (
     compile_query_plan,
 )
 from daita.agents.db.query.ir_validator import validate_query_plan
+from daita.agents.db.query.sql_validator import validate_sql_against_schema
+from daita.agents.db.runtime.state import DbRunState, set_db_run_state
 from daita.agents.db.tools.query_facade import create_db_query_tools
 
 
@@ -116,6 +118,43 @@ async def test_query_ir_compiles_catalog_join_path_for_count_question():
     assert result["next_steps"] == ["run db_query with compiled_sql"]
 
 
+async def test_db_query_executes_validated_plan_id_without_sql_preflight():
+    schema = _schema(
+        tables=[
+            _table(
+                "orders",
+                [
+                    {"name": "order_id", "type": "integer", "is_primary_key": True},
+                    {"name": "created_at", "type": "timestamp"},
+                ],
+            )
+        ]
+    )
+    plugin = MagicMock()
+    plugin.sql_dialect = "postgresql"
+    plugin.read_only = True
+    plugin._tool_query = AsyncMock(return_value={"rows": [{"total_orders": 3}]})
+    plugin._tool_count = AsyncMock(return_value={"count": 0})
+    plugin._tool_sample = AsyncMock(return_value={"rows": []})
+    set_db_run_state(plugin, DbRunState())
+
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+    plan_result = await tools["db_plan_query"].handler(
+        {
+            "goal": "How many orders were created this month?",
+            "required_fields": ["total_orders"],
+            "candidate_tables": ["orders"],
+            "aggregations": ["COUNT(orders.order_id) AS total_orders"],
+        }
+    )
+    result = await tools["db_query"].handler({"plan_id": plan_result["plan_id"]})
+
+    assert plan_result["next_steps"] == ["run db_query with plan_id"]
+    assert result == {"rows": [{"total_orders": 3}]}
+    plugin._tool_query.assert_awaited_once()
+    assert plugin._tool_query.await_args.args[0]["sql"] == plan_result["compiled_sql"]
+
+
 def test_query_ir_validation_rejects_non_numeric_sum_metric():
     schema = _schema(
         tables=[
@@ -152,6 +191,60 @@ def test_query_ir_compiler_supports_sqlite_date_macros():
     sql = compile_query_plan(plan, "sqlite").sql
 
     assert "WHERE \"orders\".\"created_at\" >= date('now', '-30 days')" in sql
+
+
+def test_ast_sql_preflight_allows_quoted_postgres_identifiers():
+    schema = _schema(
+        tables=[
+            _table(
+                "agents",
+                [
+                    {"name": "agent_id", "type": "text"},
+                    {"name": "agent_name", "type": "text"},
+                ],
+            ),
+            _table(
+                "operations",
+                [
+                    {"name": "operation_id", "type": "uuid"},
+                    {"name": "agent_id", "type": "text"},
+                    {"name": "created_at", "type": "timestamp"},
+                ],
+            ),
+        ]
+    )
+    sql = """
+    SELECT
+      "agents"."agent_id",
+      "agents"."agent_name",
+      COUNT("operations"."operation_id") AS "total_operations"
+    FROM "agents"
+    LEFT JOIN "operations" ON "agents"."agent_id" = "operations"."agent_id"
+    WHERE "operations"."created_at" >= NOW() - INTERVAL '30 days'
+    GROUP BY "agents"."agent_id", "agents"."agent_name"
+    ORDER BY "total_operations" DESC
+    LIMIT 10
+    """
+
+    assert validate_sql_against_schema(sql, schema, dialect="postgresql")["ok"] is True
+
+
+def test_ast_sql_preflight_allows_mysql_backtick_identifiers():
+    schema = _schema(
+        db_type="mysql",
+        tables=[
+            _table(
+                "agents",
+                [
+                    {"name": "agent_id", "type": "text"},
+                    {"name": "agent_name", "type": "text"},
+                ],
+            )
+        ],
+    )
+    sql = "SELECT `agents`.`agent_id`, `agents`.`agent_name` FROM `agents` LIMIT 10"
+
+    assert validate_sql_against_schema(sql, schema, dialect="mysql")["ok"] is True
 
 
 async def test_sql_facade_preflight_uses_query_validator_owner():

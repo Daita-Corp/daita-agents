@@ -17,6 +17,7 @@ from ..query.sql_validator import (
     sql_fingerprint,
     validate_sql_against_schema,
 )
+from ..query.sql_analysis import SqlAnalysis
 from ..runtime.state import get_db_run_state
 
 SQL_DATABASE_TYPES = {"postgresql", "postgres", "mysql", "sqlite", "snowflake"}
@@ -141,13 +142,17 @@ def _sql_tools(plugin: Any, schema: Dict[str, Any]) -> List[AgentTool]:
                         "type": "string",
                         "description": "SQL SELECT query for the active database dialect.",
                     },
+                    "plan_id": {
+                        "type": "string",
+                        "description": "Validated plan ID returned by db_plan_query.",
+                    },
                     "params": {
                         "type": "array",
                         "description": "Optional parameter values for placeholders.",
                         "items": {},
                     },
                 },
-                "required": ["sql"],
+                "required": [],
             },
             handler=query_handler,
             timeout_seconds=60,
@@ -236,10 +241,16 @@ def _plan_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
 
 def _validate_sql_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
     async def _handler(args: Dict[str, Any]) -> Any:
-        sql = str((args or {}).get("sql") or "")
-        validation = validate_sql_against_schema(sql, schema)
+        sql = _normalize_sql_for_plugin(plugin, str((args or {}).get("sql") or ""))
+        analysis = _validate_plugin_query_policy(plugin, sql)
+        dialect = _schema_or_plugin_dialect(plugin, schema)
+        validation = validate_sql_against_schema(
+            sql, schema, dialect=dialect, analysis=analysis
+        )
         state = get_db_run_state(plugin)
-        apply_required_field_validation(validation, sql, state)
+        apply_required_field_validation(
+            validation, sql, state, dialect=dialect, analysis=analysis
+        )
         if validation.get("error"):
             _record_sql_preflight_failure(plugin, state, validation)
             return validation
@@ -256,18 +267,28 @@ def _validate_sql_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
 
 def _preflight_sql_handler(plugin: Any, handler: Any, schema: Dict[str, Any]) -> Any:
     async def _handler(args: Dict[str, Any]) -> Any:
-        sql = str((args or {}).get("sql") or "")
-        _validate_plugin_query_policy(plugin, sql)
-        validation = validate_sql_against_schema(sql, schema)
+        args = args or {}
+        if args.get("plan_id"):
+            return await _execute_plan_id(plugin, handler, schema, args)
+
+        sql = _normalize_sql_for_plugin(plugin, str((args or {}).get("sql") or ""))
+        analysis = _validate_plugin_query_policy(plugin, sql)
+        dialect = _schema_or_plugin_dialect(plugin, schema)
+        validation = validate_sql_against_schema(
+            sql, schema, dialect=dialect, analysis=analysis
+        )
         run_state = get_db_run_state(plugin)
-        apply_required_field_validation(validation, sql, run_state)
+        apply_required_field_validation(
+            validation, sql, run_state, dialect=dialect, analysis=analysis
+        )
         if validation.get("error"):
             _record_sql_preflight_failure(plugin, run_state, validation)
             return validation
         fingerprint = sql_fingerprint(sql)
         if run_state is not None:
             run_state.record_validated_sql(fingerprint, validation)
-        result = await handler(args)
+        normalized_args = {**(args or {}), "sql": sql}
+        result = await handler(normalized_args)
         if run_state is not None:
             run_state.record_executed_query(
                 {
@@ -286,10 +307,91 @@ def _preflight_sql_handler(plugin: Any, handler: Any, schema: Dict[str, Any]) ->
     return _handler
 
 
-def _validate_plugin_query_policy(plugin: Any, sql: str) -> None:
+async def _execute_plan_id(
+    plugin: Any, handler: Any, schema: Dict[str, Any], args: Dict[str, Any]
+) -> Any:
+    run_state = get_db_run_state(plugin)
+    plan_id = str(args.get("plan_id") or "").strip()
+    if run_state is None or not plan_id:
+        return {
+            "error": "Missing query plan state",
+            "error_type": "framework_compiler_error",
+            "repair_required": True,
+            "suggested_next_tool": "db_plan_query",
+        }
+    stored = run_state.get_plan(plan_id)
+    if stored is None:
+        return {
+            "error": f"Unknown query plan ID: {plan_id}",
+            "error_type": "framework_compiler_error",
+            "repair_required": True,
+            "suggested_next_tool": "db_plan_query",
+        }
+
+    result = stored.get("result") or {}
+    validation = result.get("validation") or {}
+    sql = str(result.get("compiled_sql") or "")
+    if not sql or not validation.get("ok"):
+        return {
+            "error": "Query plan is not executable",
+            "error_type": "framework_compiler_error",
+            "repair_required": True,
+            "plan_id": plan_id,
+            "validation": validation,
+            "suggested_next_tool": "db_plan_query",
+        }
+
+    sql = _normalize_sql_for_plugin(plugin, sql)
+    _validate_plugin_query_policy(plugin, sql)
+    fingerprint = sql_fingerprint(sql)
+    run_state.record_validated_sql(
+        fingerprint,
+        {
+            "ok": True,
+            "plan_id": plan_id,
+            "source": "validated_query_ir",
+            "sql_fingerprint": fingerprint,
+        },
+    )
+    normalized_args = {**args, "sql": sql}
+    normalized_args.pop("plan_id", None)
+    result = await handler(normalized_args)
+    run_state.record_executed_query(
+        {
+            "plan_id": plan_id,
+            "sql_fingerprint": fingerprint,
+            "sql": sql,
+            "row_count": _result_row_count(result),
+            "truncated": (
+                bool(result.get("truncated")) if isinstance(result, dict) else False
+            ),
+        }
+    )
+    return result
+
+
+def _normalize_sql_for_plugin(plugin: Any, sql: str) -> str:
+    normalizer = getattr(type(plugin), "_normalize_sql", None)
+    if callable(normalizer):
+        return str(normalizer(sql))
+
+    instance_normalizer = vars(plugin).get("_normalize_sql")
+    if callable(instance_normalizer):
+        return str(instance_normalizer(sql))
+
+    return sql
+
+
+def _validate_plugin_query_policy(plugin: Any, sql: str) -> SqlAnalysis | None:
     validator = getattr(plugin, "_validate_sql_policy", None)
     if callable(validator):
-        validator(sql, operation="query")
+        analysis = validator(sql, operation="query")
+        return analysis if isinstance(analysis, SqlAnalysis) else None
+    return None
+
+
+def _schema_or_plugin_dialect(plugin: Any, schema: Dict[str, Any]) -> str:
+    return str(schema.get("database_type") or getattr(plugin, "sql_dialect", ""))
 
 
 def _record_sql_preflight_failure(

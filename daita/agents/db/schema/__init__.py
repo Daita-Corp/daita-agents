@@ -1,6 +1,13 @@
 """Schema discovery, navigation, caching, and summarization for ``from_db``."""
 
-from .cache import cache_key, detect_drift, load_cached_schema, save_schema_cache
+from .cache import (
+    cache_key,
+    clear_schema_snapshot,
+    detect_drift,
+    load_cached_schema,
+    load_schema_snapshot,
+    save_schema_cache,
+)
 from .discovery import (
     NUMERIC_TYPES,
     discover_schema,
@@ -33,6 +40,7 @@ __all__ = [
     "PII_COLUMN_PATTERNS",
     "build_db_summary",
     "cache_key",
+    "clear_schema_snapshot",
     "column_name",
     "describe_relationships",
     "detect_drift",
@@ -43,6 +51,7 @@ __all__ = [
     "is_numeric_type",
     "list_tables",
     "load_cached_schema",
+    "load_schema_snapshot",
     "matching_tables",
     "normalize_schema",
     "normalize_identifier",

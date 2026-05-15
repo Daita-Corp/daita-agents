@@ -7,7 +7,6 @@ support for all database plugins in the Daita framework.
 
 import asyncio
 import logging
-import re
 from abc import abstractmethod
 from typing import Any, Dict
 from ..core.exceptions import (
@@ -36,29 +35,6 @@ class BaseDatabasePlugin(BasePlugin):
 
     # Subclasses set this to their dialect: "postgresql", "mysql", "snowflake", "sqlite"
     sql_dialect: str = "standard"
-    _READ_QUERY_KEYWORDS = frozenset({"SELECT", "WITH", "EXPLAIN", "SHOW", "DESCRIBE"})
-    _SQLITE_READ_QUERY_KEYWORDS = _READ_QUERY_KEYWORDS | frozenset({"PRAGMA"})
-    _MUTATING_SQL_KEYWORDS = frozenset(
-        {
-            "INSERT",
-            "UPDATE",
-            "DELETE",
-            "MERGE",
-            "UPSERT",
-            "REPLACE",
-            "CREATE",
-            "ALTER",
-            "DROP",
-            "TRUNCATE",
-            "GRANT",
-            "REVOKE",
-            "CALL",
-            "COPY",
-            "LOAD",
-            "PUT",
-            "GET",
-        }
-    )
 
     def __init__(self, **kwargs):
         """
@@ -189,213 +165,93 @@ class BaseDatabasePlugin(BasePlugin):
         """
         return sql.rstrip().rstrip(";").rstrip()
 
-    @staticmethod
-    def _strip_sql_comments(sql: str) -> str:
-        """Remove SQL comments while preserving quoted strings."""
-        out = []
-        i = 0
-        quote = None
-        while i < len(sql):
-            ch = sql[i]
-            nxt = sql[i + 1] if i + 1 < len(sql) else ""
-            if quote:
-                out.append(ch)
-                if ch == quote:
-                    if nxt == quote:
-                        out.append(nxt)
-                        i += 2
-                        continue
-                    quote = None
-                i += 1
-                continue
-            if ch in ("'", '"', "`"):
-                quote = ch
-                out.append(ch)
-                i += 1
-                continue
-            if ch == "-" and nxt == "-":
-                while i < len(sql) and sql[i] not in "\r\n":
-                    i += 1
-                out.append(" ")
-                continue
-            if ch == "/" and nxt == "*":
-                i += 2
-                while i + 1 < len(sql) and not (sql[i] == "*" and sql[i + 1] == "/"):
-                    i += 1
-                i += 2
-                out.append(" ")
-                continue
-            out.append(ch)
-            i += 1
-        return "".join(out)
-
-    @staticmethod
-    def _has_internal_semicolon(sql: str) -> bool:
-        """Return True when SQL contains a semicolon outside quotes/comments."""
-        cleaned = BaseDatabasePlugin._strip_sql_comments(sql).rstrip()
-        quote = None
-        i = 0
-        while i < len(cleaned):
-            ch = cleaned[i]
-            nxt = cleaned[i + 1] if i + 1 < len(cleaned) else ""
-            if quote:
-                if ch == quote:
-                    if nxt == quote:
-                        i += 2
-                        continue
-                    quote = None
-                i += 1
-                continue
-            if ch in ("'", '"', "`"):
-                quote = ch
-            elif ch == ";":
-                return True
-            i += 1
-        return False
-
-    @staticmethod
-    def _first_sql_keyword(sql: str) -> str:
-        cleaned = BaseDatabasePlugin._strip_sql_comments(sql).lstrip()
-        match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", cleaned)
-        return match.group(1).upper() if match else ""
-
-    @staticmethod
-    def _sql_keyword_tokens(sql: str) -> list[str]:
-        """Return SQL identifier tokens outside comments and quoted strings."""
-        cleaned = BaseDatabasePlugin._strip_sql_comments(sql)
-        tokens = []
-        i = 0
-        quote = None
-        while i < len(cleaned):
-            ch = cleaned[i]
-            nxt = cleaned[i + 1] if i + 1 < len(cleaned) else ""
-            if quote:
-                if ch == quote:
-                    if nxt == quote:
-                        i += 2
-                        continue
-                    quote = None
-                i += 1
-                continue
-            if ch in ("'", '"', "`"):
-                quote = ch
-                i += 1
-                continue
-            if ch.isalpha() or ch == "_":
-                start = i
-                i += 1
-                while i < len(cleaned) and (
-                    cleaned[i].isalnum() or cleaned[i] in ("_", "$")
-                ):
-                    i += 1
-                tokens.append(cleaned[start:i].upper())
-                continue
-            i += 1
-        return tokens
-
-    @staticmethod
-    def _sql_has_limit(sql: str) -> bool:
-        return bool(
-            re.search(
-                r"\bLIMIT\b",
-                BaseDatabasePlugin._strip_sql_comments(sql),
-                re.IGNORECASE,
-            )
-        )
-
-    @staticmethod
-    def _sql_identifiers_after(sql: str, keywords: tuple[str, ...]) -> set[str]:
-        keyword_re = "|".join(re.escape(k) for k in keywords)
-        ident = r'(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`)'
-        pattern = rf"\b(?:{keyword_re})\s+({ident}(?:\.{ident})*)"
-        identifiers = set()
-        for match in re.finditer(
-            pattern,
-            BaseDatabasePlugin._strip_sql_comments(sql),
-            re.IGNORECASE,
-        ):
-            raw = match.group(1)
-            parts = [part.strip('"`') for part in raw.split(".")]
-            identifiers.add(parts[-1])
-        return identifiers
-
-    def _validate_sql_policy(self, sql: str, *, operation: str) -> None:
+    def _validate_sql_policy(self, sql: str, *, operation: str):
         if not sql or not sql.strip():
             raise ValidationError("SQL must not be empty", field="sql")
-        if self._has_internal_semicolon(sql):
+        from ..agents.db.query.sql_analysis import analyze_sql
+
+        analysis = analyze_sql(sql, dialect=self.sql_dialect)
+        if analysis.has_multiple_statements:
             raise ValidationError(
                 "SQL guardrail rejected multiple statements", field="sql"
             )
 
-        keyword = self._first_sql_keyword(sql)
-        read_keywords = (
-            self._SQLITE_READ_QUERY_KEYWORDS
-            if self.sql_dialect == "sqlite"
-            else self._READ_QUERY_KEYWORDS
-        )
-        if operation == "query" and keyword not in read_keywords:
+        if getattr(self, "read_only", False) and (
+            not analysis.is_read or analysis.mutating_statement_types
+        ):
+            statement = (
+                analysis.mutating_statement_types[0]
+                if analysis.mutating_statement_types
+                else analysis.statement_type.upper()
+            )
             raise ValidationError(
-                f"SQL guardrail rejected non-read query statement: {keyword or 'unknown'}",
+                "SQL guardrail rejected mutating statement in read-only mode: "
+                f"{statement}",
                 field="sql",
             )
 
-        if self.read_only and keyword in self._MUTATING_SQL_KEYWORDS:
+        if operation == "query" and not analysis.is_read:
             raise ValidationError(
-                f"SQL guardrail rejected mutating statement in read-only mode: {keyword}",
+                "SQL guardrail rejected non-read query statement: "
+                f"{analysis.statement_type or 'unknown'}",
                 field="sql",
             )
-        if self.read_only:
-            mutating_tokens = [
-                token
-                for token in self._sql_keyword_tokens(sql)
-                if token in self._MUTATING_SQL_KEYWORDS
-            ]
-            if mutating_tokens:
-                raise ValidationError(
-                    "SQL guardrail rejected mutating statement in read-only mode: "
-                    f"{mutating_tokens[0]}",
-                    field="sql",
-                )
 
-        referenced_tables = self._sql_identifiers_after(
-            sql, ("FROM", "JOIN", "UPDATE", "INTO", "TABLE")
-        )
-        blocked = referenced_tables & self.blocked_tables
+        blocked_tables = {
+            table.lower() for table in getattr(self, "blocked_tables", set())
+        }
+        allowed_tables = {
+            table.lower() for table in getattr(self, "allowed_tables", set())
+        }
+        blocked = {
+            table.short_key
+            for table in analysis.tables
+            if not table.is_cte
+            and ({table.key, table.short_key, table.name.lower()} & blocked_tables)
+        }
         if blocked:
             raise ValidationError(
                 f"SQL guardrail rejected blocked table(s): {', '.join(sorted(blocked))}",
                 field="sql",
             )
-        if self.allowed_tables:
-            disallowed = referenced_tables - self.allowed_tables
+        if allowed_tables:
+            disallowed = {
+                table.short_key
+                for table in analysis.tables
+                if not table.is_cte
+                and not (
+                    {table.key, table.short_key, table.name.lower()} & allowed_tables
+                )
+            }
             if disallowed:
                 raise ValidationError(
                     f"SQL guardrail rejected table(s) outside allowlist: {', '.join(sorted(disallowed))}",
                     field="sql",
                 )
 
-        cleaned = BaseDatabasePlugin._strip_sql_comments(sql)
-        blocked_columns = [
+        referenced_columns = analysis.referenced_column_names
+        blocked_columns = sorted(
             col
-            for col in self.blocked_columns
-            if re.search(rf"(?<![\w.]){re.escape(col)}(?!\w)", cleaned)
-        ]
+            for col in getattr(self, "blocked_columns", set())
+            if col.lower() in referenced_columns
+        )
         if blocked_columns:
             raise ValidationError(
                 f"SQL guardrail rejected blocked column(s): {', '.join(sorted(blocked_columns))}",
                 field="sql",
             )
+        return analysis
 
     def _prepare_tool_query_sql(self, sql: str) -> str:
         sql = sql or ""
         sql = self._normalize_sql(sql)
-        self._validate_sql_policy(sql, operation="query")
+        analysis = self._validate_sql_policy(sql, operation="query")
         if (
-            self.query_default_limit
-            and self.query_default_limit > 0
-            and not self._sql_has_limit(sql)
+            getattr(self, "query_default_limit", 0)
+            and getattr(self, "query_default_limit", 0) > 0
+            and not analysis.has_limit
         ):
-            sql = f"{sql} LIMIT {int(self.query_default_limit)}"
+            sql = f"{sql} LIMIT {int(getattr(self, 'query_default_limit', 0))}"
         return sql
 
     def _prepare_tool_execute_sql(self, sql: str) -> str:
@@ -412,9 +268,13 @@ class BaseDatabasePlugin(BasePlugin):
             coro = self._run_focus_query(sql, params, focus_dsl)
         else:
             coro = self.query(sql, params or None)
-        results = await asyncio.wait_for(coro, timeout=self.query_timeout)
+        results = await asyncio.wait_for(
+            coro, timeout=getattr(self, "query_timeout", 30)
+        )
         truncated = self._truncate_result(
-            results, max_rows=self.query_max_rows, max_chars=self.query_max_chars
+            results,
+            max_rows=getattr(self, "query_max_rows", 200),
+            max_chars=getattr(self, "query_max_chars", 50000),
         )
         return {
             "rows": truncated["rows"],
