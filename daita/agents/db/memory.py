@@ -5,10 +5,12 @@ DB-specific memory semantics for ``from_db()`` agents.
 import decimal
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
 from .schema.discovery import is_numeric_type
+from .schema.sampling import PII_COLUMN_PATTERNS
 
 if TYPE_CHECKING:
     from ..agent import Agent
@@ -23,8 +25,37 @@ DB_MEMORY_KINDS = {
     "schema_interpretation",
     "cache_marker",
 }
+DB_SEMANTIC_MEMORY_KINDS = (
+    "unit_convention",
+    "metric_definition",
+    "business_rule",
+    "data_contract_note",
+    "schema_interpretation",
+)
 DB_SEMANTIC_CATEGORY = "db_semantics"
 DB_MARKER_CATEGORY = "db_cache_marker"
+SENSITIVE_METADATA_KEYS = frozenset(
+    PII_COLUMN_PATTERNS
+    + [
+        "authorization",
+        "bearer",
+        "credential",
+        "credentials",
+        "private_key",
+    ]
+)
+PII_VALUE_PATTERNS = (
+    ("email address", re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b")),
+    ("US SSN", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
+    (
+        "credit card number",
+        re.compile(r"\b(?:\d[ -]?){13,19}\b"),
+    ),
+    (
+        "phone number",
+        re.compile(r"(?<!\w)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\w)"),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -66,7 +97,7 @@ class DBMemory:
 
     async def remember(self, record: Any) -> Optional[Dict[str, Any]]:
         normalized = normalize_db_memory_record(record)
-        return await _remember_record(self.plugin, normalized)
+        return await _upsert_record(self.plugin, normalized)
 
     async def remember_many(self, records: Iterable[Any]) -> List[Dict[str, Any]]:
         results = []
@@ -132,6 +163,100 @@ class DBMemory:
         )
 
 
+def create_db_memory_tools(db_memory: DBMemory) -> List[Any]:
+    """Create LLM-callable DB memory tools with strict from_db semantics."""
+    from ...core.tools import AgentTool
+
+    async def db_remember_handler(args: Dict[str, Any]) -> Dict[str, Any]:
+        kind = str(args.get("kind") or "").strip()
+        if kind not in DB_SEMANTIC_MEMORY_KINDS:
+            return {
+                "success": False,
+                "error": (
+                    f"Unsupported DB memory kind {kind!r}; expected one of "
+                    f"{list(DB_SEMANTIC_MEMORY_KINDS)}"
+                ),
+            }
+
+        metadata = args.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            return {"success": False, "error": "metadata must be an object"}
+
+        pii_error = _db_memory_pii_error(
+            key=str(args.get("key") or ""),
+            text=str(args.get("text") or ""),
+            metadata=metadata,
+        )
+        if pii_error:
+            return {"success": False, "error": pii_error}
+
+        try:
+            record = DBMemoryRecord(
+                kind=kind,
+                key=str(args.get("key") or "").strip(),
+                text=str(args.get("text") or "").strip(),
+                metadata=metadata,
+                importance=float(args.get("importance", 0.7)),
+            )
+            result = await db_memory.remember(record)
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+        return {
+            "success": True,
+            "kind": record.kind,
+            "key": record.key,
+            "category": record.category,
+            "status": (result or {}).get("status"),
+            "updated": (result or {}).get("updated", 0),
+            "stored": result,
+        }
+
+    return [
+        AgentTool(
+            name="db_remember",
+            description=(
+                "Store or revise durable database semantics for this from_db agent. "
+                "Use only for metric definitions, business rules, unit conventions, "
+                "data contracts, or schema interpretation; never store row values."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": list(DB_SEMANTIC_MEMORY_KINDS),
+                        "description": "The structured DB memory kind.",
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": (
+                            "Stable unique key, such as metric:revenue or "
+                            "business_rule:refunds."
+                        ),
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Self-contained semantic memory text.",
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Optional structured context for the memory.",
+                    },
+                    "importance": {
+                        "type": "number",
+                        "description": "Importance from 0.0 to 1.0.",
+                    },
+                },
+                "required": ["kind", "key", "text"],
+            },
+            handler=db_remember_handler,
+            source="from_db",
+            category="memory",
+        )
+    ]
+
+
 def normalize_db_memory_record(raw: Any) -> DBMemoryRecord:
     """Validate and normalize a DB memory record."""
     if isinstance(raw, DBMemoryRecord):
@@ -163,6 +288,74 @@ def normalize_db_memory_record(raw: Any) -> DBMemoryRecord:
         metadata=_json_safe(record.metadata),
         importance=max(0.0, min(1.0, record.importance)),
     )
+
+
+def _db_memory_pii_error(*, key: str, text: str, metadata: Dict[str, Any]) -> Optional[str]:
+    violation = _detect_pii_value(text) or _detect_pii_value(key)
+    if violation:
+        return (
+            f"DB memory cannot store row-level or PII values ({violation}); "
+            "store durable database semantics only."
+        )
+
+    sensitive_key = _find_sensitive_metadata_key(metadata)
+    if sensitive_key:
+        return (
+            f"DB memory metadata cannot include sensitive field {sensitive_key!r}; "
+            "store durable database semantics only."
+        )
+
+    metadata_value = _detect_pii_value(json.dumps(_json_safe(metadata), sort_keys=True))
+    if metadata_value:
+        return (
+            f"DB memory metadata cannot store row-level or PII values ({metadata_value}); "
+            "store durable database semantics only."
+        )
+    return None
+
+
+def _detect_pii_value(value: str) -> Optional[str]:
+    text = str(value or "")
+    if not text:
+        return None
+    for label, pattern in PII_VALUE_PATTERNS:
+        for match in pattern.finditer(text):
+            candidate = match.group(0)
+            if label == "credit card number" and not _looks_like_credit_card(candidate):
+                continue
+            return label
+    return None
+
+
+def _looks_like_credit_card(candidate: str) -> bool:
+    digits = [int(ch) for ch in candidate if ch.isdigit()]
+    if not 13 <= len(digits) <= 19:
+        return False
+    checksum = 0
+    parity = len(digits) % 2
+    for index, digit in enumerate(digits):
+        if index % 2 == parity:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        checksum += digit
+    return checksum % 10 == 0
+
+
+def _find_sensitive_metadata_key(metadata: Dict[str, Any], prefix: str = "") -> Optional[str]:
+    for key, value in metadata.items():
+        key_text = str(key).lower()
+        if key_text in SENSITIVE_METADATA_KEYS or any(
+            pattern in key_text for pattern in SENSITIVE_METADATA_KEYS
+        ):
+            return f"{prefix}{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            nested = _find_sensitive_metadata_key(
+                value, prefix=f"{prefix}{key}." if prefix else f"{key}."
+            )
+            if nested:
+                return nested
+    return None
 
 
 async def calibrate_db_memory(
@@ -365,6 +558,55 @@ async def _remember_record(
     return None
 
 
+async def _upsert_record(
+    plugin: Any, record: DBMemoryRecord
+) -> Optional[Dict[str, Any]]:
+    existing_chunk_ids = await _find_record_chunk_ids_by_key(plugin, record)
+    if existing_chunk_ids:
+        deleted = await _delete_record_chunks(plugin, existing_chunk_ids)
+        result = await _remember_record(plugin, record)
+        return {
+            "status": "updated" if deleted else "stored",
+            "updated": len(existing_chunk_ids) if deleted else 0,
+            "replaced_chunk_ids": existing_chunk_ids if deleted else [],
+            "stored": result,
+            "upsert_fallback": None if deleted else "append",
+        }
+
+    result = await _remember_record(plugin, record)
+    return {"status": "created", "updated": 0, "stored": result}
+
+
+async def _find_record_chunk_ids_by_key(
+    plugin: Any, record: DBMemoryRecord
+) -> List[str]:
+    results = await _list_records_by_category(plugin, record.category, limit=1000)
+    if results is None:
+        return []
+
+    chunk_ids = []
+    for result in results:
+        if _record_key_from_result(result) != record.key:
+            continue
+        chunk_id = result.get("chunk_id")
+        if chunk_id:
+            chunk_ids.append(str(chunk_id))
+    return chunk_ids
+
+
+async def _delete_record_chunks(plugin: Any, chunk_ids: List[str]) -> bool:
+    if not chunk_ids:
+        return True
+    backend = getattr(plugin, "backend", None)
+    if backend is not None and hasattr(backend, "delete_chunks"):
+        await backend.delete_chunks(chunk_ids)
+        return True
+    if hasattr(plugin, "delete_chunks"):
+        await plugin.delete_chunks(chunk_ids)
+        return True
+    return False
+
+
 async def _recall_records(
     plugin: Any,
     query: str,
@@ -440,6 +682,24 @@ def _record_kind_from_result(result: Dict[str, Any]) -> Optional[str]:
             payload = json.loads(content[len(marker) :])
             if isinstance(payload, dict) and payload.get("kind"):
                 return str(payload["kind"])
+    except Exception:
+        return None
+    return None
+
+
+def _record_key_from_result(result: Dict[str, Any]) -> Optional[str]:
+    metadata = result.get("metadata") or {}
+    db_memory = metadata.get("db_memory")
+    if isinstance(db_memory, dict) and db_memory.get("key"):
+        return str(db_memory["key"])
+
+    content = str(result.get("content", ""))
+    try:
+        marker = "DB memory record:\n"
+        if content.startswith(marker):
+            payload = json.loads(content[len(marker) :])
+            if isinstance(payload, dict) and payload.get("key"):
+                return str(payload["key"])
     except Exception:
         return None
     return None

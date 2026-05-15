@@ -6,7 +6,7 @@ import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING, Tuple, Union
 
 from .describe import attach_db_describe
-from .memory import DBMemory, calibrate_db_memory
+from .memory import DBMemory, calibrate_db_memory, create_db_memory_tools
 from .config.policies import (
     BudgetPreset,
     SchemaPromptPolicy,
@@ -44,6 +44,10 @@ _GENERIC_DB_TOOLS = {
     "db_execute",
     "db_find",
     "db_aggregate",
+}
+_GENERIC_MEMORY_WRITE_TOOLS = {
+    "remember",
+    "update_memory",
 }
 
 
@@ -582,6 +586,7 @@ def _attach_memory(
         memory_plugin = memory
 
     agent.add_plugin(memory_plugin)
+    _remove_generic_memory_write_tools(agent)
     disabled_for = getattr(
         memory_plugin, "_daita_disable_lifecycle_context_for_agent_ids", None
     )
@@ -595,6 +600,24 @@ def _attach_memory(
     disabled_for.add(agent.agent_id)
     agent._db_memory = memory_plugin
     agent._db_memory_semantics = DBMemory(memory_plugin)
+    _register_db_memory_tools(agent)
+
+
+def _remove_generic_memory_write_tools(agent: "Agent") -> None:
+    """Force from_db memory writes through DBMemoryRecord semantics."""
+    registry = getattr(agent, "tool_registry", None)
+    if registry is None:
+        return
+    for tool_name in _GENERIC_MEMORY_WRITE_TOOLS:
+        registry.remove(tool_name)
+
+
+def _register_db_memory_tools(agent: "Agent") -> None:
+    db_memory = getattr(agent, "_db_memory_semantics", None)
+    if db_memory is None:
+        return
+    for tool in create_db_memory_tools(db_memory):
+        agent.tool_registry.register(tool)
 
 
 async def _calibrate_memory(

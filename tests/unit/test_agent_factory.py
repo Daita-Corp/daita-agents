@@ -1564,11 +1564,14 @@ class TestFromDbLineage:
 
 class TestFromDbMemory:
     def _base_mocks(self):
+        from daita.core.tools import ToolRegistry
+
         mock_plugin = MagicMock()
         mock_plugin.connect = AsyncMock()
         mock_agent = MagicMock()
         mock_agent.add_plugin = MagicMock()
         mock_agent.run = AsyncMock(return_value="[]")
+        mock_agent.tool_registry = ToolRegistry()
         return mock_plugin, mock_agent
 
     async def test_memory_true_creates_with_workspace(self):
@@ -1623,6 +1626,475 @@ class TestFromDbMemory:
         mock_agent.add_plugin.assert_any_call(custom_memory)
         assert mock_agent._db_memory is custom_memory
         assert mock_agent._db_memory_semantics.plugin is custom_memory
+
+    async def test_from_db_removes_generic_memory_write_tools(self):
+        import daita.agents.db.builder as fac
+        from daita.agents.db import from_db
+        from daita.core.tools import AgentTool
+
+        async def fail_if_called(args):
+            raise AssertionError("generic memory write tool should not be callable")
+
+        schema = _make_normalized_schema(tables=[_table("users")])
+        mock_plugin, mock_agent = self._base_mocks()
+        for name in ("remember", "update_memory", "recall"):
+            mock_agent.tool_registry.register(
+                AgentTool(
+                    name=name,
+                    description=f"{name} test tool",
+                    parameters={},
+                    handler=fail_if_called,
+                    source="plugin",
+                    category="memory",
+                )
+            )
+        custom_memory = MagicMock()
+        custom_memory.backend = None
+        custom_memory.recall = AsyncMock(return_value=[])
+        custom_memory.remember = AsyncMock(return_value={"status": "ok"})
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            agent = await from_db("postgresql://localhost/testdb", memory=custom_memory)
+
+        assert "remember" not in agent.tool_registry.tool_names
+        assert "update_memory" not in agent.tool_registry.tool_names
+        assert "db_remember" in agent.tool_registry.tool_names
+        assert "recall" in agent.tool_registry.tool_names
+
+    async def test_db_remember_tool_stores_validated_db_memory_record(self):
+        import daita.agents.db.builder as fac
+        from daita.agents.db import from_db
+
+        schema = _make_normalized_schema(tables=[_table("users")])
+        mock_plugin, mock_agent = self._base_mocks()
+        custom_memory = MagicMock()
+        custom_memory.backend = None
+        custom_memory.recall = AsyncMock(return_value=[])
+        custom_memory.remember = AsyncMock(return_value={"chunk_id": "mem-1"})
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            agent = await from_db("postgresql://localhost/testdb", memory=custom_memory)
+
+        result = await agent.tool_registry.execute(
+            "db_remember",
+            {
+                "kind": "business_rule",
+                "key": "business_rule:revenue_refunds",
+                "text": "Revenue excludes refunded orders.",
+                "metadata": {"metric": "revenue"},
+                "importance": 0.8,
+            },
+        )
+
+        assert result["success"] is True
+        assert result["kind"] == "business_rule"
+        assert result["category"] == "db_semantics"
+        custom_memory.remember.assert_awaited_once()
+        stored_content = custom_memory.remember.await_args.args[0]
+        assert "Revenue excludes refunded orders." in stored_content
+        assert '"kind": "business_rule"' in stored_content
+
+        invalid = await agent.tool_registry.execute(
+            "db_remember",
+            {"kind": "knowledge", "key": "x", "text": "too vague"},
+        )
+
+        assert invalid["success"] is False
+        assert "Unsupported DB memory kind" in invalid["error"]
+
+    async def test_db_remember_tool_updates_existing_record_by_key(self):
+        import daita.agents.db.builder as fac
+        from daita.agents.db import from_db
+
+        schema = _make_normalized_schema(tables=[_table("users")])
+        mock_plugin, mock_agent = self._base_mocks()
+        backend = MagicMock()
+        backend.list_by_category = AsyncMock(
+            return_value=[
+                {
+                    "chunk_id": "old-1",
+                    "content": "old content",
+                    "metadata": {
+                        "db_memory": {
+                            "kind": "metric_definition",
+                            "key": "metric:revenue",
+                        }
+                    },
+                },
+                {
+                    "chunk_id": "other-1",
+                    "content": "other content",
+                    "metadata": {
+                        "db_memory": {
+                            "kind": "metric_definition",
+                            "key": "metric:margin",
+                        }
+                    },
+                },
+            ]
+        )
+        backend.delete_chunks = AsyncMock()
+        backend.remember = AsyncMock(return_value={"chunk_id": "new-1"})
+        custom_memory = SimpleNamespace(backend=backend)
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            agent = await from_db("postgresql://localhost/testdb", memory=custom_memory)
+
+        result = await agent.tool_registry.execute(
+            "db_remember",
+            {
+                "kind": "metric_definition",
+                "key": "metric:revenue",
+                "text": "Revenue excludes refunded orders.",
+            },
+        )
+
+        assert result["success"] is True
+        assert result["status"] == "updated"
+        assert result["updated"] == 1
+        backend.list_by_category.assert_awaited_once_with(
+            category="db_semantics", limit=1000
+        )
+        backend.delete_chunks.assert_awaited_once_with(["old-1"])
+        backend.remember.assert_awaited_once()
+
+    async def test_db_remember_tool_appends_when_backend_cannot_delete_existing_key(
+        self,
+    ):
+        import daita.agents.db.builder as fac
+        from daita.agents.db import from_db
+
+        schema = _make_normalized_schema(tables=[_table("users")])
+        mock_plugin, mock_agent = self._base_mocks()
+        backend = MagicMock()
+        backend.list_by_category = AsyncMock(
+            return_value=[
+                {
+                    "chunk_id": "old-1",
+                    "content": 'DB memory record:\n{"key": "business_rule:refunds"}',
+                    "metadata": {},
+                }
+            ]
+        )
+        del backend.delete_chunks
+        backend.remember = AsyncMock(return_value={"chunk_id": "new-1"})
+        custom_memory = SimpleNamespace(backend=backend)
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            agent = await from_db("postgresql://localhost/testdb", memory=custom_memory)
+
+        result = await agent.tool_registry.execute(
+            "db_remember",
+            {
+                "kind": "business_rule",
+                "key": "business_rule:refunds",
+                "text": "Refunded orders are excluded from revenue.",
+            },
+        )
+
+        assert result["success"] is True
+        assert result["status"] == "stored"
+        assert result["updated"] == 0
+        assert result["stored"]["upsert_fallback"] == "append"
+        backend.remember.assert_awaited_once()
+
+    async def test_db_remember_tool_rejects_pii_values(self):
+        import daita.agents.db.builder as fac
+        from daita.agents.db import from_db
+
+        schema = _make_normalized_schema(tables=[_table("users")])
+        mock_plugin, mock_agent = self._base_mocks()
+        custom_memory = MagicMock()
+        custom_memory.backend = None
+        custom_memory.recall = AsyncMock(return_value=[])
+        custom_memory.remember = AsyncMock(return_value={"chunk_id": "mem-1"})
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            agent = await from_db("postgresql://localhost/testdb", memory=custom_memory)
+
+        result = await agent.tool_registry.execute(
+            "db_remember",
+            {
+                "kind": "business_rule",
+                "key": "business_rule:vip_customer",
+                "text": "VIP customer email is jane@example.com.",
+            },
+        )
+
+        assert result["success"] is False
+        assert "PII values" in result["error"]
+        custom_memory.remember.assert_not_awaited()
+
+    async def test_db_remember_tool_rejects_sensitive_metadata_keys(self):
+        import daita.agents.db.builder as fac
+        from daita.agents.db import from_db
+
+        schema = _make_normalized_schema(tables=[_table("users")])
+        mock_plugin, mock_agent = self._base_mocks()
+        custom_memory = MagicMock()
+        custom_memory.backend = None
+        custom_memory.recall = AsyncMock(return_value=[])
+        custom_memory.remember = AsyncMock(return_value={"chunk_id": "mem-1"})
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            agent = await from_db("postgresql://localhost/testdb", memory=custom_memory)
+
+        result = await agent.tool_registry.execute(
+            "db_remember",
+            {
+                "kind": "data_contract_note",
+                "key": "contract:users",
+                "text": "Users must have verified contact info.",
+                "metadata": {"email": "jane@example.com"},
+            },
+        )
+
+        assert result["success"] is False
+        assert "sensitive field" in result["error"]
+        custom_memory.remember.assert_not_awaited()
+
+    async def test_db_remember_tool_allows_schema_level_pii_column_mentions(self):
+        import daita.agents.db.builder as fac
+        from daita.agents.db import from_db
+
+        schema = _make_normalized_schema(tables=[_table("users")])
+        mock_plugin, mock_agent = self._base_mocks()
+        custom_memory = MagicMock()
+        custom_memory.backend = None
+        custom_memory.recall = AsyncMock(return_value=[])
+        custom_memory.remember = AsyncMock(return_value={"chunk_id": "mem-1"})
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            agent = await from_db("postgresql://localhost/testdb", memory=custom_memory)
+
+        result = await agent.tool_registry.execute(
+            "db_remember",
+            {
+                "kind": "schema_interpretation",
+                "key": "schema:users.email",
+                "text": "users.email is a contact column and should not be used as an entity key.",
+                "metadata": {"table": "users", "column": "email"},
+            },
+        )
+
+        assert result["success"] is True
+        custom_memory.remember.assert_awaited_once()
+
+    async def test_from_db_run_does_not_offer_generic_memory_write_tools(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+        from daita.core.tools import AgentTool
+        from daita.llm.mock import MockLLMProvider
+
+        async def fail_if_called(args):
+            raise AssertionError("generic memory write tool should not run")
+
+        class FakeDbPlugin:
+            read_only = True
+            sql_dialect = "postgresql"
+
+            async def connect(self):
+                return None
+
+            async def disconnect(self):
+                return None
+
+            def get_tools(self):
+                return []
+
+        class FakeMemoryPlugin:
+            backend = None
+
+            def get_tools(self):
+                return [
+                    AgentTool(
+                        name="remember",
+                        description="Generic memory write",
+                        parameters={},
+                        handler=fail_if_called,
+                        source="plugin",
+                        category="memory",
+                    ),
+                    AgentTool(
+                        name="update_memory",
+                        description="Generic memory update",
+                        parameters={},
+                        handler=fail_if_called,
+                        source="plugin",
+                        category="memory",
+                    ),
+                    AgentTool(
+                        name="recall",
+                        description="Generic memory read",
+                        parameters={},
+                        handler=lambda args: [],
+                        source="plugin",
+                        category="memory",
+                    ),
+                ]
+
+            async def recall(self, *args, **kwargs):
+                return []
+
+            async def remember(self, *args, **kwargs):
+                raise AssertionError("generic memory write method should not run")
+
+        schema = _make_normalized_schema(tables=[_table("orders")])
+        db_plugin = FakeDbPlugin()
+        memory_plugin = FakeMemoryPlugin()
+        llm = MockLLMProvider(delay=0)
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(db_plugin, True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch.object(fac, "_register_db_facade_tools", lambda *args, **kwargs: None),
+        ):
+            agent = await from_db(
+                "postgresql://localhost/testdb",
+                llm_provider=llm,
+                memory=memory_plugin,
+            )
+
+        result = await agent.run(
+            "Please remember that revenue excludes refunds and update_memory if needed.",
+            detailed=True,
+        )
+
+        assert result["tool_calls"] == []
+        assert "remember" not in agent.tool_registry.tool_names
+        assert "update_memory" not in agent.tool_registry.tool_names
+        assert "db_remember" in agent.tool_registry.tool_names
+        selected = agent._db_last_context_metadata["selected_tools"]
+        assert "remember" not in selected
+        assert "update_memory" not in selected
+        assert "db_remember" in selected
+        offered_tool_names = {
+            tool.get("function", {}).get("name", tool.get("name"))
+            for tool in llm.call_history[-1]["tools"]
+        }
+        assert "remember" not in offered_tool_names
+        assert "update_memory" not in offered_tool_names
+        assert "db_remember" in offered_tool_names
+
+    async def test_from_db_run_does_not_execute_hallucinated_generic_memory_write(self):
+        from daita.agents.db import from_db
+        import daita.agents.db.builder as fac
+        from daita.core.tools import AgentTool
+        from daita.llm.mock import MockLLMProvider
+
+        class HallucinatedRememberLLM(MockLLMProvider):
+            async def _generate_impl(self, messages, tools=None, **kwargs):
+                self.call_history.append(
+                    {
+                        "messages": messages,
+                        "tools": tools,
+                        "params": kwargs,
+                    }
+                )
+                if tools and len(self.call_history) == 1:
+                    return {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call-remember",
+                                "name": "remember",
+                                "arguments": {
+                                    "content": "Revenue excludes refunded orders.",
+                                    "category": "knowledge",
+                                },
+                            }
+                        ],
+                    }
+                if tools:
+                    return {"content": "done", "tool_calls": None}
+                return "done"
+
+        async def fail_if_called(args):
+            raise AssertionError("generic memory write tool should not run")
+
+        class FakeDbPlugin:
+            read_only = True
+            sql_dialect = "postgresql"
+
+            async def connect(self):
+                return None
+
+            async def disconnect(self):
+                return None
+
+            def get_tools(self):
+                return []
+
+        class FakeMemoryPlugin:
+            backend = None
+
+            def get_tools(self):
+                return [
+                    AgentTool(
+                        name="remember",
+                        description="Generic memory write",
+                        parameters={},
+                        handler=fail_if_called,
+                        source="plugin",
+                        category="memory",
+                    )
+                ]
+
+            async def recall(self, *args, **kwargs):
+                return []
+
+            async def remember(self, *args, **kwargs):
+                raise AssertionError("generic memory write method should not run")
+
+        schema = _make_normalized_schema(tables=[_table("orders")])
+        llm = HallucinatedRememberLLM(delay=0)
+
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(FakeDbPlugin(), True)),
+            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
+            patch.object(fac, "_register_db_facade_tools", lambda *args, **kwargs: None),
+        ):
+            agent = await from_db(
+                "postgresql://localhost/testdb",
+                llm_provider=llm,
+                memory=FakeMemoryPlugin(),
+            )
+
+        result = await agent.run("Remember that revenue excludes refunds.", detailed=True)
+
+        assert result["result"] == "done"
+        assert result["tool_calls"][0]["tool"] == "remember"
+        assert result["tool_calls"][0]["result"] == {
+            "error": "Tool 'remember' not found"
+        }
 
     async def test_memory_none_skipped(self):
         import daita.agents.db.builder as fac

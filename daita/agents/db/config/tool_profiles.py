@@ -18,6 +18,7 @@ CORE_QUERY_TOOLS = (
     "db_aggregate",
 )
 WRITE_QUERY_TOOLS = ("db_execute",)
+MEMORY_TOOLS = ("db_remember",)
 SCHEMA_TOOLS = (
     "db_search_schema",
     "db_inspect_table",
@@ -35,6 +36,14 @@ ANALYST_TOOL_INTENTS = {
 }
 QUALITY_KEYWORDS = ("quality", "freshness", "completeness", "null rate", "profile")
 LINEAGE_KEYWORDS = ("lineage", "dependency", "depends on", "upstream", "downstream")
+MEMORY_KEYWORDS = (
+    "remember",
+    "store memory",
+    "save memory",
+    "note for later",
+    "update_memory",
+    "memory",
+)
 SCHEMA_KEYWORDS = (
     "schema",
     "table",
@@ -123,6 +132,11 @@ def select_db_tools_for_prompt(agent: Any, prompt: str) -> List[str]:
             for name in available
             if name in {"trace_lineage", "find_lineage_paths", "export_lineage"}
         )
+
+    if hasattr(agent, "_db_memory_semantics") and any(
+        keyword in text for keyword in MEMORY_KEYWORDS
+    ):
+        _extend_available(selected, available, MEMORY_TOOLS)
 
     if _has_vector_columns(getattr(agent, "_db_schema", {}) or {}):
         selected.extend(name for name in available if name.endswith("_vector_search"))
