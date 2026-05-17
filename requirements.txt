@@ -67,6 +67,7 @@ mcp>=1.0.0
 
 # === WEB SEARCH ===
 tavily-python>=0.3.0
+exa-py>=2.0.0
 
 # === DEVELOPMENT DEPENDENCIES (commented out for Lambda) ===
 # The following are excluded from Lambda layer as they're not needed:

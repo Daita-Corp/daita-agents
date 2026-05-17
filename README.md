@@ -552,6 +552,7 @@ asyncio.run(main())
 | `email`           | Send/receive email (SMTP/IMAP)   | _(included)_     |
 | `google_drive`    | Read files from Google Drive     | `[google-drive]` |
 | `websearch`       | AI-optimized web search (Tavily) | `[websearch]`    |
+| `exa_search`      | AI-powered semantic search (Exa) | `[exa]`          |
 | `mcp`             | Model Context Protocol servers   | `[mcp]`          |
 | `redis_messaging` | Redis pub/sub messaging          | `[redis]`        |
 | `redis`           | Redis data store operations      | `[redis]`        |

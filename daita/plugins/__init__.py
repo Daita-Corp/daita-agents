@@ -170,6 +170,7 @@ from .elasticsearch import ElasticsearchPlugin, elasticsearch
 
 # Web search plugins
 from .websearch import WebSearchPlugin, websearch
+from .exa import ExaSearchPlugin, exa_search
 
 # Messaging plugins
 from .redis_messaging import RedisMessagingPlugin, redis_messaging
@@ -267,6 +268,10 @@ class PluginAccess:
         """Create WebSearch plugin."""
         return websearch(**kwargs)
 
+    def exa_search(self, **kwargs) -> ExaSearchPlugin:
+        """Create Exa search plugin."""
+        return exa_search(**kwargs)
+
     def redis_messaging(self, **kwargs) -> RedisMessagingPlugin:
         """Create Redis messaging plugin."""
         return redis_messaging(**kwargs)
@@ -330,6 +335,7 @@ __all__ = [
     "EmailPlugin",
     "ElasticsearchPlugin",
     "WebSearchPlugin",
+    "ExaSearchPlugin",
     "RedisMessagingPlugin",
     "RedisPlugin",
     "BigQueryPlugin",
@@ -356,6 +362,7 @@ __all__ = [
     "email",
     "elasticsearch",
     "websearch",
+    "exa_search",
     "redis_messaging",
     "redis",
     "bigquery",
