@@ -4,7 +4,8 @@ Platform-safe metadata for agents created by ``Agent.from_db()``.
 
 from typing import Any, Dict, List, TYPE_CHECKING
 
-from .utils import ANALYST_TOOL_PREFIXES, plugin_database_name
+from .catalog_read_model import build_db_catalog_read_model
+from .utils import ANALYST_TOOL_PREFIXES
 
 if TYPE_CHECKING:
     from ..agent import Agent
@@ -59,29 +60,27 @@ def _llm_metadata(agent: "Agent") -> Dict[str, Any]:
 
 
 def _db_metadata(agent: "Agent", tool_names: List[str]) -> Dict[str, Any]:
-    schema = getattr(agent, "_db_schema", {}) or {}
+    read_model = build_db_catalog_read_model(
+        agent, summary=getattr(agent, "_db_summary", {}) or {}
+    )
     plugin = getattr(agent, "_db_plugin", None)
-    tables = schema.get("tables", [])
-    foreign_keys = schema.get("foreign_keys", [])
-    drift = getattr(agent, "_db_schema_drift", None)
-    summary = getattr(agent, "_db_summary", {}) or {}
+    drift = getattr(agent, "_db_drift", None)
+    summary = read_model.db_summary
     candidate_metrics = summary.get("candidate_metrics", [])
-    suggested_questions = summary.get("suggested_questions", [])
     signals = summary.get("signals", [])
     findings = getattr(agent, "_db_findings", []) or []
     open_findings = [f for f in findings if f.get("status") == "open"]
 
     metadata: Dict[str, Any] = {
-        "database_type": schema.get(
-            "database_type", getattr(plugin, "sql_dialect", None)
-        ),
-        "database_name": schema.get("database_name") or plugin_database_name(plugin),
+        "database_type": read_model.database_type,
+        "database_name": read_model.database_name,
+        "catalog_store_id": read_model.store_id,
         "mode": getattr(agent, "_db_mode", None),
         "read_only": bool(getattr(plugin, "read_only", True)),
-        "table_count": schema.get("table_count", len(tables)),
-        "column_count": sum(len(table.get("columns", [])) for table in tables),
-        "relationship_count": len(foreign_keys),
-        "catalog_status": "completed" if schema else "unknown",
+        "table_count": read_model.table_count,
+        "column_count": read_model.column_count,
+        "relationship_count": read_model.relationship_count,
+        "catalog_status": read_model.catalog_status,
         "drift_status": "changed" if drift else "none",
         "memory_enabled": hasattr(agent, "_db_memory"),
         "lineage_enabled": hasattr(agent, "_db_lineage"),
@@ -89,7 +88,6 @@ def _db_metadata(agent: "Agent", tool_names: List[str]) -> Dict[str, Any]:
         "quality_enabled": hasattr(agent, "_db_quality"),
         "audit_enabled": hasattr(agent, "_db_audit_log"),
         "metric_count": len(candidate_metrics),
-        "suggested_question_count": len(suggested_questions),
         "finding_count": len(findings),
         "open_finding_count": len(open_findings),
         "quality_status": "warning" if signals else "ok",

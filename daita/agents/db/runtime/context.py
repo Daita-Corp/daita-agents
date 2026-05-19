@@ -45,7 +45,9 @@ class DBContext:
 
     @property
     def schema(self) -> Dict[str, Any]:
-        return getattr(self._agent, "_db_schema", {})
+        from ..query.catalog_adapter import catalog_schema_snapshot
+
+        return catalog_schema_snapshot(self._agent)
 
     @property
     def plugin(self) -> Any:
@@ -57,7 +59,7 @@ class DBContext:
 
     @property
     def drift(self) -> Any:
-        return getattr(self._agent, "_db_schema_drift", None)
+        return getattr(self._agent, "_db_drift", None)
 
     @property
     def memory(self) -> Any:
@@ -82,11 +84,6 @@ class DBContext:
     @property
     def summary(self) -> Dict[str, Any]:
         return getattr(self._agent, "_db_summary", {})
-
-    @property
-    def suggested_questions(self) -> List[str]:
-        summary = self.summary
-        return list(summary.get("suggested_questions", []))
 
     def register_monitors(
         self,

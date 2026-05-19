@@ -6,8 +6,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from ....core.tools import AgentTool
+from .....core.tools import AgentTool
 from ._helpers import (
+    AnalystCatalogContext,
     ensure_pandas,
     make_analysis_tool,
     safe_query,
@@ -16,7 +17,7 @@ from ._helpers import (
 )
 
 if TYPE_CHECKING:
-    from ....plugins.base_db import BaseDatabasePlugin
+    from .....plugins.base_db import BaseDatabasePlugin
 
 _STRENGTH_THRESHOLDS = [
     (0.9, "very strong"),
@@ -36,7 +37,7 @@ def _strength_label(r: float) -> str:
 
 
 def create_correlate_tool(
-    plugin: "BaseDatabasePlugin", schema: Dict[str, Any]
+    plugin: "BaseDatabasePlugin", catalog_context: AnalystCatalogContext
 ) -> AgentTool:
     """Return an AgentTool that computes column correlations."""
 

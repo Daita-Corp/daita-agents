@@ -20,6 +20,7 @@ def make_audited_run(agent: "Agent", original_run: Callable) -> Callable:
             kwargs["history"] = agent._db_history
         try:
             result = await original_run(prompt, detailed=True, **kwargs)
+            result["from_db_metrics"] = _run_metrics(agent, result)
             agent._db_audit_log.append(
                 _entry(
                     agent,
@@ -97,6 +98,29 @@ def _entry(
     if context:
         entry["context"] = context
     return entry
+
+
+def _run_metrics(agent: "Agent", result: Dict[str, Any]) -> Dict[str, Any]:
+    context = getattr(agent, "_db_last_context_metadata", {}) or {}
+    tool_calls = result.get("tool_calls") or []
+    query_tools = [
+        call for call in tool_calls if str(call.get("tool", "")).startswith("db_")
+    ]
+    return {
+        "llm_call_count": result.get("iterations"),
+        "tool_call_count": len(tool_calls),
+        "db_tool_call_count": len(query_tools),
+        "tool_duration_ms": sum(
+            int(call.get("duration_ms") or 0)
+            for call in tool_calls
+            if isinstance(call, dict)
+        ),
+        "selected_tool_count": context.get("selected_tool_count"),
+        "selected_tools": context.get("selected_tools", []),
+        "runtime_context_tokens_estimate": context.get(
+            "runtime_context_tokens_estimate"
+        ),
+    }
 
 
 def _sanitize_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -6,8 +6,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, TYPE_CHECKING
 
-from ....core.tools import AgentTool
+from .....core.tools import AgentTool
 from ._helpers import (
+    AnalystCatalogContext,
     ensure_pandas,
     make_analysis_tool,
     safe_query,
@@ -16,11 +17,11 @@ from ._helpers import (
 )
 
 if TYPE_CHECKING:
-    from ....plugins.base_db import BaseDatabasePlugin
+    from .....plugins.base_db import BaseDatabasePlugin
 
 
 def create_pivot_table_tool(
-    plugin: "BaseDatabasePlugin", schema: Dict[str, Any]
+    plugin: "BaseDatabasePlugin", catalog_context: AnalystCatalogContext
 ) -> AgentTool:
     """Return an AgentTool that cross-tabulates query results."""
 

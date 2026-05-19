@@ -242,6 +242,7 @@ async def _handle_profile_store(
         return {"error": f"No profiler registered for store type '{store.store_type}'"}
 
     schema = await profiler.profile(store)
+    schema.store_id = store_id
     plugin._schemas[store_id] = schema
     await plugin._persist_schema(schema.to_dict())
 
@@ -261,47 +262,87 @@ async def _handle_get_table_schema(
     table_name = args["table_name"]
     include_indexes = args.get("include_indexes", True)
     include_foreign_keys = args.get("include_foreign_keys", True)
-
-    schema = plugin.get_schema(store_id)
-    if schema is None:
-        return {
-            "error": (
-                f"No profiled schema for store '{store_id}'. "
-                f"Run profile_store first."
-            )
-        }
-
-    schema_dict = _schema_dict(schema)
-    table = next(
-        (t for t in schema_dict.get("tables", []) if t.get("name") == table_name),
-        None,
+    return plugin.get_table_schema(
+        store_id,
+        table_name,
+        column_pattern=args.get("column_pattern"),
+        limit=int(args.get("limit") or 100),
+        offset=int(args.get("offset") or 0),
+        include_indexes=include_indexes,
+        include_foreign_keys=include_foreign_keys,
+        blocked_columns=getattr(plugin, "_db_blocked_columns", None),
     )
-    if table is None:
-        known = [t.get("name") for t in schema_dict.get("tables", [])][:20]
-        return {
-            "error": f"Table '{table_name}' not found in store '{store_id}'",
-            "known_tables_sample": known,
-        }
 
-    response: Dict[str, Any] = {
-        "store_id": store_id,
-        "table_name": table_name,
-        "columns": table.get("columns", []),
-        "row_count": table.get("row_count"),
-    }
-    if include_indexes:
-        response["indexes"] = table.get("indexes", [])
-    if include_foreign_keys:
-        fks = [
-            fk
-            for fk in schema_dict.get("foreign_keys", [])
-            if fk.get("source_table") == table_name
-            or fk.get("target_table") == table_name
-        ]
-        response["foreign_keys"] = fks
-    if table.get("metadata"):
-        response["metadata"] = table["metadata"]
-    return response
+
+async def _handle_search_catalog(
+    plugin: "CatalogPlugin", args: Dict[str, Any]
+) -> Dict[str, Any]:
+    _require(args, "store_id", "query")
+    return plugin.search_catalog(
+        args["store_id"],
+        args["query"],
+        asset_types=args.get("asset_types"),
+        include_fields=args.get("include_fields", True),
+        limit=int(args.get("limit") or 20),
+    )
+
+
+async def _handle_inspect_asset(
+    plugin: "CatalogPlugin", args: Dict[str, Any]
+) -> Dict[str, Any]:
+    _require(args, "store_id", "asset_ref")
+    return plugin.inspect_asset(
+        args["store_id"],
+        args["asset_ref"],
+        field_filter=args.get("field_filter"),
+        offset=int(args.get("offset") or 0),
+        limit=int(args.get("limit") or 100),
+    )
+
+
+async def _handle_find_relationship_paths(
+    plugin: "CatalogPlugin", args: Dict[str, Any]
+) -> Dict[str, Any]:
+    _require(args, "store_id", "from_assets", "to_assets")
+    return plugin.find_relationship_paths(
+        args["store_id"],
+        list(args.get("from_assets") or []),
+        list(args.get("to_assets") or []),
+        relationship_types=args.get("relationship_types"),
+        max_hops=int(args.get("max_hops") or 4),
+        max_paths=int(args.get("max_paths") or 5),
+    )
+
+
+async def _handle_catalog_search_schema(
+    plugin: "CatalogPlugin", args: Dict[str, Any]
+) -> Dict[str, Any]:
+    _require(args, "store_id", "query")
+    return plugin.catalog_search_schema(
+        args["store_id"],
+        args["query"],
+        limit=int(args.get("limit") or 20),
+    )
+
+
+async def _handle_catalog_inspect_table(
+    plugin: "CatalogPlugin", args: Dict[str, Any]
+) -> Dict[str, Any]:
+    return await _handle_get_table_schema(plugin, args)
+
+
+async def _handle_catalog_find_join_paths(
+    plugin: "CatalogPlugin", args: Dict[str, Any]
+) -> Dict[str, Any]:
+    _require(args, "store_id", "from_tables", "to_tables")
+    return plugin.find_relationship_paths(
+        args["store_id"],
+        list(args.get("from_tables") or []),
+        list(args.get("to_tables") or []),
+        relationship_types=["foreign_key", "references"],
+        max_hops=int(args.get("max_hops") or 4),
+        max_paths=int(args.get("max_paths") or 5),
+    )
 
 
 async def _handle_find_store(
@@ -406,7 +447,7 @@ def _catalog_tool(
 
 
 def build_catalog_tools(plugin: "CatalogPlugin") -> List["AgentTool"]:
-    """Build the 7 agent-facing CatalogPlugin tools."""
+    """Build the agent-facing CatalogPlugin tools."""
     t = lambda **kw: _catalog_tool(plugin=plugin, **kw)
 
     return [
@@ -538,10 +579,195 @@ def build_catalog_tools(plugin: "CatalogPlugin") -> List["AgentTool"]:
                         "type": "boolean",
                         "description": "Include foreign keys touching this table (default true).",
                     },
+                    "column_pattern": {
+                        "type": "string",
+                        "description": "Optional substring or glob for columns.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Skip first N matched columns (default 0).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max columns to return (default 100).",
+                    },
                 },
                 "required": ["store_id", "table_name"],
             },
             handler_fn=_handle_get_table_schema,
+            timeout_seconds=30,
+        ),
+        t(
+            name="search_catalog",
+            description=(
+                "Search profiled catalog assets and fields inside one store. "
+                "Returns bounded, scored candidates rather than the full profile."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "store_id": {"type": "string", "description": "Profiled store ID."},
+                    "query": {"type": "string", "description": "Search text."},
+                    "asset_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional asset type filter.",
+                    },
+                    "include_fields": {
+                        "type": "boolean",
+                        "description": "Search and return matched fields (default true).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max assets to return (default 20).",
+                    },
+                },
+                "required": ["store_id", "query"],
+            },
+            handler_fn=_handle_search_catalog,
+            timeout_seconds=30,
+        ),
+        t(
+            name="inspect_asset",
+            description=(
+                "Inspect one catalog asset with bounded/paginated fields and "
+                "nearby relationships."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "store_id": {"type": "string", "description": "Profiled store ID."},
+                    "asset_ref": {
+                        "type": "string",
+                        "description": "Asset name or reference to inspect.",
+                    },
+                    "field_filter": {
+                        "type": "string",
+                        "description": "Optional substring or glob for fields.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Skip first N matched fields (default 0).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max fields to return (default 100).",
+                    },
+                },
+                "required": ["store_id", "asset_ref"],
+            },
+            handler_fn=_handle_inspect_asset,
+            timeout_seconds=30,
+        ),
+        t(
+            name="find_relationship_paths",
+            description=(
+                "Find bounded relationship paths between catalog assets without "
+                "executing SQL."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "store_id": {"type": "string", "description": "Profiled store ID."},
+                    "from_assets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Starting asset references.",
+                    },
+                    "to_assets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Target asset references.",
+                    },
+                    "relationship_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional relationship type filter.",
+                    },
+                    "max_hops": {
+                        "type": "integer",
+                        "description": "Maximum path length (default 4).",
+                    },
+                    "max_paths": {
+                        "type": "integer",
+                        "description": "Maximum paths to return (default 5).",
+                    },
+                },
+                "required": ["store_id", "from_assets", "to_assets"],
+            },
+            handler_fn=_handle_find_relationship_paths,
+            timeout_seconds=30,
+        ),
+        t(
+            name="catalog_search_schema",
+            description=(
+                "Relational alias over search_catalog for tables, views, and "
+                "collections."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "store_id": {"type": "string", "description": "Profiled store ID."},
+                    "query": {"type": "string", "description": "Search text."},
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max tables to return (default 20).",
+                    },
+                },
+                "required": ["store_id", "query"],
+            },
+            handler_fn=_handle_catalog_search_schema,
+            timeout_seconds=30,
+        ),
+        t(
+            name="catalog_inspect_table",
+            description="Relational alias over inspect_asset for table metadata.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "store_id": {"type": "string", "description": "Profiled store ID."},
+                    "table_name": {
+                        "type": "string",
+                        "description": "Table to inspect.",
+                    },
+                    "column_pattern": {
+                        "type": "string",
+                        "description": "Optional substring or glob for columns.",
+                    },
+                    "offset": {"type": "integer", "description": "Column offset."},
+                    "limit": {"type": "integer", "description": "Column limit."},
+                },
+                "required": ["store_id", "table_name"],
+            },
+            handler_fn=_handle_catalog_inspect_table,
+            timeout_seconds=30,
+        ),
+        t(
+            name="catalog_find_join_paths",
+            description=(
+                "Relational alias over find_relationship_paths for FK/reference "
+                "join paths."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "store_id": {"type": "string", "description": "Profiled store ID."},
+                    "from_tables": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Starting tables.",
+                    },
+                    "to_tables": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Target tables.",
+                    },
+                    "max_hops": {"type": "integer", "description": "Default 4."},
+                    "max_paths": {"type": "integer", "description": "Default 5."},
+                },
+                "required": ["store_id", "from_tables", "to_tables"],
+            },
+            handler_fn=_handle_catalog_find_join_paths,
             timeout_seconds=30,
         ),
         t(

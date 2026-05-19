@@ -14,22 +14,19 @@ from .config.policies import (
     schema_prompt_policy_for_budget,
 )
 from .config.presets import AUTO_TOOLKIT, resolve_mode_options
+from .catalog_read_model import db_summary_from_catalog
 from .prompt import build_prompt_result, infer_domain
 from .resolve import resolve_plugin
 from .runtime.audit import make_audited_run, make_audited_stream
 from .runtime.context import attach_db_context
 from .runtime.run_context import make_db_context_run, make_db_context_stream
-from .schema.cache import (
-    cache_key,
-    detect_drift,
-    load_schema_snapshot,
-    load_cached_schema,
-    save_schema_cache,
+from .catalog_freshness import (
+    catalog_profile_key,
+    detect_profile_drift,
+    load_catalog_profile_snapshot,
 )
-from .schema.discovery import discover_schema
-from .schema.navigation import should_register_schema_navigation
-from .schema.sampling import sample_numeric_columns
-from .schema.summary import build_db_summary
+from .catalog_profile import discover_schema
+from .catalog_sampling import sample_numeric_columns
 
 if TYPE_CHECKING:
     from ..agent import Agent
@@ -67,6 +64,7 @@ async def from_db(
     memory: Union[bool, Any, None] = None,
     calibrate_memory: Optional[bool] = None,
     history: Union[bool, Any, None] = None,
+    catalog: Optional[Any] = None,
     cache_ttl: Optional[int] = None,
     read_only: Optional[bool] = None,
     query_default_limit: Optional[int] = None,
@@ -110,7 +108,10 @@ async def from_db(
             during construction. Defaults to ``False``.
         history: ``True`` to auto-create an in-memory :class:`ConversationHistory`, or pass
             an instance. Enables conversational drilldown across ``run()`` calls.
-        cache_ttl: Schema cache TTL in seconds. ``None`` disables caching.
+        catalog: Optional :class:`CatalogPlugin` instance. Defaults to a new catalog
+            plugin that owns the profiled DB schema for this agent.
+        cache_ttl: Catalog profile freshness TTL in seconds. ``None`` reuses any
+            existing catalog profile snapshot when available.
         read_only: When ``True`` (default), write tools are omitted.
         query_default_limit: LIMIT injected into DB query tools when omitted.
         query_max_rows: Maximum rows returned from DB query tools after execution.
@@ -181,7 +182,7 @@ async def from_db(
     )
     await _connect_db_plugin(plugin, was_created=was_created)
 
-    schema, drift = await _discover_schema_with_cache(
+    schema, drift, persist_profile = await _load_or_discover_schema(
         source,
         plugin,
         db_schema=db_schema,
@@ -189,36 +190,48 @@ async def from_db(
         was_created=was_created,
         use_schema_snapshot=not bool(lineage),
     )
-
     if include_sample_values:
         await sample_numeric_columns(plugin, schema, redact_pii=redact_pii_columns)
 
-    domain = infer_domain(schema)
+    catalog_plugin, catalog_store_id, schema = await _register_schema_in_catalog(
+        source,
+        plugin,
+        schema,
+        catalog_plugin=catalog,
+        db_schema=db_schema,
+        persist=persist_profile,
+    )
+
+    catalog_prompt_schema = _catalog_schema_for_prompt(
+        catalog_plugin, catalog_store_id, schema
+    )
+    domain = infer_domain(catalog_prompt_schema)
     prompt_policy = schema_prompt_policy or schema_prompt_policy_for_budget(budget)
     analyst_tools = _analyst_tool_names(schema, toolkit)
     initial_prompt_result = build_prompt_result(
-        schema,
+        catalog_prompt_schema,
         domain,
         prompt,
         analyst_tools=analyst_tools,
-        schema_navigation_enabled=False,
+        catalog_tools_enabled=True,
+        catalog_store_id=catalog_store_id,
         policy=prompt_policy,
     )
-    schema_navigation_enabled = (
-        should_register_schema_navigation(schema)
-        or initial_prompt_result.strategy != "full"
+    catalog_tools_enabled = (
+        initial_prompt_result.strategy != "full"
         or initial_prompt_result.budget_exceeded
     )
     prompt_result = (
         build_prompt_result(
-            schema,
+            catalog_prompt_schema,
             domain,
             prompt,
             analyst_tools=analyst_tools,
-            schema_navigation_enabled=True,
+            catalog_tools_enabled=True,
+            catalog_store_id=catalog_store_id,
             policy=prompt_policy,
         )
-        if schema_navigation_enabled
+        if catalog_tools_enabled
         else initial_prompt_result
     )
     system_prompt = prompt_result.prompt
@@ -231,7 +244,15 @@ async def from_db(
         prompt=system_prompt,
         agent_kwargs=agent_kwargs,
     )
-    _attach_db_state(agent, plugin=plugin, schema=schema, mode=mode, drift=drift)
+    _attach_db_state(
+        agent,
+        plugin=plugin,
+        schema=schema,
+        mode=mode,
+        drift=drift,
+        catalog_plugin=catalog_plugin,
+        catalog_store_id=catalog_store_id,
+    )
     agent._db_prompt_metadata = {
         "strategy": prompt_result.strategy,
         "estimated_tokens": prompt_result.estimated_tokens,
@@ -242,9 +263,6 @@ async def from_db(
     }
     _remove_focus_from_db_tools(agent)
 
-    _register_schema_navigation_tools(
-        agent, plugin, schema, enabled=schema_navigation_enabled
-    )
     _register_db_facade_tools(agent, plugin, schema)
     _remove_provider_db_tools(agent)
     _register_analyst_toolkit(agent, plugin, schema, toolkit=toolkit)
@@ -301,7 +319,7 @@ async def _connect_db_plugin(plugin: Any, *, was_created: bool) -> None:
         raise AgentError(f"Failed to connect to database: {exc}") from exc
 
 
-async def _discover_schema_with_cache(
+async def _load_or_discover_schema(
     source: Union[str, "BaseDatabasePlugin"],
     plugin: Any,
     *,
@@ -309,55 +327,97 @@ async def _discover_schema_with_cache(
     cache_ttl: Optional[int],
     was_created: bool,
     use_schema_snapshot: bool = True,
-) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], bool]:
+    """Load a catalog profile snapshot or discover the active DB schema.
+
+    This is still a ``from_db`` orchestration helper, but profile persistence is
+    catalog-backed. It does not read or write ``.daita/schema_cache``.
+    """
     from ...core.exceptions import AgentError
 
     schema = None
     cached_schema = None
-    cache_key_val = cache_key(source)
+    profile_key = catalog_profile_key(source)
     drift = None
+    persist_profile = cache_ttl is not None
 
-    if cache_ttl is None:
-        if use_schema_snapshot:
-            cached_schema = load_schema_snapshot(
-                cache_key_val,
-                catalog_keys=_catalog_snapshot_keys(plugin, db_schema),
-            )
-            if cached_schema is not None:
-                return cached_schema, drift
-    elif cache_ttl == 0:
-        cache_result = load_cached_schema(cache_key_val, cache_ttl)
-        if cache_result is not None:
-            cached_schema, _ = cache_result
-    elif cache_ttl > 0:
-        cache_result = load_cached_schema(cache_key_val, cache_ttl)
+    if use_schema_snapshot:
+        cache_result = load_catalog_profile_snapshot(
+            profile_key,
+            catalog_keys=_catalog_snapshot_keys(plugin, db_schema),
+            ttl=cache_ttl,
+        )
         if cache_result is not None:
             cached_schema, is_expired = cache_result
-            if not is_expired:
-                schema = cached_schema
+            if cache_ttl is None or not is_expired:
+                return cached_schema, drift, False
 
     if schema is not None:
-        return schema, drift
+        return schema, drift, False
 
     try:
         conn_string = source if isinstance(source, str) else None
         schema = await discover_schema(plugin, conn_string, db_schema)
     except Exception as exc:
         if cached_schema is not None:
-            logger.warning(f"Schema discovery failed ({exc}), using expired cache")
-            return cached_schema, drift
+            logger.warning(
+                "Schema discovery failed (%s), using stale catalog profile", exc
+            )
+            return cached_schema, drift, False
         await _disconnect_if_owned(plugin, was_created=was_created)
         raise AgentError(f"Schema discovery failed: {exc}") from exc
 
     if cached_schema is not None:
-        drift = detect_drift(cached_schema, schema)
+        drift = detect_profile_drift(cached_schema, schema)
         if drift:
             logger.warning(f"Schema drift detected: {drift}")
 
-    if cache_ttl is not None:
-        save_schema_cache(cache_key_val, schema)
+    return schema, drift, persist_profile
 
-    return schema, drift
+
+async def _register_schema_in_catalog(
+    source: Union[str, "BaseDatabasePlugin"],
+    plugin: Any,
+    schema: Dict[str, Any],
+    *,
+    catalog_plugin: Optional[Any],
+    db_schema: Optional[str],
+    persist: bool,
+) -> Tuple[Any, str, Dict[str, Any]]:
+    from ...plugins.catalog import CatalogPlugin
+
+    active_catalog = catalog_plugin or CatalogPlugin(auto_persist=False)
+    store_type = _catalog_store_type(plugin, schema)
+    options = {"schema": db_schema} if db_schema else {}
+    registered = await active_catalog.register_schema(
+        schema,
+        store_type=store_type,
+        connection_string=source if isinstance(source, str) else None,
+        persist=persist,
+        options=options,
+    )
+    store_id = registered["store_id"]
+    return active_catalog, store_id, schema
+
+
+def _catalog_store_type(plugin: Any, schema: Dict[str, Any]) -> str:
+    for value in (
+        schema.get("database_type"),
+        getattr(plugin, "sql_dialect", None),
+        getattr(plugin, "database_type", None),
+    ):
+        if isinstance(value, str) and value:
+            return value
+    return "unknown"
+
+
+def _catalog_schema_for_prompt(
+    catalog_plugin: Any, catalog_store_id: str, fallback_schema: Dict[str, Any]
+) -> Dict[str, Any]:
+    schema = catalog_plugin.get_schema(catalog_store_id)
+    if schema is None:
+        return fallback_schema
+    return schema.to_dict() if hasattr(schema, "to_dict") else dict(schema)
 
 
 def _catalog_snapshot_keys(plugin: Any, db_schema: Optional[str]) -> List[str]:
@@ -421,13 +481,20 @@ def _attach_db_state(
     schema: Dict[str, Any],
     mode: str,
     drift: Optional[Dict[str, Any]],
+    catalog_plugin: Any,
+    catalog_store_id: str,
 ) -> None:
     agent.add_plugin(plugin)
-    agent._db_schema = schema
+    agent.add_plugin(catalog_plugin)
     agent._db_plugin = plugin
-    agent._db_summary = build_db_summary(schema)
+    plugin._db_catalog = catalog_plugin
+    plugin._db_catalog_store_id = catalog_store_id
+    catalog_plugin._db_blocked_columns = set(getattr(plugin, "blocked_columns", set()))
+    agent._db_catalog = catalog_plugin
+    agent._db_catalog_store_id = catalog_store_id
+    agent._db_summary = db_summary_from_catalog(agent)
     agent._db_mode = mode
-    agent._db_schema_drift = drift
+    agent._db_drift = drift
     agent._db_monitor_events = []
     agent._db_findings = []
     agent._db_active_findings = {}
@@ -468,29 +535,15 @@ def _register_analyst_toolkit(
 ) -> None:
     if toolkit not in ("analyst", "all"):
         return
-    from .tools import register_analyst_tools
+    from .tools.analyst import register_analyst_tools
 
     register_analyst_tools(agent, plugin, schema)
-
-
-def _register_schema_navigation_tools(
-    agent: "Agent",
-    plugin: Any,
-    schema: Dict[str, Any],
-    *,
-    enabled: bool,
-) -> None:
-    if not enabled:
-        return
-    from .tools import register_schema_navigation_tools
-
-    register_schema_navigation_tools(agent, plugin, schema)
 
 
 def _register_db_facade_tools(
     agent: "Agent", plugin: Any, schema: Dict[str, Any]
 ) -> None:
-    from .tools.query_facade import create_db_query_tools
+    from .tools.query import create_db_query_tools
 
     for tool in create_db_query_tools(plugin, schema):
         agent.tool_registry.register(tool)
@@ -534,7 +587,7 @@ def _register_quality_tools(agent: "Agent", plugin: Any, *, enabled: bool) -> No
 
 async def _attach_lineage(
     agent: "Agent",
-    schema: Dict[str, Any],
+    _schema: Dict[str, Any],
     *,
     lineage: Union[bool, Any, None],
 ) -> None:
@@ -548,28 +601,13 @@ async def _attach_lineage(
         lineage_plugin = lineage
 
     agent.add_plugin(lineage_plugin)
-
-    from ...core.graph.models import AgentGraphNode, NodeType
-    from ...plugins.catalog.persistence import _derive_store
-
-    store = _derive_store(schema)
-    for fk in schema.get("foreign_keys", []):
-        src_id = AgentGraphNode.make_id(NodeType.TABLE, f"{store}.{fk['source_table']}")
-        tgt_id = AgentGraphNode.make_id(NodeType.TABLE, f"{store}.{fk['target_table']}")
-        await lineage_plugin.register_flow(
-            source_id=src_id,
-            target_id=tgt_id,
-            flow_type="references",
-            transformation=f"{fk['source_column']} → {fk['target_column']}",
-            metadata={
-                "source": "schema_discovery",
-                "store": store,
-                "fk_source_column": fk["source_column"],
-                "fk_target_column": fk["target_column"],
-            },
-        )
-
     agent._db_lineage = lineage_plugin
+    graph_backend = vars(lineage_plugin).get("_graph_backend")
+    if graph_backend is not None:
+        agent._db_query_graph_backend = graph_backend
+        plugin = getattr(agent, "_db_plugin", None)
+        if plugin is not None:
+            plugin._db_query_graph_backend = graph_backend
 
 
 def _attach_memory(
@@ -638,7 +676,7 @@ async def _calibrate_memory(
         return
     if not hasattr(agent, "_db_memory_semantics"):
         return
-    cache_key_calib = f"numeric_unit_calibration:{cache_key(source)}"
+    cache_key_calib = f"numeric_unit_calibration:{catalog_profile_key(source)}"
     await calibrate_db_memory(
         agent,
         schema,

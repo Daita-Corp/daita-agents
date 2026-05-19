@@ -1,4 +1,4 @@
-"""Shared metadata helpers for normalized ``from_db`` schemas."""
+"""SQL planner metadata helpers for normalized catalog snapshots."""
 
 from __future__ import annotations
 

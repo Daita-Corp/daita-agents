@@ -6,8 +6,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from ....core.tools import AgentTool
+from .....core.tools import AgentTool
 from ._helpers import (
+    AnalystCatalogContext,
     build_entity_profiles,
     combined_source_metadata,
     get_pk_column,
@@ -15,18 +16,20 @@ from ._helpers import (
 )
 
 if TYPE_CHECKING:
-    from ....plugins.base_db import BaseDatabasePlugin
+    from .....plugins.base_db import BaseDatabasePlugin
 
 
 def create_compare_entities_tool(
-    plugin: "BaseDatabasePlugin", schema: Dict[str, Any]
+    plugin: "BaseDatabasePlugin", catalog_context: AnalystCatalogContext
 ) -> AgentTool:
     """Return an AgentTool that compares entities side-by-side."""
 
     async def handler(args: Dict[str, Any]) -> Dict[str, Any]:
         entity_table = args.get("entity_table", "").strip()
         entity_ids = args.get("entity_ids", [])
-        id_column = args.get("id_column") or get_pk_column(schema, entity_table)
+        id_column = args.get("id_column") or get_pk_column(
+            catalog_context, entity_table
+        )
         custom_dimensions: Optional[List[Dict]] = args.get("dimensions")
 
         if not entity_table:
@@ -43,7 +46,7 @@ def create_compare_entities_tool(
         try:
             profile_result = await build_entity_profiles(
                 plugin,
-                schema,
+                catalog_context,
                 entity_table=entity_table,
                 id_column=id_column,
                 dimensions=custom_dimensions,

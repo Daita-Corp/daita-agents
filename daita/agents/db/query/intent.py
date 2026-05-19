@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from ..schema.metadata import split_identifier
+from .metadata import split_identifier
 
 COUNT_ENTITY_TOKENS = {
     "event",

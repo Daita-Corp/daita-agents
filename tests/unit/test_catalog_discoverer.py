@@ -347,6 +347,12 @@ async def test_get_tools_returns_expected_set():
         "discover_schema",
         "profile_store",
         "get_table_schema",
+        "search_catalog",
+        "inspect_asset",
+        "find_relationship_paths",
+        "catalog_search_schema",
+        "catalog_inspect_table",
+        "catalog_find_join_paths",
         "find_store",
         "compare_schemas",
         "export_diagram",
@@ -455,3 +461,77 @@ async def test_discover_and_profile_auto_persists_to_graph(tmp_path, monkeypatch
     columns = await backend.find_nodes(NodeType.COLUMN)
     column_names = {column.name for column in columns}
     assert {"id", "email"} <= column_names
+
+
+async def test_direct_schema_registration_hydrates_catalog_state():
+    plugin = CatalogPlugin()
+
+    result = await plugin.register_schema(
+        {
+            "database_type": "postgresql",
+            "database_name": "shop",
+            "tables": [
+                {
+                    "name": "orders",
+                    "row_count": 10,
+                    "columns": [
+                        {
+                            "name": "id",
+                            "type": "integer",
+                            "nullable": False,
+                            "is_primary_key": True,
+                        },
+                        {
+                            "name": "customer_id",
+                            "type": "integer",
+                            "nullable": False,
+                            "is_primary_key": False,
+                        },
+                    ],
+                },
+                {
+                    "name": "customers",
+                    "row_count": 3,
+                    "columns": [
+                        {
+                            "name": "id",
+                            "type": "integer",
+                            "nullable": False,
+                            "is_primary_key": True,
+                        }
+                    ],
+                },
+            ],
+            "foreign_keys": [
+                {
+                    "source_table": "orders",
+                    "source_column": "customer_id",
+                    "target_table": "customers",
+                    "target_column": "id",
+                }
+            ],
+            "table_count": 2,
+        },
+        store_type="postgresql",
+        connection_string="postgresql://user:secret@localhost/shop",
+    )
+
+    store_id = result["store_id"]
+    assert plugin.get_store(store_id) is not None
+    assert plugin.get_schema(store_id) is not None
+    assert result["schema"]["store_id"] == store_id
+    assert result["schema"]["profiled_at"]
+
+    search = plugin.search_catalog(store_id, "customer")
+    assert search["assets"][0]["name"] in {"customers", "orders"}
+
+    inspected = plugin.get_table_schema(store_id, "orders", column_pattern="customer")
+    assert inspected["success"] is True
+    assert inspected["columns"][0]["name"] == "customer_id"
+    assert inspected["foreign_keys"][0]["target_asset"] == "customers"
+
+    paths = plugin.find_relationship_paths(store_id, ["orders"], ["customers"])
+    assert paths["reachable"] is True
+    assert paths["paths"][0]["joins"][0]["predicate"] == (
+        "orders.customer_id = customers.id"
+    )

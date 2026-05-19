@@ -20,7 +20,7 @@ def compact_tool_result_for_context(
     policy = policy or ToolResultPolicy()
     if not _is_db_tool_name(tool_name):
         return result
-    if tool_name == "db_find_join_path":
+    if tool_name in {"catalog_find_join_paths", "find_relationship_paths"}:
         return _compact_join_path_result(result, policy)
     compacted = _compact_value(result, policy=policy)
     if _estimate_tokens(compacted) <= policy.max_result_tokens:
@@ -31,6 +31,8 @@ def compact_tool_result_for_context(
 def _is_db_tool_name(tool_name: str) -> bool:
     return (
         tool_name.startswith("db_")
+        or tool_name.startswith("catalog_")
+        or tool_name in {"search_catalog", "inspect_asset", "find_relationship_paths"}
         or tool_name.startswith("postgres_")
         or tool_name.startswith("mysql_")
         or tool_name.startswith("sqlite_")

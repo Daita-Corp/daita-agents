@@ -6,11 +6,12 @@ from __future__ import annotations
 
 from typing import Any, List
 
+from ..query.catalog_adapter import catalog_schema_snapshot, has_likely_catalog_match
 from ..utils import unique_preserving_order
 
 CORE_QUERY_TOOLS = (
+    "db_compile_and_query",
     "db_plan_query",
-    "db_validate_sql",
     "db_query",
     "db_count",
     "db_sample",
@@ -20,11 +21,12 @@ CORE_QUERY_TOOLS = (
 WRITE_QUERY_TOOLS = ("db_execute",)
 MEMORY_TOOLS = ("db_remember",)
 SCHEMA_TOOLS = (
-    "db_search_schema",
-    "db_inspect_table",
-    "db_find_join_path",
-    "db_describe_relationships",
-    "db_list_tables",
+    "catalog_search_schema",
+    "catalog_inspect_table",
+    "catalog_find_join_paths",
+    "search_catalog",
+    "inspect_asset",
+    "find_relationship_paths",
 )
 ANALYST_TOOL_INTENTS = {
     "correlate": ("correlate", "correlation", "relationship between"),
@@ -102,6 +104,17 @@ WRITE_KEYWORDS = (
     "mutate",
     "create row",
 )
+SCHEMA_REPAIR_KEYWORDS = (
+    "join",
+    "joins",
+    "foreign key",
+    "foreign keys",
+    "relationship",
+    "relationships",
+    "related",
+    "connect",
+    "path",
+)
 
 
 def select_db_tools_for_prompt(agent: Any, prompt: str) -> List[str]:
@@ -109,10 +122,14 @@ def select_db_tools_for_prompt(agent: Any, prompt: str) -> List[str]:
     selected: List[str] = []
     text = prompt.lower()
 
-    _extend_available(selected, available, SCHEMA_TOOLS)
+    needs_query_tools = _needs_query_tools(text)
+    needs_schema_tools = _needs_schema_tools(agent, text, needs_query_tools)
 
-    if _needs_query_tools(text):
+    if needs_query_tools:
         _extend_available(selected, available, CORE_QUERY_TOOLS)
+
+    if needs_schema_tools:
+        _extend_available(selected, available, SCHEMA_TOOLS)
 
     selected.extend(_explicitly_mentioned_tools(available, text))
 
@@ -138,22 +155,39 @@ def select_db_tools_for_prompt(agent: Any, prompt: str) -> List[str]:
     ):
         _extend_available(selected, available, MEMORY_TOOLS)
 
-    if _has_vector_columns(getattr(agent, "_db_schema", {}) or {}):
+    if _has_vector_columns(catalog_schema_snapshot(agent)):
         selected.extend(name for name in available if name.endswith("_vector_search"))
 
     return unique_preserving_order([name for name in selected if name in available])
 
 
+def _needs_schema_tools(agent: Any, text: str, needs_query_tools: bool) -> bool:
+    explicit_schema = any(tool.lower() in text for tool in SCHEMA_TOOLS)
+    if explicit_schema:
+        return True
+    if any(keyword in text for keyword in SCHEMA_REPAIR_KEYWORDS):
+        return True
+    if _is_schema_question(text):
+        return True
+    if not needs_query_tools:
+        return False
+    return not has_likely_catalog_match(agent, text)
+
+
 def _needs_query_tools(text: str) -> bool:
-    if any(keyword in text for keyword in SCHEMA_KEYWORDS) and not any(
-        keyword in text for keyword in DATA_QUERY_KEYWORDS
-    ):
+    if _is_schema_question(text):
         return False
     if any(keyword in text for keyword in INFERENCE_ONLY_KEYWORDS):
         return False
     if any(keyword in text for keyword in QUERY_KEYWORDS):
         return True
     return True
+
+
+def _is_schema_question(text: str) -> bool:
+    return any(keyword in text for keyword in SCHEMA_KEYWORDS) and not any(
+        keyword in text for keyword in DATA_QUERY_KEYWORDS
+    )
 
 
 def _explicitly_mentioned_tools(available: set[str], text: str) -> List[str]:

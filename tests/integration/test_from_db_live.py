@@ -542,7 +542,6 @@ async def _core_build_matrix_result(
             "has_plugin": agent.db.plugin is not None,
             "has_schema": bool(agent.db.schema),
             "has_summary": bool(agent.db.summary),
-            "suggested_question_count": len(agent.db.suggested_questions),
             "audit_entry_count": len(agent.db.audit.entries),
             "monitor_event_count": len(agent.db.monitor_events),
             "finding_count": len(agent.db.findings.all),
@@ -647,8 +646,8 @@ def _assert_core_build_matrix_result(result: dict) -> None:
     assert db_context["has_plugin"] is True, fail("agent.db plugin missing")
     assert db_context["has_schema"] is True, fail("agent.db schema missing")
     assert db_context["has_summary"] is True, fail("agent.db summary missing")
-    assert db_context["suggested_question_count"] > 0, fail(
-        "suggested questions missing"
+    assert "suggested_question_count" not in db_context, fail(
+        "suggested questions leaked"
     )
 
     assert result["query_sample"]["total_rows"] == 1, fail("query sample row mismatch")
@@ -838,55 +837,21 @@ def _assert_answer_tokens(
         )
 
 
-async def _assert_single_seeded_fk_lineage(agent) -> dict:
-    from daita.core.graph.models import (
-        AgentGraphEdge,
-        AgentGraphNode,
-        EdgeType,
-        NodeType,
-    )
-    from daita.plugins.catalog.persistence import _derive_store
-
-    store = _derive_store(agent.db.schema)
-    expected_source = AgentGraphNode.make_id(NodeType.TABLE, f"{store}.orders")
-    expected_target = AgentGraphNode.make_id(NodeType.TABLE, f"{store}.customers")
-    expected_edge_id = AgentGraphEdge.make_id(
-        expected_source,
-        EdgeType.REFERENCES,
-        expected_target,
-    )
+async def _assert_no_seeded_fk_lineage(agent) -> dict:
+    from daita.core.graph.models import EdgeType
 
     backend = agent.db.lineage._graph_backend
     edges = await backend.get_edges(edge_types=[EdgeType.REFERENCES])
-    matching = [
+    schema_edges = [
         edge
         for edge in edges
-        if edge.from_node_id == expected_source and edge.to_node_id == expected_target
+        if (edge.properties or {}).get("source") == "schema_discovery"
     ]
-
-    assert len(matching) == 1
-    assert matching[0].edge_id == expected_edge_id
-    assert matching[0].properties["flow_type"] == "references"
-    assert matching[0].properties["transformation"] == "customer_id → customer_id"
-    assert "postgresql:" in matching[0].from_node_id
-    assert "public.orders" in matching[0].from_node_id
-    assert "public.customers" in matching[0].to_node_id
-
-    lineage = await agent.db.lineage.trace_lineage(
-        expected_source,
-        direction="downstream",
-        edge_types=[EdgeType.REFERENCES],
-        max_depth=2,
-    )
-    assert lineage["downstream_count"] == 1
-    assert lineage["lineage"]["downstream"][0]["node_id"] == expected_target
+    assert schema_edges == []
 
     return {
-        "store": store,
-        "source_id": expected_source,
-        "target_id": expected_target,
-        "edge_id": expected_edge_id,
         "edge_count": len(edges),
+        "schema_edge_count": len(schema_edges),
     }
 
 
@@ -940,18 +905,19 @@ def _assert_live_tool_result(case: dict, tool_call: dict) -> None:
         assert "blocked column" in error, tool_result
 
 
-def _fresh_cache_file(source) -> Path:
-    from daita.agents.db.schema.cache import cache_key
-
-    return Path(".daita") / "schema_cache" / f"{cache_key(source)}.json"
+def _local_catalog_file() -> Path:
+    return Path(".daita") / "catalog.json"
 
 
-def _expire_and_mutate_cache(source, mutate_schema) -> None:
-    cache_file = _fresh_cache_file(source)
-    payload = json.loads(cache_file.read_text())
-    payload["schema"] = mutate_schema(payload["schema"])
-    payload["cached_at"] = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
-    cache_file.write_text(json.dumps(payload, indent=2, default=str))
+def _expire_and_mutate_catalog_profile(mutate_schema) -> None:
+    catalog_file = _local_catalog_file()
+    catalog = json.loads(catalog_file.read_text())
+    key = next(iter(catalog))
+    catalog[key] = mutate_schema(catalog[key])
+    catalog[key]["last_seen"] = (
+        datetime.now(timezone.utc) - timedelta(days=2)
+    ).isoformat()
+    catalog_file.write_text(json.dumps(catalog, indent=2, default=str))
 
 
 async def _assert_data_quality_tools(agent) -> None:
@@ -1333,7 +1299,7 @@ class TestFromDbSQLiteLive:
             assert "sqlite_list_tables" not in agent.tool_registry.tool_names
             assert "sqlite_inspect" not in agent.tool_registry.tool_names
             assert agent.db.summary["candidate_metrics"]
-            assert agent.db.suggested_questions
+            assert not hasattr(agent.db, "suggested_questions")
 
             query_result = await agent.tool_registry.execute(
                 "db_query",
@@ -1456,7 +1422,7 @@ class TestFromDbSQLiteLive:
         finally:
             await _close_agent_db(agent)
 
-    async def test_from_db_sqlite_schema_cache_skips_rediscovery(
+    async def test_from_db_sqlite_catalog_profile_skips_rediscovery(
         self, sqlite_db_path, monkeypatch, tmp_path
     ):
         monkeypatch.chdir(tmp_path)
@@ -1470,7 +1436,9 @@ class TestFromDbSQLiteLive:
         import daita.agents.db.builder as builder
 
         async def fail_discovery(*args, **kwargs):
-            raise AssertionError("schema discovery should not run on fresh cache")
+            raise AssertionError(
+                "schema discovery should not run on fresh catalog profile"
+            )
 
         monkeypatch.setattr(builder, "discover_schema", fail_discovery)
         cached_agent = await Agent.from_db(
@@ -1486,7 +1454,7 @@ class TestFromDbSQLiteLive:
 
 @pytest.mark.integration
 class TestFromDbCacheAndDrift:
-    async def test_expired_sqlite_cache_rediscover_reports_table_and_column_drift(
+    async def test_stale_sqlite_catalog_rediscover_reports_table_and_column_drift(
         self, sqlite_db_path, monkeypatch, tmp_path
     ):
         monkeypatch.chdir(tmp_path)
@@ -1497,7 +1465,7 @@ class TestFromDbCacheAndDrift:
         )
         await _close_agent_db(agent)
 
-        def mutate_cached_baseline(schema):
+        def mutate_catalog_baseline(schema):
             schema = json.loads(json.dumps(schema))
             schema["tables"] = [
                 table for table in schema["tables"] if table["name"] != "daily_metrics"
@@ -1532,7 +1500,7 @@ class TestFromDbCacheAndDrift:
             )
             return schema
 
-        _expire_and_mutate_cache(str(sqlite_db_path), mutate_cached_baseline)
+        _expire_and_mutate_catalog_profile(mutate_catalog_baseline)
 
         drifted_agent = await Agent.from_db(
             str(sqlite_db_path),
@@ -1558,7 +1526,7 @@ class TestFromDbCacheAndDrift:
         finally:
             await _close_agent_db(drifted_agent)
 
-    async def test_expired_sqlite_cache_used_when_discovery_fails(
+    async def test_stale_sqlite_catalog_used_when_discovery_fails(
         self, sqlite_db_path, monkeypatch, tmp_path
     ):
         monkeypatch.chdir(tmp_path)
@@ -1569,7 +1537,7 @@ class TestFromDbCacheAndDrift:
             cache_ttl=3600,
         )
         await _close_agent_db(agent)
-        _expire_and_mutate_cache(source, lambda schema: schema)
+        _expire_and_mutate_catalog_profile(lambda schema: schema)
 
         import daita.agents.db.builder as builder
 
@@ -1686,8 +1654,8 @@ class TestFromDbLargeGuardrails:
             assert user_message.count("<db_runtime_context>") == 1
             assert "CREATE TABLE" not in user_message
 
-            assert "db_search_schema" in agent.tool_registry.tool_names
-            assert "db_inspect_table" in agent.tool_registry.tool_names
+            assert "catalog_search_schema" in agent.tool_registry.tool_names
+            assert "catalog_inspect_table" in agent.tool_registry.tool_names
 
             query_result = await agent.tool_registry.execute(
                 "db_query",
@@ -1798,35 +1766,38 @@ class TestFromDbLargeGuardrails:
             blocked_columns=["feature_249"],
         )
         try:
-            assert "db_list_tables" in agent.tool_registry.tool_names
-            assert "db_search_schema" in agent.tool_registry.tool_names
-            assert "db_inspect_table" in agent.tool_registry.tool_names
-            assert "db_describe_relationships" in agent.tool_registry.tool_names
+            store_id = agent._db_catalog_store_id
+            assert "search_catalog" in agent.tool_registry.tool_names
+            assert "catalog_search_schema" in agent.tool_registry.tool_names
+            assert "catalog_inspect_table" in agent.tool_registry.tool_names
+            assert "catalog_find_join_paths" in agent.tool_registry.tool_names
 
             listed = await agent.tool_registry.execute(
-                "db_list_tables",
-                {"pattern": "wide", "limit": 10},
+                "search_catalog",
+                {"store_id": store_id, "query": "wide", "limit": 10},
             )
             assert listed["total_matches"] == 1
-            assert listed["tables"][0] == {
-                "name": "wide_fact_events",
-                "row_count": None,
-                "column_count": 254,
-            }
+            assert listed["assets"][0]["name"] == "wide_fact_events"
+            assert listed["assets"][0]["column_count"] == 254
 
             searched = await agent.tool_registry.execute(
-                "db_search_schema",
-                {"query": "feature 249 event value", "limit": 5},
+                "catalog_search_schema",
+                {
+                    "store_id": store_id,
+                    "query": "feature 249 event value",
+                    "limit": 5,
+                },
             )
             assert searched["tables"][0]["name"] == "wide_fact_events"
             matched_columns = {
-                column["name"] for column in searched["tables"][0]["matched_columns"]
+                column["name"] for column in searched["tables"][0]["matched_fields"]
             }
             assert {"feature_249", "event_value"}.issubset(matched_columns)
 
             inspected = await agent.tool_registry.execute(
-                "db_inspect_table",
+                "catalog_inspect_table",
                 {
+                    "store_id": store_id,
                     "table_name": "wide_fact_events",
                     "column_pattern": "feature_24",
                     "limit": 20,
@@ -1845,8 +1816,8 @@ class TestFromDbLargeGuardrails:
             assert "channel-web" not in json.dumps(inspected, default=str)
 
             missing = await agent.tool_registry.execute(
-                "db_inspect_table",
-                {"table_name": "wide_fact"},
+                "catalog_inspect_table",
+                {"store_id": store_id, "table_name": "wide_fact"},
             )
             assert missing["success"] is False
             assert missing["candidates"][0]["name"] == "wide_fact_events"
@@ -1864,17 +1835,33 @@ class TestFromDbLargeGuardrails:
             cache_ttl=None,
         )
         try:
+            store_id = agent._db_catalog_store_id
             first_page = await agent.tool_registry.execute(
-                "db_inspect_table",
-                {"table_name": "wide_fact_events", "limit": 100, "offset": 0},
+                "catalog_inspect_table",
+                {
+                    "store_id": store_id,
+                    "table_name": "wide_fact_events",
+                    "limit": 100,
+                    "offset": 0,
+                },
             )
             second_page = await agent.tool_registry.execute(
-                "db_inspect_table",
-                {"table_name": "wide_fact_events", "limit": 100, "offset": 100},
+                "catalog_inspect_table",
+                {
+                    "store_id": store_id,
+                    "table_name": "wide_fact_events",
+                    "limit": 100,
+                    "offset": 100,
+                },
             )
             third_page = await agent.tool_registry.execute(
-                "db_inspect_table",
-                {"table_name": "wide_fact_events", "limit": 100, "offset": 200},
+                "catalog_inspect_table",
+                {
+                    "store_id": store_id,
+                    "table_name": "wide_fact_events",
+                    "limit": 100,
+                    "offset": 200,
+                },
             )
 
             assert first_page["success"] is True
@@ -1916,16 +1903,18 @@ class TestFromDbLargeGuardrails:
             cache_ttl=None,
         )
         try:
+            store_id = agent._db_catalog_store_id
             missing_table = await agent.tool_registry.execute(
-                "db_inspect_table",
-                {"table_name": "wide_eventz"},
+                "catalog_inspect_table",
+                {"store_id": store_id, "table_name": "wide_eventz"},
             )
             assert missing_table["success"] is False
             assert missing_table["candidates"][0]["name"] == "wide_fact_events"
 
             inspected = await agent.tool_registry.execute(
-                "db_inspect_table",
+                "catalog_inspect_table",
                 {
+                    "store_id": store_id,
                     "table_name": "wide_fact_events",
                     "column_pattern": "feat_249",
                     "limit": 20,
@@ -1936,13 +1925,17 @@ class TestFromDbLargeGuardrails:
             assert inspected["columns"][0]["name"] == "feature_249"
 
             recovered = await agent.tool_registry.execute(
-                "db_search_schema",
-                {"query": "feature 249 wide events", "limit": 5},
+                "catalog_search_schema",
+                {
+                    "store_id": store_id,
+                    "query": "feature 249 wide events",
+                    "limit": 5,
+                },
             )
             assert recovered["tables"][0]["name"] == "wide_fact_events"
             assert any(
                 column["name"] == "feature_249"
-                for column in recovered["tables"][0]["matched_columns"]
+                for column in recovered["tables"][0]["matched_fields"]
             )
         finally:
             await _close_agent_db(agent)
@@ -2406,17 +2399,18 @@ class TestFromDbSQLiteOpenAILive:
                 "This database has many omitted tables. Find the table that stores "
                 "wide event feature columns, inspect its schema metadata, then query "
                 "the database for account_id 42. What are the feature_000 and "
-                "feature_249 values on the first event by event_id? Use schema "
-                "navigation before writing SQL.",
+                "feature_249 values on the first event by event_id? Use catalog "
+                "tools before writing SQL.",
                 detailed=True,
                 max_iterations=6,
             )
 
             tool_names = [call.get("tool") for call in result.get("tool_calls") or []]
             assert any(
-                name in tool_names for name in ("db_search_schema", "db_list_tables")
+                name in tool_names
+                for name in ("catalog_search_schema", "search_catalog")
             ), tool_names
-            assert "db_inspect_table" in tool_names, tool_names
+            assert "catalog_inspect_table" in tool_names, tool_names
             assert "db_query" in tool_names, tool_names
 
             query_call = next(
@@ -2454,7 +2448,7 @@ class TestFromDbSQLiteOpenAILive:
                 "Find the wide event feature table, inspect its columns in pages "
                 "until you locate the late feature column numbered 249, then query "
                 "account_id 42 for the first event by event_id. What is that late "
-                "feature value? Use db_inspect_table pagination rather than guessing.",
+                "feature value? Use catalog_inspect_table pagination rather than guessing.",
                 detailed=True,
                 max_iterations=12,
             )
@@ -2462,7 +2456,7 @@ class TestFromDbSQLiteOpenAILive:
             inspect_calls = [
                 call
                 for call in result.get("tool_calls") or []
-                if call.get("tool") == "db_inspect_table"
+                if call.get("tool") == "catalog_inspect_table"
             ]
             assert inspect_calls, result.get("tool_calls")
             assert any(
@@ -2503,8 +2497,8 @@ class TestFromDbSQLiteOpenAILive:
         )
         try:
             result = await agent.run(
-                "Use schema navigation to recover from these bad names before SQL. "
-                "First try db_inspect_table with table_name='wide_eventz'. Use the "
+                "Use catalog navigation to recover from these bad names before SQL. "
+                "First try catalog_inspect_table with table_name='wide_eventz'. Use the "
                 "returned candidate table. Then inspect that table with "
                 "column_pattern='feat_249' to recover the exact column. Only after "
                 "the tool result shows the corrected column should you query "
@@ -2516,7 +2510,9 @@ class TestFromDbSQLiteOpenAILive:
 
             tool_calls = result.get("tool_calls") or []
             inspect_calls = [
-                call for call in tool_calls if call.get("tool") == "db_inspect_table"
+                call
+                for call in tool_calls
+                if call.get("tool") == "catalog_inspect_table"
             ]
             assert inspect_calls, tool_calls
             first_sql_index = next(
@@ -2526,7 +2522,7 @@ class TestFromDbSQLiteOpenAILive:
             )
             assert any(
                 call.get("tool")
-                in ("db_search_schema", "db_list_tables", "db_inspect_table")
+                in ("catalog_search_schema", "search_catalog", "catalog_inspect_table")
                 for call in tool_calls[:first_sql_index]
             ), tool_calls
             assert "db_query" in [call.get("tool") for call in tool_calls]
@@ -2652,7 +2648,9 @@ class TestFromDbPostgresLive:
         import daita.agents.db.builder as builder
 
         async def fail_discovery(*args, **kwargs):
-            raise AssertionError("schema discovery should not run on fresh cache")
+            raise AssertionError(
+                "schema discovery should not run on fresh catalog profile"
+            )
 
         monkeypatch.setattr(builder, "discover_schema", fail_discovery)
         cached_agent = await Agent.from_db(
@@ -2680,28 +2678,33 @@ class TestFromDbPostgresLive:
             query_default_limit=10,
         )
         try:
+            store_id = agent._db_catalog_store_id
             tables = {table["name"] for table in agent.db.schema["tables"]}
             assert {"public.orders", "analytics.orders", "public.customers"}.issubset(
                 tables
             )
-            assert "db_search_schema" in agent.tool_registry.tool_names
-            assert "db_inspect_table" in agent.tool_registry.tool_names
+            assert "catalog_search_schema" in agent.tool_registry.tool_names
+            assert "catalog_inspect_table" in agent.tool_registry.tool_names
 
             searched = await agent.tool_registry.execute(
-                "db_search_schema",
-                {"query": "orders recognized revenue channel", "limit": 10},
+                "catalog_search_schema",
+                {
+                    "store_id": store_id,
+                    "query": "orders recognized revenue channel",
+                    "limit": 10,
+                },
             )
             names = [table["name"] for table in searched["tables"]]
             assert names[0] == "analytics.orders"
             assert "public.orders" in names
 
             public_inspect = await agent.tool_registry.execute(
-                "db_inspect_table",
-                {"table_name": "public.orders"},
+                "catalog_inspect_table",
+                {"store_id": store_id, "table_name": "public.orders"},
             )
             analytics_inspect = await agent.tool_registry.execute(
-                "db_inspect_table",
-                {"table_name": "analytics.orders"},
+                "catalog_inspect_table",
+                {"store_id": store_id, "table_name": "analytics.orders"},
             )
             assert public_inspect["success"] is True
             assert analytics_inspect["success"] is True
@@ -2714,16 +2717,17 @@ class TestFromDbPostgresLive:
             )
 
             relationships = await agent.tool_registry.execute(
-                "db_describe_relationships",
-                {"table_name": "public.orders"},
+                "catalog_find_join_paths",
+                {
+                    "store_id": store_id,
+                    "from_tables": ["public.orders"],
+                    "to_tables": ["public.customers"],
+                },
             )
-            assert relationships["relationship_count"] == 1
-            assert relationships["relationships"][0] == {
-                "source_table": "public.orders",
-                "source_column": "customer_id",
-                "target_table": "public.customers",
-                "target_column": "customer_id",
-            }
+            assert relationships["path_count"] == 1
+            assert relationships["paths"][0]["joins"][0]["predicate"] == (
+                "public.orders.customer_id = public.customers.customer_id"
+            )
 
             public_result = await agent.tool_registry.execute(
                 "db_query",
@@ -2748,7 +2752,7 @@ class TestFromDbPostgresLive:
         finally:
             await _close_agent_db(agent)
 
-    async def test_from_db_postgres_lineage_fk_persistence_is_idempotent(
+    async def test_from_db_postgres_lineage_does_not_seed_fk_flows(
         self, seeded_postgres, monkeypatch, tmp_path
     ):
         monkeypatch.chdir(tmp_path)
@@ -2760,7 +2764,7 @@ class TestFromDbPostgresLive:
             cache_ttl=None,
         )
         try:
-            first = await _assert_single_seeded_fk_lineage(first_agent)
+            first = await _assert_no_seeded_fk_lineage(first_agent)
         finally:
             await _close_agent_db(first_agent)
 
@@ -2772,7 +2776,7 @@ class TestFromDbPostgresLive:
             cache_ttl=None,
         )
         try:
-            second = await _assert_single_seeded_fk_lineage(second_agent)
+            second = await _assert_no_seeded_fk_lineage(second_agent)
         finally:
             await _close_agent_db(second_agent)
 
@@ -2823,7 +2827,7 @@ class TestFromDbPostgresOpenAILive:
         finally:
             await _close_agent_db(agent)
 
-    async def test_openai_agent_uses_persisted_fk_lineage_from_seeded_postgres(
+    async def test_openai_agent_uses_catalog_fk_relationship_from_seeded_postgres(
         self, seeded_postgres, monkeypatch, tmp_path
     ):
         monkeypatch.chdir(tmp_path)
@@ -2835,12 +2839,14 @@ class TestFromDbPostgresOpenAILive:
             **_openai_kwargs(),
         )
         try:
-            lineage_snapshot = await _assert_single_seeded_fk_lineage(agent)
+            await _assert_no_seeded_fk_lineage(agent)
+            store_id = agent._db_catalog_store_id
             started = time.perf_counter()
             result = await agent.run(
-                "Use trace_lineage exactly once to inspect this seeded Postgres "
-                f"foreign-key lineage: entity_id={lineage_snapshot['source_id']}, "
-                "direction=downstream, max_depth=2, edge_types=['references']. "
+                "Use catalog_find_join_paths exactly once to inspect this seeded "
+                "Postgres foreign-key relationship: "
+                f"store_id={store_id}, from_tables=['public.orders'], "
+                "to_tables=['public.customers'], max_hops=2. "
                 "Then answer which table the orders table references. Mention "
                 "customers and customer_id.",
                 detailed=True,
@@ -2848,16 +2854,13 @@ class TestFromDbPostgresOpenAILive:
             )
             elapsed_ms = (time.perf_counter() - started) * 1000
 
-            tool_call = _assert_any_tool_called(result, {"trace_lineage"})
+            tool_call = _assert_any_tool_called(result, {"catalog_find_join_paths"})
             tool_result = tool_call.get("result") or {}
             assert tool_call.get("duration_ms") is not None
             assert tool_call.get("duration_ms") >= 0
-            assert (
-                tool_call.get("arguments", {}).get("entity_id")
-                == lineage_snapshot["source_id"]
-            )
-            assert tool_result.get("downstream_count") == 1
-            assert lineage_snapshot["target_id"] in json.dumps(tool_result, default=str)
+            assert tool_call.get("arguments", {}).get("store_id") == store_id
+            assert tool_result.get("reachable") is True
+            assert "public.customers" in json.dumps(tool_result, default=str)
             assert result["tokens"]["total_tokens"] > 0
             assert result["cost"] >= 0
             assert elapsed_ms >= 0

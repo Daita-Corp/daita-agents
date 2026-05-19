@@ -12,13 +12,18 @@ import re
 from typing import Any, Dict, List, Optional
 
 from ..runtime.state import DbQueryPlan, DbRunState
-from ..schema.metadata import (
+from .metadata import (
     matching_tables as _matching_tables,
     schema_table_columns as _schema_table_columns,
     split_identifier as _split_identifier,
 )
-from ..schema.navigation import find_join_paths, search_schema
+from .catalog_adapter import find_relationship_paths, search_tables
 from .compiler import compile_query_plan
+from .evidence import (
+    compact_evidence_summary,
+    evidence_join_paths,
+    evidence_table_names,
+)
 from .intent import looks_like_count_intent
 from .ir_validator import validate_query_plan
 from .resolver import resolve_query_plan
@@ -33,6 +38,10 @@ def build_query_plan(
     schema: Dict[str, Any],
     *,
     run_state: Optional[DbRunState] = None,
+    include_diagnostics: bool = False,
+    evidence: Optional[Dict[str, Any]] = None,
+    catalog: Any = None,
+    store_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Normalize LLM intent and enrich it with schema candidates."""
 
@@ -50,6 +59,10 @@ def build_query_plan(
         answer_checks=_string_list(args.get("answer_checks")),
     )
 
+    evidence_tables = evidence_table_names(evidence)
+    if evidence_tables:
+        plan.candidate_tables = _merge_strings(plan.candidate_tables, evidence_tables)
+
     search_text = " ".join(
         [plan.goal]
         + plan.required_fields
@@ -58,20 +71,29 @@ def build_query_plan(
         + plan.aggregations
         + plan.grouping
     ).strip()
-    table_candidates = search_schema(
+    table_candidates = search_tables(
         schema,
         query=search_text or plan.goal,
         limit=MAX_CANDIDATE_TABLES,
+        catalog=catalog,
+        store_id=store_id,
     )
-    resolved_tables = _resolve_candidate_tables(schema, plan.candidate_tables)
+    resolved_tables = _resolve_candidate_tables(
+        schema, plan.candidate_tables, catalog=catalog, store_id=store_id
+    )
     field_candidates = _field_candidates(
         schema,
         plan.required_fields,
         candidate_tables=resolved_tables["resolved_tables"],
     )
-    join_paths = _required_join_paths(schema, plan)
+    join_paths = _merge_join_paths(
+        evidence_join_paths(evidence),
+        _required_join_paths(schema, plan, catalog=catalog, store_id=store_id),
+    )
     plan_warnings = _aggregation_reference_warnings(schema, plan)
-    query_resolution = resolve_query_plan(plan, schema)
+    query_resolution = resolve_query_plan(
+        plan, schema, catalog=catalog, store_id=store_id
+    )
     query_ir = query_resolution.plan
     ir_validation = (
         validate_query_plan(
@@ -122,22 +144,28 @@ def build_query_plan(
     if not plan.answer_checks:
         plan.answer_checks = [f"include {field}" for field in plan.required_fields]
 
+    diagnostic_fields = {
+        "plan": plan.to_dict(),
+        "table_candidates": table_candidates["tables"],
+        "field_candidates": field_candidates,
+        "join_paths": join_paths,
+        "evidence": evidence or {},
+        "query_ir_resolution": query_resolution.to_dict(),
+        "query_ir": query_ir.to_dict() if query_ir is not None else None,
+    }
+    knowledge_used = compact_evidence_summary(evidence)
     result = {
         "ok": True,
         "plan_id": None,
-        "plan": plan.to_dict(),
         "route": _classify_plan(plan),
         "resolved_tables": resolved_tables["resolved_tables"],
         "ambiguous_tables": resolved_tables["ambiguous_tables"],
         "unknown_tables": resolved_tables["unknown_tables"],
-        "table_candidates": table_candidates["tables"],
-        "field_candidates": field_candidates,
-        "join_paths": join_paths,
-        "query_ir_resolution": query_resolution.to_dict(),
-        "query_ir": query_ir.to_dict() if query_ir is not None else None,
         "compiled_sql": compiled_sql,
         "validation": ir_validation,
         "plan_warnings": plan_warnings,
+        "best_join_path": _best_join_path(join_paths),
+        "knowledge_used": knowledge_used,
         "next_steps": _next_steps(
             resolved_tables,
             field_candidates,
@@ -146,6 +174,9 @@ def build_query_plan(
             has_run_state=run_state is not None,
         ),
     }
+    result["next_step"] = result["next_steps"][0] if result["next_steps"] else None
+    if include_diagnostics:
+        result.update(diagnostic_fields)
 
     if run_state is not None:
         for field_name, candidates in field_candidates.items():
@@ -157,12 +188,54 @@ def build_query_plan(
         stored = run_state.get_plan(plan_id)
         if stored is not None:
             stored["result"]["plan_id"] = plan_id
+            stored["result"].update(diagnostic_fields)
 
     return result
 
 
+def _merge_join_paths(
+    evidence_paths: List[Dict[str, Any]], schema_paths: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    merged = []
+    seen = set()
+    for item in evidence_paths + schema_paths:
+        key = (
+            tuple(item.get("from_tables") or []),
+            tuple(item.get("to_tables") or []),
+            bool(item.get("reachable")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+    return merged
+
+
+def _merge_strings(primary: List[str], secondary: List[str]) -> List[str]:
+    out = list(primary)
+    for item in secondary:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def _best_join_path(join_paths: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    for path_result in join_paths:
+        paths = path_result.get("paths") or []
+        if path_result.get("reachable") and paths:
+            best = dict(paths[0])
+            best["from_tables"] = path_result.get("from_tables")
+            best["to_tables"] = path_result.get("to_tables")
+            return best
+    return None
+
+
 def _resolve_candidate_tables(
-    schema: Dict[str, Any], table_names: List[str]
+    schema: Dict[str, Any],
+    table_names: List[str],
+    *,
+    catalog: Any = None,
+    store_id: Optional[str] = None,
 ) -> Dict[str, List[Any]]:
     tables = schema.get("tables", []) or []
     resolved: List[str] = []
@@ -185,7 +258,13 @@ def _resolve_candidate_tables(
             unknown.append(
                 {
                     "table": name,
-                    "candidates": search_schema(schema, query=name, limit=5)["tables"],
+                    "candidates": search_tables(
+                        schema,
+                        query=name,
+                        limit=5,
+                        catalog=catalog,
+                        store_id=store_id,
+                    )["tables"],
                 }
             )
     return {
@@ -231,7 +310,11 @@ def _field_candidates(
 
 
 def _required_join_paths(
-    schema: Dict[str, Any], plan: DbQueryPlan
+    schema: Dict[str, Any],
+    plan: DbQueryPlan,
+    *,
+    catalog: Any = None,
+    store_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     path_results = []
     for join in plan.required_joins:
@@ -240,12 +323,14 @@ def _required_join_paths(
         if not from_tables or not to_tables:
             continue
         path_results.append(
-            find_join_paths(
+            find_relationship_paths(
                 schema,
                 from_tables=from_tables,
                 to_tables=to_tables,
                 max_hops=join.get("max_hops", 4),
                 max_paths=join.get("max_paths", 3),
+                catalog=catalog,
+                store_id=store_id,
             )
         )
     return path_results
@@ -271,7 +356,7 @@ def _aggregation_reference_warnings(
                         "type": "unknown_aggregation_table",
                         "aggregation": expression,
                         "table": table,
-                        "suggested_next_tool": "db_search_schema",
+                        "suggested_next_tool": "catalog_search_schema",
                     }
                 )
                 continue
@@ -281,7 +366,7 @@ def _aggregation_reference_warnings(
                     "aggregation": expression,
                     "table": table,
                     "column": column,
-                    "suggested_next_tool": "db_inspect_table",
+                    "suggested_next_tool": "catalog_inspect_table",
                 }
                 if _looks_like_plan_count_intent(plan, column):
                     warning["guidance"] = (

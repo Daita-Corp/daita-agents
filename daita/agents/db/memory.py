@@ -10,8 +10,10 @@ from dataclasses import dataclass, field
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
-from .schema.discovery import is_numeric_type
-from .schema.sampling import PII_COLUMN_PATTERNS
+from .query.catalog_adapter import has_likely_catalog_match
+from .query.intent import looks_like_count_intent
+from .catalog_profile import is_numeric_type
+from .catalog_sampling import PII_COLUMN_PATTERNS
 
 if TYPE_CHECKING:
     from ..agent import Agent
@@ -415,7 +417,9 @@ async def recall_db_memory_context(
     db_memory = getattr(agent, "_db_memory_semantics", None)
     if db_memory is None:
         return []
-    if _looks_row_level(prompt):
+    decision = db_memory_recall_decision(agent, prompt)
+    setattr(agent, "_db_last_memory_recall_decision", decision)
+    if not decision["recall"]:
         return []
     try:
         results = await db_memory.recall(
@@ -439,6 +443,82 @@ async def recall_db_memory_context(
         if content:
             snippets.append(_memory_preview(content))
     return snippets[:limit]
+
+
+def db_memory_recall_decision(agent: "Agent", prompt: str) -> Dict[str, Any]:
+    """Return whether DB semantic memory is useful for this prompt."""
+
+    text = str(prompt or "").lower()
+    semantic_matches = _matched_terms(text, SEMANTIC_RECALL_TERMS)
+    if semantic_matches:
+        return {
+            "recall": True,
+            "reason": "semantic_prompt",
+            "matched_terms": semantic_matches,
+        }
+
+    if _looks_row_level(prompt):
+        return {"recall": False, "reason": "row_level_prompt", "matched_terms": []}
+
+    identifier_matches = _identifier_matches(text)
+    if identifier_matches:
+        return {
+            "recall": False,
+            "reason": "identifier_prompt",
+            "matched_terms": identifier_matches,
+        }
+
+    if _looks_direct_query(text) and has_likely_catalog_match(agent, text):
+        return {
+            "recall": False,
+            "reason": "direct_schema_matched_query",
+            "matched_terms": _matched_terms(text, DIRECT_QUERY_TERMS),
+        }
+
+    return {"recall": True, "reason": "semantic_fallback", "matched_terms": []}
+
+
+SEMANTIC_RECALL_TERMS = (
+    "business rule",
+    "business rules",
+    "calculate",
+    "calculation",
+    "caveat",
+    "caveats",
+    "definition",
+    "definitions",
+    "exclude",
+    "excludes",
+    "include",
+    "includes",
+    "known issue",
+    "known issues",
+    "meaning",
+    "metric",
+    "metrics",
+    "remember",
+    "stored rule",
+    "unit",
+    "units",
+    "what does",
+    "you said",
+)
+DIRECT_QUERY_TERMS = (
+    "average",
+    "avg",
+    "count",
+    "find",
+    "group by",
+    "how many",
+    "list",
+    "max",
+    "minimum",
+    "min",
+    "show",
+    "sum",
+    "top",
+    "total",
+)
 
 
 def _looks_row_level(prompt: str) -> bool:
@@ -479,6 +559,24 @@ def _looks_row_level(prompt: str) -> bool:
     return any(action in text for action in row_action_terms) and any(
         entity in text for entity in row_entity_terms
     )
+
+
+def _looks_direct_query(text: str) -> bool:
+    return looks_like_count_intent(text) or bool(
+        _matched_terms(text, DIRECT_QUERY_TERMS)
+    )
+
+
+def _matched_terms(text: str, terms: Iterable[str]) -> List[str]:
+    return [term for term in terms if term in text]
+
+
+def _identifier_matches(text: str) -> List[str]:
+    matches = re.findall(
+        r"\b(?:[a-z]+_id|[0-9a-f]{8}-[0-9a-f-]{13,}|[\w.+-]+@[\w-]+(?:\.[\w-]+)+)\b",
+        text,
+    )
+    return matches[:5]
 
 
 def _numeric_columns(schema: Dict[str, Any]) -> List[Dict[str, Any]]:

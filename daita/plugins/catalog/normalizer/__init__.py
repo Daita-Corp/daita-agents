@@ -2,7 +2,7 @@
 Schema normalization functions.
 
 Converts raw ``discover_*`` output into a uniform normalized shape consumed by
-agents and the schema dispatch layer in ``daita.agents.db.schema``.
+catalog and ``from_db`` profiling.
 
 Each store type has its own module (``_postgresql.py``, ``_s3.py``, …) holding
 a single ``normalize_<store>()`` function. This module re-exports them and

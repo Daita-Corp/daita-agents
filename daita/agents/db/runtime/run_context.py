@@ -5,7 +5,8 @@ Compact per-run context for agents created by ``Agent.from_db()``.
 import re
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from ..utils import ANALYST_TOOL_PREFIXES, plugin_database_name
+from ..catalog_read_model import build_db_catalog_read_model
+from ..utils import ANALYST_TOOL_PREFIXES
 
 if TYPE_CHECKING:
     from ...agent import Agent
@@ -15,6 +16,7 @@ DEFAULT_CONTEXT_MAX_CHARS = 1600
 SCHEMA_HINT_MAX_TABLES = 5
 SCHEMA_HINT_MAX_RELATIONSHIPS = 5
 TERMINAL_DB_TOOLS = (
+    "db_compile_and_query",
     "db_query",
     "db_count",
     "db_sample",
@@ -22,11 +24,12 @@ TERMINAL_DB_TOOLS = (
     "db_aggregate",
 )
 SCHEMA_NAVIGATION_TOOLS = (
-    "db_list_tables",
-    "db_search_schema",
-    "db_inspect_table",
-    "db_describe_relationships",
-    "db_find_join_path",
+    "catalog_search_schema",
+    "catalog_inspect_table",
+    "catalog_find_join_paths",
+    "search_catalog",
+    "inspect_asset",
+    "find_relationship_paths",
 )
 
 
@@ -38,33 +41,33 @@ def build_db_run_context(
     memory_snippets: Optional[List[str]] = None,
 ) -> str:
     """Build a small DB runtime context block without querying external systems."""
-    schema = getattr(agent, "_db_schema", {}) or {}
+    read_model = build_db_catalog_read_model(
+        agent, summary=getattr(agent, "_db_summary", {}) or {}
+    )
     plugin = getattr(agent, "_db_plugin", None)
     mode = getattr(agent, "_db_mode", None)
     tool_names = list(getattr(agent.tool_registry, "tool_names", []))
-    drift = getattr(agent, "_db_schema_drift", None)
-    summary = getattr(agent, "_db_summary", {}) or {}
-    tables = schema.get("tables", [])
-    foreign_keys = schema.get("foreign_keys", [])
+    drift = getattr(agent, "_db_drift", None)
+    summary = read_model.db_summary
 
     lines = [
         "<db_runtime_context>",
         "Use DB tools autonomously. Plan analytic or multi-table work with db_plan_query; do not retry identical failed SQL.",
         (
             "Database: "
-            f"type={schema.get('database_type', getattr(plugin, 'sql_dialect', 'unknown'))}, "
-            f"name={schema.get('database_name') or plugin_database_name(plugin) or 'unknown'}, "
+            f"type={read_model.database_type}, "
+            f"name={read_model.database_name}, "
             f"mode={mode or 'unknown'}, "
-            f"tables={schema.get('table_count', len(tables))}, "
-            f"columns={sum(len(table.get('columns', [])) for table in tables)}, "
-            f"relationships={len(foreign_keys)}"
+            f"tables={read_model.table_count}, "
+            f"columns={read_model.column_count}, "
+            f"relationships={read_model.relationship_count}"
         ),
         "Query policy: " + _query_policy_summary(plugin),
         "Capabilities: " + _capability_summary(agent, tool_names),
         "Memory: " + _memory_summary(agent, memory_snippets or []),
         "Data health: " + _summary_line(summary),
         "Candidate metrics: " + _candidate_metrics_summary(summary),
-        "Schema hints: " + _schema_hint_summary(schema, prompt),
+        "Schema hints: " + _catalog_hint_summary(agent, prompt),
         "Drift: " + _drift_summary(drift),
         "</db_runtime_context>",
     ]
@@ -75,6 +78,14 @@ def make_db_context_run(agent: "Agent", original_run: Callable) -> Callable:
     """Return a run wrapper that adds compact DB context to each prompt."""
 
     async def _db_context_run(prompt: str, **kwargs: Any):
+        from .fast_path import try_db_fast_path
+
+        fast_result = await try_db_fast_path(agent, prompt, kwargs)
+        if fast_result is not None:
+            history = kwargs.get("history")
+            if history is not None and hasattr(history, "add_turn"):
+                await history.add_turn(prompt, fast_result.get("result", ""))
+            return fast_result
         augmented_prompt, kwargs = await _prepare_db_runtime_call(agent, prompt, kwargs)
         return await original_run(augmented_prompt, **kwargs)
 
@@ -102,18 +113,63 @@ async def _prepare_db_runtime_call(
     from ..memory import recall_db_memory_context
     from ..config.tool_profiles import select_db_tools_for_prompt
     from .state import DbRunState, set_db_run_state
+    from .tracing import db_trace_span
 
-    memory_snippets = await recall_db_memory_context(agent, prompt)
-    plugin = getattr(agent, "_db_plugin", None)
-    run_state = DbRunState()
-    set_db_run_state(agent, run_state)
-    if plugin is not None:
-        set_db_run_state(plugin, run_state)
-        setattr(plugin, "_daita_sql_preflight_failures", {})
-    context = build_db_run_context(
-        agent, prompt=prompt, memory_snippets=memory_snippets
-    )
-    selected_tools = select_db_tools_for_prompt(agent, prompt)
+    async with db_trace_span(
+        agent,
+        "from_db.prepare_runtime_context",
+        prompt=prompt[:200],
+    ):
+        plugin = getattr(agent, "_db_plugin", None)
+        run_state = DbRunState()
+        set_db_run_state(agent, run_state)
+        if plugin is not None:
+            set_db_run_state(plugin, run_state)
+            setattr(plugin, "_daita_sql_preflight_failures", {})
+
+        async with db_trace_span(agent, "from_db.memory_recall") as (
+            trace_manager,
+            span_id,
+        ):
+            memory_snippets = await recall_db_memory_context(agent, prompt)
+            decision = getattr(agent, "_db_last_memory_recall_decision", None) or {}
+            trace_manager.record_output(
+                span_id,
+                {
+                    "skipped": not bool(decision.get("recall", True)),
+                    "reason": decision.get("reason"),
+                    "matched_terms": decision.get("matched_terms", []),
+                    "snippet_count": len(memory_snippets),
+                },
+            )
+
+        async with db_trace_span(agent, "from_db.build_runtime_context") as (
+            trace_manager,
+            span_id,
+        ):
+            context = build_db_run_context(
+                agent, prompt=prompt, memory_snippets=memory_snippets
+            )
+            trace_manager.record_output(
+                span_id,
+                {
+                    "runtime_context_chars": len(context),
+                    "memory_snippet_count": len(memory_snippets),
+                },
+            )
+
+        async with db_trace_span(agent, "from_db.select_tools") as (
+            trace_manager,
+            span_id,
+        ):
+            selected_tools = select_db_tools_for_prompt(agent, prompt)
+            trace_manager.record_output(
+                span_id,
+                {
+                    "selected_tools": selected_tools,
+                    "selected_tool_count": len(selected_tools),
+                },
+            )
     agent._db_last_context_metadata = _context_metadata(context, selected_tools, prompt)
     kwargs.setdefault("tools", selected_tools)
     if kwargs.get("initial_messages"):
@@ -253,58 +309,48 @@ def _candidate_metrics_summary(summary: Dict[str, Any]) -> str:
     return _truncate_line(", ".join(names[:5]), 240)
 
 
-def _schema_hint_summary(schema: Dict[str, Any], prompt: str) -> str:
-    if not schema or not prompt:
-        return "use schema tools as needed"
+def _catalog_hint_summary(agent: "Agent", prompt: str) -> str:
+    store_id = getattr(agent, "_db_catalog_store_id", None)
+    catalog = getattr(agent, "_db_catalog", None)
+    catalog_suffix = f" with store_id={store_id}" if store_id else ""
+    if catalog is None or not store_id or not prompt:
+        return "use catalog tools as needed" + catalog_suffix
 
-    terms = _prompt_terms(prompt)
-    if not terms:
-        return "use schema tools as needed"
+    result = catalog.catalog_search_schema(
+        store_id, prompt, limit=SCHEMA_HINT_MAX_TABLES
+    )
+    tables = result.get("tables") or []
+    if not tables:
+        return "use catalog_search_schema for relevant tables" + catalog_suffix
 
-    tables = schema.get("tables", []) or []
-    selected = []
-    for table in tables:
-        name = str(table.get("name", ""))
-        if not name:
-            continue
-        haystack = " ".join(
-            [name.replace("_", " ")]
-            + [
-                str(col.get("name", "")).replace("_", " ")
-                for col in table.get("columns", []) or []
-            ]
-        ).lower()
-        if any(term in haystack for term in terms):
-            selected.append(table)
-        if len(selected) >= SCHEMA_HINT_MAX_TABLES:
-            break
-
-    if not selected:
-        return "use db_search_schema for relevant tables"
-
-    selected_names = {str(table.get("name")) for table in selected}
     parts = []
-    for table in selected:
-        col_names = [
+    selected_names = {str(table.get("name")) for table in tables}
+    for table in tables[:SCHEMA_HINT_MAX_TABLES]:
+        cols = [
             str(col.get("name"))
-            for col in table.get("columns", []) or []
+            for col in table.get("matched_columns", []) or []
             if col.get("name")
-            and any(term in str(col.get("name", "")).lower() for term in terms)
         ][:4]
-        if col_names:
-            parts.append(f"{table.get('name')}({', '.join(col_names)})")
+        if cols:
+            parts.append(f"{table.get('name')}({', '.join(cols)})")
         else:
             parts.append(str(table.get("name")))
 
     relationships = []
-    for fk in schema.get("foreign_keys", []) or []:
-        if (
-            str(fk.get("source_table")) in selected_names
-            or str(fk.get("target_table")) in selected_names
-        ):
+    for table_name in list(selected_names)[:2]:
+        inspected = catalog.get_table_schema(
+            store_id,
+            table_name,
+            include_indexes=False,
+            include_foreign_keys=True,
+            limit=1,
+        )
+        for fk in inspected.get("foreign_keys", []) or []:
             relationships.append(
-                f"{fk.get('source_table')}.{fk.get('source_column')}->{fk.get('target_table')}.{fk.get('target_column')}"
+                f"{fk.get('source_asset')}.{fk.get('source_field')}->{fk.get('target_asset')}.{fk.get('target_field')}"
             )
+            if len(relationships) >= SCHEMA_HINT_MAX_RELATIONSHIPS:
+                break
         if len(relationships) >= SCHEMA_HINT_MAX_RELATIONSHIPS:
             break
     if relationships:

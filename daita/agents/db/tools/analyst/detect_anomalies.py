@@ -6,8 +6,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, TYPE_CHECKING
 
-from ....core.tools import AgentTool
+from .....core.tools import AgentTool
 from ._helpers import (
+    AnalystCatalogContext,
     ensure_pandas,
     ensure_numpy,
     make_analysis_tool,
@@ -17,11 +18,11 @@ from ._helpers import (
 )
 
 if TYPE_CHECKING:
-    from ....plugins.base_db import BaseDatabasePlugin
+    from .....plugins.base_db import BaseDatabasePlugin
 
 
 def create_detect_anomalies_tool(
-    plugin: "BaseDatabasePlugin", schema: Dict[str, Any]
+    plugin: "BaseDatabasePlugin", catalog_context: AnalystCatalogContext
 ) -> AgentTool:
     """Return an AgentTool that detects statistical outliers in a column."""
 

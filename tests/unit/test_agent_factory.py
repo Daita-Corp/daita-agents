@@ -13,20 +13,19 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
 
-from daita.agents.db.schema.cache import (
-    cache_key as _db_cache_key,
-    detect_drift as _db_detect_drift,
-    load_cached_schema as _db_load_cached_schema,
-    save_schema_cache as _db_save_schema_cache,
+from daita.agents.db.catalog_freshness import (
+    catalog_profile_key as _db_catalog_profile_key,
+    detect_profile_drift as _db_detect_profile_drift,
+    load_catalog_profile_snapshot as _db_load_catalog_profile_snapshot,
 )
+from daita.agents.db.catalog_profile import normalize_schema as _db_normalize_schema
 from daita.agents.db.prompt import (
     build_prompt as _db_build_prompt,
     infer_domain as _infer_domain,
 )
 from daita.agents.db.resolve import resolve_plugin as _db_resolve_plugin
-from daita.agents.db.schema import normalize_schema as _db_normalize_schema
-from daita.agents.db.schema.summary import build_db_summary as _db_build_summary
-from daita.agents.db.schema.navigation import find_join_paths as _db_find_join_paths
+from daita.agents.db.catalog_summary import build_db_summary as _db_build_summary
+from daita.plugins.catalog import CatalogPlugin
 from daita.agents.db.monitors import normalize_monitor_definition
 from daita.agents.db.findings import normalize_finding
 from daita.agents.db.memory import (
@@ -37,6 +36,7 @@ from daita.agents.db.memory import (
     recall_db_memory_context,
 )
 from daita.agents.db.config.policies import SchemaPromptPolicy, ToolResultPolicy
+from daita.plugins.catalog.base_profiler import NormalizedSchema
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -64,13 +64,32 @@ def _table(name, columns=None, row_count=None):
     return {"name": name, "columns": columns, "row_count": row_count}
 
 
-class TestFromDbJoinPathNavigation:
-    async def test_inspect_table_uses_per_run_cache(self):
-        from daita.agents.db.runtime.state import DbRunState, set_db_run_state
-        from daita.agents.db.tools.schema_navigation import create_db_inspect_table_tool
+def _agent_with_catalog(schema, **attrs):
+    store_id = schema.get("store_id") or "test-store"
+    catalog_schema = dict(schema)
+    catalog_schema["store_id"] = store_id
+    catalog = CatalogPlugin()
+    catalog._schemas[store_id] = NormalizedSchema.from_dict(catalog_schema)
+    return SimpleNamespace(
+        _db_catalog=catalog,
+        _db_catalog_store_id=store_id,
+        **attrs,
+    )
 
-        plugin = SimpleNamespace(blocked_columns=set())
-        set_db_run_state(plugin, DbRunState())
+
+async def _attach_plugin_catalog(plugin, schema):
+    catalog = CatalogPlugin()
+    registered = await catalog.register_schema(
+        schema, store_type=schema.get("database_type", "unknown")
+    )
+    plugin._db_catalog = catalog
+    plugin._db_catalog_store_id = registered["store_id"]
+    return catalog, registered["store_id"]
+
+
+class TestFromDbJoinPathNavigation:
+    async def test_catalog_inspect_table_uses_catalog_state(self):
+        catalog = CatalogPlugin()
         schema = _make_normalized_schema(
             tables=[
                 _table(
@@ -82,17 +101,16 @@ class TestFromDbJoinPathNavigation:
                 )
             ]
         )
-        tool = create_db_inspect_table_tool(schema, plugin)
+        registered = await catalog.register_schema(schema, store_type="postgresql")
 
-        first = await tool.handler({"table_name": "users"})
-        second = await tool.handler({"table_name": "users"})
+        result = catalog.get_table_schema(registered["store_id"], "users")
 
-        assert first["success"] is True
-        assert "from_run_cache" not in first
-        assert second["from_run_cache"] is True
-        assert second["columns"] == first["columns"]
+        assert result["success"] is True
+        assert result["columns"][0]["name"] == "id"
+        assert result["columns"][1]["name"] == "email"
 
-    def test_find_join_path_returns_sql_ready_predicates(self):
+    async def test_catalog_find_join_path_returns_sql_ready_predicates(self):
+        catalog = CatalogPlugin()
         schema = _make_normalized_schema(
             tables=[
                 _table("operations"),
@@ -114,11 +132,12 @@ class TestFromDbJoinPathNavigation:
                 },
             ],
         )
+        registered = await catalog.register_schema(schema, store_type="postgresql")
 
-        result = _db_find_join_paths(
-            schema,
-            from_tables=["operations"],
-            to_tables=["users"],
+        result = catalog.find_relationship_paths(
+            registered["store_id"],
+            from_assets=["operations"],
+            to_assets=["users"],
         )
 
         assert result["success"] is True
@@ -131,7 +150,8 @@ class TestFromDbJoinPathNavigation:
             "api_keys.created_by = users.user_id",
         ]
 
-    def test_find_join_path_warns_for_membership_bridge_paths(self):
+    async def test_catalog_find_join_path_warns_for_membership_bridge_paths(self):
+        catalog = CatalogPlugin()
         schema = _make_normalized_schema(
             tables=[
                 _table("operations"),
@@ -160,11 +180,12 @@ class TestFromDbJoinPathNavigation:
                 },
             ],
         )
+        registered = await catalog.register_schema(schema, store_type="postgresql")
 
-        result = _db_find_join_paths(
-            schema,
-            from_tables=["operations"],
-            to_tables=["users"],
+        result = catalog.find_relationship_paths(
+            registered["store_id"],
+            from_assets=["operations"],
+            to_assets=["users"],
         )
 
         assert result["reachable"] is True
@@ -176,18 +197,20 @@ class TestFromDbJoinPathNavigation:
         ]
         assert result["paths"][0]["warnings"]
 
-    def test_find_join_path_reports_unknown_tables_with_candidates(self):
+    async def test_catalog_find_join_path_reports_unknown_tables_with_candidates(self):
+        catalog = CatalogPlugin()
         schema = _make_normalized_schema(tables=[_table("users")])
+        registered = await catalog.register_schema(schema, store_type="postgresql")
 
-        result = _db_find_join_paths(
-            schema,
-            from_tables=["user"],
-            to_tables=["users"],
+        result = catalog.find_relationship_paths(
+            registered["store_id"],
+            from_assets=["user"],
+            to_assets=["users"],
         )
 
         assert result["success"] is False
         assert result["reachable"] is False
-        assert result["errors"][0]["error"] == "table not found"
+        assert result["errors"][0]["error"] == "asset not found"
         assert result["errors"][0]["candidates"]
 
 
@@ -601,7 +624,7 @@ class TestDbSummary:
         assert "orders" in summary["fact_tables"]
         assert "customers" in summary["entity_tables"]
         assert summary["candidate_metrics"][0]["column"] == "total_amount"
-        assert summary["suggested_questions"]
+        assert "suggested_questions" not in summary
         assert "suggested_monitors" not in summary
 
     def test_monitor_definition_validation_rejects_incomplete_definition(self):
@@ -669,13 +692,17 @@ class TestFromDbIntegration:
 
         # Plugin connect was called
         mock_plugin.connect.assert_awaited_once()
-        # add_plugin was called with our plugin
-        mock_agent.add_plugin.assert_called_once_with(mock_plugin)
-        # _db_schema stored on agent
-        assert mock_agent._db_schema["database_type"] == "postgresql"
-        assert mock_agent._db_schema["tables"][0]["name"] == "users"
+        # add_plugin was called with the DB plugin and the catalog plugin.
+        assert mock_agent.add_plugin.call_args_list[0].args[0] is mock_plugin
         # _db_plugin stored on agent
         assert mock_agent._db_plugin is mock_plugin
+        assert mock_agent._db_catalog is not None
+        assert mock_agent._db_catalog_store_id
+        catalog_schema = mock_agent._db_catalog.get_schema(
+            mock_agent._db_catalog_store_id
+        )
+        assert catalog_schema.database_type == "postgresql"
+        assert catalog_schema.tables[0].name == "users"
 
     async def test_from_db_connect_failure_raises_agent_error(self):
         from daita.agents.db import from_db
@@ -802,7 +829,7 @@ class TestFromDbIntegration:
 
         assert mock_agent._db_prompt_metadata["strategy"] == "retrieval"
 
-    async def test_from_db_schema_prompt_policy_override_is_preserved(self):
+    async def test_from_db_catalog_prompt_policy_override_is_preserved(self):
         from daita.agents.db import from_db
         import daita.agents.db.builder as fac
 
@@ -862,8 +889,8 @@ class TestFromDbIntegration:
         # We did NOT create the plugin, so we must not disconnect it
         mock_plugin.disconnect.assert_not_awaited()
 
-    async def test_from_db_schema_stored_with_table_names(self):
-        """Verify that _db_schema on the agent contains the discovered table names."""
+    async def test_from_db_catalog_stores_discovered_table_names(self):
+        """Verify that catalog state contains the discovered table names."""
         from daita.agents.db import from_db
         import daita.agents.db.builder as fac
 
@@ -882,7 +909,10 @@ class TestFromDbIntegration:
         ):
             await from_db("postgresql://localhost/testdb")
 
-        assert mock_agent._db_schema["tables"][0]["name"] == "users"
+        catalog_schema = mock_agent._db_catalog.get_schema(
+            mock_agent._db_catalog_store_id
+        )
+        assert catalog_schema.tables[0].name == "users"
 
     async def test_from_db_does_not_sample_values_by_default(self):
         from daita.agents.db import from_db
@@ -970,7 +1000,7 @@ class TestFromDbIntegration:
         assert description["db"]["relationship_count"] == 1
         assert description["db"]["drift_status"] == "none"
         assert description["db"]["metric_count"] == 1
-        assert description["db"]["suggested_question_count"] > 0
+        assert "suggested_question_count" not in description["db"]
         assert "suggested_monitor_count" not in description["db"]
         assert description["db"]["finding_count"] == 0
         assert description["db"]["open_finding_count"] == 0
@@ -1005,7 +1035,8 @@ class TestFromDbIntegration:
         ):
             agent = await from_db("postgresql://localhost/testdb")
 
-        assert agent.db.schema is agent._db_schema
+        assert agent.db.schema["store_id"] == agent._db_catalog_store_id
+        assert isinstance(agent.db.schema.get("tables"), list)
         assert agent.db.plugin is mock_plugin
         assert agent.db.mode == "analyst"
         assert agent.db.drift is None
@@ -1014,7 +1045,7 @@ class TestFromDbIntegration:
         assert agent.db.history is None
         assert agent.db.quality is None
         assert agent.db.summary is agent._db_summary
-        assert isinstance(agent.db.suggested_questions, list)
+        assert not hasattr(agent.db, "suggested_questions")
         assert not hasattr(agent.db, "suggest_monitors")
         assert agent.db.monitor_events == []
         assert agent.db.findings.all == []
@@ -1275,9 +1306,8 @@ class TestFromDbIntegration:
     def test_db_run_context_is_compact_and_policy_aware(self):
         from daita.agents.db.runtime.run_context import build_db_run_context
 
-        agent = SimpleNamespace(
-            tool_registry=SimpleNamespace(tool_names=["postgres_query", "pivot_table"]),
-            _db_schema=_make_normalized_schema(
+        agent = _agent_with_catalog(
+            _make_normalized_schema(
                 tables=[_table("orders"), _table("customers")],
                 fks=[
                     {
@@ -1290,7 +1320,8 @@ class TestFromDbIntegration:
                 db_type="postgresql",
                 db_name="warehouse",
             ),
-            _db_schema_drift=None,
+            tool_registry=SimpleNamespace(tool_names=["postgres_query", "pivot_table"]),
+            _db_drift=None,
             _db_plugin=SimpleNamespace(
                 read_only=True,
                 query_default_limit=25,
@@ -1321,12 +1352,12 @@ class TestFromDbIntegration:
         from daita.agents.db.runtime.audit import make_audited_run
         from daita.agents.db.runtime.run_context import make_db_context_run
 
-        agent = SimpleNamespace(
-            tool_registry=SimpleNamespace(tool_names=["postgres_query"]),
-            _db_schema=_make_normalized_schema(
+        agent = _agent_with_catalog(
+            _make_normalized_schema(
                 tables=[_table("orders")], db_type="postgresql", db_name="warehouse"
             ),
-            _db_schema_drift=None,
+            tool_registry=SimpleNamespace(tool_names=["postgres_query"]),
+            _db_drift=None,
             _db_plugin=SimpleNamespace(
                 read_only=True,
                 query_default_limit=50,
@@ -1351,6 +1382,9 @@ class TestFromDbIntegration:
         assert seen["prompt"].startswith("<db_runtime_context>")
         assert "User question:\nHow much revenue?" in seen["prompt"]
         assert seen["kwargs"]["detailed"] is True
+        assert result["from_db_metrics"]["llm_call_count"] is None
+        assert result["from_db_metrics"]["tool_call_count"] == 0
+        assert result["from_db_metrics"]["selected_tools"] == []
         assert agent._db_audit_log[0]["prompt"] == "How much revenue?"
 
     async def test_stream_audit_records_tool_arguments_and_result_metadata(self):
@@ -1444,7 +1478,7 @@ class TestFromDbLineage:
         mock_agent.run = AsyncMock(return_value="[]")
         return mock_plugin, mock_agent
 
-    async def test_lineage_true_seeds_fks(self):
+    async def test_lineage_true_attaches_without_seeding_schema_fks(self):
         import daita.agents.db.builder as fac
         from daita.agents.db import from_db
 
@@ -1462,14 +1496,7 @@ class TestFromDbLineage:
             await from_db("postgresql://localhost/testdb", lineage=True)
 
         mock_agent.add_plugin.assert_any_call(mock_lineage)
-        mock_lineage.register_flow.assert_awaited_once()
-        call_kwargs = mock_lineage.register_flow.call_args[1]
-        # IDs are fully qualified by store — see docs/catalog_graph_tier2.md.
-        # Schema has db_type="postgresql", db_name="public", no host metadata,
-        # so the derived store is "postgresql:public".
-        assert call_kwargs["source_id"] == "table:postgresql:public.orders"
-        assert call_kwargs["target_id"] == "table:postgresql:public.customers"
-        assert call_kwargs["metadata"]["store"] == "postgresql:public"
+        mock_lineage.register_flow.assert_not_awaited()
         assert mock_agent._db_lineage is mock_lineage
 
     async def test_lineage_plugin_instance_used_directly(self):
@@ -1489,6 +1516,7 @@ class TestFromDbLineage:
             await from_db("postgresql://localhost/testdb", lineage=custom_lineage)
 
         mock_agent.add_plugin.assert_any_call(custom_lineage)
+        custom_lineage.register_flow.assert_not_awaited()
         assert mock_agent._db_lineage is custom_lineage
 
     async def test_lineage_none_skipped(self):
@@ -1505,10 +1533,10 @@ class TestFromDbLineage:
         ):
             await from_db("postgresql://localhost/testdb")
 
-        # add_plugin called only once (for the DB plugin), not for lineage
-        assert mock_agent.add_plugin.call_count == 1
+        # add_plugin called for DB + catalog, not lineage.
+        assert mock_agent.add_plugin.call_count == 2
 
-    async def test_lineage_entity_id_format(self):
+    async def test_lineage_graph_backend_is_exposed_for_query_tracing(self):
         import daita.agents.db.builder as fac
         from daita.agents.db import from_db
 
@@ -1526,6 +1554,7 @@ class TestFromDbLineage:
         mock_plugin, mock_agent = self._base_mocks()
         mock_lineage = MagicMock()
         mock_lineage.register_flow = AsyncMock()
+        mock_lineage._graph_backend = MagicMock()
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
@@ -1535,9 +1564,9 @@ class TestFromDbLineage:
         ):
             await from_db("postgresql://localhost/testdb", lineage=True)
 
-        call_kwargs = mock_lineage.register_flow.call_args[1]
-        assert call_kwargs["source_id"].startswith("table:")
-        assert call_kwargs["target_id"].startswith("table:")
+        mock_lineage.register_flow.assert_not_awaited()
+        assert mock_agent._db_query_graph_backend is mock_lineage._graph_backend
+        assert mock_plugin._db_query_graph_backend is mock_lineage._graph_backend
 
     async def test_lineage_no_fks_no_register_calls(self):
         import daita.agents.db.builder as fac
@@ -2118,7 +2147,7 @@ class TestFromDbMemory:
         ):
             await from_db("postgresql://localhost/testdb")
 
-        assert mock_agent.add_plugin.call_count == 1  # only DB plugin
+        assert mock_agent.add_plugin.call_count == 2  # DB plugin + catalog
 
     async def test_memory_calibration_stores_structured_unit_conventions(self):
         import daita.agents.db.builder as fac
@@ -2207,7 +2236,9 @@ class TestFromDbMemory:
             patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
             patch("daita.agents.agent.Agent", return_value=mock_agent),
             patch.object(
-                fac, "cache_key", return_value="postgresql://localhost/testdb"
+                fac,
+                "catalog_profile_key",
+                return_value="postgresql://localhost/testdb",
             ),
         ):
             await from_db(
@@ -2322,13 +2353,75 @@ class TestFromDbMemory:
             async def recall(self, *args, **kwargs):
                 raise AssertionError("row-level prompt should not recall DB memory")
 
-        agent = SimpleNamespace(_db_memory_semantics=FailingIfCalledMemory())
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("customers")]),
+            _db_memory_semantics=FailingIfCalledMemory(),
+        )
 
         snippets = await recall_db_memory_context(
             agent, "Show me the email for customer_id 1"
         )
 
         assert snippets == []
+        assert agent._db_last_memory_recall_decision["reason"] == "row_level_prompt"
+
+    async def test_direct_count_question_skips_db_memory_recall(self):
+        class FailingIfCalledMemory:
+            async def recall(self, *args, **kwargs):
+                raise AssertionError("direct count prompt should not recall DB memory")
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders")]),
+            _db_memory_semantics=FailingIfCalledMemory(),
+        )
+
+        snippets = await recall_db_memory_context(agent, "How many orders this month?")
+
+        assert snippets == []
+        assert (
+            agent._db_last_memory_recall_decision["reason"]
+            == "direct_schema_matched_query"
+        )
+
+    async def test_semantic_metric_question_recalls_db_memory(self):
+        class FakeDBMemory:
+            async def recall(self, *args, **kwargs):
+                return [
+                    {
+                        "content": 'DB memory record:\n{"text": "Revenue excludes refunds."}'
+                    }
+                ]
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders")]),
+            _db_memory_semantics=FakeDBMemory(),
+        )
+
+        snippets = await recall_db_memory_context(
+            agent, "What business rule should I use to calculate revenue?"
+        )
+
+        assert snippets == ["Revenue excludes refunds."]
+        assert agent._db_last_memory_recall_decision["reason"] == "semantic_prompt"
+
+    async def test_semantic_language_overrides_identifier_skip(self):
+        class FakeDBMemory:
+            async def recall(self, *args, **kwargs):
+                return [
+                    {
+                        "content": 'DB memory record:\n{"text": "Customer IDs are internal only."}'
+                    }
+                ]
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("customers")]),
+            _db_memory_semantics=FakeDBMemory(),
+        )
+
+        snippets = await recall_db_memory_context(agent, "What does customer_id mean?")
+
+        assert snippets == ["Customer IDs are internal only."]
+        assert agent._db_last_memory_recall_decision["reason"] == "semantic_prompt"
 
     async def test_db_memory_marker_lookup_uses_exact_category_listing(self):
         backend = MagicMock()
@@ -2365,10 +2458,10 @@ class TestFromDbMemory:
             captured["prompt"] = prompt
             return "ok"
 
-        agent = SimpleNamespace(
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders")]),
             tool_registry=SimpleNamespace(tool_names=["postgres_query"]),
-            _db_schema=_make_normalized_schema(tables=[_table("orders")]),
-            _db_schema_drift=None,
+            _db_drift=None,
             _db_plugin=SimpleNamespace(
                 read_only=True,
                 query_default_limit=50,
@@ -2401,10 +2494,10 @@ class TestFromDbMemory:
             captured["prompt"] = prompt
             return "ok"
 
-        agent = SimpleNamespace(
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("customers")]),
             tool_registry=SimpleNamespace(tool_names=["postgres_query"]),
-            _db_schema=_make_normalized_schema(tables=[_table("customers")]),
-            _db_schema_drift=None,
+            _db_drift=None,
             _db_plugin=SimpleNamespace(
                 read_only=True,
                 query_default_limit=50,
@@ -2435,10 +2528,10 @@ class TestFromDbMemory:
             captured["prompt"] = prompt
             return "ok"
 
-        agent = SimpleNamespace(
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders")]),
             tool_registry=SimpleNamespace(tool_names=["postgres_query"]),
-            _db_schema=_make_normalized_schema(tables=[_table("orders")]),
-            _db_schema_drift=None,
+            _db_drift=None,
             _db_plugin=SimpleNamespace(
                 read_only=True,
                 query_default_limit=50,
@@ -2534,35 +2627,49 @@ class TestFromDbMemory:
 
 
 # ---------------------------------------------------------------------------
-# Schema caching tests
+# Catalog profile reuse tests
 # ---------------------------------------------------------------------------
 
 
-class TestSchemaCache:
-    def test_cache_key_redacts_password(self):
-        key1 = _db_cache_key("postgresql://user:secret1@host/db")
-        key2 = _db_cache_key("postgresql://user:secret2@host/db")
+def _write_catalog_schema(schema, *, key="postgresql:default", last_seen=None):
+    catalog_dir = Path(".daita")
+    catalog_dir.mkdir(parents=True, exist_ok=True)
+    payload = dict(schema)
+    now = datetime.now(timezone.utc).isoformat()
+    payload.setdefault("first_seen", last_seen or now)
+    payload.setdefault("last_seen", last_seen or now)
+    (catalog_dir / "catalog.json").write_text(json.dumps({key: payload}, indent=2))
+
+
+class TestCatalogProfileFreshness:
+    def test_catalog_profile_key_redacts_password(self):
+        key1 = _db_catalog_profile_key("postgresql://user:secret1@host/db")
+        key2 = _db_catalog_profile_key("postgresql://user:secret2@host/db")
         assert key1 == key2
 
-    def test_cache_key_different_hosts(self):
-        key1 = _db_cache_key("postgresql://user:pass@host1/db")
-        key2 = _db_cache_key("postgresql://user:pass@host2/db")
+    def test_catalog_profile_key_different_hosts(self):
+        key1 = _db_catalog_profile_key("postgresql://user:pass@host1/db")
+        key2 = _db_catalog_profile_key("postgresql://user:pass@host2/db")
         assert key1 != key2
 
-    def test_cache_save_load_roundtrip(self, tmp_path, monkeypatch):
+    def test_catalog_snapshot_load_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         schema = _make_normalized_schema(tables=[_table("users")])
-        cache_key = "testkey123"
+        profile_key = "testkey123"
 
-        _db_save_schema_cache(cache_key, schema)
-        result = _db_load_cached_schema(cache_key, ttl=3600)
+        _write_catalog_schema(schema)
+        result = _db_load_catalog_profile_snapshot(
+            profile_key, catalog_keys=["postgresql:default"], ttl=3600
+        )
 
         assert result is not None
         loaded_schema, is_expired = result
-        assert loaded_schema == schema
+        assert loaded_schema["tables"] == schema["tables"]
+        assert loaded_schema["database_type"] == schema["database_type"]
+        assert loaded_schema["last_seen"]
         assert is_expired is False
 
-    async def test_cache_hit_skips_discovery(self, tmp_path, monkeypatch):
+    async def test_catalog_profile_hit_skips_discovery(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         import daita.agents.db.builder as fac
         from daita.agents.db import from_db
@@ -2576,10 +2683,8 @@ class TestSchemaCache:
         mock_agent.add_plugin = MagicMock()
         mock_discover = AsyncMock(return_value=schema)
 
-        # Pre-populate cache
         source = "postgresql://user:pass@host/db"
-        cache_key = _db_cache_key(source)
-        _db_save_schema_cache(cache_key, schema)
+        _write_catalog_schema(schema)
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
@@ -2590,7 +2695,7 @@ class TestSchemaCache:
 
         mock_discover.assert_not_awaited()
 
-    async def test_schema_snapshot_skips_discovery_by_default(
+    async def test_catalog_snapshot_skips_discovery_by_default(
         self, tmp_path, monkeypatch
     ):
         monkeypatch.chdir(tmp_path)
@@ -2599,8 +2704,7 @@ class TestSchemaCache:
 
         schema = _make_normalized_schema(tables=[_table("orders"), _table("customers")])
         source = "postgresql://user:pass@host/db"
-        cache_key = _db_cache_key(source)
-        _db_save_schema_cache(cache_key, schema)
+        _write_catalog_schema(schema)
 
         mock_plugin = MagicMock()
         mock_plugin.connect = AsyncMock()
@@ -2616,9 +2720,16 @@ class TestSchemaCache:
             await from_db(source, cache_ttl=None)
 
         mock_discover.assert_not_awaited()
-        assert mock_agent._db_schema == schema
+        catalog_schema = mock_agent._db_catalog.get_schema(
+            mock_agent._db_catalog_store_id
+        )
+        assert [table.name for table in catalog_schema.tables] == [
+            table["name"] for table in schema["tables"]
+        ]
 
-    async def test_cache_expired_triggers_rediscovery(self, tmp_path, monkeypatch):
+    async def test_stale_catalog_profile_triggers_rediscovery(
+        self, tmp_path, monkeypatch
+    ):
         monkeypatch.chdir(tmp_path)
         import daita.agents.db.builder as fac
         from daita.agents.db import from_db
@@ -2633,13 +2744,8 @@ class TestSchemaCache:
         mock_discover = AsyncMock(return_value=schema)
 
         source = "postgresql://user:pass@host/db"
-        cache_key = _db_cache_key(source)
-        cache_dir = tmp_path / ".daita" / "schema_cache"
-        cache_dir.mkdir(parents=True)
         old_ts = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
-        (cache_dir / f"{cache_key}.json").write_text(
-            json.dumps({"schema": schema, "cached_at": old_ts, "cache_key": cache_key})
-        )
+        _write_catalog_schema(schema, last_seen=old_ts)
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
@@ -2655,7 +2761,7 @@ class TestSchemaCache:
         new = _make_normalized_schema(
             tables=[_table("users"), _table("orders"), _table("products")]
         )
-        drift = _db_detect_drift(old, new)
+        drift = _db_detect_profile_drift(old, new)
         assert drift is not None
         assert "products" in drift["added_tables"]
         assert drift["removed_tables"] == []
@@ -2689,17 +2795,19 @@ class TestSchemaCache:
         new = _make_normalized_schema(
             tables=[{"name": "users", "columns": new_cols, "row_count": None}]
         )
-        drift = _db_detect_drift(old, new)
+        drift = _db_detect_profile_drift(old, new)
         assert drift is not None
         change = next(c for c in drift["column_changes"] if c["table"] == "users")
         assert "email" in change["removed_columns"]
 
     def test_drift_detection_no_change(self):
         schema = _make_normalized_schema(tables=[_table("users"), _table("orders")])
-        drift = _db_detect_drift(schema, schema)
+        drift = _db_detect_profile_drift(schema, schema)
         assert drift is None
 
-    async def test_expired_cache_fallback_on_failure(self, tmp_path, monkeypatch):
+    async def test_stale_catalog_profile_fallback_on_failure(
+        self, tmp_path, monkeypatch
+    ):
         monkeypatch.chdir(tmp_path)
         import daita.agents.db.builder as fac
         from daita.agents.db import from_db
@@ -2713,13 +2821,8 @@ class TestSchemaCache:
         mock_agent.add_plugin = MagicMock()
 
         source = "postgresql://user:pass@host/db"
-        cache_key = _db_cache_key(source)
-        cache_dir = tmp_path / ".daita" / "schema_cache"
-        cache_dir.mkdir(parents=True)
         old_ts = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
-        (cache_dir / f"{cache_key}.json").write_text(
-            json.dumps({"schema": schema, "cached_at": old_ts, "cache_key": cache_key})
-        )
+        _write_catalog_schema(schema, last_seen=old_ts)
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
@@ -2730,7 +2833,12 @@ class TestSchemaCache:
         ):
             await from_db(source, cache_ttl=0)
 
-        assert mock_agent._db_schema == schema
+        catalog_schema = mock_agent._db_catalog.get_schema(
+            mock_agent._db_catalog_store_id
+        )
+        assert [table.name for table in catalog_schema.tables] == [
+            table["name"] for table in schema["tables"]
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -3102,6 +3210,22 @@ def _analyst_schema():
     )
 
 
+def _analyst_context(schema=None):
+    from daita.agents.db.tools.analyst._helpers import AnalystCatalogContext
+
+    schema = schema or _analyst_schema()
+    store_id = schema.get("store_id") or "analyst-test-store"
+    catalog_schema = dict(schema)
+    catalog_schema["store_id"] = store_id
+    catalog = CatalogPlugin()
+    catalog._schemas[store_id] = NormalizedSchema.from_dict(catalog_schema)
+    return AnalystCatalogContext(
+        catalog=catalog,
+        store_id=store_id,
+        database_type=schema.get("database_type", "postgresql"),
+    )
+
+
 def _mock_plugin_with_query(rows):
     """Return a mock plugin whose query() returns rows."""
     p = MagicMock()
@@ -3140,7 +3264,7 @@ class TestRegisterAnalystTools:
 
 class TestFromDbQueryFacadeTools:
     async def test_sql_facade_tools_delegate_to_plugin_guardrails(self):
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
 
         plugin = MagicMock()
         plugin.sql_dialect = "postgresql"
@@ -3153,6 +3277,7 @@ class TestFromDbQueryFacadeTools:
         tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
 
         assert set(tools) == {
+            "db_compile_and_query",
             "db_plan_query",
             "db_validate_sql",
             "db_query",
@@ -3165,7 +3290,7 @@ class TestFromDbQueryFacadeTools:
 
     async def test_sql_facade_plan_query_enriches_intent_and_records_run_state(self):
         from daita.agents.db.runtime.state import DbRunState, set_db_run_state
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
 
         plugin = MagicMock()
         plugin.sql_dialect = "postgresql"
@@ -3216,6 +3341,7 @@ class TestFromDbQueryFacadeTools:
                 },
             ],
         )
+        await _attach_plugin_catalog(plugin, schema)
 
         tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
         result = await tools["db_plan_query"].handler(
@@ -3227,19 +3353,21 @@ class TestFromDbQueryFacadeTools:
                     {"from_tables": ["operations"], "to_tables": ["users"]}
                 ],
                 "limit": 10,
+                "include_diagnostics": True,
             }
         )
 
         assert result["ok"] is True
         assert result["route"] == "join_query"
-        assert result["resolved_tables"] == ["operations", "users"]
+        assert "operations" in result["resolved_tables"]
+        assert "users" in result["resolved_tables"]
         assert result["field_candidates"]["total tokens"][0]["column"] == "total_tokens"
-        assert result["join_paths"][0]["reachable"] is True
+        assert any(path.get("reachable") for path in result["join_paths"])
         assert state.summary()["planned_query_count"] == 1
         assert "total tokens" in state.required_answer_fields
 
     async def test_sql_facade_preflights_missing_column_before_query(self):
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
 
         plugin = MagicMock()
         plugin.sql_dialect = "postgresql"
@@ -3276,7 +3404,7 @@ class TestFromDbQueryFacadeTools:
 
     async def test_sql_facade_records_preflight_failures_in_run_state(self):
         from daita.agents.db.runtime.state import DbRunState, set_db_run_state
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
 
         plugin = MagicMock()
         plugin.sql_dialect = "postgresql"
@@ -3305,7 +3433,7 @@ class TestFromDbQueryFacadeTools:
         plugin._tool_query.assert_not_awaited()
 
     async def test_sql_facade_blocks_repeated_invalid_sql_without_generic_error(self):
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
 
         plugin = MagicMock()
         plugin.sql_dialect = "postgresql"
@@ -3338,7 +3466,7 @@ class TestFromDbQueryFacadeTools:
         plugin._tool_query.assert_not_awaited()
 
     async def test_validate_sql_tool_does_not_execute_query(self):
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
 
         plugin = MagicMock()
         plugin.sql_dialect = "postgresql"
@@ -3357,7 +3485,7 @@ class TestFromDbQueryFacadeTools:
         plugin._tool_query.assert_not_awaited()
 
     async def test_sql_facade_normalizes_trailing_semicolon_before_guardrails(self):
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
         from daita.plugins.base_db import BaseDatabasePlugin
 
         class GuardedPlugin(BaseDatabasePlugin):
@@ -3405,7 +3533,7 @@ class TestFromDbQueryFacadeTools:
         plugin._tool_query.assert_awaited_once_with({"sql": normalized_sql})
 
     async def test_sql_facade_still_rejects_internal_semicolon(self):
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
         from daita.core.exceptions import ValidationError
         from daita.plugins.base_db import BaseDatabasePlugin
 
@@ -3443,7 +3571,7 @@ class TestFromDbQueryFacadeTools:
         plugin._tool_query.assert_not_awaited()
 
     async def test_sql_facade_allows_unaliased_join_table_references(self):
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
 
         plugin = MagicMock()
         plugin.sql_dialect = "postgresql"
@@ -3490,7 +3618,7 @@ class TestFromDbQueryFacadeTools:
 
     async def test_sql_facade_blocks_metric_drift_from_required_plan_fields(self):
         from daita.agents.db.runtime.state import DbRunState, set_db_run_state
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
 
         plugin = MagicMock()
         plugin.sql_dialect = "postgresql"
@@ -3546,7 +3674,7 @@ class TestFromDbQueryFacadeTools:
 
     async def test_sql_facade_allows_count_alias_for_required_count_metric(self):
         from daita.agents.db.runtime.state import DbRunState, set_db_run_state
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
 
         plugin = MagicMock()
         plugin.sql_dialect = "postgresql"
@@ -3603,7 +3731,7 @@ class TestFromDbQueryFacadeTools:
         plugin._tool_query.assert_not_awaited()
 
     async def test_sql_facade_plan_warns_on_missing_aggregation_column(self):
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
 
         plugin = MagicMock()
         plugin.sql_dialect = "postgresql"
@@ -3632,6 +3760,7 @@ class TestFromDbQueryFacadeTools:
                 "aggregations": [
                     "SUM(operations.total_operations) AS total_operations"
                 ],
+                "include_diagnostics": True,
             }
         )
 
@@ -3641,7 +3770,7 @@ class TestFromDbQueryFacadeTools:
                 "aggregation": "SUM(operations.total_operations) AS total_operations",
                 "table": "operations",
                 "column": "total_operations",
-                "suggested_next_tool": "db_inspect_table",
+                "suggested_next_tool": "catalog_inspect_table",
                 "guidance": (
                     "For count-style questions, count stable rows such as "
                     "COUNT(*) or COUNT(primary_key) and alias the result, "
@@ -3652,7 +3781,7 @@ class TestFromDbQueryFacadeTools:
         ]
 
     async def test_mongo_facade_uses_document_store_capabilities(self):
-        from daita.agents.db.tools.query_facade import create_db_query_tools
+        from daita.agents.db.tools.query import create_db_query_tools
 
         plugin = MagicMock()
         plugin._tool_find = AsyncMock(return_value={"documents": [{"x": 1}]})
@@ -3717,6 +3846,7 @@ class TestFromDbQueryFacadeTools:
             agent = await from_db("postgresql://localhost/testdb")
 
         assert "db_query" in agent.tool_registry.tool_names
+        assert "db_compile_and_query" in agent.tool_registry.tool_names
         assert "db_count" in agent.tool_registry.tool_names
         assert "postgres_query" not in agent.tool_registry.tool_names
         assert "postgres_count" not in agent.tool_registry.tool_names
@@ -3836,7 +3966,7 @@ class TestDbResultCompaction:
         )
 
         compacted = compact_tool_result_for_context(
-            "db_find_join_path",
+            "catalog_find_join_paths",
             {
                 "success": True,
                 "path_count": 1,
@@ -3870,83 +4000,142 @@ class TestDbResultCompaction:
 
 
 class TestFromDbToolProfiles:
-    def test_schema_navigation_tools_are_not_terminal(self):
+    def test_catalog_schema_tools_are_not_terminal(self):
         from daita.agents.db.runtime.run_context import TERMINAL_DB_TOOLS
 
+        assert "db_compile_and_query" in TERMINAL_DB_TOOLS
         assert "db_query" in TERMINAL_DB_TOOLS
-        assert "db_inspect_table" not in TERMINAL_DB_TOOLS
-        assert "db_find_join_path" not in TERMINAL_DB_TOOLS
+        assert "catalog_inspect_table" not in TERMINAL_DB_TOOLS
+        assert "catalog_find_join_paths" not in TERMINAL_DB_TOOLS
 
-    def test_simple_prompt_selects_core_and_schema_tools_only(self):
+    def test_clear_data_prompt_with_schema_match_uses_compact_query_tools(self):
         from types import SimpleNamespace
         from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
 
-        agent = SimpleNamespace(
+        agent = _agent_with_catalog(
+            _make_normalized_schema(
+                tables=[
+                    _table(
+                        "sales",
+                        columns=[
+                            {"name": "sale_id", "type": "integer"},
+                            {"name": "revenue", "type": "numeric"},
+                            {"name": "created_at", "type": "timestamp"},
+                        ],
+                    )
+                ]
+            ),
             tool_registry=SimpleNamespace(
                 tool_names=[
                     "db_plan_query",
+                    "db_compile_and_query",
                     "db_query",
                     "db_validate_sql",
                     "db_count",
-                    "db_search_schema",
-                    "db_inspect_table",
-                    "db_find_join_path",
+                    "db_sample",
+                    "catalog_search_schema",
+                    "catalog_inspect_table",
+                    "catalog_find_join_paths",
                     "pivot_table",
                     "forecast_trend",
                 ]
             ),
-            _db_schema={"tables": []},
         )
 
         selected = select_db_tools_for_prompt(agent, "What were sales last month?")
 
         assert selected == [
-            "db_search_schema",
-            "db_inspect_table",
-            "db_find_join_path",
+            "db_compile_and_query",
             "db_plan_query",
-            "db_validate_sql",
             "db_query",
             "db_count",
+            "db_sample",
+        ]
+
+    def test_data_prompt_without_schema_match_keeps_schema_repair_tools(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_plan_query",
+                    "db_compile_and_query",
+                    "db_query",
+                    "db_count",
+                    "catalog_search_schema",
+                    "catalog_inspect_table",
+                    "catalog_find_join_paths",
+                ]
+            ),
+        )
+
+        selected = select_db_tools_for_prompt(agent, "What were sales last month?")
+
+        assert selected == [
+            "db_compile_and_query",
+            "db_plan_query",
+            "db_query",
+            "db_count",
+            "catalog_search_schema",
+            "catalog_inspect_table",
+            "catalog_find_join_paths",
         ]
 
     def test_schema_prompt_selects_schema_tools_only(self):
         from types import SimpleNamespace
         from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
 
-        agent = SimpleNamespace(
+        agent = _agent_with_catalog(
+            {"tables": []},
             tool_registry=SimpleNamespace(
                 tool_names=[
                     "db_query",
                     "db_count",
-                    "db_list_tables",
-                    "db_search_schema",
-                    "db_inspect_table",
+                    "catalog_search_schema",
+                    "catalog_inspect_table",
                 ]
             ),
-            _db_schema={"tables": []},
         )
 
         selected = select_db_tools_for_prompt(
             agent, "What can you tell me about my traces table?"
         )
 
-        assert selected == ["db_search_schema", "db_inspect_table", "db_list_tables"]
+        assert selected == ["catalog_search_schema", "catalog_inspect_table"]
+
+    def test_explicit_validate_sql_mention_is_preserved(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders")]),
+            tool_registry=SimpleNamespace(
+                tool_names=["db_plan_query", "db_query", "db_validate_sql"]
+            ),
+        )
+
+        selected = select_db_tools_for_prompt(
+            agent, "Use db_validate_sql for this orders query"
+        )
+
+        assert selected == ["db_plan_query", "db_query", "db_validate_sql"]
 
     def test_analysis_prompt_adds_matching_analyst_tool(self):
         from types import SimpleNamespace
         from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
 
-        agent = SimpleNamespace(
+        agent = _agent_with_catalog(
+            {"tables": []},
             tool_registry=SimpleNamespace(
                 tool_names=[
                     "db_query",
-                    "db_search_schema",
+                    "catalog_search_schema",
                     "detect_anomalies",
                     "forecast_trend",
                 ]
             ),
-            _db_schema={"tables": []},
         )
 
         selected = select_db_tools_for_prompt(
@@ -3960,11 +4149,11 @@ class TestFromDbToolProfiles:
         from types import SimpleNamespace
         from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
 
-        agent = SimpleNamespace(
+        agent = _agent_with_catalog(
+            {"tables": []},
             tool_registry=SimpleNamespace(
-                tool_names=["db_query", "db_execute", "db_search_schema"]
+                tool_names=["db_query", "db_execute", "catalog_search_schema"]
             ),
-            _db_schema={"tables": []},
         )
 
         selected = select_db_tools_for_prompt(agent, "Update customer status")
@@ -3975,11 +4164,11 @@ class TestFromDbToolProfiles:
         from types import SimpleNamespace
         from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
 
-        agent = SimpleNamespace(
+        agent = _agent_with_catalog(
+            {"tables": []},
             tool_registry=SimpleNamespace(
                 tool_names=["db_query", "dq_detect_anomaly", "detect_anomalies"]
             ),
-            _db_schema={"tables": []},
         )
 
         selected = select_db_tools_for_prompt(
@@ -3996,7 +4185,7 @@ class TestPivotTableTool:
         except ImportError:
             pytest.skip("pandas not installed")
 
-        from daita.agents.db.tools.pivot_table import create_pivot_table_tool
+        from daita.agents.db.tools.analyst.pivot_table import create_pivot_table_tool
 
         rows = [
             {"category": "A", "month": "Jan", "revenue": 100},
@@ -4005,7 +4194,7 @@ class TestPivotTableTool:
             {"category": "B", "month": "Feb", "revenue": 50},
         ]
         plugin = _mock_plugin_with_query(rows)
-        tool = create_pivot_table_tool(plugin, _analyst_schema())
+        tool = create_pivot_table_tool(plugin, _analyst_context())
 
         result = await tool.handler(
             {
@@ -4027,22 +4216,22 @@ class TestPivotTableTool:
         except ImportError:
             pytest.skip("pandas not installed")
 
-        from daita.agents.db.tools.pivot_table import create_pivot_table_tool
+        from daita.agents.db.tools.analyst.pivot_table import create_pivot_table_tool
 
         plugin = _mock_plugin_with_query([])
-        tool = create_pivot_table_tool(plugin, _analyst_schema())
+        tool = create_pivot_table_tool(plugin, _analyst_context())
         result = await tool.handler({"rows": "a", "columns": "b", "values": "c"})
         assert result["success"] is False
         assert "sql" in result["error"]
 
     async def test_graceful_degradation_without_pandas(self):
-        from daita.agents.db.tools.pivot_table import create_pivot_table_tool
+        from daita.agents.db.tools.analyst.pivot_table import create_pivot_table_tool
 
         plugin = _mock_plugin_with_query([])
-        tool = create_pivot_table_tool(plugin, _analyst_schema())
+        tool = create_pivot_table_tool(plugin, _analyst_context())
 
         with patch(
-            "daita.agents.db.tools.pivot_table.ensure_pandas",
+            "daita.agents.db.tools.analyst.pivot_table.ensure_pandas",
             side_effect=ImportError("pandas not found"),
         ):
             result = await tool.handler(
@@ -4067,11 +4256,11 @@ class TestCorrelateTool:
         except ImportError:
             pytest.skip("pandas not installed")
 
-        from daita.agents.db.tools.correlate import create_correlate_tool
+        from daita.agents.db.tools.analyst.correlate import create_correlate_tool
 
         rows = [{"x": i, "y": i * 2, "z": -i} for i in range(1, 21)]
         plugin = _mock_plugin_with_query(rows)
-        tool = create_correlate_tool(plugin, _analyst_schema())
+        tool = create_correlate_tool(plugin, _analyst_context())
 
         result = await tool.handler({"sql": "SELECT x, y, z FROM t"})
 
@@ -4095,10 +4284,10 @@ class TestCorrelateTool:
         except ImportError:
             pytest.skip("pandas not installed")
 
-        from daita.agents.db.tools.correlate import create_correlate_tool
+        from daita.agents.db.tools.analyst.correlate import create_correlate_tool
 
         plugin = _mock_plugin_with_query([])
-        tool = create_correlate_tool(plugin, _analyst_schema())
+        tool = create_correlate_tool(plugin, _analyst_context())
         result = await tool.handler({})
         assert result["success"] is False
 
@@ -4111,13 +4300,15 @@ class TestDetectAnomaliesTool:
         except ImportError:
             pytest.skip("pandas/numpy not installed")
 
-        from daita.agents.db.tools.detect_anomalies import create_detect_anomalies_tool
+        from daita.agents.db.tools.analyst.detect_anomalies import (
+            create_detect_anomalies_tool,
+        )
 
         # Values mostly 10, with one extreme outlier at 1000
         rows = [{"val": 10 + i % 3, "id": i} for i in range(50)]
         rows.append({"val": 1000, "id": 999})
         plugin = _mock_plugin_with_query(rows)
-        tool = create_detect_anomalies_tool(plugin, _analyst_schema())
+        tool = create_detect_anomalies_tool(plugin, _analyst_context())
 
         result = await tool.handler({"sql": "SELECT * FROM orders", "column": "val"})
 
@@ -4133,12 +4324,14 @@ class TestDetectAnomaliesTool:
         except ImportError:
             pytest.skip("pandas/numpy not installed")
 
-        from daita.agents.db.tools.detect_anomalies import create_detect_anomalies_tool
+        from daita.agents.db.tools.analyst.detect_anomalies import (
+            create_detect_anomalies_tool,
+        )
 
         rows = [{"val": 5, "id": i} for i in range(40)]
         rows.append({"val": 200, "id": 999})
         plugin = _mock_plugin_with_query(rows)
-        tool = create_detect_anomalies_tool(plugin, _analyst_schema())
+        tool = create_detect_anomalies_tool(plugin, _analyst_context())
 
         result = await tool.handler(
             {"sql": "SELECT * FROM t", "column": "val", "method": "iqr"}
@@ -4147,13 +4340,15 @@ class TestDetectAnomaliesTool:
         assert result["anomaly_count"] >= 1
 
     async def test_graceful_degradation_without_numpy(self):
-        from daita.agents.db.tools.detect_anomalies import create_detect_anomalies_tool
+        from daita.agents.db.tools.analyst.detect_anomalies import (
+            create_detect_anomalies_tool,
+        )
 
         plugin = _mock_plugin_with_query([])
-        tool = create_detect_anomalies_tool(plugin, _analyst_schema())
+        tool = create_detect_anomalies_tool(plugin, _analyst_context())
 
         with patch(
-            "daita.agents.db.tools.detect_anomalies.ensure_numpy",
+            "daita.agents.db.tools.analyst.detect_anomalies.ensure_numpy",
             side_effect=ImportError("numpy not found"),
         ):
             result = await tool.handler({"sql": "SELECT 1", "column": "val"})
@@ -4161,11 +4356,19 @@ class TestDetectAnomaliesTool:
 
 
 class TestHelpersInferDimensions:
-    def test_infer_dimensions_with_fk_schema(self):
-        from daita.agents.db.tools._helpers import infer_dimensions
+    def test_infer_dimensions_uses_catalog_relationships(self):
+        from daita.agents.db.tools.analyst._helpers import infer_dimensions
 
-        schema = _analyst_schema()
-        dims = infer_dimensions(schema, "customers")
+        dims = infer_dimensions(_analyst_context(), "customers")
+
+        aliases = [d["alias"] for d in dims]
+        assert "orders_count" in aliases
+        assert "orders_total_sum" in aliases
+
+    def test_infer_dimensions_with_fk_schema(self):
+        from daita.agents.db.tools.analyst._helpers import infer_dimensions
+
+        dims = infer_dimensions(_analyst_context(), "customers")
 
         aliases = [d["alias"] for d in dims]
         assert "orders_count" in aliases
@@ -4173,36 +4376,59 @@ class TestHelpersInferDimensions:
         assert len(dims) >= 1
 
     def test_infer_dimensions_no_fk(self):
-        from daita.agents.db.tools._helpers import infer_dimensions
+        from daita.agents.db.tools.analyst._helpers import infer_dimensions
 
-        schema = _make_normalized_schema(
-            tables=[_table("standalone")],
-            fks=[],
+        dims = infer_dimensions(
+            _analyst_context(
+                _make_normalized_schema(
+                    tables=[_table("standalone")],
+                    fks=[],
+                )
+            ),
+            "standalone",
         )
-        dims = infer_dimensions(schema, "standalone")
         assert dims == []
 
     def test_get_pk_column(self):
-        from daita.agents.db.tools._helpers import get_pk_column
+        from daita.agents.db.tools.analyst._helpers import get_pk_column
 
-        schema = _analyst_schema()
-        assert get_pk_column(schema, "customers") == "id"
-        assert get_pk_column(schema, "orders") == "id"
-        assert get_pk_column(schema, "nonexistent") is None
+        context = _analyst_context()
+        assert get_pk_column(context, "customers") == "id"
+        assert get_pk_column(context, "orders") == "id"
+        assert get_pk_column(context, "nonexistent") is None
 
     def test_get_numeric_columns(self):
-        from daita.agents.db.tools._helpers import get_numeric_columns
+        from daita.agents.db.tools.analyst._helpers import (
+            find_column,
+            get_numeric_columns,
+        )
 
-        schema = _analyst_schema()
-        numeric = get_numeric_columns(schema, "orders")
+        numeric = get_numeric_columns(_analyst_context(), "orders")
         assert "total" in numeric
         # id is integer — also numeric
         assert "id" in numeric
 
+        wide_columns = [
+            {"name": f"feature_{idx:03d}", "type": "text"} for idx in range(240)
+        ]
+        wide_columns.append({"name": "late_metric", "type": "numeric"})
+        wide_columns.append({"name": "blocked_metric", "type": "numeric"})
+        context = _analyst_context(
+            _make_normalized_schema(
+                tables=[_table("wide_events", columns=wide_columns)],
+            )
+        )
+        context.catalog._db_blocked_columns = {"blocked_metric"}
+
+        assert find_column(context, "wide_events", "late_metric") is not None
+        wide_numeric = get_numeric_columns(context, "wide_events")
+        assert "late_metric" in wide_numeric
+        assert "blocked_metric" not in wide_numeric
+
     def test_to_serializable(self):
         from decimal import Decimal
         from datetime import date
-        from daita.agents.db.tools._helpers import to_serializable
+        from daita.agents.db.tools.analyst._helpers import to_serializable
 
         assert to_serializable(Decimal("3.14")) == pytest.approx(3.14)
         assert to_serializable(date(2024, 1, 15)) == "2024-01-15"
@@ -4218,14 +4444,16 @@ class TestForecastTrendTool:
         except ImportError:
             pytest.skip("pandas/numpy not installed")
 
-        from daita.agents.db.tools.forecast_trend import create_forecast_trend_tool
+        from daita.agents.db.tools.analyst.forecast_trend import (
+            create_forecast_trend_tool,
+        )
 
         rows = [
             {"month": f"2024-{str(i).zfill(2)}-01", "revenue": 1000 + i * 200}
             for i in range(1, 13)
         ]
         plugin = _mock_plugin_with_query(rows)
-        tool = create_forecast_trend_tool(plugin, _analyst_schema())
+        tool = create_forecast_trend_tool(plugin, _analyst_context())
 
         result = await tool.handler(
             {
@@ -4248,10 +4476,12 @@ class TestForecastTrendTool:
         except ImportError:
             pytest.skip("pandas/numpy not installed")
 
-        from daita.agents.db.tools.forecast_trend import create_forecast_trend_tool
+        from daita.agents.db.tools.analyst.forecast_trend import (
+            create_forecast_trend_tool,
+        )
 
         plugin = _mock_plugin_with_query([{"d": "2024-01-01", "v": 100}])
-        tool = create_forecast_trend_tool(plugin, _analyst_schema())
+        tool = create_forecast_trend_tool(plugin, _analyst_context())
 
         result = await tool.handler(
             {

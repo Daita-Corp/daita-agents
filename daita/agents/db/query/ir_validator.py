@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from ..schema.discovery import is_numeric_type
-from ..schema.metadata import column_name, schema_table_columns, table_name
+from ..catalog_profile import is_numeric_type
+from .metadata import column_name, schema_table_columns, table_name
 from .ir import FieldRef, QueryPlan
 
 

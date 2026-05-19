@@ -1,11 +1,10 @@
 """
-Compact schema and data-health summary for agents created by ``from_db()``.
+Compact catalog-backed DB summary heuristics for agents created by ``from_db()``.
 """
 
 from typing import Any, Dict, List
 
-from ..utils import unique_preserving_order
-from .discovery import is_numeric_type
+from .catalog_profile import is_numeric_type
 
 _TIMESTAMP_HINTS = (
     "created_at",
@@ -48,46 +47,7 @@ def build_db_summary(schema: Dict[str, Any]) -> Dict[str, Any]:
         "quantity_columns": quantity_columns[:20],
         "candidate_metrics": candidate_metrics[:12],
         "signals": suspicious[:20],
-        "suggested_questions": suggested_questions(
-            important_tables=important_tables,
-            fact_tables=fact_tables,
-            entity_tables=entity_tables,
-            candidate_metrics=candidate_metrics,
-            timestamp_columns=timestamp_columns,
-        ),
     }
-
-
-def suggested_questions(
-    *,
-    important_tables: List[str],
-    fact_tables: List[str],
-    entity_tables: List[str],
-    candidate_metrics: List[Dict[str, Any]],
-    timestamp_columns: List[Dict[str, str]],
-) -> List[str]:
-    """Generate starter questions from compact schema signals."""
-    questions: List[str] = []
-    if candidate_metrics:
-        metric = candidate_metrics[0]
-        questions.append(f"How has {metric['name']} trended over time?")
-        if entity_tables:
-            questions.append(
-                f"Which {entity_tables[0]} records contribute most to {metric['name']}?"
-            )
-    if fact_tables:
-        questions.append(f"What changed recently in {fact_tables[0]}?")
-        questions.append(f"Are there anomalies in {fact_tables[0]}?")
-    if timestamp_columns:
-        first = timestamp_columns[0]
-        questions.append(
-            f"Is {first['table']}.{first['column']} fresh compared with expectations?"
-        )
-    if important_tables:
-        questions.append(
-            f"What are the most important patterns in {important_tables[0]}?"
-        )
-    return unique_preserving_order(questions)[:6]
 
 
 def _important_tables(tables: List[Dict[str, Any]]) -> List[str]:

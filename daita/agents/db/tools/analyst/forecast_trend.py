@@ -6,8 +6,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
-from ....core.tools import AgentTool
+from .....core.tools import AgentTool
 from ._helpers import (
+    AnalystCatalogContext,
     ensure_pandas,
     ensure_numpy,
     make_analysis_tool,
@@ -17,7 +18,7 @@ from ._helpers import (
 )
 
 if TYPE_CHECKING:
-    from ....plugins.base_db import BaseDatabasePlugin
+    from .....plugins.base_db import BaseDatabasePlugin
 
 _FREQ_DAYS = {
     "daily": 1,
@@ -38,7 +39,7 @@ def _detect_frequency(median_gap_days: float) -> str:
 
 
 def create_forecast_trend_tool(
-    plugin: "BaseDatabasePlugin", schema: Dict[str, Any]
+    plugin: "BaseDatabasePlugin", catalog_context: AnalystCatalogContext
 ) -> AgentTool:
     """Return an AgentTool that fits a linear trend and projects forward."""
 

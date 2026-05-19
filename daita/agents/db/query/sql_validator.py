@@ -7,7 +7,7 @@ import hashlib
 import re
 from typing import Any
 
-from ..schema.metadata import normalize_identifier, schema_table_columns
+from .metadata import normalize_identifier, schema_table_columns
 from .intent import is_count_metric_name
 from .ir import FieldRef, QueryPlan
 from .sql_analysis import SqlAnalysis, SqlAnalysisError, analyze_sql
@@ -68,13 +68,13 @@ def validate_sql_against_schema(
         "column_candidates": _column_candidates(missing_columns, table_columns),
         "table_candidates": _table_candidates(unknown_tables, table_columns),
         "suggested_next_tool": (
-            "db_inspect_table" if inspect_tables else "db_search_schema"
+            "catalog_inspect_table" if inspect_tables else "catalog_search_schema"
         ),
         "do_not_retry_same_sql": True,
         "guidance": (
             "Do not call db_query again with this exact SQL. Inspect the missing "
-            "or ambiguous table, use db_find_join_path for join ambiguity, then "
-            "call db_validate_sql or db_query with corrected SQL."
+            "or ambiguous table, use catalog_find_join_paths for join ambiguity, "
+            "then call db_validate_sql or db_query with corrected SQL."
         ),
     }
 

@@ -3,7 +3,8 @@ Structured per-run state for agents created by ``Agent.from_db()``.
 
 The state object is intentionally small and transient. It tracks execution
 facts that help a single run avoid duplicate work and recover deterministically;
-durable database semantics still belong in DB memory or the schema cache.
+durable database semantics still belong in DB memory, while structural facts
+belong in the catalog profile.
 """
 
 from __future__ import annotations

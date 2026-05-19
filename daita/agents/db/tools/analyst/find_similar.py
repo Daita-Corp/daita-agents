@@ -6,8 +6,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from ....core.tools import AgentTool
+from .....core.tools import AgentTool
 from ._helpers import (
+    AnalystCatalogContext,
     ensure_numpy,
     build_entity_profiles,
     combined_source_metadata,
@@ -18,11 +19,11 @@ from ._helpers import (
 )
 
 if TYPE_CHECKING:
-    from ....plugins.base_db import BaseDatabasePlugin
+    from .....plugins.base_db import BaseDatabasePlugin
 
 
 def create_find_similar_tool(
-    plugin: "BaseDatabasePlugin", schema: Dict[str, Any]
+    plugin: "BaseDatabasePlugin", catalog_context: AnalystCatalogContext
 ) -> AgentTool:
     """Return an AgentTool that finds entities similar to a reference entity."""
 
@@ -34,7 +35,9 @@ def create_find_similar_tool(
 
         entity_table = args.get("entity_table", "").strip()
         entity_id = args.get("entity_id")
-        id_column = args.get("id_column") or get_pk_column(schema, entity_table)
+        id_column = args.get("id_column") or get_pk_column(
+            catalog_context, entity_table
+        )
         custom_dimensions: Optional[List[Dict]] = args.get("dimensions")
         top_k = int(args.get("top_k", 5))
         candidate_sql = (args.get("candidate_sql") or "").strip()
@@ -68,7 +71,7 @@ def create_find_similar_tool(
 
             profile_result = await build_entity_profiles(
                 plugin,
-                schema,
+                catalog_context,
                 entity_table=entity_table,
                 id_column=id_column,
                 dimensions=custom_dimensions,

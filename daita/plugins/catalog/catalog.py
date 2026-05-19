@@ -6,7 +6,11 @@ catalog of data stores. Extends LifecyclePlugin for agent lifecycle hooks.
 """
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+import fnmatch
+import hashlib
+import re
+from collections import deque
+from typing import Any, Callable, Dict, Iterable, List, Optional, TYPE_CHECKING
 
 from ..base import LifecyclePlugin
 from .base_discoverer import (
@@ -33,6 +37,12 @@ if TYPE_CHECKING:
     from ...core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
+
+MAX_CATALOG_SEARCH_LIMIT = 50
+MAX_ASSET_FIELD_LIMIT = 200
+MAX_RELATIONSHIP_HOPS = 6
+MAX_RELATIONSHIP_PATHS = 8
+MATCHED_FIELDS_LIMIT = 12
 
 # Module-level registry. Set once at startup via register_catalog_backend_factory().
 # None means persist to .daita/catalog.json (local default).
@@ -303,8 +313,13 @@ class CatalogPlugin(LifecyclePlugin):
         from .discovery import discover_postgres
 
         result = await discover_postgres(connection_string, schema, ssl_mode)
-        persisted = await self._persist_schema(result) if persist else False
-        return self._persist_response(result, persisted)
+        return await self._register_direct_discovery(
+            result,
+            store_type="postgresql",
+            connection_string=connection_string,
+            persist=persist,
+            options={"schema": schema},
+        )
 
     async def discover_mysql(
         self,
@@ -317,8 +332,13 @@ class CatalogPlugin(LifecyclePlugin):
         from .discovery import discover_mysql
 
         result = await discover_mysql(connection_string, schema, ssl_mode)
-        persisted = await self._persist_schema(result) if persist else False
-        return self._persist_response(result, persisted)
+        return await self._register_direct_discovery(
+            result,
+            store_type="mysql",
+            connection_string=connection_string,
+            persist=persist,
+            options={"schema": schema},
+        )
 
     async def discover_mongodb(
         self,
@@ -331,8 +351,13 @@ class CatalogPlugin(LifecyclePlugin):
         from .discovery import discover_mongodb
 
         result = await discover_mongodb(connection_string, database, sample_size)
-        persisted = await self._persist_schema(result) if persist else False
-        return self._persist_response(result, persisted)
+        return await self._register_direct_discovery(
+            result,
+            store_type="mongodb",
+            connection_string=connection_string,
+            persist=persist,
+            options={"database": database},
+        )
 
     async def discover_openapi(
         self, spec_url: str, service_name: Optional[str] = None, persist: bool = False
@@ -341,8 +366,355 @@ class CatalogPlugin(LifecyclePlugin):
         from .discovery import discover_openapi
 
         result = await discover_openapi(spec_url, service_name)
-        persisted = await self._persist_schema(result) if persist else False
-        return self._persist_response(result, persisted)
+        return await self._register_direct_discovery(
+            result,
+            store_type="openapi",
+            connection_string=spec_url,
+            persist=persist,
+            options={"service_name": service_name},
+        )
+
+    async def register_schema(
+        self,
+        schema: Dict[str, Any],
+        *,
+        store_type: Optional[str] = None,
+        connection_string: Optional[str] = None,
+        store_id: Optional[str] = None,
+        persist: bool = False,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Register a normalized or raw schema dict in catalog state."""
+        return await self._register_direct_discovery(
+            schema,
+            store_type=store_type,
+            connection_string=connection_string,
+            store_id=store_id,
+            persist=persist,
+            options=options,
+        )
+
+    def search_catalog(
+        self,
+        store_id: str,
+        query: str,
+        *,
+        asset_types: Optional[List[str]] = None,
+        include_fields: bool = True,
+        limit: int = 20,
+    ) -> Dict[str, Any]:
+        """Search assets and fields within one profiled catalog store."""
+        schema = self._schema_dict_for_store(store_id)
+        if schema is None:
+            return self._missing_schema_response(store_id)
+
+        tokens = _query_tokens(query)
+        limit = _clamp_int(
+            limit, default=20, minimum=1, maximum=MAX_CATALOG_SEARCH_LIMIT
+        )
+        wanted_types = {item.lower() for item in asset_types or []}
+        scored = []
+        for table in schema.get("tables", []) or []:
+            asset_type = str(table.get("metadata", {}).get("asset_type") or "table")
+            if wanted_types and asset_type.lower() not in wanted_types:
+                continue
+            score, matched_fields, reasons = _score_asset(table, tokens, include_fields)
+            if score <= 0 and tokens:
+                continue
+            scored.append(
+                {
+                    **_asset_summary(table, store_id=store_id, asset_type=asset_type),
+                    "score": round(score, 3),
+                    "matched_fields": matched_fields[:MATCHED_FIELDS_LIMIT],
+                    "match_reasons": reasons[:8],
+                    "relationships": self._relationships_for_asset(
+                        schema, table["name"]
+                    )[:8],
+                }
+            )
+
+        scored.sort(key=lambda item: (-item["score"], item["name"]))
+        return {
+            "store_id": store_id,
+            "query": query,
+            "tokens": tokens,
+            "total_matches": len(scored),
+            "limit": limit,
+            "truncated": len(scored) > limit,
+            "assets": scored[:limit],
+        }
+
+    def catalog_search_schema(
+        self,
+        store_id: str,
+        query: str,
+        *,
+        limit: int = 20,
+    ) -> Dict[str, Any]:
+        """Relational view over search_catalog for tables/views/collections."""
+        result = self.search_catalog(
+            store_id,
+            query,
+            asset_types=["table", "view", "collection"],
+            include_fields=True,
+            limit=limit,
+        )
+        if "assets" in result:
+            result["tables"] = result.pop("assets")
+        return result
+
+    def inspect_asset(
+        self,
+        store_id: str,
+        asset_ref: str,
+        *,
+        field_filter: Optional[str] = None,
+        offset: int = 0,
+        limit: int = 100,
+        include_fields: bool = True,
+        include_indexes: bool = True,
+        include_relationships: bool = True,
+        blocked_fields: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        """Inspect one bounded catalog asset by name/reference."""
+        schema = self._schema_dict_for_store(store_id)
+        if schema is None:
+            return self._missing_schema_response(store_id)
+
+        table = _find_asset(schema, asset_ref)
+        if table is None:
+            candidates = self.search_catalog(store_id, asset_ref, limit=10).get(
+                "assets", []
+            )
+            return {
+                "success": False,
+                "store_id": store_id,
+                "asset_ref": asset_ref,
+                "error": f"Asset not found: {asset_ref}",
+                "candidates": candidates,
+            }
+
+        fields = table.get("columns", []) or []
+        filtered_fields = [
+            field for field in fields if _matches_field_pattern(field, field_filter)
+        ]
+        limit = _clamp_int(limit, default=100, minimum=1, maximum=MAX_ASSET_FIELD_LIMIT)
+        offset = _clamp_int(
+            offset, default=0, minimum=0, maximum=max(len(filtered_fields), 0)
+        )
+        page = filtered_fields[offset : offset + limit]
+        blocked = {field.lower() for field in blocked_fields or []}
+
+        result: Dict[str, Any] = {
+            "success": True,
+            "store_id": store_id,
+            "asset": _asset_summary(table, store_id=store_id),
+        }
+        if include_fields:
+            result.update(
+                {
+                    "fields": [
+                        _field_summary(field, blocked_fields=blocked) for field in page
+                    ],
+                    "field_count": len(fields),
+                    "matched_field_count": len(filtered_fields),
+                    "field_filter": field_filter or None,
+                    "offset": offset,
+                    "limit": limit,
+                    "truncated": offset + len(page) < len(filtered_fields),
+                }
+            )
+        if include_indexes:
+            result["indexes"] = table.get("indexes", []) or []
+        if include_relationships:
+            result["relationships"] = self._relationships_for_asset(
+                schema, table["name"]
+            )
+        if table.get("metadata"):
+            result["metadata"] = table["metadata"]
+        return result
+
+    def get_table_schema(
+        self,
+        store_id: str,
+        table_name: str,
+        *,
+        column_pattern: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+        include_indexes: bool = True,
+        include_foreign_keys: bool = True,
+        blocked_columns: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        """Relational inspection view over inspect_asset()."""
+        result = self.inspect_asset(
+            store_id,
+            table_name,
+            field_filter=column_pattern,
+            offset=offset,
+            limit=limit,
+            include_fields=True,
+            include_indexes=include_indexes,
+            include_relationships=include_foreign_keys,
+            blocked_fields=blocked_columns,
+        )
+        if not result.get("success"):
+            return result
+        table = result.pop("asset")
+        result["table"] = table
+        result["table_name"] = table.get("name")
+        result["columns"] = result.pop("fields", [])
+        result["column_count"] = result.pop("field_count", 0)
+        result["matched_column_count"] = result.pop("matched_field_count", 0)
+        result["column_pattern"] = result.pop("field_filter", None)
+        if include_foreign_keys:
+            result["foreign_keys"] = result.pop("relationships", [])
+        return result
+
+    def find_relationship_paths(
+        self,
+        store_id: str,
+        from_assets: List[str],
+        to_assets: List[str],
+        *,
+        relationship_types: Optional[List[str]] = None,
+        max_hops: int = 4,
+        max_paths: int = 5,
+    ) -> Dict[str, Any]:
+        """Find bounded relationship paths between catalog assets."""
+        schema = self._schema_dict_for_store(store_id)
+        if schema is None:
+            return self._missing_schema_response(store_id)
+
+        sources, source_errors = _resolve_asset_refs(
+            self, store_id, schema, from_assets
+        )
+        targets, target_errors = _resolve_asset_refs(self, store_id, schema, to_assets)
+        errors = source_errors + target_errors
+        max_hops = _clamp_int(
+            max_hops, default=4, minimum=1, maximum=MAX_RELATIONSHIP_HOPS
+        )
+        max_paths = _clamp_int(
+            max_paths, default=5, minimum=1, maximum=MAX_RELATIONSHIP_PATHS
+        )
+
+        if errors or not sources or not targets:
+            return {
+                "success": False,
+                "store_id": store_id,
+                "from_assets": from_assets,
+                "to_assets": to_assets,
+                "max_hops": max_hops,
+                "path_count": 0,
+                "reachable": False,
+                "errors": errors or ["from_assets and to_assets are required"],
+            }
+
+        adjacency = _relationship_adjacency(schema, relationship_types)
+        target_set = set(targets)
+        paths = []
+        for source in sources:
+            queue = deque([(source, [source], [])])
+            while queue and len(paths) < max_paths:
+                current, assets, relationships = queue.popleft()
+                if current in target_set and relationships:
+                    paths.append(_relationship_path_result(assets, relationships))
+                    continue
+                if len(relationships) >= max_hops:
+                    continue
+                for next_asset, relationship in adjacency.get(current, []):
+                    if next_asset in assets:
+                        continue
+                    queue.append(
+                        (
+                            next_asset,
+                            assets + [next_asset],
+                            relationships + [relationship],
+                        )
+                    )
+
+        return {
+            "success": True,
+            "store_id": store_id,
+            "from_assets": sources,
+            "to_assets": targets,
+            "max_hops": max_hops,
+            "path_count": len(paths),
+            "reachable": bool(paths),
+            "paths": paths,
+        }
+
+    def collect_evidence(
+        self,
+        store_id: str,
+        prompt: str,
+        intent: Dict[str, Any],
+        *,
+        asset_types: Optional[List[str]] = None,
+        limit: int = 8,
+    ) -> Dict[str, Any]:
+        """Return compact catalog evidence for planning or exploration."""
+        search_terms = [prompt]
+        for value in intent.values():
+            if isinstance(value, str):
+                search_terms.append(value)
+            elif isinstance(value, list):
+                search_terms.extend(
+                    str(item) for item in value if isinstance(item, str)
+                )
+        query = " ".join(term for term in search_terms if term).strip()
+        result = self.search_catalog(
+            store_id,
+            query,
+            asset_types=asset_types,
+            include_fields=True,
+            limit=limit,
+        )
+        assets = result.get("assets", [])
+        relationships = []
+        names = [asset["name"] for asset in assets[:4]]
+        if len(names) >= 2:
+            relationships = self.find_relationship_paths(
+                store_id,
+                names[:1],
+                names[1:],
+                relationship_types=["foreign_key", "references"],
+                max_hops=3,
+                max_paths=3,
+            ).get("paths", [])
+        return {
+            "store_id": store_id,
+            "query": query,
+            "assets": assets,
+            "relationships": relationships,
+            "truncated": result.get("truncated", False),
+        }
+
+    def summarize_store(
+        self,
+        store_id: str,
+        *,
+        profile: str = "agent",
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Return a bounded summary of one profiled store."""
+        schema = self._schema_dict_for_store(store_id)
+        if schema is None:
+            return self._missing_schema_response(store_id)
+        limit = _clamp_int(limit, default=50, minimum=1, maximum=200)
+        tables = schema.get("tables", []) or []
+        return {
+            "store_id": store_id,
+            "profile": profile,
+            "database_type": schema.get("database_type"),
+            "database_name": schema.get("database_name") or schema.get("schema"),
+            "table_count": int(schema.get("table_count") or len(tables)),
+            "asset_count": len(tables),
+            "assets": [
+                _asset_summary(table, store_id=store_id) for table in tables[:limit]
+            ],
+            "truncated": len(tables) > limit,
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -354,6 +726,52 @@ class CatalogPlugin(LifecyclePlugin):
         response: Dict[str, Any] = {"schema": result, "persisted": persisted}
         if not persisted:
             response["persist_skipped"] = "catalog backend not configured"
+        return response
+
+    async def _register_direct_discovery(
+        self,
+        result: Dict[str, Any],
+        *,
+        store_type: Optional[str] = None,
+        connection_string: Optional[str] = None,
+        store_id: Optional[str] = None,
+        persist: bool = False,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        from datetime import datetime, timezone
+
+        normalized = _ensure_normalized(result)
+        resolved_type = str(store_type or normalized.get("database_type", "unknown"))
+        resolved_store_id = store_id or _manual_store_id(
+            resolved_type, connection_string, normalized, options or {}
+        )
+        profiled_at = datetime.now(timezone.utc).isoformat()
+
+        normalized["store_id"] = resolved_store_id
+        normalized.setdefault("profiled_at", profiled_at)
+        metadata = dict(normalized.get("metadata", {}) or {})
+        if connection_string:
+            metadata.setdefault("connection_hint", _connection_hint(connection_string))
+        metadata.setdefault("source", "manual")
+        normalized["metadata"] = metadata
+
+        schema = NormalizedSchema.from_dict(normalized)
+        schema.store_id = resolved_store_id
+        schema.profiled_at = normalized.get("profiled_at") or profiled_at
+        self._schemas[resolved_store_id] = schema
+
+        store = _manual_store(
+            resolved_store_id,
+            resolved_type,
+            normalized,
+            connection_string=connection_string,
+            options=options or {},
+        )
+        self._discovered_stores[resolved_store_id] = store
+
+        persisted = await self._persist_schema(schema.to_dict()) if persist else False
+        response = self._persist_response(schema.to_dict(), persisted)
+        response["store_id"] = resolved_store_id
         return response
 
     # ------------------------------------------------------------------
@@ -381,10 +799,57 @@ class CatalogPlugin(LifecyclePlugin):
         Apply ``normalize_discovery`` at the boundary so both the catalog JSON
         and the graph backend see the same normalized form.
         """
-        normalized = _normalize_discovery(schema)
+        normalized = _ensure_normalized(schema)
+        if schema.get("store_id"):
+            normalized["store_id"] = schema["store_id"]
+        if schema.get("profiled_at"):
+            normalized["profiled_at"] = schema["profiled_at"]
+        if schema.get("metadata"):
+            normalized["metadata"] = schema["metadata"]
         return await _persist_schema(
             normalized, self._catalog_backend, self._graph_backend, self._agent_id
         )
+
+    def _schema_dict_for_store(self, store_id: str) -> Optional[Dict[str, Any]]:
+        schema = self.get_schema(store_id)
+        if schema is None:
+            return None
+        return schema.to_dict() if hasattr(schema, "to_dict") else dict(schema)
+
+    @staticmethod
+    def _missing_schema_response(store_id: str) -> Dict[str, Any]:
+        return {
+            "success": False,
+            "store_id": store_id,
+            "error": (
+                f"No profiled schema for store '{store_id}'. "
+                "Run profile_store or discover_schema first."
+            ),
+        }
+
+    @staticmethod
+    def _relationships_for_asset(
+        schema: Dict[str, Any],
+        asset_name: str,
+    ) -> List[Dict[str, Any]]:
+        wanted = asset_name.lower()
+        relationships = []
+        for fk in schema.get("foreign_keys", []) or []:
+            source = str(fk.get("source_table", "")).lower()
+            target = str(fk.get("target_table", "")).lower()
+            if source == wanted or target == wanted:
+                direction = "outgoing" if source == wanted else "incoming"
+                relationships.append(
+                    {
+                        "relationship_type": "foreign_key",
+                        "source_asset": fk.get("source_table"),
+                        "source_field": fk.get("source_column"),
+                        "target_asset": fk.get("target_table"),
+                        "target_field": fk.get("target_column"),
+                        "direction": direction,
+                    }
+                )
+        return relationships
 
     async def prune_stale_catalog(self, max_age_seconds: int) -> dict:
         """Remove catalog entries whose last_seen is older than max_age_seconds."""
@@ -433,3 +898,354 @@ class CatalogPlugin(LifecyclePlugin):
 def catalog(**kwargs) -> CatalogPlugin:
     """Create CatalogPlugin with simplified interface."""
     return CatalogPlugin(**kwargs)
+
+
+def _manual_store(
+    store_id: str,
+    store_type: str,
+    schema: Dict[str, Any],
+    *,
+    connection_string: Optional[str],
+    options: Dict[str, Any],
+) -> DiscoveredStore:
+    name = (
+        schema.get("database_name")
+        or schema.get("schema")
+        or schema.get("service_name")
+        or store_type
+    )
+    return DiscoveredStore(
+        id=store_id,
+        store_type=store_type,
+        display_name=str(name),
+        connection_hint=(
+            _connection_hint(connection_string) if connection_string else {}
+        ),
+        source="manual",
+        confidence=1.0,
+        tags=["manual"],
+        metadata={
+            "options": {k: v for k, v in options.items() if v is not None},
+            "profiled_at": schema.get("profiled_at"),
+        },
+    )
+
+
+def _manual_store_id(
+    store_type: str,
+    connection_string: Optional[str],
+    schema: Dict[str, Any],
+    options: Dict[str, Any],
+) -> str:
+    hint = _connection_hint(connection_string) if connection_string else {}
+    parts = [
+        str(store_type),
+        str(hint.get("host", "")),
+        str(hint.get("port", "")),
+        str(hint.get("database", "")),
+        str(schema.get("database_name") or schema.get("schema") or ""),
+        str(options.get("schema") or options.get("database") or ""),
+    ]
+    digest = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+    return f"manual:{store_type}:{digest}"
+
+
+def _connection_hint(connection_string: str) -> Dict[str, Any]:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(connection_string)
+    return {
+        "scheme": parsed.scheme,
+        "host": parsed.hostname,
+        "port": parsed.port,
+        "database": (parsed.path or "/").lstrip("/") or None,
+    }
+
+
+def _score_asset(
+    table: Dict[str, Any],
+    tokens: List[str],
+    include_fields: bool,
+) -> tuple[float, list, list]:
+    if not tokens:
+        return 0.0, [], []
+    name = str(table.get("name", "")).lower()
+    metadata = table.get("metadata", {}) or {}
+    searchable_metadata = " ".join(str(value).lower() for value in metadata.values())
+    score = 0.0
+    reasons = []
+    matched_fields = []
+
+    for token in tokens:
+        if token == name:
+            score += 6.0
+            reasons.append(f"exact asset:{token}")
+        elif token in name or token in _split_identifier(name):
+            score += 3.0
+            reasons.append(f"asset:{token}")
+        elif searchable_metadata and token in searchable_metadata:
+            score += 0.5
+            reasons.append(f"metadata:{token}")
+
+    if include_fields:
+        for field in table.get("columns", []) or []:
+            field_name = str(field.get("name", "")).lower()
+            field_comment = str(
+                field.get("column_comment") or field.get("comment") or ""
+            ).lower()
+            field_score = 0.0
+            field_reasons = []
+            for token in tokens:
+                if token == field_name:
+                    field_score += 4.0
+                    field_reasons.append(f"exact:{token}")
+                elif token in field_name or token in _split_identifier(field_name):
+                    field_score += 2.0
+                    field_reasons.append(token)
+                elif field_comment and token in field_comment:
+                    field_score += 0.5
+                    field_reasons.append(f"comment:{token}")
+            if field_score:
+                score += min(field_score, 8.0)
+                matched_fields.append(
+                    {
+                        "name": field.get("name"),
+                        "type": field.get("type"),
+                        "score": round(field_score, 3),
+                        "reasons": field_reasons[:5],
+                    }
+                )
+
+    matched_fields.sort(key=lambda item: (-item["score"], item["name"]))
+    return score, matched_fields, reasons
+
+
+def _asset_summary(
+    table: Dict[str, Any],
+    *,
+    store_id: str,
+    asset_type: str = "table",
+) -> Dict[str, Any]:
+    name = table.get("name")
+    return {
+        "store_id": store_id,
+        "name": name,
+        "asset_ref": name,
+        "asset_type": asset_type,
+        "row_count": table.get("row_count"),
+        "field_count": len(table.get("columns", []) or []),
+        "column_count": len(table.get("columns", []) or []),
+    }
+
+
+def _field_summary(
+    field: Dict[str, Any], *, blocked_fields: set[str]
+) -> Dict[str, Any]:
+    out = {
+        "name": field.get("name"),
+        "type": field.get("type"),
+        "nullable": field.get("nullable"),
+        "is_primary_key": bool(field.get("is_primary_key")),
+    }
+    comment = field.get("column_comment") or field.get("comment")
+    if comment:
+        out["comment"] = _truncate(str(comment), 160)
+    if str(field.get("name", "")).lower() in blocked_fields:
+        out["blocked_by_policy"] = True
+    return out
+
+
+def _find_asset(schema: Dict[str, Any], asset_ref: str) -> Optional[Dict[str, Any]]:
+    matches = _matching_assets(schema, asset_ref)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _matching_assets(schema: Dict[str, Any], asset_ref: str) -> List[Dict[str, Any]]:
+    wanted = str(asset_ref or "").strip().lower()
+    if not wanted:
+        return []
+    direct = []
+    short = []
+    for table in schema.get("tables", []) or []:
+        name = str(table.get("name", ""))
+        lowered = name.lower()
+        if lowered == wanted:
+            direct.append(table)
+        elif _short_name(lowered) == wanted:
+            short.append(table)
+    return direct or short
+
+
+def _resolve_asset_refs(
+    plugin: CatalogPlugin,
+    store_id: str,
+    schema: Dict[str, Any],
+    asset_refs: List[str],
+) -> tuple[List[str], List[Dict[str, Any]]]:
+    resolved = []
+    errors = []
+    for raw_name in asset_refs or []:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        matches = _matching_assets(schema, name)
+        if len(matches) == 1:
+            resolved.append(str(matches[0].get("name")))
+            continue
+        candidates = plugin.search_catalog(store_id, name, limit=5).get("assets", [])
+        errors.append(
+            {
+                "asset": name,
+                "error": "ambiguous asset" if matches else "asset not found",
+                "matches": [
+                    _asset_summary(match, store_id=store_id) for match in matches[:5]
+                ],
+                "candidates": candidates,
+            }
+        )
+    return _unique_preserving_order(resolved), errors
+
+
+def _relationship_adjacency(
+    schema: Dict[str, Any],
+    relationship_types: Optional[List[str]],
+) -> Dict[str, List[tuple[str, Dict[str, Any]]]]:
+    wanted_types = {item.lower() for item in relationship_types or []}
+    include_fk = not wanted_types or bool(wanted_types & {"foreign_key", "references"})
+    adjacency: Dict[str, List[tuple[str, Dict[str, Any]]]] = {}
+    if not include_fk:
+        return adjacency
+    for fk in schema.get("foreign_keys", []) or []:
+        source_table = str(fk.get("source_table") or "")
+        source_column = str(fk.get("source_column") or "")
+        target_table = str(fk.get("target_table") or "")
+        target_column = str(fk.get("target_column") or "")
+        if not all((source_table, source_column, target_table, target_column)):
+            continue
+        forward = {
+            "relationship_type": "foreign_key",
+            "left_asset": source_table,
+            "left_field": source_column,
+            "right_asset": target_table,
+            "right_field": target_column,
+            "predicate": f"{source_table}.{source_column} = {target_table}.{target_column}",
+            "relationship_direction": "forward",
+        }
+        reverse = {
+            "relationship_type": "foreign_key",
+            "left_asset": target_table,
+            "left_field": target_column,
+            "right_asset": source_table,
+            "right_field": source_column,
+            "predicate": f"{target_table}.{target_column} = {source_table}.{source_column}",
+            "relationship_direction": "reverse",
+        }
+        adjacency.setdefault(source_table, []).append((target_table, forward))
+        adjacency.setdefault(target_table, []).append((source_table, reverse))
+    return adjacency
+
+
+def _relationship_path_result(
+    assets: List[str], relationships: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    hop_count = len(relationships)
+    if hop_count <= 1:
+        confidence = "high"
+    elif hop_count <= 3:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    joins = [
+        {
+            "left_table": rel["left_asset"],
+            "left_column": rel["left_field"],
+            "right_table": rel["right_asset"],
+            "right_column": rel["right_field"],
+            "predicate": rel["predicate"],
+            "relationship_direction": rel["relationship_direction"],
+        }
+        for rel in relationships
+        if rel.get("relationship_type") == "foreign_key"
+    ]
+    warnings = []
+    bridge_assets = [asset for asset in assets[1:-1] if asset.endswith("_members")]
+    if bridge_assets:
+        warnings.append(
+            "Path crosses membership-style bridge assets; check whether this "
+            "attributes facts to all members or to a specific actor."
+        )
+    return {
+        "assets": assets,
+        "tables": assets,
+        "hop_count": hop_count,
+        "relationships": relationships,
+        "joins": joins,
+        "confidence": confidence,
+        "warnings": warnings,
+    }
+
+
+def _matches_field_pattern(field: Dict[str, Any], pattern: Optional[str]) -> bool:
+    if not pattern:
+        return True
+    name = str(field.get("name", "")).lower()
+    lowered_pattern = pattern.lower()
+    if any(ch in lowered_pattern for ch in "*?[]"):
+        return fnmatch.fnmatch(name, lowered_pattern)
+    if lowered_pattern in name:
+        return True
+    pattern_parts = _split_identifier(lowered_pattern)
+    name_parts = _split_identifier(name)
+    return bool(pattern_parts) and all(
+        any(part in name_part or name_part.startswith(part) for name_part in name_parts)
+        for part in pattern_parts
+    )
+
+
+def _query_tokens(query: str) -> List[str]:
+    raw_tokens = re.findall(r"[a-zA-Z0-9_]+", (query or "").lower())
+    tokens = []
+    for raw in raw_tokens:
+        tokens.extend(_split_identifier(raw))
+    seen = set()
+    return [
+        token
+        for token in tokens
+        if len(token) > 1 and token not in seen and not seen.add(token)
+    ]
+
+
+def _split_identifier(value: str) -> List[str]:
+    return [part for part in re.split(r"[^a-zA-Z0-9]+|_", value.lower()) if part]
+
+
+def _short_name(value: str) -> str:
+    return value.rsplit(".", 1)[-1]
+
+
+def _unique_preserving_order(values: Iterable[str]) -> List[str]:
+    seen = set()
+    return [value for value in values if value not in seen and not seen.add(value)]
+
+
+def _clamp_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _truncate(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[: max_chars - 3].rstrip() + "..."
+
+
+def _ensure_normalized(schema: Dict[str, Any]) -> Dict[str, Any]:
+    tables = schema.get("tables")
+    if isinstance(tables, list) and (
+        not tables or "name" in tables[0] or "columns" in tables[0]
+    ):
+        return dict(schema)
+    return _normalize_discovery(schema)

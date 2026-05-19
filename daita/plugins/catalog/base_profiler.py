@@ -130,9 +130,69 @@ class NormalizedSchema:
             ],
             "table_count": self.table_count,
         }
+        if self.store_id:
+            result["store_id"] = self.store_id
+        if self.profiled_at:
+            result["profiled_at"] = self.profiled_at
         if self.metadata:
             result["metadata"] = self.metadata
         return result
+
+    @classmethod
+    def from_dict(cls, value: Dict[str, Any]) -> "NormalizedSchema":
+        """Hydrate a NormalizedSchema from a persisted catalog record."""
+        tables = []
+        for table in value.get("tables", []) or []:
+            columns = [
+                NormalizedColumn(
+                    name=str(column.get("name", "")),
+                    type=str(column.get("type", "")),
+                    nullable=bool(column.get("nullable", True)),
+                    is_primary_key=bool(column.get("is_primary_key", False)),
+                    comment=column.get("column_comment") or column.get("comment"),
+                )
+                for column in table.get("columns", []) or []
+            ]
+            indexes = [
+                NormalizedIndex(
+                    name=str(index.get("name", "")),
+                    type=str(index.get("type", "")),
+                    columns=list(index.get("columns", []) or []),
+                    unique=bool(index.get("unique", False)),
+                    metadata=dict(index.get("metadata", {}) or {}),
+                )
+                for index in table.get("indexes", []) or []
+            ]
+            tables.append(
+                NormalizedTable(
+                    name=str(table.get("name", "")),
+                    row_count=table.get("row_count"),
+                    columns=columns,
+                    indexes=indexes,
+                    metadata=dict(table.get("metadata", {}) or {}),
+                )
+            )
+
+        foreign_keys = [
+            NormalizedForeignKey(
+                source_table=str(fk.get("source_table", "")),
+                source_column=str(fk.get("source_column", "")),
+                target_table=str(fk.get("target_table", "")),
+                target_column=str(fk.get("target_column", "")),
+            )
+            for fk in value.get("foreign_keys", []) or []
+        ]
+
+        return cls(
+            database_type=str(value.get("database_type", "unknown")),
+            database_name=str(value.get("database_name") or value.get("schema") or ""),
+            tables=tables,
+            foreign_keys=foreign_keys,
+            table_count=int(value.get("table_count") or len(tables)),
+            store_id=value.get("store_id"),
+            profiled_at=value.get("profiled_at"),
+            metadata=dict(value.get("metadata", {}) or {}),
+        )
 
 
 class BaseProfiler(ABC):
