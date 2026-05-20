@@ -4,6 +4,7 @@ Per-run tool selection for ``from_db()`` agents.
 
 from __future__ import annotations
 
+import re
 from typing import Any, List
 
 from ..query.catalog_adapter import catalog_schema_snapshot, has_likely_catalog_match
@@ -123,13 +124,33 @@ def select_db_tools_for_prompt(agent: Any, prompt: str) -> List[str]:
     text = prompt.lower()
 
     needs_query_tools = _needs_query_tools(text)
-    needs_schema_tools = _needs_schema_tools(agent, text, needs_query_tools)
+    likely_catalog_match = (
+        has_likely_catalog_match(agent, text) if needs_query_tools else False
+    )
+    needs_schema_tools = _needs_schema_tools(
+        text,
+        needs_query_tools,
+        likely_catalog_match=likely_catalog_match,
+    )
+    compile_first = _should_start_with_compile_first(
+        available,
+        text,
+        needs_query_tools=needs_query_tools,
+    )
 
     if needs_query_tools:
-        _extend_available(selected, available, CORE_QUERY_TOOLS)
+        if compile_first:
+            _extend_available(selected, available, ("db_compile_and_query",))
+        else:
+            _extend_available(selected, available, CORE_QUERY_TOOLS)
+            if _has_explicit_sql(text):
+                _extend_available(selected, available, ("db_validate_sql",))
 
     if needs_schema_tools:
-        _extend_available(selected, available, SCHEMA_TOOLS)
+        if compile_first and not likely_catalog_match:
+            _extend_available(selected, available, ("catalog_search_schema",))
+        else:
+            _extend_available(selected, available, SCHEMA_TOOLS)
 
     selected.extend(_explicitly_mentioned_tools(available, text))
 
@@ -161,7 +182,42 @@ def select_db_tools_for_prompt(agent: Any, prompt: str) -> List[str]:
     return unique_preserving_order([name for name in selected if name in available])
 
 
-def _needs_schema_tools(agent: Any, text: str, needs_query_tools: bool) -> bool:
+def _should_start_with_compile_first(
+    available: set[str], text: str, *, needs_query_tools: bool
+) -> bool:
+    return (
+        needs_query_tools
+        and "db_compile_and_query" in available
+        and not _needs_advanced_db_tools(available, text)
+    )
+
+
+def _needs_advanced_db_tools(available: set[str], text: str) -> bool:
+    if _explicitly_mentioned_tools(available, text):
+        return True
+    if any(keyword in text for keyword in WRITE_KEYWORDS):
+        return True
+    if any(keyword in text for keyword in SCHEMA_REPAIR_KEYWORDS):
+        return True
+    if any(keyword in text for keyword in QUALITY_KEYWORDS + LINEAGE_KEYWORDS):
+        return True
+    if any(
+        any(keyword in text for keyword in keywords)
+        for keywords in ANALYST_TOOL_INTENTS.values()
+    ):
+        return True
+    if any(keyword in text for keyword in ("validate", "validation", "debug", "repair")):
+        return True
+    return _has_explicit_sql(text)
+
+
+def _has_explicit_sql(text: str) -> bool:
+    return bool(re.search(r"\b(select|with|explain|sql)\b", text))
+
+
+def _needs_schema_tools(
+    text: str, needs_query_tools: bool, *, likely_catalog_match: bool
+) -> bool:
     explicit_schema = any(tool.lower() in text for tool in SCHEMA_TOOLS)
     if explicit_schema:
         return True
@@ -171,7 +227,7 @@ def _needs_schema_tools(agent: Any, text: str, needs_query_tools: bool) -> bool:
         return True
     if not needs_query_tools:
         return False
-    return not has_likely_catalog_match(agent, text)
+    return not likely_catalog_match
 
 
 def _needs_query_tools(text: str) -> bool:

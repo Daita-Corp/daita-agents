@@ -171,7 +171,8 @@ async def _prepare_db_runtime_call(
                 },
             )
     agent._db_last_context_metadata = _context_metadata(context, selected_tools, prompt)
-    kwargs.setdefault("tools", selected_tools)
+    if kwargs.get("tools") is None:
+        kwargs["tools"] = selected_tools
     if kwargs.get("initial_messages"):
         kwargs["initial_messages"] = _compact_initial_messages(
             kwargs["initial_messages"]

@@ -1387,6 +1387,75 @@ class TestFromDbIntegration:
         assert result["from_db_metrics"]["selected_tools"] == []
         assert agent._db_audit_log[0]["prompt"] == "How much revenue?"
 
+    async def test_db_context_run_replaces_none_tools_with_selected_profile(self):
+        from daita.agents.db.runtime.run_context import make_db_context_run
+
+        seen = {}
+
+        async def original_run(prompt, **kwargs):
+            seen["kwargs"] = kwargs
+            return {"result": "ok", "tool_calls": []}
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("sales")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_compile_and_query",
+                    "db_plan_query",
+                    "db_query",
+                    "db_count",
+                    "catalog_search_schema",
+                ]
+            ),
+            _db_drift=None,
+            _db_plugin=SimpleNamespace(
+                read_only=True,
+                query_default_limit=50,
+                query_max_rows=200,
+                query_max_chars=50000,
+                query_timeout=30,
+            ),
+        )
+
+        wrapped = make_db_context_run(agent, original_run)
+        await wrapped("What were sales last month?", tools=None)
+
+        assert seen["kwargs"]["tools"] == ["db_compile_and_query"]
+
+    async def test_db_context_run_preserves_explicit_tool_list(self):
+        from daita.agents.db.runtime.run_context import make_db_context_run
+
+        seen = {}
+
+        async def original_run(prompt, **kwargs):
+            seen["kwargs"] = kwargs
+            return {"result": "ok", "tool_calls": []}
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("sales")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_compile_and_query",
+                    "db_plan_query",
+                    "db_query",
+                    "catalog_search_schema",
+                ]
+            ),
+            _db_drift=None,
+            _db_plugin=SimpleNamespace(
+                read_only=True,
+                query_default_limit=50,
+                query_max_rows=200,
+                query_max_chars=50000,
+                query_timeout=30,
+            ),
+        )
+
+        wrapped = make_db_context_run(agent, original_run)
+        await wrapped("What were sales last month?", tools=["db_query"])
+
+        assert seen["kwargs"]["tools"] == ["db_query"]
+
     async def test_stream_audit_records_tool_arguments_and_result_metadata(self):
         from daita.agents.db.runtime.audit import make_audited_stream
         from daita.core.streaming import AgentEvent, EventType
@@ -4008,7 +4077,7 @@ class TestFromDbToolProfiles:
         assert "catalog_inspect_table" not in TERMINAL_DB_TOOLS
         assert "catalog_find_join_paths" not in TERMINAL_DB_TOOLS
 
-    def test_clear_data_prompt_with_schema_match_uses_compact_query_tools(self):
+    def test_clear_data_prompt_with_schema_match_starts_with_compile_only(self):
         from types import SimpleNamespace
         from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
 
@@ -4044,15 +4113,9 @@ class TestFromDbToolProfiles:
 
         selected = select_db_tools_for_prompt(agent, "What were sales last month?")
 
-        assert selected == [
-            "db_compile_and_query",
-            "db_plan_query",
-            "db_query",
-            "db_count",
-            "db_sample",
-        ]
+        assert selected == ["db_compile_and_query"]
 
-    def test_data_prompt_without_schema_match_keeps_schema_repair_tools(self):
+    def test_data_prompt_without_schema_match_adds_schema_search_only(self):
         from types import SimpleNamespace
         from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
 
@@ -4073,11 +4136,62 @@ class TestFromDbToolProfiles:
 
         selected = select_db_tools_for_prompt(agent, "What were sales last month?")
 
+        assert selected == ["db_compile_and_query", "catalog_search_schema"]
+
+    def test_explicit_sql_prompt_keeps_manual_sql_tools(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_compile_and_query",
+                    "db_plan_query",
+                    "db_query",
+                    "db_validate_sql",
+                    "catalog_search_schema",
+                ]
+            ),
+        )
+
+        selected = select_db_tools_for_prompt(
+            agent, "Run this SQL: SELECT COUNT(*) FROM orders"
+        )
+
         assert selected == [
             "db_compile_and_query",
             "db_plan_query",
             "db_query",
-            "db_count",
+            "db_validate_sql",
+        ]
+
+    def test_join_prompt_keeps_relationship_navigation_tools(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders"), _table("customers")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_compile_and_query",
+                    "db_plan_query",
+                    "db_query",
+                    "catalog_search_schema",
+                    "catalog_inspect_table",
+                    "catalog_find_join_paths",
+                ]
+            ),
+        )
+
+        selected = select_db_tools_for_prompt(
+            agent, "Show sales by customer and find the join path"
+        )
+
+        assert selected == [
+            "db_compile_and_query",
+            "db_plan_query",
+            "db_query",
             "catalog_search_schema",
             "catalog_inspect_table",
             "catalog_find_join_paths",
