@@ -6,18 +6,19 @@ Findings are durable, JSON-safe records of notable DB observations. Local
 contract later.
 """
 
+from __future__ import annotations
+
 import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .monitors import MonitorDefinition
 
 if TYPE_CHECKING:
     from ..agent import Agent
     from ...core.watch import WatchEvent
-
 
 VALID_FINDING_SEVERITIES = {"info", "warning", "critical"}
 VALID_FINDING_STATUSES = {"open", "resolved"}
@@ -60,7 +61,7 @@ class Finding:
 class DBFindings:
     """Developer-facing findings collection for ``agent.db.findings``."""
 
-    def __init__(self, agent: "Agent"):
+    def __init__(self, agent: Agent):
         self._agent = agent
 
     @property
@@ -141,14 +142,9 @@ def normalize_finding(raw: Any) -> Finding:
     )
 
 
-def normalize_findings(raw: Iterable[Any]) -> List[Finding]:
-    """Normalize a collection of findings."""
-    return [normalize_finding(item) for item in raw]
-
-
 def finding_from_monitor_event(
     monitor: MonitorDefinition,
-    event: "WatchEvent",
+    event: WatchEvent,
     *,
     finding_id: Optional[str] = None,
 ) -> Finding:
@@ -184,7 +180,7 @@ def finding_from_monitor_event(
 
 
 def record_monitor_finding(
-    agent: "Agent", event: "WatchEvent", monitor: MonitorDefinition
+    agent: Agent, event: WatchEvent, monitor: MonitorDefinition
 ) -> Dict[str, Any]:
     """Record or resolve a local finding for a monitor event."""
     active = getattr(agent, "_db_active_findings", None)
@@ -219,7 +215,7 @@ def record_monitor_finding(
     return finding
 
 
-def _findings_store(agent: "Agent") -> List[Dict[str, Any]]:
+def _findings_store(agent: Agent) -> List[Dict[str, Any]]:
     findings = getattr(agent, "_db_findings", None)
     if findings is None:
         findings = []

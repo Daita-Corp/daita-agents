@@ -29,11 +29,9 @@ import dataclasses
 import json
 import logging
 import os
-import time
 import threading
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -44,6 +42,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace import SpanKind
 from opentelemetry.trace.status import Status, StatusCode
 
+from .decision_tracing import DecisionEvent
 from .otel_exporter import BoundedInMemorySpanExporter, DaitaSpanExporter
 
 if TYPE_CHECKING:
@@ -1120,19 +1119,13 @@ def _readable_span_to_dict(span) -> Dict[str, Any]:
         span.status.description if span.status else None
     )
 
-    trace_type_str = attrs.get("daita.trace.type", "agent_execution")
-    try:
-        trace_type = TraceType(trace_type_str)
-    except ValueError:
-        trace_type = TraceType.AGENT_EXECUTION
-
     return {
         "span_id": hex_span_id,
         "trace_id": hex_trace_id,
         "parent_span_id": parent_span_id,
         "agent_id": attrs.get("daita.agent.id"),
         "operation": span.name,
-        "type": trace_type_str,
+        "type": attrs.get("daita.trace.type", "agent_execution"),
         "start_time": start_time,
         "end_time": end_time,
         "duration_ms": duration_ms,

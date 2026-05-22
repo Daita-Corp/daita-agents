@@ -62,14 +62,6 @@ def load_catalog_profile_snapshot(
     return profile, _is_expired(profile, ttl)
 
 
-def clear_catalog_profile_snapshots(profile_key: Optional[str] = None) -> None:
-    """Clear warm in-memory catalog profile snapshots."""
-    if profile_key is None:
-        _CATALOG_PROFILE_MEMORY_CACHE.clear()
-    else:
-        _CATALOG_PROFILE_MEMORY_CACHE.pop(_memory_key(profile_key), None)
-
-
 def detect_profile_drift(
     old_profile: Dict[str, Any], new_profile: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:

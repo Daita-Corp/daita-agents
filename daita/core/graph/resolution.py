@@ -77,14 +77,8 @@ def _strip_prefix(value: str) -> str:
     return value.split(":", 1)[1] if value.startswith("table:") else value
 
 
-def unresolved_id(name: str) -> str:
-    """Return the sentinel ID used for lineage references made before the
-    catalog has discovered the target table."""
-    return AgentGraphNode.make_id(NodeType.TABLE, f"{UNRESOLVED_STORE}.{name}")
-
-
 async def resolve_table(
-    graph_backend: "GraphBackend",
+    graph_backend: GraphBackend,
     name: str,
     store: Optional[str] = None,
 ) -> List[ResolvedTable]:
@@ -116,7 +110,7 @@ async def resolve_table(
 
 
 async def resolve_table_unique(
-    graph_backend: "GraphBackend",
+    graph_backend: GraphBackend,
     name: str,
     store: Optional[str] = None,
     policy: AmbiguousReferencePolicy = AmbiguousReferencePolicy.STRICT,
@@ -162,7 +156,7 @@ async def resolve_table_unique(
 
 
 async def _pick_newest(
-    graph_backend: "GraphBackend",
+    graph_backend: GraphBackend,
     candidates: List[ResolvedTable],
 ) -> ResolvedTable:
     """Return the candidate whose node has the latest ``updated_at``."""
@@ -180,7 +174,7 @@ async def _pick_newest(
 
 
 async def ensure_unresolved_placeholder(
-    graph_backend: "GraphBackend",
+    graph_backend: GraphBackend,
     name: str,
     agent_id: Optional[str] = None,
 ) -> ResolvedTable:
@@ -201,7 +195,7 @@ async def ensure_unresolved_placeholder(
 
 
 async def resolve_or_placeholder(
-    graph_backend: Optional["GraphBackend"],
+    graph_backend: Optional[GraphBackend],
     name: str,
     store: Optional[str] = None,
     agent_id: Optional[str] = None,

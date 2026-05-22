@@ -93,7 +93,12 @@ def compile_and_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
                 analysis=analysis,
             )
             if validation.get("error"):
-                record_sql_preflight_failure(plugin, run_state, validation)
+                record_sql_preflight_failure(
+                    plugin,
+                    run_state,
+                    validation,
+                    source_tool="db_compile_and_query",
+                )
                 result = {
                     **validation,
                     "plan_id": plan_result.get("plan_id"),
@@ -105,7 +110,11 @@ def compile_and_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
 
             fingerprint = sql_fingerprint(sql)
             if run_state is not None:
-                run_state.record_validated_sql(fingerprint, validation)
+                run_state.record_validated_sql(
+                    fingerprint,
+                    validation,
+                    source_tool="db_compile_and_query",
+                )
             query_result = await trace_sql_execution(
                 plugin, plugin._tool_query, {"sql": sql}
             )
@@ -115,13 +124,15 @@ def compile_and_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
                         "plan_id": plan_result.get("plan_id"),
                         "sql_fingerprint": fingerprint,
                         "sql": sql,
+                        "columns": result_columns(query_result),
                         "row_count": result_row_count(query_result),
                         "truncated": (
                             bool(query_result.get("truncated"))
                             if isinstance(query_result, dict)
                             else False
                         ),
-                    }
+                    },
+                    source_tool="db_compile_and_query",
                 )
             result = _compile_and_query_result(
                 plan_result, validation, sql, query_result, args or {}
@@ -143,10 +154,16 @@ def validate_sql_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
             validation, sql, state, dialect=dialect, analysis=analysis
         )
         if validation.get("error"):
-            record_sql_preflight_failure(plugin, state, validation)
+            record_sql_preflight_failure(
+                plugin, state, validation, source_tool="db_validate_sql"
+            )
             return validation
         if state is not None:
-            state.record_validated_sql(sql_fingerprint(sql), validation)
+            state.record_validated_sql(
+                sql_fingerprint(sql),
+                validation,
+                source_tool="db_validate_sql",
+            )
         return {
             "ok": True,
             "sql_fingerprint": sql_fingerprint(sql),
@@ -159,8 +176,16 @@ def validate_sql_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
 def preflight_sql_handler(plugin: Any, handler: Any, schema: Dict[str, Any]) -> Any:
     async def _handler(args: Dict[str, Any]) -> Any:
         args = args or {}
-        if args.get("plan_id"):
-            return await execute_plan_id(plugin, handler, schema, args)
+        plan_id = str(args.get("plan_id") or "").strip()
+        if plan_id:
+            run_state = get_db_run_state(plugin)
+            stored_plan = run_state.get_plan(plan_id) if run_state is not None else None
+            if stored_plan is not None and _stored_plan_is_executable(stored_plan):
+                return await execute_plan_id(plugin, handler, schema, args)
+            if not args.get("sql"):
+                return await execute_plan_id(plugin, handler, schema, args)
+            args = dict(args)
+            args.pop("plan_id", None)
 
         sql = _normalize_sql_for_plugin(plugin, str((args or {}).get("sql") or ""))
         analysis = _validate_plugin_query_policy(plugin, sql)
@@ -175,7 +200,9 @@ def preflight_sql_handler(plugin: Any, handler: Any, schema: Dict[str, Any]) -> 
             return validation
         fingerprint = sql_fingerprint(sql)
         if run_state is not None:
-            run_state.record_validated_sql(fingerprint, validation)
+            run_state.record_validated_sql(
+                fingerprint, validation, source_tool="db_query"
+            )
         normalized_args = {**(args or {}), "sql": sql}
         result = await trace_sql_execution(plugin, handler, normalized_args)
         if run_state is not None:
@@ -183,17 +210,25 @@ def preflight_sql_handler(plugin: Any, handler: Any, schema: Dict[str, Any]) -> 
                 {
                     "sql_fingerprint": fingerprint,
                     "sql": sql,
+                    "columns": result_columns(result),
                     "row_count": result_row_count(result),
                     "truncated": (
                         bool(result.get("truncated"))
                         if isinstance(result, dict)
                         else False
                     ),
-                }
+                },
+                source_tool="db_query",
             )
         return result
 
     return _handler
+
+
+def _stored_plan_is_executable(stored: Dict[str, Any]) -> bool:
+    result = stored.get("result") or {}
+    validation = result.get("validation") or {}
+    return bool(str(result.get("compiled_sql") or "").strip() and validation.get("ok"))
 
 
 async def execute_plan_id(
@@ -241,6 +276,7 @@ async def execute_plan_id(
             "source": "validated_query_ir",
             "sql_fingerprint": fingerprint,
         },
+        source_tool="db_query",
     )
     normalized_args = {**args, "sql": sql}
     normalized_args.pop("plan_id", None)
@@ -250,11 +286,13 @@ async def execute_plan_id(
             "plan_id": plan_id,
             "sql_fingerprint": fingerprint,
             "sql": sql,
+            "columns": result_columns(result),
             "row_count": result_row_count(result),
             "truncated": (
                 bool(result.get("truncated")) if isinstance(result, dict) else False
             ),
-        }
+        },
+        source_tool="db_query",
     )
     return result
 
@@ -317,11 +355,19 @@ def query_graph_backend(owner: Any) -> Any:
 
 
 def record_sql_preflight_failure(
-    plugin: Any, run_state: Any, validation: Dict[str, Any]
+    plugin: Any,
+    run_state: Any,
+    validation: Dict[str, Any],
+    *,
+    source_tool: str = "db_query",
 ) -> None:
     fingerprint = validation["sql_fingerprint"]
     if run_state is not None:
-        attempt_count = run_state.record_failed_sql(fingerprint)
+        attempt_count = run_state.record_failed_sql(
+            fingerprint,
+            validation,
+            source_tool=source_tool,
+        )
     else:
         failures = getattr(plugin, "_daita_sql_preflight_failures", None)
         if not isinstance(failures, dict):
@@ -348,6 +394,18 @@ def result_row_count(result: Any) -> int:
         return result["total_rows"]
     rows = result.get("rows")
     return len(rows) if isinstance(rows, list) else 0
+
+
+def result_columns(result: Any) -> List[str]:
+    if not isinstance(result, dict):
+        return []
+    columns = result.get("columns")
+    if isinstance(columns, list):
+        return [str(column) for column in columns if column]
+    rows = result.get("rows")
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return [str(column) for column in rows[0].keys()]
+    return []
 
 
 def _normalize_sql_for_plugin(plugin: Any, sql: str) -> str:

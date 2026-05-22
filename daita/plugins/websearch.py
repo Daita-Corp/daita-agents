@@ -62,6 +62,7 @@ from ..core.exceptions import (
     ConnectionError as DaitaConnectionError,
     AuthenticationError,
 )
+from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
 
@@ -436,10 +437,8 @@ class WebSearchPlugin(BasePlugin):
         url = args.get("url")
         return await self.fetch_page(url)
 
-    def get_tools(self) -> List["AgentTool"]:
+    def get_tools(self) -> List[AgentTool]:
         """Expose web search operations as agent tools."""
-        from ..core.tools import AgentTool
-
         return [
             AgentTool(
                 name="search_web",

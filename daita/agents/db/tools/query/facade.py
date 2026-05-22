@@ -41,7 +41,10 @@ def _sql_tools(plugin: Any, schema: Dict[str, Any]) -> List[AgentTool]:
             description=(
                 "Convert a database question into a structured query plan and "
                 "resolve candidate tables, fields, and required join paths. Use "
-                "this before SQL for analytic or multi-table questions."
+                "this before SQL for analytic or multi-table questions. When the "
+                "result includes suggested_next_tool=db_query, call db_query with "
+                "suggested_next_arguments; do not call db_plan_query again for "
+                "the same goal."
             ),
             parameters=query_intent_parameters(include_diagnostics=True),
             handler=plan_query_tool_handler(plugin, schema),
@@ -52,10 +55,10 @@ def _sql_tools(plugin: Any, schema: Dict[str, Any]) -> List[AgentTool]:
             name="db_compile_and_query",
             description=(
                 "Plan, compile, validate, and execute a supported read-only "
-                "database question in one step. Use for clear count, top-N, "
-                "grouped aggregation, and simple filtered query intents."
+                "database question in one step. Use for clear single-table "
+                "counts, direct lookups, and simple filtered query intents."
             ),
-            parameters=query_intent_parameters(),
+            parameters=query_intent_parameters(mode="compile"),
             handler=compile_and_query_tool_handler(plugin, schema),
             timeout_seconds=60,
         ),
@@ -84,7 +87,9 @@ def _sql_tools(plugin: Any, schema: Dict[str, Any]) -> List[AgentTool]:
             name="db_query",
             description=(
                 "Run a read-only SQL query against the connected database. Add LIMIT "
-                "to control result size; a default LIMIT is applied when omitted."
+                "to control result size; a default LIMIT is applied when omitted. "
+                "After db_plan_query returns a validated plan_id, pass that plan_id "
+                "here instead of rewriting the SQL."
             ),
             parameters={
                 "type": "object",
@@ -174,6 +179,9 @@ def _sql_tools(plugin: Any, schema: Dict[str, Any]) -> List[AgentTool]:
                 },
                 handler=plugin._tool_execute,
                 timeout_seconds=60,
+                retry_safe=False,
+                replay_safe=False,
+                side_effecting=True,
             )
         )
     return tools
@@ -268,6 +276,9 @@ def _db_tool(
     parameters: Dict[str, Any],
     handler: Any,
     timeout_seconds: int,
+    replay_safe: bool = True,
+    retry_safe: bool = True,
+    side_effecting: bool = False,
 ) -> AgentTool:
     return AgentTool(
         name=name,
@@ -278,4 +289,7 @@ def _db_tool(
         source="from_db",
         plugin_name=plugin.__class__.__name__,
         timeout_seconds=timeout_seconds,
+        retry_safe=retry_safe,
+        replay_safe=replay_safe,
+        side_effecting=side_effecting,
     )

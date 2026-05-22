@@ -13,16 +13,19 @@ Covers:
 import json
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Dict, List
-from uuid import UUID, uuid4
+from typing import Any, List
+from uuid import uuid4
 
 import pytest
 
 from daita.agents.agent import Agent
+from daita.agents.db.runtime.state import DbRunState, set_db_run_state
+from daita.agents.runtime.contextvars import get_active_run_state
 from daita.core.exceptions import AgentError
 from daita.core.streaming import EventType
 from daita.core.tools import AgentTool
 from daita.core.tracing import get_trace_manager
+from daita.config.settings import Settings
 from daita.llm.mock import MockLLMProvider
 from daita.plugins.base import LifecyclePlugin
 
@@ -115,7 +118,11 @@ class TestBasicExecution:
         result = await agent.run("prompt", detailed=True)
         assert result.get("agent_name") == agent.name
 
-    async def test_run_no_llm_raises_agent_error(self):
+    async def test_run_no_llm_raises_agent_error(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(
+            Settings, "get_llm_api_key", lambda _settings, _provider: None
+        )
         agent = Agent(name="NoLLM", llm_provider="openai")
         # No API key → llm property returns None
         with pytest.raises(AgentError, match="No API key"):
@@ -175,6 +182,213 @@ class TestMaxIterations:
         agent = _make_agent(always_tool_call)
         with pytest.raises(AgentError, match="Max iterations"):
             await agent.run("go", max_iterations=2)
+
+    async def test_partial_exit_returns_evidence_backed_result_when_enabled(self):
+        async def lookup(args):
+            return {"answer": 7}
+
+        tool = AgentTool(
+            name="lookup",
+            description="Lookup a value",
+            parameters={"type": "object", "properties": {}},
+            handler=lookup,
+        )
+        repeated_call = {
+            "content": "Looking.",
+            "tool_calls": [{"id": "tc", "name": "lookup", "arguments": {}}],
+        }
+        agent = _make_agent([repeated_call], tools=[tool])
+
+        result = await agent.run(
+            "find the answer",
+            max_iterations=1,
+            detailed=True,
+            partial_exit=True,
+        )
+
+        assert result["partial"] is True
+        assert "Partial result based on evidence" in result["result"]
+        assert "lookup({}) returned {answer=7}" in result["result"]
+        assert result["diagnostics"]["exit_reason"] == "max_iterations_partial"
+        assert result["diagnostics"]["evidence_count"] == 1
+
+    async def test_partial_exit_is_plain_string_when_not_detailed(self):
+        async def lookup(args):
+            return {"answer": 9}
+
+        tool = AgentTool(
+            name="lookup",
+            description="Lookup a value",
+            parameters={"type": "object", "properties": {}},
+            handler=lookup,
+        )
+        repeated_call = {
+            "content": "Looking.",
+            "tool_calls": [{"id": "tc", "name": "lookup", "arguments": {}}],
+        }
+        agent = _make_agent([repeated_call], tools=[tool])
+
+        result = await agent.run(
+            "find the answer",
+            max_iterations=1,
+            partial_exit=True,
+        )
+
+        assert isinstance(result, str)
+        assert "answer=9" in result
+
+    async def test_terminal_tool_result_adds_final_synthesis_guidance(self):
+        async def query(args):
+            return {"rows": [{"answer": 7}]}
+
+        tool = AgentTool(
+            name="db_query",
+            description="Run a database query",
+            parameters={"type": "object", "properties": {}},
+            handler=query,
+        )
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "name": "db_query",
+                            "arguments": {"sql": "select"},
+                        }
+                    ],
+                },
+                "The answer is 7.",
+            ]
+        )
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
+
+        result = await agent.run(
+            "answer from db",
+            detailed=True,
+            final_synthesis_without_tools=True,
+            terminal_tools={"db_query"},
+        )
+
+        assert result["result"] == "The answer is 7."
+        second_call = llm.call_history[1]
+        assert second_call["tools"] in (None, [])
+        assert second_call["messages"][-1]["role"] == "user"
+        assert "Provide the final answer now" in second_call["messages"][-1]["content"]
+
+    async def test_terminal_tool_result_synthesizes_at_iteration_limit(self):
+        async def query(args):
+            return {"rows": [{"answer": 7}]}
+
+        tool = AgentTool(
+            name="db_query",
+            description="Run a database query",
+            parameters={"type": "object", "properties": {}},
+            handler=query,
+        )
+        repeated_tool_call = {
+            "content": "",
+            "tool_calls": [{"id": "c1", "name": "db_query", "arguments": {}}],
+        }
+        llm = SequentialMockLLM(response_sequence=[repeated_tool_call] * 4)
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
+
+        result = await agent.run(
+            "answer from db",
+            detailed=True,
+            max_iterations=3,
+            final_synthesis_without_tools=True,
+            terminal_tools={"db_query"},
+        )
+
+        assert result["result"] == 'Query result: [{"answer": 7}]'
+        assert result["diagnostics"]["exit_reason"] == "terminal_evidence_synthesis"
+
+    async def test_guardrail_payload_is_not_terminal_evidence(self):
+        async def query(args):
+            return {
+                "guardrail": "repeated_tool_error",
+                "message": "Try something else.",
+            }
+
+        tool = AgentTool(
+            name="db_query",
+            description="Run a database query",
+            parameters={"type": "object", "properties": {}},
+            handler=query,
+        )
+        repeated_tool_call = {
+            "content": "",
+            "tool_calls": [{"id": "c1", "name": "db_query", "arguments": {}}],
+        }
+        llm = SequentialMockLLM(response_sequence=[repeated_tool_call] * 2)
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
+
+        with pytest.raises(AgentError, match="Max iterations"):
+            await agent.run(
+                "answer from db",
+                max_iterations=1,
+                final_synthesis_without_tools=True,
+                terminal_tools={"db_query"},
+            )
+
+    async def test_suggested_next_tool_constrains_next_turn_tools(self):
+        async def plan(args):
+            return {
+                "ok": True,
+                "suggested_next_tool": "db_query",
+                "suggested_next_arguments": {"plan_id": "plan_1"},
+            }
+
+        async def query(args):
+            return {"rows": [{"answer": 7}]}
+
+        tools = [
+            AgentTool(
+                name="db_plan_query",
+                description="Plan",
+                parameters={"type": "object", "properties": {}},
+                handler=plan,
+            ),
+            AgentTool(
+                name="db_query",
+                description="Query",
+                parameters={"type": "object", "properties": {}},
+                handler=query,
+            ),
+        ]
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "c1", "name": "db_plan_query", "arguments": {}}
+                    ],
+                },
+                "The answer is 7.",
+            ]
+        )
+        agent = Agent(name="T", llm_provider=llm, tools=tools)
+
+        result = await agent.run("answer from db", detailed=True)
+
+        assert result["result"] == "The answer is 7."
+        second_call_tools = llm.call_history[1]["tools"]
+        assert [tool["function"]["name"] for tool in second_call_tools] == ["db_query"]
+        assert (
+            "suggested_next_arguments" in llm.call_history[1]["messages"][-2]["content"]
+        )
+
+    async def test_partial_exit_without_evidence_still_raises(self):
+        repeated_call = {
+            "content": "Calling missing tool.",
+            "tool_calls": [{"id": "tc", "name": "missing", "arguments": {}}],
+        }
+        agent = _make_agent([repeated_call])
+
+        with pytest.raises(AgentError, match="Max iterations"):
+            await agent.run("go", max_iterations=1, partial_exit=True)
 
     async def test_single_iteration_when_no_tool_calls(self):
         agent = _make_agent(["Direct answer."])
@@ -246,6 +460,157 @@ class TestToolCallingLoop:
         assert result["tool_calls"][0]["tool"] == "add"
         assert result["tool_calls"][0]["duration_ms"] >= 0
 
+    async def test_tool_handler_can_read_active_run_state(self):
+        seen_run_ids = []
+
+        async def h(args):
+            run_state = get_active_run_state()
+            seen_run_ids.append(run_state.run_id if run_state else None)
+            return "ok"
+
+        tool = AgentTool(
+            name="stateful",
+            description="Read run state",
+            parameters={"type": "object", "properties": {}},
+            handler=h,
+        )
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "Checking.",
+                    "tool_calls": [{"id": "c1", "name": "stateful", "arguments": {}}],
+                },
+                "Done.",
+            ]
+        )
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
+
+        result = await agent.run("check state", detailed=True)
+
+        assert seen_run_ids == [result["diagnostics"]["run_id"]]
+        assert get_active_run_state() is None
+
+    async def test_db_run_rejects_final_answer_without_query_evidence(self):
+        async def h(args):
+            run_state = get_active_run_state()
+            db_state = run_state.domains["db"]
+            db_state.record_executed_query(
+                {
+                    "sql": args["sql"],
+                    "row_count": 1,
+                    "returned_rows": 1,
+                    "truncated": False,
+                }
+            )
+            return {"rows": [{"customer": "Bob", "total_revenue": 250}]}
+
+        tool = AgentTool(
+            name="db_query",
+            description="Run SQL",
+            parameters={
+                "type": "object",
+                "properties": {"sql": {"type": "string"}},
+                "required": ["sql"],
+            },
+            handler=h,
+            category="database",
+            source="from_db",
+        )
+        llm = SequentialMockLLM(
+            response_sequence=[
+                "I need to inspect the schema first.",
+                {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "name": "db_query",
+                            "arguments": {
+                                "sql": "SELECT 'Bob' AS customer, 250 AS total_revenue"
+                            },
+                        }
+                    ],
+                },
+                "Bob has the highest total order revenue: 250.",
+            ]
+        )
+        agent = Agent(name="DbRuntimeAgent", llm_provider=llm, tools=[tool])
+        set_db_run_state(agent, DbRunState())
+
+        result = await agent.run(
+            "Which customer has the highest total order revenue?",
+            tools=["db_query"],
+            detailed=True,
+            max_iterations=4,
+        )
+
+        assert result["result"] == "Bob has the highest total order revenue: 250."
+        assert [call["tool"] for call in result["tool_calls"]] == ["db_query"]
+        assert result["diagnostics"]["db_completeness"]["can_answer"] is True
+        assert (
+            "db_final_answer_without_query_evidence"
+            in result["diagnostics"]["warnings"]
+        )
+        assert len(llm.call_history) == 3
+
+    async def test_db_run_rejects_incomplete_final_answer_after_query(self):
+        async def h(args):
+            run_state = get_active_run_state()
+            db_state = run_state.domains["db"]
+            db_state.record_executed_query(
+                {
+                    "sql": args["sql"],
+                    "row_count": 1,
+                    "returned_rows": 1,
+                    "truncated": False,
+                }
+            )
+            return {"rows": [{"customer": "Bob", "total_revenue": 250}]}
+
+        tool = AgentTool(
+            name="db_query",
+            description="Run SQL",
+            parameters={
+                "type": "object",
+                "properties": {"sql": {"type": "string"}},
+                "required": ["sql"],
+            },
+            handler=h,
+            category="database",
+            source="from_db",
+        )
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "name": "db_query",
+                            "arguments": {
+                                "sql": "SELECT 'Bob' AS customer, 250 AS total_revenue"
+                            },
+                        }
+                    ],
+                },
+                "I will write a corrected SQL query now.",
+                "Bob has the highest total order revenue: 250.",
+            ]
+        )
+        agent = Agent(name="DbRuntimeAgent", llm_provider=llm, tools=[tool])
+        set_db_run_state(agent, DbRunState())
+
+        result = await agent.run(
+            "Which customer has the highest total order revenue?",
+            tools=["db_query"],
+            detailed=True,
+            max_iterations=4,
+        )
+
+        assert result["result"] == "Bob has the highest total order revenue: 250."
+        assert "db_final_answer_incomplete" in result["diagnostics"]["warnings"]
+        assert len(llm.call_history) == 3
+
     async def test_iterations_incremented_per_llm_call(self):
         tool = _add_tool()
         llm = SequentialMockLLM(
@@ -263,6 +628,168 @@ class TestToolCallingLoop:
         result = await agent.run("go", detailed=True)
         # 1 iteration for tool call + 1 iteration for final answer = 2
         assert result["iterations"] == 2
+
+    async def test_repeated_tool_error_gets_guidance_before_hard_stop(self):
+        async def broken(args):
+            return {"error": "same failure"}
+
+        tool = AgentTool(
+            name="broken",
+            description="Always fails",
+            parameters={"type": "object", "properties": {}},
+            handler=broken,
+        )
+        repeated_call = {
+            "content": "Trying.",
+            "tool_calls": [{"id": "c1", "name": "broken", "arguments": {}}],
+        }
+        llm = SequentialMockLLM(response_sequence=[repeated_call] * 4)
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
+
+        with pytest.raises(AgentError, match="Loop detected"):
+            await agent.run("try it", max_iterations=4)
+
+        third_turn_messages = llm.call_history[2]["messages"]
+        guidance_messages = [
+            json.loads(message["content"])
+            for message in third_turn_messages
+            if message.get("role") == "tool"
+        ]
+        assert guidance_messages[-1]["guardrail"] == "repeated_tool_error"
+        assert guidance_messages[-1]["suggested_next_step"] == (
+            "change_arguments_or_synthesize"
+        )
+
+    async def test_repeated_identical_result_gets_no_progress_guidance(self):
+        async def read(args):
+            return {"value": 1}
+
+        tool = AgentTool(
+            name="read_value",
+            description="Read a value",
+            parameters={"type": "object", "properties": {}},
+            handler=read,
+        )
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "Reading.",
+                    "tool_calls": [{"id": "c1", "name": "read_value", "arguments": {}}],
+                },
+                {
+                    "content": "Reading again.",
+                    "tool_calls": [{"id": "c2", "name": "read_value", "arguments": {}}],
+                },
+                "Done.",
+            ]
+        )
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
+
+        result = await agent.run("read twice", detailed=True)
+
+        assert result["tool_calls"][1]["result"]["guardrail"] == "repeated_no_progress"
+        assert "repeated_no_progress" in result["diagnostics"]["warnings"]
+        assert result["diagnostics"]["evidence_count"] == 2
+
+    async def test_successful_db_plan_result_constrains_repeated_plan_turn(self):
+        plan_counter = 0
+
+        async def plan(args):
+            nonlocal plan_counter
+            plan_counter += 1
+            return {
+                "ok": True,
+                "plan_id": f"plan_{plan_counter}",
+                "route": "aggregation",
+                "compiled_sql": "SELECT 7 AS answer",
+                "validation": {"ok": True},
+                "suggested_next_tool": "db_query",
+                "suggested_next_arguments": {"plan_id": f"plan_{plan_counter}"},
+                "resolved_tables": ["answers"],
+            }
+
+        async def query(args):
+            return {"rows": [{"answer": 7}]}
+
+        tools = [
+            AgentTool(
+                name="db_plan_query",
+                description="Plan a database query",
+                parameters={"type": "object", "properties": {}},
+                handler=plan,
+            ),
+            AgentTool(
+                name="db_query",
+                description="Run a database query",
+                parameters={"type": "object", "properties": {}},
+                handler=query,
+            ),
+        ]
+        repeated_plan = lambda call_id: {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "name": "db_plan_query",
+                    "arguments": {"goal": "answer"},
+                }
+            ],
+        }
+        llm = SequentialMockLLM(
+            response_sequence=[
+                repeated_plan("c1"),
+                repeated_plan("c2"),
+                "The answer is 7.",
+            ]
+        )
+        agent = Agent(name="T", llm_provider=llm, tools=tools)
+
+        result = await agent.run("answer", detailed=True)
+
+        second_call_tools = llm.call_history[1]["tools"]
+        assert [tool["function"]["name"] for tool in second_call_tools] == ["db_query"]
+        assert (
+            "Tool 'db_plan_query' not found"
+            in result["tool_calls"][1]["result"]["error"]
+        )
+
+    async def test_different_arguments_do_not_trigger_repeat_guidance(self):
+        async def read(args):
+            return {"value": 1}
+
+        tool = AgentTool(
+            name="read_value",
+            description="Read a value",
+            parameters={
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+                "required": ["id"],
+            },
+            handler=read,
+        )
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "Reading.",
+                    "tool_calls": [
+                        {"id": "c1", "name": "read_value", "arguments": {"id": 1}}
+                    ],
+                },
+                {
+                    "content": "Reading another.",
+                    "tool_calls": [
+                        {"id": "c2", "name": "read_value", "arguments": {"id": 2}}
+                    ],
+                },
+                "Done.",
+            ]
+        )
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
+
+        result = await agent.run("read both", detailed=True)
+
+        assert "guardrail" not in result["tool_calls"][1]["result"]
+        assert result["diagnostics"]["evidence_count"] == 2
 
     async def test_tool_span_records_input_and_output_events(self):
         tm = get_trace_manager()
@@ -314,13 +841,13 @@ class TestToolCallingLoop:
 
 
 # ===========================================================================
-# JSON serialiser in _append_tool_messages
+# JSON serializer for tool result messages
 # ===========================================================================
 
 
 class TestJsonSerialiser:
     """
-    Tests for the custom json_serializer inside _append_tool_messages.
+    Tests for the custom json_serializer used in tool result messages.
     We exercise it by making a tool return values that are not natively
     JSON-serialisable and verifying that run() completes without error.
     """

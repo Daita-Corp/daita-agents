@@ -6,14 +6,9 @@ and zero-configuration tracing. Use Agent for most use cases; subclass BaseAgent
 for full control over the execution loop.
 """
 
-import hashlib
 import json
 import logging
 import time
-from dataclasses import dataclass
-from datetime import datetime, date
-from decimal import Decimal
-from uuid import UUID
 from typing import TYPE_CHECKING, Dict, Any, Optional, List, Union, Callable
 
 if TYPE_CHECKING:
@@ -26,103 +21,31 @@ from ..core.interfaces import LLMProvider
 from ..core.exceptions import AgentError, SkillError
 from ..skills.base import BaseSkill
 from ..core.tracing import TraceType
+from .runtime.guardrails import (
+    has_terminal_tool_result as _has_terminal_tool_result,
+    make_error_fingerprint as _make_error_fingerprint,
+    tool_loop_error_message as _tool_loop_error_message,
+)
+from .runtime.llm_turn import LLMResult
+from .runtime.loop import AgentRunController
+from .runtime.tools import (
+    execute_tool_call as _execute_tool_call,
+    json_serializer as _json_serializer,
+)
 from .base import BaseAgent
 
 logger = logging.getLogger(__name__)
 
-
-async def _execute_tool_call(
-    tool_call: Dict[str, Any], tools: List["AgentTool"]
-) -> Any:
-    """
-    Execute a single tool call with timeout and error handling.
-
-    Intentionally lives in the agent layer — tool execution is an agent concern.
-    The LLM layer is responsible for generating tool call requests; the agent
-    layer is responsible for acting on them.
-    """
-    tool_name = tool_call["name"]
-    arguments = tool_call["arguments"]
-
-    tool = next((t for t in tools if t.name == tool_name), None)
-    if not tool:
-        return {"error": f"Tool '{tool_name}' not found"}
-
-    try:
-        result = await asyncio.wait_for(
-            tool.handler(arguments), timeout=tool.timeout_seconds
-        )
-        return result
-    except asyncio.TimeoutError:
-        return {"error": f"Tool '{tool_name}' timed out after {tool.timeout_seconds}s"}
-    except Exception as e:
-        return {"error": f"Tool '{tool_name}' failed: {str(e)}"}
-
-
-def _make_error_fingerprint(tool_call: Dict[str, Any]) -> str:
-    """Stable hash of (tool_name, arguments) used for loop detection."""
-    args_hash = hashlib.md5(
-        json.dumps(tool_call.get("arguments", {}), sort_keys=True, default=str).encode()
-    ).hexdigest()[:8]
-    return f"{tool_call['name']}:{args_hash}"
-
-
-def _has_terminal_tool_result(
-    results: List[Dict[str, Any]], terminal_tools: set[str]
-) -> bool:
-    """Return True when a configured terminal tool completed without an error."""
-    if not terminal_tools:
-        return False
-    for result in results:
-        if result.get("tool") not in terminal_tools:
-            continue
-        raw = result.get("result")
-        if isinstance(raw, dict) and raw.get("error"):
-            continue
-        if isinstance(raw, dict) and (
-            raw.get("repair_required")
-            or raw.get("preflight_failed")
-            or raw.get("blocked_repeat")
-        ):
-            continue
-        return True
-    return False
-
-
-def _tool_loop_error_message(raw: Any) -> Optional[str]:
-    """Return an error-like message for tool results that should count as loops."""
-    if not isinstance(raw, dict):
-        return None
-    if raw.get("error"):
-        return str(raw["error"])
-    if raw.get("blocked_repeat"):
-        return str(raw.get("message") or raw.get("status") or "blocked repeat")
-    if raw.get("repair_required") or raw.get("preflight_failed"):
-        return str(raw.get("message") or raw.get("guidance") or "repair required")
-    return None
-
-
-def _json_serializer(obj):
-    """
-    Custom JSON serializer for types commonly returned by database plugins.
-
-    Handles datetime, Decimal, UUID, and other non-JSON-native types that
-    plugins might return from queries.
-    """
-    if isinstance(obj, (datetime, date)):
-        return obj.isoformat()
-    elif isinstance(obj, Decimal):
-        return float(obj)
-    elif isinstance(obj, UUID):
-        return str(obj)
-    elif isinstance(obj, bytes):
-        return obj.decode("utf-8", errors="replace")
-    elif hasattr(obj, "to_dict") and callable(obj.to_dict):
-        return obj.to_dict()
-    elif hasattr(obj, "__dict__"):
-        # Exclude private/internal attributes to avoid leaking credentials or state
-        return {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+__all__ = [
+    "Agent",
+    "FocusedTool",
+    "LLMResult",
+    "_execute_tool_call",
+    "_json_serializer",
+    "_make_error_fingerprint",
+    "_has_terminal_tool_result",
+    "_tool_loop_error_message",
+]
 
 
 # Import unified plugin access
@@ -184,28 +107,6 @@ class FocusedTool:
 
     def __repr__(self):
         return f"FocusedTool({self._tool.name}, focus={self._focus!r})"
-
-
-@dataclass
-class LLMResult:
-    """Unified LLM response format for both streaming and non-streaming."""
-
-    text: str
-    tool_calls: List[Dict[str, Any]]
-
-    @classmethod
-    def from_response(cls, response: Any) -> "LLMResult":
-        """Create LLMResult from non-streaming response."""
-        if isinstance(response, str):
-            return cls(text=response, tool_calls=[])
-        elif isinstance(response, dict):
-            return cls(
-                text=response.get("content", ""),
-                tool_calls=response.get("tool_calls", []),
-            )
-        else:
-            logger.warning(f"Unexpected response type: {type(response)}")
-            return cls(text=str(response), tool_calls=[])
 
 
 def _resolve_tool_focus(
@@ -750,123 +651,6 @@ class Agent(BaseAgent):
 
         return result
 
-    async def _stream_llm_turn(
-        self,
-        conversation: List[Dict],
-        tools: List["AgentTool"],
-        on_event: Callable,
-        **kwargs,
-    ) -> LLMResult:
-        """Execute streaming LLM turn with event emission."""
-        from ..core.streaming import EventType
-
-        thinking_text = ""
-        tool_calls = []
-
-        async for chunk in await self.llm.generate(
-            messages=conversation, tools=tools, stream=True, **kwargs
-        ):
-            if chunk.type == "text":
-                thinking_text += chunk.content
-                self._emit_event(on_event, EventType.THINKING, content=chunk.content)
-
-            elif chunk.type == "tool_call_complete":
-                tool_calls.append(
-                    {
-                        "id": chunk.tool_call_id,
-                        "name": chunk.tool_name,
-                        "arguments": chunk.tool_args,
-                    }
-                )
-                self._emit_event(
-                    on_event,
-                    EventType.TOOL_CALL,
-                    tool_name=chunk.tool_name,
-                    tool_args=chunk.tool_args,
-                )
-
-        return LLMResult(text=thinking_text, tool_calls=tool_calls)
-
-    async def _nonstream_llm_turn(
-        self, conversation: List[Dict], tools: List["AgentTool"], **kwargs
-    ) -> LLMResult:
-        """Execute non-streaming LLM turn."""
-        return LLMResult.from_response(
-            await self.llm.generate(
-                messages=conversation, tools=tools, stream=False, **kwargs
-            )
-        )
-
-    async def _execute_and_track_tool(
-        self,
-        tool_call: Dict[str, Any],
-        tools: List["AgentTool"],
-        on_event: Optional[Callable],
-    ) -> Dict[str, Any]:
-        """Execute tool and emit result event."""
-        from ..core.streaming import EventType
-
-        tool_name = tool_call["name"]
-
-        async with self.trace_manager.span(
-            operation_name=f"tool_{tool_name}",
-            trace_type=TraceType.TOOL_EXECUTION,
-            agent_id=self.agent_id,
-            tool_name=tool_name,
-            input_data=tool_call.get("arguments"),
-        ) as span_id:
-            # Track execution time
-            start_time = time.time()
-
-            result = await _execute_tool_call(tool_call, tools)
-            self.trace_manager.record_output(span_id, result)
-
-            # Calculate duration
-            duration_ms = int((time.time() - start_time) * 1000)
-
-            # Track this tool call in history
-            tool_call_record = {
-                "name": tool_name,
-                "duration_ms": duration_ms,
-                "input": tool_call.get("arguments"),
-                "output": result,
-            }
-            self._tool_call_history.append(tool_call_record)
-
-            # Emit result event
-            self._emit_event(
-                on_event, EventType.TOOL_RESULT, tool_name=tool_name, result=result
-            )
-
-            return {
-                "tool": tool_name,
-                "arguments": tool_call["arguments"],
-                "result": result,
-                "duration_ms": duration_ms,
-            }
-
-    def _append_tool_messages(
-        self, conversation: List[Dict], tool_calls: List[Dict], results: List[Any]
-    ):
-        """Add tool calls and results to conversation history."""
-        # Add assistant message with tool calls
-        conversation.append({"role": "assistant", "tool_calls": tool_calls})
-
-        # Add tool result messages
-        for tool_call, result in zip(tool_calls, results):
-            content_result = result["result"]
-            compactor = getattr(self, "_compact_tool_result_for_context", None)
-            if callable(compactor):
-                content_result = compactor(tool_call["name"], content_result)
-            conversation.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "name": tool_call["name"],
-                    "content": json.dumps(content_result, default=_json_serializer),
-                }
-            )
-
     def _build_final_result(
         self,
         final_text: str,
@@ -983,110 +767,13 @@ class Agent(BaseAgent):
         **kwargs,
     ) -> Dict[str, Any]:
         """Unified autonomous execution path for both streaming and non-streaming."""
-        from ..core.streaming import EventType
-
-        # Check if LLM provider is available
-        if self.llm is None:
-            provider_name = self._llm_provider_name or "openai"
-            raise AgentError(
-                f"Cannot execute: No API key found for '{provider_name}'. "
-                f"Set {provider_name.upper()}_API_KEY environment variable "
-                f"or pass api_key parameter to Agent."
-            )
-
-        # Prepare tools with focus wrapping
-        resolved_tools = await self._prepare_tools_with_focus(tools)
-        active_tools = resolved_tools
-        final_synthesis_without_tools = bool(
-            kwargs.pop("final_synthesis_without_tools", False)
-        )
-        terminal_tools = set(kwargs.pop("terminal_tools", []) or [])
-
-        # Reset tool call history for this execution
-        self._tool_call_history = []
-
-        conversation = await self._build_initial_conversation(prompt, initial_messages)
-        tools_called = []
-
-        # Tracks consecutive error count per (tool_name, args) fingerprint.
-        # Reset to 0 on any successful call with that fingerprint.
-        # Raised to AgentError when the same call fails 3 times in a row —
-        # the agent has demonstrated it cannot self-correct from this error.
-        _error_fingerprints: Dict[str, int] = {}
-
-        # Autonomous tool calling loop
-        for iteration in range(max_iterations):
-            # Emit iteration event
-            self._emit_event(
-                on_event,
-                EventType.ITERATION,
-                iteration=iteration + 1,
-                max_iterations=max_iterations,
-            )
-
-            # Get LLM response (streaming or non-streaming based on on_event)
-            if on_event:
-                llm_result = await self._stream_llm_turn(
-                    conversation, active_tools, on_event, **kwargs
-                )
-            else:
-                llm_result = await self._nonstream_llm_turn(
-                    conversation, active_tools, **kwargs
-                )
-
-            # Check if LLM wants to call tools
-            if llm_result.tool_calls:
-                # Execute each tool
-                results = []
-                for tool_call in llm_result.tool_calls:
-                    result = await self._execute_and_track_tool(
-                        tool_call, active_tools, on_event
-                    )
-                    tools_called.append(result)
-                    results.append(result)
-
-                    # Loop detection: identical (tool, args) producing consecutive errors
-                    raw = result.get("result", {})
-                    fp = _make_error_fingerprint(tool_call)
-                    loop_error = _tool_loop_error_message(raw)
-                    if loop_error:
-                        _error_fingerprints[fp] = _error_fingerprints.get(fp, 0) + 1
-                        if _error_fingerprints[fp] >= 3:
-                            raise AgentError(
-                                f"Loop detected: '{tool_call['name']}' returned a repair/error result "
-                                f"{_error_fingerprints[fp]} consecutive times with identical "
-                                f"arguments. Last result: {loop_error}"
-                            )
-                    else:
-                        _error_fingerprints.pop(fp, None)
-
-                # Add to conversation and continue loop
-                self._append_tool_messages(conversation, llm_result.tool_calls, results)
-                if final_synthesis_without_tools and _has_terminal_tool_result(
-                    results, terminal_tools
-                ):
-                    active_tools = []
-                else:
-                    active_tools = resolved_tools
-                continue
-
-            # Final answer received
-            return self._build_final_result(
-                llm_result.text, tools_called, iteration + 1, on_event
-            )
-
-        # Max iterations reached without final answer
-        token_stats = self.llm.get_token_stats() if self.llm is not None else {}
-        raise AgentError(
-            f"Max iterations ({max_iterations}) reached without final answer",
-            agent_id=self.agent_id,
-            task=prompt,
-            context={
-                "max_iterations": max_iterations,
-                "iterations": max_iterations,
-                "tool_calls": tools_called,
-                "tokens": token_stats,
-            },
+        return await AgentRunController(self).run(
+            prompt=prompt,
+            tools=tools,
+            max_iterations=max_iterations,
+            on_event=on_event,
+            initial_messages=initial_messages,
+            **kwargs,
         )
 
     # ========================================================================

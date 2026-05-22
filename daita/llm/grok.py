@@ -115,7 +115,7 @@ class GrokProvider(OpenAICompatibleMixin, BaseLLMProvider):
 
         except Exception as e:
             logger.error(f"Grok generation failed: {str(e)}")
-            raise LLMError(f"Grok generation failed: {str(e)}")
+            raise self._provider_error("Grok generation failed", e) from e
 
     async def _stream_impl(
         self,
@@ -191,7 +191,7 @@ class GrokProvider(OpenAICompatibleMixin, BaseLLMProvider):
 
         except Exception as e:
             logger.error(f"Grok streaming failed: {str(e)}")
-            raise LLMError(f"Grok streaming failed: {str(e)}")
+            raise self._provider_error("Grok streaming failed", e) from e
 
     @property
     def info(self) -> Dict[str, Any]:

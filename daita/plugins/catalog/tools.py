@@ -432,6 +432,9 @@ def _catalog_tool(
     handler_fn,
     plugin: "CatalogPlugin",
     timeout_seconds: int = 60,
+    replay_safe: bool = True,
+    retry_safe: bool = True,
+    side_effecting: bool = False,
 ) -> "AgentTool":
     """Create an AgentTool with catalog defaults and bound handler."""
     from ...core.tools import AgentTool
@@ -442,6 +445,9 @@ def _catalog_tool(
         parameters=parameters,
         handler=lambda args, p=plugin: handler_fn(p, args),
         timeout_seconds=timeout_seconds,
+        retry_safe=retry_safe,
+        replay_safe=replay_safe,
+        side_effecting=side_effecting,
         **_CATALOG_TOOL_DEFAULTS,
     )
 

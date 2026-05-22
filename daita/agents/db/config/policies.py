@@ -9,6 +9,52 @@ from typing import Literal
 
 BudgetPreset = Literal["auto", "full", "compact", "retrieval"]
 
+CORE_DB_QUERY_TOOLS = (
+    "db_compile_and_query",
+    "db_plan_query",
+    "db_query",
+    "db_count",
+    "db_sample",
+    "db_find",
+    "db_aggregate",
+)
+ANSWER_EVIDENCE_DB_TOOLS = (
+    "db_query",
+    "db_compile_and_query",
+    "db_find",
+    "db_aggregate",
+)
+TERMINAL_DB_TOOLS = (
+    "db_compile_and_query",
+    "db_query",
+    "db_count",
+    "db_sample",
+    "db_find",
+    "db_aggregate",
+)
+WRITE_DB_TOOLS = ("db_execute",)
+DB_MEMORY_TOOLS = ("db_remember",)
+GENERIC_PROVIDER_DB_TOOLS = (
+    "db_query",
+    "db_count",
+    "db_sample",
+    "db_execute",
+    "db_find",
+    "db_aggregate",
+)
+GENERIC_MEMORY_WRITE_TOOLS = (
+    "remember",
+    "update_memory",
+)
+SCHEMA_NAVIGATION_TOOLS = (
+    "catalog_search_schema",
+    "catalog_inspect_table",
+    "catalog_find_join_paths",
+    "search_catalog",
+    "inspect_asset",
+    "find_relationship_paths",
+)
+
 
 @dataclass(frozen=True)
 class SchemaPromptPolicy:

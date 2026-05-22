@@ -179,9 +179,11 @@ def build_prompt_result(
     )
     lines.append("- Always use LIMIT to keep result sets manageable.")
     lines.append(
-        "- For clear count, top-N, grouped aggregation, and simple filtered "
-        "questions, prefer db_compile_and_query first. Use db_plan_query for "
-        "ambiguous, multi-table, join-heavy, validation, or debugging workflows."
+        "- For clear single-table counts, direct lookups, and simple filtered "
+        "questions, prefer db_compile_and_query first. For open-ended analytics, "
+        "grouping, ranking, entity labels, joins, validation, or debugging, use "
+        "db_plan_query first, then execute the validated plan with db_query using "
+        "the returned suggested_next_arguments."
     )
     lines.append(
         "- Use catalog/schema tools to traverse tables, columns, and relationships; "

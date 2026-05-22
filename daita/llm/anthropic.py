@@ -166,7 +166,7 @@ class AnthropicProvider(BaseLLMProvider):
 
         except Exception as e:
             logger.error(f"Anthropic generation failed: {str(e)}")
-            raise LLMError(f"Anthropic generation failed: {str(e)}")
+            raise self._provider_error("Anthropic generation failed", e) from e
 
     async def _stream_impl(
         self,
@@ -252,7 +252,7 @@ class AnthropicProvider(BaseLLMProvider):
 
         except Exception as e:
             logger.error(f"Anthropic streaming failed: {str(e)}")
-            raise LLMError(f"Anthropic streaming failed: {str(e)}")
+            raise self._provider_error("Anthropic streaming failed", e) from e
 
     async def generate_with_system(
         self, prompt: str, system_message: str, **kwargs

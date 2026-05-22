@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
-def query_intent_parameters(*, include_diagnostics: bool = False) -> Dict[str, Any]:
+def query_intent_parameters(
+    *, include_diagnostics: bool = False, mode: str = "plan"
+) -> Dict[str, Any]:
     properties = {
         "goal": {
             "type": "string",
@@ -21,11 +23,6 @@ def query_intent_parameters(*, include_diagnostics: bool = False) -> Dict[str, A
             "items": {"type": "string"},
             "description": "Likely tables or collections involved.",
         },
-        "required_joins": {
-            "type": "array",
-            "items": {"type": "object"},
-            "description": "Join requirements with from_tables and to_tables arrays.",
-        },
         "filters": {
             "type": "array",
             "items": {"type": "string"},
@@ -36,31 +33,45 @@ def query_intent_parameters(*, include_diagnostics: bool = False) -> Dict[str, A
             "items": {"type": "string"},
             "description": "Requested metrics such as count, sum, average.",
         },
-        "grouping": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Fields to group by.",
-        },
-        "ordering": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Sort requirements.",
-        },
         "limit": {
             "type": "integer",
             "description": "Maximum rows requested, if any.",
         },
-        "assumptions": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Assumptions needed to proceed.",
-        },
-        "answer_checks": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Completeness checks for the final answer.",
-        },
     }
+    if mode == "plan":
+        properties.update(
+            {
+                "required_joins": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": (
+                        "Join requirements with from_tables and to_tables arrays."
+                    ),
+                },
+                "grouping": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Fields to group by.",
+                },
+                "ordering": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Sort requirements.",
+                },
+                "assumptions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Assumptions needed to proceed.",
+                },
+                "answer_checks": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Completeness checks for the final answer.",
+                },
+            }
+        )
+    elif mode != "compile":
+        raise ValueError("mode must be 'plan' or 'compile'")
     if include_diagnostics:
         properties["include_diagnostics"] = {
             "type": "boolean",

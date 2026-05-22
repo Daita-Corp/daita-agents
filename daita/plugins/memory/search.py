@@ -6,6 +6,7 @@ Supports importance-weighted scoring and temporal decay.
 """
 
 import json
+import hashlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime

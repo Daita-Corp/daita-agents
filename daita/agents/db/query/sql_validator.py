@@ -49,7 +49,7 @@ def validate_sql_against_schema(
     missing_columns = _missing_columns(analysis, table_columns)
 
     if not unknown_tables and not missing_columns:
-        return {"ok": True, "sql_fingerprint": sql_fingerprint(sql)}
+        return _validation_ok(sql, analysis)
 
     inspect_tables = _tables_to_inspect(unknown_tables, missing_columns)
     return {
@@ -198,6 +198,36 @@ def required_field_warnings(
 def sql_fingerprint(sql: str) -> str:
     normalized = re.sub(r"\s+", " ", (sql or "").strip().lower())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _validation_ok(sql: str, analysis: SqlAnalysis) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "sql_fingerprint": sql_fingerprint(sql),
+        "referenced_tables": sorted(
+            {table.key for table in analysis.tables if not table.is_cte}
+        ),
+        "referenced_columns": sorted(analysis.referenced_column_names),
+        "selected_columns": _selected_output_columns(analysis),
+    }
+
+
+def _selected_output_columns(analysis: SqlAnalysis) -> list[str]:
+    columns: list[str] = []
+    for item in analysis.select_items:
+        name = item.alias or _simple_selected_expression_name(item.expression_sql)
+        if name and name not in columns:
+            columns.append(name)
+    return columns
+
+
+def _simple_selected_expression_name(expression_sql: str) -> str:
+    expression = str(expression_sql or "").strip().strip('"`[]')
+    if not expression:
+        return ""
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?", expression):
+        return expression.rsplit(".", 1)[-1]
+    return ""
 
 
 def _validation_error(

@@ -552,8 +552,22 @@ class BaseAgent(AgentABC):
             should_retry = False
             confidence = 0.0
 
+            if getattr(error, "_daita_suppress_whole_run_retry", False):
+                reasoning.append(
+                    "Whole-run retry suppressed because committed tool work is not replay-safe"
+                )
+                should_retry = False
+                confidence = 1.0
+
+            elif getattr(error, "_daita_stream_event_emitted", False):
+                reasoning.append(
+                    "Whole-run retry suppressed because streaming output was already emitted"
+                )
+                should_retry = False
+                confidence = 1.0
+
             # Check attempt limit
-            if attempt >= max_attempts:
+            elif attempt >= max_attempts:
                 reasoning.append(f"Max attempts reached ({attempt}/{max_attempts})")
                 should_retry = False
                 confidence = 1.0  # Certain we shouldn't retry

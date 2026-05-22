@@ -10,7 +10,6 @@ import logging
 import asyncio
 from typing import TYPE_CHECKING, Dict, Any, Optional, List
 
-from ..core.exceptions import LLMError
 from .base import BaseLLMProvider
 
 if TYPE_CHECKING:
@@ -210,7 +209,7 @@ class GeminiProvider(BaseLLMProvider):
 
         except Exception as e:
             logger.error(f"Gemini generation failed: {str(e)}")
-            raise LLMError(f"Gemini generation failed: {str(e)}")
+            raise self._provider_error("Gemini generation failed", e) from e
 
     async def _stream_impl(
         self,
@@ -273,7 +272,7 @@ class GeminiProvider(BaseLLMProvider):
 
         except Exception as e:
             logger.error(f"Gemini streaming failed: {str(e)}")
-            raise LLMError(f"Gemini streaming failed: {str(e)}")
+            raise self._provider_error("Gemini streaming failed", e) from e
 
     def _convert_tools_to_format(
         self, tools: List["AgentTool"]

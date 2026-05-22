@@ -60,6 +60,7 @@ from ..core.exceptions import (
     ConnectionError as DaitaConnectionError,
     AuthenticationError,
 )
+from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
 
@@ -552,10 +553,8 @@ class ExaSearchPlugin(BasePlugin):
             include_summary=args.get("include_summary"),
         )
 
-    def get_tools(self) -> List["AgentTool"]:
+    def get_tools(self) -> List[AgentTool]:
         """Expose Exa search operations as agent tools."""
-        from ..core.tools import AgentTool
-
         return [
             AgentTool(
                 name="search_web",

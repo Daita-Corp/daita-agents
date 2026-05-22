@@ -39,18 +39,6 @@ def catalog_schema_snapshot(agent: Any) -> Dict[str, Any]:
     return schema.to_dict() if hasattr(schema, "to_dict") else dict(schema)
 
 
-def catalog_store_summary(agent: Any, *, limit: int = 50) -> Dict[str, Any]:
-    """Return active catalog summary."""
-    catalog = vars(agent).get("_db_catalog")
-    store_id = vars(agent).get("_db_catalog_store_id")
-    if catalog is None or not store_id:
-        return {}
-    summary = catalog.summarize_store(store_id, limit=limit)
-    if summary and not summary.get("error"):
-        return summary
-    return {}
-
-
 def primary_key_or_identity(table: Dict[str, Any]) -> Optional[str]:
     columns = table.get("columns") or []
     for column in columns:

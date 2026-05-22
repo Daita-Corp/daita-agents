@@ -5,6 +5,7 @@ Compact per-run context for agents created by ``Agent.from_db()``.
 import re
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
+from ..config.policies import SCHEMA_NAVIGATION_TOOLS, TERMINAL_DB_TOOLS
 from ..catalog_read_model import build_db_catalog_read_model
 from ..utils import ANALYST_TOOL_PREFIXES
 
@@ -15,22 +16,6 @@ if TYPE_CHECKING:
 DEFAULT_CONTEXT_MAX_CHARS = 1600
 SCHEMA_HINT_MAX_TABLES = 5
 SCHEMA_HINT_MAX_RELATIONSHIPS = 5
-TERMINAL_DB_TOOLS = (
-    "db_compile_and_query",
-    "db_query",
-    "db_count",
-    "db_sample",
-    "db_find",
-    "db_aggregate",
-)
-SCHEMA_NAVIGATION_TOOLS = (
-    "catalog_search_schema",
-    "catalog_inspect_table",
-    "catalog_find_join_paths",
-    "search_catalog",
-    "inspect_asset",
-    "find_relationship_paths",
-)
 
 
 def build_db_run_context(
@@ -52,7 +37,7 @@ def build_db_run_context(
 
     lines = [
         "<db_runtime_context>",
-        "Use DB tools autonomously. Plan analytic or multi-table work with db_plan_query; do not retry identical failed SQL.",
+        "Use DB tools autonomously. Plan open-ended analytic, ranking, label, filtered, or multi-table work with db_plan_query, then execute validated plans with db_query using suggested_next_arguments. Do not repeat db_plan_query for the same goal after it returns a plan_id.",
         (
             "Database: "
             f"type={read_model.database_type}, "
@@ -63,6 +48,11 @@ def build_db_run_context(
             f"relationships={read_model.relationship_count}"
         ),
         "Query policy: " + _query_policy_summary(plugin),
+        (
+            "Answer policy: execute an answer-bearing DB query before final "
+            "answers; when identifying an entity, include its human-readable "
+            "name or label with the id when available."
+        ),
         "Capabilities: " + _capability_summary(agent, tool_names),
         "Memory: " + _memory_summary(agent, memory_snippets or []),
         "Data health: " + _summary_line(summary),

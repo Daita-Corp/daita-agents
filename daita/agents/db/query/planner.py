@@ -175,6 +175,9 @@ def build_query_plan(
         ),
     }
     result["next_step"] = result["next_steps"][0] if result["next_steps"] else None
+    if compiled_sql:
+        result["suggested_next_tool"] = "db_query"
+        result["suggested_next_arguments"] = {"sql": compiled_sql}
     if include_diagnostics:
         result.update(diagnostic_fields)
 
@@ -185,10 +188,18 @@ def build_query_plan(
             run_state.record_join_paths(path_result)
         plan_id = run_state.record_plan(plan, result)
         result["plan_id"] = plan_id
+        if compiled_sql:
+            result["suggested_next_arguments"] = {"plan_id": plan_id}
+            result["next_steps"] = [f"run db_query with plan_id={plan_id}"]
+            result["next_step"] = result["next_steps"][0]
         stored = run_state.get_plan(plan_id)
         if stored is not None:
             stored["result"]["plan_id"] = plan_id
             stored["result"].update(diagnostic_fields)
+            if compiled_sql:
+                stored["result"]["suggested_next_arguments"] = {"plan_id": plan_id}
+                stored["result"]["next_steps"] = list(result["next_steps"])
+                stored["result"]["next_step"] = result["next_step"]
 
     return result
 

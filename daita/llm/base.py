@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 import logging
 
+from ..core.exceptions import LLMError
 from ..core.tracing import get_trace_manager, TraceType
 from ..core.interfaces import LLMProvider
 from .pricing import CostEstimate, TokenUsage, estimate_llm_cost
@@ -395,6 +396,60 @@ class BaseLLMProvider(LLMProvider, ABC):
         if not self.api_key:
             raise ValueError(f"API key required for {self.__class__.__name__}")
 
+    def _provider_error(self, message: str, error: Exception) -> LLMError:
+        """Wrap provider SDK errors while preserving retry-relevant context."""
+        status_code = _get_error_status_code(error)
+        error_type = error.__class__.__name__
+        retry_after = getattr(error, "retry_after", None)
+        if retry_after is None:
+            response = getattr(error, "response", None)
+            headers = getattr(response, "headers", None)
+            if headers is not None:
+                retry_after = headers.get("retry-after") or headers.get("Retry-After")
+
+        retry_hint = "retryable"
+        if status_code in {408, 409, 429, 500, 502, 503, 504}:
+            retry_hint = "transient"
+        elif status_code in {400, 401, 402, 403, 404, 422}:
+            retry_hint = "permanent"
+        elif error_type in {
+            "APIConnectionError",
+            "APITimeoutError",
+            "ConnectError",
+            "ConnectionError",
+            "InternalServerError",
+            "RateLimitError",
+            "ReadTimeout",
+            "ServiceUnavailableError",
+            "TimeoutError",
+        }:
+            retry_hint = "transient"
+        elif error_type in {
+            "AuthenticationError",
+            "BadRequestError",
+            "BillingError",
+            "InvalidRequestError",
+            "NotFoundError",
+            "PermissionDeniedError",
+            "PermissionError",
+            "QuotaExceededError",
+            "ValidationError",
+        }:
+            retry_hint = "permanent"
+
+        context = {
+            "provider_error_type": error_type,
+            "status_code": status_code,
+            "retry_after": retry_after,
+        }
+        return LLMError(
+            f"{message}: {error}",
+            provider=self.provider_name,
+            model=self.model,
+            retry_hint=retry_hint,
+            context=context,
+        )
+
     def set_agent_id(self, agent_id: str):
         """
         Set the agent ID for tracing context.
@@ -526,6 +581,23 @@ def _get_usage_field(value: Any, key: str, default: Any = None) -> Any:
     if isinstance(value, dict):
         return value.get(key, default)
     return getattr(value, key, default)
+
+
+def _get_error_status_code(error: Exception) -> Optional[int]:
+    for attr in ("status_code", "status"):
+        value = getattr(error, attr, None)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    response = getattr(error, "response", None)
+    value = getattr(response, "status_code", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 # Context manager for batch LLM operations

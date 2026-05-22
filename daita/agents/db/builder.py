@@ -9,6 +9,8 @@ from .describe import attach_db_describe
 from .memory import DBMemory, calibrate_db_memory, create_db_memory_tools
 from .config.policies import (
     BudgetPreset,
+    GENERIC_MEMORY_WRITE_TOOLS,
+    GENERIC_PROVIDER_DB_TOOLS,
     SchemaPromptPolicy,
     ToolResultPolicy,
     schema_prompt_policy_for_budget,
@@ -33,19 +35,6 @@ if TYPE_CHECKING:
     from ...plugins.base_db import BaseDatabasePlugin
 
 logger = logging.getLogger(__name__)
-
-_GENERIC_DB_TOOLS = {
-    "db_query",
-    "db_count",
-    "db_sample",
-    "db_execute",
-    "db_find",
-    "db_aggregate",
-}
-_GENERIC_MEMORY_WRITE_TOOLS = {
-    "remember",
-    "update_memory",
-}
 
 
 async def from_db(
@@ -553,7 +542,7 @@ def _remove_provider_db_tools(agent: "Agent") -> None:
     """Keep provider-owned tools internal to from_db after generic facades exist."""
 
     for tool_name in list(agent.tool_registry.tool_names):
-        if tool_name in _GENERIC_DB_TOOLS:
+        if tool_name in GENERIC_PROVIDER_DB_TOOLS:
             continue
         if tool_name.endswith("_vector_search"):
             continue
@@ -650,7 +639,7 @@ def _remove_generic_memory_write_tools(agent: "Agent") -> None:
     registry = getattr(agent, "tool_registry", None)
     if registry is None:
         return
-    for tool_name in _GENERIC_MEMORY_WRITE_TOOLS:
+    for tool_name in GENERIC_MEMORY_WRITE_TOOLS:
         registry.remove(tool_name)
 
 

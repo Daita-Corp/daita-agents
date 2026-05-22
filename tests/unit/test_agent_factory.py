@@ -4160,10 +4160,10 @@ class TestFromDbToolProfiles:
         )
 
         assert selected == [
-            "db_compile_and_query",
             "db_plan_query",
             "db_query",
             "db_validate_sql",
+            "db_compile_and_query",
         ]
 
     def test_join_prompt_keeps_relationship_navigation_tools(self):
@@ -4189,9 +4189,9 @@ class TestFromDbToolProfiles:
         )
 
         assert selected == [
-            "db_compile_and_query",
             "db_plan_query",
             "db_query",
+            "db_compile_and_query",
             "catalog_search_schema",
             "catalog_inspect_table",
             "catalog_find_join_paths",
@@ -4290,6 +4290,30 @@ class TestFromDbToolProfiles:
         )
 
         assert "dq_detect_anomaly" in selected
+
+    def test_strict_explicit_tool_request_uses_only_named_tool(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_compile_and_query",
+                    "db_plan_query",
+                    "db_query",
+                    "db_count",
+                    "catalog_search_schema",
+                ]
+            ),
+        )
+
+        selected = select_db_tools_for_prompt(
+            agent,
+            "Use db_query exactly once to answer which customer has top revenue",
+        )
+
+        assert selected == ["db_query"]
 
 
 class TestPivotTableTool:

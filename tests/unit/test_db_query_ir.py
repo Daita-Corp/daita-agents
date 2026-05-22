@@ -11,8 +11,14 @@ from daita.agents.db.query import (
 )
 from daita.agents.db.query.ir_validator import validate_query_plan
 from daita.agents.db.query.sql_validator import validate_sql_against_schema
+from daita.agents.db.runtime.completeness import (
+    attach_db_completeness,
+    summarize_db_completeness,
+)
 from daita.agents.db.runtime.state import DbRunState, set_db_run_state
 from daita.agents.db.tools.query import create_db_query_tools
+from daita.agents.runtime.contextvars import active_run_state
+from daita.agents.runtime.state import RunState
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.base_profiler import NormalizedSchema
 
@@ -46,10 +52,19 @@ def _agent_with_catalog(schema, **attrs):
 
 async def _attach_plugin_catalog(plugin, schema):
     catalog = CatalogPlugin()
-    registered = await catalog.register_schema(schema, store_type=schema["database_type"])
+    registered = await catalog.register_schema(
+        schema, store_type=schema["database_type"]
+    )
     plugin._db_catalog = catalog
     plugin._db_catalog_store_id = registered["store_id"]
     return catalog, registered["store_id"]
+
+
+def _activate_run_state(db_state=None):
+    run_state = RunState(agent_id="test-agent")
+    if db_state is not None:
+        run_state.domains["db"] = db_state
+    return run_state, active_run_state.set(run_state)
 
 
 def test_query_ir_round_trips_to_plain_dicts():
@@ -217,11 +232,83 @@ async def test_db_query_executes_validated_plan_id_without_sql_preflight():
     )
     result = await tools["db_query"].handler({"plan_id": plan_result["plan_id"]})
 
-    assert plan_result["next_steps"] == ["run db_query with plan_id"]
+    assert plan_result["next_steps"] == ["run db_query with plan_id=plan_1"]
+    assert plan_result["suggested_next_tool"] == "db_query"
+    assert plan_result["suggested_next_arguments"] == {"plan_id": "plan_1"}
     assert "query_ir" not in plan_result
     assert result == {"rows": [{"total_orders": 3}]}
     plugin._tool_query.assert_awaited_once()
     assert plugin._tool_query.await_args.args[0]["sql"] == plan_result["compiled_sql"]
+
+
+async def test_db_query_falls_back_to_sql_when_unknown_plan_id_is_paired_with_sql():
+    schema = _schema(
+        tables=[
+            _table(
+                "orders",
+                [
+                    {"name": "order_id", "type": "integer"},
+                ],
+            )
+        ]
+    )
+    plugin = MagicMock()
+    plugin.sql_dialect = "postgresql"
+    plugin.read_only = True
+    plugin._tool_query = AsyncMock(return_value={"rows": [{"order_id": 1}]})
+    plugin._tool_count = AsyncMock(return_value={"count": 0})
+    plugin._tool_sample = AsyncMock(return_value={"rows": []})
+    set_db_run_state(plugin, DbRunState())
+
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+    result = await tools["db_query"].handler(
+        {"plan_id": "missing_plan", "sql": "SELECT order_id FROM orders"}
+    )
+
+    assert result == {"rows": [{"order_id": 1}]}
+    plugin._tool_query.assert_awaited_once()
+    assert plugin._tool_query.await_args.args[0] == {
+        "sql": "SELECT order_id FROM orders"
+    }
+
+
+async def test_db_query_falls_back_to_sql_when_plan_id_is_not_executable():
+    schema = _schema(
+        tables=[
+            _table(
+                "orders",
+                [
+                    {"name": "order_id", "type": "integer"},
+                ],
+            )
+        ]
+    )
+    plugin = MagicMock()
+    plugin.sql_dialect = "postgresql"
+    plugin.read_only = True
+    plugin._tool_query = AsyncMock(return_value={"rows": []})
+    plugin._tool_count = AsyncMock(return_value={"count": 0})
+    plugin._tool_sample = AsyncMock(return_value={"rows": []})
+    state = DbRunState()
+    set_db_run_state(plugin, state)
+    state.plans_by_id["plan_1"] = {
+        "plan_id": "plan_1",
+        "result": {
+            "compiled_sql": "",
+            "validation": {"ok": False},
+        },
+    }
+
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+    result = await tools["db_query"].handler(
+        {"plan_id": "plan_1", "sql": "SELECT order_id FROM orders WHERE order_id > 10"}
+    )
+
+    assert result == {"rows": []}
+    plugin._tool_query.assert_awaited_once()
+    assert plugin._tool_query.await_args.args[0] == {
+        "sql": "SELECT order_id FROM orders WHERE order_id > 10"
+    }
 
 
 async def test_db_plan_query_returns_compact_output_by_default_and_debug_details_on_request():
@@ -271,6 +358,51 @@ async def test_db_plan_query_returns_compact_output_by_default_and_debug_details
     assert diagnostic["query_ir"]["metrics"][0]["name"] == "total_orders"
     assert diagnostic["table_candidates"]
     assert diagnostic["field_candidates"]
+
+
+async def test_db_plan_query_records_shared_evidence():
+    plugin = SimpleNamespace(
+        sql_dialect="postgresql",
+        read_only=True,
+        _tool_query=AsyncMock(return_value={"rows": []}),
+        _tool_count=AsyncMock(return_value={"count": 0}),
+        _tool_sample=AsyncMock(return_value={"rows": []}),
+    )
+    state = DbRunState()
+    set_db_run_state(plugin, state)
+    run_state, token = _activate_run_state(state)
+    schema = _schema(
+        tables=[
+            _table(
+                "orders",
+                [
+                    {"name": "order_id", "type": "integer"},
+                    {"name": "total_amount", "type": "numeric"},
+                ],
+            )
+        ]
+    )
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+
+    try:
+        result = await tools["db_plan_query"].handler(
+            {
+                "goal": "Revenue by order",
+                "required_fields": ["total amount"],
+                "candidate_tables": ["orders"],
+            }
+        )
+    finally:
+        active_run_state.reset(token)
+
+    assert result["plan_id"] == "plan_1"
+    assert state.summary()["planned_query_count"] == 1
+    assert [record.kind for record in run_state.evidence] == ["query_plan"]
+    evidence = run_state.evidence[0]
+    assert evidence.domain == "db"
+    assert evidence.source_tool == "db_plan_query"
+    assert evidence.payload["plan_id"] == "plan_1"
+    assert evidence.payload["resolved_tables"] == ["orders"]
 
 
 async def test_db_plan_query_uses_catalog_evidence_for_candidate_tables():
@@ -405,6 +537,246 @@ async def test_db_compile_and_query_plans_validates_and_executes_supported_inten
     assert result["validation"]["ok"] is True
     assert "COUNT" in result["sql"]
     plugin._tool_query.assert_awaited_once()
+
+
+async def test_db_query_records_validated_and_executed_query_evidence():
+    plugin = SimpleNamespace(
+        sql_dialect="postgresql",
+        read_only=True,
+        _tool_query=AsyncMock(
+            return_value={
+                "rows": [{"revenue": 125}],
+                "total_rows": 1,
+                "truncated": False,
+            }
+        ),
+        _tool_count=AsyncMock(return_value={"count": 0}),
+        _tool_sample=AsyncMock(return_value={"rows": []}),
+    )
+    state = DbRunState()
+    set_db_run_state(plugin, state)
+    run_state, token = _activate_run_state(state)
+    schema = _schema(
+        tables=[
+            _table(
+                "orders",
+                [
+                    {"name": "customer_id", "type": "integer"},
+                    {"name": "total_amount", "type": "numeric"},
+                ],
+            )
+        ]
+    )
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+
+    try:
+        result = await tools["db_query"].handler(
+            {
+                "sql": (
+                    "SELECT SUM(total_amount) AS revenue "
+                    "FROM orders WHERE customer_id = 1"
+                )
+            }
+        )
+    finally:
+        active_run_state.reset(token)
+
+    assert result["rows"] == [{"revenue": 125}]
+    assert state.summary()["validated_sql_count"] == 1
+    assert state.summary()["executed_query_count"] == 1
+    assert [record.kind for record in run_state.evidence] == [
+        "validated_sql",
+        "executed_query",
+    ]
+    validated = run_state.evidence[0]
+    assert validated.payload["referenced_tables"] == ["orders"]
+    assert validated.payload["referenced_columns"] == ["customer_id", "total_amount"]
+    assert validated.payload["selected_columns"] == ["revenue"]
+    executed = run_state.evidence[1]
+    assert executed.domain == "db"
+    assert executed.source_tool == "db_query"
+    assert executed.payload["columns"] == ["revenue"]
+    assert executed.payload["row_count"] == 1
+    assert executed.payload["truncated"] is False
+
+    completeness = attach_db_completeness(run_state)
+    assert completeness["status"] == "answerable"
+    assert completeness["can_answer"] is True
+    assert completeness["queries_executed"] == 1
+    assert completeness["total_rows_observed"] == 1
+    assert run_state.diagnostics["db_completeness"] == completeness
+    assert state.final_completeness_status == completeness
+
+
+async def test_db_query_records_rejected_sql_evidence():
+    plugin = SimpleNamespace(
+        sql_dialect="postgresql",
+        read_only=True,
+        _tool_query=AsyncMock(return_value={"rows": []}),
+        _tool_count=AsyncMock(return_value={"count": 0}),
+        _tool_sample=AsyncMock(return_value={"rows": []}),
+    )
+    state = DbRunState()
+    set_db_run_state(plugin, state)
+    run_state, token = _activate_run_state(state)
+    schema = _schema(
+        tables=[
+            _table(
+                "customers",
+                [
+                    {"name": "customer_id", "type": "integer"},
+                    {"name": "customer_name", "type": "text"},
+                ],
+            )
+        ]
+    )
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+
+    try:
+        result = await tools["db_query"].handler(
+            {"sql": "SELECT c.email FROM customers c"}
+        )
+    finally:
+        active_run_state.reset(token)
+
+    assert result["repair_required"] is True
+    assert state.summary()["failed_sql_count"] == 1
+    assert [record.kind for record in run_state.evidence] == ["rejected_sql"]
+    rejected = run_state.evidence[0]
+    assert rejected.domain == "db"
+    assert rejected.source_tool == "db_query"
+    assert rejected.payload["error_type"] == "schema_reference_error"
+    assert rejected.payload["missing_columns"] == [
+        {"table": "customers", "column": "email", "reason": "column not found"}
+    ]
+    assert rejected.payload["attempt_count"] == 1
+
+    completeness = summarize_db_completeness(run_state)
+    assert completeness["status"] == "blocked"
+    assert completeness["can_answer"] is False
+    assert completeness["sql_rejected"] == 1
+    assert completeness["unresolved_repair"] is True
+    assert completeness["latest_db_evidence_kind"] == "rejected_sql"
+    assert completeness["warnings"] == [
+        "sql_rejections_present",
+        "unresolved_sql_repair",
+    ]
+
+
+def test_db_completeness_reports_insufficient_evidence_for_empty_db_run_state():
+    state = DbRunState()
+    state.required_answer_fields.append("total revenue")
+    run_state = RunState(agent_id="test-agent")
+    run_state.domains["db"] = state
+
+    completeness = attach_db_completeness(run_state)
+
+    assert completeness["status"] == "insufficient_evidence"
+    assert completeness["can_answer"] is False
+    assert completeness["missing_required_fields"] == ["total revenue"]
+    assert completeness["warnings"] == [
+        "required_fields_tracked",
+        "missing_required_fields",
+    ]
+    assert state.final_completeness_status == completeness
+
+
+def test_db_completeness_requires_planned_fields_in_returned_columns():
+    state = DbRunState()
+    state.required_answer_fields.append("customer_name")
+    run_state = RunState(agent_id="test-agent")
+    run_state.domains["db"] = state
+    token = active_run_state.set(run_state)
+    try:
+        state.record_executed_query(
+            {
+                "sql": "SELECT customer_id FROM customers",
+                "columns": ["customer_id"],
+                "row_count": 1,
+                "truncated": False,
+            }
+        )
+    finally:
+        active_run_state.reset(token)
+
+    completeness = attach_db_completeness(run_state)
+
+    assert completeness["status"] == "missing_required_fields"
+    assert completeness["can_answer"] is False
+    assert completeness["returned_columns"] == ["customer_id"]
+    assert completeness["missing_required_fields"] == ["customer_name"]
+
+
+def test_db_completeness_matches_semantic_returned_column_aliases():
+    state = DbRunState()
+    state.required_answer_fields.extend(["customer records", "order revenue"])
+    run_state = RunState(agent_id="test-agent")
+    run_state.domains["db"] = state
+    token = active_run_state.set(run_state)
+    try:
+        state.record_executed_query(
+            {
+                "sql": "SELECT COUNT(*) AS total_customers, SUM(total_amount) AS total_revenue FROM orders",
+                "columns": ["total_customers", "total_revenue"],
+                "row_count": 1,
+                "truncated": False,
+            }
+        )
+    finally:
+        active_run_state.reset(token)
+
+    completeness = attach_db_completeness(run_state)
+
+    assert completeness["status"] == "answerable"
+    assert completeness["can_answer"] is True
+    assert completeness["missing_required_fields"] == []
+
+
+def test_db_completeness_blocks_when_latest_sql_repair_is_unresolved():
+    state = DbRunState()
+    run_state = RunState(agent_id="test-agent")
+    run_state.domains["db"] = state
+    token = active_run_state.set(run_state)
+    try:
+        state.record_executed_query(
+            {
+                "sql": "SELECT customer_name FROM customers",
+                "columns": ["customer_name"],
+                "row_count": 1,
+                "truncated": False,
+            }
+        )
+        state.record_failed_sql(
+            "bad-sql",
+            {"sql_fingerprint": "bad-sql", "repair_required": True},
+        )
+    finally:
+        active_run_state.reset(token)
+
+    blocked = attach_db_completeness(run_state)
+
+    assert blocked["status"] == "blocked"
+    assert blocked["can_answer"] is False
+    assert blocked["unresolved_repair"] is True
+
+    token = active_run_state.set(run_state)
+    try:
+        state.record_executed_query(
+            {
+                "sql": "SELECT customer_name FROM customers",
+                "columns": ["customer_name"],
+                "row_count": 1,
+                "truncated": False,
+            }
+        )
+    finally:
+        active_run_state.reset(token)
+
+    unblocked = attach_db_completeness(run_state)
+
+    assert unblocked["status"] == "answerable"
+    assert unblocked["can_answer"] is True
+    assert unblocked["unresolved_repair"] is False
 
 
 async def test_db_compile_and_query_returns_repair_payload_when_intent_cannot_compile():

@@ -354,6 +354,10 @@ class AgentTool:
 
     # Safety features
     timeout_seconds: Optional[int] = None  # Execution timeout
+    retry_safe: bool = False  # Safe to retry the tool operation itself
+    replay_safe: bool = False  # Safe to replay during whole-run retry
+    idempotent: bool = False  # Side-effecting but protected against duplicates
+    side_effecting: bool = True  # Conservative default for unknown tools
 
     # Focus DSL — applied to this tool's results before the LLM sees them.
     # Can be overridden per-agent via Agent(focus={"tool_name": "..."}).
