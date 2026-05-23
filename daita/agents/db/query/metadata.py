@@ -5,6 +5,22 @@ from __future__ import annotations
 import re
 from typing import Any
 
+FIELD_TOKEN_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "by",
+    "for",
+    "from",
+    "of",
+    "record",
+    "records",
+    "the",
+    "to",
+    "total",
+}
+
 
 def column_name(column: Any) -> str:
     if isinstance(column, dict):
@@ -70,3 +86,65 @@ def split_identifier(value: str) -> list[str]:
 
 def normalize_identifier(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+
+def normalize_field_phrase(value: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).split())
+
+
+def field_phrase_tokens(value: str) -> set[str]:
+    tokens: set[str] = set()
+    for token in normalize_field_phrase(value).split():
+        if not token or token in FIELD_TOKEN_STOPWORDS:
+            continue
+        tokens.add(token[:-1] if token.endswith("s") and len(token) > 3 else token)
+    return tokens
+
+
+def required_field_matches_output(required_field: str, output_name: str) -> bool:
+    normalized_required = normalize_identifier(required_field)
+    normalized_output = normalize_identifier(output_name)
+    if not normalized_required or not normalized_output:
+        return False
+    if normalized_required == normalized_output:
+        return True
+
+    required_tokens = field_phrase_tokens(required_field)
+    output_tokens = field_phrase_tokens(output_name)
+    if not required_tokens or not output_tokens:
+        return False
+    shared = required_tokens & output_tokens
+    if required_tokens <= output_tokens or output_tokens <= required_tokens:
+        return True
+    return len(shared) >= min(2, len(required_tokens), len(output_tokens))
+
+
+def field_ref_matches_required(field: Any, required_field: str) -> bool:
+    table = str(getattr(field, "table", "") or "")
+    column = str(getattr(field, "column", "") or "")
+    return required_field_matches_output(
+        required_field, column
+    ) or required_field_matches_output(required_field, f"{table}.{column}")
+
+
+def metric_matches_required(metric: Any, required_field: str) -> bool:
+    if required_field_matches_output(required_field, getattr(metric, "name", "")):
+        return True
+    column = str(getattr(metric, "column", "") or "")
+    return bool(column and required_field_matches_output(required_field, column))
+
+
+def candidate_column_matches_required(
+    required_field: str, column: str, *, min_score: int = 6, score: int = 0
+) -> bool:
+    if score < min_score:
+        return False
+    normalized_field = normalize_identifier(required_field)
+    normalized_column = normalize_identifier(column)
+    if not normalized_field or not normalized_column:
+        return False
+    return (
+        normalized_column == normalized_field
+        or normalized_column.endswith(normalized_field)
+        or normalized_field.endswith(normalized_column)
+    )

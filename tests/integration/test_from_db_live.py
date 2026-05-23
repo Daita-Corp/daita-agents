@@ -23,11 +23,15 @@ from pathlib import Path
 import pytest
 
 from daita.agents.agent import Agent
+from daita.agents.db.config import ANSWER_EVIDENCE_DB_TOOLS
 from daita.agents.db.memory import DBMemoryRecord
+from daita.core.graph import LocalGraphBackend
+from daita.core.graph.models import EdgeType, NodeType
 from daita.core.streaming import LLMChunk
 from daita.embeddings.base import BaseEmbeddingProvider
 from daita.core.watch import WatchEvent
 from daita.llm.mock import MockLLMProvider
+from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.memory import MemoryPlugin
 from daita.plugins.sqlite import SQLitePlugin
 
@@ -808,6 +812,43 @@ def _assert_any_tool_called(result: dict, tool_names: set[str]) -> dict:
         f"Expected one of {sorted(tool_names)}. "
         f"Tools actually called: {[call.get('tool') for call in calls]}"
     )
+
+
+def _tool_names(result: dict) -> list[str]:
+    return [call.get("tool") for call in result.get("tool_calls") or []]
+
+
+def _answer_evidence_calls(result: dict) -> list[dict]:
+    return [
+        call
+        for call in result.get("tool_calls") or []
+        if call.get("tool") in ANSWER_EVIDENCE_DB_TOOLS
+    ]
+
+
+def _assert_catalog_first_query_workflow(result: dict) -> None:
+    calls = result.get("tool_calls") or []
+    tool_names = _tool_names(result)
+    assert "catalog_find_join_paths" in tool_names
+    catalog_indexes = [
+        index
+        for index, call in enumerate(calls)
+        if call.get("tool") == "catalog_find_join_paths"
+    ]
+    assert catalog_indexes, f"No catalog join-path call in {tool_names}"
+    assert len(catalog_indexes) <= 3, f"Repeated catalog path calls: {tool_names}"
+
+    answer_calls = _answer_evidence_calls(result)
+    assert len(answer_calls) == 1, f"Expected exactly one DB answer call: {tool_names}"
+    answer_index = calls.index(answer_calls[0])
+    assert min(catalog_indexes) < answer_index, (
+        "Expected catalog join-path evidence before DB execution. "
+        f"Actual tools: {tool_names}"
+    )
+
+    catalog_result = calls[catalog_indexes[-1]].get("result") or {}
+    assert catalog_result.get("reachable") is True
+    assert catalog_result.get("suggested_next_tool") == "db_plan_query"
 
 
 def _assert_answer_tokens(
@@ -2869,5 +2910,137 @@ class TestFromDbPostgresOpenAILive:
                 all_of=["customers"],
                 any_of=["customer_id", "foreign", "references"],
             )
+        finally:
+            await _close_agent_db(agent)
+
+    async def test_openai_open_ended_quality_uses_postgres_catalog_and_graph(
+        self, seeded_postgres, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        backend = LocalGraphBackend(graph_type="from_db_pg_open_ended_live")
+        catalog = CatalogPlugin(backend=backend, auto_persist=True)
+        agent = await Agent.from_db(
+            seeded_postgres,
+            name="postgres-from-db-open-ended-live",
+            mode="analyst",
+            cache_ttl=3600,
+            query_default_limit=10,
+            catalog=catalog,
+            **_openai_kwargs(),
+        )
+        try:
+            assert agent._db_catalog is catalog
+            assert "catalog_search_schema" in agent.tool_registry.tool_names
+            assert "catalog_inspect_table" in agent.tool_registry.tool_names
+            assert "catalog_find_join_paths" in agent.tool_registry.tool_names
+
+            graph_tables = await backend.find_nodes(NodeType.TABLE)
+            graph_table_names = {node.name.split(".")[-1] for node in graph_tables}
+            assert {"customers", "orders", "daily_metrics"} <= graph_table_names
+            fk_edges = await backend.get_edges(edge_types=[EdgeType.REFERENCES])
+            fk_edge_text = json.dumps(
+                [
+                    {
+                        "from": edge.from_node_id,
+                        "to": edge.to_node_id,
+                        "type": str(edge.edge_type),
+                    }
+                    for edge in fk_edges
+                ],
+                default=str,
+            )
+            assert "orders.customer_id" in fk_edge_text
+            assert "customers.customer_id" in fk_edge_text
+
+            store_id = agent._db_catalog_store_id
+            join_path = await agent.tool_registry.execute(
+                "catalog_find_join_paths",
+                {
+                    "store_id": store_id,
+                    "from_tables": ["orders"],
+                    "to_tables": ["customers"],
+                    "max_hops": 2,
+                },
+            )
+            assert join_path["reachable"] is True
+
+            cases = [
+                {
+                    "prompt": "How many customers are in the database?",
+                    "expected_tokens": ["3"],
+                    "expected_status": "answerable",
+                    "require_catalog_graph": False,
+                },
+                {
+                    "prompt": (
+                        "Which customer has the highest total order revenue, and what "
+                        "is the amount? Include the customer name. Use the catalog "
+                        "relationship graph to find the join path before querying."
+                    ),
+                    "expected_tokens": ["Bob", "150"],
+                    "expected_status": "answerable",
+                    "require_catalog_graph": True,
+                },
+                {
+                    "prompt": "What is the total shipped order revenue?",
+                    "expected_tokens": ["125"],
+                    "expected_status": "answerable",
+                    "require_catalog_graph": False,
+                },
+                {
+                    "prompt": (
+                        "Which customers have signup_date after 2030-01-01? If there "
+                        "are no matching rows, say there are no matching customers."
+                    ),
+                    "expected_tokens": ["no"],
+                    "expected_status": "answerable_empty",
+                    "require_catalog_graph": False,
+                },
+            ]
+
+            results = []
+            for case in cases:
+                result = await agent.run(
+                    case["prompt"],
+                    detailed=True,
+                    max_iterations=10,
+                )
+                _assert_answer_tokens(result, all_of=case["expected_tokens"])
+                tool_names = _tool_names(result)
+                if case["require_catalog_graph"]:
+                    _assert_catalog_first_query_workflow(result)
+                completeness = (result.get("diagnostics") or {}).get("db_completeness")
+                if completeness is not None:
+                    assert completeness["can_answer"] is True
+                    assert completeness["missing_required_fields"] == []
+                    assert completeness["status"] == case["expected_status"]
+                    status = completeness["status"]
+                else:
+                    assert case["expected_status"] == "answerable"
+                    status = "fast_path"
+                assert any(
+                    call.get("tool") in {"db_query", "db_compile_and_query"}
+                    for call in result.get("tool_calls") or []
+                )
+                results.append(
+                    {
+                        "prompt": case["prompt"],
+                        "answer": result.get("result"),
+                        "status": status,
+                        "tools": tool_names,
+                    }
+                )
+
+            if os.environ.get("DAITA_FROM_DB_ACCURACY_OUTPUT"):
+                _write_live_accuracy_result(
+                    tmp_path,
+                    {
+                        "case_id": "postgres_open_ended_catalog_graph",
+                        "database": "postgresql",
+                        "catalog_store_id": store_id,
+                        "join_path": join_path,
+                        "results": results,
+                    },
+                )
         finally:
             await _close_agent_db(agent)

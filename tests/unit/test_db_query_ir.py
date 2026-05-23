@@ -124,8 +124,17 @@ def test_catalog_adapter_requires_catalog_for_search_and_paths():
 
     assert search["source"] == "missing_catalog"
     assert search["tables"] == []
-    assert paths["source"] == "missing_catalog"
-    assert paths["reachable"] is False
+    assert paths["source"] == "schema"
+    assert paths["reachable"] is True
+    assert paths["paths"][0]["joins"] == [
+        {
+            "left_table": "orders",
+            "left_column": "customer_id",
+            "right_table": "customers",
+            "right_column": "customer_id",
+            "predicate": "orders.customer_id = customers.customer_id",
+        }
+    ]
 
 
 async def test_query_ir_compiles_catalog_join_path_for_count_question():
@@ -199,6 +208,224 @@ async def test_query_ir_compiles_catalog_join_path_for_count_question():
         "LIMIT 1"
     )
     assert result["next_steps"] == ["run db_query with compiled_sql"]
+
+
+async def test_query_ir_compiles_join_for_cross_table_sum_and_label():
+    schema = _schema(
+        tables=[
+            _table(
+                "orders",
+                [
+                    {"name": "order_id", "type": "integer", "is_primary_key": True},
+                    {"name": "customer_id", "type": "integer"},
+                    {"name": "total_amount", "type": "numeric"},
+                ],
+            ),
+            _table(
+                "customers",
+                [
+                    {"name": "customer_id", "type": "integer", "is_primary_key": True},
+                    {"name": "name", "type": "text"},
+                ],
+            ),
+        ],
+        fks=[
+            {
+                "source_table": "orders",
+                "source_column": "customer_id",
+                "target_table": "customers",
+                "target_column": "customer_id",
+            }
+        ],
+    )
+    plugin = MagicMock()
+    plugin.sql_dialect = "postgresql"
+    plugin.read_only = True
+    plugin._tool_query = AsyncMock(return_value={"rows": []})
+    plugin._tool_count = AsyncMock(return_value={"count": 0})
+    plugin._tool_sample = AsyncMock(return_value={"rows": []})
+
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+    result = await tools["db_plan_query"].handler(
+        {
+            "goal": "Which customer has the highest total order revenue?",
+            "required_fields": ["customers.name", "total_revenue"],
+            "candidate_tables": ["orders", "customers"],
+            "required_joins": [{"from_tables": ["customers"], "to_tables": ["orders"]}],
+            "aggregations": ["SUM(orders.total_amount) AS total_revenue"],
+            "grouping": ["customers.name"],
+            "ordering": ["total_revenue desc"],
+            "limit": 1,
+            "include_diagnostics": True,
+        }
+    )
+
+    assert result["validation"]["ok"] is True
+    assert result["query_ir"]["joins"] == [
+        {
+            "left": {"table": "orders", "column": "customer_id"},
+            "right": {"table": "customers", "column": "customer_id"},
+        }
+    ]
+    assert (
+        'JOIN "customers" ON "orders"."customer_id" = "customers"."customer_id"'
+        in result["compiled_sql"]
+    )
+
+
+async def test_db_plan_query_compiles_join_from_recorded_catalog_path():
+    schema = _schema(
+        tables=[
+            _table(
+                "orders",
+                [
+                    {"name": "order_id", "type": "integer", "is_primary_key": True},
+                    {"name": "customer_id", "type": "integer"},
+                    {"name": "total_amount", "type": "numeric"},
+                ],
+            ),
+            _table(
+                "customers",
+                [
+                    {"name": "customer_id", "type": "integer", "is_primary_key": True},
+                    {"name": "name", "type": "text"},
+                ],
+            ),
+        ],
+        fks=[],
+    )
+    plugin = MagicMock()
+    plugin.sql_dialect = "postgresql"
+    plugin.read_only = True
+    plugin._tool_query = AsyncMock(return_value={"rows": []})
+    plugin._tool_count = AsyncMock(return_value={"count": 0})
+    plugin._tool_sample = AsyncMock(return_value={"rows": []})
+    state = DbRunState()
+    set_db_run_state(plugin, state)
+    state.record_catalog_tool_result(
+        "catalog_find_join_paths",
+        {"from_tables": ["orders"], "to_tables": ["customers"]},
+        {
+            "success": True,
+            "from_assets": ["orders"],
+            "to_assets": ["customers"],
+            "reachable": True,
+            "path_count": 1,
+            "paths": [
+                {
+                    "tables": ["orders", "customers"],
+                    "joins": [
+                        {
+                            "left_table": "orders",
+                            "left_column": "customer_id",
+                            "right_table": "customers",
+                            "right_column": "customer_id",
+                            "predicate": ("orders.customer_id = customers.customer_id"),
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+    result = await tools["db_plan_query"].handler(
+        {
+            "goal": "Which customer has the highest total order revenue?",
+            "required_fields": ["customers.name", "total_revenue"],
+            "aggregations": ["SUM(orders.total_amount) AS total_revenue"],
+            "grouping": ["customers.name"],
+            "ordering": ["total_revenue desc"],
+            "limit": 1,
+            "include_diagnostics": True,
+        }
+    )
+
+    assert state.summary()["catalog_join_evidence_count"] == 1
+    assert result["validation"]["ok"] is True
+    assert result["evidence"]["joins"][0]["provenance"] == "catalog_find_join_paths"
+    assert result["plan"]["required_joins"] == [
+        {
+            "from_tables": ["orders"],
+            "to_tables": ["customers"],
+            "paths": result["evidence"]["joins"][0]["paths"],
+            "source": "catalog",
+            "provenance": "catalog_find_join_paths",
+        }
+    ]
+    assert (
+        'JOIN "customers" ON "orders"."customer_id" = "customers"."customer_id"'
+        in result["compiled_sql"]
+    )
+
+
+async def test_query_ir_preserves_simple_value_filter_and_metric_phrase():
+    schema = _schema(
+        tables=[
+            _table(
+                "orders",
+                [
+                    {"name": "order_id", "type": "integer", "is_primary_key": True},
+                    {"name": "total_amount", "type": "numeric"},
+                    {"name": "status", "type": "text"},
+                ],
+            )
+        ],
+        db_type="sqlite",
+    )
+    plugin = MagicMock()
+    plugin.sql_dialect = "sqlite"
+    plugin.read_only = True
+    plugin._tool_query = AsyncMock(return_value={"rows": []})
+    plugin._tool_count = AsyncMock(return_value={"count": 0})
+    plugin._tool_sample = AsyncMock(return_value={"rows": []})
+
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+    result = await tools["db_plan_query"].handler(
+        {
+            "goal": "What is the total shipped order revenue?",
+            "required_fields": ["total shipped order revenue"],
+            "candidate_tables": ["orders"],
+            "filters": ["status = shipped"],
+            "aggregations": ["SUM(orders.total_amount) AS total_revenue"],
+        }
+    )
+
+    assert result["validation"]["ok"] is True
+    assert 'SUM("orders"."total_amount") AS "total_revenue"' in result["compiled_sql"]
+    assert 'WHERE "orders"."status" = \'shipped\'' in result["compiled_sql"]
+    assert result["suggested_next_tool"] == "db_query"
+
+
+def test_query_ir_validation_rejects_unjoined_cross_table_references():
+    schema = _schema(
+        tables=[
+            _table(
+                "orders",
+                [
+                    {"name": "total_amount", "type": "numeric"},
+                ],
+            ),
+            _table("customers", [{"name": "name", "type": "text"}]),
+        ]
+    )
+    plan = QueryPlan(
+        grain=[FieldRef("customers", "name")],
+        metrics=[
+            Metric(
+                name="total_revenue",
+                kind="sum",
+                table="orders",
+                column="total_amount",
+            )
+        ],
+    )
+
+    result = validate_query_plan(plan, schema, dialect="postgresql")
+
+    assert result["ok"] is False
+    assert result["errors"][-1]["type"] == "unjoined_table_reference"
+    assert set(result["errors"][-1]["missing_tables"]) == {"orders", "customers"}
 
 
 async def test_db_query_executes_validated_plan_id_without_sql_preflight():
@@ -705,6 +932,71 @@ def test_db_completeness_requires_planned_fields_in_returned_columns():
     assert completeness["can_answer"] is False
     assert completeness["returned_columns"] == ["customer_id"]
     assert completeness["missing_required_fields"] == ["customer_name"]
+
+
+def test_db_completeness_uses_selected_columns_for_empty_results():
+    state = DbRunState()
+    state.required_answer_fields.extend(["customer_id", "signup_date"])
+    run_state = RunState(agent_id="test-agent")
+    run_state.domains["db"] = state
+    token = active_run_state.set(run_state)
+    try:
+        state.record_executed_query(
+            {
+                "sql": (
+                    "SELECT customer_id, signup_date FROM customers "
+                    "WHERE signup_date > '2030-01-01'"
+                ),
+                "columns": [],
+                "selected_columns": ["customer_id", "signup_date"],
+                "row_count": 0,
+                "truncated": False,
+            }
+        )
+    finally:
+        active_run_state.reset(token)
+
+    completeness = attach_db_completeness(run_state)
+
+    assert completeness["status"] == "answerable_empty"
+    assert completeness["can_answer"] is True
+    assert completeness["returned_columns"] == []
+    assert completeness["evidence_columns"] == ["customer_id", "signup_date"]
+    assert completeness["missing_required_fields"] == []
+
+
+def test_db_completeness_matches_qualified_required_fields_to_output_names():
+    state = DbRunState()
+    state.required_answer_fields.extend(
+        [
+            "customers.customer_id",
+            "customers.name",
+            "SUM(orders.total_amount) AS total_revenue",
+        ]
+    )
+    run_state = RunState(agent_id="test-agent")
+    run_state.domains["db"] = state
+    token = active_run_state.set(run_state)
+    try:
+        state.record_executed_query(
+            {
+                "sql": (
+                    "SELECT customers.customer_id, customers.name, "
+                    "SUM(orders.total_amount) AS total_revenue FROM orders"
+                ),
+                "columns": ["customer_id", "name", "total_revenue"],
+                "row_count": 1,
+                "truncated": False,
+            }
+        )
+    finally:
+        active_run_state.reset(token)
+
+    completeness = attach_db_completeness(run_state)
+
+    assert completeness["status"] == "answerable"
+    assert completeness["can_answer"] is True
+    assert completeness["missing_required_fields"] == []
 
 
 def test_db_completeness_matches_semantic_returned_column_aliases():

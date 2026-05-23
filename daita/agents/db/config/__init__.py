@@ -16,7 +16,11 @@ from .policies import (
     schema_prompt_policy_for_budget,
 )
 from .presets import AUTO_TOOLKIT, MODE_PRESETS, FromDbModePreset, resolve_mode_options
-from .tool_profiles import select_db_tools_for_prompt
+from .tool_profiles import (
+    DbToolProfile,
+    select_db_tool_profile,
+    select_db_tools_for_prompt,
+)
 
 __all__ = [
     "AUTO_TOOLKIT",
@@ -27,6 +31,7 @@ __all__ = [
     "GENERIC_PROVIDER_DB_TOOLS",
     "MODE_PRESETS",
     "BudgetPreset",
+    "DbToolProfile",
     "FromDbModePreset",
     "PromptBuildResult",
     "SCHEMA_NAVIGATION_TOOLS",
@@ -36,5 +41,6 @@ __all__ = [
     "WRITE_DB_TOOLS",
     "resolve_mode_options",
     "schema_prompt_policy_for_budget",
+    "select_db_tool_profile",
     "select_db_tools_for_prompt",
 ]

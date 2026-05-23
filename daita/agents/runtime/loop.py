@@ -125,6 +125,7 @@ class AgentRunController:
                     run_state.set_phase(RunPhase.TOOL_EXECUTION)
                     results = []
                     for tool_call in llm_result.tool_calls:
+                        self._normalize_db_catalog_tool_call(run_state, tool_call)
                         result = await execute_and_track_tool(
                             agent, tool_call, active_tools, on_event
                         )
@@ -132,6 +133,7 @@ class AgentRunController:
                         tools_called.append(result)
                         results.append(result)
                         self._record_tool_evidence(run_state, tool_call, result)
+                        self._record_db_catalog_evidence(run_state, tool_call, result)
 
                         guardrail_decision = self.guardrails.observe_tool_result(
                             run_state, tool_call, result
@@ -300,6 +302,56 @@ class AgentRunController:
             },
         )
 
+    def _record_db_catalog_evidence(
+        self, run_state: RunState, tool_call: Dict[str, Any], result: Dict[str, Any]
+    ) -> None:
+        tool_name = str(tool_call.get("name") or "")
+        if not tool_name.startswith("catalog_"):
+            return
+        db_state = run_state.domains.get("db")
+        recorder = getattr(db_state, "record_catalog_tool_result", None)
+        if not callable(recorder):
+            return
+        handoff = recorder(
+            tool_name, tool_call.get("arguments", {}) or {}, result.get("result")
+        )
+        raw = result.get("result")
+        if isinstance(handoff, dict) and isinstance(raw, dict):
+            raw.update(
+                {
+                    key: value
+                    for key, value in handoff.items()
+                    if key not in raw or raw[key] in (None, "", [], {})
+                }
+            )
+
+    def _normalize_db_catalog_tool_call(
+        self, run_state: RunState, tool_call: Dict[str, Any]
+    ) -> None:
+        tool_name = str(tool_call.get("name") or "")
+        if tool_name not in {
+            "catalog_search_schema",
+            "catalog_inspect_table",
+            "catalog_find_join_paths",
+        }:
+            return
+        if "db" not in run_state.domains:
+            return
+        active_store_id = getattr(self.agent, "_db_catalog_store_id", None)
+        active_catalog = getattr(self.agent, "_db_catalog", None)
+        if not active_store_id or active_catalog is None:
+            return
+        arguments = tool_call.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+            tool_call["arguments"] = arguments
+        provided = str(arguments.get("store_id") or "").strip()
+        if provided == active_store_id:
+            return
+        if provided and _catalog_has_schema(active_catalog, provided):
+            return
+        arguments["store_id"] = active_store_id
+
     def _terminal_result_text(self, result: Optional[Dict[str, Any]]) -> str:
         raw = (result or {}).get("result")
         if isinstance(raw, dict):
@@ -325,3 +377,13 @@ class AgentRunController:
             if tool_name:
                 return str(tool_name)
         return None
+
+
+def _catalog_has_schema(catalog: Any, store_id: str) -> bool:
+    getter = getattr(catalog, "get_schema", None)
+    if not callable(getter):
+        return False
+    try:
+        return getter(store_id) is not None
+    except Exception:
+        return False

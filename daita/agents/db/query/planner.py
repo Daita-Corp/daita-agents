@@ -62,6 +62,10 @@ def build_query_plan(
     evidence_tables = evidence_table_names(evidence)
     if evidence_tables:
         plan.candidate_tables = _merge_strings(plan.candidate_tables, evidence_tables)
+    evidence_joins = evidence_join_paths(evidence)
+    plan.required_joins = _merge_join_requirements(
+        plan.required_joins, _join_requirements_from_evidence(evidence_joins)
+    )
 
     search_text = " ".join(
         [plan.goal]
@@ -87,7 +91,7 @@ def build_query_plan(
         candidate_tables=resolved_tables["resolved_tables"],
     )
     join_paths = _merge_join_paths(
-        evidence_join_paths(evidence),
+        evidence_joins,
         _required_join_paths(schema, plan, catalog=catalog, store_id=store_id),
     )
     plan_warnings = _aggregation_reference_warnings(schema, plan)
@@ -228,6 +232,46 @@ def _merge_strings(primary: List[str], secondary: List[str]) -> List[str]:
         if item not in out:
             out.append(item)
     return out
+
+
+def _join_requirements_from_evidence(
+    evidence_paths: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    requirements = []
+    for item in evidence_paths:
+        if not item.get("reachable"):
+            continue
+        from_tables = _string_list(item.get("from_tables") or item.get("from_assets"))
+        to_tables = _string_list(item.get("to_tables") or item.get("to_assets"))
+        if not from_tables or not to_tables:
+            continue
+        requirements.append(
+            {
+                "from_tables": from_tables,
+                "to_tables": to_tables,
+                "paths": item.get("paths") or [],
+                "source": item.get("source", "catalog"),
+                "provenance": item.get("provenance", "catalog_evidence"),
+            }
+        )
+    return requirements
+
+
+def _merge_join_requirements(
+    primary: List[Dict[str, Any]], secondary: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    merged = []
+    seen = set()
+    for item in primary + secondary:
+        key = (
+            tuple(_string_list(item.get("from_tables") or item.get("from"))),
+            tuple(_string_list(item.get("to_tables") or item.get("to"))),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+    return merged
 
 
 def _best_join_path(join_paths: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

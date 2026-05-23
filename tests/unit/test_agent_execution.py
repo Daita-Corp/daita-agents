@@ -380,6 +380,157 @@ class TestMaxIterations:
             "suggested_next_arguments" in llm.call_history[1]["messages"][-2]["content"]
         )
 
+    async def test_db_catalog_join_result_suggests_plan_query(self):
+        async def find_join_paths(args):
+            return {
+                "success": True,
+                "from_assets": ["orders"],
+                "to_assets": ["customers"],
+                "reachable": True,
+                "path_count": 1,
+                "paths": [
+                    {
+                        "tables": ["orders", "customers"],
+                        "joins": [
+                            {
+                                "left_table": "orders",
+                                "left_column": "customer_id",
+                                "right_table": "customers",
+                                "right_column": "customer_id",
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        async def plan(args):
+            return {"ok": True}
+
+        tools = [
+            AgentTool(
+                name="catalog_find_join_paths",
+                description="Find joins",
+                parameters={"type": "object", "properties": {}},
+                handler=find_join_paths,
+            ),
+            AgentTool(
+                name="db_plan_query",
+                description="Plan",
+                parameters={"type": "object", "properties": {}},
+                handler=plan,
+            ),
+        ]
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "name": "catalog_find_join_paths",
+                            "arguments": {
+                                "from_tables": ["orders"],
+                                "to_tables": ["customers"],
+                            },
+                        }
+                    ],
+                },
+                "Ready to plan.",
+            ]
+        )
+        agent = Agent(name="T", llm_provider=llm, tools=tools)
+        db_state = DbRunState()
+        db_state.configure_workflow(["catalog_find_join_paths", "db_plan_query"])
+        set_db_run_state(agent, db_state)
+
+        result = await agent.run("answer from db", detailed=True)
+
+        assert result["result"] == "Ready to plan."
+        raw_catalog_result = result["tool_calls"][0]["result"]
+        assert raw_catalog_result["suggested_next_tool"] == "db_plan_query"
+        assert raw_catalog_result["suggested_next_arguments"] == {
+            "candidate_tables": ["orders", "customers"],
+            "required_joins": [{"from_tables": ["orders"], "to_tables": ["customers"]}],
+        }
+        second_call_tools = llm.call_history[1]["tools"]
+        assert [tool["function"]["name"] for tool in second_call_tools] == [
+            "db_plan_query"
+        ]
+
+    async def test_db_catalog_tool_uses_active_store_for_unprofiled_store_id(self):
+        seen = {}
+
+        async def search_schema(args):
+            seen["args"] = dict(args)
+            return {"store_id": args["store_id"], "tables": []}
+
+        tool = AgentTool(
+            name="catalog_search_schema",
+            description="Search catalog",
+            parameters={"type": "object", "properties": {}},
+            handler=search_schema,
+        )
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "name": "catalog_search_schema",
+                            "arguments": {
+                                "store_id": "invented-store",
+                                "query": "orders",
+                            },
+                        }
+                    ],
+                },
+                "Done.",
+            ]
+        )
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
+        agent._db_catalog_store_id = "active-store"
+        agent._db_catalog = type(
+            "Catalog",
+            (),
+            {
+                "get_schema": lambda _self, store_id: (
+                    object() if store_id == "active-store" else None
+                )
+            },
+        )()
+        db_state = DbRunState()
+        db_state.configure_workflow(
+            ["catalog_search_schema"], intent_kind="schema_only"
+        )
+        set_db_run_state(agent, db_state)
+
+        result = await agent.run("inspect schema", detailed=True)
+
+        assert result["result"] == "Done."
+        assert seen["args"]["store_id"] == "active-store"
+        assert result["tool_calls"][0]["arguments"]["store_id"] == "active-store"
+
+    def test_schema_catalog_join_result_does_not_emit_db_handoff(self):
+        state = DbRunState()
+        state.configure_workflow(["catalog_find_join_paths"])
+
+        handoff = state.record_catalog_tool_result(
+            "catalog_find_join_paths",
+            {"from_tables": ["orders"], "to_tables": ["customers"]},
+            {
+                "success": True,
+                "from_assets": ["orders"],
+                "to_assets": ["customers"],
+                "reachable": True,
+                "path_count": 1,
+                "paths": [{"tables": ["orders", "customers"], "joins": [{}]}],
+            },
+        )
+
+        assert handoff is None
+        assert state.summary()["catalog_join_evidence_count"] == 1
+
     async def test_partial_exit_without_evidence_still_raises(self):
         repeated_call = {
             "content": "Calling missing tool.",

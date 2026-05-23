@@ -7,9 +7,15 @@ import hashlib
 import re
 from typing import Any
 
-from .metadata import normalize_identifier, schema_table_columns
+from .metadata import (
+    candidate_column_matches_required,
+    field_ref_matches_required,
+    metric_matches_required,
+    normalize_identifier,
+    schema_table_columns,
+)
 from .intent import is_count_metric_name
-from .ir import FieldRef, QueryPlan
+from .ir import QueryPlan
 from .sql_analysis import SqlAnalysis, SqlAnalysisError, analyze_sql
 
 
@@ -85,9 +91,6 @@ def required_field_warnings_for_plan(
     if plan is None or not required_fields:
         return []
 
-    grain_names = {
-        token for field in plan.grain for token in _field_tokens(field) if token
-    }
     metric_aliases = {
         normalize_identifier(metric.name): metric for metric in plan.metrics
     }
@@ -96,10 +99,12 @@ def required_field_warnings_for_plan(
         normalized = normalize_identifier(field_name)
         if not normalized:
             continue
-        if any(normalized in tokens or tokens in normalized for tokens in grain_names):
+        if any(field_ref_matches_required(field, field_name) for field in plan.grain):
             continue
         metric = metric_aliases.get(normalized)
         if metric is not None:
+            continue
+        if any(metric_matches_required(metric, field_name) for metric in plan.metrics):
             continue
         if is_count_metric_name(field_name) and any(
             metric.kind == "count" and normalize_identifier(metric.name) == normalized
@@ -314,13 +319,6 @@ def _known_table_key(table_key: str, table_columns: dict[str, set[str]]) -> str 
     return None
 
 
-def _field_tokens(field: FieldRef) -> set[str]:
-    return {
-        normalize_identifier(field.column),
-        normalize_identifier(f"{field.table}.{field.column}"),
-    }
-
-
 def _count_alias_satisfies_required_field(
     field_name: str, selected_expressions: dict[str, Any]
 ) -> bool:
@@ -332,18 +330,14 @@ def _count_alias_satisfies_required_field(
 def _high_confidence_required_columns(
     field_name: str, candidates: list[dict[str, Any]]
 ) -> set[str]:
-    normalized_field = normalize_identifier(field_name)
     out: set[str] = set()
     for candidate in candidates:
         column = str(candidate.get("column") or "").strip().lower()
         if not column:
             continue
         score = int(candidate.get("score") or 0)
-        normalized_column = normalize_identifier(column)
-        if score >= 6 and (
-            normalized_column == normalized_field
-            or normalized_column.endswith(normalized_field)
-            or normalized_field.endswith(normalized_column)
+        if candidate_column_matches_required(
+            field_name, column, min_score=6, score=score
         ):
             out.add(column)
     return out

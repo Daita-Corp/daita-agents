@@ -189,16 +189,24 @@ class TestCatalogPluginPostgres:
         # Raw discover_* shape: tables[].table_name, columns live in a flat
         # sibling array keyed by table_name + column_name.
         schema = result.get("schema") or result
-        table_names = {t["table_name"] for t in schema.get("tables", [])}
+        table_names = {
+            t.get("table_name") or t.get("name") for t in schema.get("tables", [])
+        }
         assert (
             EXPECTED_TABLES <= table_names
         ), f"Expected {EXPECTED_TABLES} in {table_names}"
 
-        orders_cols = {
-            c["column_name"]
-            for c in schema.get("columns", [])
-            if c.get("table_name") == "orders"
-        }
+        if schema.get("columns"):
+            orders_cols = {
+                c["column_name"]
+                for c in schema.get("columns", [])
+                if c.get("table_name") == "orders"
+            }
+        else:
+            orders_table = next(
+                t for t in schema.get("tables", []) if t["name"] == "orders"
+            )
+            orders_cols = {c["name"] for c in orders_table.get("columns", [])}
         assert {"order_id", "customer_id", "amount", "status", "created_at"} <= (
             orders_cols
         ), f"orders columns: {orders_cols}"

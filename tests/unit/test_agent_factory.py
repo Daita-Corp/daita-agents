@@ -19,6 +19,7 @@ from daita.agents.db.catalog_freshness import (
     load_catalog_profile_snapshot as _db_load_catalog_profile_snapshot,
 )
 from daita.agents.db.catalog_profile import normalize_schema as _db_normalize_schema
+from daita.agents.db.catalog_profile import discover_schema_fallback
 from daita.agents.db.prompt import (
     build_prompt as _db_build_prompt,
     infer_domain as _infer_domain,
@@ -418,6 +419,60 @@ class TestNormalizeDbSchema:
         user_col = next(c for c in tbl["columns"] if c["name"] == "user_id")
         assert user_col["is_primary_key"] is False
         assert result["foreign_keys"] == []
+
+    async def test_discover_schema_fallback_preserves_plugin_foreign_keys(self):
+        plugin = SimpleNamespace(
+            sql_dialect="sqlite",
+            path="/tmp/test.sqlite",
+            tables=AsyncMock(return_value=["orders", "customers"]),
+            describe=AsyncMock(
+                side_effect=[
+                    [
+                        {
+                            "column_name": "order_id",
+                            "data_type": "integer",
+                            "is_nullable": "NO",
+                            "is_primary_key": True,
+                        },
+                        {
+                            "column_name": "customer_id",
+                            "data_type": "integer",
+                            "is_nullable": "NO",
+                        },
+                    ],
+                    [
+                        {
+                            "column_name": "customer_id",
+                            "data_type": "integer",
+                            "is_nullable": "NO",
+                            "is_primary_key": True,
+                        }
+                    ],
+                ]
+            ),
+            foreign_keys=AsyncMock(
+                return_value=[
+                    {
+                        "source_table": "orders",
+                        "source_column": "customer_id",
+                        "target_table": "customers",
+                        "target_column": "customer_id",
+                    }
+                ]
+            ),
+        )
+
+        result = await discover_schema_fallback(plugin)
+
+        assert result["database_type"] == "sqlite"
+        assert result["foreign_keys"] == [
+            {
+                "source_table": "orders",
+                "source_column": "customer_id",
+                "target_table": "customers",
+                "target_column": "customer_id",
+            }
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -4218,6 +4273,109 @@ class TestFromDbToolProfiles:
         )
 
         assert selected == ["catalog_search_schema", "catalog_inspect_table"]
+
+    def test_catalog_graph_data_prompt_keeps_query_tools(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.tool_profiles import (
+            select_db_tool_profile,
+            select_db_tools_for_prompt,
+        )
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders"), _table("customers")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_plan_query",
+                    "db_query",
+                    "db_validate_sql",
+                    "db_compile_and_query",
+                    "catalog_search_schema",
+                    "catalog_inspect_table",
+                    "catalog_find_join_paths",
+                ]
+            ),
+        )
+
+        selected = select_db_tools_for_prompt(
+            agent,
+            "Which customer has the highest total order revenue? Use the catalog "
+            "relationship graph to find the join path before querying.",
+        )
+        profile = select_db_tool_profile(
+            agent,
+            "Which customer has the highest total order revenue? Use the catalog "
+            "relationship graph to find the join path before querying.",
+        )
+
+        assert selected == [
+            "db_plan_query",
+            "db_query",
+            "db_validate_sql",
+            "db_compile_and_query",
+            "catalog_search_schema",
+            "catalog_inspect_table",
+            "catalog_find_join_paths",
+        ]
+        assert profile.intent == "data_query_catalog_assisted"
+        assert profile.required_phases == ["catalog", "plan", "execute"]
+
+    def test_schema_prompt_profile_is_schema_only(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.tool_profiles import select_db_tool_profile
+
+        agent = _agent_with_catalog(
+            {"tables": []},
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_plan_query",
+                    "db_query",
+                    "catalog_search_schema",
+                    "catalog_inspect_table",
+                    "catalog_find_join_paths",
+                ]
+            ),
+        )
+
+        profile = select_db_tool_profile(
+            agent, "Describe the schema relationships between my tables"
+        )
+
+        assert profile.intent == "schema_only"
+        assert profile.tools == [
+            "catalog_search_schema",
+            "catalog_inspect_table",
+            "catalog_find_join_paths",
+        ]
+        assert profile.required_phases == []
+
+    def test_manual_sql_prompt_profile(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.tool_profiles import select_db_tool_profile
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_plan_query",
+                    "db_query",
+                    "db_validate_sql",
+                    "db_compile_and_query",
+                    "catalog_search_schema",
+                ]
+            ),
+        )
+
+        profile = select_db_tool_profile(
+            agent, "Run this SQL: SELECT COUNT(*) FROM orders"
+        )
+
+        assert profile.intent == "manual_sql"
+        assert profile.tools == [
+            "db_plan_query",
+            "db_query",
+            "db_validate_sql",
+            "db_compile_and_query",
+        ]
 
     def test_explicit_validate_sql_mention_is_preserved(self):
         from types import SimpleNamespace

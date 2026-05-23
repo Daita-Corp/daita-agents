@@ -115,6 +115,16 @@ def find_relationship_paths(
             "source": "catalog",
         }
 
+    schema_result = _schema_relationship_paths(
+        _schema,
+        from_tables=from_tables,
+        to_tables=to_tables,
+        max_hops=max_hops,
+        max_paths=max_paths,
+    )
+    if schema_result.get("reachable"):
+        return schema_result
+
     return {
         "success": False,
         "from_tables": from_tables,
@@ -126,6 +136,92 @@ def find_relationship_paths(
         "errors": ["catalog and store_id are required for relationship paths"],
         "source": "missing_catalog",
     }
+
+
+def _schema_relationship_paths(
+    schema: Dict[str, Any],
+    *,
+    from_tables: List[str],
+    to_tables: List[str],
+    max_hops: int,
+    max_paths: int,
+) -> Dict[str, Any]:
+    adjacency = _schema_relationship_adjacency(schema)
+    starts = [table for table in from_tables if table in adjacency]
+    targets = set(to_tables)
+    paths = []
+    for start in starts:
+        queue = [(start, [])]
+        visited = {start}
+        while queue and len(paths) < max_paths:
+            table, joins = queue.pop(0)
+            if len(joins) >= max_hops:
+                continue
+            for next_table, join in adjacency.get(table, []):
+                if next_table in visited:
+                    continue
+                next_joins = joins + [join]
+                if next_table in targets:
+                    paths.append(
+                        {
+                            "tables": [start]
+                            + [item["right_table"] for item in next_joins],
+                            "joins": next_joins,
+                            "predicate": " AND ".join(
+                                item["predicate"] for item in next_joins
+                            ),
+                            "confidence": 0.9,
+                        }
+                    )
+                    if len(paths) >= max_paths:
+                        break
+                visited.add(next_table)
+                queue.append((next_table, next_joins))
+    return {
+        "success": bool(paths),
+        "from_tables": from_tables,
+        "to_tables": to_tables,
+        "max_hops": max_hops,
+        "path_count": len(paths),
+        "reachable": bool(paths),
+        "paths": paths,
+        "errors": [] if paths else ["no schema relationship path found"],
+        "source": "schema",
+    }
+
+
+def _schema_relationship_adjacency(
+    schema: Dict[str, Any],
+) -> Dict[str, List[tuple[str, Dict[str, Any]]]]:
+    adjacency: Dict[str, List[tuple[str, Dict[str, Any]]]] = {}
+    for fk in schema.get("foreign_keys", []) or []:
+        source_table = str(fk.get("source_table") or "")
+        source_column = str(fk.get("source_column") or "")
+        target_table = str(fk.get("target_table") or "")
+        target_column = str(fk.get("target_column") or "")
+        if not all((source_table, source_column, target_table, target_column)):
+            continue
+        forward = {
+            "left_table": source_table,
+            "left_column": source_column,
+            "right_table": target_table,
+            "right_column": target_column,
+            "predicate": (
+                f"{source_table}.{source_column} = " f"{target_table}.{target_column}"
+            ),
+        }
+        reverse = {
+            "left_table": target_table,
+            "left_column": target_column,
+            "right_table": source_table,
+            "right_column": source_column,
+            "predicate": (
+                f"{target_table}.{target_column} = " f"{source_table}.{source_column}"
+            ),
+        }
+        adjacency.setdefault(source_table, []).append((target_table, forward))
+        adjacency.setdefault(target_table, []).append((source_table, reverse))
+    return adjacency
 
 
 def _catalog_asset_to_table(asset: Dict[str, Any]) -> Dict[str, Any]:

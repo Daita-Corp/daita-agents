@@ -25,10 +25,12 @@ def plan_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
             "from_db.plan_query",
             trace_type=TraceType.TOOL_EXECUTION,
         ) as (trace_manager, span_id):
+            run_state = get_db_run_state(plugin)
             evidence = await collect_query_evidence(
                 str((args or {}).get("goal") or ""),
                 args or {},
                 schema,
+                run_state=run_state,
                 catalog=vars(plugin).get("_db_catalog"),
                 store_id=vars(plugin).get("_db_catalog_store_id"),
                 graph_backend=query_graph_backend(plugin),
@@ -36,7 +38,7 @@ def plan_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
             result = build_query_plan(
                 args or {},
                 schema,
-                run_state=get_db_run_state(plugin),
+                run_state=run_state,
                 include_diagnostics=_include_plan_diagnostics(args),
                 evidence=evidence,
                 catalog=vars(plugin).get("_db_catalog"),
@@ -62,6 +64,7 @@ def compile_and_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
                 str((args or {}).get("goal") or ""),
                 args or {},
                 schema,
+                run_state=run_state,
                 catalog=vars(plugin).get("_db_catalog"),
                 store_id=vars(plugin).get("_db_catalog_store_id"),
                 graph_backend=query_graph_backend(plugin),
@@ -125,6 +128,7 @@ def compile_and_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
                         "sql_fingerprint": fingerprint,
                         "sql": sql,
                         "columns": result_columns(query_result),
+                        "selected_columns": validation.get("selected_columns") or [],
                         "row_count": result_row_count(query_result),
                         "truncated": (
                             bool(query_result.get("truncated"))
@@ -211,6 +215,7 @@ def preflight_sql_handler(plugin: Any, handler: Any, schema: Dict[str, Any]) -> 
                     "sql_fingerprint": fingerprint,
                     "sql": sql,
                     "columns": result_columns(result),
+                    "selected_columns": validation.get("selected_columns") or [],
                     "row_count": result_row_count(result),
                     "truncated": (
                         bool(result.get("truncated"))
@@ -266,11 +271,18 @@ async def execute_plan_id(
         }
 
     sql = _normalize_sql_for_plugin(plugin, sql)
-    _validate_plugin_query_policy(plugin, sql)
+    analysis = _validate_plugin_query_policy(plugin, sql)
     fingerprint = sql_fingerprint(sql)
+    validation = validate_sql_against_schema(
+        sql,
+        schema,
+        dialect=schema_or_plugin_dialect(plugin, schema),
+        analysis=analysis,
+    )
     run_state.record_validated_sql(
         fingerprint,
         {
+            **validation,
             "ok": True,
             "plan_id": plan_id,
             "source": "validated_query_ir",
@@ -287,6 +299,7 @@ async def execute_plan_id(
             "sql_fingerprint": fingerprint,
             "sql": sql,
             "columns": result_columns(result),
+            "selected_columns": validation.get("selected_columns") or [],
             "row_count": result_row_count(result),
             "truncated": (
                 bool(result.get("truncated")) if isinstance(result, dict) else False

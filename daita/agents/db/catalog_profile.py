@@ -9,6 +9,7 @@ plugin before that profile is registered with catalog state.
 from __future__ import annotations
 
 import asyncio
+from inspect import isawaitable
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from ...plugins.catalog import CatalogPlugin
@@ -87,6 +88,7 @@ async def discover_schema_fallback(
             return await plugin.describe(table_name)
 
     descriptions = await asyncio.gather(*[describe_one(t) for t in table_names])
+    foreign_keys = await _discover_plugin_foreign_keys(plugin)
 
     db_type = getattr(plugin, "sql_dialect", "unknown")
     db_name = (
@@ -114,9 +116,21 @@ async def discover_schema_fallback(
         "database_type": db_type,
         "database_name": str(db_name),
         "tables": tables,
-        "foreign_keys": [],
+        "foreign_keys": foreign_keys,
         "table_count": len(tables),
     }
+
+
+async def _discover_plugin_foreign_keys(
+    plugin: "BaseDatabasePlugin",
+) -> List[Dict[str, Any]]:
+    handler = getattr(plugin, "foreign_keys", None)
+    if handler is None:
+        return []
+    result = handler()
+    if isawaitable(result):
+        result = await result
+    return list(result or [])
 
 
 async def _discover_postgres(

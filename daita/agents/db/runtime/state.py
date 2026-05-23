@@ -37,8 +37,12 @@ class DbQueryPlan:
 class DbRunState:
     """Transient state reset for each ``from_db`` agent run."""
 
+    intent_kind: Optional[str] = None
     inspected_tables: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     candidate_columns: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    catalog_evidence: Dict[str, List[Dict[str, Any]]] = field(
+        default_factory=lambda: {"tables": [], "columns": [], "joins": []}
+    )
     known_join_paths: List[Dict[str, Any]] = field(default_factory=list)
     failed_sql_fingerprints: Dict[str, int] = field(default_factory=dict)
     validated_sql: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -59,6 +63,202 @@ class DbRunState:
         for path in result.get("paths") or []:
             if path not in self.known_join_paths:
                 self.known_join_paths.append(path)
+
+    def configure_workflow(
+        self, selected_tools: List[str], *, intent_kind: Optional[str] = None
+    ) -> None:
+        if intent_kind:
+            self.intent_kind = intent_kind
+            return
+        tool_names = set(selected_tools or [])
+        has_query_tools = bool(
+            tool_names.intersection(
+                {"db_plan_query", "db_query", "db_validate_sql", "db_compile_and_query"}
+            )
+        )
+        has_catalog_tools = any(name.startswith("catalog_") for name in tool_names)
+        if has_query_tools and has_catalog_tools:
+            self.intent_kind = "data_query_catalog_assisted"
+        elif has_query_tools:
+            self.intent_kind = "data_query"
+        elif has_catalog_tools:
+            self.intent_kind = "schema_question"
+
+    def record_catalog_tool_result(
+        self, tool_name: str, arguments: Dict[str, Any], result: Any
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(result, dict) or result.get("error"):
+            return None
+        if tool_name == "catalog_search_schema":
+            self._record_catalog_search(arguments, result)
+        elif tool_name == "catalog_inspect_table":
+            self._record_catalog_inspection(arguments, result)
+        elif tool_name == "catalog_find_join_paths":
+            self._record_catalog_join_paths(arguments, result)
+            return self._catalog_join_handoff(result)
+        return None
+
+    def catalog_planner_evidence(self) -> Dict[str, Any]:
+        tables = list(self.catalog_evidence.get("tables") or [])
+        joins = list(self.catalog_evidence.get("joins") or [])
+        for join in joins:
+            for table_name in (join.get("from_tables") or []) + (
+                join.get("to_tables") or []
+            ):
+                table = {
+                    "table": table_name,
+                    "confidence": join.get("confidence", 0.95),
+                    "source": "catalog",
+                    "provenance": join.get("provenance", "catalog_evidence"),
+                }
+                _append_unique_evidence(tables, table, key=("table",))
+        return {
+            "tables": tables,
+            "columns": list(self.catalog_evidence.get("columns") or []),
+            "joins": joins,
+            "sources": ["catalog"] if tables or joins else [],
+            "confidence": _evidence_confidence(tables + joins),
+        }
+
+    def _record_catalog_search(
+        self, arguments: Dict[str, Any], result: Dict[str, Any]
+    ) -> None:
+        for table in result.get("tables") or []:
+            if not isinstance(table, dict):
+                continue
+            table_name = str(table.get("name") or table.get("asset_ref") or "").strip()
+            if not table_name:
+                continue
+            _append_unique_evidence(
+                self.catalog_evidence["tables"],
+                {
+                    "table": table_name,
+                    "confidence": _score_to_confidence(table.get("score"), 0.75),
+                    "source": "catalog",
+                    "provenance": "catalog_search_schema",
+                    "query": arguments.get("query"),
+                },
+                key=("table",),
+            )
+            for field in table.get("matched_fields") or []:
+                if not isinstance(field, dict):
+                    continue
+                column_name = str(field.get("name") or "").strip()
+                if not column_name:
+                    continue
+                _append_unique_evidence(
+                    self.catalog_evidence["columns"],
+                    {
+                        "table": table_name,
+                        "column": column_name,
+                        "confidence": _score_to_confidence(field.get("score"), 0.7),
+                        "source": "catalog",
+                        "provenance": "catalog_search_schema",
+                    },
+                    key=("table", "column"),
+                )
+
+    def _record_catalog_inspection(
+        self, arguments: Dict[str, Any], result: Dict[str, Any]
+    ) -> None:
+        table_name = str(
+            result.get("table_name") or arguments.get("table_name") or ""
+        ).strip()
+        if not table_name:
+            return
+        self.inspected_tables[table_name] = dict(result)
+        _append_unique_evidence(
+            self.catalog_evidence["tables"],
+            {
+                "table": table_name,
+                "confidence": 0.9,
+                "source": "catalog",
+                "provenance": "catalog_inspect_table",
+            },
+            key=("table",),
+        )
+        for column in result.get("columns") or []:
+            if not isinstance(column, dict):
+                continue
+            column_name = str(column.get("name") or "").strip()
+            if not column_name:
+                continue
+            _append_unique_evidence(
+                self.catalog_evidence["columns"],
+                {
+                    "table": table_name,
+                    "column": column_name,
+                    "type": column.get("type"),
+                    "confidence": 0.9,
+                    "source": "catalog",
+                    "provenance": "catalog_inspect_table",
+                },
+                key=("table", "column"),
+            )
+
+    def _record_catalog_join_paths(
+        self, arguments: Dict[str, Any], result: Dict[str, Any]
+    ) -> None:
+        from_tables = _string_list(
+            result.get("from_tables")
+            or result.get("from_assets")
+            or arguments.get("from_tables")
+        )
+        to_tables = _string_list(
+            result.get("to_tables")
+            or result.get("to_assets")
+            or arguments.get("to_tables")
+        )
+        join_result = {
+            **result,
+            "from_tables": from_tables,
+            "to_tables": to_tables,
+            "source": "catalog",
+            "provenance": "catalog_find_join_paths",
+            "confidence": 0.95 if result.get("reachable") else 0.4,
+        }
+        _append_unique_evidence(
+            self.catalog_evidence["joins"],
+            join_result,
+            key=("from_tables", "to_tables", "reachable"),
+        )
+        self.record_join_paths(result)
+        _record_db_evidence(
+            "catalog_join_path",
+            source_tool="catalog_find_join_paths",
+            payload={
+                "from_tables": from_tables,
+                "to_tables": to_tables,
+                "reachable": bool(result.get("reachable")),
+                "path_count": result.get("path_count", len(result.get("paths") or [])),
+            },
+        )
+
+    def _catalog_join_handoff(self, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if self.intent_kind not in {"data_query_catalog_assisted", "data_query"}:
+            return None
+        if not result.get("reachable") or not result.get("paths"):
+            return None
+        if self.planned_queries:
+            return None
+        from_tables = _string_list(
+            result.get("from_tables") or result.get("from_assets")
+        )
+        to_tables = _string_list(result.get("to_tables") or result.get("to_assets"))
+        if not from_tables or not to_tables:
+            return None
+        return {
+            "suggested_next_tool": "db_plan_query",
+            "suggested_next_arguments": {
+                "candidate_tables": _unique_strings(from_tables + to_tables),
+                "required_joins": [
+                    {
+                        "from_tables": from_tables,
+                        "to_tables": to_tables,
+                    }
+                ],
+            },
+        }
 
     def record_failed_sql(
         self,
@@ -137,7 +337,14 @@ class DbRunState:
     def summary(self) -> Dict[str, Any]:
         return {
             "inspected_table_count": len(self.inspected_tables),
+            "intent_kind": self.intent_kind,
             "candidate_field_count": len(self.candidate_columns),
+            "catalog_table_evidence_count": len(
+                self.catalog_evidence.get("tables") or []
+            ),
+            "catalog_join_evidence_count": len(
+                self.catalog_evidence.get("joins") or []
+            ),
             "known_join_path_count": len(self.known_join_paths),
             "failed_sql_count": sum(self.failed_sql_fingerprints.values()),
             "validated_sql_count": len(self.validated_sql),
@@ -251,9 +458,75 @@ def _compact_query_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
         "sql",
         "tables",
         "columns",
+        "selected_columns",
         "row_count",
         "returned_rows",
         "truncated",
         "assumptions",
     )
     return {key: metadata[key] for key in allowed if key in metadata}
+
+
+def _append_unique_evidence(
+    items: List[Dict[str, Any]], item: Dict[str, Any], *, key: tuple[str, ...]
+) -> None:
+    item_key = _evidence_key(item, key)
+    for index, existing in enumerate(items):
+        if _evidence_key(existing, key) != item_key:
+            continue
+        if _score(item) > _score(existing):
+            items[index] = item
+        return
+    items.append(item)
+
+
+def _evidence_key(item: Dict[str, Any], key: tuple[str, ...]) -> tuple[Any, ...]:
+    values = []
+    for part in key:
+        value = item.get(part)
+        if isinstance(value, list):
+            values.append(tuple(str(entry).lower() for entry in value))
+        else:
+            values.append(str(value or "").lower())
+    return tuple(values)
+
+
+def _score_to_confidence(value: Any, default: float) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return default
+    if score <= 0:
+        return default
+    return round(min(0.95, score / 10), 3)
+
+
+def _evidence_confidence(items: List[Dict[str, Any]]) -> float:
+    if not items:
+        return 0.0
+    return round(min(1.0, max(_score(item) for item in items)), 3)
+
+
+def _score(item: Dict[str, Any]) -> float:
+    try:
+        return float(item.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _unique_strings(values: List[str]) -> List[str]:
+    out = []
+    for value in values:
+        if value and value not in out:
+            out.append(value)
+    return out

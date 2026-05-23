@@ -5,6 +5,7 @@ Per-run tool selection for ``from_db()`` agents.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from typing import Any, List
 
 from ..query.catalog_adapter import catalog_schema_snapshot, has_likely_catalog_match
@@ -103,7 +104,7 @@ SCHEMA_REPAIR_KEYWORDS = (
     "connect",
     "path",
 )
-STAGED_QUERY_KEYWORDS = (
+QUERY_SHAPE_KEYWORDS = (
     "after",
     "before",
     "between",
@@ -112,16 +113,11 @@ STAGED_QUERY_KEYWORDS = (
     "grouped",
     "highest",
     "include",
-    "label",
     "lowest",
     "matching",
     "most",
     "least",
-    "name",
     "per ",
-    "revenue",
-    "shipped",
-    "status",
     "top",
     "where",
 )
@@ -133,23 +129,48 @@ STAGED_DB_QUERY_TOOLS = (
 )
 
 
-def select_db_tools_for_prompt(agent: Any, prompt: str) -> List[str]:
+@dataclass(frozen=True)
+class DbToolProfile:
+    """Deterministic tool profile for one ``from_db`` prompt."""
+
+    intent: str
+    tools: List[str]
+    required_phases: List[str] = field(default_factory=list)
+
+
+def select_db_tool_profile(agent: Any, prompt: str) -> DbToolProfile:
     available = set(getattr(agent.tool_registry, "tool_names", []))
     selected: List[str] = []
     text = prompt.lower()
 
-    needs_query_tools = _needs_query_tools(text)
+    explicit_tools = _explicitly_mentioned_tools(available, text)
+    if explicit_tools and _is_strict_explicit_tool_request(text):
+        return DbToolProfile(
+            intent=_classify_db_intent(text, likely_catalog_match=False),
+            tools=unique_preserving_order(explicit_tools),
+            required_phases=[],
+        )
+
+    intent = _classify_db_intent(text, likely_catalog_match=False)
+    needs_query_tools = intent in {
+        "manual_sql",
+        "admin_or_write",
+        "data_query_simple",
+        "data_query_catalog_assisted",
+    }
     likely_catalog_match = (
         has_likely_catalog_match(agent, text) if needs_query_tools else False
     )
-    needs_schema_tools = _needs_schema_tools(
-        text,
-        needs_query_tools,
-        likely_catalog_match=likely_catalog_match,
+    intent = _classify_db_intent(text, likely_catalog_match=likely_catalog_match)
+    needs_query_tools = intent in {
+        "manual_sql",
+        "admin_or_write",
+        "data_query_simple",
+        "data_query_catalog_assisted",
+    }
+    needs_schema_tools = _profile_needs_schema_tools(
+        text, intent, needs_query_tools, likely_catalog_match=likely_catalog_match
     )
-    explicit_tools = _explicitly_mentioned_tools(available, text)
-    if explicit_tools and _is_strict_explicit_tool_request(text):
-        return unique_preserving_order(explicit_tools)
 
     compile_first = _should_start_with_compile_first(
         available,
@@ -198,7 +219,16 @@ def select_db_tools_for_prompt(agent: Any, prompt: str) -> List[str]:
     if _has_vector_columns(catalog_schema_snapshot(agent)):
         selected.extend(name for name in available if name.endswith("_vector_search"))
 
-    return unique_preserving_order([name for name in selected if name in available])
+    tools = unique_preserving_order([name for name in selected if name in available])
+    return DbToolProfile(
+        intent=intent,
+        tools=tools,
+        required_phases=_required_phases(intent, tools),
+    )
+
+
+def select_db_tools_for_prompt(agent: Any, prompt: str) -> List[str]:
+    return select_db_tool_profile(agent, prompt).tools
 
 
 def _should_start_with_compile_first(
@@ -237,13 +267,13 @@ def _needs_advanced_db_tools(available: set[str], text: str) -> bool:
 def _needs_staged_query_path(text: str) -> bool:
     if _is_simple_count_question(text):
         return False
-    return any(keyword in text for keyword in STAGED_QUERY_KEYWORDS)
+    return any(keyword in text for keyword in QUERY_SHAPE_KEYWORDS)
 
 
 def _is_simple_count_question(text: str) -> bool:
     return (
         any(keyword in text for keyword in ("how many", "count"))
-        and not any(keyword in text for keyword in STAGED_QUERY_KEYWORDS)
+        and not any(keyword in text for keyword in QUERY_SHAPE_KEYWORDS)
         and not _has_explicit_sql(text)
     )
 
@@ -252,11 +282,19 @@ def _has_explicit_sql(text: str) -> bool:
     return bool(re.search(r"\b(select|with|explain|sql)\b", text))
 
 
-def _needs_schema_tools(
-    text: str, needs_query_tools: bool, *, likely_catalog_match: bool
+def _profile_needs_schema_tools(
+    text: str,
+    intent: str,
+    needs_query_tools: bool,
+    *,
+    likely_catalog_match: bool,
 ) -> bool:
     explicit_schema = any(tool.lower() in text for tool in SCHEMA_NAVIGATION_TOOLS)
     if explicit_schema:
+        return True
+    if intent == "data_query_catalog_assisted":
+        return True
+    if intent == "schema_only":
         return True
     if any(keyword in text for keyword in SCHEMA_REPAIR_KEYWORDS):
         return True
@@ -267,14 +305,89 @@ def _needs_schema_tools(
     return not likely_catalog_match
 
 
-def _needs_query_tools(text: str) -> bool:
-    if _is_schema_question(text):
-        return False
+def _classify_db_intent(text: str, *, likely_catalog_match: bool) -> str:
+    if _has_explicit_sql(text):
+        return "manual_sql"
+    if any(keyword in text for keyword in WRITE_KEYWORDS):
+        return "admin_or_write"
+    if _is_schema_only_intent(text):
+        return "schema_only"
+    if _has_catalog_assisted_data_intent(text, likely_catalog_match):
+        return "data_query_catalog_assisted"
+    return "data_query_simple"
+
+
+def _is_schema_only_intent(text: str) -> bool:
     if any(keyword in text for keyword in INFERENCE_ONLY_KEYWORDS):
-        return False
-    if any(keyword in text for keyword in QUERY_KEYWORDS):
         return True
-    return True
+    if any(keyword in text for keyword in SCHEMA_KEYWORDS) and not any(
+        keyword in text
+        for keyword in DATA_QUERY_KEYWORDS
+        + (
+            "how many",
+            "count",
+            "total",
+            "sum",
+            "average",
+            "avg",
+            "minimum",
+            "maximum",
+            "highest",
+            "lowest",
+            "top",
+        )
+    ):
+        return True
+    return _is_schema_question(text) and not _has_data_answer_intent(text)
+
+
+def _has_catalog_assisted_data_intent(text: str, likely_catalog_match: bool) -> bool:
+    if not _has_data_answer_intent(text) and not any(
+        keyword in text for keyword in QUERY_KEYWORDS
+    ):
+        return False
+    if any(tool in text for tool in SCHEMA_NAVIGATION_TOOLS):
+        return True
+    if any(keyword in text for keyword in SCHEMA_REPAIR_KEYWORDS):
+        return True
+    if "catalog" in text or "graph" in text:
+        return True
+    if not likely_catalog_match and _needs_staged_query_path(text):
+        return True
+    return False
+
+
+def _required_phases(intent: str, tools: List[str]) -> List[str]:
+    phases = []
+    if intent == "data_query_catalog_assisted" and any(
+        name.startswith("catalog_") for name in tools
+    ):
+        phases.append("catalog")
+    if any(name in tools for name in ("db_plan_query", "db_compile_and_query")):
+        phases.append("plan")
+    if any(name in tools for name in ("db_query", "db_compile_and_query")):
+        phases.append("execute")
+    return phases
+
+
+def _has_data_answer_intent(text: str) -> bool:
+    if any(keyword in text for keyword in DATA_QUERY_KEYWORDS):
+        return True
+    if _needs_staged_query_path(text):
+        return True
+    return any(
+        keyword in text
+        for keyword in (
+            "how many",
+            "count",
+            "total",
+            "sum",
+            "average",
+            "avg",
+            "minimum",
+            "maximum",
+        )
+    )
 
 
 def _is_schema_question(text: str) -> bool:

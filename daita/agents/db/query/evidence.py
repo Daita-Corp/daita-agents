@@ -19,13 +19,18 @@ async def collect_query_evidence(
     intent_args: Dict[str, Any],
     schema: Dict[str, Any],
     *,
+    run_state: Any = None,
     catalog: Any = None,
     store_id: Optional[str] = None,
     graph_backend: Any = None,
 ) -> Dict[str, Any]:
     """Collect compact relational evidence for SQL planning."""
+    run_evidence = _run_state_evidence(run_state)
+    if evidence_join_paths(run_evidence):
+        return run_evidence
+
     if catalog is None or not store_id:
-        return _empty_evidence()
+        return run_evidence if _has_evidence(run_evidence) else _empty_evidence()
 
     text = _search_text(prompt, intent_args)
     payload = catalog.collect_evidence(
@@ -35,7 +40,7 @@ async def collect_query_evidence(
         asset_types=["table", "view", "collection"],
         limit=MAX_EVIDENCE_ITEMS,
     )
-    return _catalog_evidence(payload)
+    return _merge_evidence(run_evidence, _catalog_evidence(payload))
 
 
 def evidence_table_names(evidence: Optional[Dict[str, Any]]) -> List[str]:
@@ -132,6 +137,64 @@ def _empty_evidence() -> Dict[str, Any]:
         "sources": [],
         "confidence": 0.0,
     }
+
+
+def _run_state_evidence(run_state: Any) -> Dict[str, Any]:
+    if run_state is None:
+        return _empty_evidence()
+    getter = getattr(run_state, "catalog_planner_evidence", None)
+    if not callable(getter):
+        return _empty_evidence()
+    evidence = getter()
+    return evidence if isinstance(evidence, dict) else _empty_evidence()
+
+
+def _has_evidence(evidence: Dict[str, Any]) -> bool:
+    return bool(evidence_join_paths(evidence) or evidence_table_names(evidence))
+
+
+def _merge_evidence(
+    primary: Dict[str, Any], fallback: Dict[str, Any]
+) -> Dict[str, Any]:
+    if not _has_evidence(primary):
+        return fallback
+    tables = _dedupe_evidence(
+        list(primary.get("tables") or []) + list(fallback.get("tables") or []),
+        key="table",
+    )
+    columns = _dedupe_evidence(
+        list(primary.get("columns") or []) + list(fallback.get("columns") or []),
+        key=("table", "column"),
+    )
+    joins = _dedupe_joins(
+        list(primary.get("joins") or []) + list(fallback.get("joins") or [])
+    )
+    sources = unique_preserving_order(
+        list(primary.get("sources") or []) + list(fallback.get("sources") or [])
+    )
+    return {
+        "tables": tables[:MAX_EVIDENCE_ITEMS],
+        "columns": columns[:MAX_EVIDENCE_ITEMS],
+        "joins": joins[:MAX_EVIDENCE_ITEMS],
+        "sources": sources,
+        "confidence": _evidence_confidence(tables + columns + joins),
+    }
+
+
+def _dedupe_joins(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    best: Dict[Any, Dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            tuple(str(value).lower() for value in item.get("from_tables") or []),
+            tuple(str(value).lower() for value in item.get("to_tables") or []),
+            bool(item.get("reachable")),
+        )
+        if key in best and _score(item) <= _score(best[key]):
+            continue
+        best[key] = item
+    return sorted(best.values(), key=lambda item: (-_score(item), str(item)))
 
 
 def _search_text(prompt: str, intent_args: Dict[str, Any]) -> str:

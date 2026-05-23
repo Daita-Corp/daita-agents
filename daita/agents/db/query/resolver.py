@@ -9,6 +9,7 @@ from typing import Any, Optional
 from ..utils import unique_preserving_order
 from .metadata import (
     column_name as _column_name,
+    metric_matches_required as _metric_matches_required,
     normalize_identifier as _normalize,
     split_identifier as _split_identifier,
     table_name as _table_name,
@@ -183,7 +184,7 @@ def resolve_query_plan(
 
     fact_table = metrics[0].table
     grain = _resolve_grain(legacy_plan, context, candidate_tables, fact_table, metrics)
-    filters = _resolve_time_filters(legacy_plan, context, fact_table)
+    filters = _resolve_filters(legacy_plan, context, fact_table, candidate_tables)
     joins = _resolve_joins(
         legacy_plan,
         schema,
@@ -315,16 +316,11 @@ def _resolve_grain(
     metrics: list[Metric],
 ) -> list[FieldRef]:
     grain: list[FieldRef] = []
-    metric_aliases = {_normalize(metric.name) for metric in metrics}
-    metric_aliases.update(
-        _normalize(name) for name in _metric_like_required_fields(legacy_plan)
-    )
     names = list(getattr(legacy_plan, "grouping", []) or [])
     names.extend(
         field
         for field in getattr(legacy_plan, "required_fields", []) or []
-        if _normalize(field) not in metric_aliases
-        and not looks_like_count_intent(field)
+        if not _required_field_is_metric(field, metrics)
     )
 
     for name in names:
@@ -336,6 +332,12 @@ def _resolve_grain(
         elif field and "." in name and field not in grain:
             grain.append(field)
     return grain
+
+
+def _required_field_is_metric(field: Any, metrics: list[Metric]) -> bool:
+    return looks_like_count_intent(field) or any(
+        _metric_matches_required(metric, str(field or "")) for metric in metrics
+    )
 
 
 def _resolve_time_filters(
@@ -373,6 +375,64 @@ def _resolve_time_filters(
     return []
 
 
+def _resolve_filters(
+    legacy_plan: Any,
+    context: "_SqlPlanningView",
+    fact_table: str,
+    candidate_tables: list[str],
+) -> list[Filter]:
+    filters = _resolve_time_filters(legacy_plan, context, fact_table)
+    preferred_tables = [fact_table] + [
+        table for table in candidate_tables if table != fact_table
+    ]
+    for expression in getattr(legacy_plan, "filters", []) or []:
+        parsed = _filter_from_expression(expression, context, preferred_tables)
+        if parsed is not None and parsed not in filters:
+            filters.append(parsed)
+    return filters
+
+
+def _filter_from_expression(
+    expression: Any,
+    context: "_SqlPlanningView",
+    preferred_tables: list[str],
+) -> Optional[Filter]:
+    text = str(expression or "").strip()
+    if not text:
+        return None
+    match = re.match(
+        r"^\s*([A-Za-z_][\w.]*?)\s*(=|!=|>=|<=|>|<)\s*(.+?)\s*$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    field = context.resolve_field(match.group(1), preferred_tables=preferred_tables)
+    if field is None:
+        return None
+    value = _parse_filter_value(match.group(3))
+    return Filter(field=field, operator=match.group(2), value=value)
+
+
+def _parse_filter_value(value: Any) -> Any:
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1]
+    lowered = text.lower()
+    if lowered == "null":
+        return None
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
 def _resolve_joins(
     legacy_plan: Any,
     schema: dict[str, Any],
@@ -385,13 +445,38 @@ def _resolve_joins(
     store_id: Optional[str] = None,
 ) -> list[Join]:
     target_tables = [field.table for field in grain if field.table != fact_table]
+    provided_paths: list[dict[str, Any]] = []
+    context = _SqlPlanningView(schema)
     for requirement in getattr(legacy_plan, "required_joins", []) or []:
-        target_tables.extend(
-            _string_list(requirement.get("to_tables") or requirement.get("to"))
-        )
+        for table_ref in _string_list(
+            requirement.get("from_tables") or requirement.get("from")
+        ):
+            resolved = context.resolve_table(table_ref)
+            if resolved and resolved != fact_table:
+                target_tables.append(resolved)
+        for table_ref in _string_list(
+            requirement.get("to_tables") or requirement.get("to")
+        ):
+            resolved = context.resolve_table(table_ref)
+            if resolved and resolved != fact_table:
+                target_tables.append(resolved)
+        for path in requirement.get("paths") or []:
+            if isinstance(path, dict) and path.get("joins"):
+                provided_paths.append(path)
 
     joins: list[Join] = []
+    resolved_targets: set[str] = set()
+    for path in provided_paths:
+        path_tables = _string_list(path.get("tables"))
+        resolved_targets.update(table for table in path_tables if table != fact_table)
+        for join in path.get("joins") or []:
+            resolved = _join_from_path_item(join)
+            if resolved is not None and resolved not in joins:
+                joins.append(resolved)
+
     for target_table in unique_preserving_order(target_tables, skip_empty=True):
+        if target_table in resolved_targets:
+            continue
         path_result = find_relationship_paths(
             schema,
             from_tables=[fact_table],
@@ -429,6 +514,20 @@ def _resolve_joins(
             if resolved not in joins:
                 joins.append(resolved)
     return joins
+
+
+def _join_from_path_item(item: dict[str, Any]) -> Join | None:
+    try:
+        left_table = item["left_table"]
+        left_column = item["left_column"]
+        right_table = item["right_table"]
+        right_column = item["right_column"]
+    except KeyError:
+        return None
+    return Join(
+        left=FieldRef(str(left_table), str(left_column)),
+        right=FieldRef(str(right_table), str(right_column)),
+    )
 
 
 def _resolve_ordering(
@@ -501,21 +600,6 @@ def _choose_fact_table(
         if context.primary_key_or_identity(table):
             return table
     return candidate_tables[0]
-
-
-def _metric_like_required_fields(legacy_plan: Any) -> list[str]:
-    fields = [
-        field
-        for field in getattr(legacy_plan, "required_fields", []) or []
-        if looks_like_count_intent(field)
-    ]
-    for aggregation in getattr(legacy_plan, "aggregations", []) or []:
-        match = re.search(
-            r"\bas\s+([A-Za-z_][\w]*)\s*$", aggregation, flags=re.IGNORECASE
-        )
-        if match:
-            fields.append(match.group(1))
-    return fields
 
 
 def _count_alias(legacy_plan: Any, fact_table: str) -> str:

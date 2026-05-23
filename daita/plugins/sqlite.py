@@ -266,6 +266,23 @@ class SQLitePlugin(BaseDatabasePlugin):
             for row in rows
         ]
 
+    async def foreign_keys(self) -> List[Dict[str, Any]]:
+        """Return declared SQLite foreign key relationships."""
+        keys: List[Dict[str, Any]] = []
+        for table in await self.tables():
+            quoted_table = '"' + table.replace('"', '""') + '"'
+            rows = await self.query(f"PRAGMA foreign_key_list({quoted_table})")
+            for row in rows:
+                keys.append(
+                    {
+                        "source_table": table,
+                        "source_column": row.get("from", ""),
+                        "target_table": row.get("table", ""),
+                        "target_column": row.get("to", ""),
+                    }
+                )
+        return keys
+
     async def pragma(self, key: str, value: Any = None) -> Any:
         """
         Get or set a SQLite PRAGMA value.

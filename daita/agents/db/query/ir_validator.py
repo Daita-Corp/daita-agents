@@ -77,6 +77,10 @@ def validate_query_plan(
                 }
             )
 
+    relation_error = _relation_graph_error(plan)
+    if relation_error is not None:
+        errors.append(relation_error)
+
     date_macros = [
         item.value.get("macro")
         for item in plan.filters
@@ -103,6 +107,59 @@ def _plan_field_refs(plan: QueryPlan) -> list[FieldRef]:
     for join in plan.joins:
         fields.extend([join.left, join.right])
     return fields
+
+
+def _relation_graph_error(plan: QueryPlan) -> dict[str, Any] | None:
+    referenced_tables = _referenced_tables(plan)
+    if len(referenced_tables) <= 1:
+        return None
+    connected = _connected_join_tables(plan, referenced_tables)
+    missing = sorted(table for table in referenced_tables if table not in connected)
+    if missing:
+        return {
+            "type": "unjoined_table_reference",
+            "tables": sorted(referenced_tables),
+            "missing_tables": missing,
+            "guidance": (
+                "Every table referenced by selected fields, metrics, filters, "
+                "or ordering must be connected by QueryPlan.joins before SQL "
+                "compilation."
+            ),
+        }
+    return None
+
+
+def _referenced_tables(plan: QueryPlan) -> set[str]:
+    tables = {field.table for field in _plan_field_refs(plan) if field.table}
+    tables.update(metric.table for metric in plan.metrics if metric.table)
+    for order in plan.order_by:
+        if isinstance(order.field, FieldRef) and order.field.table:
+            tables.add(order.field.table)
+    return tables
+
+
+def _connected_join_tables(plan: QueryPlan, referenced_tables: set[str]) -> set[str]:
+    if not plan.joins:
+        return set()
+    adjacency: dict[str, set[str]] = {}
+    for join in plan.joins:
+        left = join.left.table
+        right = join.right.table
+        if not left or not right:
+            continue
+        adjacency.setdefault(left, set()).add(right)
+        adjacency.setdefault(right, set()).add(left)
+    start = next(iter(referenced_tables))
+    seen = {start}
+    queue = [start]
+    while queue:
+        table = queue.pop(0)
+        for neighbor in adjacency.get(table, set()):
+            if neighbor in seen:
+                continue
+            seen.add(neighbor)
+            queue.append(neighbor)
+    return seen
 
 
 def _schema_column_types(schema: dict[str, Any]) -> dict[tuple[str, str], str]:

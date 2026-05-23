@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, List
 
 from ...runtime.state import FinalAnswerReadiness
 from ..config.policies import ANSWER_EVIDENCE_DB_TOOLS
+from ..query.metadata import required_field_matches_output
 from .state import DbRunState
 
 INCOMPLETE_FINAL_MARKERS = (
@@ -103,8 +104,9 @@ def summarize_db_completeness(run_state) -> Dict[str, Any]:
         if isinstance(record.payload.get("row_count"), int)
     ]
     returned_columns = _returned_columns(executed_records)
+    evidence_columns = _evidence_columns(executed_records)
     missing_required_fields = _missing_required_fields(
-        required_fields, returned_columns, executed_records
+        required_fields, evidence_columns, executed_records
     )
     truncated_count = sum(
         1 for record in executed_records if bool(record.payload.get("truncated"))
@@ -132,6 +134,7 @@ def summarize_db_completeness(run_state) -> Dict[str, Any]:
         "row_counts": row_counts,
         "total_rows_observed": sum(row_counts),
         "returned_columns": sorted(returned_columns),
+        "evidence_columns": sorted(evidence_columns),
         "latest_db_evidence_kind": latest_db_record.kind if latest_db_record else None,
         "latest_db_evidence_tool": (
             latest_db_record.source_tool if latest_db_record else None
@@ -209,6 +212,15 @@ def _returned_columns(records: List[Any]) -> set[str]:
     return columns
 
 
+def _evidence_columns(records: List[Any]) -> set[str]:
+    columns = _returned_columns(records)
+    for record in records:
+        for column in record.payload.get("selected_columns") or []:
+            if column:
+                columns.add(str(column))
+    return columns
+
+
 def _has_unresolved_repair(latest_db_record: Any) -> bool:
     if latest_db_record is None:
         return False
@@ -219,65 +231,25 @@ def _has_unresolved_repair(latest_db_record: Any) -> bool:
 
 
 def _missing_required_fields(
-    required_fields: List[str], returned_columns: set[str], executed_records: List[Any]
+    required_fields: List[str], evidence_columns: set[str], executed_records: List[Any]
 ) -> List[str]:
     if not required_fields:
         return []
     if not executed_records:
         return list(required_fields)
-    if not returned_columns:
+    if not evidence_columns:
         return list(required_fields)
     return [
         field
         for field in required_fields
-        if not _field_is_covered_by_columns(field, returned_columns)
+        if not _field_is_covered_by_columns(field, evidence_columns)
     ]
 
 
 def _field_is_covered_by_columns(field: str, returned_columns: set[str]) -> bool:
-    normalized_field = _normalize_field_name(field)
-    field_tokens = _field_tokens(field)
-    for column in returned_columns:
-        normalized_column = _normalize_field_name(column)
-        if normalized_field == normalized_column:
-            return True
-        column_tokens = _field_tokens(column)
-        if not field_tokens or not column_tokens:
-            continue
-        shared = field_tokens & column_tokens
-        if field_tokens <= column_tokens or column_tokens <= field_tokens:
-            return True
-        if len(shared) >= min(2, len(field_tokens), len(column_tokens)):
-            return True
-    return False
-
-
-def _field_tokens(value: str) -> set[str]:
-    stopwords = {
-        "a",
-        "an",
-        "and",
-        "as",
-        "by",
-        "for",
-        "from",
-        "of",
-        "record",
-        "records",
-        "the",
-        "to",
-        "total",
-    }
-    tokens = set()
-    for token in _normalize_field_name(value).split():
-        if not token or token in stopwords:
-            continue
-        tokens.add(token[:-1] if token.endswith("s") and len(token) > 3 else token)
-    return tokens
-
-
-def _normalize_field_name(value: str) -> str:
-    return " ".join(str(value or "").lower().replace("_", " ").split())
+    return any(
+        required_field_matches_output(field, column) for column in returned_columns
+    )
 
 
 def _final_answer_guidance(db_state: Any, summary: Dict[str, Any]) -> str:

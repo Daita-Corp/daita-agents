@@ -101,7 +101,7 @@ async def _prepare_db_runtime_call(
     agent: "Agent", prompt: str, kwargs: Dict[str, Any]
 ) -> tuple[str, Dict[str, Any]]:
     from ..memory import recall_db_memory_context
-    from ..config.tool_profiles import select_db_tools_for_prompt
+    from ..config.tool_profiles import select_db_tool_profile
     from .state import DbRunState, set_db_run_state
     from .tracing import db_trace_span
 
@@ -152,12 +152,18 @@ async def _prepare_db_runtime_call(
             trace_manager,
             span_id,
         ):
-            selected_tools = select_db_tools_for_prompt(agent, prompt)
+            tool_profile = select_db_tool_profile(agent, prompt)
+            selected_tools = tool_profile.tools
+            run_state.configure_workflow(
+                selected_tools, intent_kind=tool_profile.intent
+            )
             trace_manager.record_output(
                 span_id,
                 {
                     "selected_tools": selected_tools,
                     "selected_tool_count": len(selected_tools),
+                    "required_phases": tool_profile.required_phases,
+                    "intent_kind": run_state.intent_kind,
                 },
             )
     agent._db_last_context_metadata = _context_metadata(context, selected_tools, prompt)
