@@ -22,7 +22,9 @@ def _memory_key(profile_key: str) -> str:
     return f"{Path.cwd().resolve()}:{profile_key}"
 
 
-def catalog_profile_key(source: Union[str, Any]) -> str:
+def catalog_profile_key(
+    source: Union[str, Any], *, db_schema: Optional[str] = None
+) -> str:
     """Compute a stable profile key for *source*, stripping credentials."""
     if isinstance(source, str):
         try:
@@ -37,9 +39,12 @@ def catalog_profile_key(source: Union[str, Any]) -> str:
         cls_name = type(source).__name__
         attrs = ":".join(
             str(getattr(source, attr, ""))
-            for attr in ("host", "port", "database_name", "path")
+            for attr in ("host", "port", "database_name", "database", "path")
         )
         key_text = f"{cls_name}:{attrs}"
+
+    if db_schema:
+        key_text = f"{key_text}|schema={db_schema}"
 
     return hashlib.sha256(key_text.encode()).hexdigest()[:16]
 
@@ -52,7 +57,7 @@ def load_catalog_profile_snapshot(
 ) -> Optional[Tuple[Dict[str, Any], bool]]:
     """Load a persisted catalog profile and report whether it is stale."""
     profile = (
-        _load_profile_from_catalog(catalog_keys)
+        _load_profile_from_catalog(profile_key, catalog_keys)
         if ttl is not None
         else _load_catalog_profile(profile_key, catalog_keys=catalog_keys)
     )
@@ -104,7 +109,7 @@ def _load_catalog_profile(
     if memory_key in _CATALOG_PROFILE_MEMORY_CACHE:
         return _CATALOG_PROFILE_MEMORY_CACHE[memory_key]
 
-    profile = _load_profile_from_catalog(catalog_keys)
+    profile = _load_profile_from_catalog(profile_key, catalog_keys)
     if profile is not None:
         _CATALOG_PROFILE_MEMORY_CACHE[memory_key] = profile
         return profile
@@ -134,6 +139,7 @@ def _is_expired(profile: Dict[str, Any], ttl: Optional[int]) -> bool:
 
 
 def _load_profile_from_catalog(
+    profile_key: str,
     catalog_keys: Optional[List[str]],
 ) -> Optional[Dict[str, Any]]:
     catalog_path = Path(".daita") / "catalog.json"
@@ -149,14 +155,19 @@ def _load_profile_from_catalog(
     if not isinstance(catalog, dict):
         return None
 
-    for key in catalog_keys or []:
+    exact_keys = [profile_key, *(catalog_keys or [])]
+    for key in exact_keys:
         profile = catalog.get(key)
         if isinstance(profile, dict) and isinstance(profile.get("tables"), list):
             return profile
 
-    if len(catalog) == 1:
-        profile = next(iter(catalog.values()))
-        if isinstance(profile, dict) and isinstance(profile.get("tables"), list):
+    for profile in catalog.values():
+        if not isinstance(profile, dict) or not isinstance(profile.get("tables"), list):
+            continue
+        metadata = profile.get("metadata") or {}
+        if profile.get("profile_key") == profile_key:
+            return profile
+        if isinstance(metadata, dict) and metadata.get("profile_key") == profile_key:
             return profile
 
     return None

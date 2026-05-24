@@ -23,7 +23,11 @@ SCHEMA_TERMS = ("schema", "column", "columns", "relationship", "relationships")
 
 
 async def try_db_fast_path(
-    agent: Any, prompt: str, kwargs: Dict[str, Any]
+    agent: Any,
+    prompt: str,
+    kwargs: Dict[str, Any],
+    *,
+    run_state: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """Try a deterministic DB answer before the autonomous LLM loop."""
 
@@ -32,7 +36,7 @@ async def try_db_fast_path(
         "from_db.fast_path",
         prompt=prompt[:200],
     ) as (trace_manager, span_id):
-        intent = await _simple_count_intent(agent, prompt)
+        intent = await _simple_count_intent(agent, prompt, run_state=run_state)
         if intent is None:
             trace_manager.record_output(span_id, {"used": False})
             return None
@@ -96,10 +100,17 @@ async def try_db_fast_path(
                 "kind": "simple_count",
                 "fallback_reason": None,
             },
+            "diagnostics": {
+                "db_run_state": (
+                    run_state.summary() if hasattr(run_state, "summary") else {}
+                )
+            },
         }
 
 
-async def _simple_count_intent(agent: Any, prompt: str) -> Optional[Dict[str, Any]]:
+async def _simple_count_intent(
+    agent: Any, prompt: str, *, run_state: Any = None
+) -> Optional[Dict[str, Any]]:
     text = str(prompt or "").lower()
     if not looks_like_count_intent(text):
         return None
@@ -107,7 +118,7 @@ async def _simple_count_intent(agent: Any, prompt: str) -> Optional[Dict[str, An
         return None
 
     schema = catalog_schema_snapshot(agent)
-    table = await _evidence_table_match(agent, prompt, schema)
+    table = await _evidence_table_match(agent, prompt, schema, run_state=run_state)
     if table is None:
         return None
     table_ref = table_name(table)
@@ -124,15 +135,15 @@ async def _simple_count_intent(agent: Any, prompt: str) -> Optional[Dict[str, An
 
 
 async def _evidence_table_match(
-    agent: Any, prompt: str, schema: Dict[str, Any]
+    agent: Any, prompt: str, schema: Dict[str, Any], *, run_state: Any = None
 ) -> Optional[Dict[str, Any]]:
     evidence = await collect_query_evidence(
         prompt,
         {"goal": prompt},
         schema,
+        run_state=run_state,
         catalog=vars(agent).get("_db_catalog"),
         store_id=vars(agent).get("_db_catalog_store_id"),
-        graph_backend=vars(agent).get("_db_query_graph_backend"),
     )
     table_names = evidence_table_names(evidence)
     if len(table_names) != 1:

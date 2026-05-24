@@ -10,6 +10,7 @@ from daita.agents.db.query import (
     compile_query_plan,
 )
 from daita.agents.db.query.ir_validator import validate_query_plan
+from daita.agents.db.query.requirements import parse_answer_requirements
 from daita.agents.db.query.sql_validator import validate_sql_against_schema
 from daita.agents.db.runtime.completeness import (
     attach_db_completeness,
@@ -18,6 +19,7 @@ from daita.agents.db.runtime.completeness import (
 from daita.agents.db.runtime.state import DbRunState, set_db_run_state
 from daita.agents.db.tools.query import create_db_query_tools
 from daita.agents.runtime.contextvars import active_run_state
+from daita.agents.runtime.guardrails import ToolCallGuardrails
 from daita.agents.runtime.state import RunState
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.base_profiler import NormalizedSchema
@@ -65,6 +67,10 @@ def _activate_run_state(db_state=None):
     if db_state is not None:
         run_state.domains["db"] = db_state
     return run_state, active_run_state.set(run_state)
+
+
+def _set_answer_requirements(state, values):
+    state.record_answer_requirements(parse_answer_requirements(list(values)))
 
 
 def test_query_ir_round_trips_to_plain_dicts():
@@ -466,6 +472,172 @@ async def test_db_query_executes_validated_plan_id_without_sql_preflight():
     assert result == {"rows": [{"total_orders": 3}]}
     plugin._tool_query.assert_awaited_once()
     assert plugin._tool_query.await_args.args[0]["sql"] == plan_result["compiled_sql"]
+
+
+async def test_db_query_revalidates_plan_id_before_execution():
+    schema = _schema(
+        tables=[
+            _table(
+                "orders",
+                [
+                    {"name": "order_id", "type": "integer"},
+                ],
+            )
+        ]
+    )
+    plugin = MagicMock()
+    plugin.sql_dialect = "postgresql"
+    plugin.read_only = True
+    plugin._tool_query = AsyncMock(return_value={"rows": []})
+    plugin._tool_count = AsyncMock(return_value={"count": 0})
+    plugin._tool_sample = AsyncMock(return_value={"rows": []})
+    state = DbRunState()
+    set_db_run_state(plugin, state)
+    state.plans_by_id["plan_1"] = {
+        "plan_id": "plan_1",
+        "result": {
+            "compiled_sql": "SELECT missing_column FROM orders",
+            "validation": {"ok": True},
+        },
+    }
+
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+    result = await tools["db_query"].handler({"plan_id": "plan_1"})
+
+    assert result["error_type"] == "schema_reference_error"
+    assert result["repair_required"] is True
+    assert result["suggested_next_tool"] == "db_plan_query"
+    assert result["plan_id"] == "plan_1"
+    plugin._tool_query.assert_not_awaited()
+
+
+async def test_db_plan_preserves_structured_aggregate_alias_with_unrelated_revenue_column():
+    schema = _schema(
+        tables=[
+            _table(
+                "public.customers",
+                [
+                    {"name": "customer_id", "type": "integer", "is_primary_key": True},
+                    {"name": "name", "type": "text"},
+                ],
+            ),
+            _table(
+                "public.orders",
+                [
+                    {"name": "order_id", "type": "integer", "is_primary_key": True},
+                    {"name": "customer_id", "type": "integer"},
+                    {"name": "total_amount", "type": "numeric"},
+                ],
+            ),
+            _table("public.daily_metrics", [{"name": "revenue", "type": "numeric"}]),
+        ],
+        fks=[
+            {
+                "source_table": "public.orders",
+                "source_column": "customer_id",
+                "target_table": "public.customers",
+                "target_column": "customer_id",
+            }
+        ],
+    )
+    plugin = MagicMock()
+    plugin.sql_dialect = "postgresql"
+    plugin.read_only = True
+    plugin._tool_query = AsyncMock(
+        return_value={"rows": [{"customer_id": 2, "name": "Bob", "total_revenue": 150}]}
+    )
+    plugin._tool_count = AsyncMock(return_value={"count": 0})
+    plugin._tool_sample = AsyncMock(return_value={"rows": []})
+    set_db_run_state(plugin, DbRunState())
+
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+    plan_result = await tools["db_plan_query"].handler(
+        {
+            "goal": "Which customer has the highest total revenue?",
+            "required_fields": [
+                "customers.customer_id",
+                "customers.name",
+                "SUM(orders.total_amount) AS total_revenue",
+            ],
+            "candidate_tables": ["orders", "customers"],
+            "aggregations": ["SUM(orders.total_amount)"],
+            "grouping": ["customers.customer_id", "customers.name"],
+            "ordering": ["total_revenue DESC"],
+            "limit": 1,
+        }
+    )
+
+    assert plan_result["validation"]["ok"] is True
+    assert 'AS "total_revenue"' in plan_result["compiled_sql"]
+    assert "sum_total_amount" not in plan_result["compiled_sql"]
+
+    result = await tools["db_query"].handler({"plan_id": plan_result["plan_id"]})
+
+    assert result["rows"] == [{"customer_id": 2, "name": "Bob", "total_revenue": 150}]
+    plugin._tool_query.assert_awaited_once()
+
+
+async def test_db_plan_treats_required_metric_source_as_aggregate_requirement():
+    schema = _schema(
+        tables=[
+            _table(
+                "orders",
+                [
+                    {"name": "order_id", "type": "integer", "is_primary_key": True},
+                    {"name": "total_amount", "type": "numeric"},
+                ],
+            )
+        ]
+    )
+    plugin = MagicMock()
+    plugin.sql_dialect = "postgresql"
+    plugin.read_only = True
+    plugin._tool_query = AsyncMock(return_value={"rows": [{"total_revenue": 150}]})
+    plugin._tool_count = AsyncMock(return_value={"count": 0})
+    plugin._tool_sample = AsyncMock(return_value={"rows": []})
+    set_db_run_state(plugin, DbRunState())
+
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+    plan_result = await tools["db_plan_query"].handler(
+        {
+            "goal": "Find total order revenue.",
+            "required_fields": ["orders.total_amount"],
+            "candidate_tables": ["orders"],
+            "aggregations": ["SUM(orders.total_amount) AS total_revenue"],
+        }
+    )
+    result = await tools["db_query"].handler({"plan_id": plan_result["plan_id"]})
+
+    assert plan_result["validation"]["ok"] is True
+    assert result["rows"] == [{"total_revenue": 150}]
+    plugin._tool_query.assert_awaited_once()
+
+
+def test_db_guardrail_uses_sql_fingerprint_across_different_plan_ids():
+    run_state = RunState(agent_id="test-agent")
+    run_state.domains["db"] = DbRunState()
+    guardrails = ToolCallGuardrails()
+    raw = {
+        "repair_required": True,
+        "preflight_failed": True,
+        "sql_fingerprint": "same-sql",
+        "error_type": "required_field_error",
+        "message": "same SQL failed",
+    }
+
+    first = guardrails.observe_tool_result(
+        run_state,
+        {"name": "db_query", "arguments": {"plan_id": "plan_1"}},
+        {"result": raw},
+    )
+    second = guardrails.observe_tool_result(
+        run_state,
+        {"name": "db_query", "arguments": {"plan_id": "plan_2"}},
+        {"result": raw},
+    )
+
+    assert first.guidance_result is None
+    assert second.guidance_result["guardrail"] == "repeated_tool_error"
 
 
 async def test_db_query_falls_back_to_sql_when_unknown_plan_id_is_paired_with_sql():
@@ -892,7 +1064,7 @@ async def test_db_query_records_rejected_sql_evidence():
 
 def test_db_completeness_reports_insufficient_evidence_for_empty_db_run_state():
     state = DbRunState()
-    state.required_answer_fields.append("total revenue")
+    _set_answer_requirements(state, ["total revenue"])
     run_state = RunState(agent_id="test-agent")
     run_state.domains["db"] = state
 
@@ -910,7 +1082,7 @@ def test_db_completeness_reports_insufficient_evidence_for_empty_db_run_state():
 
 def test_db_completeness_requires_planned_fields_in_returned_columns():
     state = DbRunState()
-    state.required_answer_fields.append("customer_name")
+    _set_answer_requirements(state, ["customer_name"])
     run_state = RunState(agent_id="test-agent")
     run_state.domains["db"] = state
     token = active_run_state.set(run_state)
@@ -936,7 +1108,7 @@ def test_db_completeness_requires_planned_fields_in_returned_columns():
 
 def test_db_completeness_uses_selected_columns_for_empty_results():
     state = DbRunState()
-    state.required_answer_fields.extend(["customer_id", "signup_date"])
+    _set_answer_requirements(state, ["customer_id", "signup_date"])
     run_state = RunState(agent_id="test-agent")
     run_state.domains["db"] = state
     token = active_run_state.set(run_state)
@@ -967,12 +1139,13 @@ def test_db_completeness_uses_selected_columns_for_empty_results():
 
 def test_db_completeness_matches_qualified_required_fields_to_output_names():
     state = DbRunState()
-    state.required_answer_fields.extend(
+    _set_answer_requirements(
+        state,
         [
             "customers.customer_id",
             "customers.name",
             "SUM(orders.total_amount) AS total_revenue",
-        ]
+        ],
     )
     run_state = RunState(agent_id="test-agent")
     run_state.domains["db"] = state
@@ -1001,7 +1174,7 @@ def test_db_completeness_matches_qualified_required_fields_to_output_names():
 
 def test_db_completeness_matches_semantic_returned_column_aliases():
     state = DbRunState()
-    state.required_answer_fields.extend(["customer records", "order revenue"])
+    _set_answer_requirements(state, ["customer records", "order revenue"])
     run_state = RunState(agent_id="test-agent")
     run_state.domains["db"] = state
     token = active_run_state.set(run_state)

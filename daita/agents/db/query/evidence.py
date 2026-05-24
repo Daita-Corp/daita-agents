@@ -22,7 +22,6 @@ async def collect_query_evidence(
     run_state: Any = None,
     catalog: Any = None,
     store_id: Optional[str] = None,
-    graph_backend: Any = None,
 ) -> Dict[str, Any]:
     """Collect compact relational evidence for SQL planning."""
     run_evidence = _run_state_evidence(run_state)

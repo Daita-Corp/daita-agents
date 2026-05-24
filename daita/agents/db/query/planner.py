@@ -12,6 +12,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from ..runtime.state import DbQueryPlan, DbRunState
+from ..utils import string_list
 from .metadata import (
     matching_tables as _matching_tables,
     schema_table_columns as _schema_table_columns,
@@ -26,6 +27,7 @@ from .evidence import (
 )
 from .intent import looks_like_count_intent
 from .ir_validator import validate_query_plan
+from .requirements import parse_answer_requirements
 from .resolver import resolve_query_plan
 from .sql_validator import required_field_warnings_for_plan
 
@@ -45,13 +47,19 @@ def build_query_plan(
 ) -> Dict[str, Any]:
     """Normalize LLM intent and enrich it with schema candidates."""
 
+    required_fields = _string_list(args.get("required_fields"))
+    aggregations = _string_list(args.get("aggregations"))
+    answer_requirements = parse_answer_requirements(
+        required_fields, aggregations=aggregations
+    )
     plan = DbQueryPlan(
         goal=str(args.get("goal") or "").strip(),
-        required_fields=_string_list(args.get("required_fields")),
+        required_fields=required_fields,
+        answer_requirements=answer_requirements,
         candidate_tables=_string_list(args.get("candidate_tables")),
         required_joins=_join_requirements(args.get("required_joins")),
         filters=_string_list(args.get("filters")),
-        aggregations=_string_list(args.get("aggregations")),
+        aggregations=aggregations,
         grouping=_string_list(args.get("grouping")),
         ordering=_string_list(args.get("ordering")),
         limit=_optional_int(args.get("limit")),
@@ -109,7 +117,7 @@ def build_query_plan(
         else {"ok": False, "errors": [], "warnings": []}
     )
     required_field_warnings = required_field_warnings_for_plan(
-        query_ir, plan.required_fields
+        query_ir, plan.answer_requirements
     )
     if required_field_warnings:
         ir_validation = {
@@ -509,18 +517,7 @@ def _join_requirements(value: Any) -> List[Dict[str, Any]]:
 
 
 def _string_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value] if value.strip() else []
-    if not isinstance(value, list):
-        return []
-    out = []
-    for item in value:
-        text = str(item).strip()
-        if text and text not in out:
-            out.append(text)
-    return out
+    return string_list(value, unique=True)
 
 
 def _optional_int(value: Any) -> Optional[int]:

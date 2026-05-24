@@ -71,7 +71,11 @@ async def persist_schema(
             except (json.JSONDecodeError, ValueError):
                 logger.warning("catalog.json was corrupt, overwriting.")
 
-        key = f"{schema.get('database_type', 'unknown')}:{schema.get('schema', 'default')}"
+        key = (
+            schema.get("store_id")
+            or schema.get("profile_key")
+            or f"{schema.get('database_type', 'unknown')}:{schema.get('schema', 'default')}"
+        )
         now = datetime.now(timezone.utc).isoformat()
 
         if key in existing:

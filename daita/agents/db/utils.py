@@ -42,3 +42,25 @@ def plugin_database_name(plugin: Any) -> Any:
         or getattr(plugin, "db", None)
         or getattr(plugin, "path", None)
     )
+
+
+def string_list(value: Any, *, unique: bool = False) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if not isinstance(value, list):
+        return []
+    strings = [str(item).strip() for item in value if str(item).strip()]
+    if unique:
+        return unique_preserving_order(strings)
+    return strings
+
+
+def clamp_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))

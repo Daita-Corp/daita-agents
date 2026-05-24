@@ -326,14 +326,14 @@ async def _load_or_discover_schema(
 
     schema = None
     cached_schema = None
-    profile_key = catalog_profile_key(source)
+    profile_key = catalog_profile_key(source, db_schema=db_schema)
     drift = None
     persist_profile = cache_ttl is not None
 
     if use_schema_snapshot:
         cache_result = load_catalog_profile_snapshot(
             profile_key,
-            catalog_keys=_catalog_snapshot_keys(plugin, db_schema),
+            catalog_keys=_catalog_snapshot_keys(plugin, db_schema, profile_key),
             ttl=cache_ttl,
         )
         if cache_result is not None:
@@ -377,11 +377,16 @@ async def _register_schema_in_catalog(
 
     active_catalog = catalog_plugin or CatalogPlugin(auto_persist=False)
     store_type = _catalog_store_type(plugin, schema)
+    profile_key = catalog_profile_key(source, db_schema=db_schema)
     options = {"schema": db_schema} if db_schema else {}
+    metadata = dict(schema.get("metadata") or {})
+    metadata["profile_key"] = profile_key
+    schema = {**schema, "metadata": metadata, "profile_key": profile_key}
     registered = await active_catalog.register_schema(
         schema,
         store_type=store_type,
         connection_string=source if isinstance(source, str) else None,
+        store_id=_catalog_store_id(profile_key),
         persist=persist,
         options=options,
     )
@@ -409,21 +414,31 @@ def _catalog_schema_for_prompt(
     return schema.to_dict() if hasattr(schema, "to_dict") else dict(schema)
 
 
-def _catalog_snapshot_keys(plugin: Any, db_schema: Optional[str]) -> List[str]:
+def _catalog_store_id(profile_key: str) -> str:
+    return f"from_db:{profile_key}"
+
+
+def _catalog_snapshot_keys(
+    plugin: Any, db_schema: Optional[str], profile_key: Optional[str] = None
+) -> List[str]:
+    keys = []
+    if profile_key:
+        keys.append(_catalog_store_id(profile_key))
+        keys.append(profile_key)
+
     dialect = getattr(plugin, "sql_dialect", None) or getattr(
         plugin, "database_type", None
     )
-    if not dialect:
-        return []
+    if not isinstance(dialect, str) or not dialect:
+        return list(dict.fromkeys(keys))
 
-    keys = []
     if db_schema:
         keys.append(f"{dialect}:{db_schema}")
 
     database_name = getattr(plugin, "database_name", None) or getattr(
         plugin, "database", None
     )
-    if database_name:
+    if isinstance(database_name, str) and database_name:
         keys.append(f"{dialect}:{database_name}")
 
     keys.append(f"{dialect}:default")
@@ -591,12 +606,6 @@ async def _attach_lineage(
 
     agent.add_plugin(lineage_plugin)
     agent._db_lineage = lineage_plugin
-    graph_backend = vars(lineage_plugin).get("_graph_backend")
-    if graph_backend is not None:
-        agent._db_query_graph_backend = graph_backend
-        plugin = getattr(agent, "_db_plugin", None)
-        if plugin is not None:
-            plugin._db_query_graph_backend = graph_backend
 
 
 def _attach_memory(

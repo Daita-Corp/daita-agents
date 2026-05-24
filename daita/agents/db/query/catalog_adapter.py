@@ -10,7 +10,9 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
+from ..utils import clamp_int as _clamp_int
 from .metadata import column_name as _column_name
+from .metadata import split_identifier as _split_identifier
 
 MAX_SEARCH_LIMIT = 50
 MAX_JOIN_HOPS = 6
@@ -257,15 +259,3 @@ def _query_tokens(query: str) -> List[str]:
         for token in tokens
         if len(token) > 1 and token not in seen and not seen.add(token)
     ]
-
-
-def _split_identifier(value: str) -> List[str]:
-    return [part for part in re.split(r"[^a-zA-Z0-9]+|_", value.lower()) if part]
-
-
-def _clamp_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = default
-    return max(minimum, min(maximum, parsed))

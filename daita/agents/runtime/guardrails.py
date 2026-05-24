@@ -110,7 +110,9 @@ class ToolCallGuardrails:
     ) -> "GuardrailDecision":
         """Record a tool result and return guidance or a hard stop when needed."""
         raw = result.get("result", {})
-        fingerprint = make_error_fingerprint(tool_call)
+        fingerprint = _domain_retry_fingerprint(
+            run_state, tool_call, raw, kind="error"
+        ) or make_error_fingerprint(tool_call)
         loop_error = tool_loop_error_message(raw)
         if loop_error:
             count = run_state.failed_tool_fingerprints.get(fingerprint, 0) + 1
@@ -140,7 +142,9 @@ class ToolCallGuardrails:
             return GuardrailDecision()
         run_state.failed_tool_fingerprints.pop(fingerprint, None)
 
-        result_fingerprint = make_result_fingerprint(tool_call, result)
+        result_fingerprint = _domain_retry_fingerprint(
+            run_state, tool_call, raw, kind="result"
+        ) or make_result_fingerprint(tool_call, result)
         count = run_state.repeated_result_fingerprints.get(result_fingerprint, 0) + 1
         run_state.repeated_result_fingerprints[result_fingerprint] = count
         if count >= self.guidance_after_repeats:
@@ -188,3 +192,16 @@ def _guardrail_payload(
         "repeat_count": repeat_count,
         "last_result": last_result,
     }
+
+
+def _domain_retry_fingerprint(
+    run_state: Any, tool_call: Dict[str, Any], raw_result: Any, *, kind: str
+) -> Optional[str]:
+    for domain_state in getattr(run_state, "domains", {}).values():
+        callback = getattr(domain_state, "tool_retry_fingerprint", None)
+        if not callable(callback):
+            continue
+        fingerprint = callback(tool_call, raw_result, kind=kind)
+        if fingerprint:
+            return str(fingerprint)
+    return None

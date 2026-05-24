@@ -5,7 +5,10 @@ Compact per-run context for agents created by ``Agent.from_db()``.
 import re
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from ..config.policies import SCHEMA_NAVIGATION_TOOLS, TERMINAL_DB_TOOLS
+from ..config.policies import (
+    SCHEMA_NAVIGATION_TOOLS as _SCHEMA_NAVIGATION_TOOLS,
+    TERMINAL_DB_TOOLS,
+)
 from ..catalog_read_model import build_db_catalog_read_model
 from ..utils import ANALYST_TOOL_PREFIXES
 
@@ -13,6 +16,7 @@ if TYPE_CHECKING:
     from ...agent import Agent
 
 
+SCHEMA_NAVIGATION_TOOLS = _SCHEMA_NAVIGATION_TOOLS
 DEFAULT_CONTEXT_MAX_CHARS = 1600
 SCHEMA_HINT_MAX_TABLES = 5
 SCHEMA_HINT_MAX_RELATIONSHIPS = 5
@@ -70,13 +74,16 @@ def make_db_context_run(agent: "Agent", original_run: Callable) -> Callable:
     async def _db_context_run(prompt: str, **kwargs: Any):
         from .fast_path import try_db_fast_path
 
-        fast_result = await try_db_fast_path(agent, prompt, kwargs)
+        run_state = _start_db_run_state(agent)
+        fast_result = await try_db_fast_path(agent, prompt, kwargs, run_state=run_state)
         if fast_result is not None:
             history = kwargs.get("history")
             if history is not None and hasattr(history, "add_turn"):
                 await history.add_turn(prompt, fast_result.get("result", ""))
             return fast_result
-        augmented_prompt, kwargs = await _prepare_db_runtime_call(agent, prompt, kwargs)
+        augmented_prompt, kwargs = await _prepare_db_runtime_call(
+            agent, prompt, kwargs, run_state=run_state
+        )
         return await original_run(augmented_prompt, **kwargs)
 
     return _db_context_run
@@ -98,11 +105,14 @@ def _augment_prompt(prompt: str, context: str) -> str:
 
 
 async def _prepare_db_runtime_call(
-    agent: "Agent", prompt: str, kwargs: Dict[str, Any]
+    agent: "Agent",
+    prompt: str,
+    kwargs: Dict[str, Any],
+    *,
+    run_state: Any = None,
 ) -> tuple[str, Dict[str, Any]]:
     from ..memory import recall_db_memory_context
     from ..config.tool_profiles import select_db_tool_profile
-    from .state import DbRunState, set_db_run_state
     from .tracing import db_trace_span
 
     async with db_trace_span(
@@ -110,12 +120,8 @@ async def _prepare_db_runtime_call(
         "from_db.prepare_runtime_context",
         prompt=prompt[:200],
     ):
-        plugin = getattr(agent, "_db_plugin", None)
-        run_state = DbRunState()
-        set_db_run_state(agent, run_state)
-        if plugin is not None:
-            set_db_run_state(plugin, run_state)
-            setattr(plugin, "_daita_sql_preflight_failures", {})
+        if run_state is None:
+            run_state = _start_db_run_state(agent)
 
         async with db_trace_span(agent, "from_db.memory_recall") as (
             trace_manager,
@@ -176,6 +182,18 @@ async def _prepare_db_runtime_call(
     kwargs.setdefault("final_synthesis_without_tools", True)
     kwargs.setdefault("terminal_tools", TERMINAL_DB_TOOLS)
     return _augment_prompt(prompt, context), kwargs
+
+
+def _start_db_run_state(agent: "Agent") -> Any:
+    from .state import DbRunState, set_db_run_state
+
+    plugin = getattr(agent, "_db_plugin", None)
+    run_state = DbRunState()
+    set_db_run_state(agent, run_state)
+    if plugin is not None:
+        set_db_run_state(plugin, run_state)
+        setattr(plugin, "_daita_sql_preflight_failures", {})
+    return run_state
 
 
 def _context_metadata(
@@ -402,5 +420,33 @@ def _truncate_line(value: str, max_chars: int) -> str:
 def _truncate_context(context: str, max_chars: int) -> str:
     if len(context) <= max_chars:
         return context
-    suffix = "\n...context truncated\n</db_runtime_context>"
-    return context[: max_chars - len(suffix)].rstrip() + suffix
+    lines = context.splitlines()
+    if len(lines) < 3:
+        suffix = "\n...context truncated\n</db_runtime_context>"
+        return context[: max_chars - len(suffix)].rstrip() + suffix
+
+    priority_prefixes = (
+        "Use DB tools",
+        "Database:",
+        "Query policy:",
+        "Capabilities:",
+        "Memory:",
+        "Data health:",
+        "Candidate metrics:",
+        "Schema hints:",
+        "Drift:",
+    )
+    body = [
+        _truncate_line(line, 220)
+        for prefix in priority_prefixes
+        for line in lines[1:-1]
+        if line.startswith(prefix)
+    ]
+    output = [lines[0]]
+    truncated_marker = "...context truncated"
+    for line in body:
+        candidate = "\n".join(output + [line, truncated_marker, lines[-1]])
+        if len(candidate) > max_chars:
+            continue
+        output.append(line)
+    return "\n".join(output + [truncated_marker, lines[-1]])

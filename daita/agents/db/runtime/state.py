@@ -12,6 +12,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+from ..query.requirements import AnswerRequirement
+from ..utils import string_list as _string_list
+
 
 @dataclass
 class DbQueryPlan:
@@ -19,6 +22,7 @@ class DbQueryPlan:
 
     goal: str
     required_fields: List[str] = field(default_factory=list)
+    answer_requirements: List[AnswerRequirement] = field(default_factory=list)
     candidate_tables: List[str] = field(default_factory=list)
     required_joins: List[Dict[str, Any]] = field(default_factory=list)
     filters: List[str] = field(default_factory=list)
@@ -47,7 +51,7 @@ class DbRunState:
     failed_sql_fingerprints: Dict[str, int] = field(default_factory=dict)
     validated_sql: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     executed_queries: List[Dict[str, Any]] = field(default_factory=list)
-    required_answer_fields: List[str] = field(default_factory=list)
+    answer_requirements: List[AnswerRequirement] = field(default_factory=list)
     planned_queries: List[Dict[str, Any]] = field(default_factory=list)
     plans_by_id: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     next_plan_number: int = 1
@@ -58,6 +62,10 @@ class DbRunState:
     ) -> None:
         if candidates:
             self.candidate_columns[field_name] = list(candidates)
+
+    @property
+    def required_answer_fields(self) -> List[str]:
+        return [requirement.display_name for requirement in self.answer_requirements]
 
     def record_join_paths(self, result: Dict[str, Any]) -> None:
         for path in result.get("paths") or []:
@@ -140,10 +148,10 @@ class DbRunState:
                 },
                 key=("table",),
             )
-            for field in table.get("matched_fields") or []:
-                if not isinstance(field, dict):
+            for matched_field in table.get("matched_fields") or []:
+                if not isinstance(matched_field, dict):
                     continue
-                column_name = str(field.get("name") or "").strip()
+                column_name = str(matched_field.get("name") or "").strip()
                 if not column_name:
                     continue
                 _append_unique_evidence(
@@ -151,7 +159,9 @@ class DbRunState:
                     {
                         "table": table_name,
                         "column": column_name,
-                        "confidence": _score_to_confidence(field.get("score"), 0.7),
+                        "confidence": _score_to_confidence(
+                            matched_field.get("score"), 0.7
+                        ),
                         "source": "catalog",
                         "provenance": "catalog_search_schema",
                     },
@@ -314,9 +324,7 @@ class DbRunState:
         stored = {"plan_id": plan_id, "plan": plan.to_dict(), "result": dict(result)}
         self.planned_queries.append(stored)
         self.plans_by_id[plan_id] = stored
-        for field_name in plan.required_fields:
-            if field_name not in self.required_answer_fields:
-                self.required_answer_fields.append(field_name)
+        self.record_answer_requirements(plan.answer_requirements)
         _record_db_evidence(
             "query_plan",
             source_tool="db_plan_query",
@@ -330,6 +338,45 @@ class DbRunState:
             },
         )
         return plan_id
+
+    def record_answer_requirements(self, requirements: List[AnswerRequirement]) -> None:
+        seen = {requirement.raw for requirement in self.answer_requirements}
+        for requirement in requirements:
+            if requirement.raw in seen:
+                continue
+            self.answer_requirements.append(requirement)
+            seen.add(requirement.raw)
+
+    def tool_retry_fingerprint(
+        self, tool_call: Dict[str, Any], raw_result: Any, *, kind: str
+    ) -> Optional[str]:
+        """Return a DB-domain retry identity for generic loop guardrails."""
+
+        if not isinstance(raw_result, dict):
+            return None
+        tool_name = str(tool_call.get("name") or "")
+        sql_fp = str(raw_result.get("sql_fingerprint") or "").strip()
+        if kind == "error" and tool_name in {
+            "db_query",
+            "db_validate_sql",
+            "db_compile_and_query",
+        }:
+            if sql_fp and (
+                raw_result.get("repair_required")
+                or raw_result.get("preflight_failed")
+                or raw_result.get("blocked_repeat")
+            ):
+                error_type = str(raw_result.get("error_type") or "sql_repair")
+                return f"db:sql_error:{sql_fp}:{error_type}"
+        if kind == "result" and tool_name == "db_plan_query":
+            sql = str(raw_result.get("compiled_sql") or "").strip()
+            if sql:
+                from ..query.sql_validator import sql_fingerprint
+
+                validation = raw_result.get("validation") or {}
+                status = "valid" if validation.get("ok") else "invalid"
+                return f"db:plan:{sql_fingerprint(sql)}:{status}"
+        return None
 
     def get_plan(self, plan_id: str) -> Optional[Dict[str, Any]]:
         return self.plans_by_id.get(plan_id)
@@ -512,16 +559,6 @@ def _score(item: Dict[str, Any]) -> float:
         return float(item.get("confidence") or 0.0)
     except (TypeError, ValueError):
         return 0.0
-
-
-def _string_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value] if value.strip() else []
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _unique_strings(values: List[str]) -> List[str]:

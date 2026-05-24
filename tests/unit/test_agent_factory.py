@@ -1660,38 +1660,6 @@ class TestFromDbLineage:
         # add_plugin called for DB + catalog, not lineage.
         assert mock_agent.add_plugin.call_count == 2
 
-    async def test_lineage_graph_backend_is_exposed_for_query_tracing(self):
-        import daita.agents.db.builder as fac
-        from daita.agents.db import from_db
-
-        schema = _make_normalized_schema(
-            tables=[_table("invoices"), _table("accounts")],
-            fks=[
-                {
-                    "source_table": "invoices",
-                    "source_column": "account_id",
-                    "target_table": "accounts",
-                    "target_column": "id",
-                }
-            ],
-        )
-        mock_plugin, mock_agent = self._base_mocks()
-        mock_lineage = MagicMock()
-        mock_lineage.register_flow = AsyncMock()
-        mock_lineage._graph_backend = MagicMock()
-
-        with (
-            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
-            patch.object(fac, "discover_schema", AsyncMock(return_value=schema)),
-            patch("daita.agents.agent.Agent", return_value=mock_agent),
-            patch("daita.plugins.lineage.LineagePlugin", return_value=mock_lineage),
-        ):
-            await from_db("postgresql://localhost/testdb", lineage=True)
-
-        mock_lineage.register_flow.assert_not_awaited()
-        assert mock_agent._db_query_graph_backend is mock_lineage._graph_backend
-        assert mock_plugin._db_query_graph_backend is mock_lineage._graph_backend
-
     async def test_lineage_no_fks_no_register_calls(self):
         import daita.agents.db.builder as fac
         from daita.agents.db import from_db
@@ -2808,7 +2776,8 @@ class TestCatalogProfileFreshness:
         mock_discover = AsyncMock(return_value=schema)
 
         source = "postgresql://user:pass@host/db"
-        _write_catalog_schema(schema)
+        profile_key = _db_catalog_profile_key(source)
+        _write_catalog_schema(schema, key=f"from_db:{profile_key}")
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
@@ -2828,7 +2797,8 @@ class TestCatalogProfileFreshness:
 
         schema = _make_normalized_schema(tables=[_table("orders"), _table("customers")])
         source = "postgresql://user:pass@host/db"
-        _write_catalog_schema(schema)
+        profile_key = _db_catalog_profile_key(source)
+        _write_catalog_schema(schema, key=f"from_db:{profile_key}")
 
         mock_plugin = MagicMock()
         mock_plugin.connect = AsyncMock()
@@ -2851,6 +2821,41 @@ class TestCatalogProfileFreshness:
             table["name"] for table in schema["tables"]
         ]
 
+    async def test_unrelated_single_catalog_profile_does_not_shadow_source(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        import daita.agents.db.builder as fac
+        from daita.agents.db import from_db
+
+        stale_schema = _make_normalized_schema(
+            tables=[_table("customers")], db_type="sqlite", db_name="benchmark"
+        )
+        active_schema = _make_normalized_schema(
+            tables=[_table("users")], db_type="postgresql", db_name="db"
+        )
+        _write_catalog_schema(stale_schema, key="sqlite:benchmark")
+
+        mock_plugin = MagicMock()
+        mock_plugin.connect = AsyncMock()
+        mock_agent = MagicMock()
+        mock_agent.add_plugin = MagicMock()
+        mock_discover = AsyncMock(return_value=active_schema)
+
+        source = "postgresql://user:pass@host/db"
+        with (
+            patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
+            patch.object(fac, "discover_schema", mock_discover),
+            patch("daita.agents.agent.Agent", return_value=mock_agent),
+        ):
+            await from_db(source, cache_ttl=None)
+
+        mock_discover.assert_awaited_once()
+        catalog_schema = mock_agent._db_catalog.get_schema(
+            mock_agent._db_catalog_store_id
+        )
+        assert [table.name for table in catalog_schema.tables] == ["users"]
+
     async def test_stale_catalog_profile_triggers_rediscovery(
         self, tmp_path, monkeypatch
     ):
@@ -2869,7 +2874,8 @@ class TestCatalogProfileFreshness:
 
         source = "postgresql://user:pass@host/db"
         old_ts = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
-        _write_catalog_schema(schema, last_seen=old_ts)
+        profile_key = _db_catalog_profile_key(source)
+        _write_catalog_schema(schema, key=f"from_db:{profile_key}", last_seen=old_ts)
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
@@ -2946,7 +2952,8 @@ class TestCatalogProfileFreshness:
 
         source = "postgresql://user:pass@host/db"
         old_ts = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
-        _write_catalog_schema(schema, last_seen=old_ts)
+        profile_key = _db_catalog_profile_key(source)
+        _write_catalog_schema(schema, key=f"from_db:{profile_key}", last_seen=old_ts)
 
         with (
             patch.object(fac, "resolve_plugin", return_value=(mock_plugin, True)),
@@ -3790,8 +3797,13 @@ class TestFromDbQueryFacadeTools:
         assert result["required_field_warnings"] == [
             {
                 "required_field": "total tokens",
-                "expected_columns": ["total_tokens"],
-                "reason": "required field not referenced by SQL",
+                "expected_source_columns": [{"table": "", "column": "total_tokens"}],
+                "expected_outputs": [
+                    "total tokens",
+                    "total_tokens",
+                    "total_tokens_used",
+                ],
+                "reason": "required source column not referenced by SQL",
             }
         ]
         plugin._tool_query.assert_not_awaited()

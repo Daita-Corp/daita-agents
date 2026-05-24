@@ -133,18 +133,3 @@ def metric_matches_required(metric: Any, required_field: str) -> bool:
     column = str(getattr(metric, "column", "") or "")
     return bool(column and required_field_matches_output(required_field, column))
 
-
-def candidate_column_matches_required(
-    required_field: str, column: str, *, min_score: int = 6, score: int = 0
-) -> bool:
-    if score < min_score:
-        return False
-    normalized_field = normalize_identifier(required_field)
-    normalized_column = normalize_identifier(column)
-    if not normalized_field or not normalized_column:
-        return False
-    return (
-        normalized_column == normalized_field
-        or normalized_column.endswith(normalized_field)
-        or normalized_field.endswith(normalized_column)
-    )

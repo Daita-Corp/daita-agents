@@ -8,7 +8,6 @@ import re
 from typing import Any
 
 from .metadata import (
-    candidate_column_matches_required,
     field_ref_matches_required,
     metric_matches_required,
     normalize_identifier,
@@ -16,6 +15,12 @@ from .metadata import (
 )
 from .intent import is_count_metric_name
 from .ir import QueryPlan
+from .requirements import (
+    AnswerRequirement,
+    output_satisfies_requirement,
+    requirement_covers_field,
+    requirement_covers_metric,
+)
 from .sql_analysis import SqlAnalysis, SqlAnalysisError, analyze_sql
 
 
@@ -86,18 +91,36 @@ def validate_sql_against_schema(
 
 
 def required_field_warnings_for_plan(
-    plan: QueryPlan | None, required_fields: list[str]
+    plan: QueryPlan | None, requirements: list[AnswerRequirement]
 ) -> list[dict[str, Any]]:
-    if plan is None or not required_fields:
+    if plan is None or not requirements:
         return []
 
     metric_aliases = {
         normalize_identifier(metric.name): metric for metric in plan.metrics
     }
     warnings: list[dict[str, Any]] = []
-    for field_name in required_fields:
+    for requirement in requirements:
+        field_name = requirement.raw
         normalized = normalize_identifier(field_name)
         if not normalized:
+            continue
+        if requirement.kind == "aggregate":
+            if any(
+                requirement_covers_metric(requirement, metric)
+                for metric in plan.metrics
+            ):
+                continue
+            warnings.append(
+                {
+                    "required_field": field_name,
+                    "reason": "required aggregate not represented by query plan IR",
+                }
+            )
+            continue
+        if requirement.kind == "field" and any(
+            requirement_covers_field(requirement, field) for field in plan.grain
+        ):
             continue
         if any(field_ref_matches_required(field, field_name) for field in plan.grain):
             continue
@@ -167,34 +190,51 @@ def required_field_warnings(
 ) -> list[dict[str, Any]]:
     if run_state is None:
         return []
-    required_fields = getattr(run_state, "required_answer_fields", None) or []
-    candidate_columns = getattr(run_state, "candidate_columns", None) or {}
-    if not required_fields or not isinstance(candidate_columns, dict):
+    requirements = getattr(run_state, "answer_requirements", None) or []
+    if not requirements:
         return []
 
     if analysis is None:
         analysis = analyze_sql(sql, dialect=dialect)
-    referenced_columns = analysis.referenced_column_names
-    selected_by_alias = {
-        normalize_identifier(item.alias): item
-        for item in analysis.select_items
-        if item.alias
-    }
+    selected_outputs = _selected_output_columns(analysis)
     warnings: list[dict[str, Any]] = []
-    for field_name in required_fields:
-        candidates = candidate_columns.get(field_name) or []
-        required_columns = _high_confidence_required_columns(field_name, candidates)
-        if not required_columns:
+    for requirement in requirements:
+        source_required = bool(requirement.source_columns)
+        source_present = (
+            _analysis_references_sources(analysis, requirement)
+            if source_required
+            else True
+        )
+        output_present = any(
+            output_satisfies_requirement(requirement, output)
+            for output in selected_outputs
+        )
+        if source_present and output_present:
             continue
-        if referenced_columns & required_columns:
+        if (
+            source_present
+            and requirement.kind == "aggregate"
+            and not requirement.output_name
+        ):
             continue
-        if _count_alias_satisfies_required_field(field_name, selected_by_alias):
-            continue
+        reason = (
+            "required source column not referenced by SQL"
+            if not source_present
+            else "required output field not selected by SQL"
+        )
         warnings.append(
             {
-                "required_field": field_name,
-                "expected_columns": sorted(required_columns)[:8],
-                "reason": "required field not referenced by SQL",
+                "required_field": requirement.raw,
+                "expected_source_columns": [
+                    {
+                        "table": source.table,
+                        "column": source.column,
+                    }
+                    for source in requirement.source_columns
+                ],
+                "expected_outputs": list(requirement.acceptable_outputs)
+                or [requirement.output_name],
+                "reason": reason,
             }
         )
     return warnings
@@ -227,10 +267,13 @@ def _selected_output_columns(analysis: SqlAnalysis) -> list[str]:
 
 
 def _simple_selected_expression_name(expression_sql: str) -> str:
-    expression = str(expression_sql or "").strip().strip('"`[]')
+    expression = re.sub(r'["`\[\]]', "", str(expression_sql or "").strip())
     if not expression:
         return ""
-    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?", expression):
+    if re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*",
+        expression,
+    ):
         return expression.rsplit(".", 1)[-1]
     return ""
 
@@ -319,28 +362,29 @@ def _known_table_key(table_key: str, table_columns: dict[str, set[str]]) -> str 
     return None
 
 
-def _count_alias_satisfies_required_field(
-    field_name: str, selected_expressions: dict[str, Any]
+def _analysis_references_sources(
+    analysis: SqlAnalysis, requirement: AnswerRequirement
 ) -> bool:
-    normalized_field = normalize_identifier(field_name)
-    selected = selected_expressions.get(normalized_field)
-    return bool(selected and is_count_metric_name(field_name) and selected.is_count)
-
-
-def _high_confidence_required_columns(
-    field_name: str, candidates: list[dict[str, Any]]
-) -> set[str]:
-    out: set[str] = set()
-    for candidate in candidates:
-        column = str(candidate.get("column") or "").strip().lower()
-        if not column:
+    for source in requirement.source_columns:
+        if not source.column:
             continue
-        score = int(candidate.get("score") or 0)
-        if candidate_column_matches_required(
-            field_name, column, min_score=6, score=score
-        ):
-            out.add(column)
-    return out
+        source_column = source.column.lower()
+        source_table = source.table.lower()
+        for column in analysis.columns:
+            if column.key != source_column:
+                continue
+            if not source_table:
+                return True
+            qualifier = column.qualifier_key
+            if not qualifier:
+                return True
+            if (
+                qualifier == source_table
+                or qualifier.split(".")[-1] == source_table.split(".")[-1]
+            ):
+                return True
+        return False
+    return True
 
 
 def _tables_to_inspect(

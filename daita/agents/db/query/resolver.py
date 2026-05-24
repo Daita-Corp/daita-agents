@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from ..utils import string_list as _string_list
 from ..utils import unique_preserving_order
 from .metadata import (
     column_name as _column_name,
@@ -17,6 +18,12 @@ from .metadata import (
 from .catalog_adapter import find_relationship_paths, search_tables
 from .intent import looks_like_count_intent
 from .ir import FieldRef, Filter, Join, Metric, OrderBy, QueryPlan
+from .requirements import (
+    AnswerRequirement,
+    metric_alias_from_requirements,
+    parse_aggregation,
+    requirement_covers_metric,
+)
 
 
 @dataclass
@@ -224,9 +231,21 @@ def _resolve_metrics(
     warnings: list[dict[str, Any]],
 ) -> list[Metric]:
     metrics: list[Metric] = []
+    requirements = list(getattr(legacy_plan, "answer_requirements", []) or [])
     for expression in getattr(legacy_plan, "aggregations", []) or []:
         metric = _metric_from_aggregation(
-            expression, context, candidate_tables, warnings
+            expression, context, candidate_tables, warnings, requirements=requirements
+        )
+        if metric is not None and metric not in metrics:
+            metrics.append(metric)
+
+    for requirement in requirements:
+        if requirement.kind != "aggregate":
+            continue
+        if any(requirement_covers_metric(requirement, metric) for metric in metrics):
+            continue
+        metric = _metric_from_requirement(
+            requirement, context, candidate_tables, warnings
         )
         if metric is not None and metric not in metrics:
             metrics.append(metric)
@@ -254,13 +273,11 @@ def _metric_from_aggregation(
     context: "_SqlPlanningView",
     candidate_tables: list[str],
     warnings: list[dict[str, Any]],
+    *,
+    requirements: list[AnswerRequirement],
 ) -> Optional[Metric]:
-    match = re.search(
-        r"\b(count|sum|avg|min|max)\s*\(\s*(distinct\s+)?(?:(?P<table>[A-Za-z_][\w.]*)\.)?(?P<column>[A-Za-z_][\w]*|\*)?\s*\)(?:\s+as\s+(?P<alias>[A-Za-z_][\w]*))?",
-        expression or "",
-        flags=re.IGNORECASE,
-    )
-    if not match:
+    parsed = parse_aggregation(expression)
+    if parsed is None:
         warnings.append(
             {
                 "type": "unsupported_aggregation",
@@ -270,12 +287,10 @@ def _metric_from_aggregation(
         )
         return None
 
-    raw_kind = match.group(1).lower()
-    distinct = bool(match.group(2))
-    kind = "distinct_count" if raw_kind == "count" and distinct else raw_kind
-    raw_table = match.group("table")
-    raw_column = match.group("column")
-    alias = match.group("alias")
+    kind = parsed.kind
+    raw_table = parsed.table
+    raw_column = parsed.column
+    alias = parsed.alias
     table = context.resolve_table(raw_table) if raw_table else candidate_tables[0]
     if not table:
         warnings.append(
@@ -287,7 +302,7 @@ def _metric_from_aggregation(
         )
         return None
 
-    column = None if raw_column in (None, "*") else raw_column
+    column = raw_column
     if kind == "count" and not column:
         column = context.primary_key_or_identity(table)
     if column and not context.has_column(table, column):
@@ -304,8 +319,34 @@ def _metric_from_aggregation(
             )
             return None
 
-    metric_alias = alias or _default_metric_alias(kind, table, column)
+    metric_alias = (
+        alias
+        or metric_alias_from_requirements(
+            expression=expression,
+            kind=kind,
+            table=table,
+            column=column,
+            requirements=requirements,
+        )
+        or _default_metric_alias(kind, table, column)
+    )
     return Metric(name=metric_alias, kind=kind, table=table, column=column)
+
+
+def _metric_from_requirement(
+    requirement: AnswerRequirement,
+    context: "_SqlPlanningView",
+    candidate_tables: list[str],
+    warnings: list[dict[str, Any]],
+) -> Optional[Metric]:
+    expression = requirement.source_expression or requirement.raw
+    return _metric_from_aggregation(
+        expression,
+        context,
+        candidate_tables,
+        warnings,
+        requirements=[requirement],
+    )
 
 
 def _resolve_grain(
@@ -318,9 +359,10 @@ def _resolve_grain(
     grain: list[FieldRef] = []
     names = list(getattr(legacy_plan, "grouping", []) or [])
     names.extend(
-        field
-        for field in getattr(legacy_plan, "required_fields", []) or []
-        if not _required_field_is_metric(field, metrics)
+        requirement.raw
+        for requirement in getattr(legacy_plan, "answer_requirements", []) or []
+        if requirement.kind != "aggregate"
+        and not _required_field_is_metric(requirement.raw, metrics)
     )
 
     for name in names:
@@ -603,9 +645,13 @@ def _choose_fact_table(
 
 
 def _count_alias(legacy_plan: Any, fact_table: str) -> str:
-    for field in getattr(legacy_plan, "required_fields", []) or []:
-        if looks_like_count_intent(field):
-            return _snake_case(field)
+    required_fields = [
+        requirement.raw
+        for requirement in getattr(legacy_plan, "answer_requirements", []) or []
+    ] or list(getattr(legacy_plan, "required_fields", []) or [])
+    for required_field in required_fields:
+        if looks_like_count_intent(required_field):
+            return _snake_case(required_field)
     return f"total_{_split_identifier(fact_table)[-1] if _split_identifier(fact_table) else 'rows'}"
 
 
@@ -621,16 +667,6 @@ def _intent_text(legacy_plan: Any) -> str:
     for attr in ("required_fields", "filters", "aggregations", "grouping", "ordering"):
         parts.extend(getattr(legacy_plan, attr, []) or [])
     return " ".join(str(part) for part in parts).lower()
-
-
-def _string_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value] if value.strip() else []
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _snake_case(value: str) -> str:

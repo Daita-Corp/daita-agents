@@ -14,6 +14,7 @@ from ...query.sql_validator import (
     validate_sql_against_schema,
 )
 from ...runtime.state import get_db_run_state
+from ...utils import string_list
 
 
 def plan_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
@@ -33,7 +34,6 @@ def plan_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
                 run_state=run_state,
                 catalog=vars(plugin).get("_db_catalog"),
                 store_id=vars(plugin).get("_db_catalog_store_id"),
-                graph_backend=query_graph_backend(plugin),
             )
             result = build_query_plan(
                 args or {},
@@ -67,7 +67,6 @@ def compile_and_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
                 run_state=run_state,
                 catalog=vars(plugin).get("_db_catalog"),
                 store_id=vars(plugin).get("_db_catalog_store_id"),
-                graph_backend=query_graph_backend(plugin),
             )
             plan_result = build_query_plan(
                 args or {},
@@ -273,12 +272,27 @@ async def execute_plan_id(
     sql = _normalize_sql_for_plugin(plugin, sql)
     analysis = _validate_plugin_query_policy(plugin, sql)
     fingerprint = sql_fingerprint(sql)
-    validation = validate_sql_against_schema(
+    validation = await trace_sql_validation(plugin, schema, sql, analysis)
+    apply_required_field_validation(
+        validation,
         sql,
-        schema,
+        run_state,
         dialect=schema_or_plugin_dialect(plugin, schema),
         analysis=analysis,
     )
+    if validation.get("error") or not validation.get("ok"):
+        record_sql_preflight_failure(
+            plugin,
+            run_state,
+            validation,
+            source_tool="db_query",
+        )
+        return {
+            **validation,
+            "plan_id": plan_id,
+            "repair_required": True,
+            "suggested_next_tool": "db_plan_query",
+        }
     run_state.record_validated_sql(
         fingerprint,
         {
@@ -361,10 +375,6 @@ async def trace_sql_execution(plugin: Any, handler: Any, args: Dict[str, Any]) -
 
 def schema_or_plugin_dialect(plugin: Any, schema: Dict[str, Any]) -> str:
     return str(schema.get("database_type") or getattr(plugin, "sql_dialect", ""))
-
-
-def query_graph_backend(owner: Any) -> Any:
-    return vars(owner).get("_db_query_graph_backend")
 
 
 def record_sql_preflight_failure(
@@ -502,16 +512,10 @@ def _compile_and_query_result(
                 "ok": bool(validation.get("ok")),
                 "sql_fingerprint": validation.get("sql_fingerprint"),
             },
-            "assumptions": _string_list_arg(intent_args.get("assumptions")),
+            "assumptions": string_list(intent_args.get("assumptions")),
         }
     )
     return payload
-
-
-def _string_list_arg(value: Any) -> List[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item) for item in value if str(item).strip()]
 
 
 def _compile_and_query_trace(result: Dict[str, Any]) -> Dict[str, Any]:

@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List
 
 from ...runtime.state import FinalAnswerReadiness
 from ..config.policies import ANSWER_EVIDENCE_DB_TOOLS
-from ..query.metadata import required_field_matches_output
+from ..query.requirements import AnswerRequirement, output_satisfies_requirement
 from .state import DbRunState
 
 INCOMPLETE_FINAL_MARKERS = (
@@ -93,11 +93,12 @@ def summarize_db_completeness(run_state) -> Dict[str, Any]:
     latest_db_record = db_records[-1] if db_records else None
     unresolved_repair = _has_unresolved_repair(latest_db_record)
 
-    required_fields = (
-        list(getattr(db_state, "required_answer_fields", []) or [])
+    requirements = (
+        list(getattr(db_state, "answer_requirements", []) or [])
         if isinstance(db_state, DbRunState)
         else []
     )
+    required_fields = [requirement.display_name for requirement in requirements]
     row_counts = [
         record.payload.get("row_count")
         for record in executed_records
@@ -106,7 +107,7 @@ def summarize_db_completeness(run_state) -> Dict[str, Any]:
     returned_columns = _returned_columns(executed_records)
     evidence_columns = _evidence_columns(executed_records)
     missing_required_fields = _missing_required_fields(
-        required_fields, evidence_columns, executed_records
+        requirements, evidence_columns, executed_records
     )
     truncated_count = sum(
         1 for record in executed_records if bool(record.payload.get("truncated"))
@@ -231,24 +232,28 @@ def _has_unresolved_repair(latest_db_record: Any) -> bool:
 
 
 def _missing_required_fields(
-    required_fields: List[str], evidence_columns: set[str], executed_records: List[Any]
+    requirements: List[AnswerRequirement],
+    evidence_columns: set[str],
+    executed_records: List[Any],
 ) -> List[str]:
-    if not required_fields:
+    if not requirements:
         return []
     if not executed_records:
-        return list(required_fields)
+        return [requirement.display_name for requirement in requirements]
     if not evidence_columns:
-        return list(required_fields)
+        return [requirement.display_name for requirement in requirements]
     return [
-        field
-        for field in required_fields
-        if not _field_is_covered_by_columns(field, evidence_columns)
+        requirement.display_name
+        for requirement in requirements
+        if not _requirement_is_covered_by_columns(requirement, evidence_columns)
     ]
 
 
-def _field_is_covered_by_columns(field: str, returned_columns: set[str]) -> bool:
+def _requirement_is_covered_by_columns(
+    requirement: AnswerRequirement, returned_columns: set[str]
+) -> bool:
     return any(
-        required_field_matches_output(field, column) for column in returned_columns
+        output_satisfies_requirement(requirement, column) for column in returned_columns
     )
 
 

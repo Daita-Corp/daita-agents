@@ -5,10 +5,12 @@ from .intent import is_count_metric_name, looks_like_count_intent
 from .ir_validator import validate_query_plan
 from .ir import FieldRef, Filter, Join, Metric, OrderBy, QueryPlan
 from .planner import build_query_plan
+from .requirements import AnswerRequirement, SourceColumn, parse_answer_requirements
 from .resolver import resolve_query_plan
 from .sql_validator import validate_sql_against_schema
 
 __all__ = [
+    "AnswerRequirement",
     "CompiledQuery",
     "FieldRef",
     "Filter",
@@ -16,10 +18,12 @@ __all__ = [
     "Metric",
     "OrderBy",
     "QueryPlan",
+    "SourceColumn",
     "build_query_plan",
     "compile_query_plan",
     "is_count_metric_name",
     "looks_like_count_intent",
+    "parse_answer_requirements",
     "resolve_query_plan",
     "validate_query_plan",
     "validate_sql_against_schema",
