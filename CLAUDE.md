@@ -68,6 +68,14 @@ Before editing during a refactor, briefly identify:
 - Why the change is not adding a parallel abstraction
 - Tests that will catch behavior drift
 
+### Root-cause fixes
+
+When fixing bugs or reliability issues, trace the failure to the underlying contract, state ownership, lifecycle, or architectural boundary that allowed it. Do not stack narrow patches, special cases, retries, or defensive checks on top of a broken design indefinitely. Prefer replacing the incorrect mechanism with a coherent owner and removing the obsolete path it supersedes, with regression tests that prove the root issue stays fixed.
+
+### Catalog ownership
+
+The catalog plugin is the owner for cataloging infrastructure, normalized schemas, relationships, and graph traversal/search over data assets. `Agent.from_db()` should use the catalog as its source of structural truth when planning queries, finding tables, resolving joins, and traversing relationships. Do not move catalog graphing, infrastructure discovery, or relationship-search ownership into the from_db runtime; from_db should consume catalog capabilities to make querying easier.
+
 ## Critical: the lazy import rule
 
 **All optional dependencies must be imported inside `connect()` or inside a `@property client` body — never at module top-level.**

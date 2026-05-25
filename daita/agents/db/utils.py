@@ -7,13 +7,15 @@ from typing import Any, TypeVar
 
 T = TypeVar("T", bound=Hashable)
 
-ANALYST_TOOL_PREFIXES = (
-    "pivot_",
-    "correlate",
-    "detect_",
-    "compare_",
-    "find_",
-    "forecast_",
+ANALYST_TOOL_NAMES = frozenset(
+    (
+        "pivot_table",
+        "correlate",
+        "detect_anomalies",
+        "compare_entities",
+        "find_similar",
+        "forecast_trend",
+    )
 )
 
 

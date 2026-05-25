@@ -10,7 +10,7 @@ from ..config.policies import (
     TERMINAL_DB_TOOLS,
 )
 from ..catalog_read_model import build_db_catalog_read_model
-from ..utils import ANALYST_TOOL_PREFIXES
+from ..utils import ANALYST_TOOL_NAMES
 
 if TYPE_CHECKING:
     from ...agent import Agent
@@ -262,7 +262,7 @@ def _query_policy_summary(plugin: Any) -> str:
 
 def _capability_summary(agent: "Agent", tool_names: List[str]) -> str:
     capabilities = ["sql", "schema"]
-    if any(name.startswith(ANALYST_TOOL_PREFIXES) for name in tool_names):
+    if ANALYST_TOOL_NAMES.intersection(tool_names):
         capabilities.append("analyst_tools")
     if hasattr(agent, "_db_memory"):
         capabilities.append("memory")

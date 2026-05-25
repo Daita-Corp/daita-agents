@@ -5,7 +5,7 @@ Platform-safe metadata for agents created by ``Agent.from_db()``.
 from typing import Any, Dict, List, TYPE_CHECKING
 
 from .catalog_read_model import build_db_catalog_read_model
-from .utils import ANALYST_TOOL_PREFIXES
+from .utils import ANALYST_TOOL_NAMES
 
 if TYPE_CHECKING:
     from ..agent import Agent
@@ -37,7 +37,7 @@ def describe_db_agent(agent: "Agent") -> Dict[str, Any]:
 
 def _capabilities(agent: "Agent", tool_names: List[str]) -> List[str]:
     capabilities = ["sql", "schema"]
-    if any(name.startswith(ANALYST_TOOL_PREFIXES) for name in tool_names):
+    if ANALYST_TOOL_NAMES.intersection(tool_names):
         capabilities.append("analyst_tools")
     if hasattr(agent, "_db_quality"):
         capabilities.append("data_quality")
