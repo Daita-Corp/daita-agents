@@ -233,9 +233,8 @@ def preflight_sql_handler(plugin: Any, handler: Any, schema: Dict[str, Any]) -> 
 
 
 def _stored_plan_is_executable(stored: Dict[str, Any]) -> bool:
-    result = stored.get("result") or {}
-    validation = result.get("validation") or {}
-    return bool(str(result.get("compiled_sql") or "").strip() and validation.get("ok"))
+    validation = stored.get("validation") or {}
+    return bool(str(stored.get("compiled_sql") or "").strip() and validation.get("ok"))
 
 
 async def execute_plan_id(
@@ -265,9 +264,8 @@ async def execute_plan_id(
             "db_plan_query",
         )
 
-    result = stored.get("result") or {}
-    validation = result.get("validation") or {}
-    sql = str(result.get("compiled_sql") or "")
+    validation = stored.get("validation") or {}
+    sql = str(stored.get("compiled_sql") or "")
     if not sql or not validation.get("ok"):
         return _with_suggested_next_tool(
             {

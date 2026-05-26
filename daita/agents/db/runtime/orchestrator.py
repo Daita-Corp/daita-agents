@@ -6,32 +6,16 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from ...runtime.state import FinalAnswerReadiness
-from ..config.policies import TERMINAL_DB_TOOLS
-from ..config.tool_profiles import DbToolProfile, select_db_tool_profile
+from ..config.route_decision import DbRouteDecision, build_db_route_decision
+from ..config.intent_classifier import DbPromptClassification
+from ..config.tool_selection import (
+    is_db_repair_tool,
+    is_generic_catalog_tool,
+    is_schema_navigation_tool,
+    relational_catalog_alias,
+)
 from ..utils import string_list
 from .state import DbRunState, set_db_run_state
-
-GENERIC_CATALOG_TOOLS = {
-    "search_catalog",
-    "inspect_asset",
-    "find_relationship_paths",
-}
-RELATIONAL_CATALOG_ALIASES = {
-    "search_catalog": "catalog_search_schema",
-    "inspect_asset": "catalog_inspect_table",
-    "find_relationship_paths": "catalog_find_join_paths",
-}
-FROM_DB_SCHEMA_TOOLS = (
-    "catalog_search_schema",
-    "catalog_inspect_table",
-    "catalog_find_join_paths",
-)
-DB_REPAIR_TOOLS = {
-    "db_compile_and_query",
-    "db_plan_query",
-    "db_query",
-    "db_validate_sql",
-}
 
 
 @dataclass(frozen=True)
@@ -39,6 +23,7 @@ class DbRunContract:
     """The DB-specific execution contract for one user request."""
 
     intent: str
+    capabilities: tuple[str, ...]
     tools: tuple[str, ...]
     required_phases: tuple[str, ...]
     terminal_tools: tuple[str, ...]
@@ -49,6 +34,8 @@ class DbRunContract:
     max_tool_calls: int
     max_repair_attempts: int
     final_synthesis_without_tools: bool = True
+    workflow_guidance: str = ""
+    answer_guidance: str = ""
 
 
 @dataclass(frozen=True)
@@ -88,10 +75,20 @@ class DbToolCallDecision:
 class DbRunOrchestrator:
     """Plain-Python owner of DB run policy for one ``from_db`` request."""
 
-    def __init__(self, agent: Any, prompt: str, *, state: Optional[DbRunState] = None):
+    def __init__(
+        self,
+        agent: Any,
+        prompt: str,
+        *,
+        state: Optional[DbRunState] = None,
+        classification: Optional[DbPromptClassification] = None,
+        route_decision: Optional[DbRouteDecision] = None,
+    ):
         self.agent = agent
         self.prompt = prompt
         self.state = state or DbRunState()
+        self.classification = classification
+        self.route_decision = route_decision
         self.contract: Optional[DbRunContract] = None
         self.memory_snippets: List[str] = []
         self._diagnostics: Dict[str, Any] = {}
@@ -108,12 +105,24 @@ class DbRunOrchestrator:
             "from_db.prepare_orchestrator",
             prompt=self.prompt[:200],
         ):
+            if self.classification is None:
+                if self.route_decision is None:
+                    self.route_decision = build_db_route_decision(
+                        self.agent, self.prompt
+                    )
+                self.classification = self.route_decision.classification
+            elif self.route_decision is None:
+                self.route_decision = build_db_route_decision(
+                    self.agent,
+                    self.prompt,
+                    classification=self.classification,
+                )
             async with db_trace_span(self.agent, "from_db.memory_recall") as (
                 trace_manager,
                 span_id,
             ):
                 self.memory_snippets = await recall_db_memory_context(
-                    self.agent, self.prompt
+                    self.agent, self.prompt, classification=self.classification
                 )
                 decision = (
                     getattr(self.agent, "_db_last_memory_recall_decision", None) or {}
@@ -132,10 +141,10 @@ class DbRunOrchestrator:
                 trace_manager,
                 span_id,
             ):
-                profile = select_db_tool_profile(self.agent, self.prompt)
-                self.contract = self._contract_from_profile(profile)
+                self.contract = self._contract_from_route(self.route_decision)
                 self.state.intent_kind = self.contract.intent
                 self.state.run_contract = self.contract
+                self._diagnostics.update(dict(self.route_decision.diagnostics))
                 trace_manager.record_output(span_id, self.contract_summary())
 
             async with db_trace_span(self.agent, "from_db.build_runtime_context") as (
@@ -176,15 +185,14 @@ class DbRunOrchestrator:
     def normalize_tool_call(self, run_state: Any, tool_call: Dict[str, Any]) -> None:
         """Normalize DB/catalog tool calls before execution."""
         tool_name = str(tool_call.get("name") or "")
-        if tool_name in RELATIONAL_CATALOG_ALIASES:
-            alias = RELATIONAL_CATALOG_ALIASES[tool_name]
+        alias = relational_catalog_alias(tool_name)
+        if alias:
             if alias in self._require_contract().tools:
                 tool_call["name"] = alias
                 tool_name = alias
 
-        if (
-            tool_name not in FROM_DB_SCHEMA_TOOLS
-            and tool_name not in GENERIC_CATALOG_TOOLS
+        if not is_schema_navigation_tool(tool_name) and not is_generic_catalog_tool(
+            tool_name
         ):
             return
         active_store_id = getattr(self.agent, "_db_catalog_store_id", None)
@@ -237,7 +245,7 @@ class DbRunOrchestrator:
                 },
             )
 
-        if self._repair_budget_exhausted() and tool_name in DB_REPAIR_TOOLS:
+        if self._repair_budget_exhausted() and is_db_repair_tool(tool_name):
             return self._blocked_tool_call(
                 tool_name,
                 warning="db_repair_budget_exhausted",
@@ -260,7 +268,7 @@ class DbRunOrchestrator:
         """Record DB facts and attach allowed handoff hints to tool results."""
         tool_name = str(tool_call.get("name") or "")
         raw = result.get("result")
-        if tool_name in FROM_DB_SCHEMA_TOOLS:
+        if is_schema_navigation_tool(tool_name):
             self.state.record_catalog_tool_result(
                 tool_name, tool_call.get("arguments", {}) or {}, raw
             )
@@ -315,7 +323,7 @@ class DbRunOrchestrator:
         if not suggested:
             return None
         if self._suggested_tool_allowed(suggested):
-            if self._repair_budget_exhausted() and suggested in DB_REPAIR_TOOLS:
+            if self._repair_budget_exhausted() and is_db_repair_tool(suggested):
                 return DbNextToolDecision(
                     tool_name=suggested,
                     allowed=False,
@@ -380,6 +388,7 @@ class DbRunOrchestrator:
             return {}
         return {
             "intent": contract.intent,
+            "capabilities": list(contract.capabilities),
             "tools": list(contract.tools),
             "required_phases": list(contract.required_phases),
             "terminal_tools": list(contract.terminal_tools),
@@ -389,6 +398,8 @@ class DbRunOrchestrator:
             "max_model_turns": contract.max_model_turns,
             "max_tool_calls": contract.max_tool_calls,
             "max_repair_attempts": contract.max_repair_attempts,
+            "workflow_policy": contract.workflow_guidance,
+            "answer_policy": contract.answer_guidance,
         }
 
     @staticmethod
@@ -404,86 +415,29 @@ class DbRunOrchestrator:
     def _install_state(self) -> None:
         self.state = self.start_state(self.agent, self.state)
 
-    def _contract_from_profile(self, profile: DbToolProfile) -> DbRunContract:
-        available = set(getattr(self.agent.tool_registry, "tool_names", []))
-        tools = self._contract_tools(profile, available)
-        evidence_mode = self._evidence_mode(profile.intent)
-        allow_catalog_final = evidence_mode == "catalog"
-        require_executed_query = evidence_mode == "query"
+    def _contract_from_route(self, route: DbRouteDecision) -> DbRunContract:
+        policy = route.policy
+        intent_name = route.intent.value
         return DbRunContract(
-            intent=profile.intent,
-            tools=tuple(tools),
-            required_phases=tuple(profile.required_phases),
-            terminal_tools=self._terminal_tools(profile.intent, tools),
-            evidence_mode=evidence_mode,
-            allow_catalog_final=allow_catalog_final,
-            require_executed_query=require_executed_query,
-            max_model_turns=self._max_model_turns(profile.intent),
-            max_tool_calls=self._max_tool_calls(profile.intent),
-            max_repair_attempts=self._max_repair_attempts(profile.intent),
+            intent=intent_name,
+            capabilities=route.capabilities,
+            tools=route.tools,
+            required_phases=route.required_phases,
+            terminal_tools=route.terminal_tools,
+            evidence_mode=route.evidence_mode,
+            allow_catalog_final=route.allow_catalog_final,
+            require_executed_query=route.require_executed_query,
+            max_model_turns=route.max_model_turns,
+            max_tool_calls=route.max_tool_calls,
+            max_repair_attempts=route.max_repair_attempts,
+            workflow_guidance=policy.workflow_guidance,
+            answer_guidance=policy.answer_guidance,
         )
-
-    def _contract_tools(self, profile: DbToolProfile, available: set[str]) -> List[str]:
-        prompt_text = str(self.prompt or "").lower()
-        selected: List[str] = []
-        for name in profile.tools:
-            if name in GENERIC_CATALOG_TOOLS and name not in prompt_text:
-                alias = RELATIONAL_CATALOG_ALIASES[name]
-                if alias in available:
-                    selected.append(alias)
-                self._diagnostics.setdefault("hidden_generic_catalog_tools", []).append(
-                    name
-                )
-                continue
-            selected.append(name)
-        return _unique([name for name in selected if name in available])
-
-    def _terminal_tools(self, intent: str, tools: Sequence[str]) -> tuple[str, ...]:
-        tool_set = set(tools)
-        if intent in {"schema_only", "schema_question", "schema_explain"}:
-            return tuple(name for name in FROM_DB_SCHEMA_TOOLS if name in tool_set)
-        if intent == "memory_only":
-            return tuple(name for name in ("db_remember",) if name in tool_set)
-        return tuple(name for name in TERMINAL_DB_TOOLS if name in tool_set)
 
     def _suggested_tool_allowed(self, tool_name: Any) -> bool:
         if not tool_name:
             return False
         return str(tool_name) in set(self._require_contract().tools)
-
-    def _evidence_mode(self, intent: str) -> str:
-        if intent in {"schema_only", "schema_question", "schema_explain"}:
-            return "catalog"
-        if intent == "memory_only":
-            return "memory"
-        if intent in {"conversational"}:
-            return "none"
-        return "query"
-
-    def _max_model_turns(self, intent: str) -> int:
-        if intent in {"schema_only", "schema_question", "schema_explain"}:
-            return 2
-        if intent in {"data_query_simple", "manual_sql", "memory_only"}:
-            return 3
-        if intent == "data_query_catalog_assisted":
-            return 6
-        return 4
-
-    def _max_tool_calls(self, intent: str) -> int:
-        if intent in {"schema_only", "schema_question", "schema_explain"}:
-            return 5
-        if intent in {"data_query_simple", "manual_sql", "memory_only"}:
-            return 3
-        if intent == "data_query_catalog_assisted":
-            return 8
-        return 5
-
-    def _max_repair_attempts(self, intent: str) -> int:
-        if intent in {"schema_only", "schema_question", "schema_explain"}:
-            return 0
-        if intent == "data_query_catalog_assisted":
-            return 2
-        return 1
 
     def _result_is_successful_terminal(self, raw: Any) -> bool:
         if isinstance(raw, dict) and raw.get("error"):

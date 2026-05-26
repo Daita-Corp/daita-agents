@@ -5,52 +5,315 @@ Public policy objects for ``Agent.from_db()`` budget controls.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
+
+from .intent import DbEvidenceMode, DbIntent, DbIntentKind
+from . import tool_selection
 
 BudgetPreset = Literal["auto", "full", "compact", "retrieval"]
+DbCapabilityCondition = Literal[
+    "needs_schema_search",
+    "needs_full_schema_navigation",
+    "needs_validation",
+    "needs_quality",
+    "needs_write",
+    "needs_lineage",
+    "needs_memory_write",
+    "has_vector_columns",
+    "requested_analyst_tool",
+]
 
-CORE_DB_QUERY_TOOLS = (
-    "db_compile_and_query",
-    "db_plan_query",
-    "db_query",
-    "db_count",
-    "db_sample",
-    "db_find",
-    "db_aggregate",
+
+@dataclass(frozen=True)
+class ConditionalCapability:
+    """Capability included when a named DB-local condition is true."""
+
+    capability: str
+    when: DbCapabilityCondition
+
+
+@dataclass(frozen=True)
+class DbWorkflowPolicy:
+    """Declarative runtime policy for a structured DB intent."""
+
+    intent_kind: DbIntentKind
+    evidence_mode: DbEvidenceMode
+    required_phases: tuple[str, ...]
+    required_capabilities: tuple[str, ...]
+    optional_capabilities: tuple[ConditionalCapability, ...]
+    terminal_capabilities: tuple[str, ...]
+    allow_catalog_final: bool
+    require_executed_query: bool
+    max_model_turns: int
+    max_tool_calls: int
+    max_repair_attempts: int
+    workflow_guidance: str
+    answer_guidance: str
+    fast_path_capabilities: tuple[str, ...] = ()
+
+
+_SCHEMA_WORKFLOW_GUIDANCE = (
+    "Use catalog/schema tools to gather structural evidence. Do not plan or "
+    "execute SQL for schema-only questions."
 )
-ANSWER_EVIDENCE_DB_TOOLS = (
-    "db_query",
-    "db_compile_and_query",
-    "db_find",
-    "db_aggregate",
+_SCHEMA_ANSWER_GUIDANCE = (
+    "catalog/schema evidence is sufficient; explain confidence and caveats "
+    "from table, column, and relationship metadata. Do not query rows unless "
+    "the user asks for values, counts, samples, or calculations."
 )
-TERMINAL_DB_TOOLS = (
-    "db_compile_and_query",
-    "db_query",
-    "db_count",
-    "db_sample",
-    "db_find",
-    "db_aggregate",
+_QUERY_WORKFLOW_GUIDANCE = (
+    "Use focused query tools. Do not repeat a plan after it returns a plan_id."
 )
-WRITE_DB_TOOLS = ("db_execute",)
-DB_MEMORY_TOOLS = ("db_remember",)
-GENERIC_PROVIDER_DB_TOOLS = (
-    "db_query",
-    "db_count",
-    "db_sample",
-    "db_execute",
-    "db_find",
-    "db_aggregate",
+_QUERY_ANSWER_GUIDANCE = (
+    "executed query evidence is required for data answers; include readable "
+    "labels with ids when available."
 )
-GENERIC_MEMORY_WRITE_TOOLS = (
-    "remember",
-    "update_memory",
+_SCHEMA_SEARCH_OPTIONAL = (
+    ConditionalCapability(
+        tool_selection.CATALOG_SEARCH_CAPABILITY, "needs_schema_search"
+    ),
 )
-SCHEMA_NAVIGATION_TOOLS = (
-    "catalog_search_schema",
-    "catalog_inspect_table",
-    "catalog_find_join_paths",
+_FULL_SCHEMA_NAVIGATION_OPTIONAL = (
+    ConditionalCapability(
+        tool_selection.CATALOG_SEARCH_CAPABILITY, "needs_full_schema_navigation"
+    ),
+    ConditionalCapability(
+        tool_selection.CATALOG_INSPECT_CAPABILITY, "needs_full_schema_navigation"
+    ),
+    ConditionalCapability(
+        tool_selection.CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+        "needs_full_schema_navigation",
+    ),
 )
+_COMMON_OPTIONAL_CAPABILITIES = (
+    ConditionalCapability(
+        tool_selection.DB_VALIDATE_SQL_CAPABILITY, "needs_validation"
+    ),
+    ConditionalCapability(
+        tool_selection.DB_QUALITY_PROFILE_CAPABILITY, "needs_quality"
+    ),
+    ConditionalCapability(tool_selection.DB_WRITE_CAPABILITY, "needs_write"),
+    ConditionalCapability(tool_selection.DB_LINEAGE_TRACE_CAPABILITY, "needs_lineage"),
+    ConditionalCapability(
+        tool_selection.DB_MEMORY_WRITE_CAPABILITY, "needs_memory_write"
+    ),
+    ConditionalCapability(
+        tool_selection.VECTOR_SEARCH_CAPABILITY, "has_vector_columns"
+    ),
+    *(
+        ConditionalCapability(
+            f"{tool_selection.ANALYST_CAPABILITY_PREFIX}{tool_name}",
+            "requested_analyst_tool",
+        )
+        for tool_name in sorted(tool_selection.ANALYST_TOOL_NAMES)
+    ),
+)
+
+
+DB_WORKFLOW_POLICIES = {
+    DbIntentKind.CONVERSATIONAL: DbWorkflowPolicy(
+        intent_kind=DbIntentKind.CONVERSATIONAL,
+        evidence_mode=DbEvidenceMode.NONE,
+        required_phases=(),
+        required_capabilities=(),
+        optional_capabilities=_COMMON_OPTIONAL_CAPABILITIES,
+        terminal_capabilities=(),
+        allow_catalog_final=False,
+        require_executed_query=False,
+        max_model_turns=4,
+        max_tool_calls=5,
+        max_repair_attempts=1,
+        workflow_guidance="Answer directly; no DB evidence is required by this contract.",
+        answer_guidance="answer directly without DB tool evidence when appropriate.",
+    ),
+    DbIntentKind.SCHEMA_ONLY: DbWorkflowPolicy(
+        intent_kind=DbIntentKind.SCHEMA_ONLY,
+        evidence_mode=DbEvidenceMode.CATALOG,
+        required_phases=(),
+        required_capabilities=(
+            tool_selection.CATALOG_SEARCH_CAPABILITY,
+            tool_selection.CATALOG_INSPECT_CAPABILITY,
+            tool_selection.CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+        ),
+        optional_capabilities=_COMMON_OPTIONAL_CAPABILITIES,
+        terminal_capabilities=(
+            tool_selection.CATALOG_SEARCH_CAPABILITY,
+            tool_selection.CATALOG_INSPECT_CAPABILITY,
+            tool_selection.CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+        ),
+        allow_catalog_final=True,
+        require_executed_query=False,
+        max_model_turns=2,
+        max_tool_calls=5,
+        max_repair_attempts=0,
+        workflow_guidance=_SCHEMA_WORKFLOW_GUIDANCE,
+        answer_guidance=_SCHEMA_ANSWER_GUIDANCE,
+    ),
+    DbIntentKind.SCHEMA_QUESTION: DbWorkflowPolicy(
+        intent_kind=DbIntentKind.SCHEMA_QUESTION,
+        evidence_mode=DbEvidenceMode.CATALOG,
+        required_phases=(),
+        required_capabilities=(
+            tool_selection.CATALOG_SEARCH_CAPABILITY,
+            tool_selection.CATALOG_INSPECT_CAPABILITY,
+            tool_selection.CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+        ),
+        optional_capabilities=_COMMON_OPTIONAL_CAPABILITIES,
+        terminal_capabilities=(
+            tool_selection.CATALOG_SEARCH_CAPABILITY,
+            tool_selection.CATALOG_INSPECT_CAPABILITY,
+            tool_selection.CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+        ),
+        allow_catalog_final=True,
+        require_executed_query=False,
+        max_model_turns=2,
+        max_tool_calls=5,
+        max_repair_attempts=0,
+        workflow_guidance=_SCHEMA_WORKFLOW_GUIDANCE,
+        answer_guidance=_SCHEMA_ANSWER_GUIDANCE,
+    ),
+    DbIntentKind.SCHEMA_EXPLAIN: DbWorkflowPolicy(
+        intent_kind=DbIntentKind.SCHEMA_EXPLAIN,
+        evidence_mode=DbEvidenceMode.CATALOG,
+        required_phases=(),
+        required_capabilities=(
+            tool_selection.CATALOG_SEARCH_CAPABILITY,
+            tool_selection.CATALOG_INSPECT_CAPABILITY,
+            tool_selection.CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+        ),
+        optional_capabilities=_COMMON_OPTIONAL_CAPABILITIES,
+        terminal_capabilities=(
+            tool_selection.CATALOG_SEARCH_CAPABILITY,
+            tool_selection.CATALOG_INSPECT_CAPABILITY,
+            tool_selection.CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+        ),
+        allow_catalog_final=True,
+        require_executed_query=False,
+        max_model_turns=2,
+        max_tool_calls=5,
+        max_repair_attempts=0,
+        workflow_guidance=_SCHEMA_WORKFLOW_GUIDANCE,
+        answer_guidance=_SCHEMA_ANSWER_GUIDANCE,
+    ),
+    DbIntentKind.DATA_QUERY_SIMPLE: DbWorkflowPolicy(
+        intent_kind=DbIntentKind.DATA_QUERY_SIMPLE,
+        evidence_mode=DbEvidenceMode.QUERY,
+        required_phases=("plan", "execute"),
+        required_capabilities=(
+            tool_selection.DB_PLAN_CAPABILITY,
+            tool_selection.DB_EXECUTE_CAPABILITY,
+        ),
+        optional_capabilities=(
+            *_SCHEMA_SEARCH_OPTIONAL,
+            *_FULL_SCHEMA_NAVIGATION_OPTIONAL,
+            *_COMMON_OPTIONAL_CAPABILITIES,
+        ),
+        terminal_capabilities=(
+            tool_selection.DB_COMPILE_AND_EXECUTE_CAPABILITY,
+            tool_selection.DB_EXECUTE_CAPABILITY,
+        ),
+        fast_path_capabilities=(tool_selection.DB_COMPILE_AND_EXECUTE_CAPABILITY,),
+        allow_catalog_final=False,
+        require_executed_query=True,
+        max_model_turns=3,
+        max_tool_calls=3,
+        max_repair_attempts=1,
+        workflow_guidance=_QUERY_WORKFLOW_GUIDANCE,
+        answer_guidance=_QUERY_ANSWER_GUIDANCE,
+    ),
+    DbIntentKind.DATA_QUERY_CATALOG_ASSISTED: DbWorkflowPolicy(
+        intent_kind=DbIntentKind.DATA_QUERY_CATALOG_ASSISTED,
+        evidence_mode=DbEvidenceMode.QUERY,
+        required_phases=("catalog", "plan", "execute"),
+        required_capabilities=(
+            tool_selection.DB_PLAN_CAPABILITY,
+            tool_selection.DB_EXECUTE_CAPABILITY,
+            tool_selection.CATALOG_SEARCH_CAPABILITY,
+            tool_selection.CATALOG_INSPECT_CAPABILITY,
+            tool_selection.CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+        ),
+        optional_capabilities=_COMMON_OPTIONAL_CAPABILITIES,
+        terminal_capabilities=(
+            tool_selection.DB_COMPILE_AND_EXECUTE_CAPABILITY,
+            tool_selection.DB_EXECUTE_CAPABILITY,
+        ),
+        allow_catalog_final=False,
+        require_executed_query=True,
+        max_model_turns=6,
+        max_tool_calls=8,
+        max_repair_attempts=2,
+        workflow_guidance=(
+            "Use catalog tools to resolve tables, columns, and relationships, then "
+            "plan with db_plan_query and execute with db_query."
+        ),
+        answer_guidance=(
+            "catalog evidence may guide planning, but final numeric/data answers "
+            "require executed query evidence."
+        ),
+    ),
+    DbIntentKind.MANUAL_SQL: DbWorkflowPolicy(
+        intent_kind=DbIntentKind.MANUAL_SQL,
+        evidence_mode=DbEvidenceMode.QUERY,
+        required_phases=("execute",),
+        required_capabilities=(
+            tool_selection.DB_VALIDATE_SQL_CAPABILITY,
+            tool_selection.DB_EXECUTE_CAPABILITY,
+        ),
+        optional_capabilities=_COMMON_OPTIONAL_CAPABILITIES,
+        terminal_capabilities=(tool_selection.DB_EXECUTE_CAPABILITY,),
+        allow_catalog_final=False,
+        require_executed_query=True,
+        max_model_turns=3,
+        max_tool_calls=3,
+        max_repair_attempts=1,
+        workflow_guidance="Validate the provided SQL before execution; execute only when safe.",
+        answer_guidance="validated/executed SQL evidence is required before final answers.",
+    ),
+    DbIntentKind.ADMIN_OR_WRITE: DbWorkflowPolicy(
+        intent_kind=DbIntentKind.ADMIN_OR_WRITE,
+        evidence_mode=DbEvidenceMode.QUERY,
+        required_phases=("execute",),
+        required_capabilities=(
+            tool_selection.DB_WRITE_CAPABILITY,
+            tool_selection.DB_VALIDATE_SQL_CAPABILITY,
+            tool_selection.DB_EXECUTE_CAPABILITY,
+        ),
+        optional_capabilities=_COMMON_OPTIONAL_CAPABILITIES,
+        terminal_capabilities=(
+            tool_selection.DB_WRITE_CAPABILITY,
+            tool_selection.DB_EXECUTE_CAPABILITY,
+        ),
+        allow_catalog_final=False,
+        require_executed_query=True,
+        max_model_turns=4,
+        max_tool_calls=5,
+        max_repair_attempts=1,
+        workflow_guidance="Apply write/admin guardrails before any mutating action.",
+        answer_guidance=_QUERY_ANSWER_GUIDANCE,
+    ),
+    DbIntentKind.MEMORY_ONLY: DbWorkflowPolicy(
+        intent_kind=DbIntentKind.MEMORY_ONLY,
+        evidence_mode=DbEvidenceMode.MEMORY,
+        required_phases=(),
+        required_capabilities=(tool_selection.DB_MEMORY_WRITE_CAPABILITY,),
+        optional_capabilities=_COMMON_OPTIONAL_CAPABILITIES,
+        terminal_capabilities=(tool_selection.DB_MEMORY_WRITE_CAPABILITY,),
+        allow_catalog_final=False,
+        require_executed_query=False,
+        max_model_turns=3,
+        max_tool_calls=3,
+        max_repair_attempts=1,
+        workflow_guidance="Use DB memory tools only for the requested memory operation.",
+        answer_guidance="answer from the memory operation result or confirm completion.",
+    ),
+}
+
+
+def workflow_policy_for_intent(intent: Any) -> DbWorkflowPolicy:
+    """Return the runtime workflow policy for an intent-like value."""
+
+    kind = _intent_kind(intent)
+    return DB_WORKFLOW_POLICIES[kind]
 
 
 @dataclass(frozen=True)
@@ -160,3 +423,16 @@ def schema_prompt_policy_for_budget(budget: BudgetPreset) -> SchemaPromptPolicy:
 def _require_positive(name: str, value: int) -> None:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
+
+
+def _intent_kind(intent: Any) -> DbIntentKind:
+    if isinstance(intent, DbIntent):
+        return intent.kind
+    if isinstance(intent, DbIntentKind):
+        return intent
+    if isinstance(intent, str) and intent:
+        try:
+            return DbIntentKind(intent)
+        except ValueError:
+            return DbIntentKind.DATA_QUERY_SIMPLE
+    return DbIntentKind.DATA_QUERY_SIMPLE

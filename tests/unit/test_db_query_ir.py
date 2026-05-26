@@ -91,7 +91,67 @@ def test_query_ir_round_trips_to_plain_dicts():
     assert QueryPlan.from_dict(plan.to_dict()).to_dict() == plan.to_dict()
 
 
-def test_catalog_adapter_requires_catalog_for_search_and_paths():
+def test_identity_column_modes_use_one_shared_policy():
+    from daita.agents.db.query.metadata import identity_column
+
+    assert (
+        identity_column(
+            _table(
+                "orders",
+                [
+                    {"name": "id", "type": "integer"},
+                    {"name": "order_id", "type": "integer", "is_primary_key": True},
+                ],
+            ),
+            mode="declared_only",
+        )
+        == "order_id"
+    )
+    assert (
+        identity_column(
+            _table("orders", [{"name": "order_id", "type": "integer"}]),
+            mode="declared_or_conventional",
+        )
+        == "order_id"
+    )
+    assert (
+        identity_column(
+            _table("users", [{"name": "uuid", "type": "text"}]),
+            mode="count_stable_row",
+        )
+        == "uuid"
+    )
+    assert (
+        identity_column(
+            _table("events", [{"name": "key", "type": "text"}]),
+            mode="declared_or_conventional",
+        )
+        == "key"
+    )
+    assert (
+        identity_column(
+            _table("audit_logs", [{"name": "account_id", "type": "integer"}]),
+            mode="declared_or_conventional",
+        )
+        == "account_id"
+    )
+    assert (
+        identity_column(
+            _table("users", [{"name": "uuid", "type": "text"}]),
+            mode="declared_only",
+        )
+        is None
+    )
+    assert (
+        identity_column(
+            _table("metrics", [{"name": "value", "type": "numeric"}]),
+            mode="count_stable_row",
+        )
+        is None
+    )
+
+
+async def test_catalog_adapter_requires_catalog_for_search_and_catalog_for_paths():
     from daita.agents.db.query.catalog_adapter import (
         find_relationship_paths,
         search_tables,
@@ -122,15 +182,25 @@ def test_catalog_adapter_requires_catalog_for_search_and_paths():
     )
 
     search = search_tables(schema, query="orders")
-    paths = find_relationship_paths(
+    missing_paths = find_relationship_paths(
         schema,
         from_tables=["orders"],
         to_tables=["customers"],
     )
+    catalog, store_id = await _attach_plugin_catalog(SimpleNamespace(), schema)
+    paths = find_relationship_paths(
+        schema,
+        from_tables=["orders"],
+        to_tables=["customers"],
+        catalog=catalog,
+        store_id=store_id,
+    )
 
     assert search["source"] == "missing_catalog"
     assert search["tables"] == []
-    assert paths["source"] == "schema"
+    assert missing_paths["source"] == "missing_catalog"
+    assert missing_paths["reachable"] is False
+    assert paths["source"] == "catalog"
     assert paths["reachable"] is True
     assert paths["paths"][0]["joins"] == [
         {
@@ -139,6 +209,7 @@ def test_catalog_adapter_requires_catalog_for_search_and_paths():
             "right_table": "customers",
             "right_column": "customer_id",
             "predicate": "orders.customer_id = customers.customer_id",
+            "relationship_direction": "forward",
         }
     ]
 
@@ -250,6 +321,7 @@ async def test_query_ir_compiles_join_for_cross_table_sum_and_label():
     plugin._tool_query = AsyncMock(return_value={"rows": []})
     plugin._tool_count = AsyncMock(return_value={"count": 0})
     plugin._tool_sample = AsyncMock(return_value={"rows": []})
+    await _attach_plugin_catalog(plugin, schema)
 
     tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
     result = await tools["db_plan_query"].handler(
@@ -350,7 +422,7 @@ async def test_db_plan_query_compiles_join_from_recorded_catalog_path():
     assert state.summary()["catalog_join_evidence_count"] == 1
     assert result["validation"]["ok"] is True
     assert result["evidence"]["joins"][0]["provenance"] == "catalog_find_join_paths"
-    assert result["plan"]["required_joins"] == [
+    assert result["intent"]["required_joins"] == [
         {
             "from_tables": ["orders"],
             "to_tables": ["customers"],
@@ -452,7 +524,8 @@ async def test_db_query_executes_validated_plan_id_without_sql_preflight():
     plugin._tool_query = AsyncMock(return_value={"rows": [{"total_orders": 3}]})
     plugin._tool_count = AsyncMock(return_value={"count": 0})
     plugin._tool_sample = AsyncMock(return_value={"rows": []})
-    set_db_run_state(plugin, DbRunState())
+    db_state = DbRunState()
+    set_db_run_state(plugin, db_state)
 
     tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
     plan_result = await tools["db_plan_query"].handler(
@@ -469,6 +542,12 @@ async def test_db_query_executes_validated_plan_id_without_sql_preflight():
     assert plan_result["suggested_next_tool"] == "db_query"
     assert plan_result["suggested_next_arguments"] == {"plan_id": "plan_1"}
     assert "query_ir" not in plan_result
+    assert "intent" not in plan_result
+    stored_plan = db_state.get_plan("plan_1")
+    assert stored_plan["intent"]["goal"] == "How many orders were created this month?"
+    assert stored_plan["query_ir"]["metrics"][0]["name"] == "total_orders"
+    assert stored_plan["compiled_sql"] == plan_result["compiled_sql"]
+    assert "result" not in stored_plan
     assert result == {"rows": [{"total_orders": 3}]}
     plugin._tool_query.assert_awaited_once()
     assert plugin._tool_query.await_args.args[0]["sql"] == plan_result["compiled_sql"]
@@ -495,10 +574,8 @@ async def test_db_query_revalidates_plan_id_before_execution():
     set_db_run_state(plugin, state)
     state.plans_by_id["plan_1"] = {
         "plan_id": "plan_1",
-        "result": {
-            "compiled_sql": "SELECT missing_column FROM orders",
-            "validation": {"ok": True},
-        },
+        "compiled_sql": "SELECT missing_column FROM orders",
+        "validation": {"ok": True},
     }
 
     tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
@@ -548,6 +625,7 @@ async def test_db_plan_preserves_structured_aggregate_alias_with_unrelated_reven
     )
     plugin._tool_count = AsyncMock(return_value={"count": 0})
     plugin._tool_sample = AsyncMock(return_value={"rows": []})
+    await _attach_plugin_catalog(plugin, schema)
     set_db_run_state(plugin, DbRunState())
 
     tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
@@ -692,10 +770,8 @@ async def test_db_query_falls_back_to_sql_when_plan_id_is_not_executable():
     set_db_run_state(plugin, state)
     state.plans_by_id["plan_1"] = {
         "plan_id": "plan_1",
-        "result": {
-            "compiled_sql": "",
-            "validation": {"ok": False},
-        },
+        "compiled_sql": "",
+        "validation": {"ok": False},
     }
 
     tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
@@ -752,8 +828,10 @@ async def test_db_plan_query_returns_compact_output_by_default_and_debug_details
     assert compact["ok"] is True
     assert compact["next_step"] == "run db_query with compiled_sql"
     assert "query_ir" not in compact
+    assert "intent" not in compact
     assert "table_candidates" not in compact
     assert "field_candidates" not in compact
+    assert diagnostic["intent"]["goal"] == "How many orders?"
     assert diagnostic["query_ir"]["metrics"][0]["name"] == "total_orders"
     assert diagnostic["table_candidates"]
     assert diagnostic["field_candidates"]
@@ -801,6 +879,8 @@ async def test_db_plan_query_records_shared_evidence():
     assert evidence.domain == "db"
     assert evidence.source_tool == "db_plan_query"
     assert evidence.payload["plan_id"] == "plan_1"
+    assert evidence.payload["intent"]["goal"] == "Revenue by order"
+    assert "query_ir" in evidence.payload
     assert evidence.payload["resolved_tables"] == ["orders"]
 
 
@@ -1370,6 +1450,54 @@ async def test_db_fast_path_uses_catalog_metadata_evidence():
 
     assert result["from_db_fast_path"]["used"] is True
     assert result["result"] == "total_users: 9"
+
+
+async def test_fast_path_and_planner_use_shared_conventional_identity():
+    from daita.agents.db.runtime.fast_path import try_db_fast_path
+
+    schema = _schema(
+        tables=[
+            _table(
+                "users",
+                [
+                    {"name": "uuid", "type": "text"},
+                    {"name": "created_at", "type": "timestamp"},
+                ],
+            )
+        ]
+    )
+    plugin = MagicMock()
+    plugin.sql_dialect = "postgresql"
+    plugin.read_only = True
+    plugin._tool_query = AsyncMock(return_value={"rows": [{"total_users": 5}]})
+    plugin._tool_count = AsyncMock(return_value={"count": 0})
+    plugin._tool_sample = AsyncMock(return_value={"rows": []})
+    await _attach_plugin_catalog(plugin, schema)
+    tools = {tool.name: tool for tool in create_db_query_tools(plugin, schema)}
+
+    plan = await tools["db_plan_query"].handler(
+        {
+            "goal": "How many users?",
+            "required_fields": ["total_users"],
+            "candidate_tables": ["users"],
+            "include_diagnostics": True,
+        }
+    )
+    agent = _agent_with_catalog(
+        schema,
+        _tool_call_history=[],
+        tool_registry=SimpleNamespace(get=tools.get),
+    )
+    fast_path = await try_db_fast_path(agent, "How many users?", {})
+
+    assert plan["query_ir"]["metrics"] == [
+        {"name": "total_users", "kind": "count", "table": "users", "column": "uuid"}
+    ]
+    assert fast_path["from_db_fast_path"]["used"] is True
+    assert (
+        'COUNT("users"."uuid") AS "total_users"'
+        in fast_path["tool_calls"][0]["result"]["sql"]
+    )
     assert plugin._tool_query.await_args.args[0]["sql"].startswith("SELECT")
 
 

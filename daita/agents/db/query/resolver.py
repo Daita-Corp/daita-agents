@@ -1,4 +1,4 @@
-"""Catalog-backed resolver from legacy planning strings to Query IR."""
+"""Catalog-backed resolver from query intent strings to Query IR."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from ..utils import string_list as _string_list
 from ..utils import unique_preserving_order
 from .metadata import (
     column_name as _column_name,
+    identity_column as _identity_column,
     metric_matches_required as _metric_matches_required,
     normalize_identifier as _normalize,
     split_identifier as _split_identifier,
@@ -108,24 +109,6 @@ class _SqlPlanningView:
         _, table, column = matches[0]
         return FieldRef(table, column)
 
-    def primary_key_or_identity(self, table_name: str) -> Optional[str]:
-        columns = self._columns(table_name)
-        for column in columns:
-            if bool(column.get("is_primary_key")):
-                return _column_name(column)
-        names = [_column_name(column) for column in columns]
-        short = table_name.split(".")[-1].rstrip("s")
-        preferred = [f"{short}_id", "id", "uuid", "key"]
-        for name in preferred:
-            for col_name in names:
-                if col_name.lower() == name.lower():
-                    return col_name
-        for col_name in names:
-            lowered = col_name.lower()
-            if lowered.endswith("_id") or lowered == "id":
-                return col_name
-        return None
-
     def timestamp_column(self, table_name: str) -> Optional[str]:
         names = [_column_name(column) for column in self._columns(table_name)]
         preferred = [
@@ -155,19 +138,19 @@ class _SqlPlanningView:
 
 
 def resolve_query_plan(
-    legacy_plan: Any,
+    query_intent: Any,
     schema: dict[str, Any],
     *,
     catalog: Any = None,
     store_id: Optional[str] = None,
 ) -> ResolveResult:
-    """Resolve a legacy ``DbQueryPlan`` into a typed QueryPlan when safe."""
+    """Resolve a ``QueryIntent`` into a typed QueryPlan when safe."""
 
     context = _SqlPlanningView(schema)
     candidate_tables = context.resolve_tables(
-        getattr(legacy_plan, "candidate_tables", [])
+        getattr(query_intent, "candidate_tables", [])
     )
-    goal = str(getattr(legacy_plan, "goal", "") or "")
+    goal = str(getattr(query_intent, "goal", "") or "")
     warnings: list[dict[str, Any]] = []
     ambiguities: list[dict[str, Any]] = []
 
@@ -185,15 +168,15 @@ def resolve_query_plan(
             ]
         )
 
-    metrics = _resolve_metrics(legacy_plan, context, candidate_tables, warnings)
+    metrics = _resolve_metrics(query_intent, context, candidate_tables, warnings)
     if not metrics:
         return ResolveResult(warnings=warnings)
 
     fact_table = metrics[0].table
-    grain = _resolve_grain(legacy_plan, context, candidate_tables, fact_table, metrics)
-    filters = _resolve_filters(legacy_plan, context, fact_table, candidate_tables)
+    grain = _resolve_grain(query_intent, context, candidate_tables, fact_table, metrics)
+    filters = _resolve_filters(query_intent, context, fact_table, candidate_tables)
     joins = _resolve_joins(
-        legacy_plan,
+        query_intent,
         schema,
         fact_table,
         grain,
@@ -202,8 +185,8 @@ def resolve_query_plan(
         catalog=catalog,
         store_id=store_id,
     )
-    order_by = _resolve_ordering(legacy_plan, goal, metrics, grain)
-    limit = _resolve_limit(getattr(legacy_plan, "limit", None), goal, order_by)
+    order_by = _resolve_ordering(query_intent, goal, metrics, grain)
+    limit = _resolve_limit(getattr(query_intent, "limit", None), goal, order_by)
 
     plan = QueryPlan(
         grain=grain,
@@ -225,14 +208,14 @@ def resolve_query_plan(
 
 
 def _resolve_metrics(
-    legacy_plan: Any,
+    query_intent: Any,
     context: "_SqlPlanningView",
     candidate_tables: list[str],
     warnings: list[dict[str, Any]],
 ) -> list[Metric]:
     metrics: list[Metric] = []
-    requirements = list(getattr(legacy_plan, "answer_requirements", []) or [])
-    for expression in getattr(legacy_plan, "aggregations", []) or []:
+    requirements = list(getattr(query_intent, "answer_requirements", []) or [])
+    for expression in getattr(query_intent, "aggregations", []) or []:
         metric = _metric_from_aggregation(
             expression, context, candidate_tables, warnings, requirements=requirements
         )
@@ -253,16 +236,18 @@ def _resolve_metrics(
     if metrics:
         return metrics
 
-    text = _intent_text(legacy_plan)
+    text = _intent_text(query_intent)
     if looks_like_count_intent(text):
         fact_table = _choose_fact_table(context, candidate_tables, text)
-        alias = _count_alias(legacy_plan, fact_table)
+        alias = _count_alias(query_intent, fact_table)
         metrics.append(
             Metric(
                 name=alias,
                 kind="count",
                 table=fact_table,
-                column=context.primary_key_or_identity(fact_table),
+                column=_identity_column(
+                    context.tables.get(fact_table), mode="count_stable_row"
+                ),
             )
         )
     return metrics
@@ -304,10 +289,12 @@ def _metric_from_aggregation(
 
     column = raw_column
     if kind == "count" and not column:
-        column = context.primary_key_or_identity(table)
+        column = _identity_column(context.tables.get(table), mode="count_stable_row")
     if column and not context.has_column(table, column):
         if kind == "count":
-            column = context.primary_key_or_identity(table)
+            column = _identity_column(
+                context.tables.get(table), mode="count_stable_row"
+            )
         else:
             warnings.append(
                 {
@@ -350,17 +337,17 @@ def _metric_from_requirement(
 
 
 def _resolve_grain(
-    legacy_plan: Any,
+    query_intent: Any,
     context: "_SqlPlanningView",
     candidate_tables: list[str],
     fact_table: str,
     metrics: list[Metric],
 ) -> list[FieldRef]:
     grain: list[FieldRef] = []
-    names = list(getattr(legacy_plan, "grouping", []) or [])
+    names = list(getattr(query_intent, "grouping", []) or [])
     names.extend(
         requirement.raw
-        for requirement in getattr(legacy_plan, "answer_requirements", []) or []
+        for requirement in getattr(query_intent, "answer_requirements", []) or []
         if requirement.kind != "aggregate"
         and not _required_field_is_metric(requirement.raw, metrics)
     )
@@ -383,11 +370,11 @@ def _required_field_is_metric(field: Any, metrics: list[Metric]) -> bool:
 
 
 def _resolve_time_filters(
-    legacy_plan: Any,
+    query_intent: Any,
     context: "_SqlPlanningView",
     fact_table: str,
 ) -> list[Filter]:
-    text = _intent_text(legacy_plan)
+    text = _intent_text(query_intent)
     timestamp_column = context.timestamp_column(fact_table)
     if not timestamp_column:
         return []
@@ -418,16 +405,16 @@ def _resolve_time_filters(
 
 
 def _resolve_filters(
-    legacy_plan: Any,
+    query_intent: Any,
     context: "_SqlPlanningView",
     fact_table: str,
     candidate_tables: list[str],
 ) -> list[Filter]:
-    filters = _resolve_time_filters(legacy_plan, context, fact_table)
+    filters = _resolve_time_filters(query_intent, context, fact_table)
     preferred_tables = [fact_table] + [
         table for table in candidate_tables if table != fact_table
     ]
-    for expression in getattr(legacy_plan, "filters", []) or []:
+    for expression in getattr(query_intent, "filters", []) or []:
         parsed = _filter_from_expression(expression, context, preferred_tables)
         if parsed is not None and parsed not in filters:
             filters.append(parsed)
@@ -476,7 +463,7 @@ def _parse_filter_value(value: Any) -> Any:
 
 
 def _resolve_joins(
-    legacy_plan: Any,
+    query_intent: Any,
     schema: dict[str, Any],
     fact_table: str,
     grain: list[FieldRef],
@@ -489,7 +476,7 @@ def _resolve_joins(
     target_tables = [field.table for field in grain if field.table != fact_table]
     provided_paths: list[dict[str, Any]] = []
     context = _SqlPlanningView(schema)
-    for requirement in getattr(legacy_plan, "required_joins", []) or []:
+    for requirement in getattr(query_intent, "required_joins", []) or []:
         for table_ref in _string_list(
             requirement.get("from_tables") or requirement.get("from")
         ):
@@ -573,12 +560,12 @@ def _join_from_path_item(item: dict[str, Any]) -> Join | None:
 
 
 def _resolve_ordering(
-    legacy_plan: Any,
+    query_intent: Any,
     goal: str,
     metrics: list[Metric],
     grain: list[FieldRef],
 ) -> list[OrderBy]:
-    order_text = " ".join(getattr(legacy_plan, "ordering", []) or [])
+    order_text = " ".join(getattr(query_intent, "ordering", []) or [])
     combined = f"{goal} {order_text}".lower()
     direction = (
         "asc"
@@ -639,16 +626,16 @@ def _choose_fact_table(
         if any(token in text for token in _split_identifier(table)):
             return table
     for table in candidate_tables:
-        if context.primary_key_or_identity(table):
+        if _identity_column(context.tables.get(table), mode="count_stable_row"):
             return table
     return candidate_tables[0]
 
 
-def _count_alias(legacy_plan: Any, fact_table: str) -> str:
+def _count_alias(query_intent: Any, fact_table: str) -> str:
     required_fields = [
         requirement.raw
-        for requirement in getattr(legacy_plan, "answer_requirements", []) or []
-    ] or list(getattr(legacy_plan, "required_fields", []) or [])
+        for requirement in getattr(query_intent, "answer_requirements", []) or []
+    ] or list(getattr(query_intent, "required_fields", []) or [])
     for required_field in required_fields:
         if looks_like_count_intent(required_field):
             return _snake_case(required_field)
@@ -662,10 +649,10 @@ def _default_metric_alias(kind: str, table: str, column: Optional[str]) -> str:
     return f"{kind}_{_snake_case(source)}"
 
 
-def _intent_text(legacy_plan: Any) -> str:
-    parts = [getattr(legacy_plan, "goal", "") or ""]
+def _intent_text(query_intent: Any) -> str:
+    parts = [getattr(query_intent, "goal", "") or ""]
     for attr in ("required_fields", "filters", "aggregations", "grouping", "ordering"):
-        parts.extend(getattr(legacy_plan, attr, []) or [])
+        parts.extend(getattr(query_intent, attr, []) or [])
     return " ".join(str(part) for part in parts).lower()
 
 

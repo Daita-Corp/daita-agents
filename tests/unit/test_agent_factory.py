@@ -1477,7 +1477,7 @@ class TestFromDbIntegration:
         assert result["from_db_metrics"]["selected_tools"] == []
         assert agent._db_audit_log[0]["prompt"] == "How much revenue?"
 
-    async def test_db_context_run_replaces_none_tools_with_selected_profile(self):
+    async def test_db_context_run_replaces_none_tools_with_route_tools(self):
         from daita.agents.db.runtime.run_context import make_db_context_run
 
         seen = {}
@@ -2510,6 +2510,38 @@ class TestFromDbMemory:
             == "direct_schema_matched_query"
         )
 
+    async def test_classified_direct_query_skips_db_memory_recall(self):
+        from daita.agents.db.config import classify_db_prompt
+
+        class FailingIfCalledMemory:
+            async def recall(self, *args, **kwargs):
+                raise AssertionError("classified direct query should not recall memory")
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders")]),
+            _db_memory_semantics=FailingIfCalledMemory(),
+        )
+        classification = classify_db_prompt(
+            "How many orders this month?",
+            available_tools=[],
+            likely_catalog_match=True,
+        )
+
+        snippets = await recall_db_memory_context(
+            agent,
+            "How many orders this month?",
+            classification=classification,
+        )
+
+        assert snippets == []
+        assert (
+            agent._db_last_memory_recall_decision["reason"]
+            == "direct_schema_matched_query"
+        )
+        assert agent._db_last_memory_recall_decision["matched_terms"] == [
+            "data_query_simple"
+        ]
+
     async def test_semantic_metric_question_recalls_db_memory(self):
         class FakeDBMemory:
             async def recall(self, *args, **kwargs):
@@ -2530,6 +2562,61 @@ class TestFromDbMemory:
 
         assert snippets == ["Revenue excludes refunds."]
         assert agent._db_last_memory_recall_decision["reason"] == "semantic_prompt"
+
+    async def test_classified_semantic_metric_question_recalls_db_memory(self):
+        from daita.agents.db.config import classify_db_prompt
+
+        class FakeDBMemory:
+            async def recall(self, *args, **kwargs):
+                return [
+                    {
+                        "content": 'DB memory record:\n{"text": "Revenue excludes refunds."}'
+                    }
+                ]
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders")]),
+            _db_memory_semantics=FakeDBMemory(),
+        )
+        prompt = "What business rule should I use to calculate revenue?"
+        classification = classify_db_prompt(
+            prompt,
+            available_tools=[],
+            likely_catalog_match=False,
+        )
+
+        snippets = await recall_db_memory_context(
+            agent, prompt, classification=classification
+        )
+
+        assert snippets == ["Revenue excludes refunds."]
+        assert agent._db_last_memory_recall_decision["reason"] == "semantic_prompt"
+        assert "business rule" in agent._db_last_memory_recall_decision["matched_terms"]
+
+    async def test_classified_row_level_prompt_skips_db_memory_recall(self):
+        from daita.agents.db.config import classify_db_prompt
+
+        class FailingIfCalledMemory:
+            async def recall(self, *args, **kwargs):
+                raise AssertionError("row-level classified prompt should not recall")
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("customers")]),
+            _db_memory_semantics=FailingIfCalledMemory(),
+        )
+        prompt = "Show me the email for customer_id 1"
+        classification = classify_db_prompt(
+            prompt,
+            available_tools=[],
+            likely_catalog_match=True,
+        )
+
+        snippets = await recall_db_memory_context(
+            agent, prompt, classification=classification
+        )
+
+        assert snippets == []
+        assert agent._db_last_memory_recall_decision["reason"] == "row_level_prompt"
 
     async def test_semantic_language_overrides_identifier_skip(self):
         class FakeDBMemory:
@@ -4170,19 +4257,59 @@ class TestDbResultCompaction:
         assert "extra" not in path["joins"][0]
 
 
-class TestFromDbToolProfiles:
-    def test_catalog_schema_tools_are_not_terminal(self):
-        from daita.agents.db.config.policies import TERMINAL_DB_TOOLS
-        from daita.agents.db.runtime.orchestrator import FROM_DB_SCHEMA_TOOLS
+class TestFromDbRouteDecision:
+    def test_capability_selection_distinguishes_query_and_catalog_tools(self):
+        from daita.agents.db.config.tool_selection import (
+            CATALOG_INSPECT_CAPABILITY,
+            CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+            DB_COMPILE_AND_EXECUTE_CAPABILITY,
+            DB_EXECUTE_CAPABILITY,
+            select_tools_for_capabilities,
+        )
 
-        assert "db_compile_and_query" in TERMINAL_DB_TOOLS
-        assert "db_query" in TERMINAL_DB_TOOLS
-        assert "catalog_inspect_table" in FROM_DB_SCHEMA_TOOLS
-        assert "catalog_find_join_paths" in FROM_DB_SCHEMA_TOOLS
+        available = [
+            "db_compile_and_query",
+            "db_query",
+            "catalog_inspect_table",
+            "catalog_find_join_paths",
+        ]
+
+        assert select_tools_for_capabilities(
+            available,
+            [DB_COMPILE_AND_EXECUTE_CAPABILITY, DB_EXECUTE_CAPABILITY],
+        ) == ["db_compile_and_query", "db_query"]
+        assert select_tools_for_capabilities(
+            available,
+            [CATALOG_INSPECT_CAPABILITY, CATALOG_RELATIONSHIP_PATHS_CAPABILITY],
+        ) == ["catalog_inspect_table", "catalog_find_join_paths"]
+
+    def test_capability_selection_uses_declared_db_local_tools_only(self):
+        from daita.agents.db.config.tool_selection import (
+            DB_QUALITY_PROFILE_CAPABILITY,
+            VECTOR_SEARCH_CAPABILITY,
+            select_tools_for_capabilities,
+        )
+
+        available = [
+            "dq_profile",
+            "dq_custom_local_tool",
+            "postgres_vector_search",
+            "custom_vector_search",
+        ]
+
+        assert select_tools_for_capabilities(
+            available, [DB_QUALITY_PROFILE_CAPABILITY]
+        ) == ["dq_profile"]
+        assert select_tools_for_capabilities(available, [VECTOR_SEARCH_CAPABILITY]) == [
+            "postgres_vector_search"
+        ]
 
     def test_clear_data_prompt_with_schema_match_starts_with_compile_only(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+        from daita.agents.db.config.route_decision import build_db_route_decision
+        from daita.agents.db.config.tool_selection import (
+            DB_COMPILE_AND_EXECUTE_CAPABILITY,
+        )
 
         agent = _agent_with_catalog(
             _make_normalized_schema(
@@ -4214,13 +4341,21 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        selected = select_db_tools_for_prompt(agent, "What were sales last month?")
+        prompt = "What were sales last month?"
+        route = build_db_route_decision(agent, prompt)
+        selected = list(route.tools)
 
         assert selected == ["db_compile_and_query"]
+        assert list(route.capabilities) == [DB_COMPILE_AND_EXECUTE_CAPABILITY]
+        assert route.fast_path.eligible is False
 
     def test_data_prompt_without_schema_match_adds_schema_search_only(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+        from daita.agents.db.config.route_decision import build_db_route_decision
+        from daita.agents.db.config.tool_selection import (
+            CATALOG_SEARCH_CAPABILITY,
+            DB_COMPILE_AND_EXECUTE_CAPABILITY,
+        )
 
         agent = _agent_with_catalog(
             _make_normalized_schema(tables=[_table("orders")]),
@@ -4237,13 +4372,19 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        selected = select_db_tools_for_prompt(agent, "What were sales last month?")
+        prompt = "What were sales last month?"
+        route = build_db_route_decision(agent, prompt)
+        selected = list(route.tools)
 
         assert selected == ["db_compile_and_query", "catalog_search_schema"]
+        assert list(route.capabilities) == [
+            DB_COMPILE_AND_EXECUTE_CAPABILITY,
+            CATALOG_SEARCH_CAPABILITY,
+        ]
 
     def test_explicit_sql_prompt_keeps_manual_sql_tools(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             _make_normalized_schema(tables=[_table("orders")]),
@@ -4258,15 +4399,16 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        selected = select_db_tools_for_prompt(
+        route = build_db_route_decision(
             agent, "Run this SQL: SELECT COUNT(*) FROM orders"
         )
+        selected = list(route.tools)
 
         assert selected == ["db_validate_sql", "db_query"]
 
     def test_join_prompt_keeps_relationship_navigation_tools(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             _make_normalized_schema(tables=[_table("orders"), _table("customers")]),
@@ -4282,9 +4424,10 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        selected = select_db_tools_for_prompt(
+        route = build_db_route_decision(
             agent, "Show sales by customer and find the join path"
         )
+        selected = list(route.tools)
 
         assert selected == [
             "db_plan_query",
@@ -4296,7 +4439,7 @@ class TestFromDbToolProfiles:
 
     def test_schema_prompt_selects_schema_tools_only(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             {"tables": []},
@@ -4310,18 +4453,24 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        selected = select_db_tools_for_prompt(
+        route = build_db_route_decision(
             agent, "What can you tell me about my traces table?"
         )
+        selected = list(route.tools)
 
         assert selected == ["catalog_search_schema", "catalog_inspect_table"]
 
     def test_catalog_graph_data_prompt_keeps_query_tools(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import (
-            select_db_tool_profile,
-            select_db_tools_for_prompt,
+        from daita.agents.db.config import DbIntentKind
+        from daita.agents.db.config.tool_selection import (
+            CATALOG_INSPECT_CAPABILITY,
+            CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+            CATALOG_SEARCH_CAPABILITY,
+            DB_EXECUTE_CAPABILITY,
+            DB_PLAN_CAPABILITY,
         )
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             _make_normalized_schema(tables=[_table("orders"), _table("customers")]),
@@ -4338,16 +4487,12 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        selected = select_db_tools_for_prompt(
+        route = build_db_route_decision(
             agent,
             "Which customer has the highest total order revenue? Use the catalog "
             "relationship graph to find the join path before querying.",
         )
-        profile = select_db_tool_profile(
-            agent,
-            "Which customer has the highest total order revenue? Use the catalog "
-            "relationship graph to find the join path before querying.",
-        )
+        selected = list(route.tools)
 
         assert selected == [
             "db_plan_query",
@@ -4356,12 +4501,50 @@ class TestFromDbToolProfiles:
             "catalog_inspect_table",
             "catalog_find_join_paths",
         ]
-        assert profile.intent == "data_query_catalog_assisted"
-        assert profile.required_phases == ["catalog", "plan", "execute"]
+        assert list(route.capabilities) == [
+            DB_PLAN_CAPABILITY,
+            DB_EXECUTE_CAPABILITY,
+            CATALOG_SEARCH_CAPABILITY,
+            CATALOG_INSPECT_CAPABILITY,
+            CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+        ]
+        assert route.intent.kind == DbIntentKind.DATA_QUERY_CATALOG_ASSISTED
+        assert route.required_phases == ("catalog", "plan", "execute")
+
+    def test_validation_prompt_adds_optional_validation_capability(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.route_decision import build_db_route_decision
+        from daita.agents.db.config.tool_selection import (
+            DB_EXECUTE_CAPABILITY,
+            DB_PLAN_CAPABILITY,
+            DB_VALIDATE_SQL_CAPABILITY,
+        )
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("orders")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_plan_query",
+                    "db_query",
+                    "db_validate_sql",
+                    "db_compile_and_query",
+                ]
+            ),
+        )
+
+        route = build_db_route_decision(agent, "Debug the orders query")
+
+        assert list(route.capabilities) == [
+            DB_PLAN_CAPABILITY,
+            DB_EXECUTE_CAPABILITY,
+            DB_VALIDATE_SQL_CAPABILITY,
+        ]
+        assert route.tools == ("db_plan_query", "db_query", "db_validate_sql")
 
     def test_schema_prompt_profile_is_schema_only(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tool_profile
+        from daita.agents.db.config import DbEvidenceMode, DbIntentKind
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             {"tables": []},
@@ -4376,21 +4559,23 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        profile = select_db_tool_profile(
+        route = build_db_route_decision(
             agent, "Describe the schema relationships between my tables"
         )
 
-        assert profile.intent == "schema_only"
-        assert profile.tools == [
+        assert route.intent.kind == DbIntentKind.SCHEMA_ONLY
+        assert route.intent.evidence_mode == DbEvidenceMode.CATALOG
+        assert route.tools == (
             "catalog_search_schema",
             "catalog_inspect_table",
             "catalog_find_join_paths",
-        ]
-        assert profile.required_phases == []
+        )
+        assert route.required_phases == ()
 
     def test_metric_terms_inside_schema_search_stay_schema_only(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tool_profile
+        from daita.agents.db.config import DbIntentKind
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             _make_normalized_schema(tables=[_table("payments")]),
@@ -4407,24 +4592,25 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        profile = select_db_tool_profile(
+        route = build_db_route_decision(
             agent,
             "Search the schema for columns that might represent price, amount, "
             "total, revenue, invoice, payment, or subscription. Tell me which "
             "columns are safest to use and why.",
         )
 
-        assert profile.intent == "schema_only"
-        assert profile.tools == [
+        assert route.intent.kind == DbIntentKind.SCHEMA_ONLY
+        assert route.tools == (
             "catalog_search_schema",
             "catalog_inspect_table",
             "catalog_find_join_paths",
-        ]
-        assert profile.required_phases == []
+        )
+        assert route.required_phases == ()
 
     def test_schema_assisted_calculation_requires_query_intent(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tool_profile
+        from daita.agents.db.config import DbEvidenceMode, DbIntentKind
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             _make_normalized_schema(tables=[_table("payments")]),
@@ -4441,25 +4627,28 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        profile = select_db_tool_profile(
+        route = build_db_route_decision(
             agent,
             "Find the safest revenue column, then calculate total revenue by "
             "billing period.",
         )
 
-        assert profile.intent == "data_query_catalog_assisted"
-        assert profile.tools == [
+        assert route.intent.kind == DbIntentKind.DATA_QUERY_CATALOG_ASSISTED
+        assert route.intent.evidence_mode == DbEvidenceMode.QUERY
+        assert route.intent.needs_catalog_resolution is True
+        assert route.tools == (
             "db_plan_query",
             "db_query",
             "catalog_search_schema",
             "catalog_inspect_table",
             "catalog_find_join_paths",
-        ]
-        assert profile.required_phases == ["catalog", "plan", "execute"]
+        )
+        assert route.required_phases == ("catalog", "plan", "execute")
 
-    def test_manual_sql_prompt_profile(self):
+    def test_manual_sql_route(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tool_profile
+        from daita.agents.db.config import DbIntentKind
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             _make_normalized_schema(tables=[_table("orders")]),
@@ -4474,19 +4663,20 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        profile = select_db_tool_profile(
+        route = build_db_route_decision(
             agent, "Run this SQL: SELECT COUNT(*) FROM orders"
         )
 
-        assert profile.intent == "manual_sql"
-        assert profile.tools == [
+        assert route.intent.kind == DbIntentKind.MANUAL_SQL
+        assert route.intent.needs_sql_execution is True
+        assert route.tools == (
             "db_validate_sql",
             "db_query",
-        ]
+        )
 
     def test_explicit_validate_sql_mention_is_preserved(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             _make_normalized_schema(tables=[_table("orders")]),
@@ -4495,15 +4685,16 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        selected = select_db_tools_for_prompt(
+        route = build_db_route_decision(
             agent, "Use db_validate_sql for this orders query"
         )
+        selected = list(route.tools)
 
         assert selected == ["db_plan_query", "db_query", "db_validate_sql"]
 
     def test_analysis_prompt_adds_matching_analyst_tool(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             {"tables": []},
@@ -4517,16 +4708,66 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        selected = select_db_tools_for_prompt(
+        route = build_db_route_decision(
             agent, "Forecast the revenue trend for next quarter"
         )
+        selected = list(route.tools)
 
         assert "forecast_trend" in selected
         assert "detect_anomalies" not in selected
 
+    def test_optional_capabilities_add_quality_memory_lineage_and_vector_tools(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.route_decision import build_db_route_decision
+        from daita.agents.db.config.tool_selection import (
+            DB_LINEAGE_TRACE_CAPABILITY,
+            DB_MEMORY_WRITE_CAPABILITY,
+            DB_QUALITY_PROFILE_CAPABILITY,
+            VECTOR_SEARCH_CAPABILITY,
+        )
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(
+                tables=[
+                    _table(
+                        "documents",
+                        columns=[
+                            {"name": "document_id", "type": "integer"},
+                            {"name": "embedding", "type": "vector"},
+                        ],
+                    )
+                ]
+            ),
+            _db_memory_semantics=object(),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_query",
+                    "db_plan_query",
+                    "dq_profile",
+                    "trace_lineage",
+                    "db_remember",
+                    "postgres_vector_search",
+                ]
+            ),
+        )
+
+        route = build_db_route_decision(
+            agent,
+            "Remember the quality lineage note for documents",
+        )
+
+        assert DB_QUALITY_PROFILE_CAPABILITY in route.capabilities
+        assert DB_LINEAGE_TRACE_CAPABILITY in route.capabilities
+        assert DB_MEMORY_WRITE_CAPABILITY in route.capabilities
+        assert VECTOR_SEARCH_CAPABILITY in route.capabilities
+        assert "dq_profile" in route.tools
+        assert "trace_lineage" in route.tools
+        assert "db_remember" in route.tools
+        assert "postgres_vector_search" in route.tools
+
     def test_write_prompt_adds_execute_when_available(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             {"tables": []},
@@ -4535,13 +4776,14 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        selected = select_db_tools_for_prompt(agent, "Update customer status")
+        route = build_db_route_decision(agent, "Update customer status")
+        selected = list(route.tools)
 
         assert "db_execute" in selected
 
     def test_explicit_tool_name_mentions_are_preserved(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             {"tables": []},
@@ -4550,15 +4792,16 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        selected = select_db_tools_for_prompt(
+        route = build_db_route_decision(
             agent, "Use dq_detect_anomaly on daily_metrics revenue"
         )
+        selected = list(route.tools)
 
         assert "dq_detect_anomaly" in selected
 
     def test_strict_explicit_tool_request_uses_only_named_tool(self):
         from types import SimpleNamespace
-        from daita.agents.db.config.tool_profiles import select_db_tools_for_prompt
+        from daita.agents.db.config.route_decision import build_db_route_decision
 
         agent = _agent_with_catalog(
             _make_normalized_schema(tables=[_table("orders")]),
@@ -4573,10 +4816,11 @@ class TestFromDbToolProfiles:
             ),
         )
 
-        selected = select_db_tools_for_prompt(
+        route = build_db_route_decision(
             agent,
             "Use db_query exactly once to answer which customer has top revenue",
         )
+        selected = list(route.tools)
 
         assert selected == ["db_query"]
 
@@ -4799,6 +5043,24 @@ class TestHelpersInferDimensions:
         assert get_pk_column(context, "customers") == "id"
         assert get_pk_column(context, "orders") == "id"
         assert get_pk_column(context, "nonexistent") is None
+
+        conventional_context = _analyst_context(
+            _make_normalized_schema(
+                tables=[
+                    _table("users", columns=[{"name": "uuid", "type": "text"}]),
+                    _table("events", columns=[{"name": "key", "type": "text"}]),
+                    _table(
+                        "line_items",
+                        columns=[{"name": "line_item_id", "type": "integer"}],
+                    ),
+                    _table("metrics", columns=[{"name": "value", "type": "numeric"}]),
+                ]
+            )
+        )
+        assert get_pk_column(conventional_context, "users") == "uuid"
+        assert get_pk_column(conventional_context, "events") == "key"
+        assert get_pk_column(conventional_context, "line_items") == "line_item_id"
+        assert get_pk_column(conventional_context, "metrics") is None
 
     def test_get_numeric_columns(self):
         from daita.agents.db.tools.analyst._helpers import (

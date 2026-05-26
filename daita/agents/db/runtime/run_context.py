@@ -6,9 +6,10 @@ import re
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from ..catalog_read_model import build_db_catalog_read_model
-from ..utils import ANALYST_TOOL_NAMES
+from ..config.policies import workflow_policy_for_intent
+from ..config.route_decision import build_db_route_decision
+from ..config.tool_selection import has_analyst_tool
 from .orchestrator import (
-    FROM_DB_SCHEMA_TOOLS,
     DbRunContract,
     DbRunOrchestrator,
 )
@@ -17,7 +18,6 @@ if TYPE_CHECKING:
     from ...agent import Agent
 
 
-SCHEMA_NAVIGATION_TOOLS = FROM_DB_SCHEMA_TOOLS
 DEFAULT_CONTEXT_MAX_CHARS = 1600
 
 
@@ -79,14 +79,25 @@ def make_db_context_run(agent: "Agent", original_run: Callable) -> Callable:
         from .fast_path import try_db_fast_path
 
         run_state = DbRunOrchestrator.start_state(agent)
-        fast_result = await try_db_fast_path(agent, prompt, kwargs, run_state=run_state)
+        route_decision = build_db_route_decision(agent, prompt)
+        fast_result = await try_db_fast_path(
+            agent,
+            prompt,
+            kwargs,
+            run_state=run_state,
+            route_decision=route_decision,
+        )
         if fast_result is not None:
             history = kwargs.get("history")
             if history is not None and hasattr(history, "add_turn"):
                 await history.add_turn(prompt, fast_result.get("result", ""))
             return fast_result
         augmented_prompt, kwargs = await _prepare_db_runtime_call(
-            agent, prompt, kwargs, run_state=run_state
+            agent,
+            prompt,
+            kwargs,
+            run_state=run_state,
+            route_decision=route_decision,
         )
         return await original_run(augmented_prompt, **kwargs)
 
@@ -114,8 +125,22 @@ async def _prepare_db_runtime_call(
     kwargs: Dict[str, Any],
     *,
     run_state: Any = None,
+    classification: Any = None,
+    route_decision: Any = None,
 ) -> tuple[str, Dict[str, Any]]:
-    orchestrator = DbRunOrchestrator(agent, prompt, state=run_state)
+    if route_decision is None:
+        route_decision = build_db_route_decision(
+            agent,
+            prompt,
+            classification=classification,
+        )
+    orchestrator = DbRunOrchestrator(
+        agent,
+        prompt,
+        state=run_state,
+        classification=route_decision.classification,
+        route_decision=route_decision,
+    )
     prepared = await orchestrator.prepare()
     context = prepared.context
     selected_tools = list(prepared.contract.tools)
@@ -132,10 +157,6 @@ async def _prepare_db_runtime_call(
     kwargs.setdefault("max_iterations", prepared.contract.max_model_turns)
     kwargs["run_orchestrator"] = orchestrator
     return _augment_prompt(prompt, context), kwargs
-
-
-def _start_db_run_state(agent: "Agent") -> Any:
-    return DbRunOrchestrator.start_state(agent)
 
 
 def _context_metadata(
@@ -205,80 +226,22 @@ def _query_policy_summary(plugin: Any) -> str:
 def _workflow_policy_summary(
     intent_kind: Optional[str], *, contract: Optional[DbRunContract] = None
 ) -> str:
-    if contract is not None:
-        if contract.evidence_mode == "catalog":
-            return (
-                "Use only the selected catalog/schema tools. Catalog evidence is "
-                "the terminal evidence for this request."
-            )
-        if contract.evidence_mode == "query":
-            return (
-                "Use the selected DB tools according to the run contract. Final "
-                "answers require executed query evidence."
-            )
-        if contract.evidence_mode == "memory":
-            return "Use DB memory tools only for the requested memory operation."
-        return "Answer directly; no DB evidence is required by this contract."
-    if intent_kind in {"schema_only", "schema_question"}:
-        return (
-            "Use catalog/schema tools to gather structural evidence. Do not plan "
-            "or execute SQL for schema-only questions."
-        )
-    if intent_kind == "data_query_catalog_assisted":
-        return (
-            "Use catalog tools to resolve tables, columns, and relationships, then "
-            "plan with db_plan_query and execute with db_query."
-        )
-    if intent_kind == "manual_sql":
-        return "Validate the provided SQL before execution; execute only when safe."
-    if intent_kind == "admin_or_write":
-        return "Apply write/admin guardrails before any mutating action."
-    if intent_kind == "memory_only":
-        return "Use DB memory tools only for the requested memory operation."
-    return "Use focused query tools. Do not repeat a plan after it returns a plan_id."
+    if contract is not None and contract.workflow_guidance:
+        return contract.workflow_guidance
+    return workflow_policy_for_intent(intent_kind).workflow_guidance
 
 
 def _answer_policy_summary(
     intent_kind: Optional[str], *, contract: Optional[DbRunContract] = None
 ) -> str:
-    if contract is not None:
-        if contract.allow_catalog_final:
-            return (
-                "catalog/schema evidence is sufficient; answer from table, column, "
-                "and relationship metadata with confidence and caveats."
-            )
-        if contract.require_executed_query:
-            return (
-                "executed query evidence is required for data answers; catalog "
-                "evidence may guide planning but is not enough by itself."
-            )
-        if contract.evidence_mode == "memory":
-            return "answer from the memory operation result or confirm completion."
-        return "answer directly without DB tool evidence when appropriate."
-    if intent_kind in {"schema_only", "schema_question"}:
-        return (
-            "catalog/schema evidence is sufficient; explain confidence and caveats "
-            "from table, column, and relationship metadata. Do not query rows unless "
-            "the user asks for values, counts, samples, or calculations."
-        )
-    if intent_kind == "data_query_catalog_assisted":
-        return (
-            "catalog evidence may guide planning, but final numeric/data answers "
-            "require executed query evidence."
-        )
-    if intent_kind == "manual_sql":
-        return "validated/executed SQL evidence is required before final answers."
-    if intent_kind == "memory_only":
-        return "answer from the memory operation result or confirm completion."
-    return (
-        "executed query evidence is required for data answers; include readable "
-        "labels with ids when available."
-    )
+    if contract is not None and contract.answer_guidance:
+        return contract.answer_guidance
+    return workflow_policy_for_intent(intent_kind).answer_guidance
 
 
 def _capability_summary(agent: "Agent", tool_names: List[str]) -> str:
     capabilities = ["sql", "schema"]
-    if ANALYST_TOOL_NAMES.intersection(tool_names):
+    if has_analyst_tool(tool_names):
         capabilities.append("analyst_tools")
     if hasattr(agent, "_db_memory"):
         capabilities.append("memory")

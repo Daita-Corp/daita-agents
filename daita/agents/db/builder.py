@@ -9,11 +9,13 @@ from .describe import attach_db_describe
 from .memory import DBMemory, calibrate_db_memory, create_db_memory_tools
 from .config.policies import (
     BudgetPreset,
-    GENERIC_MEMORY_WRITE_TOOLS,
-    GENERIC_PROVIDER_DB_TOOLS,
     SchemaPromptPolicy,
     ToolResultPolicy,
     schema_prompt_policy_for_budget,
+)
+from .config.tool_selection import (
+    GENERIC_MEMORY_WRITE_TOOLS,
+    should_keep_provider_db_tool,
 )
 from .config.presets import AUTO_TOOLKIT, resolve_mode_options
 from .catalog_read_model import db_summary_from_catalog
@@ -557,11 +559,7 @@ def _remove_provider_db_tools(agent: "Agent") -> None:
     """Keep provider-owned tools internal to from_db after generic facades exist."""
 
     for tool_name in list(agent.tool_registry.tool_names):
-        if tool_name in GENERIC_PROVIDER_DB_TOOLS:
-            continue
-        if tool_name.endswith("_vector_search"):
-            continue
-        if tool_name.endswith("_vector_upsert"):
+        if should_keep_provider_db_tool(tool_name):
             continue
         tool = agent.tool_registry.get(tool_name)
         if tool is not None and tool.source == "plugin" and tool.category == "database":

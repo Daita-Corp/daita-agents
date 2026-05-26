@@ -108,7 +108,7 @@ def create_forecast_trend_tool(
             # Convert dates to ordinal float for regression
             ordinals = dates.astype("datetime64[D]").astype(float)
             coeffs = np.polyfit(ordinals, values, deg=1)
-            slope, intercept = coeffs
+            slope = coeffs[0]
 
             fitted = np.polyval(coeffs, ordinals)
             ss_res = np.sum((values - fitted) ** 2)

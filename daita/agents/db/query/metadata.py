@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal
+
+IdentityMode = Literal[
+    "declared_only",
+    "declared_or_conventional",
+    "count_stable_row",
+]
 
 FIELD_TOKEN_STOPWORDS = {
     "a",
@@ -38,6 +44,44 @@ def table_name(table: Any) -> str:
 
 def short_table_name(name: str) -> str:
     return str(name).split(".")[-1].lower()
+
+
+def identity_column(
+    table: Any,
+    *,
+    mode: IdentityMode = "declared_or_conventional",
+) -> str | None:
+    """Return the best row identity column for a normalized table."""
+    if mode not in {
+        "declared_only",
+        "declared_or_conventional",
+        "count_stable_row",
+    }:
+        raise ValueError("unknown identity resolution mode")
+    if not isinstance(table, dict):
+        return None
+
+    columns = [
+        column for column in table.get("columns") or [] if isinstance(column, dict)
+    ]
+    for column in columns:
+        if bool(column.get("is_primary_key")):
+            return column_name(column)
+    if mode == "declared_only":
+        return None
+
+    names = [name for name in (column_name(column) for column in columns) if name]
+    short = short_table_name(table_name(table)).rstrip("s")
+    preferred = [f"{short}_id", "id", "uuid", "key"]
+    for wanted in preferred:
+        for name in names:
+            if name.lower() == wanted.lower():
+                return name
+    for name in names:
+        lowered = name.lower()
+        if lowered.endswith("_id") or lowered == "id":
+            return name
+    return None
 
 
 def schema_table_columns(schema: dict[str, Any]) -> dict[str, set[str]]:
@@ -132,4 +176,3 @@ def metric_matches_required(metric: Any, required_field: str) -> bool:
         return True
     column = str(getattr(metric, "column", "") or "")
     return bool(column and required_field_matches_output(required_field, column))
-

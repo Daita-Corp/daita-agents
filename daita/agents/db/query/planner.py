@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from ..runtime.state import DbQueryPlan, DbRunState
+from ..runtime.state import DbRunState
 from ..utils import string_list
 from .metadata import (
     matching_tables as _matching_tables,
@@ -25,7 +25,7 @@ from .evidence import (
     evidence_join_paths,
     evidence_table_names,
 )
-from .intent import looks_like_count_intent
+from .intent import QueryIntent, QueryPlanRecord, looks_like_count_intent
 from .ir_validator import validate_query_plan
 from .requirements import parse_answer_requirements
 from .resolver import resolve_query_plan
@@ -52,7 +52,7 @@ def build_query_plan(
     answer_requirements = parse_answer_requirements(
         required_fields, aggregations=aggregations
     )
-    plan = DbQueryPlan(
+    intent = QueryIntent(
         goal=str(args.get("goal") or "").strip(),
         required_fields=required_fields,
         answer_requirements=answer_requirements,
@@ -69,42 +69,44 @@ def build_query_plan(
 
     evidence_tables = evidence_table_names(evidence)
     if evidence_tables:
-        plan.candidate_tables = _merge_strings(plan.candidate_tables, evidence_tables)
+        intent.candidate_tables = _merge_strings(
+            intent.candidate_tables, evidence_tables
+        )
     evidence_joins = evidence_join_paths(evidence)
-    plan.required_joins = _merge_join_requirements(
-        plan.required_joins, _join_requirements_from_evidence(evidence_joins)
+    intent.required_joins = _merge_join_requirements(
+        intent.required_joins, _join_requirements_from_evidence(evidence_joins)
     )
 
     search_text = " ".join(
-        [plan.goal]
-        + plan.required_fields
-        + plan.candidate_tables
-        + plan.filters
-        + plan.aggregations
-        + plan.grouping
+        [intent.goal]
+        + intent.required_fields
+        + intent.candidate_tables
+        + intent.filters
+        + intent.aggregations
+        + intent.grouping
     ).strip()
     table_candidates = search_tables(
         schema,
-        query=search_text or plan.goal,
+        query=search_text or intent.goal,
         limit=MAX_CANDIDATE_TABLES,
         catalog=catalog,
         store_id=store_id,
     )
     resolved_tables = _resolve_candidate_tables(
-        schema, plan.candidate_tables, catalog=catalog, store_id=store_id
+        schema, intent.candidate_tables, catalog=catalog, store_id=store_id
     )
     field_candidates = _field_candidates(
         schema,
-        plan.required_fields,
+        intent.required_fields,
         candidate_tables=resolved_tables["resolved_tables"],
     )
     join_paths = _merge_join_paths(
         evidence_joins,
-        _required_join_paths(schema, plan, catalog=catalog, store_id=store_id),
+        _required_join_paths(schema, intent, catalog=catalog, store_id=store_id),
     )
-    plan_warnings = _aggregation_reference_warnings(schema, plan)
+    plan_warnings = _aggregation_reference_warnings(schema, intent)
     query_resolution = resolve_query_plan(
-        plan, schema, catalog=catalog, store_id=store_id
+        intent, schema, catalog=catalog, store_id=store_id
     )
     query_ir = query_resolution.plan
     ir_validation = (
@@ -117,7 +119,7 @@ def build_query_plan(
         else {"ok": False, "errors": [], "warnings": []}
     )
     required_field_warnings = required_field_warnings_for_plan(
-        query_ir, plan.answer_requirements
+        query_ir, intent.answer_requirements
     )
     if required_field_warnings:
         ir_validation = {
@@ -153,67 +155,50 @@ def build_query_plan(
     if compiler_warning:
         plan_warnings.append(compiler_warning)
 
-    if not plan.answer_checks:
-        plan.answer_checks = [f"include {field}" for field in plan.required_fields]
+    if not intent.answer_checks:
+        intent.answer_checks = [f"include {field}" for field in intent.required_fields]
 
-    diagnostic_fields = {
-        "plan": plan.to_dict(),
+    diagnostics = {
         "table_candidates": table_candidates["tables"],
         "field_candidates": field_candidates,
         "join_paths": join_paths,
         "evidence": evidence or {},
         "query_ir_resolution": query_resolution.to_dict(),
-        "query_ir": query_ir.to_dict() if query_ir is not None else None,
     }
     knowledge_used = compact_evidence_summary(evidence)
-    result = {
-        "ok": True,
-        "plan_id": None,
-        "route": _classify_plan(plan),
-        "resolved_tables": resolved_tables["resolved_tables"],
-        "ambiguous_tables": resolved_tables["ambiguous_tables"],
-        "unknown_tables": resolved_tables["unknown_tables"],
-        "compiled_sql": compiled_sql,
-        "validation": ir_validation,
-        "plan_warnings": plan_warnings,
-        "best_join_path": _best_join_path(join_paths),
-        "knowledge_used": knowledge_used,
-        "next_steps": _next_steps(
+    record = QueryPlanRecord(
+        plan_id=None,
+        intent=intent,
+        query_ir=query_ir,
+        validation=ir_validation,
+        compiled_sql=compiled_sql,
+        route=_classify_intent(intent),
+        resolved_tables=resolved_tables["resolved_tables"],
+        ambiguous_tables=resolved_tables["ambiguous_tables"],
+        unknown_tables=resolved_tables["unknown_tables"],
+        plan_warnings=plan_warnings,
+        best_join_path=_best_join_path(join_paths),
+        knowledge_used=knowledge_used,
+        diagnostics=diagnostics,
+        next_steps=_next_steps(
             resolved_tables,
             field_candidates,
             join_paths,
             compiled_sql,
             has_run_state=run_state is not None,
         ),
-    }
-    result["next_step"] = result["next_steps"][0] if result["next_steps"] else None
-    if compiled_sql:
-        result["suggested_next_tool"] = "db_query"
-        result["suggested_next_arguments"] = {"sql": compiled_sql}
-    if include_diagnostics:
-        result.update(diagnostic_fields)
+    )
 
     if run_state is not None:
         for field_name, candidates in field_candidates.items():
             run_state.record_candidate_columns(field_name, candidates)
         for path_result in join_paths:
             run_state.record_join_paths(path_result)
-        plan_id = run_state.record_plan(plan, result)
-        result["plan_id"] = plan_id
+        plan_id = run_state.record_plan(record)
         if compiled_sql:
-            result["suggested_next_arguments"] = {"plan_id": plan_id}
-            result["next_steps"] = [f"run db_query with plan_id={plan_id}"]
-            result["next_step"] = result["next_steps"][0]
-        stored = run_state.get_plan(plan_id)
-        if stored is not None:
-            stored["result"]["plan_id"] = plan_id
-            stored["result"].update(diagnostic_fields)
-            if compiled_sql:
-                stored["result"]["suggested_next_arguments"] = {"plan_id": plan_id}
-                stored["result"]["next_steps"] = list(result["next_steps"])
-                stored["result"]["next_step"] = result["next_step"]
+            record.next_steps = [f"run db_query with plan_id={plan_id}"]
 
-    return result
+    return record.to_dict(include_diagnostics=include_diagnostics)
 
 
 def _merge_join_paths(
@@ -374,13 +359,13 @@ def _field_candidates(
 
 def _required_join_paths(
     schema: Dict[str, Any],
-    plan: DbQueryPlan,
+    intent: QueryIntent,
     *,
     catalog: Any = None,
     store_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     path_results = []
-    for join in plan.required_joins:
+    for join in intent.required_joins:
         from_tables = _string_list(join.get("from_tables") or join.get("from"))
         to_tables = _string_list(join.get("to_tables") or join.get("to"))
         if not from_tables or not to_tables:
@@ -400,11 +385,11 @@ def _required_join_paths(
 
 
 def _aggregation_reference_warnings(
-    schema: Dict[str, Any], plan: DbQueryPlan
+    schema: Dict[str, Any], intent: QueryIntent
 ) -> List[Dict[str, Any]]:
     table_columns = _schema_table_columns(schema)
     warnings: List[Dict[str, Any]] = []
-    for expression in plan.aggregations:
+    for expression in intent.aggregations:
         for table, column in re.findall(
             r"\b([A-Za-z_][\w.]*)\.([A-Za-z_][\w]*)\b", expression
         ):
@@ -431,7 +416,7 @@ def _aggregation_reference_warnings(
                     "column": column,
                     "suggested_next_tool": "catalog_inspect_table",
                 }
-                if _looks_like_plan_count_intent(plan, column):
+                if _looks_like_intent_count(intent, column):
                     warning["guidance"] = (
                         "For count-style questions, count stable rows such as "
                         "COUNT(*) or COUNT(primary_key) and alias the result, "
@@ -442,12 +427,12 @@ def _aggregation_reference_warnings(
     return warnings
 
 
-def _looks_like_plan_count_intent(plan: DbQueryPlan, column_name: str) -> bool:
+def _looks_like_intent_count(intent: QueryIntent, column_name: str) -> bool:
     text = " ".join(
-        [plan.goal, column_name]
-        + plan.required_fields
-        + plan.aggregations
-        + plan.ordering
+        [intent.goal, column_name]
+        + intent.required_fields
+        + intent.aggregations
+        + intent.ordering
     )
     return looks_like_count_intent(text)
 
@@ -485,12 +470,12 @@ def _next_steps(
     return steps
 
 
-def _classify_plan(plan: DbQueryPlan) -> str:
-    if plan.aggregations or plan.grouping:
+def _classify_intent(intent: QueryIntent) -> str:
+    if intent.aggregations or intent.grouping:
         return "aggregation"
-    if plan.required_joins:
+    if intent.required_joins:
         return "join_query"
-    text = plan.goal.lower()
+    text = intent.goal.lower()
     if any(term in text for term in ("schema", "table", "column", "relationship")):
         return "schema_question"
     return "data_query"

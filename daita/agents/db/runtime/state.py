@@ -9,32 +9,12 @@ belong in the catalog profile.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from ..query.intent import QueryPlanRecord
 from ..query.requirements import AnswerRequirement
 from ..utils import string_list as _string_list
-
-
-@dataclass
-class DbQueryPlan:
-    """Structured representation of a database question before SQL exists."""
-
-    goal: str
-    required_fields: List[str] = field(default_factory=list)
-    answer_requirements: List[AnswerRequirement] = field(default_factory=list)
-    candidate_tables: List[str] = field(default_factory=list)
-    required_joins: List[Dict[str, Any]] = field(default_factory=list)
-    filters: List[str] = field(default_factory=list)
-    aggregations: List[str] = field(default_factory=list)
-    grouping: List[str] = field(default_factory=list)
-    ordering: List[str] = field(default_factory=list)
-    limit: Optional[int] = None
-    assumptions: List[str] = field(default_factory=list)
-    answer_checks: List[str] = field(default_factory=list)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
 
 
 @dataclass
@@ -273,23 +253,29 @@ class DbRunState:
             payload=_compact_query_metadata(metadata),
         )
 
-    def record_plan(self, plan: DbQueryPlan, result: Dict[str, Any]) -> str:
+    def record_plan(self, record: QueryPlanRecord) -> str:
         plan_id = f"plan_{self.next_plan_number}"
         self.next_plan_number += 1
-        stored = {"plan_id": plan_id, "plan": plan.to_dict(), "result": dict(result)}
+        record.plan_id = plan_id
+        if record.compiled_sql:
+            record.next_steps = [f"run db_query with plan_id={plan_id}"]
+        stored = record.to_dict(include_diagnostics=True)
         self.planned_queries.append(stored)
         self.plans_by_id[plan_id] = stored
-        self.record_answer_requirements(plan.answer_requirements)
+        self.record_answer_requirements(record.intent.answer_requirements)
         _record_db_evidence(
             "query_plan",
             source_tool="db_plan_query",
             payload={
                 "plan_id": plan_id,
-                "plan": plan.to_dict(),
-                "route": result.get("route"),
-                "resolved_tables": list(result.get("resolved_tables") or []),
-                "compiled_sql": result.get("compiled_sql"),
-                "validation": _compact_validation(result.get("validation") or {}),
+                "intent": record.intent.to_dict(),
+                "query_ir": (
+                    record.query_ir.to_dict() if record.query_ir is not None else None
+                ),
+                "route": record.route,
+                "resolved_tables": list(record.resolved_tables),
+                "compiled_sql": record.compiled_sql,
+                "validation": _compact_validation(record.validation),
             },
         )
         return plan_id

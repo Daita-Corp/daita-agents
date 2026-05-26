@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING
 
 from .....core.tools import AgentTool
 from ...catalog_profile import is_numeric_type
+from ...query.metadata import identity_column
 
 if TYPE_CHECKING:
     from .....plugins.base_db import BaseDatabasePlugin
@@ -171,14 +172,11 @@ def get_pk_column(
     context: AnalystCatalogContext,
     table: str,
 ) -> Optional[str]:
-    """Return the primary key column name for a table, or None."""
+    """Return the best identity column name for a table, or None."""
     catalog_table = _catalog_table(context, table)
     if catalog_table is None:
         return None
-    for col in catalog_table.get("columns", []):
-        if col.get("is_primary_key"):
-            return col["name"]
-    return None
+    return identity_column(catalog_table, mode="declared_or_conventional")
 
 
 def get_numeric_columns(

@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional
 
 from ...runtime.state import FinalAnswerReadiness
-from ..config.policies import ANSWER_EVIDENCE_DB_TOOLS, SCHEMA_NAVIGATION_TOOLS
+from ..config.tool_selection import (
+    ANSWER_EVIDENCE_CAPABILITIES,
+    CATALOG_NAVIGATION_CAPABILITIES,
+    tool_has_any_capability,
+)
 from ..query.requirements import AnswerRequirement, output_satisfies_requirement
 from .state import DbRunState
 
@@ -66,7 +70,9 @@ def evaluate_db_final_answer_readiness(
         return FinalAnswerReadiness(diagnostics=diagnostics)
 
     available_names = _tool_names(available_tools)
-    if schema_only and available_names.intersection(SCHEMA_NAVIGATION_TOOLS):
+    if schema_only and _any_tool_has_capability(
+        available_names, CATALOG_NAVIGATION_CAPABILITIES
+    ):
         warning = (
             "db_final_answer_incomplete"
             if can_answer and incomplete_final
@@ -79,7 +85,7 @@ def evaluate_db_final_answer_readiness(
             diagnostics=diagnostics,
         )
 
-    if not available_names.intersection(ANSWER_EVIDENCE_DB_TOOLS):
+    if not _any_tool_has_capability(available_names, ANSWER_EVIDENCE_CAPABILITIES):
         return FinalAnswerReadiness(diagnostics=diagnostics)
 
     warning = (
@@ -219,6 +225,12 @@ def _tool_names(tools: Iterable[Any]) -> set[str]:
     return names
 
 
+def _any_tool_has_capability(
+    tool_names: Iterable[str], capabilities: Iterable[str]
+) -> bool:
+    return any(tool_has_any_capability(name, capabilities) for name in tool_names)
+
+
 def _looks_incomplete_final_answer(text: str) -> bool:
     normalized = " ".join(str(text or "").lower().split())
     return any(marker in normalized for marker in INCOMPLETE_FINAL_MARKERS)
@@ -347,7 +359,7 @@ def _final_answer_guidance(
     if isinstance(db_state, DbRunState) and db_state.planned_queries:
         latest_plan = db_state.planned_queries[-1]
         plan_id = latest_plan.get("plan_id")
-        compiled_sql = (latest_plan.get("result") or {}).get("compiled_sql")
+        compiled_sql = latest_plan.get("compiled_sql")
         if plan_id and compiled_sql:
             plan_instruction = (
                 f" Use db_query with plan_id={plan_id!r} if that plan answers "

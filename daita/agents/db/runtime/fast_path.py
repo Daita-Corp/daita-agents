@@ -5,21 +5,16 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional
 
+from ..config.route_decision import DbRouteDecision, build_db_route_decision
 from ..query.evidence import collect_query_evidence, evidence_table_names
-from ..query.catalog_adapter import (
-    catalog_schema_snapshot,
-    primary_key_or_identity,
-)
+from ..query.catalog_adapter import catalog_schema_snapshot
 from ..query.metadata import (
+    identity_column,
     short_table_name,
     split_identifier,
     table_name,
 )
-from ..query.intent import looks_like_count_intent
 from .tracing import db_trace_span
-
-WRITE_TERMS = ("insert", "update", "delete", "upsert", "write", "mutate")
-SCHEMA_TERMS = ("schema", "column", "columns", "relationship", "relationships")
 
 
 async def try_db_fast_path(
@@ -28,20 +23,41 @@ async def try_db_fast_path(
     kwargs: Dict[str, Any],
     *,
     run_state: Any = None,
+    route_decision: DbRouteDecision | None = None,
 ) -> Optional[Dict[str, Any]]:
     """Try a deterministic DB answer before the autonomous LLM loop."""
+
+    if route_decision is None:
+        route_decision = build_db_route_decision(agent, prompt)
 
     async with db_trace_span(
         agent,
         "from_db.fast_path",
         prompt=prompt[:200],
     ) as (trace_manager, span_id):
-        intent = await _simple_count_intent(agent, prompt, run_state=run_state)
-        if intent is None:
-            trace_manager.record_output(span_id, {"used": False})
+        fast_path = route_decision.fast_path
+        if not fast_path.eligible:
+            trace_manager.record_output(
+                span_id, {"used": False, "reason": fast_path.reason}
+            )
             return None
 
-        tool = agent.tool_registry.get("db_compile_and_query")
+        intent = await _simple_count_intent(
+            agent,
+            prompt,
+            run_state=run_state,
+        )
+        if intent is None:
+            trace_manager.record_output(
+                span_id, {"used": False, "reason": "table_match_unavailable"}
+            )
+            return None
+
+        tool_name = fast_path.tool_name
+        if tool_name is None:
+            tool = None
+        else:
+            tool = agent.tool_registry.get(tool_name)
         if tool is None:
             trace_manager.record_output(
                 span_id, {"used": False, "reason": "tool_unavailable"}
@@ -57,6 +73,7 @@ async def try_db_fast_path(
             {
                 "used": result_ok,
                 "reason": None if result_ok else "compile_or_query_failed",
+                "strategy": fast_path.strategy,
                 "tool_duration_ms": duration_ms,
             },
         )
@@ -64,7 +81,7 @@ async def try_db_fast_path(
             return None
 
         tool_record = {
-            "tool": "db_compile_and_query",
+            "tool": tool_name,
             "arguments": intent,
             "result": result,
             "duration_ms": duration_ms,
@@ -72,7 +89,7 @@ async def try_db_fast_path(
         agent._db_last_context_metadata = {
             "runtime_context_chars": 0,
             "runtime_context_tokens_estimate": 0,
-            "selected_tools": ["db_compile_and_query"],
+            "selected_tools": [tool_name],
             "selected_tool_count": 1,
             "prompt_terms": split_identifier(prompt),
             "fast_path": True,
@@ -80,7 +97,7 @@ async def try_db_fast_path(
         if hasattr(agent, "_tool_call_history"):
             agent._tool_call_history.append(
                 {
-                    "name": "db_compile_and_query",
+                    "name": tool_name,
                     "duration_ms": duration_ms,
                     "input": intent,
                     "output": result,
@@ -109,20 +126,17 @@ async def try_db_fast_path(
 
 
 async def _simple_count_intent(
-    agent: Any, prompt: str, *, run_state: Any = None
+    agent: Any,
+    prompt: str,
+    *,
+    run_state: Any = None,
 ) -> Optional[Dict[str, Any]]:
-    text = str(prompt or "").lower()
-    if not looks_like_count_intent(text):
-        return None
-    if any(term in text for term in WRITE_TERMS + SCHEMA_TERMS):
-        return None
-
     schema = catalog_schema_snapshot(agent)
     table = await _evidence_table_match(agent, prompt, schema, run_state=run_state)
     if table is None:
         return None
     table_ref = table_name(table)
-    pk = primary_key_or_identity(table)
+    pk = identity_column(table, mode="count_stable_row")
     alias = f"total_{short_table_name(table_ref)}"
     return {
         "goal": prompt,

@@ -7,17 +7,6 @@ from typing import Any, TypeVar
 
 T = TypeVar("T", bound=Hashable)
 
-ANALYST_TOOL_NAMES = frozenset(
-    (
-        "pivot_table",
-        "correlate",
-        "detect_anomalies",
-        "compare_entities",
-        "find_similar",
-        "forecast_trend",
-    )
-)
-
 
 def unique_preserving_order(
     values: Iterable[T], *, skip_empty: bool = False

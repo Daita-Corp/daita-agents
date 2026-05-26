@@ -17,6 +17,7 @@ from .catalog_sampling import PII_COLUMN_PATTERNS
 
 if TYPE_CHECKING:
     from ..agent import Agent
+    from .config.intent_classifier import DbPromptClassification
 
 logger = logging.getLogger(__name__)
 
@@ -412,12 +413,13 @@ async def recall_db_memory_context(
     prompt: str,
     *,
     limit: int = 5,
+    classification: Optional["DbPromptClassification"] = None,
 ) -> List[str]:
     """Recall compact DB-specific memory snippets for a user prompt."""
     db_memory = getattr(agent, "_db_memory_semantics", None)
     if db_memory is None:
         return []
-    decision = db_memory_recall_decision(agent, prompt)
+    decision = db_memory_recall_decision(agent, prompt, classification=classification)
     setattr(agent, "_db_last_memory_recall_decision", decision)
     if not decision["recall"]:
         return []
@@ -445,11 +447,19 @@ async def recall_db_memory_context(
     return snippets[:limit]
 
 
-def db_memory_recall_decision(agent: "Agent", prompt: str) -> Dict[str, Any]:
+def db_memory_recall_decision(
+    agent: "Agent",
+    prompt: str,
+    *,
+    classification: Optional["DbPromptClassification"] = None,
+) -> Dict[str, Any]:
     """Return whether DB semantic memory is useful for this prompt."""
 
     text = str(prompt or "").lower()
-    semantic_matches = _matched_terms(text, SEMANTIC_RECALL_TERMS)
+    if classification is not None:
+        return _classified_memory_recall_decision(agent, prompt, classification)
+
+    semantic_matches = _matched_terms(text, FALLBACK_SEMANTIC_RECALL_TERMS)
     if semantic_matches:
         return {
             "recall": True,
@@ -472,13 +482,58 @@ def db_memory_recall_decision(agent: "Agent", prompt: str) -> Dict[str, Any]:
         return {
             "recall": False,
             "reason": "direct_schema_matched_query",
-            "matched_terms": _matched_terms(text, DIRECT_QUERY_TERMS),
+            "matched_terms": _matched_terms(text, FALLBACK_DIRECT_QUERY_TERMS),
         }
 
     return {"recall": True, "reason": "semantic_fallback", "matched_terms": []}
 
 
-SEMANTIC_RECALL_TERMS = (
+def _classified_memory_recall_decision(
+    agent: "Agent",
+    prompt: str,
+    classification: "DbPromptClassification",
+) -> Dict[str, Any]:
+    if classification.needs_semantic_memory:
+        return {
+            "recall": True,
+            "reason": "semantic_prompt",
+            "matched_terms": list(classification.semantic_memory_terms),
+        }
+
+    text = str(prompt or "").lower()
+    if _looks_row_level(prompt):
+        return {"recall": False, "reason": "row_level_prompt", "matched_terms": []}
+
+    identifier_matches = _identifier_matches(text)
+    if identifier_matches:
+        return {
+            "recall": False,
+            "reason": "identifier_prompt",
+            "matched_terms": identifier_matches,
+        }
+
+    if (
+        classification.intent.needs_sql_execution
+        and classification.likely_catalog_match
+        and not classification.needs_memory_tools
+    ):
+        return {
+            "recall": False,
+            "reason": "direct_schema_matched_query",
+            "matched_terms": [classification.intent.value],
+        }
+
+    if classification.needs_memory_tools:
+        return {
+            "recall": True,
+            "reason": "memory_intent",
+            "matched_terms": [classification.intent.value],
+        }
+
+    return {"recall": True, "reason": "semantic_fallback", "matched_terms": []}
+
+
+FALLBACK_SEMANTIC_RECALL_TERMS = (
     "business rule",
     "business rules",
     "calculate",
@@ -503,7 +558,7 @@ SEMANTIC_RECALL_TERMS = (
     "what does",
     "you said",
 )
-DIRECT_QUERY_TERMS = (
+FALLBACK_DIRECT_QUERY_TERMS = (
     "average",
     "avg",
     "count",
@@ -563,7 +618,7 @@ def _looks_row_level(prompt: str) -> bool:
 
 def _looks_direct_query(text: str) -> bool:
     return looks_like_count_intent(text) or bool(
-        _matched_terms(text, DIRECT_QUERY_TERMS)
+        _matched_terms(text, FALLBACK_DIRECT_QUERY_TERMS)
     )
 
 
