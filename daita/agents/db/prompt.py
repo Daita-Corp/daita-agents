@@ -171,19 +171,17 @@ def build_prompt_result(
 
     lines.append("")
     lines.append("## Guidelines")
-    lines.append("- Use the database query tools to answer questions.")
     lines.append(
-        "- Do not ask the user to confirm routine read-only steps. Inspect schema, "
-        "find join paths, run SELECT queries, and repair recoverable SQL errors "
-        "autonomously."
+        "- Follow the per-run DB workflow and tool contract in runtime context."
+    )
+    lines.append(
+        "- Do not ask the user to confirm routine read-only steps allowed by the "
+        "active runtime context."
     )
     lines.append("- Always use LIMIT to keep result sets manageable.")
     lines.append(
-        "- For clear single-table counts, direct lookups, and simple filtered "
-        "questions, prefer db_compile_and_query first. For open-ended analytics, "
-        "grouping, ranking, entity labels, joins, validation, or debugging, use "
-        "db_plan_query first, then execute the validated plan with db_query using "
-        "the returned suggested_next_arguments."
+        "- Use selected query tools for retrieving values, counts, aggregations, "
+        "examples, rankings, trends, and row-level facts."
     )
     lines.append(
         "- Use catalog/schema tools to traverse tables, columns, and relationships; "
@@ -196,17 +194,16 @@ def build_prompt_result(
     )
     lines.append(
         "- Before writing SQL that joins tables, verify the relevant tables, columns, "
-        "and join path. Use catalog_find_join_paths when the relationship is not direct."
+        "and join path when the runtime context exposes catalog tools."
     )
     lines.append(
-        "- If SQL fails because a table or column is missing, inspect the schema and "
-        "retry with corrected SQL before giving a final answer."
+        "- If SQL fails because a table or column is missing, use the allowed repair "
+        "tools from the runtime context before retrying."
     )
     lines.append(
         "- If db_query returns repair_required or preflight_failed, never call "
-        "db_query again with the same SQL. Use catalog_inspect_table, "
-        "catalog_search_schema, or catalog_find_join_paths, then call "
-        "db_validate_sql or db_query with corrected SQL."
+        "db_query again with the same SQL. Follow the runtime context for the "
+        "allowed repair path."
     )
     lines.append(
         "- When multiple business interpretations are valid, choose the most direct "

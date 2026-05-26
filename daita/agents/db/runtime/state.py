@@ -44,6 +44,7 @@ class DbRunState:
     intent_kind: Optional[str] = None
     inspected_tables: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     candidate_columns: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    catalog_search_count: int = 0
     catalog_evidence: Dict[str, List[Dict[str, Any]]] = field(
         default_factory=lambda: {"tables": [], "columns": [], "joins": []}
     )
@@ -56,6 +57,7 @@ class DbRunState:
     plans_by_id: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     next_plan_number: int = 1
     final_completeness_status: Optional[Dict[str, Any]] = None
+    run_contract: Any = None
 
     def record_candidate_columns(
         self, field_name: str, candidates: List[Dict[str, Any]]
@@ -72,39 +74,17 @@ class DbRunState:
             if path not in self.known_join_paths:
                 self.known_join_paths.append(path)
 
-    def configure_workflow(
-        self, selected_tools: List[str], *, intent_kind: Optional[str] = None
-    ) -> None:
-        if intent_kind:
-            self.intent_kind = intent_kind
-            return
-        tool_names = set(selected_tools or [])
-        has_query_tools = bool(
-            tool_names.intersection(
-                {"db_plan_query", "db_query", "db_validate_sql", "db_compile_and_query"}
-            )
-        )
-        has_catalog_tools = any(name.startswith("catalog_") for name in tool_names)
-        if has_query_tools and has_catalog_tools:
-            self.intent_kind = "data_query_catalog_assisted"
-        elif has_query_tools:
-            self.intent_kind = "data_query"
-        elif has_catalog_tools:
-            self.intent_kind = "schema_question"
-
     def record_catalog_tool_result(
         self, tool_name: str, arguments: Dict[str, Any], result: Any
-    ) -> Optional[Dict[str, Any]]:
+    ) -> None:
         if not isinstance(result, dict) or result.get("error"):
-            return None
+            return
         if tool_name == "catalog_search_schema":
             self._record_catalog_search(arguments, result)
         elif tool_name == "catalog_inspect_table":
             self._record_catalog_inspection(arguments, result)
         elif tool_name == "catalog_find_join_paths":
             self._record_catalog_join_paths(arguments, result)
-            return self._catalog_join_handoff(result)
-        return None
 
     def catalog_planner_evidence(self) -> Dict[str, Any]:
         tables = list(self.catalog_evidence.get("tables") or [])
@@ -131,6 +111,7 @@ class DbRunState:
     def _record_catalog_search(
         self, arguments: Dict[str, Any], result: Dict[str, Any]
     ) -> None:
+        self.catalog_search_count += 1
         for table in result.get("tables") or []:
             if not isinstance(table, dict):
                 continue
@@ -243,32 +224,6 @@ class DbRunState:
                 "path_count": result.get("path_count", len(result.get("paths") or [])),
             },
         )
-
-    def _catalog_join_handoff(self, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if self.intent_kind not in {"data_query_catalog_assisted", "data_query"}:
-            return None
-        if not result.get("reachable") or not result.get("paths"):
-            return None
-        if self.planned_queries:
-            return None
-        from_tables = _string_list(
-            result.get("from_tables") or result.get("from_assets")
-        )
-        to_tables = _string_list(result.get("to_tables") or result.get("to_assets"))
-        if not from_tables or not to_tables:
-            return None
-        return {
-            "suggested_next_tool": "db_plan_query",
-            "suggested_next_arguments": {
-                "candidate_tables": _unique_strings(from_tables + to_tables),
-                "required_joins": [
-                    {
-                        "from_tables": from_tables,
-                        "to_tables": to_tables,
-                    }
-                ],
-            },
-        }
 
     def record_failed_sql(
         self,
@@ -386,6 +341,7 @@ class DbRunState:
             "inspected_table_count": len(self.inspected_tables),
             "intent_kind": self.intent_kind,
             "candidate_field_count": len(self.candidate_columns),
+            "catalog_search_count": self.catalog_search_count,
             "catalog_table_evidence_count": len(
                 self.catalog_evidence.get("tables") or []
             ),
@@ -417,18 +373,28 @@ def get_db_run_state(owner: Any) -> Optional[DbRunState]:
     return state if isinstance(state, DbRunState) else None
 
 
-def set_db_run_state(owner: Any, state: DbRunState) -> None:
+def set_db_run_state(
+    owner: Any,
+    state: DbRunState,
+    *,
+    register_final_answer_readiness: bool = True,
+) -> None:
     setattr(owner, "_daita_db_run_state", state)
-    _register_db_final_answer_readiness(owner)
+    if register_final_answer_readiness:
+        _register_db_final_answer_readiness(owner)
     try:
         from daita.agents.runtime.contextvars import get_active_run_state
 
         run_state = get_active_run_state()
         if run_state is not None:
             run_state.domains["db"] = state
-            hook = _db_final_answer_readiness_hook()
-            if hook is not None and hook not in run_state.final_answer_readiness_hooks:
-                run_state.final_answer_readiness_hooks.append(hook)
+            if register_final_answer_readiness:
+                hook = _db_final_answer_readiness_hook()
+                if (
+                    hook is not None
+                    and hook not in run_state.final_answer_readiness_hooks
+                ):
+                    run_state.final_answer_readiness_hooks.append(hook)
     except Exception:
         pass
 
@@ -559,11 +525,3 @@ def _score(item: Dict[str, Any]) -> float:
         return float(item.get("confidence") or 0.0)
     except (TypeError, ValueError):
         return 0.0
-
-
-def _unique_strings(values: List[str]) -> List[str]:
-    out = []
-    for value in values:
-        if value and value not in out:
-            out.append(value)
-    return out

@@ -5,21 +5,20 @@ Compact per-run context for agents created by ``Agent.from_db()``.
 import re
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from ..config.policies import (
-    SCHEMA_NAVIGATION_TOOLS as _SCHEMA_NAVIGATION_TOOLS,
-    TERMINAL_DB_TOOLS,
-)
 from ..catalog_read_model import build_db_catalog_read_model
 from ..utils import ANALYST_TOOL_NAMES
+from .orchestrator import (
+    FROM_DB_SCHEMA_TOOLS,
+    DbRunContract,
+    DbRunOrchestrator,
+)
 
 if TYPE_CHECKING:
     from ...agent import Agent
 
 
-SCHEMA_NAVIGATION_TOOLS = _SCHEMA_NAVIGATION_TOOLS
+SCHEMA_NAVIGATION_TOOLS = FROM_DB_SCHEMA_TOOLS
 DEFAULT_CONTEXT_MAX_CHARS = 1600
-SCHEMA_HINT_MAX_TABLES = 5
-SCHEMA_HINT_MAX_RELATIONSHIPS = 5
 
 
 def build_db_run_context(
@@ -28,6 +27,9 @@ def build_db_run_context(
     prompt: str = "",
     max_chars: int = DEFAULT_CONTEXT_MAX_CHARS,
     memory_snippets: Optional[List[str]] = None,
+    intent_kind: Optional[str] = None,
+    selected_tools: Optional[List[str]] = None,
+    contract: Optional[DbRunContract] = None,
 ) -> str:
     """Build a small DB runtime context block without querying external systems."""
     read_model = build_db_catalog_read_model(
@@ -35,13 +37,19 @@ def build_db_run_context(
     )
     plugin = getattr(agent, "_db_plugin", None)
     mode = getattr(agent, "_db_mode", None)
-    tool_names = list(getattr(agent.tool_registry, "tool_names", []))
+    if contract is not None:
+        intent_kind = contract.intent
+        tool_names = list(contract.tools)
+    else:
+        tool_names = list(
+            selected_tools or getattr(agent.tool_registry, "tool_names", [])
+        )
     drift = getattr(agent, "_db_drift", None)
     summary = read_model.db_summary
 
     lines = [
         "<db_runtime_context>",
-        "Use DB tools autonomously. Plan open-ended analytic, ranking, label, filtered, or multi-table work with db_plan_query, then execute validated plans with db_query using suggested_next_arguments. Do not repeat db_plan_query for the same goal after it returns a plan_id.",
+        "Workflow: " + _workflow_policy_summary(intent_kind, contract=contract),
         (
             "Database: "
             f"type={read_model.database_type}, "
@@ -52,16 +60,12 @@ def build_db_run_context(
             f"relationships={read_model.relationship_count}"
         ),
         "Query policy: " + _query_policy_summary(plugin),
-        (
-            "Answer policy: execute an answer-bearing DB query before final "
-            "answers; when identifying an entity, include its human-readable "
-            "name or label with the id when available."
-        ),
+        "Answer policy: " + _answer_policy_summary(intent_kind, contract=contract),
         "Capabilities: " + _capability_summary(agent, tool_names),
+        "Selected tools: " + _selected_tools_summary(tool_names),
         "Memory: " + _memory_summary(agent, memory_snippets or []),
         "Data health: " + _summary_line(summary),
         "Candidate metrics: " + _candidate_metrics_summary(summary),
-        "Schema hints: " + _catalog_hint_summary(agent, prompt),
         "Drift: " + _drift_summary(drift),
         "</db_runtime_context>",
     ]
@@ -74,7 +78,7 @@ def make_db_context_run(agent: "Agent", original_run: Callable) -> Callable:
     async def _db_context_run(prompt: str, **kwargs: Any):
         from .fast_path import try_db_fast_path
 
-        run_state = _start_db_run_state(agent)
+        run_state = DbRunOrchestrator.start_state(agent)
         fast_result = await try_db_fast_path(agent, prompt, kwargs, run_state=run_state)
         if fast_result is not None:
             history = kwargs.get("history")
@@ -111,68 +115,12 @@ async def _prepare_db_runtime_call(
     *,
     run_state: Any = None,
 ) -> tuple[str, Dict[str, Any]]:
-    from ..memory import recall_db_memory_context
-    from ..config.tool_profiles import select_db_tool_profile
-    from .tracing import db_trace_span
-
-    async with db_trace_span(
-        agent,
-        "from_db.prepare_runtime_context",
-        prompt=prompt[:200],
-    ):
-        if run_state is None:
-            run_state = _start_db_run_state(agent)
-
-        async with db_trace_span(agent, "from_db.memory_recall") as (
-            trace_manager,
-            span_id,
-        ):
-            memory_snippets = await recall_db_memory_context(agent, prompt)
-            decision = getattr(agent, "_db_last_memory_recall_decision", None) or {}
-            trace_manager.record_output(
-                span_id,
-                {
-                    "skipped": not bool(decision.get("recall", True)),
-                    "reason": decision.get("reason"),
-                    "matched_terms": decision.get("matched_terms", []),
-                    "snippet_count": len(memory_snippets),
-                },
-            )
-
-        async with db_trace_span(agent, "from_db.build_runtime_context") as (
-            trace_manager,
-            span_id,
-        ):
-            context = build_db_run_context(
-                agent, prompt=prompt, memory_snippets=memory_snippets
-            )
-            trace_manager.record_output(
-                span_id,
-                {
-                    "runtime_context_chars": len(context),
-                    "memory_snippet_count": len(memory_snippets),
-                },
-            )
-
-        async with db_trace_span(agent, "from_db.select_tools") as (
-            trace_manager,
-            span_id,
-        ):
-            tool_profile = select_db_tool_profile(agent, prompt)
-            selected_tools = tool_profile.tools
-            run_state.configure_workflow(
-                selected_tools, intent_kind=tool_profile.intent
-            )
-            trace_manager.record_output(
-                span_id,
-                {
-                    "selected_tools": selected_tools,
-                    "selected_tool_count": len(selected_tools),
-                    "required_phases": tool_profile.required_phases,
-                    "intent_kind": run_state.intent_kind,
-                },
-            )
+    orchestrator = DbRunOrchestrator(agent, prompt, state=run_state)
+    prepared = await orchestrator.prepare()
+    context = prepared.context
+    selected_tools = list(prepared.contract.tools)
     agent._db_last_context_metadata = _context_metadata(context, selected_tools, prompt)
+    agent._db_last_context_metadata["contract"] = orchestrator.contract_summary()
     if kwargs.get("tools") is None:
         kwargs["tools"] = selected_tools
     if kwargs.get("initial_messages"):
@@ -180,20 +128,14 @@ async def _prepare_db_runtime_call(
             kwargs["initial_messages"]
         )
     kwargs.setdefault("final_synthesis_without_tools", True)
-    kwargs.setdefault("terminal_tools", TERMINAL_DB_TOOLS)
+    kwargs.setdefault("terminal_tools", prepared.contract.terminal_tools)
+    kwargs.setdefault("max_iterations", prepared.contract.max_model_turns)
+    kwargs["run_orchestrator"] = orchestrator
     return _augment_prompt(prompt, context), kwargs
 
 
 def _start_db_run_state(agent: "Agent") -> Any:
-    from .state import DbRunState, set_db_run_state
-
-    plugin = getattr(agent, "_db_plugin", None)
-    run_state = DbRunState()
-    set_db_run_state(agent, run_state)
-    if plugin is not None:
-        set_db_run_state(plugin, run_state)
-        setattr(plugin, "_daita_sql_preflight_failures", {})
-    return run_state
+    return DbRunOrchestrator.start_state(agent)
 
 
 def _context_metadata(
@@ -260,6 +202,80 @@ def _query_policy_summary(plugin: Any) -> str:
     return ", ".join(parts)
 
 
+def _workflow_policy_summary(
+    intent_kind: Optional[str], *, contract: Optional[DbRunContract] = None
+) -> str:
+    if contract is not None:
+        if contract.evidence_mode == "catalog":
+            return (
+                "Use only the selected catalog/schema tools. Catalog evidence is "
+                "the terminal evidence for this request."
+            )
+        if contract.evidence_mode == "query":
+            return (
+                "Use the selected DB tools according to the run contract. Final "
+                "answers require executed query evidence."
+            )
+        if contract.evidence_mode == "memory":
+            return "Use DB memory tools only for the requested memory operation."
+        return "Answer directly; no DB evidence is required by this contract."
+    if intent_kind in {"schema_only", "schema_question"}:
+        return (
+            "Use catalog/schema tools to gather structural evidence. Do not plan "
+            "or execute SQL for schema-only questions."
+        )
+    if intent_kind == "data_query_catalog_assisted":
+        return (
+            "Use catalog tools to resolve tables, columns, and relationships, then "
+            "plan with db_plan_query and execute with db_query."
+        )
+    if intent_kind == "manual_sql":
+        return "Validate the provided SQL before execution; execute only when safe."
+    if intent_kind == "admin_or_write":
+        return "Apply write/admin guardrails before any mutating action."
+    if intent_kind == "memory_only":
+        return "Use DB memory tools only for the requested memory operation."
+    return "Use focused query tools. Do not repeat a plan after it returns a plan_id."
+
+
+def _answer_policy_summary(
+    intent_kind: Optional[str], *, contract: Optional[DbRunContract] = None
+) -> str:
+    if contract is not None:
+        if contract.allow_catalog_final:
+            return (
+                "catalog/schema evidence is sufficient; answer from table, column, "
+                "and relationship metadata with confidence and caveats."
+            )
+        if contract.require_executed_query:
+            return (
+                "executed query evidence is required for data answers; catalog "
+                "evidence may guide planning but is not enough by itself."
+            )
+        if contract.evidence_mode == "memory":
+            return "answer from the memory operation result or confirm completion."
+        return "answer directly without DB tool evidence when appropriate."
+    if intent_kind in {"schema_only", "schema_question"}:
+        return (
+            "catalog/schema evidence is sufficient; explain confidence and caveats "
+            "from table, column, and relationship metadata. Do not query rows unless "
+            "the user asks for values, counts, samples, or calculations."
+        )
+    if intent_kind == "data_query_catalog_assisted":
+        return (
+            "catalog evidence may guide planning, but final numeric/data answers "
+            "require executed query evidence."
+        )
+    if intent_kind == "manual_sql":
+        return "validated/executed SQL evidence is required before final answers."
+    if intent_kind == "memory_only":
+        return "answer from the memory operation result or confirm completion."
+    return (
+        "executed query evidence is required for data answers; include readable "
+        "labels with ids when available."
+    )
+
+
 def _capability_summary(agent: "Agent", tool_names: List[str]) -> str:
     capabilities = ["sql", "schema"]
     if ANALYST_TOOL_NAMES.intersection(tool_names):
@@ -271,6 +287,12 @@ def _capability_summary(agent: "Agent", tool_names: List[str]) -> str:
     if hasattr(agent, "_db_history"):
         capabilities.append("history")
     return ", ".join(capabilities)
+
+
+def _selected_tools_summary(tool_names: List[str]) -> str:
+    if not tool_names:
+        return "none"
+    return ", ".join(tool_names[:12])
 
 
 def _memory_summary(agent: "Agent", snippets: List[str]) -> str:
@@ -322,55 +344,6 @@ def _candidate_metrics_summary(summary: Dict[str, Any]) -> str:
         return "none"
     names = [m.get("name", "") for m in metrics if m.get("name")]
     return _truncate_line(", ".join(names[:5]), 240)
-
-
-def _catalog_hint_summary(agent: "Agent", prompt: str) -> str:
-    store_id = getattr(agent, "_db_catalog_store_id", None)
-    catalog = getattr(agent, "_db_catalog", None)
-    catalog_suffix = f" with store_id={store_id}" if store_id else ""
-    if catalog is None or not store_id or not prompt:
-        return "use catalog tools as needed" + catalog_suffix
-
-    result = catalog.catalog_search_schema(
-        store_id, prompt, limit=SCHEMA_HINT_MAX_TABLES
-    )
-    tables = result.get("tables") or []
-    if not tables:
-        return "use catalog_search_schema for relevant tables" + catalog_suffix
-
-    parts = []
-    selected_names = {str(table.get("name")) for table in tables}
-    for table in tables[:SCHEMA_HINT_MAX_TABLES]:
-        cols = [
-            str(col.get("name"))
-            for col in table.get("matched_columns", []) or []
-            if col.get("name")
-        ][:4]
-        if cols:
-            parts.append(f"{table.get('name')}({', '.join(cols)})")
-        else:
-            parts.append(str(table.get("name")))
-
-    relationships = []
-    for table_name in list(selected_names)[:2]:
-        inspected = catalog.get_table_schema(
-            store_id,
-            table_name,
-            include_indexes=False,
-            include_foreign_keys=True,
-            limit=1,
-        )
-        for fk in inspected.get("foreign_keys", []) or []:
-            relationships.append(
-                f"{fk.get('source_asset')}.{fk.get('source_field')}->{fk.get('target_asset')}.{fk.get('target_field')}"
-            )
-            if len(relationships) >= SCHEMA_HINT_MAX_RELATIONSHIPS:
-                break
-        if len(relationships) >= SCHEMA_HINT_MAX_RELATIONSHIPS:
-            break
-    if relationships:
-        parts.append("rels=" + ", ".join(relationships))
-    return _truncate_line("; ".join(parts), 500)
 
 
 def _prompt_terms(prompt: str) -> List[str]:
@@ -426,14 +399,15 @@ def _truncate_context(context: str, max_chars: int) -> str:
         return context[: max_chars - len(suffix)].rstrip() + suffix
 
     priority_prefixes = (
-        "Use DB tools",
+        "Workflow:",
         "Database:",
         "Query policy:",
+        "Answer policy:",
         "Capabilities:",
+        "Candidate metrics:",
         "Memory:",
         "Data health:",
-        "Candidate metrics:",
-        "Schema hints:",
+        "Selected tools:",
         "Drift:",
     )
     body = [

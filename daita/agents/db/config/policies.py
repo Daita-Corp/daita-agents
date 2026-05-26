@@ -50,9 +50,6 @@ SCHEMA_NAVIGATION_TOOLS = (
     "catalog_search_schema",
     "catalog_inspect_table",
     "catalog_find_join_paths",
-    "search_catalog",
-    "inspect_asset",
-    "find_relationship_paths",
 )
 
 

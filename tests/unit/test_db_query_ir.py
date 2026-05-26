@@ -1080,6 +1080,37 @@ def test_db_completeness_reports_insufficient_evidence_for_empty_db_run_state():
     assert state.final_completeness_status == completeness
 
 
+def test_schema_only_completeness_accepts_catalog_evidence():
+    state = DbRunState(intent_kind="schema_only")
+    run_state = RunState(agent_id="test-agent")
+    run_state.domains["db"] = state
+
+    state.record_catalog_tool_result(
+        "catalog_search_schema",
+        {"query": "revenue"},
+        {
+            "tables": [
+                {
+                    "name": "payments",
+                    "score": 0.95,
+                    "matched_fields": [
+                        {"name": "amount", "score": 0.9},
+                        {"name": "currency", "score": 0.7},
+                    ],
+                }
+            ]
+        },
+    )
+
+    completeness = attach_db_completeness(run_state)
+
+    assert completeness["status"] == "answerable_schema"
+    assert completeness["can_answer"] is True
+    assert completeness["queries_executed"] == 0
+    assert completeness["catalog_table_evidence_count"] == 1
+    assert completeness["catalog_column_evidence_count"] == 2
+
+
 def test_db_completeness_requires_planned_fields_in_returned_columns():
     state = DbRunState()
     _set_answer_requirements(state, ["customer_name"])

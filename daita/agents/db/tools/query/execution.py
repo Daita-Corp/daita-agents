@@ -80,7 +80,7 @@ def compile_and_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
             sql = str(plan_result.get("compiled_sql") or "").strip()
             validation = plan_result.get("validation") or {}
             if not sql or not validation.get("ok"):
-                result = _compile_and_query_repair_payload(plan_result)
+                result = _compile_and_query_repair_payload(plan_result, run_state)
                 trace_manager.record_output(span_id, result)
                 return result
 
@@ -101,12 +101,15 @@ def compile_and_query_tool_handler(plugin: Any, schema: Dict[str, Any]) -> Any:
                     validation,
                     source_tool="db_compile_and_query",
                 )
-                result = {
-                    **validation,
-                    "plan_id": plan_result.get("plan_id"),
-                    "repair_required": True,
-                    "suggested_next_tool": "db_plan_query",
-                }
+                result = _with_suggested_next_tool(
+                    {
+                        **validation,
+                        "plan_id": plan_result.get("plan_id"),
+                        "repair_required": True,
+                    },
+                    run_state,
+                    "db_plan_query",
+                )
                 trace_manager.record_output(span_id, _compile_and_query_trace(result))
                 return result
 
@@ -241,33 +244,42 @@ async def execute_plan_id(
     run_state = get_db_run_state(plugin)
     plan_id = str(args.get("plan_id") or "").strip()
     if run_state is None or not plan_id:
-        return {
-            "error": "Missing query plan state",
-            "error_type": "framework_compiler_error",
-            "repair_required": True,
-            "suggested_next_tool": "db_plan_query",
-        }
+        return _with_suggested_next_tool(
+            {
+                "error": "Missing query plan state",
+                "error_type": "framework_compiler_error",
+                "repair_required": True,
+            },
+            run_state,
+            "db_plan_query",
+        )
     stored = run_state.get_plan(plan_id)
     if stored is None:
-        return {
-            "error": f"Unknown query plan ID: {plan_id}",
-            "error_type": "framework_compiler_error",
-            "repair_required": True,
-            "suggested_next_tool": "db_plan_query",
-        }
+        return _with_suggested_next_tool(
+            {
+                "error": f"Unknown query plan ID: {plan_id}",
+                "error_type": "framework_compiler_error",
+                "repair_required": True,
+            },
+            run_state,
+            "db_plan_query",
+        )
 
     result = stored.get("result") or {}
     validation = result.get("validation") or {}
     sql = str(result.get("compiled_sql") or "")
     if not sql or not validation.get("ok"):
-        return {
-            "error": "Query plan is not executable",
-            "error_type": "framework_compiler_error",
-            "repair_required": True,
-            "plan_id": plan_id,
-            "validation": validation,
-            "suggested_next_tool": "db_plan_query",
-        }
+        return _with_suggested_next_tool(
+            {
+                "error": "Query plan is not executable",
+                "error_type": "framework_compiler_error",
+                "repair_required": True,
+                "plan_id": plan_id,
+                "validation": validation,
+            },
+            run_state,
+            "db_plan_query",
+        )
 
     sql = _normalize_sql_for_plugin(plugin, sql)
     analysis = _validate_plugin_query_policy(plugin, sql)
@@ -287,12 +299,15 @@ async def execute_plan_id(
             validation,
             source_tool="db_query",
         )
-        return {
-            **validation,
-            "plan_id": plan_id,
-            "repair_required": True,
-            "suggested_next_tool": "db_plan_query",
-        }
+        return _with_suggested_next_tool(
+            {
+                **validation,
+                "plan_id": plan_id,
+                "repair_required": True,
+            },
+            run_state,
+            "db_plan_query",
+        )
     run_state.record_validated_sql(
         fingerprint,
         {
@@ -451,6 +466,20 @@ def _validate_plugin_query_policy(plugin: Any, sql: str) -> SqlAnalysis | None:
     return None
 
 
+def _with_suggested_next_tool(
+    payload: Dict[str, Any], run_state: Any, tool_name: str
+) -> Dict[str, Any]:
+    contract = getattr(run_state, "run_contract", None)
+    allowed_tools = getattr(contract, "tools", None)
+    if allowed_tools is not None and tool_name not in set(allowed_tools):
+        diagnostics = dict(payload.get("diagnostics") or {})
+        diagnostics["suppressed_suggested_next_tool"] = tool_name
+        payload["diagnostics"] = diagnostics
+        return payload
+    payload["suggested_next_tool"] = tool_name
+    return payload
+
+
 def _plan_trace_summary(result: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "plan_id": result.get("plan_id"),
@@ -472,21 +501,26 @@ def _include_plan_diagnostics(args: Any) -> bool:
     return bool(args.get("include_diagnostics") or args.get("debug"))
 
 
-def _compile_and_query_repair_payload(plan_result: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "ok": False,
-        "plan_id": plan_result.get("plan_id"),
-        "route": plan_result.get("route"),
-        "resolved_tables": plan_result.get("resolved_tables", []),
-        "ambiguous_tables": plan_result.get("ambiguous_tables", []),
-        "unknown_tables": plan_result.get("unknown_tables", []),
-        "validation": plan_result.get("validation"),
-        "plan_warnings": plan_result.get("plan_warnings", []),
-        "repair_required": True,
-        "suggested_next_tool": "db_plan_query",
-        "next_step": plan_result.get("next_step"),
-        "message": "Query intent could not be compiled into validated SQL.",
-    }
+def _compile_and_query_repair_payload(
+    plan_result: Dict[str, Any], run_state: Any
+) -> Dict[str, Any]:
+    return _with_suggested_next_tool(
+        {
+            "ok": False,
+            "plan_id": plan_result.get("plan_id"),
+            "route": plan_result.get("route"),
+            "resolved_tables": plan_result.get("resolved_tables", []),
+            "ambiguous_tables": plan_result.get("ambiguous_tables", []),
+            "unknown_tables": plan_result.get("unknown_tables", []),
+            "validation": plan_result.get("validation"),
+            "plan_warnings": plan_result.get("plan_warnings", []),
+            "repair_required": True,
+            "next_step": plan_result.get("next_step"),
+            "message": "Query intent could not be compiled into validated SQL.",
+        },
+        run_state,
+        "db_plan_query",
+    )
 
 
 def _compile_and_query_result(

@@ -11,7 +11,6 @@ from typing import Any, List
 from ..query.catalog_adapter import catalog_schema_snapshot, has_likely_catalog_match
 from ..utils import unique_preserving_order
 from .policies import (
-    CORE_DB_QUERY_TOOLS,
     DB_MEMORY_TOOLS,
     SCHEMA_NAVIGATION_TOOLS,
     WRITE_DB_TOOLS,
@@ -34,6 +33,13 @@ MEMORY_KEYWORDS = (
     "note for later",
     "update_memory",
     "memory",
+)
+MEMORY_WRITE_KEYWORDS = (
+    "remember",
+    "store memory",
+    "save memory",
+    "note for later",
+    "update_memory",
 )
 SCHEMA_KEYWORDS = (
     "schema",
@@ -121,11 +127,31 @@ QUERY_SHAPE_KEYWORDS = (
     "top",
     "where",
 )
-STAGED_DB_QUERY_TOOLS = (
-    "db_plan_query",
-    "db_query",
-    "db_validate_sql",
-    "db_compile_and_query",
+DATA_EXECUTION_KEYWORDS = (
+    "calculate",
+    "compute",
+    "execute",
+    "query",
+    "run sql",
+    "run a query",
+    "by month",
+    "by week",
+    "by day",
+    "per ",
+    "group by",
+)
+SCHEMA_SEARCH_PATTERNS = (
+    r"\bsearch\s+(?:the\s+)?schema\b",
+    r"\binspect\s+(?:the\s+)?schema\b",
+    r"\bscan\s+(?:the\s+)?schema\b",
+    r"\bschema\s+(?:for|to find|search)\b",
+    r"\b(?:which|what)\s+columns?\b",
+    r"\bcolumns?\s+(?:that|which|might|may|could|look|represent|related|safe|safest)\b",
+    r"\bfind\s+(?:tables?|columns?)\b",
+    r"\bfind\b.*\bcolumns?\b",
+    r"\btables?\s+related\b",
+    r"\bdo not query data\b",
+    r"\bjust inspect\s+(?:the\s+)?schema\b",
 )
 
 
@@ -178,16 +204,27 @@ def select_db_tool_profile(agent: Any, prompt: str) -> DbToolProfile:
         needs_query_tools=needs_query_tools,
     )
 
-    if needs_query_tools:
+    if intent == "manual_sql":
+        _extend_available(selected, available, ("db_validate_sql", "db_query"))
+    elif intent == "admin_or_write":
+        _extend_available(selected, available, WRITE_DB_TOOLS)
+        _extend_available(selected, available, ("db_validate_sql", "db_query"))
+    elif intent == "data_query_simple":
         if compile_first:
             _extend_available(selected, available, ("db_compile_and_query",))
         else:
-            _extend_available(selected, available, STAGED_DB_QUERY_TOOLS)
-            if _has_explicit_sql(text):
-                _extend_available(selected, available, CORE_DB_QUERY_TOOLS)
+            _extend_available(selected, available, ("db_plan_query", "db_query"))
+    elif intent == "data_query_catalog_assisted":
+        _extend_available(selected, available, ("db_plan_query", "db_query"))
+        if any(
+            keyword in text for keyword in ("validate", "validation", "debug", "repair")
+        ):
+            _extend_available(selected, available, ("db_validate_sql",))
 
     if needs_schema_tools:
-        if compile_first and not likely_catalog_match:
+        if intent == "data_query_catalog_assisted":
+            _extend_available(selected, available, SCHEMA_NAVIGATION_TOOLS)
+        elif compile_first and not likely_catalog_match:
             _extend_available(selected, available, ("catalog_search_schema",))
         else:
             _extend_available(selected, available, SCHEMA_NAVIGATION_TOOLS)
@@ -211,8 +248,9 @@ def select_db_tool_profile(agent: Any, prompt: str) -> DbToolProfile:
             if name in {"trace_lineage", "find_lineage_paths", "export_lineage"}
         )
 
-    if hasattr(agent, "_db_memory_semantics") and any(
-        keyword in text for keyword in MEMORY_KEYWORDS
+    if hasattr(agent, "_db_memory_semantics") and (
+        intent == "memory_only"
+        or any(keyword in text for keyword in MEMORY_WRITE_KEYWORDS)
     ):
         _extend_available(selected, available, DB_MEMORY_TOOLS)
 
@@ -310,6 +348,8 @@ def _classify_db_intent(text: str, *, likely_catalog_match: bool) -> str:
         return "manual_sql"
     if any(keyword in text for keyword in WRITE_KEYWORDS):
         return "admin_or_write"
+    if _is_memory_only_intent(text):
+        return "memory_only"
     if _is_schema_only_intent(text):
         return "schema_only"
     if _has_catalog_assisted_data_intent(text, likely_catalog_match):
@@ -318,6 +358,8 @@ def _classify_db_intent(text: str, *, likely_catalog_match: bool) -> str:
 
 
 def _is_schema_only_intent(text: str) -> bool:
+    if _has_schema_search_phrase(text) and not _has_data_execution_intent(text):
+        return True
     if any(keyword in text for keyword in INFERENCE_ONLY_KEYWORDS):
         return True
     if any(keyword in text for keyword in SCHEMA_KEYWORDS) and not any(
@@ -346,6 +388,8 @@ def _has_catalog_assisted_data_intent(text: str, likely_catalog_match: bool) -> 
         keyword in text for keyword in QUERY_KEYWORDS
     ):
         return False
+    if _has_schema_search_phrase(text):
+        return True
     if any(tool in text for tool in SCHEMA_NAVIGATION_TOOLS):
         return True
     if any(keyword in text for keyword in SCHEMA_REPAIR_KEYWORDS):
@@ -371,6 +415,8 @@ def _required_phases(intent: str, tools: List[str]) -> List[str]:
 
 
 def _has_data_answer_intent(text: str) -> bool:
+    if _has_data_execution_intent(text):
+        return True
     if any(keyword in text for keyword in DATA_QUERY_KEYWORDS):
         return True
     if _needs_staged_query_path(text):
@@ -393,6 +439,35 @@ def _has_data_answer_intent(text: str) -> bool:
 def _is_schema_question(text: str) -> bool:
     return any(keyword in text for keyword in SCHEMA_KEYWORDS) and not any(
         keyword in text for keyword in DATA_QUERY_KEYWORDS
+    )
+
+
+def _has_schema_search_phrase(text: str) -> bool:
+    return any(re.search(pattern, text) for pattern in SCHEMA_SEARCH_PATTERNS)
+
+
+def _has_data_execution_intent(text: str) -> bool:
+    if (
+        "do not query" in text
+        or "without querying" in text
+        or "just inspect the schema" in text
+    ):
+        return False
+    return any(keyword in text for keyword in DATA_EXECUTION_KEYWORDS)
+
+
+def _is_memory_only_intent(text: str) -> bool:
+    if not any(keyword in text for keyword in MEMORY_KEYWORDS):
+        return False
+    return not any(
+        keyword in text
+        for keyword in (
+            SCHEMA_KEYWORDS
+            + QUERY_KEYWORDS
+            + DATA_QUERY_KEYWORDS
+            + WRITE_KEYWORDS
+            + DATA_EXECUTION_KEYWORDS
+        )
     )
 
 

@@ -58,6 +58,11 @@ class AgentRunController:
         try:
             resolved_tools = await agent._prepare_tools_with_focus(tools)
             active_tools = resolved_tools
+            run_orchestrator = kwargs.pop("run_orchestrator", None)
+            if run_orchestrator is not None:
+                attach = getattr(run_orchestrator, "attach_run_state", None)
+                if callable(attach):
+                    attach(run_state)
             final_synthesis_without_tools = bool(
                 kwargs.pop("final_synthesis_without_tools", False)
             )
@@ -125,15 +130,34 @@ class AgentRunController:
                     run_state.set_phase(RunPhase.TOOL_EXECUTION)
                     results = []
                     for tool_call in llm_result.tool_calls:
-                        self._normalize_db_catalog_tool_call(run_state, tool_call)
-                        result = await execute_and_track_tool(
-                            agent, tool_call, active_tools, on_event
+                        self._normalize_tool_call(
+                            run_state, tool_call, run_orchestrator
                         )
+                        before_decision = self._before_tool_call(
+                            run_state, tool_call, run_orchestrator
+                        )
+                        if before_decision is not None:
+                            if before_decision.get("warning"):
+                                warning = str(before_decision["warning"])
+                                if warning not in run_state.warnings:
+                                    run_state.warnings.append(warning)
+                            run_state.diagnostics.update(
+                                before_decision.get("diagnostics") or {}
+                            )
+                            result = self._blocked_tool_result(
+                                tool_call, before_decision
+                            )
+                        else:
+                            result = await execute_and_track_tool(
+                                agent, tool_call, active_tools, on_event
+                            )
                         run_state.record_tool_call(result)
                         tools_called.append(result)
                         results.append(result)
                         self._record_tool_evidence(run_state, tool_call, result)
-                        self._record_db_catalog_evidence(run_state, tool_call, result)
+                        self._observe_tool_result(
+                            run_state, tool_call, result, run_orchestrator
+                        )
 
                         guardrail_decision = self.guardrails.observe_tool_result(
                             run_state, tool_call, result
@@ -151,17 +175,20 @@ class AgentRunController:
                     append_tool_messages(
                         agent, conversation, llm_result.tool_calls, results
                     )
-                    terminal_result = has_terminal_tool_result(results, terminal_tools)
+                    if forced_guidance := self._forced_synthesis_guidance(
+                        results, run_orchestrator
+                    ):
+                        conversation.append(
+                            {"role": "user", "content": forced_guidance}
+                        )
+                        active_tools = []
+                        continue
+                    terminal_result = self._terminal_result(
+                        results, terminal_tools, run_orchestrator
+                    )
                     if final_synthesis_without_tools and terminal_result:
                         terminal_evidence_seen = True
-                        latest_terminal_result = next(
-                            (
-                                result
-                                for result in reversed(results)
-                                if result.get("tool") in terminal_tools
-                            ),
-                            None,
-                        )
+                        latest_terminal_result = terminal_result
                         conversation.append(
                             {
                                 "role": "user",
@@ -172,22 +199,42 @@ class AgentRunController:
                             }
                         )
                         active_tools = []
-                    elif suggested_next_tool := self._suggested_next_tool(results):
-                        conversation.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"The previous tool result suggested calling "
-                                    f"{suggested_next_tool}. Call that tool next "
-                                    "using the provided suggested_next_arguments."
-                                ),
-                            }
+                    elif suggested_decision := self._resolve_suggested_next_tool(
+                        results, resolved_tools, run_orchestrator
+                    ):
+                        suggested_next_tool = suggested_decision.get("tool_name")
+                        if suggested_decision.get("warning"):
+                            warning = str(suggested_decision["warning"])
+                            if warning not in run_state.warnings:
+                                run_state.warnings.append(warning)
+                        run_state.diagnostics.update(
+                            suggested_decision.get("diagnostics") or {}
                         )
-                        active_tools = [
+                        if not suggested_decision.get("allowed"):
+                            guidance = suggested_decision.get("guidance")
+                            if guidance:
+                                conversation.append(
+                                    {"role": "user", "content": guidance}
+                                )
+                            active_tools = resolved_tools
+                            continue
+                        suggested_tools = [
                             tool
                             for tool in resolved_tools
                             if getattr(tool, "name", None) == suggested_next_tool
                         ]
+                        if suggested_tools:
+                            conversation.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"The previous tool result suggested calling "
+                                        f"{suggested_next_tool}. Call that tool next "
+                                        "using the provided suggested_next_arguments."
+                                    ),
+                                }
+                            )
+                            active_tools = suggested_tools
                     else:
                         active_tools = resolved_tools
                     continue
@@ -302,55 +349,87 @@ class AgentRunController:
             },
         )
 
-    def _record_db_catalog_evidence(
-        self, run_state: RunState, tool_call: Dict[str, Any], result: Dict[str, Any]
+    def _observe_tool_result(
+        self,
+        run_state: RunState,
+        tool_call: Dict[str, Any],
+        result: Dict[str, Any],
+        orchestrator: Any = None,
     ) -> None:
-        tool_name = str(tool_call.get("name") or "")
-        if not tool_name.startswith("catalog_"):
-            return
-        db_state = run_state.domains.get("db")
-        recorder = getattr(db_state, "record_catalog_tool_result", None)
-        if not callable(recorder):
-            return
-        handoff = recorder(
-            tool_name, tool_call.get("arguments", {}) or {}, result.get("result")
-        )
-        raw = result.get("result")
-        if isinstance(handoff, dict) and isinstance(raw, dict):
-            raw.update(
-                {
-                    key: value
-                    for key, value in handoff.items()
-                    if key not in raw or raw[key] in (None, "", [], {})
-                }
-            )
+        observer = getattr(orchestrator, "observe_tool_result", None)
+        if callable(observer):
+            observer(run_state, tool_call, result)
 
-    def _normalize_db_catalog_tool_call(
-        self, run_state: RunState, tool_call: Dict[str, Any]
+    def _normalize_tool_call(
+        self,
+        run_state: RunState,
+        tool_call: Dict[str, Any],
+        orchestrator: Any = None,
     ) -> None:
-        tool_name = str(tool_call.get("name") or "")
-        if tool_name not in {
-            "catalog_search_schema",
-            "catalog_inspect_table",
-            "catalog_find_join_paths",
-        }:
-            return
-        if "db" not in run_state.domains:
-            return
-        active_store_id = getattr(self.agent, "_db_catalog_store_id", None)
-        active_catalog = getattr(self.agent, "_db_catalog", None)
-        if not active_store_id or active_catalog is None:
-            return
-        arguments = tool_call.get("arguments")
-        if not isinstance(arguments, dict):
-            arguments = {}
-            tool_call["arguments"] = arguments
-        provided = str(arguments.get("store_id") or "").strip()
-        if provided == active_store_id:
-            return
-        if provided and _catalog_has_schema(active_catalog, provided):
-            return
-        arguments["store_id"] = active_store_id
+        normalizer = getattr(orchestrator, "normalize_tool_call", None)
+        if callable(normalizer):
+            normalizer(run_state, tool_call)
+
+    def _before_tool_call(
+        self,
+        run_state: RunState,
+        tool_call: Dict[str, Any],
+        orchestrator: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        decider = getattr(orchestrator, "before_tool_call", None)
+        if not callable(decider):
+            return None
+        decision = decider(run_state, tool_call)
+        if decision is None or bool(getattr(decision, "allow", True)):
+            return None
+        return {
+            "result": getattr(decision, "result", None) or {},
+            "warning": getattr(decision, "warning", None),
+            "guidance": getattr(decision, "guidance", None),
+            "diagnostics": getattr(decision, "diagnostics", {}) or {},
+        }
+
+    def _blocked_tool_result(
+        self, tool_call: Dict[str, Any], decision: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        return {
+            "tool": str(tool_call.get("name") or ""),
+            "arguments": tool_call.get("arguments", {}) or {},
+            "result": decision.get("result") or {},
+            "duration_ms": 0,
+            "retry_safe": False,
+            "replay_safe": False,
+            "idempotent": True,
+            "side_effecting": False,
+        }
+
+    def _terminal_result(
+        self,
+        results: List[Dict[str, Any]],
+        terminal_tools: set[str],
+        orchestrator: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        terminal_selector = getattr(orchestrator, "terminal_result", None)
+        if callable(terminal_selector):
+            return terminal_selector(results)
+        if not has_terminal_tool_result(results, terminal_tools):
+            return None
+        return next(
+            (
+                result
+                for result in reversed(results)
+                if result.get("tool") in terminal_tools
+            ),
+            None,
+        )
+
+    def _forced_synthesis_guidance(
+        self, results: List[Dict[str, Any]], orchestrator: Any = None
+    ) -> Optional[str]:
+        guidance = getattr(orchestrator, "synthesis_guidance", None)
+        if callable(guidance):
+            return guidance(results)
+        return None
 
     def _terminal_result_text(self, result: Optional[Dict[str, Any]]) -> str:
         raw = (result or {}).get("result")
@@ -378,12 +457,49 @@ class AgentRunController:
                 return str(tool_name)
         return None
 
+    def _resolve_suggested_next_tool(
+        self,
+        results: List[Dict[str, Any]],
+        resolved_tools: List["AgentTool"],
+        orchestrator: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        resolver = getattr(orchestrator, "resolve_suggested_next_tool", None)
+        if callable(resolver):
+            decision = resolver(results, resolved_tools)
+            if decision is not None:
+                return {
+                    "tool_name": getattr(decision, "tool_name", None),
+                    "allowed": bool(getattr(decision, "allowed", False)),
+                    "guidance": getattr(decision, "guidance", None),
+                    "warning": getattr(decision, "warning", None),
+                    "diagnostics": getattr(decision, "diagnostics", {}) or {},
+                }
+            return None
 
-def _catalog_has_schema(catalog: Any, store_id: str) -> bool:
-    getter = getattr(catalog, "get_schema", None)
-    if not callable(getter):
-        return False
-    try:
-        return getter(store_id) is not None
-    except Exception:
-        return False
+        suggested_next_tool = self._suggested_next_tool(results)
+        if not suggested_next_tool:
+            return None
+        available = {
+            str(getattr(tool, "name", ""))
+            for tool in resolved_tools
+            if getattr(tool, "name", None)
+        }
+        if suggested_next_tool in available:
+            return {"tool_name": suggested_next_tool, "allowed": True}
+        guidance = (
+            f"The previous tool result suggested {suggested_next_tool}, but that "
+            "tool is not available in this run. Do not call unavailable tools. "
+            "Synthesize from the available evidence"
+        )
+        if available:
+            guidance += " or choose one of the available tools: " + ", ".join(
+                sorted(available)
+            )
+        guidance += "."
+        return {
+            "tool_name": suggested_next_tool,
+            "allowed": False,
+            "guidance": guidance,
+            "warning": f"suggested_next_tool_unavailable:{suggested_next_tool}",
+            "diagnostics": {"unavailable_suggested_next_tool": suggested_next_tool},
+        }

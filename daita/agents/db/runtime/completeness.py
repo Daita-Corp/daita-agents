@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from ...runtime.state import FinalAnswerReadiness
-from ..config.policies import ANSWER_EVIDENCE_DB_TOOLS
+from ..config.policies import ANSWER_EVIDENCE_DB_TOOLS, SCHEMA_NAVIGATION_TOOLS
 from ..query.requirements import AnswerRequirement, output_satisfies_requirement
 from .state import DbRunState
 
@@ -37,7 +37,11 @@ def attach_db_completeness(run_state) -> Dict[str, Any] | None:
 
 
 def evaluate_db_final_answer_readiness(
-    run_state, final_text: str, available_tools: Iterable[Any]
+    run_state,
+    final_text: str,
+    available_tools: Iterable[Any],
+    *,
+    contract: Optional[Any] = None,
 ) -> FinalAnswerReadiness | None:
     """Evaluate DB-specific final-answer readiness behind the generic hook."""
     db_state = run_state.domains.get("db")
@@ -47,13 +51,14 @@ def evaluate_db_final_answer_readiness(
     if not has_db_domain:
         return None
 
-    summary = summarize_db_completeness(run_state)
+    summary = summarize_db_completeness(run_state, contract=contract)
     diagnostics = {"db_completeness": summary}
     if isinstance(db_state, DbRunState):
         db_state.final_completeness_status = summary
 
     incomplete_final = _looks_incomplete_final_answer(final_text)
     can_answer = bool(summary.get("can_answer"))
+    schema_only = _is_schema_only_state(db_state, contract=contract)
     if can_answer and not incomplete_final:
         return FinalAnswerReadiness(diagnostics=diagnostics)
 
@@ -61,6 +66,19 @@ def evaluate_db_final_answer_readiness(
         return FinalAnswerReadiness(diagnostics=diagnostics)
 
     available_names = _tool_names(available_tools)
+    if schema_only and available_names.intersection(SCHEMA_NAVIGATION_TOOLS):
+        warning = (
+            "db_final_answer_incomplete"
+            if can_answer and incomplete_final
+            else "db_final_answer_without_schema_evidence"
+        )
+        return FinalAnswerReadiness(
+            allow_final=False,
+            guidance=_final_answer_guidance(db_state, summary, contract=contract),
+            warning=warning,
+            diagnostics=diagnostics,
+        )
+
     if not available_names.intersection(ANSWER_EVIDENCE_DB_TOOLS):
         return FinalAnswerReadiness(diagnostics=diagnostics)
 
@@ -71,13 +89,15 @@ def evaluate_db_final_answer_readiness(
     )
     return FinalAnswerReadiness(
         allow_final=False,
-        guidance=_final_answer_guidance(db_state, summary),
+        guidance=_final_answer_guidance(db_state, summary, contract=contract),
         warning=warning,
         diagnostics=diagnostics,
     )
 
 
-def summarize_db_completeness(run_state) -> Dict[str, Any]:
+def summarize_db_completeness(
+    run_state, *, contract: Optional[Any] = None
+) -> Dict[str, Any]:
     """Summarize whether DB evidence looks sufficient to answer safely.
 
     This helper is diagnostic-only. It does not block final answers and does not
@@ -92,6 +112,10 @@ def summarize_db_completeness(run_state) -> Dict[str, Any]:
     plan_records = by_kind.get("query_plan", [])
     latest_db_record = db_records[-1] if db_records else None
     unresolved_repair = _has_unresolved_repair(latest_db_record)
+    schema_only = _is_schema_only_state(db_state, contract=contract)
+    if _contract_evidence_mode(contract) == "catalog":
+        unresolved_repair = False
+    catalog_counts = _catalog_evidence_counts(db_state)
 
     requirements = (
         list(getattr(db_state, "answer_requirements", []) or [])
@@ -112,7 +136,14 @@ def summarize_db_completeness(run_state) -> Dict[str, Any]:
     truncated_count = sum(
         1 for record in executed_records if bool(record.payload.get("truncated"))
     )
+    catalog_answer_evidence_count = (
+        _catalog_answer_evidence_count(catalog_counts)
+        if contract is not None
+        else sum(catalog_counts.values())
+    )
     status = _status(
+        schema_only=schema_only,
+        catalog_evidence_count=catalog_answer_evidence_count,
         executed_count=len(executed_records),
         rejected_count=len(rejected_records),
         truncated_count=truncated_count,
@@ -123,11 +154,24 @@ def summarize_db_completeness(run_state) -> Dict[str, Any]:
 
     return {
         "status": status,
-        "can_answer": (
-            len(executed_records) > 0
-            and not missing_required_fields
-            and not unresolved_repair
+        "can_answer": _can_answer(
+            schema_only=schema_only,
+            contract=contract,
+            catalog_evidence_count=catalog_answer_evidence_count,
+            executed_count=len(executed_records),
+            missing_required_fields=missing_required_fields,
+            unresolved_repair=unresolved_repair,
         ),
+        "intent_kind": getattr(db_state, "intent_kind", None),
+        "inspected_table_count": (
+            len(getattr(db_state, "inspected_tables", {}) or {})
+            if isinstance(db_state, DbRunState)
+            else 0
+        ),
+        "catalog_table_evidence_count": catalog_counts["tables"],
+        "catalog_column_evidence_count": catalog_counts["columns"],
+        "catalog_join_evidence_count": catalog_counts["joins"],
+        "catalog_search_count": catalog_counts["searches"],
         "plans_created": len(plan_records),
         "sql_validated": len(validated_records),
         "sql_rejected": len(rejected_records),
@@ -182,6 +226,8 @@ def _looks_incomplete_final_answer(text: str) -> bool:
 
 def _status(
     *,
+    schema_only: bool,
+    catalog_evidence_count: int,
     executed_count: int,
     rejected_count: int,
     truncated_count: int,
@@ -191,6 +237,10 @@ def _status(
 ) -> str:
     if unresolved_repair:
         return "blocked"
+    if schema_only and catalog_evidence_count > 0:
+        return "answerable_schema"
+    if schema_only:
+        return "insufficient_schema_evidence"
     if executed_count > 0 and missing_required_fields:
         return "missing_required_fields"
     if executed_count > 0 and row_counts and sum(row_counts) == 0:
@@ -202,6 +252,26 @@ def _status(
     if rejected_count > 0:
         return "blocked"
     return "insufficient_evidence"
+
+
+def _can_answer(
+    *,
+    schema_only: bool,
+    contract: Optional[Any],
+    catalog_evidence_count: int,
+    executed_count: int,
+    missing_required_fields: List[str],
+    unresolved_repair: bool,
+) -> bool:
+    if unresolved_repair:
+        return False
+    if _contract_requires_executed_query(contract):
+        return executed_count > 0 and not missing_required_fields
+    if _contract_allows_catalog_final(contract):
+        return catalog_evidence_count > 0
+    if schema_only:
+        return catalog_evidence_count > 0
+    return executed_count > 0 and not missing_required_fields
 
 
 def _returned_columns(records: List[Any]) -> set[str]:
@@ -257,7 +327,22 @@ def _requirement_is_covered_by_columns(
     )
 
 
-def _final_answer_guidance(db_state: Any, summary: Dict[str, Any]) -> str:
+def _final_answer_guidance(
+    db_state: Any, summary: Dict[str, Any], *, contract: Optional[Any] = None
+) -> str:
+    if _is_schema_only_state(db_state, contract=contract):
+        if summary.get("can_answer"):
+            return (
+                "Do not call SQL tools. Provide the final answer from the "
+                "catalog/schema evidence already collected, including confidence "
+                "and caveats where the schema is ambiguous."
+            )
+        return (
+            "Do not call SQL tools. Gather schema evidence with catalog_search_schema "
+            "or catalog_inspect_table, inspect relationships when relevant, then "
+            "answer with caveats if remaining ambiguity cannot be resolved from schema."
+        )
+
     plan_instruction = ""
     if isinstance(db_state, DbRunState) and db_state.planned_queries:
         latest_plan = db_state.planned_queries[-1]
@@ -279,6 +364,50 @@ def _final_answer_guidance(db_state: Any, summary: Dict[str, Any]) -> str:
         "question, answer directly from those rows. If they do not contain the "
         "requested fields, use db_query or db_compile_and_query with corrected "
         f"SQL to gather the missing evidence.{missing_instruction}{plan_instruction}"
+    )
+
+
+def _is_schema_only_state(db_state: Any, *, contract: Optional[Any] = None) -> bool:
+    if _contract_evidence_mode(contract) == "catalog":
+        return True
+    return isinstance(db_state, DbRunState) and db_state.intent_kind in {
+        "schema_only",
+        "schema_question",
+    }
+
+
+def _contract_evidence_mode(contract: Optional[Any]) -> Optional[str]:
+    if contract is None:
+        return None
+    return str(getattr(contract, "evidence_mode", "") or "") or None
+
+
+def _contract_requires_executed_query(contract: Optional[Any]) -> bool:
+    return bool(getattr(contract, "require_executed_query", False))
+
+
+def _contract_allows_catalog_final(contract: Optional[Any]) -> bool:
+    return bool(getattr(contract, "allow_catalog_final", False))
+
+
+def _catalog_evidence_counts(db_state: Any) -> Dict[str, int]:
+    counts = {"tables": 0, "columns": 0, "joins": 0, "searches": 0}
+    if not isinstance(db_state, DbRunState):
+        return counts
+    evidence = db_state.catalog_evidence or {}
+    for key in counts:
+        if key in evidence:
+            counts[key] = len(evidence.get(key) or [])
+    counts["tables"] += len(db_state.inspected_tables or {})
+    counts["searches"] = int(getattr(db_state, "catalog_search_count", 0) or 0)
+    return counts
+
+
+def _catalog_answer_evidence_count(counts: Dict[str, int]) -> int:
+    return (
+        int(counts.get("tables", 0))
+        + int(counts.get("columns", 0))
+        + int(counts.get("joins", 0))
     )
 
 

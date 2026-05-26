@@ -1403,6 +1403,41 @@ class TestFromDbIntegration:
         assert "Candidate metrics:" in context
         assert "Memory: disabled" in context
 
+    def test_schema_only_run_context_does_not_require_query_evidence(self):
+        from types import SimpleNamespace
+        from daita.agents.db.runtime.run_context import build_db_run_context
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("payments")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_compile_and_query",
+                    "db_query",
+                    "catalog_search_schema",
+                    "catalog_inspect_table",
+                ]
+            ),
+            _db_drift=None,
+            _db_plugin=SimpleNamespace(
+                read_only=True,
+                query_default_limit=50,
+                query_max_rows=200,
+                query_max_chars=50000,
+                query_timeout=30,
+            ),
+        )
+
+        context = build_db_run_context(
+            agent,
+            prompt="Which columns look like revenue?",
+            intent_kind="schema_only",
+            selected_tools=["catalog_search_schema", "catalog_inspect_table"],
+        )
+
+        assert "catalog/schema evidence is sufficient" in context
+        assert "Do not plan or execute SQL" in context
+        assert "execute an answer-bearing DB query" not in context
+
     async def test_db_context_run_augments_prompt_but_audit_keeps_original(self):
         from daita.agents.db.runtime.audit import make_audited_run
         from daita.agents.db.runtime.run_context import make_db_context_run
@@ -2221,9 +2256,9 @@ class TestFromDbMemory:
 
         assert result["result"] == "done"
         assert result["tool_calls"][0]["tool"] == "remember"
-        assert result["tool_calls"][0]["result"] == {
-            "error": "Tool 'remember' not found"
-        }
+        assert result["tool_calls"][0]["result"]["guardrail"] == (
+            "db_tool_not_allowed:remember"
+        )
 
     async def test_memory_none_skipped(self):
         import daita.agents.db.builder as fac
@@ -4137,12 +4172,13 @@ class TestDbResultCompaction:
 
 class TestFromDbToolProfiles:
     def test_catalog_schema_tools_are_not_terminal(self):
-        from daita.agents.db.runtime.run_context import TERMINAL_DB_TOOLS
+        from daita.agents.db.config.policies import TERMINAL_DB_TOOLS
+        from daita.agents.db.runtime.orchestrator import FROM_DB_SCHEMA_TOOLS
 
         assert "db_compile_and_query" in TERMINAL_DB_TOOLS
         assert "db_query" in TERMINAL_DB_TOOLS
-        assert "catalog_inspect_table" not in TERMINAL_DB_TOOLS
-        assert "catalog_find_join_paths" not in TERMINAL_DB_TOOLS
+        assert "catalog_inspect_table" in FROM_DB_SCHEMA_TOOLS
+        assert "catalog_find_join_paths" in FROM_DB_SCHEMA_TOOLS
 
     def test_clear_data_prompt_with_schema_match_starts_with_compile_only(self):
         from types import SimpleNamespace
@@ -4226,12 +4262,7 @@ class TestFromDbToolProfiles:
             agent, "Run this SQL: SELECT COUNT(*) FROM orders"
         )
 
-        assert selected == [
-            "db_plan_query",
-            "db_query",
-            "db_validate_sql",
-            "db_compile_and_query",
-        ]
+        assert selected == ["db_validate_sql", "db_query"]
 
     def test_join_prompt_keeps_relationship_navigation_tools(self):
         from types import SimpleNamespace
@@ -4258,7 +4289,6 @@ class TestFromDbToolProfiles:
         assert selected == [
             "db_plan_query",
             "db_query",
-            "db_compile_and_query",
             "catalog_search_schema",
             "catalog_inspect_table",
             "catalog_find_join_paths",
@@ -4322,8 +4352,6 @@ class TestFromDbToolProfiles:
         assert selected == [
             "db_plan_query",
             "db_query",
-            "db_validate_sql",
-            "db_compile_and_query",
             "catalog_search_schema",
             "catalog_inspect_table",
             "catalog_find_join_paths",
@@ -4360,6 +4388,75 @@ class TestFromDbToolProfiles:
         ]
         assert profile.required_phases == []
 
+    def test_metric_terms_inside_schema_search_stay_schema_only(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.tool_profiles import select_db_tool_profile
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("payments")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_compile_and_query",
+                    "db_plan_query",
+                    "db_query",
+                    "db_validate_sql",
+                    "catalog_search_schema",
+                    "catalog_inspect_table",
+                    "catalog_find_join_paths",
+                ]
+            ),
+        )
+
+        profile = select_db_tool_profile(
+            agent,
+            "Search the schema for columns that might represent price, amount, "
+            "total, revenue, invoice, payment, or subscription. Tell me which "
+            "columns are safest to use and why.",
+        )
+
+        assert profile.intent == "schema_only"
+        assert profile.tools == [
+            "catalog_search_schema",
+            "catalog_inspect_table",
+            "catalog_find_join_paths",
+        ]
+        assert profile.required_phases == []
+
+    def test_schema_assisted_calculation_requires_query_intent(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.tool_profiles import select_db_tool_profile
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("payments")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_compile_and_query",
+                    "db_plan_query",
+                    "db_query",
+                    "db_validate_sql",
+                    "catalog_search_schema",
+                    "catalog_inspect_table",
+                    "catalog_find_join_paths",
+                ]
+            ),
+        )
+
+        profile = select_db_tool_profile(
+            agent,
+            "Find the safest revenue column, then calculate total revenue by "
+            "billing period.",
+        )
+
+        assert profile.intent == "data_query_catalog_assisted"
+        assert profile.tools == [
+            "db_plan_query",
+            "db_query",
+            "catalog_search_schema",
+            "catalog_inspect_table",
+            "catalog_find_join_paths",
+        ]
+        assert profile.required_phases == ["catalog", "plan", "execute"]
+
     def test_manual_sql_prompt_profile(self):
         from types import SimpleNamespace
         from daita.agents.db.config.tool_profiles import select_db_tool_profile
@@ -4383,10 +4480,8 @@ class TestFromDbToolProfiles:
 
         assert profile.intent == "manual_sql"
         assert profile.tools == [
-            "db_plan_query",
-            "db_query",
             "db_validate_sql",
-            "db_compile_and_query",
+            "db_query",
         ]
 
     def test_explicit_validate_sql_mention_is_preserved(self):

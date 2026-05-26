@@ -19,6 +19,7 @@ from uuid import uuid4
 import pytest
 
 from daita.agents.agent import Agent
+from daita.agents.db.runtime.orchestrator import DbRunContract, DbRunOrchestrator
 from daita.agents.db.runtime.state import DbRunState, set_db_run_state
 from daita.agents.runtime.contextvars import get_active_run_state
 from daita.core.exceptions import AgentError
@@ -380,6 +381,105 @@ class TestMaxIterations:
             "suggested_next_arguments" in llm.call_history[1]["messages"][-2]["content"]
         )
 
+    async def test_unavailable_suggested_next_tool_does_not_empty_tools(self):
+        async def search(args):
+            return {
+                "ok": False,
+                "suggested_next_tool": "db_plan_query",
+                "suggested_next_arguments": {"goal": "answer"},
+            }
+
+        tool = AgentTool(
+            name="catalog_search_schema",
+            description="Search schema",
+            parameters={"type": "object", "properties": {}},
+            handler=search,
+        )
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "name": "catalog_search_schema",
+                            "arguments": {},
+                        }
+                    ],
+                },
+                "I can answer from the schema evidence.",
+            ]
+        )
+        agent = Agent(name="T", llm_provider=llm, tools=[tool])
+
+        result = await agent.run("answer from schema", detailed=True)
+
+        assert result["result"] == "I can answer from the schema evidence."
+        second_call_tools = llm.call_history[1]["tools"]
+        assert [tool["function"]["name"] for tool in second_call_tools] == [
+            "catalog_search_schema"
+        ]
+        assert (
+            result["diagnostics"]["unavailable_suggested_next_tool"] == "db_plan_query"
+        )
+        assert "suggested_next_tool_unavailable:db_plan_query" in (
+            result["diagnostics"]["warnings"]
+        )
+
+    async def test_schema_only_db_run_answers_from_catalog_evidence(self):
+        async def search(args):
+            return {
+                "tables": [
+                    {
+                        "name": "payments",
+                        "score": 0.95,
+                        "matched_fields": [{"name": "amount", "score": 0.9}],
+                    }
+                ]
+            }
+
+        tool = AgentTool(
+            name="catalog_search_schema",
+            description="Search schema",
+            parameters={"type": "object", "properties": {}},
+            handler=search,
+            category="database",
+            source="from_db",
+        )
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "name": "catalog_search_schema",
+                            "arguments": {"query": "revenue"},
+                        }
+                    ],
+                },
+                "payments.amount is the safest revenue-like column.",
+            ]
+        )
+        agent = Agent(name="SchemaRuntimeAgent", llm_provider=llm, tools=[tool])
+        prompt = "Search the schema for revenue columns."
+        orchestrator = DbRunOrchestrator(agent, prompt, state=DbRunState())
+        prepared = await orchestrator.prepare()
+
+        result = await agent.run(
+            prompt,
+            tools=list(prepared.contract.tools),
+            run_orchestrator=orchestrator,
+            detailed=True,
+            max_iterations=3,
+        )
+
+        assert result["result"] == "payments.amount is the safest revenue-like column."
+        assert result["diagnostics"]["db_completeness"]["status"] == (
+            "answerable_schema"
+        )
+        assert result["diagnostics"]["db_completeness"]["queries_executed"] == 0
+
     async def test_db_catalog_join_result_suggests_plan_query(self):
         async def find_join_paths(args):
             return {
@@ -439,11 +539,16 @@ class TestMaxIterations:
             ]
         )
         agent = Agent(name="T", llm_provider=llm, tools=tools)
-        db_state = DbRunState()
-        db_state.configure_workflow(["catalog_find_join_paths", "db_plan_query"])
-        set_db_run_state(agent, db_state)
+        prompt = "Show sales by customer and find the join path"
+        orchestrator = DbRunOrchestrator(agent, prompt, state=DbRunState())
+        prepared = await orchestrator.prepare()
 
-        result = await agent.run("answer from db", detailed=True)
+        result = await agent.run(
+            prompt,
+            tools=list(prepared.contract.tools),
+            run_orchestrator=orchestrator,
+            detailed=True,
+        )
 
         assert result["result"] == "Ready to plan."
         raw_catalog_result = result["tool_calls"][0]["result"]
@@ -462,7 +567,7 @@ class TestMaxIterations:
 
         async def search_schema(args):
             seen["args"] = dict(args)
-            return {"store_id": args["store_id"], "tables": []}
+            return {"store_id": args["store_id"], "tables": [{"name": "orders"}]}
 
         tool = AgentTool(
             name="catalog_search_schema",
@@ -495,17 +600,21 @@ class TestMaxIterations:
             (),
             {
                 "get_schema": lambda _self, store_id: (
-                    object() if store_id == "active-store" else None
-                )
+                    {"tables": []} if store_id == "active-store" else None
+                ),
+                "summarize_store": lambda _self, store_id, limit=None: {},
             },
         )()
-        db_state = DbRunState()
-        db_state.configure_workflow(
-            ["catalog_search_schema"], intent_kind="schema_only"
-        )
-        set_db_run_state(agent, db_state)
+        prompt = "inspect schema"
+        orchestrator = DbRunOrchestrator(agent, prompt, state=DbRunState())
+        prepared = await orchestrator.prepare()
 
-        result = await agent.run("inspect schema", detailed=True)
+        result = await agent.run(
+            prompt,
+            tools=list(prepared.contract.tools),
+            run_orchestrator=orchestrator,
+            detailed=True,
+        )
 
         assert result["result"] == "Done."
         assert seen["args"]["store_id"] == "active-store"
@@ -513,7 +622,6 @@ class TestMaxIterations:
 
     def test_schema_catalog_join_result_does_not_emit_db_handoff(self):
         state = DbRunState()
-        state.configure_workflow(["catalog_find_join_paths"])
 
         handoff = state.record_catalog_tool_result(
             "catalog_find_join_paths",
@@ -530,6 +638,71 @@ class TestMaxIterations:
 
         assert handoff is None
         assert state.summary()["catalog_join_evidence_count"] == 1
+
+    async def test_db_tool_budget_blocks_extra_tool_calls(self):
+        async def search(args):
+            return {
+                "tables": [
+                    {
+                        "name": "payments",
+                        "score": 0.95,
+                        "matched_fields": [{"name": "amount", "score": 0.9}],
+                    }
+                ]
+            }
+
+        tool = AgentTool(
+            name="catalog_search_schema",
+            description="Search schema",
+            parameters={"type": "object", "properties": {}},
+            handler=search,
+            category="database",
+            source="from_db",
+        )
+        llm = SequentialMockLLM(
+            response_sequence=[
+                {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "name": "catalog_search_schema",
+                            "arguments": {"query": "revenue"},
+                        },
+                        {
+                            "id": "c2",
+                            "name": "catalog_search_schema",
+                            "arguments": {"query": "amount"},
+                        },
+                    ],
+                },
+                "payments.amount is the best match.",
+            ]
+        )
+        agent = Agent(name="BudgetAgent", llm_provider=llm, tools=[tool])
+        prompt = "Search the schema for revenue columns."
+        orchestrator = DbRunOrchestrator(agent, prompt, state=DbRunState())
+        await orchestrator.prepare()
+        orchestrator.contract = DbRunContract(
+            **{
+                **orchestrator.contract.__dict__,
+                "max_tool_calls": 1,
+            }
+        )
+        orchestrator.state.run_contract = orchestrator.contract
+
+        result = await agent.run(
+            prompt,
+            tools=list(orchestrator.contract.tools),
+            run_orchestrator=orchestrator,
+            detailed=True,
+            max_iterations=3,
+        )
+
+        assert result["tool_calls"][1]["result"]["guardrail"] == (
+            "db_tool_budget_exhausted"
+        )
+        assert "db_tool_budget_exhausted" in result["diagnostics"]["warnings"]
 
     async def test_partial_exit_without_evidence_still_raises(self):
         repeated_call = {
