@@ -37,6 +37,7 @@ class DbRunState:
     plans_by_id: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     next_plan_number: int = 1
     final_completeness_status: Optional[Dict[str, Any]] = None
+    final_veto_count: int = 0
     run_contract: Any = None
 
     def record_candidate_columns(
@@ -340,6 +341,7 @@ class DbRunState:
             "executed_query_count": len(self.executed_queries),
             "required_answer_fields": list(self.required_answer_fields),
             "planned_query_count": len(self.planned_queries),
+            "final_veto_count": self.final_veto_count,
         }
 
 

@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from ...runtime.state import FinalAnswerReadiness
 from ..config.route_decision import DbRouteDecision, build_db_route_decision
 from ..config.intent_classifier import DbPromptClassification
 from ..config.tool_selection import (
+    CATALOG_INSPECT_CAPABILITY,
+    CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+    CATALOG_SEARCH_CAPABILITY,
     is_db_repair_tool,
     is_generic_catalog_tool,
     is_schema_navigation_tool,
     relational_catalog_alias,
+    select_tools_for_capabilities,
+    tool_has_any_capability,
 )
 from ..utils import string_list
 from .state import DbRunState, set_db_run_state
@@ -28,11 +33,14 @@ class DbRunContract:
     required_phases: tuple[str, ...]
     terminal_tools: tuple[str, ...]
     evidence_mode: str
+    access_mode: str
+    forbidden_capabilities: tuple[str, ...]
     allow_catalog_final: bool
     require_executed_query: bool
     max_model_turns: int
     max_tool_calls: int
     max_repair_attempts: int
+    max_final_vetoes: int = 1
     final_synthesis_without_tools: bool = True
     workflow_guidance: str = ""
     answer_guidance: str = ""
@@ -227,6 +235,22 @@ class DbRunOrchestrator:
                 diagnostics={"blocked_db_tool": tool_name},
             )
 
+        if contract.forbidden_capabilities and tool_has_any_capability(
+            tool_name, contract.forbidden_capabilities
+        ):
+            return self._blocked_tool_call(
+                tool_name,
+                warning=f"db_forbidden_capability:{tool_name}",
+                message=(
+                    f"{tool_name} is forbidden by this DB run contract. "
+                    "Synthesize from allowed evidence or use an allowed tool."
+                ),
+                diagnostics={
+                    "blocked_db_tool": tool_name,
+                    "forbidden_capabilities": list(contract.forbidden_capabilities),
+                },
+            )
+
         if (
             int(getattr(run_state, "tool_call_count", 0) or 0)
             >= contract.max_tool_calls
@@ -268,6 +292,9 @@ class DbRunOrchestrator:
         """Record DB facts and attach allowed handoff hints to tool results."""
         tool_name = str(tool_call.get("name") or "")
         raw = result.get("result")
+        if tool_name == "db_plan_query":
+            self._observe_plan_result(raw)
+            return
         if is_schema_navigation_tool(tool_name):
             self.state.record_catalog_tool_result(
                 tool_name, tool_call.get("arguments", {}) or {}, raw
@@ -303,6 +330,15 @@ class DbRunOrchestrator:
 
     def synthesis_guidance(self, results: Sequence[Dict[str, Any]]) -> Optional[str]:
         """Return forced-synthesis guidance after budget or policy blocks."""
+        if (
+            self._diagnostics.get("contract_revision")
+            and self._evidence_satisfies_contract()
+        ):
+            return (
+                "The DB run contract has been revised to schema/catalog evidence. "
+                "Do not call SQL or row-reading tools. Provide the final answer "
+                "from the catalog/schema evidence already collected."
+            )
         for result in reversed(results):
             raw = result.get("result")
             if not isinstance(raw, dict):
@@ -388,16 +424,19 @@ class DbRunOrchestrator:
             return {}
         return {
             "intent": contract.intent,
+            "access_mode": contract.access_mode,
             "capabilities": list(contract.capabilities),
             "tools": list(contract.tools),
             "required_phases": list(contract.required_phases),
             "terminal_tools": list(contract.terminal_tools),
             "evidence_mode": contract.evidence_mode,
+            "forbidden_capabilities": list(contract.forbidden_capabilities),
             "allow_catalog_final": contract.allow_catalog_final,
             "require_executed_query": contract.require_executed_query,
             "max_model_turns": contract.max_model_turns,
             "max_tool_calls": contract.max_tool_calls,
             "max_repair_attempts": contract.max_repair_attempts,
+            "max_final_vetoes": contract.max_final_vetoes,
             "workflow_policy": contract.workflow_guidance,
             "answer_policy": contract.answer_guidance,
         }
@@ -425,6 +464,8 @@ class DbRunOrchestrator:
             required_phases=route.required_phases,
             terminal_tools=route.terminal_tools,
             evidence_mode=route.evidence_mode,
+            access_mode=route.access_mode,
+            forbidden_capabilities=route.forbidden_capabilities,
             allow_catalog_final=route.allow_catalog_final,
             require_executed_query=route.require_executed_query,
             max_model_turns=route.max_model_turns,
@@ -546,6 +587,86 @@ class DbRunOrchestrator:
         if contract.evidence_mode == "memory":
             return False
         return True
+
+    def _observe_plan_result(self, result: Any) -> None:
+        if not isinstance(result, dict) or result.get("error"):
+            return
+        if (
+            str(result.get("route") or "") != "schema_question"
+            or str(result.get("compiled_sql") or "").strip()
+        ):
+            return
+        knowledge = result.get("knowledge_used") or {}
+        if isinstance(knowledge, dict) and "catalog" in (
+            knowledge.get("sources") or []
+        ):
+            self._record_plan_catalog_evidence(result)
+            self._downgrade_to_catalog_contract("planner_schema_question")
+
+    def _record_plan_catalog_evidence(self, result: Dict[str, Any]) -> None:
+        tables: List[Dict[str, Any]] = []
+        for item in result.get("table_candidates") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("table") or "").strip()
+            if name:
+                tables.append(item)
+        knowledge = result.get("knowledge_used") or {}
+        if isinstance(knowledge, dict):
+            for name in knowledge.get("tables") or []:
+                name = str(name).strip()
+                if name and not any(
+                    str(table.get("name") or table.get("table") or "") == name
+                    for table in tables
+                ):
+                    tables.append({"name": name, "score": 8.0})
+        if not tables:
+            return
+        self.state.record_catalog_tool_result(
+            "catalog_search_schema",
+            {"query": self.prompt},
+            {"tables": tables},
+        )
+
+    def _downgrade_to_catalog_contract(self, reason: str) -> None:
+        contract = self._require_contract()
+        catalog_capabilities = (
+            CATALOG_SEARCH_CAPABILITY,
+            CATALOG_INSPECT_CAPABILITY,
+            CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
+        )
+        available = getattr(
+            getattr(self.agent, "tool_registry", None), "tool_names", []
+        )
+        tools = tuple(select_tools_for_capabilities(available, catalog_capabilities))
+        self.contract = replace(
+            contract,
+            intent="schema_question",
+            access_mode="schema_only",
+            capabilities=catalog_capabilities,
+            tools=tools,
+            required_phases=(),
+            terminal_tools=tools,
+            evidence_mode="catalog",
+            allow_catalog_final=True,
+            require_executed_query=False,
+            max_model_turns=min(contract.max_model_turns, 2),
+            max_repair_attempts=0,
+            workflow_guidance=(
+                "Use catalog/schema tools to gather structural evidence. "
+                "Do not plan or execute SQL for schema-only questions."
+            ),
+            answer_guidance=(
+                "catalog/schema evidence is sufficient; explain confidence and "
+                "caveats from table, column, and relationship metadata."
+            ),
+        )
+        self.state.intent_kind = "schema_question"
+        self.state.run_contract = self.contract
+        self._diagnostics["contract_revision"] = {
+            "reason": reason,
+            "evidence_mode": "catalog",
+        }
 
     def _require_contract(self) -> DbRunContract:
         if self.contract is None:

@@ -9,10 +9,23 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .intent import DbIntent, DbIntentKind
 from .tool_selection import CATALOG_NAVIGATION_TOOL_NAMES
+
+
+@dataclass(frozen=True)
+class DbAccessConstraints:
+    """Hard data-access constraints extracted before task classification."""
+
+    schema_only_requested: bool = False
+    forbid_row_access: bool = False
+    forbid_sql_execution: bool = False
+    allow_aggregate_only: bool = False
+    explicit_sample_requested: bool = False
+    explicit_rows_requested: bool = False
+    explicit_sql_requested: bool = False
 
 
 @dataclass(frozen=True)
@@ -20,6 +33,7 @@ class DbPromptClassification:
     """Structured prompt signals used by DB tool selection."""
 
     intent: DbIntent
+    access_constraints: DbAccessConstraints = field(default_factory=DbAccessConstraints)
     likely_catalog_match: bool = False
     query_shape: str | None = None
     aggregation_kind: str | None = None
@@ -231,7 +245,12 @@ def classify_db_prompt(
 
     text = str(prompt or "").lower()
     available_set = set(available_tools)
-    intent = _classify_db_intent(text, likely_catalog_match=likely_catalog_match)
+    constraints = extract_db_access_constraints(text)
+    intent = _classify_db_intent(
+        text,
+        likely_catalog_match=likely_catalog_match,
+        constraints=constraints,
+    )
     needs_query_tools = intent.needs_sql_execution
     query_shape = _query_shape(text)
     aggregation_kind = _aggregation_kind(text, query_shape=query_shape)
@@ -262,6 +281,7 @@ def classify_db_prompt(
     )
     return DbPromptClassification(
         intent=intent,
+        access_constraints=constraints,
         likely_catalog_match=likely_catalog_match,
         query_shape=query_shape,
         aggregation_kind=aggregation_kind,
@@ -281,7 +301,35 @@ def classify_db_prompt(
     )
 
 
-def _classify_db_intent(text: str, *, likely_catalog_match: bool) -> DbIntent:
+def extract_db_access_constraints(text: str) -> DbAccessConstraints:
+    """Extract non-negotiable access constraints before intent routing."""
+
+    schema_only_requested = _schema_only_requested(text)
+    forbid_sql_execution = schema_only_requested or _forbids_sql_execution(text)
+    forbid_row_access = (
+        schema_only_requested or forbid_sql_execution or _forbids_row_access(text)
+    )
+    explicit_sample_requested = _explicit_sample_requested(text)
+    explicit_rows_requested = _explicit_rows_requested(text)
+    return DbAccessConstraints(
+        schema_only_requested=schema_only_requested,
+        forbid_row_access=forbid_row_access,
+        forbid_sql_execution=forbid_sql_execution,
+        allow_aggregate_only=_allow_aggregate_only(text),
+        explicit_sample_requested=explicit_sample_requested,
+        explicit_rows_requested=explicit_rows_requested,
+        explicit_sql_requested=_has_explicit_sql(text),
+    )
+
+
+def _classify_db_intent(
+    text: str,
+    *,
+    likely_catalog_match: bool,
+    constraints: DbAccessConstraints,
+) -> DbIntent:
+    if constraints.schema_only_requested or constraints.forbid_sql_execution:
+        return DbIntent.from_kind(DbIntentKind.SCHEMA_ONLY)
     if _has_explicit_sql(text):
         return DbIntent.from_kind(DbIntentKind.MANUAL_SQL)
     if _has_any(text, WRITE_TERMS):
@@ -433,6 +481,72 @@ def _has_data_execution_intent(text: str) -> bool:
     if _has_any(text, NO_DATA_QUERY_TERMS):
         return False
     return _has_any(text, DATA_EXECUTION_TERMS)
+
+
+def _schema_only_requested(text: str) -> bool:
+    return any(
+        re.search(pattern, text)
+        for pattern in (
+            r"\bschema\s+evidence\s+only\b",
+            r"\bschema\s+only\b",
+            r"\buse\s+(?:only\s+)?schema\s+evidence\b",
+            r"\buse\s+(?:the\s+)?schema\s+only\b",
+            r"\bcatalog\s+evidence\s+only\b",
+            r"\bmetadata\s+only\b",
+        )
+    )
+
+
+def _forbids_row_access(text: str) -> bool:
+    return any(
+        re.search(pattern, text)
+        for pattern in (
+            r"\bdo\s+not\s+(?:query|read|fetch|return|sample|inspect)\s+(?:any\s+)?(?:rows?|records?|data)\b",
+            r"\bdon't\s+(?:query|read|fetch|return|sample|inspect)\s+(?:any\s+)?(?:rows?|records?|data)\b",
+            r"\bwithout\s+(?:querying|reading|fetching|returning|sampling|inspecting)\s+(?:any\s+)?(?:rows?|records?|data)\b",
+            r"\bno\s+(?:row|record|data)\s+(?:access|reads?|queries|samples?)\b",
+        )
+    )
+
+
+def _forbids_sql_execution(text: str) -> bool:
+    return any(
+        re.search(pattern, text)
+        for pattern in (
+            r"\bdo\s+not\s+(?:execute|run|write)\s+(?:sql|queries?|selects?)\b",
+            r"\bdon't\s+(?:execute|run|write)\s+(?:sql|queries?|selects?)\b",
+            r"\bwithout\s+(?:executing|running|writing)\s+(?:sql|queries?|selects?)\b",
+            r"\bno\s+(?:sql|query)\s+execution\b",
+            r"\bdo\s+not\s+query\s+(?:the\s+)?(?:database|data)\b",
+        )
+    )
+
+
+def _allow_aggregate_only(text: str) -> bool:
+    return bool(_forbids_row_access(text) and _has_any(text, DATA_AGGREGATION_TERMS))
+
+
+def _explicit_sample_requested(text: str) -> bool:
+    return any(
+        re.search(pattern, text)
+        for pattern in (
+            r"\bsample\s+(?:rows?|records?|data)\b",
+            r"\bshow\s+(?:me\s+)?(?:a\s+)?sample\b",
+            r"\bexample\s+rows?\b",
+        )
+    )
+
+
+def _explicit_rows_requested(text: str) -> bool:
+    return any(
+        re.search(pattern, text)
+        for pattern in (
+            r"\bshow\s+(?:me\s+)?(?:rows?|records?)\b",
+            r"\blist\s+(?:rows?|records?)\b",
+            r"\breturn\s+(?:rows?|records?)\b",
+            r"\brecent\s+(?:rows?|records?)\b",
+        )
+    ) or _explicit_sample_requested(text)
 
 
 def _is_memory_only_intent(text: str) -> bool:

@@ -11,7 +11,9 @@ from collections.abc import Iterable, Sequence
 
 DB_PLAN_CAPABILITY = "db.plan"
 DB_VALIDATE_SQL_CAPABILITY = "db.validate_sql"
-DB_EXECUTE_CAPABILITY = "db.execute"
+DB_SQL_EXECUTE_CAPABILITY = "db.sql_execute"
+DB_ROW_READ_CAPABILITY = "db.row_read"
+DB_AGGREGATE_READ_CAPABILITY = "db.aggregate_read"
 DB_COMPILE_AND_EXECUTE_CAPABILITY = "db.compile_and_execute"
 DB_WRITE_CAPABILITY = "db.write"
 CATALOG_SEARCH_CAPABILITY = "catalog.search"
@@ -63,12 +65,12 @@ DB_TOOL_CAPABILITIES = {
     "db_plan_query": (DB_PLAN_CAPABILITY,),
     "db_compile_and_query": (DB_COMPILE_AND_EXECUTE_CAPABILITY,),
     "db_validate_sql": (DB_VALIDATE_SQL_CAPABILITY,),
-    "db_query": (DB_EXECUTE_CAPABILITY,),
-    "db_count": (DB_EXECUTE_CAPABILITY,),
-    "db_sample": (DB_EXECUTE_CAPABILITY,),
-    "db_find": (DB_EXECUTE_CAPABILITY,),
-    "db_aggregate": (DB_EXECUTE_CAPABILITY,),
-    "db_execute": (DB_WRITE_CAPABILITY, DB_EXECUTE_CAPABILITY),
+    "db_query": (DB_SQL_EXECUTE_CAPABILITY,),
+    "db_count": (DB_AGGREGATE_READ_CAPABILITY,),
+    "db_sample": (DB_ROW_READ_CAPABILITY,),
+    "db_find": (DB_ROW_READ_CAPABILITY,),
+    "db_aggregate": (DB_AGGREGATE_READ_CAPABILITY,),
+    "db_execute": (DB_WRITE_CAPABILITY, DB_SQL_EXECUTE_CAPABILITY),
     "db_remember": (DB_MEMORY_WRITE_CAPABILITY,),
     "catalog_search_schema": (CATALOG_SEARCH_CAPABILITY,),
     "catalog_inspect_table": (CATALOG_INSPECT_CAPABILITY,),
@@ -91,7 +93,12 @@ DB_TOOL_CAPABILITIES = {
 }
 
 ANSWER_EVIDENCE_CAPABILITIES = frozenset(
-    {DB_EXECUTE_CAPABILITY, DB_COMPILE_AND_EXECUTE_CAPABILITY}
+    {
+        DB_SQL_EXECUTE_CAPABILITY,
+        DB_COMPILE_AND_EXECUTE_CAPABILITY,
+        DB_AGGREGATE_READ_CAPABILITY,
+        DB_ROW_READ_CAPABILITY,
+    }
 )
 CATALOG_NAVIGATION_CAPABILITIES = frozenset(
     {
@@ -104,13 +111,13 @@ DB_REPAIR_CAPABILITIES = frozenset(
     {
         DB_PLAN_CAPABILITY,
         DB_VALIDATE_SQL_CAPABILITY,
-        DB_EXECUTE_CAPABILITY,
+        DB_SQL_EXECUTE_CAPABILITY,
         DB_COMPILE_AND_EXECUTE_CAPABILITY,
     }
 )
 PROVIDER_VISIBLE_CAPABILITIES = frozenset(
     {
-        DB_EXECUTE_CAPABILITY,
+        DB_SQL_EXECUTE_CAPABILITY,
         VECTOR_SEARCH_CAPABILITY,
         VECTOR_UPSERT_CAPABILITY,
     }

@@ -4263,7 +4263,7 @@ class TestFromDbRouteDecision:
             CATALOG_INSPECT_CAPABILITY,
             CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
             DB_COMPILE_AND_EXECUTE_CAPABILITY,
-            DB_EXECUTE_CAPABILITY,
+            DB_SQL_EXECUTE_CAPABILITY,
             select_tools_for_capabilities,
         )
 
@@ -4276,7 +4276,7 @@ class TestFromDbRouteDecision:
 
         assert select_tools_for_capabilities(
             available,
-            [DB_COMPILE_AND_EXECUTE_CAPABILITY, DB_EXECUTE_CAPABILITY],
+            [DB_COMPILE_AND_EXECUTE_CAPABILITY, DB_SQL_EXECUTE_CAPABILITY],
         ) == ["db_compile_and_query", "db_query"]
         assert select_tools_for_capabilities(
             available,
@@ -4467,7 +4467,7 @@ class TestFromDbRouteDecision:
             CATALOG_INSPECT_CAPABILITY,
             CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
             CATALOG_SEARCH_CAPABILITY,
-            DB_EXECUTE_CAPABILITY,
+            DB_SQL_EXECUTE_CAPABILITY,
             DB_PLAN_CAPABILITY,
         )
         from daita.agents.db.config.route_decision import build_db_route_decision
@@ -4503,7 +4503,7 @@ class TestFromDbRouteDecision:
         ]
         assert list(route.capabilities) == [
             DB_PLAN_CAPABILITY,
-            DB_EXECUTE_CAPABILITY,
+            DB_SQL_EXECUTE_CAPABILITY,
             CATALOG_SEARCH_CAPABILITY,
             CATALOG_INSPECT_CAPABILITY,
             CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
@@ -4515,7 +4515,7 @@ class TestFromDbRouteDecision:
         from types import SimpleNamespace
         from daita.agents.db.config.route_decision import build_db_route_decision
         from daita.agents.db.config.tool_selection import (
-            DB_EXECUTE_CAPABILITY,
+            DB_SQL_EXECUTE_CAPABILITY,
             DB_PLAN_CAPABILITY,
             DB_VALIDATE_SQL_CAPABILITY,
         )
@@ -4536,7 +4536,7 @@ class TestFromDbRouteDecision:
 
         assert list(route.capabilities) == [
             DB_PLAN_CAPABILITY,
-            DB_EXECUTE_CAPABILITY,
+            DB_SQL_EXECUTE_CAPABILITY,
             DB_VALIDATE_SQL_CAPABILITY,
         ]
         assert route.tools == ("db_plan_query", "db_query", "db_validate_sql")
@@ -4606,6 +4606,75 @@ class TestFromDbRouteDecision:
             "catalog_find_join_paths",
         )
         assert route.required_phases == ()
+
+    def test_schema_only_no_rows_prompt_forbids_query_and_row_tools(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config import DbIntentKind
+        from daita.agents.db.config.route_decision import build_db_route_decision
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("payments")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_compile_and_query",
+                    "db_plan_query",
+                    "db_query",
+                    "db_count",
+                    "db_sample",
+                    "catalog_search_schema",
+                    "catalog_inspect_table",
+                    "catalog_find_join_paths",
+                    "postgres_vector_search",
+                ]
+            ),
+        )
+
+        route = build_db_route_decision(
+            agent,
+            "Which tables look most relevant for understanding customer billing "
+            "or revenue? Use schema evidence only; do not query rows.",
+        )
+
+        assert route.intent.kind == DbIntentKind.SCHEMA_ONLY
+        assert route.access_mode == "schema_only"
+        assert route.tools == (
+            "catalog_search_schema",
+            "catalog_inspect_table",
+            "catalog_find_join_paths",
+        )
+        assert "db.row_read" in route.forbidden_capabilities
+        assert "db.sql_execute" in route.forbidden_capabilities
+        assert route.require_executed_query is False
+        assert route.allow_catalog_final is True
+        assert route.max_model_turns == 2
+
+    def test_no_row_count_prompt_uses_aggregate_tool_without_sql_or_sample(self):
+        from types import SimpleNamespace
+        from daita.agents.db.config.route_decision import build_db_route_decision
+
+        agent = _agent_with_catalog(
+            _make_normalized_schema(tables=[_table("payments")]),
+            tool_registry=SimpleNamespace(
+                tool_names=[
+                    "db_compile_and_query",
+                    "db_query",
+                    "db_count",
+                    "db_sample",
+                    "catalog_search_schema",
+                ]
+            ),
+        )
+
+        route = build_db_route_decision(
+            agent,
+            "How many payments are there? Do not query rows.",
+        )
+
+        assert route.access_mode == "aggregate_only"
+        assert route.tools == ("db_count",)
+        assert "db_sample" not in route.tools
+        assert "db_query" not in route.tools
+        assert "db_compile_and_query" not in route.tools
 
     def test_schema_assisted_calculation_requires_query_intent(self):
         from types import SimpleNamespace

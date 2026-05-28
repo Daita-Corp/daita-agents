@@ -201,7 +201,7 @@ DB_WORKFLOW_POLICIES = {
         required_phases=("plan", "execute"),
         required_capabilities=(
             tool_selection.DB_PLAN_CAPABILITY,
-            tool_selection.DB_EXECUTE_CAPABILITY,
+            tool_selection.DB_SQL_EXECUTE_CAPABILITY,
         ),
         optional_capabilities=(
             *_SCHEMA_SEARCH_OPTIONAL,
@@ -210,7 +210,7 @@ DB_WORKFLOW_POLICIES = {
         ),
         terminal_capabilities=(
             tool_selection.DB_COMPILE_AND_EXECUTE_CAPABILITY,
-            tool_selection.DB_EXECUTE_CAPABILITY,
+            tool_selection.DB_SQL_EXECUTE_CAPABILITY,
         ),
         fast_path_capabilities=(tool_selection.DB_COMPILE_AND_EXECUTE_CAPABILITY,),
         allow_catalog_final=False,
@@ -227,7 +227,7 @@ DB_WORKFLOW_POLICIES = {
         required_phases=("catalog", "plan", "execute"),
         required_capabilities=(
             tool_selection.DB_PLAN_CAPABILITY,
-            tool_selection.DB_EXECUTE_CAPABILITY,
+            tool_selection.DB_SQL_EXECUTE_CAPABILITY,
             tool_selection.CATALOG_SEARCH_CAPABILITY,
             tool_selection.CATALOG_INSPECT_CAPABILITY,
             tool_selection.CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
@@ -235,7 +235,7 @@ DB_WORKFLOW_POLICIES = {
         optional_capabilities=_COMMON_OPTIONAL_CAPABILITIES,
         terminal_capabilities=(
             tool_selection.DB_COMPILE_AND_EXECUTE_CAPABILITY,
-            tool_selection.DB_EXECUTE_CAPABILITY,
+            tool_selection.DB_SQL_EXECUTE_CAPABILITY,
         ),
         allow_catalog_final=False,
         require_executed_query=True,
@@ -257,10 +257,10 @@ DB_WORKFLOW_POLICIES = {
         required_phases=("execute",),
         required_capabilities=(
             tool_selection.DB_VALIDATE_SQL_CAPABILITY,
-            tool_selection.DB_EXECUTE_CAPABILITY,
+            tool_selection.DB_SQL_EXECUTE_CAPABILITY,
         ),
         optional_capabilities=_COMMON_OPTIONAL_CAPABILITIES,
-        terminal_capabilities=(tool_selection.DB_EXECUTE_CAPABILITY,),
+        terminal_capabilities=(tool_selection.DB_SQL_EXECUTE_CAPABILITY,),
         allow_catalog_final=False,
         require_executed_query=True,
         max_model_turns=3,
@@ -276,12 +276,12 @@ DB_WORKFLOW_POLICIES = {
         required_capabilities=(
             tool_selection.DB_WRITE_CAPABILITY,
             tool_selection.DB_VALIDATE_SQL_CAPABILITY,
-            tool_selection.DB_EXECUTE_CAPABILITY,
+            tool_selection.DB_SQL_EXECUTE_CAPABILITY,
         ),
         optional_capabilities=_COMMON_OPTIONAL_CAPABILITIES,
         terminal_capabilities=(
             tool_selection.DB_WRITE_CAPABILITY,
-            tool_selection.DB_EXECUTE_CAPABILITY,
+            tool_selection.DB_SQL_EXECUTE_CAPABILITY,
         ),
         allow_catalog_final=False,
         require_executed_query=True,

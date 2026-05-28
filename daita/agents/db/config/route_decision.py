@@ -16,12 +16,16 @@ from .policies import (
 )
 from .tool_selection import (
     ANALYST_CAPABILITY_PREFIX,
+    DB_AGGREGATE_READ_CAPABILITY,
     DB_COMPILE_AND_EXECUTE_CAPABILITY,
     DB_TOOL_CAPABILITIES,
+    DB_ROW_READ_CAPABILITY,
+    DB_SQL_EXECUTE_CAPABILITY,
     is_generic_catalog_tool,
     relational_catalog_alias,
     select_tools_for_capabilities,
     supported_required_phases,
+    tool_has_any_capability,
 )
 
 
@@ -47,6 +51,8 @@ class DbRouteDecision:
     required_phases: tuple[str, ...]
     terminal_tools: tuple[str, ...]
     evidence_mode: str
+    access_mode: str
+    forbidden_capabilities: tuple[str, ...]
     allow_catalog_final: bool
     require_executed_query: bool
     max_model_turns: int
@@ -69,6 +75,7 @@ def build_db_route_decision(
     intent = classification.intent
     policy = workflow_policy_for_intent(intent)
     diagnostics: dict[str, Any] = {}
+    forbidden_capabilities = _forbidden_capabilities(classification)
 
     if classification.strict_explicit_tool_request:
         capabilities: list[str] = []
@@ -80,6 +87,19 @@ def build_db_route_decision(
         selected.extend(classification.explicit_tools)
         selected = unique_preserving_order(selected)
         required_phases = supported_required_phases(policy.required_phases, selected)
+
+    if forbidden_capabilities:
+        capabilities = [
+            capability
+            for capability in capabilities
+            if capability not in forbidden_capabilities
+        ]
+        selected = [
+            tool_name
+            for tool_name in selected
+            if not tool_has_any_capability(tool_name, forbidden_capabilities)
+        ]
+        diagnostics["forbidden_capabilities"] = list(forbidden_capabilities)
 
     tools = tuple(_canonical_tools(selected, available, prompt, diagnostics))
     terminal_tools = tuple(
@@ -94,6 +114,8 @@ def build_db_route_decision(
         required_phases=tuple(required_phases),
         terminal_tools=terminal_tools,
         evidence_mode=policy.evidence_mode.value,
+        access_mode=_access_mode_for_classification(classification),
+        forbidden_capabilities=forbidden_capabilities,
         allow_catalog_final=policy.allow_catalog_final,
         require_executed_query=policy.require_executed_query,
         max_model_turns=policy.max_model_turns,
@@ -150,6 +172,13 @@ def _capabilities_for_policy(
         for optional in policy.optional_capabilities
         if _optional_capability_applies(optional, agent, classification)
     )
+    constraints = classification.access_constraints
+    if constraints.allow_aggregate_only and not constraints.forbid_sql_execution:
+        capabilities.append(DB_AGGREGATE_READ_CAPABILITY)
+    if (
+        constraints.explicit_sample_requested or constraints.explicit_rows_requested
+    ) and not constraints.forbid_row_access:
+        capabilities.append(DB_ROW_READ_CAPABILITY)
     return unique_preserving_order(capabilities)
 
 
@@ -215,6 +244,48 @@ def _optional_capability_applies(
         tool_name = optional.capability[len(ANALYST_CAPABILITY_PREFIX) :]
         return tool_name in classification.requested_analyst_tools
     return False
+
+
+def _forbidden_capabilities(
+    classification: DbPromptClassification,
+) -> tuple[str, ...]:
+    constraints = classification.access_constraints
+    forbidden: list[str] = []
+    if constraints.forbid_row_access:
+        forbidden.extend(
+            [
+                DB_ROW_READ_CAPABILITY,
+                DB_SQL_EXECUTE_CAPABILITY,
+                DB_COMPILE_AND_EXECUTE_CAPABILITY,
+            ]
+        )
+    if constraints.forbid_sql_execution:
+        forbidden.extend(
+            [
+                DB_SQL_EXECUTE_CAPABILITY,
+                DB_COMPILE_AND_EXECUTE_CAPABILITY,
+            ]
+        )
+    return tuple(unique_preserving_order(forbidden))
+
+
+def _access_mode_for_classification(classification: DbPromptClassification) -> str:
+    constraints = classification.access_constraints
+    if constraints.schema_only_requested or constraints.forbid_sql_execution:
+        return "schema_only"
+    if classification.intent.is_write_or_admin:
+        return "write"
+    if constraints.allow_aggregate_only:
+        return "aggregate_only"
+    if constraints.forbid_row_access:
+        return "no_row_access"
+    if constraints.explicit_sample_requested or constraints.explicit_rows_requested:
+        return "row_read"
+    if classification.intent.needs_sql_execution:
+        return "query_allowed"
+    if classification.intent.kind == DbIntentKind.MEMORY_ONLY:
+        return "memory"
+    return "no_db_access"
 
 
 def _has_vector_columns(schema: dict) -> bool:

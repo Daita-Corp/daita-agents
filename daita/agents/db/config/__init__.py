@@ -13,7 +13,11 @@ from .policies import (
     workflow_policy_for_intent,
 )
 from .intent import DbEvidenceMode, DbIntent, DbIntentKind, evidence_mode_for_intent
-from .intent_classifier import DbPromptClassification, classify_db_prompt
+from .intent_classifier import (
+    DbAccessConstraints,
+    DbPromptClassification,
+    classify_db_prompt,
+)
 from .presets import AUTO_TOOLKIT, MODE_PRESETS, FromDbModePreset, resolve_mode_options
 from .route_decision import (
     DbFastPathDecision,
@@ -29,13 +33,15 @@ from .tool_selection import (
     CATALOG_NAVIGATION_TOOL_NAMES,
     CATALOG_RELATIONSHIP_PATHS_CAPABILITY,
     CATALOG_SEARCH_CAPABILITY,
+    DB_AGGREGATE_READ_CAPABILITY,
     DB_COMPILE_AND_EXECUTE_CAPABILITY,
-    DB_EXECUTE_CAPABILITY,
     DB_LINEAGE_TRACE_CAPABILITY,
     DB_MEMORY_WRITE_CAPABILITY,
     DB_PLAN_CAPABILITY,
     DB_QUALITY_PROFILE_CAPABILITY,
+    DB_ROW_READ_CAPABILITY,
     DB_REPAIR_CAPABILITIES,
+    DB_SQL_EXECUTE_CAPABILITY,
     DB_TOOL_CAPABILITIES,
     DB_VALIDATE_SQL_CAPABILITY,
     DB_WRITE_CAPABILITY,
@@ -70,17 +76,20 @@ __all__ = [
     "DB_TOOL_CAPABILITIES",
     "DB_WORKFLOW_POLICIES",
     "DbEvidenceMode",
+    "DbAccessConstraints",
     "DbIntent",
     "DbIntentKind",
     "DbPromptClassification",
     "DbWorkflowPolicy",
+    "DB_AGGREGATE_READ_CAPABILITY",
     "DB_COMPILE_AND_EXECUTE_CAPABILITY",
-    "DB_EXECUTE_CAPABILITY",
     "DB_LINEAGE_TRACE_CAPABILITY",
     "GENERIC_CATALOG_TOOLS",
     "DB_MEMORY_WRITE_CAPABILITY",
     "DB_PLAN_CAPABILITY",
     "DB_QUALITY_PROFILE_CAPABILITY",
+    "DB_ROW_READ_CAPABILITY",
+    "DB_SQL_EXECUTE_CAPABILITY",
     "DB_VALIDATE_SQL_CAPABILITY",
     "DB_WRITE_CAPABILITY",
     "GENERIC_MEMORY_WRITE_TOOLS",

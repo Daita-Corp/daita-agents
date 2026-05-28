@@ -675,11 +675,10 @@ async def test_phase6_postgres_from_db_openai_models_emit_full_traces(
         _assert_trace_operations(
             trace,
             {
-                "from_db.fast_path",
-                "from_db.prepare_runtime_context",
                 "from_db.memory_recall",
+                "from_db.prepare_orchestrator",
+                "from_db.build_contract",
                 "from_db.build_runtime_context",
-                "from_db.select_tools",
                 "agent_run",
                 "llm_openai",
                 "tool_db_query",
@@ -755,11 +754,10 @@ async def test_phase6_mysql_from_db_live_trace_and_simple_select(
         _assert_trace_operations(
             trace,
             {
-                "from_db.fast_path",
-                "from_db.prepare_runtime_context",
                 "from_db.memory_recall",
+                "from_db.prepare_orchestrator",
+                "from_db.build_contract",
                 "from_db.build_runtime_context",
-                "from_db.select_tools",
                 "agent_run",
                 "llm_openai",
                 "tool_db_query",

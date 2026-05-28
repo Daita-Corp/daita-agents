@@ -154,7 +154,14 @@ async def _prepare_db_runtime_call(
         )
     kwargs.setdefault("final_synthesis_without_tools", True)
     kwargs.setdefault("terminal_tools", prepared.contract.terminal_tools)
-    kwargs.setdefault("max_iterations", prepared.contract.max_model_turns)
+    kwargs.setdefault("partial_exit", True)
+    existing_max_iterations = kwargs.get("max_iterations")
+    if existing_max_iterations is None:
+        kwargs["max_iterations"] = prepared.contract.max_model_turns
+    else:
+        kwargs["max_iterations"] = min(
+            int(existing_max_iterations), prepared.contract.max_model_turns
+        )
     kwargs["run_orchestrator"] = orchestrator
     return _augment_prompt(prompt, context), kwargs
 

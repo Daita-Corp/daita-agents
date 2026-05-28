@@ -132,10 +132,16 @@ def _sanitize_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     sanitized: Dict[str, Any] = {}
     if "tool" in call:
         sanitized["tool"] = call["tool"]
+    elif "name" in call:
+        sanitized["tool"] = call["name"]
     if "arguments" in call:
         sanitized["arguments"] = _sanitize_arguments(call.get("arguments"))
+    elif "input" in call:
+        sanitized["arguments"] = _sanitize_arguments(call.get("input"))
     if "result" in call:
         sanitized["result"] = _sanitize_result(call.get("result"))
+    elif "output" in call:
+        sanitized["result"] = _sanitize_result(call.get("output"))
     if "error" in call:
         sanitized["error"] = str(call["error"])
     return sanitized

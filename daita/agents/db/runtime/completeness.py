@@ -78,8 +78,12 @@ def evaluate_db_final_answer_readiness(
             if can_answer and incomplete_final
             else "db_final_answer_without_schema_evidence"
         )
-        return FinalAnswerReadiness(
-            allow_final=False,
+        return _veto_or_allow_final(
+            run_state,
+            db_state,
+            contract,
+            summary,
+            available_names,
             guidance=_final_answer_guidance(db_state, summary, contract=contract),
             warning=warning,
             diagnostics=diagnostics,
@@ -93,8 +97,12 @@ def evaluate_db_final_answer_readiness(
         if can_answer and incomplete_final
         else "db_final_answer_without_query_evidence"
     )
-    return FinalAnswerReadiness(
-        allow_final=False,
+    return _veto_or_allow_final(
+        run_state,
+        db_state,
+        contract,
+        summary,
+        available_names,
         guidance=_final_answer_guidance(db_state, summary, contract=contract),
         warning=warning,
         diagnostics=diagnostics,
@@ -139,6 +147,8 @@ def summarize_db_completeness(
     missing_required_fields = _missing_required_fields(
         requirements, evidence_columns, executed_records
     )
+    if schema_only or _contract_evidence_mode(contract) == "catalog":
+        missing_required_fields = []
     truncated_count = sum(
         1 for record in executed_records if bool(record.payload.get("truncated"))
     )
@@ -234,6 +244,65 @@ def _any_tool_has_capability(
 def _looks_incomplete_final_answer(text: str) -> bool:
     normalized = " ".join(str(text or "").lower().split())
     return any(marker in normalized for marker in INCOMPLETE_FINAL_MARKERS)
+
+
+def _veto_or_allow_final(
+    run_state: Any,
+    db_state: Any,
+    contract: Optional[Any],
+    summary: Dict[str, Any],
+    available_names: set[str],
+    *,
+    guidance: str,
+    warning: str,
+    diagnostics: Dict[str, Any],
+) -> FinalAnswerReadiness:
+    if isinstance(db_state, DbRunState):
+        db_state.final_veto_count += 1
+        diagnostics["db_final_veto_count"] = db_state.final_veto_count
+    if _should_release_final_veto(
+        run_state, db_state, contract, summary, available_names
+    ):
+        return FinalAnswerReadiness(
+            warning="db_final_veto_limit_released",
+            diagnostics=diagnostics,
+        )
+    return FinalAnswerReadiness(
+        allow_final=False,
+        guidance=guidance,
+        warning=warning,
+        diagnostics=diagnostics,
+    )
+
+
+def _should_release_final_veto(
+    run_state: Any,
+    db_state: Any,
+    contract: Optional[Any],
+    summary: Dict[str, Any],
+    available_names: set[str],
+) -> bool:
+    if not isinstance(db_state, DbRunState):
+        return False
+    max_vetoes = int(getattr(contract, "max_final_vetoes", 1) or 1)
+    if db_state.final_veto_count <= max_vetoes:
+        return False
+    if int(summary.get("evidence_count") or 0) <= 0:
+        return False
+    max_tool_calls = getattr(contract, "max_tool_calls", None)
+    budget_exhausted = (
+        isinstance(max_tool_calls, int)
+        and int(getattr(run_state, "tool_call_count", 0) or 0) >= max_tool_calls
+    )
+    if _is_schema_only_state(db_state, contract=contract):
+        can_get_schema = _any_tool_has_capability(
+            available_names, CATALOG_NAVIGATION_CAPABILITIES
+        )
+        return bool(summary.get("can_answer") or budget_exhausted or not can_get_schema)
+    can_get_query_evidence = _any_tool_has_capability(
+        available_names, ANSWER_EVIDENCE_CAPABILITIES
+    )
+    return bool(budget_exhausted or not can_get_query_evidence)
 
 
 def _status(

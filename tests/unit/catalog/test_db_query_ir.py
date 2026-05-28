@@ -1191,6 +1191,122 @@ def test_schema_only_completeness_accepts_catalog_evidence():
     assert completeness["catalog_column_evidence_count"] == 2
 
 
+def test_schema_only_completeness_treats_required_fields_as_answer_shape():
+    state = DbRunState(intent_kind="schema_question")
+    _set_answer_requirements(
+        state,
+        ["table_name", "relevant_columns", "why_relevant", "relationship_evidence"],
+    )
+    run_state = RunState(agent_id="test-agent")
+    run_state.domains["db"] = state
+    state.record_catalog_tool_result(
+        "catalog_search_schema",
+        {"query": "billing revenue"},
+        {
+            "tables": [
+                {
+                    "name": "payments",
+                    "score": 0.95,
+                    "matched_fields": [{"name": "amount", "score": 0.9}],
+                }
+            ]
+        },
+    )
+
+    completeness = attach_db_completeness(run_state)
+
+    assert completeness["status"] == "answerable_schema"
+    assert completeness["can_answer"] is True
+    assert completeness["missing_required_fields"] == []
+    assert completeness["queries_executed"] == 0
+
+
+def test_orchestrator_downgrades_schema_plan_to_catalog_contract():
+    from daita.agents.db.runtime.orchestrator import (
+        DbRunContract,
+        DbRunOrchestrator,
+    )
+
+    agent = SimpleNamespace(
+        tool_registry=SimpleNamespace(
+            tool_names=[
+                "db_plan_query",
+                "db_query",
+                "db_sample",
+                "catalog_search_schema",
+                "catalog_inspect_table",
+                "catalog_find_join_paths",
+            ]
+        )
+    )
+    state = DbRunState()
+    orchestrator = DbRunOrchestrator(
+        agent,
+        "Which tables are relevant for billing?",
+        state=state,
+    )
+    orchestrator.contract = DbRunContract(
+        intent="data_query_simple",
+        access_mode="query_allowed",
+        capabilities=("db.plan", "db.sql_execute", "db.row_read"),
+        tools=("db_plan_query", "db_query", "db_sample"),
+        required_phases=("plan", "execute"),
+        terminal_tools=("db_query",),
+        evidence_mode="query",
+        forbidden_capabilities=(),
+        allow_catalog_final=False,
+        require_executed_query=True,
+        max_model_turns=6,
+        max_tool_calls=8,
+        max_repair_attempts=1,
+    )
+    state.run_contract = orchestrator.contract
+
+    orchestrator.observe_tool_result(
+        RunState(agent_id="test-agent"),
+        {"name": "db_plan_query", "arguments": {}},
+        {
+            "tool": "db_plan_query",
+            "result": {
+                "ok": True,
+                "route": "schema_question",
+                "compiled_sql": None,
+                "knowledge_used": {
+                    "sources": ["catalog"],
+                    "tables": ["payments"],
+                },
+                "table_candidates": [
+                    {
+                        "name": "payments",
+                        "score": 9.0,
+                        "matched_fields": [{"name": "amount", "score": 8.0}],
+                    }
+                ],
+            },
+        },
+    )
+
+    assert orchestrator.contract.evidence_mode == "catalog"
+    assert orchestrator.contract.access_mode == "schema_only"
+    assert orchestrator.contract.require_executed_query is False
+    assert orchestrator.contract.allow_catalog_final is True
+    assert orchestrator.contract.tools == (
+        "catalog_search_schema",
+        "catalog_inspect_table",
+        "catalog_find_join_paths",
+    )
+    assert state.intent_kind == "schema_question"
+    assert state.catalog_evidence["tables"][0]["table"] == "payments"
+    assert state.catalog_evidence["columns"][0]["column"] == "amount"
+
+    blocked = orchestrator.before_tool_call(
+        RunState(agent_id="test-agent"),
+        {"name": "db_sample", "arguments": {"table": "payments", "n": 1}},
+    )
+    assert blocked.allow is False
+    assert blocked.warning == "db_tool_not_allowed:db_sample"
+
+
 def test_db_completeness_requires_planned_fields_in_returned_columns():
     state = DbRunState()
     _set_answer_requirements(state, ["customer_name"])
