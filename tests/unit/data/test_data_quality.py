@@ -13,6 +13,7 @@ from daita.plugins.data_quality import (
     data_quality,
     _validate_identifier,
 )
+from daita.plugins.base import PluginContext
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -50,6 +51,30 @@ def test_factory_function_returns_plugin():
     assert isinstance(data_quality(), DataQualityPlugin)
 
 
+def test_data_quality_declares_extension_manifest_and_capabilities():
+    plugin = DataQualityPlugin()
+
+    assert plugin.manifest.id == "data_quality"
+    assert {capability.id for capability in plugin.declare_capabilities()} == {
+        "quality.profile",
+        "quality.anomaly.detect",
+        "quality.freshness.check",
+        "quality.report.generate",
+    }
+    assert {executor.id for executor in plugin.get_executors()} == {
+        "data_quality.profile",
+        "data_quality.anomaly.detect",
+        "data_quality.freshness.check",
+        "data_quality.report.generate",
+    }
+    assert {schema.kind for schema in plugin.declare_evidence_schemas()} == {
+        "quality.profile",
+        "quality.anomaly",
+        "quality.freshness",
+        "quality.report",
+    }
+
+
 def test_factory_function_passes_db():
     db = MagicMock()
     assert data_quality(db=db)._db is db
@@ -79,33 +104,67 @@ def test_validate_identifier_invalid():
 
 
 # ---------------------------------------------------------------------------
-# initialize
+# setup
 # ---------------------------------------------------------------------------
 
 
-def test_initialize_sets_agent_id():
+async def test_setup_sets_agent_id():
     plugin = DataQualityPlugin()
     with patch("daita.core.graph.backend.auto_select_backend") as mock_backend:
         mock_backend.return_value = MagicMock()
-        plugin.initialize("agent-123")
+        await plugin.setup(
+            PluginContext(
+                runtime_id="runtime-123",
+                runtime_kind="agent",
+                agent_id="agent-123",
+            )
+        )
     assert plugin._agent_id == "agent-123"
 
 
-def test_initialize_auto_selects_backend():
+async def test_setup_auto_selects_backend():
     plugin = DataQualityPlugin()
     mock_be = MagicMock()
     with patch("daita.core.graph.backend.auto_select_backend", return_value=mock_be):
-        plugin.initialize("agent-123")
+        await plugin.setup(
+            PluginContext(
+                runtime_id="runtime-123",
+                runtime_kind="agent",
+                agent_id="agent-123",
+            )
+        )
     assert plugin._graph_backend is mock_be
 
 
-def test_initialize_skips_backend_if_provided():
+async def test_setup_skips_backend_if_provided():
     custom_backend = MagicMock()
     plugin = DataQualityPlugin(backend=custom_backend)
     with patch("daita.core.graph.backend.auto_select_backend") as mock_select:
-        plugin.initialize("agent-123")
+        await plugin.setup(
+            PluginContext(
+                runtime_id="runtime-123",
+                runtime_kind="agent",
+                agent_id="agent-123",
+            )
+        )
     mock_select.assert_not_called()
     assert plugin._graph_backend is custom_backend
+
+
+async def test_setup_uses_plugin_context_and_auto_selects_backend():
+    plugin = DataQualityPlugin()
+    mock_be = MagicMock()
+    with patch("daita.core.graph.backend.auto_select_backend", return_value=mock_be):
+        await plugin.setup(
+            PluginContext(
+                runtime_id="runtime-123",
+                runtime_kind="agent",
+                agent_id="agent-123",
+            )
+        )
+
+    assert plugin._agent_id == "agent-123"
+    assert plugin._graph_backend is mock_be
 
 
 # ---------------------------------------------------------------------------
@@ -126,30 +185,30 @@ def test_validate_db_returns_db():
 
 
 # ---------------------------------------------------------------------------
-# get_tools — now 4 tools (profile, detect_anomaly, check_freshness, report)
+# Runtime capability declarations
 # ---------------------------------------------------------------------------
 
 
-def test_get_tools_returns_four_tools():
+def test_declared_capabilities_return_four_operations():
     plugin = make_dq()
-    assert len(plugin.get_tools()) == 4
+    assert len(plugin.declare_capabilities()) == 4
 
 
-def test_get_tools_names():
+def test_declared_capability_names():
     plugin = make_dq()
-    names = {t.name for t in plugin.get_tools()}
+    names = {capability.id for capability in plugin.declare_capabilities()}
     assert names == {
-        "dq_profile",
-        "dq_detect_anomaly",
-        "dq_check_freshness",
-        "dq_report",
+        "quality.profile",
+        "quality.anomaly.detect",
+        "quality.freshness.check",
+        "quality.report.generate",
     }
 
 
-def test_all_tools_have_handlers():
+def test_all_declared_executors_have_handlers():
     plugin = make_dq()
-    for tool in plugin.get_tools():
-        assert callable(tool.handler)
+    for executor in plugin.get_executors():
+        assert callable(executor.handler)
 
 
 # ---------------------------------------------------------------------------

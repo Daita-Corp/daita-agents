@@ -39,6 +39,7 @@ boto3 = pytest.importorskip(
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
 from daita.core.graph import LocalGraphBackend
+from daita.plugins.base import PluginContext
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.aws import AWSDiscoverer
 
@@ -107,6 +108,16 @@ def _aws_reachable() -> bool:
         return False
 
 
+async def _setup_catalog(plugin: CatalogPlugin, agent_id: str) -> None:
+    await plugin.setup(
+        PluginContext(
+            runtime_id=agent_id,
+            runtime_kind="agent",
+            agent_id=agent_id,
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -141,7 +152,7 @@ async def plugin_with_aws(tmp_path, monkeypatch, aws_discoverer):
     backend = LocalGraphBackend(graph_type="catalog_aws_live")
     plugin = CatalogPlugin(backend=backend, auto_persist=False)
     plugin.add_discoverer(aws_discoverer)
-    plugin.initialize("catalog-aws-live")
+    await _setup_catalog(plugin, "catalog-aws-live")
     return plugin, backend
 
 

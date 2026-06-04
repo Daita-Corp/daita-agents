@@ -248,7 +248,7 @@ class TestDeferredContradictionChecking:
         chunk_id = result["chunk_id"]
         assert len(plugin._pending_contradiction_checks) == 1
 
-        # Simulate the deferred processing from on_agent_stop
+        # Simulate the deferred processing from teardown
         real_plugin = MagicMock(spec=MemoryPlugin)
         real_plugin.backend = backend
         real_plugin._checker = checker

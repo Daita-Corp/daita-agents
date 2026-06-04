@@ -7,12 +7,16 @@ parameter validation, and error mapping without making real API calls.
 
 import pytest
 from unittest.mock import MagicMock, patch
+from daita.plugins.manifest import PluginKind
+from daita.plugins.registry import ExtensionRegistry
 from daita.plugins.exa import (
     ExaSearchPlugin,
     exa_search,
     _extract_snippet,
     _result_from_item,
 )
+from daita.runtime import Operation, Task
+from tests.unit.plugins.projection_helpers import projected_tools, projected_tool_names
 from daita.core.exceptions import (
     AuthenticationError,
     RateLimitError,
@@ -50,6 +54,37 @@ def make_response(items):
     response = MagicMock()
     response.results = items
     return response
+
+
+def test_exa_plugin_declares_extension_first_contract():
+    plugin = make_plugin()
+    registry = ExtensionRegistry()
+
+    registry.register(plugin)
+
+    assert plugin.manifest.id == "exa_search"
+    assert plugin.manifest.kind is PluginKind.CONNECTOR
+    assert registry.plugin_ids == ("exa_search",)
+    assert {capability.id for capability in registry.capabilities} == {
+        "exa_search.web.search",
+        "exa_search.web.find_similar",
+    }
+    assert {view.name for view in registry.tool_views} == {
+        "search_web",
+        "find_similar",
+    }
+    assert registry.evidence_schemas[0].kind == "web.search.results"
+
+
+def test_exa_projected_tools_carry_declared_capability_metadata():
+    plugin = make_plugin()
+
+    by_name = projected_tools(plugin)
+
+    assert by_name["search_web"].capability_ids == ("exa_search.web.search",)
+    assert by_name["search_web"].side_effecting is False
+    assert by_name["search_web"].idempotent is True
+    assert by_name["find_similar"].capability_ids == ("exa_search.web.find_similar",)
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +290,52 @@ async def test_search_returns_normalized_results(monkeypatch):
     assert out["results"][0]["highlights"] == ["key passage"]
 
 
+async def test_exa_executor_returns_typed_search_evidence(monkeypatch):
+    plugin = make_plugin(include_highlights=True)
+    fake_response = make_response(
+        [
+            {
+                "title": "Doc",
+                "url": "https://example.com/doc",
+                "highlights": ["key passage"],
+            }
+        ]
+    )
+
+    async def fake_call(self, kwargs, contents):
+        assert kwargs["query"] == "test query"
+        assert contents == {"highlights": True}
+        return fake_response
+
+    monkeypatch.setattr(ExaSearchPlugin, "_call_search_with_contents", fake_call)
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+
+    executor = registry.get_executor("exa_search.web")
+    operation = Operation(id="op-1", operation_type="web.search")
+    task = Task(
+        id="task-1",
+        operation_id=operation.id,
+        capability_id="exa_search.web.search",
+        executor_id="exa_search.web",
+        input={"query": "test query"},
+        required_evidence=frozenset({"web.search.results"}),
+    )
+
+    evidence = await executor.execute(
+        task,
+        operation,
+        {"tool_view": {"name": "search_web"}},
+    )
+
+    assert len(evidence) == 1
+    assert evidence[0].kind == "web.search.results"
+    assert evidence[0].owner == "exa_search"
+    assert evidence[0].payload["operation"] == "search_web"
+    assert evidence[0].payload["request"] == {"query": "test query"}
+    assert evidence[0].payload["response"]["results"][0]["title"] == "Doc"
+
+
 async def test_search_passes_filters_to_sdk(monkeypatch):
     plugin = make_plugin(include_highlights=False)
     captured = {}
@@ -366,10 +447,9 @@ async def test_search_error_propagates_as_daita_error(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_get_tools_exposes_search_and_find_similar():
+def test_projected_tools_expose_search_and_find_similar():
     plugin = make_plugin()
-    tools = plugin.get_tools()
-    names = {t.name for t in tools}
+    names = projected_tool_names(plugin)
     assert names == {"search_web", "find_similar"}
 
 

@@ -9,21 +9,179 @@ import os
 import json
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from datetime import datetime
-from .base import BasePlugin
+
+from daita.runtime import (
+    AccessMode,
+    Capability,
+    Evidence,
+    EvidenceSchema,
+    RiskLevel,
+    ToolView,
+)
+
+from .base import ConnectorPlugin
+from .manifest import PluginKind, PluginManifest
 from ..core.exceptions import AuthenticationError, PluginError
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
 
-class SlackPlugin(BasePlugin):
+_SLACK_TOOL_DEFINITIONS = (
+    {
+        "name": "send_slack_message",
+        "capability_id": "slack.message.send",
+        "operation_type": "slack.message.send",
+        "description": "Send a message to a Slack channel or user.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "Channel name (e.g., #general) or channel ID",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Message text to send",
+                },
+            },
+            "required": ["channel", "text"],
+        },
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.MEDIUM,
+        "retry_safe": False,
+        "idempotent": False,
+        "side_effecting": True,
+        "handler_name": "_tool_send_message",
+    },
+    {
+        "name": "send_slack_summary",
+        "capability_id": "slack.summary.send",
+        "operation_type": "slack.summary.send",
+        "description": "Send a formatted agent results summary to a Slack channel.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "Channel name or ID",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Summary text describing the results",
+                },
+                "results": {
+                    "type": "object",
+                    "description": "Optional results data to include",
+                },
+            },
+            "required": ["channel", "summary"],
+        },
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.MEDIUM,
+        "retry_safe": False,
+        "idempotent": False,
+        "side_effecting": True,
+        "handler_name": "_tool_send_summary",
+    },
+    {
+        "name": "list_slack_channels",
+        "capability_id": "slack.channel.list",
+        "operation_type": "slack.channel.list",
+        "description": "List all Slack channels the bot has access to.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+        "access": AccessMode.METADATA_READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "handler_name": "_tool_list_channels",
+    },
+    {
+        "name": "read_slack_messages",
+        "capability_id": "slack.message.read",
+        "operation_type": "slack.message.read",
+        "description": "Read recent messages from a Slack channel.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "Channel ID or name (e.g., #general)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of messages to return (default: 20)",
+                },
+            },
+            "required": ["channel"],
+        },
+        "access": AccessMode.READ,
+        "risk": RiskLevel.MEDIUM,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "handler_name": "_tool_read_messages",
+    },
+)
+
+
+class _SlackExecutor:
+    """Execute Slack runtime capabilities and return typed evidence."""
+
+    id = "slack.operations"
+    capability_ids = frozenset(
+        definition["capability_id"] for definition in _SLACK_TOOL_DEFINITIONS
+    )
+
+    def __init__(self, plugin: "SlackPlugin") -> None:
+        self._plugin = plugin
+
+    async def execute(self, task, operation, context):
+        definition = self._plugin._definition_for_capability(task.capability_id)
+        handler = getattr(self._plugin, definition["handler_name"])
+        result = await handler(dict(task.input or {}))
+        tool_view_name = (
+            context.get("tool_view", {}).get("name")
+            if isinstance(context, dict)
+            else None
+        ) or definition["name"]
+        return [
+            Evidence(
+                kind="slack.operation.result",
+                owner=self._plugin.manifest.id,
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={
+                    "operation": definition["name"],
+                    "request": dict(task.input or {}),
+                    "result": result,
+                },
+                metadata={
+                    "capability_id": task.capability_id,
+                    "tool_view": tool_view_name,
+                },
+            )
+        ]
+
+
+class SlackPlugin(ConnectorPlugin):
     """
     Simple Slack plugin for agents.
 
     Handles Slack messaging, thread management, and file sharing with agent-specific features.
     """
+
+    manifest = PluginManifest(
+        id="slack",
+        display_name="Slack",
+        version="2.0.0",
+        kind=PluginKind.CONNECTOR,
+        domains=frozenset({"slack", "messaging", "collaboration"}),
+        provides=frozenset({"slack_read", "slack_send"}),
+    )
 
     def __init__(self, token: str, default_channel: Optional[str] = None, **kwargs):
         """
@@ -50,8 +208,84 @@ class SlackPlugin(BasePlugin):
 
         self._client = None
         self._user_info = None
+        self._executor = _SlackExecutor(self)
 
         logger.debug(f"Slack plugin configured with token: {token[:12]}...")
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether the Slack client has been initialized."""
+        return self._client is not None
+
+    async def teardown(self) -> None:
+        """Release runtime-owned Slack resources."""
+        await self.disconnect()
+
+    def declare_capabilities(self) -> tuple[Capability, ...]:
+        """Declare Slack operations as runtime-plannable capabilities."""
+        return tuple(
+            Capability(
+                id=definition["capability_id"],
+                owner=self.manifest.id,
+                description=definition["description"],
+                domains=frozenset({"slack", "messaging", "collaboration"}),
+                operation_types=frozenset({definition["operation_type"]}),
+                access=definition["access"],
+                risk=definition["risk"],
+                input_schema=definition["parameters"],
+                output_evidence=frozenset({"slack.operation.result"}),
+                executor=self._executor.id,
+                model_visible=True,
+                retry_safe=definition["retry_safe"],
+                replay_safe=definition["retry_safe"],
+                idempotent=definition["idempotent"],
+                side_effecting=definition["side_effecting"],
+                timeout_seconds=30,
+                metadata={"tool_name": definition["name"]},
+            )
+            for definition in _SLACK_TOOL_DEFINITIONS
+        )
+
+    def declare_evidence_schemas(self) -> tuple[EvidenceSchema, ...]:
+        """Declare the typed evidence returned by Slack capability execution."""
+        return (
+            EvidenceSchema(
+                kind="slack.operation.result",
+                owner=self.manifest.id,
+                description="Slack operation result evidence.",
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string"},
+                        "request": {"type": "object"},
+                        "result": {"type": "object"},
+                    },
+                    "required": ["operation", "request", "result"],
+                },
+            ),
+        )
+
+    def get_executors(self) -> tuple[_SlackExecutor, ...]:
+        """Return the executor for Slack runtime capabilities."""
+        return (self._executor,)
+
+    def get_tool_views(self) -> tuple[ToolView, ...]:
+        """Expose Slack capabilities as model-visible tool views."""
+        return tuple(
+            ToolView(
+                name=definition["name"],
+                capability_id=definition["capability_id"],
+                description=definition["description"],
+                parameters=definition["parameters"],
+            )
+            for definition in _SLACK_TOOL_DEFINITIONS
+        )
+
+    def _definition_for_capability(self, capability_id: str) -> dict[str, Any]:
+        for definition in _SLACK_TOOL_DEFINITIONS:
+            if definition["capability_id"] == capability_id:
+                return definition
+        raise KeyError(capability_id)
 
     async def connect(self):
         """Initialize Slack client and validate connection."""
@@ -235,80 +469,6 @@ class SlackPlugin(BasePlugin):
             logger.error(f"Failed to send agent summary: {e}")
             raise PluginError(
                 f"Slack send_agent_summary failed: {e}", plugin_name="Slack"
-            )
-
-    async def create_thread_from_workflow(
-        self,
-        channel: str,
-        workflow_results: Dict[str, Any],
-        title: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Create a threaded discussion from workflow results.
-
-        Args:
-            channel: Channel ID or name
-            workflow_results: Workflow execution results
-            title: Optional title for the thread
-
-        Returns:
-            Thread creation response with thread_ts
-
-        Example:
-            result = await slack.create_thread_from_workflow("#workflows", workflow_results)
-        """
-        if self._client is None:
-            await self.connect()
-
-        try:
-            # Create initial thread message
-            thread_title = (
-                title
-                or f"Workflow Results - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            )
-
-            # Create main thread message
-            main_blocks = self._format_workflow_summary(workflow_results, thread_title)
-
-            main_response = await self.send_message(
-                channel=channel,
-                text=f"Workflow Thread: {thread_title}",
-                blocks=main_blocks,
-            )
-
-            thread_ts = main_response["ts"]
-
-            # Add individual agent results as thread replies
-            agents = workflow_results.get("agents", {})
-            for agent_id, agent_result in agents.items():
-                agent_blocks = self._format_agent_results(
-                    agent_result, f"Agent: {agent_id}"
-                )
-
-                await self.send_message(
-                    channel=channel,
-                    text=f"Agent {agent_id} Results",
-                    blocks=agent_blocks,
-                    thread_ts=thread_ts,
-                )
-
-            result = {
-                "ok": True,
-                "thread_ts": thread_ts,
-                "channel": channel,
-                "agent_count": len(agents),
-                "main_message": main_response,
-            }
-
-            logger.info(
-                f"Created workflow thread in {channel} with {len(agents)} agents"
-            )
-            return result
-
-        except Exception as e:
-            logger.error(f"Failed to create workflow thread: {e}")
-            raise PluginError(
-                f"Slack create_thread_from_workflow failed: {e}", plugin_name="Slack"
             )
 
     async def upload_file(
@@ -551,150 +711,6 @@ class SlackPlugin(BasePlugin):
             )
 
         return blocks
-
-    def _format_workflow_summary(
-        self, workflow_results: Dict[str, Any], title: str
-    ) -> List[Dict[str, Any]]:
-        """Format workflow results as Slack Block Kit blocks."""
-        blocks = []
-
-        # Header block
-        blocks.append({"type": "header", "text": {"type": "plain_text", "text": title}})
-
-        # Workflow summary
-        total_agents = len(workflow_results.get("agents", {}))
-        successful_agents = sum(
-            1
-            for agent in workflow_results.get("agents", {}).values()
-            if agent.get("status") == "success"
-        )
-        failed_agents = total_agents - successful_agents
-
-        workflow_status = "Success" if failed_agents == 0 else f"{failed_agents} Failed"
-
-        blocks.append(
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*Status:* {workflow_status}"},
-                    {"type": "mrkdwn", "text": f"*Total Agents:* {total_agents}"},
-                    {"type": "mrkdwn", "text": f"*Successful:* {successful_agents}"},
-                    {"type": "mrkdwn", "text": f"*Failed:* {failed_agents}"},
-                ],
-            }
-        )
-
-        # Add divider
-        blocks.append({"type": "divider"})
-
-        # Agent summary
-        if total_agents > 0:
-            blocks.append(
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": "*Agent Results:*\nSee thread replies for detailed results from each agent.",
-                    },
-                }
-            )
-
-        return blocks
-
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose Slack operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for Slack messaging operations
-        """
-        from ..core.tools import AgentTool
-
-        return [
-            AgentTool(
-                name="send_slack_message",
-                description="Send a message to a Slack channel or user.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "channel": {
-                            "type": "string",
-                            "description": "Channel name (e.g., #general) or channel ID",
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": "Message text to send",
-                        },
-                    },
-                    "required": ["channel", "text"],
-                },
-                handler=self._tool_send_message,
-                category="communication",
-                source="plugin",
-                plugin_name="Slack",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="send_slack_summary",
-                description="Send a formatted agent results summary to a Slack channel.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "channel": {
-                            "type": "string",
-                            "description": "Channel name or ID",
-                        },
-                        "summary": {
-                            "type": "string",
-                            "description": "Summary text describing the results",
-                        },
-                        "results": {
-                            "type": "object",
-                            "description": "Optional results data to include",
-                        },
-                    },
-                    "required": ["channel", "summary"],
-                },
-                handler=self._tool_send_summary,
-                category="communication",
-                source="plugin",
-                plugin_name="Slack",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="list_slack_channels",
-                description="List all Slack channels the bot has access to.",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_list_channels,
-                category="communication",
-                source="plugin",
-                plugin_name="Slack",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="read_slack_messages",
-                description="Read recent messages from a Slack channel.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "channel": {
-                            "type": "string",
-                            "description": "Channel ID or name (e.g., #general)",
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of messages to return (default: 20)",
-                        },
-                    },
-                    "required": ["channel"],
-                },
-                handler=self._tool_read_messages,
-                category="communication",
-                source="plugin",
-                plugin_name="Slack",
-                timeout_seconds=30,
-            ),
-        ]
 
     async def _tool_send_message(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for send_slack_message"""

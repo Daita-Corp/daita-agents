@@ -3,16 +3,27 @@ Unit tests for the skills system (daita/skills/, agent.add_skill()).
 """
 
 import logging
-import os
-import tempfile
-
 import pytest
 
 from daita.agents.agent import Agent
 from daita.core.exceptions import SkillError
-from daita.core.tools import AgentTool
 from daita.llm.mock import MockLLMProvider
-from daita.plugins.base import BasePlugin, LifecyclePlugin
+from daita.plugins import (
+    ExtensionRegistry,
+    PluginKind,
+    PluginManifest,
+    RuntimeExtensionPlugin,
+    SkillPlugin,
+)
+from daita.runtime import (
+    AccessMode,
+    Capability,
+    Evidence,
+    Operation,
+    RiskLevel,
+    Task,
+    ToolView,
+)
 from daita.skills.base import BaseSkill, Skill
 
 # ===========================================================================
@@ -20,24 +31,98 @@ from daita.skills.base import BaseSkill, Skill
 # ===========================================================================
 
 
-def _tool(name: str):
-    async def h(args):
-        return f"result_from_{name}"
+class RecordingExecutor:
+    def __init__(self, executor_id: str, capability_ids: tuple[str, ...]):
+        self.id = executor_id
+        self.capability_ids = frozenset(capability_ids)
+        self.calls = []
 
-    return AgentTool(name=name, description=f"Tool {name}", parameters={}, handler=h)
+    async def execute(self, task: Task, operation: Operation, context: dict):
+        self.calls.append((task, operation, context))
+        return [
+            Evidence(
+                kind="skill.result",
+                owner=task.executor_id.split(".")[0],
+                payload={"ok": True, "input": task.input},
+            )
+        ]
 
 
-class StubPlugin(BasePlugin):
-    """Minimal plugin for dependency resolution tests."""
+def _capability(
+    capability_id: str,
+    owner: str,
+    executor_id: str,
+    *,
+    description: str = "Run capability.",
+) -> Capability:
+    return Capability(
+        id=capability_id,
+        owner=owner,
+        description=description,
+        domains=frozenset({"agent", "skill"}),
+        operation_types=frozenset({"skill.execute"}),
+        access=AccessMode.READ,
+        risk=RiskLevel.LOW,
+        input_schema={"type": "object"},
+        output_evidence=frozenset({"skill.result"}),
+        executor=executor_id,
+        model_visible=True,
+        side_effecting=False,
+    )
 
-    def get_tools(self):
-        return [_tool("stub_query")]
+
+class StubPlugin(RuntimeExtensionPlugin):
+    """Minimal plugin for capability dependency resolution tests."""
+
+    manifest = PluginManifest(
+        id="stub",
+        display_name="Stub",
+        version="1.0.0",
+        kind=PluginKind.RUNTIME_EXTENSION,
+    )
+
+    def __init__(self):
+        self.executor = RecordingExecutor("stub.execute", ("db.sql.execute_read",))
+
+    def declare_capabilities(self):
+        return (
+            _capability(
+                "db.sql.execute_read",
+                "stub",
+                "stub.execute",
+                description="Execute a read query.",
+            ),
+        )
+
+    def get_executors(self):
+        return (self.executor,)
 
 
-class StubDatabasePlugin(BasePlugin):
-    """A different plugin type for negative-match tests."""
+class ManifestDependencyPlugin(RuntimeExtensionPlugin):
+    manifest = PluginManifest(
+        id="manifest_dependency",
+        display_name="Manifest Dependency",
+        version="1.0.0",
+        kind=PluginKind.RUNTIME_EXTENSION,
+    )
 
-    pass
+    def __init__(self):
+        self.executor = RecordingExecutor(
+            "manifest_dependency.execute",
+            ("dependency.lookup",),
+        )
+
+    def declare_capabilities(self):
+        return (
+            _capability(
+                "dependency.lookup",
+                "manifest_dependency",
+                "manifest_dependency.execute",
+            ),
+        )
+
+    def get_executors(self):
+        return (self.executor,)
 
 
 # ===========================================================================
@@ -90,26 +175,40 @@ class TestBaseSkill:
         prompt_file.write_text("v2")
         assert skill.get_instructions() == "v1"
 
-    def test_get_tools_default_empty(self):
+    def test_skill_has_no_local_get_tools_surface(self):
         skill = BaseSkill()
-        assert skill.get_tools() == []
+        assert not hasattr(skill, "get_tools")
 
-    def test_requires_default_empty(self):
+    def test_requires_capabilities_default_empty(self):
         skill = BaseSkill()
-        assert skill.requires() == {}
+        assert skill.requires_capabilities() == ()
+        assert skill.resolved_capabilities == {}
 
     def test_config_passthrough(self):
         skill = BaseSkill(sample_size=500, mode="fast")
         assert skill.config == {"sample_size": 500, "mode": "fast"}
 
-    async def test_on_before_run_returns_instructions(self):
-        class MySkill(BaseSkill):
-            name = "my"
-            instructions = "Be helpful."
+    def test_skill_uses_extension_contract_not_lifecycle_base(self):
+        skill = Skill(name="report_builder", instructions="Use tables.")
 
-        skill = MySkill()
-        result = await skill.on_before_run("any prompt")
-        assert result == "Be helpful."
+        assert isinstance(skill, SkillPlugin)
+        assert skill.manifest.id == "skill_report_builder"
+        assert skill.manifest.kind is PluginKind.SKILL
+
+    async def test_skill_declares_instruction_context_provider(self):
+        skill = Skill(name="report", instructions="Use markdown.")
+        provider = skill.get_context_providers()[0]
+
+        block = await provider.render(
+            {"prompt": "draft a report"},
+            next(iter(provider.audiences)),
+            1000,
+        )
+
+        assert provider.id == "skill_report.instructions"
+        assert block.content == "Use markdown."
+        assert block.metadata["context_kind"] == "skill_instructions"
+        assert block.metadata["skill_name"] == "report"
 
 
 # ===========================================================================
@@ -119,15 +218,40 @@ class TestBaseSkill:
 
 class TestSkillFactory:
     def test_basic_creation(self):
-        t = _tool("fmt")
-        skill = Skill(name="report", instructions="Use markdown.", tools=[t])
+        executor = RecordingExecutor("skill_report.format", ("skill.report.format",))
+        capability = _capability(
+            "skill.report.format",
+            "skill_report",
+            "skill_report.format",
+        )
+        tool_view = ToolView(
+            name="format_report",
+            capability_id="skill.report.format",
+            description="Format a report.",
+            parameters={"type": "object"},
+        )
+        skill = Skill(
+            name="report",
+            instructions="Use markdown.",
+            capabilities=(capability,),
+            executors=(executor,),
+            tool_views=(tool_view,),
+        )
         assert skill.name == "report"
         assert skill.get_instructions() == "Use markdown."
-        assert skill.get_tools() == [t]
+        assert skill.declare_capabilities() == (capability,)
+        assert skill.get_executors() == (executor,)
+        assert skill.get_tool_views() == (tool_view,)
 
-    def test_no_tools_defaults_empty(self):
+    def test_runtime_declarations_default_empty(self):
         skill = Skill(name="empty", instructions="Nothing.")
-        assert skill.get_tools() == []
+        assert skill.declare_capabilities() == ()
+        assert skill.get_executors() == ()
+        assert skill.get_tool_views() == ()
+
+    def test_rejects_legacy_tools_keyword(self):
+        with pytest.raises(TypeError, match="no longer accepts 'tools'"):
+            Skill(name="legacy", tools=[object()])
 
     def test_rejects_relative_instructions_file(self):
         with pytest.raises(ValueError, match="absolute path"):
@@ -157,11 +281,46 @@ class TestSkillFactory:
 
 
 class TestAddSkill:
-    def test_skill_appears_in_tool_sources(self, mock_llm):
+    def test_constructor_skills_register_with_extension_registry(self, mock_llm):
+        skill = Skill(name="s", instructions="Do stuff.")
+
+        agent = Agent(name="A", llm_provider=mock_llm, skills=[skill])
+
+        assert agent.skills == [skill]
+        assert "skill_s" in agent.attached_plugin_ids
+        assert "skills" not in agent._llm_kwargs
+
+    def test_constructor_skills_resolve_capabilities_from_extension_registry(
+        self, mock_llm
+    ):
+        class DepSkill(BaseSkill):
+            name = "dep"
+
+            def requires_capabilities(self):
+                return ("dependency.lookup",)
+
+        plugin = ManifestDependencyPlugin()
+        registry = ExtensionRegistry()
+        registry.register(plugin)
+
+        skill = DepSkill()
+        agent = Agent(
+            name="A",
+            llm_provider=mock_llm,
+            extension_registry=registry,
+            skills=[skill],
+        )
+
+        assert skill.resolved_capabilities["dependency.lookup"] == (
+            plugin.declare_capabilities()[0],
+        )
+
+    def test_add_skill_registers_skill(self, mock_llm):
         agent = Agent(name="A", llm_provider=mock_llm)
         skill = Skill(name="s", instructions="Do stuff.")
         agent.add_skill(skill)
-        assert skill in agent.tool_sources
+        assert skill in agent.skills
+        assert "skill_s" in agent.attached_plugin_ids
 
     def test_skills_property(self, mock_llm):
         agent = Agent(name="A", llm_provider=mock_llm)
@@ -171,6 +330,15 @@ class TestAddSkill:
         agent.add_skill(s2)
         assert agent.skills == [s1, s2]
 
+    def test_skills_property_uses_constructor_extension_registry(self, mock_llm):
+        registry = ExtensionRegistry()
+        skill = Skill(name="s", instructions="Do stuff.")
+        registry.register(skill)
+
+        agent = Agent(name="A", llm_provider=mock_llm, extension_registry=registry)
+
+        assert agent.skills == [skill]
+
     def test_skills_property_excludes_plugins(self, mock_llm):
         agent = Agent(name="A", llm_provider=mock_llm)
         agent.add_plugin(StubPlugin())
@@ -178,18 +346,38 @@ class TestAddSkill:
         assert len(agent.skills) == 1
         assert agent.skills[0].name == "s"
 
-    def test_skill_tools_registered(self, mock_llm):
-        t = _tool("skill_tool")
+    async def test_skill_owned_tool_view_registers_as_agent_tool(self, mock_llm):
+        executor = RecordingExecutor("skill_s.lookup", ("skill.lookup",))
+        skill = Skill(
+            name="s",
+            capabilities=(_capability("skill.lookup", "skill_s", "skill_s.lookup"),),
+            executors=(executor,),
+            tool_views=(
+                ToolView(
+                    name="skill_lookup",
+                    capability_id="skill.lookup",
+                    description="Run skill lookup.",
+                    parameters={"type": "object"},
+                ),
+            ),
+        )
         agent = Agent(name="A", llm_provider=mock_llm)
-        agent.add_skill(Skill(name="s", tools=[t]))
-        assert "skill_tool" in agent.tool_names
 
-    def test_dependency_resolution_success(self, mock_llm):
+        agent.add_skill(skill)
+
+        tools = agent.available_tools
+        assert [tool.name for tool in tools] == ["skill_lookup"]
+        result = await agent.call_tool("skill_lookup", {"query": "abc"})
+        assert result["capability_id"] == "skill.lookup"
+        assert result["evidence"][0]["payload"]["input"] == {"query": "abc"}
+        assert executor.calls[0][0].capability_id == "skill.lookup"
+
+    def test_capability_requirement_resolution_success(self, mock_llm):
         class DepSkill(BaseSkill):
             name = "dep"
 
-            def requires(self):
-                return {"plug": StubPlugin}
+            def requires_capabilities(self):
+                return ("db.sql.execute_read",)
 
         agent = Agent(name="A", llm_provider=mock_llm)
         plugin = StubPlugin()
@@ -197,29 +385,51 @@ class TestAddSkill:
 
         skill = DepSkill()
         agent.add_skill(skill)
-        assert skill._resolved_plugins["plug"] is plugin
+        assert skill.resolved_capabilities["db.sql.execute_read"] == (
+            plugin.declare_capabilities()[0],
+        )
 
-    def test_dependency_resolution_failure(self, mock_llm):
+    def test_capability_requirement_uses_extension_registry_for_manifest_plugins(
+        self, mock_llm
+    ):
         class DepSkill(BaseSkill):
             name = "dep"
 
-            def requires(self):
-                return {"db": StubDatabasePlugin}
+            def requires_capabilities(self):
+                return ("dependency.lookup",)
 
         agent = Agent(name="A", llm_provider=mock_llm)
-        with pytest.raises(SkillError, match="requires plugins not yet added"):
+        plugin = ManifestDependencyPlugin()
+        agent.add_plugin(plugin)
+
+        skill = DepSkill()
+        agent.add_skill(skill)
+
+        assert skill.resolved_capabilities["dependency.lookup"] == (
+            plugin.declare_capabilities()[0],
+        )
+
+    def test_capability_requirement_resolution_failure(self, mock_llm):
+        class DepSkill(BaseSkill):
+            name = "dep"
+
+            def requires_capabilities(self):
+                return ("db.sql.execute_read",)
+
+        agent = Agent(name="A", llm_provider=mock_llm)
+        with pytest.raises(SkillError, match="requires capabilities not yet available"):
             agent.add_skill(DepSkill())
 
-    def test_dependency_resolution_partial_failure(self, mock_llm):
+    def test_capability_requirement_resolution_partial_failure(self, mock_llm):
         class MultiDepSkill(BaseSkill):
             name = "multi"
 
-            def requires(self):
-                return {"a": StubPlugin, "b": StubDatabasePlugin}
+            def requires_capabilities(self):
+                return ("db.sql.execute_read", "db.sql.execute_write")
 
         agent = Agent(name="A", llm_provider=mock_llm)
         agent.add_plugin(StubPlugin())
-        with pytest.raises(SkillError, match="StubDatabasePlugin"):
+        with pytest.raises(SkillError, match="db.sql.execute_write"):
             agent.add_skill(MultiDepSkill())
 
 
@@ -254,22 +464,6 @@ class TestPromptInjection:
         # Both under the same section header
         assert system_msg.count("## Skills & Expertise") == 1
 
-    async def test_plugin_context_not_grouped_with_skills(self, mock_llm):
-        class ContextPlugin(LifecyclePlugin):
-            async def on_before_run(self, prompt):
-                return "Plugin context here."
-
-        agent = Agent(name="A", llm_provider=mock_llm, prompt="Base.")
-        agent.add_plugin(ContextPlugin())
-        agent.add_skill(Skill(name="s", instructions="Skill inst."))
-
-        conversation = await agent._build_initial_conversation("Hi")
-        system_msg = conversation[0]["content"]
-
-        # Plugin context should be separate from the skills section
-        assert "Plugin context here." in system_msg
-        assert "### s\nSkill inst." in system_msg
-
     async def test_skill_with_no_instructions_omitted(self, mock_llm):
         agent = Agent(name="A", llm_provider=mock_llm)
         agent.add_skill(Skill(name="empty"))
@@ -285,21 +479,7 @@ class TestPromptInjection:
 # ===========================================================================
 
 
-class TestLifecycleExceptionLogging:
-    async def test_failing_plugin_logs_warning(self, mock_llm, caplog):
-        class FailingPlugin(LifecyclePlugin):
-            async def on_before_run(self, prompt):
-                raise RuntimeError("boom")
-
-        agent = Agent(name="A", llm_provider=mock_llm)
-        agent.add_plugin(FailingPlugin())
-
-        with caplog.at_level(logging.WARNING):
-            conversation = await agent._build_initial_conversation("Hi")
-
-        assert "on_before_run failed" in caplog.text
-        assert "boom" in caplog.text
-
+class TestSkillInstructionExceptionLogging:
     async def test_failing_skill_logs_warning(self, mock_llm, caplog):
         class FailingSkill(BaseSkill):
             name = "bad_skill"
@@ -315,19 +495,6 @@ class TestLifecycleExceptionLogging:
 
         assert "bad_skill" in caplog.text
         assert "bad instructions" in caplog.text
-
-    async def test_failing_plugin_does_not_block_others(self, mock_llm):
-        class FailPlugin(LifecyclePlugin):
-            async def on_before_run(self, prompt):
-                raise RuntimeError("fail")
-
-        agent = Agent(name="A", llm_provider=mock_llm)
-        agent.add_plugin(FailPlugin())
-        agent.add_skill(Skill(name="ok", instructions="Still works."))
-
-        conversation = await agent._build_initial_conversation("Hi")
-        system_msg = conversation[0]["content"]
-        assert "Still works." in system_msg
 
 
 # ===========================================================================

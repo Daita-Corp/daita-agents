@@ -101,22 +101,6 @@ class SkillError(PluginError):
     pass
 
 
-class WorkflowError(DaitaError):
-    """Exception raised by workflow operations."""
-
-    def __init__(
-        self,
-        message: str,
-        workflow_name: str = None,
-        retry_hint: str = "retryable",
-        context: dict = None,
-    ):
-        super().__init__(
-            message, retry_hint, self._enrich(context, workflow_name=workflow_name)
-        )
-        self.workflow_name = workflow_name
-
-
 class RoutingError(DaitaError):
     """Exception raised during task routing operations."""
 

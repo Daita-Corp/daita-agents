@@ -272,10 +272,10 @@ class TestConfigs:
         }
 
     @staticmethod
-    def reliability_workflow_config() -> Dict[str, Any]:
-        """Workflow configuration with reliability features."""
+    def reliability_runtime_config() -> Dict[str, Any]:
+        """Runtime configuration with reliability features."""
         return {
-            "name": "reliable_workflow",
+            "name": "reliable_runtime",
             "reliability": {
                 "acknowledgments": True,
                 "task_tracking": True,

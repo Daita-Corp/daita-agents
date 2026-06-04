@@ -30,17 +30,12 @@ def create_agent() -> Agent:
 You MUST follow these steps for EACH sub-question. Do NOT skip any step.
 
 Step 1: Call the search tool with the sub-question.
-Step 2: Call scratch() to store raw notes from the search result for this \
-sub-question. Use key="sq_1", "sq_2", etc. Include the answer, key facts, and \
-source URLs.
-Step 3: Call remember() to store the key finding. You MUST set category="finding" \
-and importance=0.7 (or 0.8 if the finding is surprising or well-sourced).
+Step 2: Extract the answer, key facts, and source URLs from the search result.
 
 After processing ALL sub-questions:
 
-Step 4: Call think() to review your scratch notes across all sub-questions. Look \
-for contradictions or patterns.
-Step 5: Output ONLY the final JSON:
+Step 3: Review all sub-question findings for contradictions or patterns.
+Step 4: Output ONLY the final JSON:
 {
   "query": "original query",
   "findings": [
@@ -56,5 +51,5 @@ Step 5: Output ONLY the final JSON:
 }
 
 Use search_keywords from the plan to refine searches if results are too broad.""",
-        tools=[search, memory],
+        plugins=[search, memory],
     )

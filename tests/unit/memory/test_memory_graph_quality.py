@@ -167,7 +167,7 @@ class TestMergeOnFlush:
         for i, b in enumerate(backends):
             await b.add_node(_make_node(f"entity:e{i}", f"Entity {i}"))
 
-        # Flush all sequentially (simulates on_agent_stop loop)
+        # Flush all sequentially (simulates teardown)
         for b in backends:
             await b.flush()
 

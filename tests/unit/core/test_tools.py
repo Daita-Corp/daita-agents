@@ -3,8 +3,8 @@ Unit tests for daita/core/tools.py
 
 Covers:
   - @tool decorator: schema extraction, name/description, sync/async wrapping
-  - AgentTool: format conversion methods, execute() with timeout
-  - ToolRegistry: CRUD, duplicate handling, execute dispatch
+  - LocalTool: format conversion methods, execute() with timeout
+  - LocalToolCatalog: CRUD, duplicate handling, execute dispatch
 """
 
 import asyncio
@@ -13,8 +13,8 @@ from typing import Dict, List, Literal, Optional, Union
 import pytest
 
 from daita.core.tools import (
-    AgentTool,
-    ToolRegistry,
+    LocalTool,
+    LocalToolCatalog,
     _extract_parameters_from_function,
     _type_hint_to_json_schema,
     tool,
@@ -237,7 +237,7 @@ class TestToolDecoratorSchema:
             """Desc."""
             return ""
 
-        assert isinstance(fn, AgentTool)
+        assert isinstance(fn, LocalTool)
 
     def test_called_as_function_returns_agent_tool(self):
         def fn(x: int) -> int:
@@ -249,7 +249,7 @@ class TestToolDecoratorSchema:
             return x
 
         result = tool(fn)
-        assert isinstance(result, AgentTool)
+        assert isinstance(result, LocalTool)
 
     def test_source_is_custom(self):
         @tool
@@ -286,17 +286,17 @@ class TestToolDecoratorSchema:
 
 
 # ===========================================================================
-# AgentTool — format conversion
+# LocalTool — format conversion
 # ===========================================================================
 
 
-class TestAgentToolFormatConversion:
+class TestLocalToolFormatConversion:
     @pytest.fixture
     def sample_tool(self):
         async def handler(args):
             return args
 
-        return AgentTool(
+        return LocalTool(
             name="search",
             description="Search for records",
             parameters={
@@ -344,7 +344,7 @@ class TestAgentToolFormatConversion:
         async def handler(args):
             return args
 
-        t = AgentTool(
+        t = LocalTool(
             name="fetch",
             description="Fetch data",
             parameters={
@@ -363,7 +363,7 @@ class TestAgentToolFormatConversion:
         async def handler(args):
             return "ok"
 
-        t = AgentTool(
+        t = LocalTool(
             name="ping",
             description="Ping the server",
             parameters={"type": "object", "properties": {}, "required": []},
@@ -374,11 +374,11 @@ class TestAgentToolFormatConversion:
 
 
 # ===========================================================================
-# AgentTool — execution
+# LocalTool — execution
 # ===========================================================================
 
 
-class TestAgentToolExecution:
+class TestLocalToolExecution:
     async def test_execute_sync_handler(self):
         # @tool wraps sync functions in an async handler automatically.
         # Verify that execute() can await a sync-origin handler correctly.
@@ -429,7 +429,7 @@ class TestAgentToolExecution:
         async def slow_handler(args):
             await asyncio.sleep(10)
 
-        t = AgentTool(
+        t = LocalTool(
             name="slow",
             description="Slow tool",
             parameters={},
@@ -443,7 +443,7 @@ class TestAgentToolExecution:
         async def fast_handler(args):
             return "done"
 
-        t = AgentTool(
+        t = LocalTool(
             name="fast",
             description="Fast tool",
             parameters={},
@@ -454,7 +454,7 @@ class TestAgentToolExecution:
         assert result == "done"
 
     async def test_non_callable_handler_raises(self):
-        t = AgentTool(
+        t = LocalTool(
             name="broken",
             description="Broken tool",
             parameters={},
@@ -465,28 +465,28 @@ class TestAgentToolExecution:
 
 
 # ===========================================================================
-# ToolRegistry
+# LocalToolCatalog
 # ===========================================================================
 
 
-class TestToolRegistry:
+class TestLocalToolCatalog:
     @pytest.fixture
     def registry(self):
-        return ToolRegistry()
+        return LocalToolCatalog()
 
     @pytest.fixture
     def tool_a(self):
         async def h(args):
             return "a"
 
-        return AgentTool(name="tool_a", description="Tool A", parameters={}, handler=h)
+        return LocalTool(name="tool_a", description="Tool A", parameters={}, handler=h)
 
     @pytest.fixture
     def tool_b(self):
         async def h(args):
             return "b"
 
-        return AgentTool(name="tool_b", description="Tool B", parameters={}, handler=h)
+        return LocalTool(name="tool_b", description="Tool B", parameters={}, handler=h)
 
     def test_starts_empty(self, registry):
         assert registry.tool_count == 0
@@ -508,7 +508,7 @@ class TestToolRegistry:
         async def h(args):
             return "replacement"
 
-        replacement = AgentTool(
+        replacement = LocalTool(
             name="tool_a", description="Replacement", parameters={}, handler=h
         )
         registry.register(tool_a)

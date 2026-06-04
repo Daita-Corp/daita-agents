@@ -15,16 +15,216 @@ Features:
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from .base import BasePlugin
+from daita.runtime import (
+    AccessMode,
+    Capability,
+    Evidence,
+    EvidenceSchema,
+    RiskLevel,
+    ToolView,
+)
+
+from .base import ConnectorPlugin
+from .manifest import PluginKind, PluginManifest
 from ..core.exceptions import PluginError
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
 
-class Neo4jPlugin(BasePlugin):
+_NEO4J_OPERATION_DEFINITIONS = (
+    {
+        "tool_name": "neo4j_query",
+        "capability_id": "neo4j.query.execute",
+        "operation_type": "neo4j.query.execute",
+        "description": "Execute a Cypher query against a Neo4j graph database.",
+        "access": AccessMode.READ,
+        "risk": RiskLevel.MEDIUM,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "handler_name": "_tool_query",
+        "write": False,
+    },
+    {
+        "tool_name": "neo4j_find_nodes",
+        "capability_id": "neo4j.node.find",
+        "operation_type": "neo4j.node.find",
+        "description": "Find Neo4j nodes by label and properties.",
+        "access": AccessMode.READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "handler_name": "_tool_find_nodes",
+        "write": False,
+    },
+    {
+        "tool_name": "neo4j_find_path",
+        "capability_id": "neo4j.path.find",
+        "operation_type": "neo4j.path.find",
+        "description": "Find the shortest path between two Neo4j nodes.",
+        "access": AccessMode.READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "handler_name": "_tool_find_path",
+        "write": False,
+    },
+    {
+        "tool_name": "neo4j_get_neighbors",
+        "capability_id": "neo4j.neighbor.list",
+        "operation_type": "neo4j.neighbor.list",
+        "description": "List neighboring nodes connected to a Neo4j node.",
+        "access": AccessMode.READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "handler_name": "_tool_get_neighbors",
+        "write": False,
+    },
+    {
+        "tool_name": "neo4j_schema",
+        "capability_id": "neo4j.schema.read",
+        "operation_type": "neo4j.schema.read",
+        "description": "Read Neo4j labels and relationship types.",
+        "access": AccessMode.METADATA_READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "handler_name": "_tool_schema",
+        "write": False,
+    },
+    {
+        "tool_name": "neo4j_list_labels",
+        "capability_id": "neo4j.labels.list",
+        "operation_type": "neo4j.labels.list",
+        "description": "List Neo4j node labels.",
+        "access": AccessMode.METADATA_READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "handler_name": "_tool_list_labels",
+        "write": False,
+    },
+    {
+        "tool_name": "neo4j_list_relationship_types",
+        "capability_id": "neo4j.relationship_types.list",
+        "operation_type": "neo4j.relationship_types.list",
+        "description": "List Neo4j relationship types.",
+        "access": AccessMode.METADATA_READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "handler_name": "_tool_list_relationship_types",
+        "write": False,
+    },
+    {
+        "tool_name": "neo4j_graph_stats",
+        "capability_id": "neo4j.stats.read",
+        "operation_type": "neo4j.stats.read",
+        "description": "Read Neo4j node and relationship counts.",
+        "access": AccessMode.METADATA_READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "handler_name": "_tool_graph_stats",
+        "write": False,
+    },
+    {
+        "tool_name": "neo4j_create_node",
+        "capability_id": "neo4j.node.create",
+        "operation_type": "neo4j.node.create",
+        "description": "Create a Neo4j node.",
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.MEDIUM,
+        "retry_safe": False,
+        "idempotent": False,
+        "side_effecting": True,
+        "handler_name": "_tool_create_node",
+        "write": True,
+    },
+    {
+        "tool_name": "neo4j_create_relationship",
+        "capability_id": "neo4j.relationship.create",
+        "operation_type": "neo4j.relationship.create",
+        "description": "Create a Neo4j relationship.",
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.MEDIUM,
+        "retry_safe": False,
+        "idempotent": False,
+        "side_effecting": True,
+        "handler_name": "_tool_create_relationship",
+        "write": True,
+    },
+    {
+        "tool_name": "neo4j_delete_node",
+        "capability_id": "neo4j.node.delete",
+        "operation_type": "neo4j.node.delete",
+        "description": "Delete a Neo4j node and its relationships.",
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.HIGH,
+        "retry_safe": False,
+        "idempotent": True,
+        "side_effecting": True,
+        "handler_name": "_tool_delete_node",
+        "write": True,
+    },
+)
+
+
+class _Neo4jExecutor:
+    """Execute Neo4j runtime capabilities and return typed evidence."""
+
+    id = "neo4j.operations"
+
+    def __init__(self, plugin: "Neo4jPlugin") -> None:
+        self._plugin = plugin
+
+    @property
+    def capability_ids(self) -> frozenset[str]:
+        return frozenset(
+            definition["capability_id"]
+            for definition in self._plugin._operation_definitions()
+        )
+
+    async def execute(self, task, operation, context):
+        definition = self._plugin._definition_for_capability(task.capability_id)
+        handler = getattr(self._plugin, definition["handler_name"])
+        result = await handler(dict(task.input or {}))
+        tool_view_name = (
+            context.get("tool_view", {}).get("name")
+            if isinstance(context, dict)
+            else None
+        ) or definition["tool_name"]
+        return [
+            Evidence(
+                kind="neo4j.operation.result",
+                owner=self._plugin.manifest.id,
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={
+                    "operation": definition["tool_name"],
+                    "request": dict(task.input or {}),
+                    "result": result,
+                },
+                metadata={
+                    "capability_id": task.capability_id,
+                    "tool_view": tool_view_name,
+                },
+            )
+        ]
+
+
+class Neo4jPlugin(ConnectorPlugin):
     """
     Plugin for Neo4j graph database operations.
 
@@ -53,6 +253,16 @@ class Neo4jPlugin(BasePlugin):
             paths = await graph.find_path("Person", {"name": "Alice"}, "Person", {"name": "Bob"})
         ```
     """
+
+    manifest = PluginManifest(
+        id="neo4j",
+        display_name="Neo4j",
+        version="2.0.0",
+        kind=PluginKind.CONNECTOR,
+        domains=frozenset({"neo4j", "graph", "database"}),
+        provides=frozenset({"graph_query", "graph_mutation", "graph_metadata"}),
+        optional_dependencies=frozenset({"neo4j"}),
+    )
 
     def __init__(
         self,
@@ -90,8 +300,226 @@ class Neo4jPlugin(BasePlugin):
 
         self._driver = None
         self._driver_config = kwargs
+        self._executor = _Neo4jExecutor(self)
 
         logger.debug(f"Neo4jPlugin initialized for {uri}, database={database}")
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether the Neo4j driver has been initialized."""
+        return self._driver is not None
+
+    async def teardown(self) -> None:
+        """Release runtime-owned Neo4j resources."""
+        await self.disconnect()
+
+    def _operation_definitions(self) -> tuple[dict[str, Any], ...]:
+        """Return operation definitions enabled for this plugin instance."""
+        return tuple(
+            definition
+            for definition in _NEO4J_OPERATION_DEFINITIONS
+            if not self.read_only or not definition["write"]
+        )
+
+    def _definition_for_capability(self, capability_id: str) -> dict[str, Any]:
+        for definition in self._operation_definitions():
+            if definition["capability_id"] == capability_id:
+                return definition
+        raise KeyError(capability_id)
+
+    def _definition_for_tool(self, tool_name: str) -> dict[str, Any]:
+        for definition in self._operation_definitions():
+            if definition["tool_name"] == tool_name:
+                return definition
+        raise KeyError(tool_name)
+
+    def declare_capabilities(self) -> tuple[Capability, ...]:
+        """Declare Neo4j operations as runtime-plannable capabilities."""
+        return tuple(
+            Capability(
+                id=definition["capability_id"],
+                owner=self.manifest.id,
+                description=definition["description"],
+                domains=frozenset({"neo4j", "graph", "database"}),
+                operation_types=frozenset({definition["operation_type"]}),
+                access=definition["access"],
+                risk=definition["risk"],
+                input_schema=self._tool_parameters(definition["tool_name"]),
+                output_evidence=frozenset({"neo4j.operation.result"}),
+                executor=self._executor.id,
+                model_visible=True,
+                retry_safe=definition["retry_safe"],
+                replay_safe=definition["retry_safe"],
+                idempotent=definition["idempotent"],
+                side_effecting=definition["side_effecting"],
+                timeout_seconds=60,
+                metadata={"tool_name": definition["tool_name"]},
+            )
+            for definition in self._operation_definitions()
+        )
+
+    def declare_evidence_schemas(self) -> tuple[EvidenceSchema, ...]:
+        """Declare typed evidence returned by Neo4j capability execution."""
+        return (
+            EvidenceSchema(
+                kind="neo4j.operation.result",
+                owner=self.manifest.id,
+                description="Neo4j operation result evidence.",
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string"},
+                        "request": {"type": "object"},
+                        "result": {"type": "object"},
+                    },
+                    "required": ["operation", "request", "result"],
+                },
+            ),
+        )
+
+    def get_executors(self) -> tuple[_Neo4jExecutor, ...]:
+        """Return the Neo4j runtime executor."""
+        return (self._executor,)
+
+    def get_tool_views(self) -> tuple[ToolView, ...]:
+        """Return model-visible views over Neo4j capabilities."""
+        return tuple(
+            ToolView(
+                name=definition["tool_name"],
+                capability_id=definition["capability_id"],
+                description=definition["description"],
+                parameters=self._tool_parameters(definition["tool_name"]),
+            )
+            for definition in self._operation_definitions()
+        )
+
+    def _tool_parameters(self, tool_name: str) -> Dict[str, Any]:
+        """Return the JSON schema for an existing Neo4j tool view."""
+        empty = {"type": "object", "properties": {}, "required": []}
+        object_props = {
+            "type": "object",
+            "description": "Properties to match as key-value pairs",
+        }
+        schemas: dict[str, dict[str, Any]] = {
+            "neo4j_query": {
+                "type": "object",
+                "properties": {
+                    "cypher": {
+                        "type": "string",
+                        "description": "Cypher query to execute.",
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "Optional query parameters as key-value pairs.",
+                    },
+                },
+                "required": ["cypher"],
+            },
+            "neo4j_find_nodes": {
+                "type": "object",
+                "properties": {
+                    "label": {
+                        "type": "string",
+                        "description": "Node label to search for.",
+                    },
+                    "properties": object_props,
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of nodes to return.",
+                    },
+                },
+                "required": ["label"],
+            },
+            "neo4j_find_path": {
+                "type": "object",
+                "properties": {
+                    "from_label": {
+                        "type": "string",
+                        "description": "Start node label.",
+                    },
+                    "from_properties": object_props,
+                    "to_label": {"type": "string", "description": "End node label."},
+                    "to_properties": object_props,
+                    "max_length": {
+                        "type": "integer",
+                        "description": "Maximum path length.",
+                    },
+                },
+                "required": [
+                    "from_label",
+                    "from_properties",
+                    "to_label",
+                    "to_properties",
+                ],
+            },
+            "neo4j_get_neighbors": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "Node label."},
+                    "properties": object_props,
+                    "relationship_type": {
+                        "type": "string",
+                        "description": "Optional relationship type filter.",
+                    },
+                    "direction": {
+                        "type": "string",
+                        "description": "outgoing, incoming, or both.",
+                    },
+                },
+                "required": ["label", "properties"],
+            },
+            "neo4j_schema": empty,
+            "neo4j_list_labels": empty,
+            "neo4j_list_relationship_types": empty,
+            "neo4j_graph_stats": empty,
+            "neo4j_create_node": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "Node label."},
+                    "properties": object_props,
+                },
+                "required": ["label", "properties"],
+            },
+            "neo4j_create_relationship": {
+                "type": "object",
+                "properties": {
+                    "from_label": {
+                        "type": "string",
+                        "description": "Source node label.",
+                    },
+                    "from_properties": object_props,
+                    "to_label": {"type": "string", "description": "Target node label."},
+                    "to_properties": object_props,
+                    "relationship_type": {
+                        "type": "string",
+                        "description": "Relationship type.",
+                    },
+                    "relationship_properties": {
+                        "type": "object",
+                        "description": "Optional relationship properties.",
+                    },
+                },
+                "required": [
+                    "from_label",
+                    "from_properties",
+                    "to_label",
+                    "to_properties",
+                    "relationship_type",
+                ],
+            },
+            "neo4j_delete_node": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "Node label."},
+                    "properties": object_props,
+                },
+                "required": ["label", "properties"],
+            },
+        }
+        try:
+            return schemas[tool_name]
+        except KeyError as exc:
+            raise KeyError(tool_name) from exc
 
     async def connect(self):
         """Connect to Neo4j database."""
@@ -134,276 +562,6 @@ class Neo4jPlugin(BasePlugin):
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
         await self.disconnect()
-
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose Neo4j operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for graph operations
-        """
-        from ..core.tools import AgentTool
-
-        tools = [
-            AgentTool(
-                name="neo4j_query",
-                description="Execute a Cypher query against the Neo4j graph database. Include LIMIT in your query to control result size.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "cypher": {
-                            "type": "string",
-                            "description": "Cypher query to execute (e.g., 'MATCH (n:Person) RETURN n LIMIT 10')",
-                        },
-                        "parameters": {
-                            "type": "object",
-                            "description": "Optional query parameters as key-value pairs",
-                        },
-                    },
-                    "required": ["cypher"],
-                },
-                handler=self._tool_query,
-                category="graph",
-                source="plugin",
-                plugin_name="Neo4j",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="neo4j_find_nodes",
-                description="Find nodes by label and properties",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "label": {
-                            "type": "string",
-                            "description": "Node label to search for",
-                        },
-                        "properties": {
-                            "type": "object",
-                            "description": "Properties to match (partial match supported)",
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of nodes to return (default: 50)",
-                        },
-                    },
-                    "required": ["label"],
-                },
-                handler=self._tool_find_nodes,
-                category="graph",
-                source="plugin",
-                plugin_name="Neo4j",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="neo4j_find_path",
-                description="Find shortest path between two nodes",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "from_label": {
-                            "type": "string",
-                            "description": "Label of start node",
-                        },
-                        "from_properties": {
-                            "type": "object",
-                            "description": "Properties to match start node",
-                        },
-                        "to_label": {
-                            "type": "string",
-                            "description": "Label of end node",
-                        },
-                        "to_properties": {
-                            "type": "object",
-                            "description": "Properties to match end node",
-                        },
-                        "max_length": {
-                            "type": "integer",
-                            "description": "Maximum path length (default: 5)",
-                        },
-                    },
-                    "required": [
-                        "from_label",
-                        "from_properties",
-                        "to_label",
-                        "to_properties",
-                    ],
-                },
-                handler=self._tool_find_path,
-                category="graph",
-                source="plugin",
-                plugin_name="Neo4j",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="neo4j_get_neighbors",
-                description="Get all neighboring nodes connected to a node",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "label": {"type": "string", "description": "Label of the node"},
-                        "properties": {
-                            "type": "object",
-                            "description": "Properties to match the node",
-                        },
-                        "relationship_type": {
-                            "type": "string",
-                            "description": "Optional relationship type to filter (e.g., 'KNOWS')",
-                        },
-                        "direction": {
-                            "type": "string",
-                            "description": "Direction: 'outgoing', 'incoming', or 'both' (default: 'both')",
-                        },
-                    },
-                    "required": ["label", "properties"],
-                },
-                handler=self._tool_get_neighbors,
-                category="graph",
-                source="plugin",
-                plugin_name="Neo4j",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="neo4j_schema",
-                description="List all node labels and relationship types in the Neo4j database. Use this to explore the graph schema.",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_schema,
-                category="graph",
-                source="plugin",
-                plugin_name="Neo4j",
-                timeout_seconds=30,
-            ),
-        ]
-
-        tools += [
-            AgentTool(
-                name="neo4j_list_labels",
-                description="List all node labels in the Neo4j database",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_list_labels,
-                category="graph",
-                source="plugin",
-                plugin_name="Neo4j",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="neo4j_list_relationship_types",
-                description="List all relationship types in the Neo4j database",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_list_relationship_types,
-                category="graph",
-                source="plugin",
-                plugin_name="Neo4j",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="neo4j_graph_stats",
-                description="Get node and relationship counts in the Neo4j database",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_graph_stats,
-                category="graph",
-                source="plugin",
-                plugin_name="Neo4j",
-                timeout_seconds=30,
-            ),
-        ]
-
-        if not self.read_only:
-            tools += [
-                AgentTool(
-                    name="neo4j_create_node",
-                    description="Create a new node in the graph with a label and properties",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "label": {
-                                "type": "string",
-                                "description": "Node label (e.g., 'Person', 'Company')",
-                            },
-                            "properties": {
-                                "type": "object",
-                                "description": "Node properties as key-value pairs",
-                            },
-                        },
-                        "required": ["label", "properties"],
-                    },
-                    handler=self._tool_create_node,
-                    category="graph",
-                    source="plugin",
-                    plugin_name="Neo4j",
-                    timeout_seconds=30,
-                ),
-                AgentTool(
-                    name="neo4j_create_relationship",
-                    description="Create a relationship between two nodes",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "from_label": {
-                                "type": "string",
-                                "description": "Label of source node",
-                            },
-                            "from_properties": {
-                                "type": "object",
-                                "description": "Properties to match source node",
-                            },
-                            "to_label": {
-                                "type": "string",
-                                "description": "Label of target node",
-                            },
-                            "to_properties": {
-                                "type": "object",
-                                "description": "Properties to match target node",
-                            },
-                            "relationship_type": {
-                                "type": "string",
-                                "description": "Type of relationship (e.g., 'KNOWS', 'WORKS_AT')",
-                            },
-                            "relationship_properties": {
-                                "type": "object",
-                                "description": "Optional properties for the relationship",
-                            },
-                        },
-                        "required": [
-                            "from_label",
-                            "from_properties",
-                            "to_label",
-                            "to_properties",
-                            "relationship_type",
-                        ],
-                    },
-                    handler=self._tool_create_relationship,
-                    category="graph",
-                    source="plugin",
-                    plugin_name="Neo4j",
-                    timeout_seconds=30,
-                ),
-                AgentTool(
-                    name="neo4j_delete_node",
-                    description="Delete a node and its relationships",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "label": {
-                                "type": "string",
-                                "description": "Label of the node to delete",
-                            },
-                            "properties": {
-                                "type": "object",
-                                "description": "Properties to match the node",
-                            },
-                        },
-                        "required": ["label", "properties"],
-                    },
-                    handler=self._tool_delete_node,
-                    category="graph",
-                    source="plugin",
-                    plugin_name="Neo4j",
-                    timeout_seconds=30,
-                ),
-            ]
-
-        return tools
 
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for neo4j_query"""

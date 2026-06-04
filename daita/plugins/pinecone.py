@@ -7,10 +7,19 @@ Managed cloud vector database with serverless and pod-based deployment options.
 import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from .base import PluginContext
 from .base_vector import BaseVectorPlugin
+from .pinecone_extensions import (
+    PINECONE_MANIFEST,
+    PineconeExecutor,
+    pinecone_capabilities,
+    pinecone_evidence_schemas,
+    pinecone_operation_definitions,
+    pinecone_tool_views,
+)
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +30,8 @@ class PineconePlugin(BaseVectorPlugin):
 
     Supports Pinecone's native filter syntax and namespaces for multi-tenancy.
     """
+
+    manifest = PINECONE_MANIFEST
 
     def __init__(
         self,
@@ -49,12 +60,49 @@ class PineconePlugin(BaseVectorPlugin):
         self.host = host
         self._index = None
         self._embedding_fn = embedding_fn
+        self._executor = PineconeExecutor(self)
 
         super().__init__(
             api_key=api_key, index=index, namespace=namespace, host=host, **kwargs
         )
 
         logger.debug(f"Pinecone plugin configured for index '{index}'")
+
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the Pinecone connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the Pinecone connector from a runtime."""
+        await self.disconnect()
+
+    # ---------------------------------------------------------------------------
+    # Runtime extension declarations
+    # ---------------------------------------------------------------------------
+
+    def declare_capabilities(self):
+        return pinecone_capabilities()
+
+    def get_executors(self):
+        return (self._executor,)
+
+    def declare_evidence_schemas(self):
+        return pinecone_evidence_schemas()
+
+    def get_tool_views(self):
+        return pinecone_tool_views()
+
+    def _definition_for_capability(self, capability_id: str) -> dict:
+        for definition in pinecone_operation_definitions():
+            if definition["capability_id"] == capability_id:
+                return definition
+        raise KeyError(capability_id)
+
+    def _definition_for_tool(self, tool_name: str) -> dict:
+        for definition in pinecone_operation_definitions():
+            if definition["tool_name"] == tool_name:
+                return definition
+        raise KeyError(tool_name)
 
     async def connect(self):
         """Connect to Pinecone."""
@@ -70,11 +118,9 @@ class PineconePlugin(BaseVectorPlugin):
 
             logger.info(f"Connected to Pinecone index '{self.index_name}'")
         except ImportError:
-            self._handle_connection_error(
-                ImportError(
-                    "pinecone not installed. Install with: pip install 'daita-agents[pinecone]'"
-                ),
-                "connection",
+            raise ImportError(
+                "pinecone is required for PineconePlugin. "
+                "Install with: pip install 'daita-agents[pinecone]'"
             )
         except Exception as e:
             self._handle_connection_error(e, "connection")
@@ -263,130 +309,6 @@ class PineconePlugin(BaseVectorPlugin):
             "total_vector_count": stats.get("total_vector_count"),
             "namespaces": stats.get("namespaces", {}),
         }
-
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose Pinecone operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for vector operations
-        """
-        from ..core.tools import AgentTool
-
-        return [
-            AgentTool(
-                name="pinecone_search",
-                description="Search Pinecone for similar vectors. Provide 'vector' (float array) or 'text' (auto-embedded).",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "vector": {
-                            "type": "array",
-                            "description": "Query vector as array of floats",
-                            "items": {"type": "number"},
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": "Query text (auto-embedded via configured embedding_fn; use instead of vector)",
-                        },
-                        "top_k": {
-                            "type": "integer",
-                            "description": "Maximum number of results to return (default: 10)",
-                        },
-                        "filter": {
-                            "type": "object",
-                            "description": 'Pinecone filter dict (e.g., {"category": {"$eq": "tech"}})',
-                        },
-                        "namespace": {
-                            "type": "string",
-                            "description": "Optional namespace to search within",
-                        },
-                    },
-                    "required": [],
-                },
-                handler=self._tool_search,
-                category="vector_db",
-                source="plugin",
-                plugin_name="Pinecone",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="pinecone_upsert",
-                description="Insert or update Pinecone vectors with metadata.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "ids": {
-                            "type": "array",
-                            "description": "List of unique vector IDs",
-                            "items": {"type": "string"},
-                        },
-                        "vectors": {
-                            "type": "array",
-                            "description": "List of vectors (each vector is an array of floats)",
-                            "items": {"type": "array", "items": {"type": "number"}},
-                        },
-                        "metadata": {
-                            "type": "array",
-                            "description": "Optional list of metadata objects (one per vector)",
-                            "items": {"type": "object"},
-                        },
-                        "namespace": {
-                            "type": "string",
-                            "description": "Optional namespace",
-                        },
-                    },
-                    "required": ["ids", "vectors"],
-                },
-                handler=self._tool_upsert,
-                category="vector_db",
-                source="plugin",
-                plugin_name="Pinecone",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="pinecone_delete",
-                description="Delete Pinecone vectors by ID, filter, or entire namespace.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "ids": {
-                            "type": "array",
-                            "description": "List of vector IDs to delete",
-                            "items": {"type": "string"},
-                        },
-                        "filter": {
-                            "type": "object",
-                            "description": "Pinecone filter for deletion",
-                        },
-                        "namespace": {
-                            "type": "string",
-                            "description": "Optional namespace",
-                        },
-                        "delete_all": {
-                            "type": "boolean",
-                            "description": "If true, delete all vectors in namespace",
-                        },
-                    },
-                    "required": [],
-                },
-                handler=self._tool_delete,
-                category="vector_db",
-                source="plugin",
-                plugin_name="Pinecone",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="pinecone_stats",
-                description="Get Pinecone index stats: dimension, vector count, and namespaces.",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_stats,
-                category="vector_db",
-                source="plugin",
-                plugin_name="Pinecone",
-                timeout_seconds=30,
-            ),
-        ]
 
     async def _tool_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for pinecone_search"""

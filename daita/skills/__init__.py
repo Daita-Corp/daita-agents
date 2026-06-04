@@ -1,7 +1,7 @@
 """
 Daita Skills — reusable units of agent capability.
 
-Skills bundle related tools with domain-specific instructions,
+Skills bundle capability declarations with domain-specific instructions,
 sitting between raw tools and full plugins in the abstraction hierarchy.
 """
 

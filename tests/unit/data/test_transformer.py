@@ -7,7 +7,10 @@ All tests use mocked database and graph backends — no real database required.
 import pytest
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
+from daita.plugins.base import PluginContext
 from daita.plugins.transformer import TransformerPlugin, transformer, _local_parse_sql
+from daita.runtime import Operation, Task
+from tests.unit.plugins.projection_helpers import projected_tools, projected_tool_names
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -112,25 +115,53 @@ def test_factory_passes_db():
 
 
 # ---------------------------------------------------------------------------
-# initialize
+# setup
 # ---------------------------------------------------------------------------
 
 
-def test_initialize_sets_agent_id():
+async def test_setup_sets_agent_id():
     plugin = TransformerPlugin()
     with patch(
         "daita.core.graph.backend.auto_select_backend", return_value=MagicMock()
     ):
-        plugin.initialize("agent-xyz")
+        await plugin.setup(
+            PluginContext(
+                runtime_id="runtime-xyz",
+                runtime_kind="agent",
+                agent_id="agent-xyz",
+            )
+        )
     assert plugin._agent_id == "agent-xyz"
 
 
-def test_initialize_skips_backend_if_provided():
+async def test_setup_skips_backend_if_provided():
     custom_be = MagicMock()
     plugin = TransformerPlugin(backend=custom_be)
     with patch("daita.core.graph.backend.auto_select_backend") as mock_sel:
-        plugin.initialize("agent-xyz")
+        await plugin.setup(
+            PluginContext(
+                runtime_id="runtime-xyz",
+                runtime_kind="agent",
+                agent_id="agent-xyz",
+            )
+        )
     mock_sel.assert_not_called()
+
+
+async def test_setup_uses_plugin_context_and_auto_selects_backend():
+    plugin = TransformerPlugin()
+    mock_be = MagicMock()
+    with patch("daita.core.graph.backend.auto_select_backend", return_value=mock_be):
+        await plugin.setup(
+            PluginContext(
+                runtime_id="runtime-xyz",
+                runtime_kind="agent",
+                agent_id="agent-xyz",
+            )
+        )
+
+    assert plugin._agent_id == "agent-xyz"
+    assert plugin._graph_backend is mock_be
 
 
 # ---------------------------------------------------------------------------
@@ -151,19 +182,18 @@ def test_validate_db_returns_db():
 
 
 # ---------------------------------------------------------------------------
-# get_tools
+# Projected tools
 # ---------------------------------------------------------------------------
 
 
-def test_get_tools_returns_six_tools():
+def test_projected_tools_return_six_tools():
     plugin = make_tx()
-    tools = plugin.get_tools()
-    assert len(tools) == 6
+    assert len(projected_tools(plugin)) == 6
 
 
-def test_get_tools_names():
+def test_projected_tool_names():
     plugin = make_tx()
-    names = {t.name for t in plugin.get_tools()}
+    names = projected_tool_names(plugin)
     assert names == {
         "transform_create",
         "transform_run",
@@ -172,6 +202,57 @@ def test_get_tools_names():
         "transform_diff",
         "transform_list",
     }
+
+
+def test_transformer_declares_extension_surfaces():
+    plugin = make_tx()
+
+    assert plugin.manifest.id == "transformer"
+    assert plugin.get_executors()[0].id == "transformer.operations"
+
+    capabilities = {
+        capability.id: capability for capability in plugin.declare_capabilities()
+    }
+    tool_views = {view.name: view for view in plugin.get_tool_views()}
+    tools = projected_tools(plugin)
+
+    assert set(tool_views) == set(tools)
+    assert set(capabilities) == {view.capability_id for view in tool_views.values()}
+    assert tools["transform_run"].capability_ids == ("transformer.run",)
+    assert capabilities["transformer.run"].side_effecting is True
+    assert capabilities["transformer.list"].side_effecting is False
+    assert plugin.declare_evidence_schemas()[0].kind == "transformer.operation.result"
+
+
+async def test_transformer_executor_runs_declared_capability():
+    plugin = make_tx()
+    executor = plugin.get_executors()[0]
+    operation = Operation(id="op-1", operation_type="data.transform.create")
+    task = Task(
+        id="task-1",
+        operation_id=operation.id,
+        capability_id="transformer.definition.create",
+        executor_id=executor.id,
+        input={
+            "name": "orders_summary",
+            "sql": "INSERT INTO orders_summary SELECT customer_id FROM orders",
+            "description": "Orders summary",
+        },
+    )
+
+    evidence = await executor.execute(
+        task,
+        operation,
+        context={"tool_view": {"name": "transform_create"}},
+    )
+
+    assert len(evidence) == 1
+    assert evidence[0].kind == "transformer.operation.result"
+    assert evidence[0].metadata["capability_id"] == "transformer.definition.create"
+    assert evidence[0].metadata["tool_view"] == "transform_create"
+    assert evidence[0].payload["operation"] == "transform_create"
+    assert evidence[0].payload["result"]["success"] is True
+    assert "orders_summary" in plugin._definitions
 
 
 # ---------------------------------------------------------------------------

@@ -1,14 +1,15 @@
 """
 Code quality skill — built with the Skill() convenience factory.
 
-Demonstrates the factory pattern: inline instructions + a list of tool
-functions, no subclassing needed.
+Demonstrates the factory pattern: inline instructions plus skill-owned
+capabilities, executors, and ToolViews, no subclassing needed.
 """
 
 import ast
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-from daita.core.tools import AgentTool, tool
+from daita.core.tools import tool
+from daita.runtime import AccessMode, Capability, Evidence, RiskLevel, ToolView
 from daita.skills import Skill
 
 QUALITY_INSTRUCTIONS = """\
@@ -40,6 +41,52 @@ For each finding, report:
 
 Praise well-written code when you see it — reviews should be balanced.\
 """
+
+
+class _QualityToolExecutor:
+    def __init__(self, executor_id: str, capability_id: str, tool_ref):
+        self.id = executor_id
+        self.capability_ids = frozenset({capability_id})
+        self._tool = tool_ref
+
+    async def execute(self, task, operation, context):
+        result = await self._tool.execute(task.input)
+        return [
+            Evidence(
+                kind="skill.tool_result",
+                owner="skill_code_quality",
+                payload={"tool": self._tool.name, "result": result},
+                operation_id=operation.id,
+                task_id=task.id,
+                metadata={"capability_id": task.capability_id},
+            )
+        ]
+
+
+def _quality_capability(capability_id: str, executor_id: str, tool_ref) -> Capability:
+    return Capability(
+        id=capability_id,
+        owner="skill_code_quality",
+        description=tool_ref.description,
+        domains=frozenset({"agent", "code_review", "quality"}),
+        operation_types=frozenset({"code.review.quality"}),
+        access=AccessMode.READ,
+        risk=RiskLevel.LOW,
+        input_schema=tool_ref.parameters,
+        output_evidence=frozenset({"skill.tool_result"}),
+        executor=executor_id,
+        model_visible=True,
+        side_effecting=False,
+    )
+
+
+def _quality_tool_view(tool_ref, capability_id: str) -> ToolView:
+    return ToolView(
+        name=tool_ref.name,
+        capability_id=capability_id,
+        description=tool_ref.description,
+        parameters=tool_ref.parameters,
+    )
 
 
 @tool
@@ -172,9 +219,38 @@ async def check_naming_conventions(code: str) -> Dict[str, Any]:
 
 def create_code_quality_skill() -> Skill:
     """Build the code quality skill using the Skill convenience factory."""
+    complexity_capability = "skill.quality.analyze_complexity"
+    naming_capability = "skill.quality.check_naming"
     return Skill(
         name="code_quality",
         description="Analyse code complexity, structure, and naming conventions",
         instructions=QUALITY_INSTRUCTIONS,
-        tools=[analyze_complexity, check_naming_conventions],
+        capabilities=(
+            _quality_capability(
+                complexity_capability,
+                "skill_code_quality.analyze_complexity",
+                analyze_complexity,
+            ),
+            _quality_capability(
+                naming_capability,
+                "skill_code_quality.check_naming",
+                check_naming_conventions,
+            ),
+        ),
+        executors=(
+            _QualityToolExecutor(
+                "skill_code_quality.analyze_complexity",
+                complexity_capability,
+                analyze_complexity,
+            ),
+            _QualityToolExecutor(
+                "skill_code_quality.check_naming",
+                naming_capability,
+                check_naming_conventions,
+            ),
+        ),
+        tool_views=(
+            _quality_tool_view(analyze_complexity, complexity_capability),
+            _quality_tool_view(check_naming_conventions, naming_capability),
+        ),
     )

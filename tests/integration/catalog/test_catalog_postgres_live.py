@@ -4,7 +4,7 @@ Live integration test for CatalogPlugin + PostgreSQL.
 Spins up a throwaway Postgres container via docker, seeds a known schema,
 then runs the full catalog → graph → agent pipeline against it. Per spec:
 
-  1. CatalogPlugin works with Postgres (discover_schema returns a normalized
+  1. CatalogPlugin works with Postgres (direct discovery returns a normalized
      schema matching the seed).
   2. Graph is built correctly (nodes + edges match the seeded tables/FKs).
   3. Agent traversal speed — logged, not asserted.
@@ -39,6 +39,7 @@ asyncpg = pytest.importorskip(
 
 from daita.core.graph import LocalGraphBackend
 from daita.core.graph.models import NodeType
+from daita.plugins.base import PluginContext
 from daita.plugins.catalog import CatalogPlugin
 
 from tests.integration._harness import (
@@ -85,6 +86,16 @@ INSERT INTO orders (customer_id, amount, status) VALUES
 
 EXPECTED_TABLES = {"customers", "orders"}
 EXPECTED_FK_EDGE = ("orders", "customer_id", "customers", "customer_id")
+
+
+async def _setup_catalog(plugin: CatalogPlugin, agent_id: str) -> None:
+    await plugin.setup(
+        PluginContext(
+            runtime_id=agent_id,
+            runtime_kind="agent",
+            agent_id=agent_id,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +167,7 @@ async def plugin_with_backend(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     backend = LocalGraphBackend(graph_type="catalog_pg_live")
     plugin = CatalogPlugin(backend=backend, auto_persist=False)
-    plugin.initialize("catalog-pg-live")
+    await _setup_catalog(plugin, "catalog-pg-live")
     return plugin, backend
 
 
@@ -168,22 +179,16 @@ async def plugin_with_backend(tmp_path, monkeypatch):
 @pytest.mark.integration
 @pytest.mark.requires_db
 class TestCatalogPluginPostgres:
-    async def test_discover_schema_returns_seeded_tables(
+    async def test_discover_postgres_returns_seeded_tables(
         self, plugin_with_backend, seeded_postgres
     ):
         plugin, _ = plugin_with_backend
 
-        discover_tool = next(
-            t for t in plugin.get_tools() if t.name == "discover_schema"
-        )
-        async with timed("discover_schema postgres"):
-            result = await discover_tool.execute(
-                {
-                    "store_type": "postgresql",
-                    "connection_string": seeded_postgres,
-                    "options": {"ssl_mode": "disable"},
-                    "persist": False,
-                }
+        async with timed("discover_postgres"):
+            result = await plugin.discover_postgres(
+                connection_string=seeded_postgres,
+                ssl_mode="disable",
+                persist=False,
             )
 
         # Raw discover_* shape: tables[].table_name, columns live in a flat
@@ -233,17 +238,11 @@ class TestPostgresGraphCorrectness:
         and FK-derived edges for the seeded schema."""
         plugin, backend = plugin_with_backend
 
-        discover_tool = next(
-            t for t in plugin.get_tools() if t.name == "discover_schema"
-        )
-        async with timed("discover_schema + persist"):
-            await discover_tool.execute(
-                {
-                    "store_type": "postgresql",
-                    "connection_string": seeded_postgres,
-                    "options": {"ssl_mode": "disable"},
-                    "persist": True,
-                }
+        async with timed("discover_postgres + persist"):
+            await plugin.discover_postgres(
+                connection_string=seeded_postgres,
+                ssl_mode="disable",
+                persist=True,
             )
 
         # Tables must be present as graph nodes.
@@ -277,27 +276,29 @@ class TestPostgresGraphCorrectness:
 @pytest.mark.integration
 @pytest.mark.requires_db
 class TestAgentPostgresLive:
-    async def test_agent_discovers_and_describes_schema(
+    async def test_agent_searches_and_describes_registered_schema(
         self, plugin_with_backend, seeded_postgres
     ):
-        """Agent uses discover_schema + get_table_schema to answer a
-        question that requires reading actual table/column metadata."""
+        """Agent queries an already registered catalog schema."""
         plugin, _ = plugin_with_backend
+        discovery = await plugin.discover_postgres(
+            connection_string=seeded_postgres,
+            ssl_mode="disable",
+            persist=True,
+        )
+        store_id = discovery["store_id"]
 
         agent = build_live_agent(name="PostgresCatalogAgent", tools=[plugin])
 
         async with timed("agent.run postgres describe"):
             result = await agent.run(
-                f"Use the catalog tools to profile this PostgreSQL database: "
-                f"`{seeded_postgres}`. Important: this is a local container "
-                f"without TLS, so pass options={{'ssl_mode': 'disable'}} to "
-                f"discover_schema. Then tell me the names of all tables and "
-                f"how `orders.customer_id` relates to the `customers` table. "
-                f"Be concise.",
+                f"Use the catalog tools for store `{store_id}`. Tell me the "
+                f"names of all tables and how `orders.customer_id` relates "
+                f"to the `customers` table. Be concise.",
                 detailed=True,
             )
 
-        assert_tool_called(result, "discover_schema")
+        assert_tool_called(result, "catalog_search_schema")
         assert_answer_mentions(result, ["customers", "orders"])
         # Must surface the FK relationship in some form
         assert_answer_mentions(
@@ -309,50 +310,30 @@ class TestAgentPostgresLive:
     async def test_agent_handles_single_table_lookup(
         self, plugin_with_backend, seeded_postgres
     ):
-        """Agent should choose get_table_schema once the store is profiled —
-        not shovel the entire schema back through the LLM again."""
+        """Agent should choose targeted catalog ToolViews once the store is profiled."""
         plugin, _ = plugin_with_backend
 
         # Prime the catalog by profiling first, then discover the store_id.
-        discover_tool = next(
-            t for t in plugin.get_tools() if t.name == "discover_schema"
+        discovery = await plugin.discover_postgres(
+            connection_string=seeded_postgres,
+            ssl_mode="disable",
+            persist=True,
         )
-        await discover_tool.execute(
-            {
-                "store_type": "postgresql",
-                "connection_string": seeded_postgres,
-                "options": {"ssl_mode": "disable"},
-                "persist": True,
-            }
-        )
-
-        # After profiling via discover_schema, the plugin's internal store
-        # catalog may or may not have a matching DiscoveredStore entry
-        # depending on the discovery path. Skip the agent step when there's
-        # no store_id the agent can pass to get_table_schema.
-        stores = plugin.get_stores(store_type="postgresql")
-        if not stores:
-            pytest.skip(
-                "discover_schema didn't register a DiscoveredStore; "
-                "get_table_schema needs one — would be exercised by the "
-                "discover_infrastructure flow instead."
-            )
-
-        store_id = stores[0].id
+        store_id = discovery["store_id"]
 
         agent = build_live_agent(name="PostgresLookupAgent", tools=[plugin])
         async with timed("agent.run single-table lookup"):
             result = await agent.run(
                 f"For the Postgres store with id `{store_id}`, what columns "
-                f"does the `orders` table have? Use the most targeted tool "
-                f"available — avoid re-profiling the whole database.",
+                f"does the `orders` table have?",
                 detailed=True,
             )
 
         tool_names = {c.get("tool") for c in result.get("tool_calls", [])}
         assert (
-            "get_table_schema" in tool_names or "profile_store" in tool_names
-        ), f"Agent used neither get_table_schema nor profile_store: {tool_names}"
+            "catalog_inspect_asset" in tool_names
+            or "catalog_search_schema" in tool_names
+        ), f"Agent used neither catalog inspection nor search: {tool_names}"
         assert_answer_mentions(
             result, ["order_id", "customer_id", "amount"], any_of=True
         )

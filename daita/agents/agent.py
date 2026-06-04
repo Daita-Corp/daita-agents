@@ -8,6 +8,7 @@ for full control over the execution loop.
 
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Dict, Any, Optional, List, Union, Callable
 
@@ -19,6 +20,26 @@ import asyncio
 from ..config.base import AgentConfig, AgentType, RetryPolicy
 from ..core.interfaces import LLMProvider
 from ..core.exceptions import AgentError, SkillError
+from ..runtime import (
+    AccessMode,
+    Capability,
+    ContextAudience,
+    ContextBlock,
+    ContextProvider,
+    Evidence,
+    EvidenceSchema,
+    Executor,
+    InMemoryRuntimeStore,
+    MonitorRuntime,
+    MonitorSpec,
+    Operation,
+    Policy,
+    RiskLevel,
+    RuntimeKernel,
+    Task,
+    ToolView,
+    Worker,
+)
 from ..skills.base import BaseSkill
 from ..core.tracing import TraceType
 from .runtime.guardrails import (
@@ -27,19 +48,22 @@ from .runtime.guardrails import (
     tool_loop_error_message as _tool_loop_error_message,
 )
 from .runtime.llm_turn import LLMResult
-from .runtime.loop import AgentRunController
 from .runtime.tools import (
     execute_tool_call as _execute_tool_call,
     json_serializer as _json_serializer,
 )
 from .base import BaseAgent
+from .chat_runtime import ChatRuntime, ChatRunResult, ChatToolCallResult, ModelToolSpec
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "Agent",
+    "ChatRunResult",
+    "ChatToolCallResult",
     "FocusedTool",
     "LLMResult",
+    "ModelToolSpec",
     "_execute_tool_call",
     "_json_serializer",
     "_make_error_fingerprint",
@@ -50,16 +74,18 @@ __all__ = [
 
 # Import unified plugin access
 from ..plugins import PluginAccess
-from ..plugins.base import BasePlugin, LifecyclePlugin
+from ..plugins.base import PluginContext
+from ..plugins.manifest import PluginKind, PluginManifest
+from ..plugins.registry import ExtensionRegistry, RegistryDiagnostic
 from ..llm.factory import create_llm_provider
 from ..config.settings import settings
-from ..core.tools import AgentTool, ToolRegistry
+from ..core.tools import LocalTool, LocalToolCatalog
 
 
 class FocusedTool:
     """Wrapper that applies a Focus DSL expression to tool results before they reach the LLM."""
 
-    def __init__(self, tool: AgentTool, focus: str):
+    def __init__(self, tool: LocalTool, focus: str):
         self._tool = tool
         self._focus = focus
 
@@ -109,15 +135,132 @@ class FocusedTool:
         return f"FocusedTool({self._tool.name}, focus={self._focus!r})"
 
 
+class LocalWatchExecutor:
+    """Runtime executor for one local @agent.watch handler."""
+
+    def __init__(self, *, executor_id: str, capability_id: str, handler, config):
+        self.id = executor_id
+        self.capability_ids = frozenset({capability_id})
+        self._handler = handler
+        self._config = config
+
+    async def execute(self, task: Task, operation: Operation, context):
+        event = context.get("watch_event")
+        if event is None:
+            raise RuntimeError("watch handler context did not include watch_event")
+
+        async def _invoke():
+            return await self._handler(event)
+
+        if self._config.handler_timeout is not None:
+            result = await asyncio.wait_for(
+                _invoke(),
+                timeout=self._config.handler_timeout,
+            )
+        else:
+            result = await _invoke()
+        if isinstance(result, Evidence):
+            return [result]
+        if isinstance(result, (list, tuple)) and all(
+            isinstance(item, Evidence) for item in result
+        ):
+            return list(result)
+        payload: dict[str, Any] = {
+            "watch_name": self._config.name,
+            "handled": True,
+        }
+        if result is not None:
+            payload["result"] = result
+        return [
+            Evidence(
+                kind="agent.local.watch.result",
+                owner=context.get("watch_owner"),
+                payload=payload,
+                metadata={"monitor_id": context.get("monitor_id")},
+            )
+        ]
+
+
+class LocalWatchPlugin:
+    """Hidden runtime declaration for one @agent.watch handler."""
+
+    def __init__(self, *, plugin_id: str, capability_id: str, executor, config):
+        self.manifest = PluginManifest(
+            id=plugin_id,
+            display_name=f"Watch Handler {config.name}",
+            version="1.0.0",
+            kind=PluginKind.RUNTIME_EXTENSION,
+            domains=frozenset({"monitor"}),
+        )
+        self._capability = Capability(
+            id=capability_id,
+            owner=plugin_id,
+            description=f"Handle watch trigger {config.name}.",
+            domains=frozenset({"monitor", "watch"}),
+            operation_types=frozenset({"monitor.triggered"}),
+            access=AccessMode.NONE,
+            risk=RiskLevel.LOW,
+            input_schema={"type": "object"},
+            output_evidence=frozenset({"agent.local.watch.result"}),
+            executor=executor.id,
+            runtime_only=True,
+            model_visible=False,
+            side_effecting=True,
+            metadata={"watch_name": config.name},
+        )
+        self._executor = executor
+
+    def declare_capabilities(self):
+        return (self._capability,)
+
+    def get_executors(self):
+        return (self._executor,)
+
+
 def _resolve_tool_focus(
     agent_focus: Optional[Union[str, Dict[str, str]]],
-    t: "AgentTool",
+    t: "LocalTool",
 ) -> Optional[str]:
     """Return the effective focus DSL for a single tool, applying precedence rules."""
     tool_default = getattr(t, "focus", None)
     if isinstance(agent_focus, dict):
         return agent_focus.get(t.name) or tool_default
     return agent_focus or tool_default
+
+
+def _runtime_id_segment(value: str) -> str:
+    segment = re.sub(r"[^a-z0-9_]+", "_", value.lower()).strip("_")
+    if not segment:
+        segment = "handler"
+    if segment[0].isdigit():
+        segment = f"handler_{segment}"
+    return segment
+
+
+def _watch_event_payload(event: Any) -> dict[str, Any]:
+    return {
+        "value": _json_safe(getattr(event, "value", None)),
+        "triggered_at": _json_safe(getattr(event, "triggered_at", None)),
+        "source_type": getattr(event, "source_type", None),
+        "resolved": bool(getattr(event, "resolved", False)),
+        "previous_value": _json_safe(getattr(event, "previous_value", None)),
+    }
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    try:
+        json.dumps(value)
+    except TypeError:
+        return repr(value)
+    return value
 
 
 class Agent(BaseAgent):
@@ -142,10 +285,10 @@ class Agent(BaseAgent):
 
     @classmethod
     async def from_db(cls, source, **kwargs):
-        """Create a fully configured Agent from a database connection string or plugin.
+        """Create a DB-aware agent from a database source.
 
-        Connects to the database, discovers the schema, generates a system prompt,
-        and returns an Agent with query tools ready to use.
+        This public entry point is backed by the operation-centric DB runtime.
+        It returns a ``DbAgent`` facade instead of a patched generic ``Agent``.
 
         Args:
             source: Connection string (e.g. "postgresql://user:pass@host/db") or
@@ -171,7 +314,7 @@ class Agent(BaseAgent):
             )
             result = await agent.run("What are our top customers?")
         """
-        from .db import from_db
+        from daita.db import from_db
 
         return await from_db(source, **kwargs)
 
@@ -187,8 +330,13 @@ class Agent(BaseAgent):
         focus: Optional[Union[str, Dict[str, str]]] = None,
         relay: Optional[str] = None,
         mcp: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
+        mcp_servers: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
         display_reasoning: bool = False,
-        # Tool sources
+        # Extension/plugin sources
+        plugins: Optional[List] = None,
+        extension_registry: Optional[ExtensionRegistry] = None,
+        skills: Optional[List[BaseSkill]] = None,
+        # Tool sources (local tool projection: LocalTool or plugin-like objects)
         tools: Optional[List] = None,
         # Reliability
         enable_reliability: bool = False,
@@ -249,11 +397,26 @@ class Agent(BaseAgent):
             self._setup_decision_display()
 
         # Tool management (unified system)
-        self.tool_registry = ToolRegistry()
-        self.tool_sources = []
+        self.local_tool_catalog = LocalToolCatalog()
+        self.extension_registry = extension_registry or ExtensionRegistry()
+        self.runtime_store = InMemoryRuntimeStore()
+        self.runtime_kernel = RuntimeKernel(
+            runtime_id=self.agent_id,
+            runtime_kind="chat",
+            extension_registry=self.extension_registry,
+            runtime_store=self.runtime_store,
+        )
+        self._runtime: ChatRuntime | None = None
+        self._extension_setup_plugin_ids: set[str] = set()
+        self._local_tool_sources = []
         self._tools_setup = False
+        self._watch_action_plugins: dict[str, tuple[str, str]] = {}
+        for plugin in plugins or []:
+            self.add_plugin(plugin)
         for source in tools or []:
             self.add_plugin(source)
+        for skill in skills or []:
+            self.add_skill(skill)
         self._focus_default_warned: set = (
             set()
         )  # tracks @tool focus defaults already logged
@@ -264,14 +427,53 @@ class Agent(BaseAgent):
         # MCP server integration — setup happens lazily on first use
         self.mcp_registry = None
         self.mcp_tools = []
+        mcp_config = mcp_servers if mcp_servers is not None else mcp
         self._mcp_server_configs = (
-            ([mcp] if isinstance(mcp, dict) else mcp) if mcp is not None else []
+            ([mcp_config] if isinstance(mcp_config, dict) else mcp_config)
+            if mcp_config is not None
+            else []
         )
 
         # Plugin access for direct plugin usage
         self.plugins = PluginAccess()
 
         logger.debug(f"Agent {self.name} initialized")
+
+    @property
+    def runtime(self) -> ChatRuntime:
+        """Return the ChatRuntime implementation behind this Agent facade."""
+        if self._runtime is None:
+            runtime = ChatRuntime(
+                runtime_id=self.agent_id,
+                agent_name=self.name,
+                llm_getter=lambda: self.llm,
+                llm_provider_name_getter=lambda: self._llm_provider_name,
+                config=self.config,
+                prompt=self.prompt,
+                default_focus=self.default_focus,
+                extension_registry=self.extension_registry,
+                runtime_kernel=self.runtime_kernel,
+                runtime_store=self.runtime_store,
+                trace_manager=self.trace_manager,
+                setup_tools=self._setup_tools,
+                setup_extensions=self.setup_extensions,
+                start_watches=self._start_watches,
+                emit_event=self._emit_event,
+                retry_with_tracing=self._retry_with_tracing,
+                context_blocks_renderer=self._render_extension_context_blocks,
+                context_formatter=self._format_extension_context,
+                final_answer_hooks_getter=lambda: getattr(
+                    self, "_daita_final_answer_readiness_hooks", []
+                ),
+            )
+            runtime.bind_local_tool_catalog(self.local_tool_catalog)
+            self._runtime = runtime
+        return self._runtime
+
+    @runtime.setter
+    def runtime(self, value: ChatRuntime) -> None:
+        """Allow advanced users and tests to replace the ChatRuntime."""
+        self._runtime = value
 
     @property
     def llm(self):
@@ -379,25 +581,20 @@ class Agent(BaseAgent):
             raise
 
     def _register_tool_source(self, source) -> None:
-        """Register a single tool source (AgentTool or plugin) into the tool registry."""
-        if isinstance(source, AgentTool):
-            self.tool_registry.register(source)
-        elif hasattr(source, "get_tools"):
-            plugin_tools = source.get_tools()
-            if plugin_tools:
-                self.tool_registry.register_many(plugin_tools)
-                logger.info(
-                    f"Registered {len(plugin_tools)} tools from "
-                    f"{source.__class__.__name__}"
-                )
+        """Register a local LocalTool source into the compatibility registry."""
+        if isinstance(source, LocalTool):
+            self.local_tool_catalog.register(source)
         else:
             logger.warning(
-                f"Invalid tool source: {source}. "
-                f"Expected AgentTool or plugin with get_tools() method."
+                "Ignoring non-manifest plugin %s; runtime plugins must declare a "
+                "PluginManifest with capabilities and executors.",
+                source.__class__.__name__,
             )
 
     async def _setup_tools(self):
         """Set up MCP tools. Non-MCP tools are registered eagerly in add_plugin()."""
+        await self._setup_extension_plugins()
+
         if self._tools_setup:
             return  # Already setup
 
@@ -405,13 +602,68 @@ class Agent(BaseAgent):
         if self._mcp_server_configs and self.mcp_registry is None:
             await self._setup_mcp_tools()
             for mcp_tool in self.mcp_tools:
-                agent_tool = AgentTool.from_mcp_tool(mcp_tool, self.mcp_registry)
-                self.tool_registry.register(agent_tool)
+                local_tool = LocalTool.from_mcp_tool(mcp_tool, self.mcp_registry)
+                self.local_tool_catalog.register(local_tool)
 
         self._tools_setup = True
         logger.info(
-            f"Agent {self.name} ready with {self.tool_registry.tool_count} tools"
+            f"Agent {self.name} ready with {self.local_tool_catalog.tool_count} tools"
         )
+
+    async def _setup_extension_plugins(self) -> None:
+        """Set up runtime-aware plugins through the extension registry."""
+        pending_plugin_ids = self._pending_extension_setup_plugin_ids()
+        if not pending_plugin_ids:
+            return
+
+        context = PluginContext(
+            runtime_id=self.agent_id,
+            runtime_kind="agent",
+            agent_id=self.agent_id,
+        )
+        for plugin_id in pending_plugin_ids:
+            await self.extension_registry.setup_plugin(plugin_id, context)
+            self._extension_setup_plugin_ids.add(plugin_id)
+
+    def _pending_extension_setup_plugin_ids(self) -> List[str]:
+        """Return registered plugin IDs that have not run PluginContext setup."""
+        return [
+            plugin_id
+            for plugin_id in self.extension_registry.plugin_ids
+            if plugin_id not in self._extension_setup_plugin_ids
+        ]
+
+    async def setup_extensions(self) -> None:
+        """Set up attached registry plugins through ``PluginContext``."""
+        await self._setup_extension_plugins()
+
+    async def teardown_extensions(self) -> None:
+        """Tear down attached registry plugins and clear setup state."""
+        if not self.extension_registry.plugin_ids:
+            return
+        try:
+            await self.extension_registry.teardown_all()
+        finally:
+            self._extension_setup_plugin_ids.clear()
+
+    @property
+    def extension_setup_plugin_ids(self) -> List[str]:
+        """Return registry plugin IDs that have completed ``PluginContext`` setup."""
+        return [
+            plugin_id
+            for plugin_id in self.extension_registry.plugin_ids
+            if plugin_id in self._extension_setup_plugin_ids
+        ]
+
+    @property
+    def pending_extension_setup_plugin_ids(self) -> List[str]:
+        """Return registry plugin IDs pending ``PluginContext`` setup."""
+        return self._pending_extension_setup_plugin_ids()
+
+    @property
+    def extensions_setup_complete(self) -> bool:
+        """Return True when all registry plugins have completed setup."""
+        return not self.pending_extension_setup_plugin_ids
 
     # ========================================================================
     # USER API - What developers call directly
@@ -420,7 +672,7 @@ class Agent(BaseAgent):
     async def run(
         self,
         prompt: str,
-        tools: Optional[List[Union[str, AgentTool]]] = None,
+        tools: Optional[List[Union[str, LocalTool]]] = None,
         max_iterations: int = 20,
         timeout_seconds: Optional[int] = None,
         on_event: Optional[Callable] = None,
@@ -449,7 +701,7 @@ class Agent(BaseAgent):
     async def stream(
         self,
         prompt: str,
-        tools: Optional[List[Union[str, AgentTool]]] = None,
+        tools: Optional[List[Union[str, LocalTool]]] = None,
         max_iterations: int = 20,
         timeout_seconds: Optional[int] = None,
         history: Optional["ConversationHistory"] = None,
@@ -513,7 +765,7 @@ class Agent(BaseAgent):
     async def _run_traced(
         self,
         prompt: str,
-        tools: Optional[List[Union[str, AgentTool]]],
+        tools: Optional[List[Union[str, LocalTool]]],
         max_iterations: int,
         timeout_seconds: Optional[int],
         on_event: Optional[Callable],
@@ -538,7 +790,7 @@ class Agent(BaseAgent):
             prompt=prompt[:200],  # Truncate for storage
             tools_requested=tools_requested,
             max_iterations=max_iterations,
-            entry_point="run",  # Distinguishes from _process() calls
+            entry_point="run",
             input_data={"prompt": prompt, "tools_requested": tools_requested},
         ) as span_id:
             # Start watches lazily on first run (idempotent)
@@ -587,23 +839,26 @@ class Agent(BaseAgent):
             return result
 
     def _resolve_tools(
-        self, tools: Optional[List[Union[str, AgentTool]]]
-    ) -> List[AgentTool]:
-        """Resolve tool names to AgentTool instances. If None, returns all registered tools."""
+        self, tools: Optional[List[Union[str, LocalTool]]]
+    ) -> List[LocalTool]:
+        """Resolve tool names to LocalTool instances. If None, returns all registered tools."""
         if tools is None:
             # Use all registered tools
-            return list(self.tool_registry.tools)
+            return list(self.available_tools)
 
         tool_list = []
         for t in tools:
             if isinstance(t, str):
                 # Tool name - look up in registry
-                tool = self.tool_registry.get(t)
-                if not tool:
+                tool = next(
+                    (item for item in self.available_tools if item.name == t),
+                    None,
+                )
+                if tool is None:
                     raise ValueError(f"Tool '{t}' not found in registry")
                 tool_list.append(tool)
             else:
-                # Already an AgentTool instance
+                # Already an LocalTool instance
                 tool_list.append(t)
 
         return tool_list
@@ -616,8 +871,8 @@ class Agent(BaseAgent):
             on_event(AgentEvent(type=event_type, **kwargs))
 
     async def _prepare_tools_with_focus(
-        self, tools: Optional[List[Union[str, "AgentTool"]]]
-    ) -> List["AgentTool"]:
+        self, tools: Optional[List[Union[str, "LocalTool"]]]
+    ) -> List["LocalTool"]:
         """Resolve tools and wrap with FocusedTool using the focus precedence chain.
 
         Precedence (highest → lowest):
@@ -687,26 +942,20 @@ class Agent(BaseAgent):
     async def _execute_autonomous_with_retry(
         self,
         prompt: str,
-        tools: Optional[List[Union[str, "AgentTool"]]],
+        tools: Optional[List[Union[str, "LocalTool"]]],
         max_iterations: int,
         on_event: Optional[Callable],
         **kwargs,
     ) -> Dict[str, Any]:
-        """Execute autonomous tool calling with retry logic via the shared scaffold."""
-
-        async def execute(attempt: int, max_attempts: int) -> Dict[str, Any]:
-            result = await self._execute_autonomous(
-                prompt=prompt,
-                tools=tools,
-                max_iterations=max_iterations,
-                on_event=on_event,
-                **kwargs,
-            )
-            if attempt > 1:
-                result["retry_attempt"] = attempt
-            return result
-
-        return await self._retry_with_tracing(execute, "autonomous_retry_attempt")
+        """Execute autonomous tool calling with retry logic via ChatRuntime."""
+        result = await self.runtime.run_with_retry(
+            prompt=prompt,
+            tools=tools,
+            max_iterations=max_iterations,
+            on_event=on_event,
+            **kwargs,
+        )
+        return result.to_agent_result()
 
     async def _build_initial_conversation(
         self,
@@ -715,8 +964,8 @@ class Agent(BaseAgent):
     ) -> List[Dict]:
         """Build the opening conversation list for a run.
 
-        Assembles: system prompt + memory context (from on_before_run hooks)
-        + prior history + current user message.
+        Assembles: system prompt + extension context + prior history + current
+        user message.
         """
         conversation = []
         system_parts = []
@@ -724,25 +973,29 @@ class Agent(BaseAgent):
         if self.prompt:
             system_parts.append(self.prompt)
 
-        skill_parts = []
-        for source in self.tool_sources:
-            disabled_for = getattr(
-                source, "_daita_disable_lifecycle_context_for_agent_ids", set()
-            )
-            if self.agent_id in disabled_for:
-                continue
-            if isinstance(source, LifecyclePlugin):
-                try:
-                    context = await source.on_before_run(prompt)
-                    if context:
-                        if isinstance(source, BaseSkill):
-                            skill_parts.append(f"### {source.name}\n{context}")
-                        else:
-                            system_parts.append(context)
-                except Exception as e:
-                    source_name = getattr(source, "name", source.__class__.__name__)
-                    logger.warning("on_before_run failed for '%s': %s", source_name, e)
+        extension_blocks = await self._render_extension_context_blocks(prompt)
+        extension_context = self._format_extension_context(
+            [
+                block
+                for block in extension_blocks
+                if block.metadata.get("context_kind") != "skill_instructions"
+            ]
+        )
+        if extension_context:
+            system_parts.append(extension_context)
 
+        skill_parts = [
+            f"### {block.metadata.get('skill_name') or block.owner}\n{block.content}"
+            for block in sorted(
+                (
+                    block
+                    for block in extension_blocks
+                    if block.metadata.get("context_kind") == "skill_instructions"
+                ),
+                key=lambda item: item.priority,
+                reverse=True,
+            )
+        ]
         if skill_parts:
             system_parts.append("## Skills & Expertise\n" + "\n\n".join(skill_parts))
 
@@ -757,17 +1010,88 @@ class Agent(BaseAgent):
         conversation.append({"role": "user", "content": prompt})
         return conversation
 
+    async def _render_extension_context(self, prompt: str) -> Optional[str]:
+        """Render primary-model context from extension registry providers."""
+        return self._format_extension_context(
+            await self._render_extension_context_blocks(prompt)
+        )
+
+    async def _render_extension_context_blocks(self, prompt: str) -> List[ContextBlock]:
+        """Render primary-model context blocks from extension providers."""
+        return await self.render_context_blocks(prompt)
+
+    @property
+    def context_providers(self) -> List[ContextProvider]:
+        """Return context providers declared by attached registry plugins."""
+        return list(self.extension_registry.context_providers)
+
+    def get_context_provider(
+        self, provider_id: str, *, owner: Optional[str] = None
+    ) -> ContextProvider:
+        """Return one context provider declaration, optionally disambiguated by owner."""
+        return self.extension_registry.get_context_provider(provider_id, owner=owner)
+
+    async def render_context_blocks(
+        self,
+        prompt: str,
+        *,
+        audience: ContextAudience = ContextAudience.PRIMARY_MODEL,
+        token_budget: int = 2000,
+    ) -> List[ContextBlock]:
+        """Render context blocks for a target runtime audience."""
+        await self._setup_extension_plugins()
+        audience = ContextAudience(audience)
+
+        blocks: List[ContextBlock] = []
+        for provider in self.extension_registry.context_providers:
+            if audience not in provider.audiences:
+                continue
+            try:
+                block = await provider.render(
+                    {
+                        "prompt": prompt,
+                        "runtime_id": self.agent_id,
+                        "agent_id": self.agent_id,
+                    },
+                    audience,
+                    token_budget,
+                )
+            except Exception as e:
+                provider_name = getattr(provider, "id", provider.__class__.__name__)
+                logger.warning(
+                    "context provider '%s' failed for agent '%s': %s",
+                    provider_name,
+                    self.name,
+                    e,
+                )
+                continue
+            if block is not None and block.content:
+                blocks.append(block)
+
+        return blocks
+
+    def _format_extension_context(self, blocks: List[ContextBlock]) -> Optional[str]:
+        """Format rendered extension context blocks for the generic Agent loop."""
+        if not blocks:
+            return None
+
+        rendered_blocks = [
+            f"### {block.id}\n{block.content}"
+            for block in sorted(blocks, key=lambda item: item.priority, reverse=True)
+        ]
+        return "## Runtime Context\n" + "\n\n".join(rendered_blocks)
+
     async def _execute_autonomous(
         self,
         prompt: str,
-        tools: Optional[List[Union[str, "AgentTool"]]],
+        tools: Optional[List[Union[str, "LocalTool"]]],
         max_iterations: int,
         on_event: Optional[Callable],
         initial_messages: Optional[List[Dict]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Unified autonomous execution path for both streaming and non-streaming."""
-        return await AgentRunController(self).run(
+        """Delegate generic chat execution to ChatRuntime."""
+        result = await self.runtime.run(
             prompt=prompt,
             tools=tools,
             max_iterations=max_iterations,
@@ -775,43 +1099,7 @@ class Agent(BaseAgent):
             initial_messages=initial_messages,
             **kwargs,
         )
-
-    # ========================================================================
-    # INTERNAL - Backward compatibility for system integration
-    # ========================================================================
-
-    async def _process(
-        self,
-        task: str,
-        data: Any = None,
-        context: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """INTERNAL: Legacy entry point — delegates to receive_message.
-
-        Prefer receive_message() for new integrations; this exists for
-        backward compatibility with older workflow and lambda callers.
-        """
-        result = await self.receive_message(
-            data=data if data is not None else task,
-            source_agent="internal",
-            channel="process",
-            workflow_name=task,
-            **kwargs,
-        )
-
-        if context:
-            result["context"] = {**result.get("context", {}), **context}
-
-        # Legacy fields expected by older internal callers
-        result["task"] = task
-        result["status"] = "success" if "result" in result else "error"
-
-        return result
-
-    # ========================================================================
-    # SYSTEM INTEGRATION API - What infrastructure calls
-    # ========================================================================
+        return result.to_agent_result()
 
     def _frame_payload(self, data: Any, tag: str) -> str:
         """Wrap data in an XML-like tag for safe LLM framing (prevents prompt injection)."""
@@ -820,30 +1108,6 @@ class Agent(BaseAgent):
         elif data is not None:
             return f"\n\n<{tag}>{str(data)[:4000]}</{tag}>"
         return ""
-
-    async def receive_message(
-        self,
-        data: Any,
-        source_agent: str,
-        channel: str,
-        workflow_name: Optional[str] = None,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """Handle workflow relay message from another agent. Called automatically by workflow system."""
-        prompt = "A message has arrived from the workflow system. Process the input data below."
-        prompt += self._frame_payload(data, "input_data")
-
-        result = await self.run(prompt, detailed=True, **kwargs)
-
-        # Add workflow metadata to result
-        result["workflow_metadata"] = {
-            "source_agent": source_agent,
-            "channel": channel,
-            "workflow": workflow_name,
-            "entry_point": "receive_message",
-        }
-
-        return result
 
     async def on_webhook(
         self, payload: Dict[str, Any], webhook_config: Dict[str, Any]
@@ -887,65 +1151,425 @@ class Agent(BaseAgent):
 
     # User customization methods
 
+    def _attached_plugin_sources(self) -> List[Any]:
+        """Return attached plugins with registry-owned plugins first."""
+        return [
+            *(
+                self.extension_registry.get_plugin(plugin_id)
+                for plugin_id in self.extension_registry.plugin_ids
+            ),
+            *self._local_tool_sources,
+        ]
+
+    @property
+    def attached_plugins(self) -> List[Any]:
+        """Return attached plugin objects using registry-first ownership order."""
+        return self._attached_plugin_sources()
+
+    @property
+    def attached_plugin_ids(self) -> List[str]:
+        """Return stable IDs for manifest plugins and class names for local tool sources."""
+        plugin_ids: List[str] = []
+        for source in self._attached_plugin_sources():
+            manifest = getattr(source, "manifest", None)
+            if isinstance(manifest, dict):
+                plugin_id = manifest.get("id")
+            else:
+                plugin_id = getattr(manifest, "id", None)
+            plugin_ids.append(plugin_id or source.__class__.__name__)
+        return plugin_ids
+
+    def get_attached_plugin(self, identifier: Union[str, type]) -> Optional[Any]:
+        """Return one attached plugin by stable ID, class name, or type."""
+        for source in self._attached_plugin_sources():
+            if isinstance(identifier, type):
+                if isinstance(source, identifier):
+                    return source
+                continue
+
+            manifest = getattr(source, "manifest", None)
+            plugin_id = (
+                manifest.get("id")
+                if isinstance(manifest, dict)
+                else getattr(manifest, "id", None)
+            )
+            if identifier in {plugin_id, source.__class__.__name__}:
+                return source
+        return None
+
+    @property
+    def plugin_manifests(self) -> List[PluginManifest]:
+        """Return manifests declared by attached registry plugins."""
+        return list(self.extension_registry.manifests)
+
+    def get_plugin_manifest(self, plugin_id: str) -> Optional[PluginManifest]:
+        """Return one attached registry plugin manifest by stable plugin ID."""
+        return next(
+            (
+                manifest
+                for manifest in self.plugin_manifests
+                if manifest.id == plugin_id
+            ),
+            None,
+        )
+
+    @property
+    def capabilities(self) -> List[Capability]:
+        """Return runtime capabilities declared by attached registry plugins."""
+        return list(self.extension_registry.capabilities)
+
+    def get_capability(
+        self, capability_id: str, *, owner: Optional[str] = None
+    ) -> Capability:
+        """Return one runtime capability, optionally disambiguated by owner."""
+        return self.extension_registry.get_capability(capability_id, owner=owner)
+
+    def find_capabilities(
+        self,
+        *,
+        domain: Optional[str] = None,
+        operation_type: Optional[str] = None,
+    ) -> List[Capability]:
+        """Find declared runtime capabilities by domain or operation type."""
+        return list(
+            self.extension_registry.find_capabilities(
+                domain=domain,
+                operation_type=operation_type,
+            )
+        )
+
+    @property
+    def tool_views(self) -> List[ToolView]:
+        """Return model-facing tool view declarations from registry plugins."""
+        return list(self.extension_registry.tool_views)
+
+    def get_tool_view(self, name: str) -> Optional[ToolView]:
+        """Return one model-facing tool view declaration by tool name."""
+        return next((view for view in self.tool_views if view.name == name), None)
+
+    def get_tool_view_owner(self, name: str) -> str:
+        """Return the stable plugin ID that owns a registry tool view."""
+        return self.extension_registry.get_tool_view_owner(name)
+
+    @property
+    def executors(self) -> List[Executor]:
+        """Return executors declared by attached registry plugins."""
+        return list(self.extension_registry.executors)
+
+    def get_executor(self, executor_id: str) -> Executor:
+        """Return one executor declared by attached registry plugins."""
+        return self.extension_registry.get_executor(executor_id)
+
+    async def execute_capability(
+        self,
+        capability_id: str,
+        arguments: Dict[str, Any],
+        *,
+        owner: Optional[str] = None,
+        operation_type: Optional[str] = None,
+        operation_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        executor_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Execute one registry capability through the shared runtime kernel."""
+        await self.setup_extensions()
+
+        capability = self.get_capability(capability_id, owner=owner)
+        selected_operation_type = (
+            operation_type
+            or (
+                sorted(capability.operation_types)[0]
+                if capability.operation_types
+                else None
+            )
+            or "capability.execute"
+        )
+        execution_metadata = {
+            "capability_id": capability.id,
+            **(metadata or {}),
+        }
+        context = {
+            "agent_id": self.agent_id,
+            "runtime_id": self.agent_id,
+            "capability": capability.to_dict(),
+        }
+        context.update(executor_context or {})
+
+        if operation_id is None:
+            operation = await self.runtime_kernel.create_operation(
+                operation_type=selected_operation_type,
+                request=arguments,
+                required_evidence=capability.output_evidence,
+                metadata=execution_metadata,
+            )
+        else:
+            operation = await self.runtime_store.load_operation(operation_id)
+            if operation is None:
+                operation = await self.runtime_kernel.create_operation(
+                    operation_id=operation_id,
+                    operation_type=selected_operation_type,
+                    request=arguments,
+                    required_evidence=capability.output_evidence,
+                    metadata=execution_metadata,
+                )
+        task = await self.runtime_kernel.plan_task(
+            task_id=task_id,
+            operation_id=operation.id,
+            capability_id=capability.id,
+            owner=capability.owner,
+            input=arguments,
+            metadata=execution_metadata,
+        )
+        result = await self.runtime_kernel.execute_task(task.id, context=context)
+        return {
+            "capability_id": capability.id,
+            "evidence": [
+                item.to_dict() if hasattr(item, "to_dict") else item
+                for item in result.evidence
+            ],
+        }
+
+    @property
+    def policies(self) -> List[Policy]:
+        """Return policies declared by attached registry plugins."""
+        return list(self.extension_registry.policies)
+
+    def get_policy(self, policy_id: str, *, owner: Optional[str] = None) -> Policy:
+        """Return one policy declaration, optionally disambiguated by owner."""
+        return self.extension_registry.get_policy(policy_id, owner=owner)
+
+    @property
+    def evidence_schemas(self) -> List[EvidenceSchema]:
+        """Return evidence schemas declared by attached registry plugins."""
+        return list(self.extension_registry.evidence_schemas)
+
+    def get_evidence_schema(
+        self, kind: str, *, owner: Optional[str] = None
+    ) -> EvidenceSchema:
+        """Return one evidence schema declaration, optionally disambiguated by owner."""
+        return self.extension_registry.get_evidence_schema(kind, owner=owner)
+
+    @property
+    def workers(self) -> List[Worker]:
+        """Return workers declared by attached registry plugins."""
+        return list(self.extension_registry.workers)
+
+    def get_worker(self, worker_id: str, *, owner: Optional[str] = None) -> Worker:
+        """Return one worker declaration, optionally disambiguated by owner."""
+        return self.extension_registry.get_worker(worker_id, owner=owner)
+
+    @property
+    def extension_diagnostics(self) -> List[RegistryDiagnostic]:
+        """Return diagnostics for registry-owned extension declarations."""
+        return list(self.extension_registry.diagnostics)
+
     def add_plugin(self, plugin: Any):
         """
-        Add a plugin to agent's tool sources and immediately register its tools.
+        Add a plugin or local LocalTool to the agent.
 
-        Automatically initializes plugin with agent context if plugin has initialize() method.
+        Manifest-bearing plugins are registered with the extension registry so
+        runtime semantics are keyed by stable plugin IDs. Non-manifest sources
+        are accepted only when they are local LocalTool projection objects.
         """
-        if hasattr(plugin, "initialize") and callable(plugin.initialize):
-            plugin.initialize(agent_id=self.agent_id)
-
-        self.tool_sources.append(plugin)
-        self._register_tool_source(plugin)
+        has_manifest = getattr(plugin, "manifest", None) is not None
+        if has_manifest:
+            self.extension_registry.register(plugin)
+        else:
+            self._local_tool_sources.append(plugin)
+            self._register_tool_source(plugin)
         logger.debug(f"Added plugin: {plugin.__class__.__name__}")
+
+    async def _invoke_watch_handler_through_runtime(
+        self,
+        handler: Callable,
+        event: Any,
+        config: Any,
+    ) -> None:
+        """Execute a watch handler as a runtime monitor action task."""
+        plugin_id, capability_id = self._ensure_watch_handler_capability(
+            handler,
+            config,
+        )
+        payload = _watch_event_payload(event)
+        monitor = MonitorRuntime(kernel=self.runtime_kernel)
+        await monitor.tick(
+            MonitorSpec(
+                id=f"watch.{_runtime_id_segment(config.name)}",
+                name=config.name,
+                trigger={"truthy": True},
+                action_capability_id=capability_id,
+                action_input={"event": payload},
+                metadata={
+                    "watch_name": config.name,
+                    "watch_owner": plugin_id,
+                    "source_type": payload.get("source_type"),
+                    "resolved": payload.get("resolved"),
+                },
+            ),
+            value=payload,
+            execute_actions=True,
+            raise_action_errors=True,
+            context={
+                "agent_id": self.agent_id,
+                "watch_event": event,
+                "watch_owner": plugin_id,
+            },
+        )
+
+    def _ensure_watch_handler_capability(
+        self,
+        handler: Callable,
+        config: Any,
+    ) -> tuple[str, str]:
+        key = config.name
+        existing = self._watch_action_plugins.get(key)
+        if existing is not None:
+            return existing
+        suffix = _runtime_id_segment(config.name)
+        plugin_id = f"watch_{suffix}_{len(self._watch_action_plugins) + 1}"
+        capability_id = f"agent.local.watch.{suffix}"
+        executor = LocalWatchExecutor(
+            executor_id=f"{plugin_id}.executor",
+            capability_id=capability_id,
+            handler=handler,
+            config=config,
+        )
+        self.extension_registry.register(
+            LocalWatchPlugin(
+                plugin_id=plugin_id,
+                capability_id=capability_id,
+                executor=executor,
+                config=config,
+            )
+        )
+        self._watch_action_plugins[key] = (plugin_id, capability_id)
+        return plugin_id, capability_id
 
     def add_skill(self, skill: "BaseSkill"):
         """Add a skill to the agent.
 
-        Plugin dependencies declared in ``skill.requires()`` are resolved
-        against already-registered plugins. Add plugins before skills that
-        need them.
+        Capability requirements declared in ``skill.requires_capabilities()``
+        are resolved against already-registered extension capabilities. Add
+        capability-providing plugins before skills that need them.
         """
-        requirements = skill.requires()
+        requirements = skill.requires_capabilities()
         if requirements:
-            available = [s for s in self.tool_sources if isinstance(s, BasePlugin)]
-            unmet = []
-            for key, plugin_type in requirements.items():
-                match = next((p for p in available if isinstance(p, plugin_type)), None)
-                if match is None:
-                    unmet.append(f"'{key}' ({plugin_type.__name__})")
-                else:
-                    skill._resolved_plugins[key] = match
+            capabilities_by_id: dict[str, list] = {}
+            for capability in self.extension_registry.capabilities:
+                capabilities_by_id.setdefault(capability.id, []).append(capability)
+            unmet = [
+                capability_id
+                for capability_id in requirements
+                if capability_id not in capabilities_by_id
+            ]
             if unmet:
                 raise SkillError(
-                    f"Skill '{skill.name}' requires plugins not yet added: "
-                    f"{', '.join(unmet)}. Add the required plugin(s) before "
+                    f"Skill '{skill.name}' requires capabilities not yet available: "
+                    f"{', '.join(unmet)}. Add capability-providing plugin(s) before "
                     f"adding this skill.",
                     plugin_name=skill.name,
                 )
+            skill._resolved_capabilities = {
+                capability_id: tuple(capabilities_by_id[capability_id])
+                for capability_id in requirements
+            }
 
         self.add_plugin(skill)
 
     @property
     def skills(self) -> List["BaseSkill"]:
         """Return all attached skills."""
-        return [s for s in self.tool_sources if isinstance(s, BaseSkill)]
+        return [
+            source
+            for source in self._attached_plugin_sources()
+            if isinstance(source, BaseSkill)
+        ]
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
         """Execute a tool by name with arguments."""
         await self._setup_tools()
-        return await self.tool_registry.execute(name, arguments)
+        view = self.get_tool_view(name)
+        if view is not None:
+            owner = self.extension_registry.get_tool_view_owner(name)
+            capability = self.extension_registry.get_capability(
+                view.capability_id,
+                owner=owner,
+            )
+            operation_type = (
+                sorted(capability.operation_types)[0]
+                if capability.operation_types
+                else "tool.call"
+            )
+            return await self.execute_capability(
+                view.capability_id,
+                arguments,
+                owner=owner,
+                operation_type=operation_type,
+                metadata={"tool_view": view.name},
+                executor_context={"tool_view": view.to_dict(), "tool_owner": owner},
+            )
+
+        tool = self.local_tool_catalog.get(name)
+        if tool is None:
+            raise RuntimeError(f"Tool '{name}' not found in registry")
+        spec = self.runtime._register_local_tool(tool)
+        execution = await self.runtime_kernel.execute_capability(
+            spec.capability_id,
+            owner=spec.owner,
+            operation_type="chat.tool_call",
+            input=arguments,
+            context={
+                "tool_view": spec.tool_view.to_dict(),
+                "tool_owner": spec.owner,
+            },
+        )
+        return self.runtime._render_evidence_for_model(tuple(execution.evidence))
 
     @property
-    def available_tools(self) -> List[AgentTool]:
-        """Get list of all available tools."""
-        return self.tool_registry.tools.copy()
+    def available_tools(self) -> List[LocalTool]:
+        """Get model-visible local tools plus registry ToolView projections."""
+        projected = []
+        for view in self.extension_registry.tool_views:
+            if not view.model_visible:
+                continue
+            owner = self.extension_registry.get_tool_view_owner(view.name)
+            capability = self.extension_registry.get_capability(
+                view.capability_id,
+                owner=owner,
+            )
+            projected.append(
+                LocalTool(
+                    name=view.name,
+                    description=view.description,
+                    parameters=view.parameters,
+                    handler=lambda arguments, tool_name=view.name: self.call_tool(
+                        tool_name,
+                        arguments,
+                    ),
+                    source="plugin",
+                    plugin_name=owner,
+                    capability_ids=(view.capability_id,),
+                    output_evidence=tuple(capability.output_evidence),
+                    timeout_seconds=capability.timeout_seconds,
+                    retry_safe=capability.retry_safe,
+                    replay_safe=capability.replay_safe,
+                    idempotent=capability.idempotent,
+                    side_effecting=capability.side_effecting,
+                    metadata=dict(view.metadata),
+                )
+            )
+        return [*projected, *self.local_tool_catalog.tools.copy()]
+
+    @property
+    def tools(self) -> List[LocalTool]:
+        """Return model-visible tools using the registry-backed projection."""
+        return self.available_tools
 
     @property
     def tool_names(self) -> List[str]:
         """Get list of all tool names"""
-        return self.tool_registry.tool_names
+        return [tool.name for tool in self.available_tools]
 
     async def __aenter__(self):
         """Support ``async with agent:`` for automatic lifecycle management."""
@@ -963,14 +1587,6 @@ class Agent(BaseAgent):
 
     async def stop(self) -> None:
         """Stop agent and clean up all resources including MCP connections."""
-        # Trigger auto-curation in memory plugins
-        for source in self.tool_sources:
-            if isinstance(source, LifecyclePlugin):
-                try:
-                    await source.on_agent_stop()
-                except Exception as e:
-                    logger.warning(f"Error during on_agent_stop: {e}")
-
         # Clean up MCP connections first
         if self.mcp_registry:
             try:
@@ -978,6 +1594,8 @@ class Agent(BaseAgent):
                 logger.info(f"Cleaned up MCP connections for agent {self.name}")
             except Exception as e:
                 logger.warning(f"Error cleaning up MCP connections: {e}")
+
+        await self.teardown_extensions()
 
         # Call parent stop for standard cleanup
         await super().stop()
@@ -1004,9 +1622,41 @@ class Agent(BaseAgent):
         base_health.update(
             {
                 "tools": {
-                    "count": self.tool_registry.tool_count,
+                    "count": len(self.available_tools),
                     "setup": self._tools_setup,
-                    "names": self.tool_registry.tool_names if self._tools_setup else [],
+                    "names": self.tool_names,
+                },
+                "extensions": {
+                    "plugin_ids": list(self.extension_registry.plugin_ids),
+                    "manifest_ids": [manifest.id for manifest in self.plugin_manifests],
+                    "capability_ids": [
+                        capability.id for capability in self.capabilities
+                    ],
+                    "capability_count": len(self.capabilities),
+                    "tool_view_names": [view.name for view in self.tool_views],
+                    "tool_view_count": len(self.tool_views),
+                    "context_provider_ids": [
+                        provider.id for provider in self.context_providers
+                    ],
+                    "context_provider_count": len(self.context_providers),
+                    "executor_ids": [executor.id for executor in self.executors],
+                    "executor_count": len(self.executors),
+                    "policy_ids": [policy.id for policy in self.policies],
+                    "policy_count": len(self.policies),
+                    "evidence_schema_kinds": [
+                        schema.kind for schema in self.evidence_schemas
+                    ],
+                    "evidence_schema_count": len(self.evidence_schemas),
+                    "worker_ids": [worker.id for worker in self.workers],
+                    "worker_count": len(self.workers),
+                    "diagnostic_ids": [
+                        diagnostic.declaration_id
+                        for diagnostic in self.extension_diagnostics
+                    ],
+                    "diagnostic_count": len(self.extension_diagnostics),
+                    "setup_plugin_ids": self.extension_setup_plugin_ids,
+                    "pending_setup_plugin_ids": self.pending_extension_setup_plugin_ids,
+                    "setup_complete": self.extensions_setup_complete,
                 },
                 "relay": {"enabled": self.relay is not None, "channel": self.relay},
                 "llm": {

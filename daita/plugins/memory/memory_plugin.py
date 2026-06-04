@@ -6,11 +6,19 @@ Project-scoped by default, global as opt-in.
 """
 
 import logging
+import inspect
 import os
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
-from ..base import LifecyclePlugin
-from ...core.tools import AgentTool, tool
+from ..base import DomainServicePlugin
+from ...core.tools import LocalTool, tool
+from .extensions import (
+    MEMORY_MANIFEST,
+    MemoryContextProvider,
+    MemoryExecutor,
+    memory_capabilities,
+    memory_evidence_schemas,
+)
 
 if TYPE_CHECKING:
     from ...embeddings.base import BaseEmbeddingProvider
@@ -45,12 +53,18 @@ def _memory_graph_type(scope: str, workspace: str, project_name: Optional[str]) 
     return safe or "memory"
 
 
-class MemoryPlugin(LifecyclePlugin):
+async def _maybe_await(result: Any) -> Any:
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+class MemoryPlugin(DomainServicePlugin):
     """
     Production-ready memory plugin for DAITA agents.
 
     Features:
-    - Automatic context injection before each run (on_before_run)
+    - Automatic context injection through MemoryContextProvider
     - Hybrid semantic + keyword recall with importance weighting and temporal decay
     - Access tracking: recalled memories increment access_count for smarter pruning
     - Curator-maintained MEMORY.md: clean, categorized, never append-bloated
@@ -72,6 +86,8 @@ class MemoryPlugin(LifecyclePlugin):
         # Global scope
         agent.add_plugin(MemoryPlugin(scope="global"))
     """
+
+    manifest = MEMORY_MANIFEST
 
     def __init__(
         self,
@@ -204,6 +220,47 @@ class MemoryPlugin(LifecyclePlugin):
         self._pending_contradiction_checks: list = []
         self._background_tasks: list = []
 
+    async def setup(self, context):
+        """Set up the memory backend for an extension-runtime host."""
+        self._configure_backend(context.agent_id or context.runtime_id)
+
+    def declare_capabilities(self):
+        return memory_capabilities()
+
+    def get_executors(self):
+        return (
+            MemoryExecutor(
+                id="memory.semantic.recall",
+                capability_ids=frozenset({"memory.semantic.recall"}),
+                evidence_kind="memory.semantic.recall",
+                handler=self._execute_semantic_recall,
+            ),
+            MemoryExecutor(
+                id="memory.semantic.write",
+                capability_ids=frozenset({"memory.semantic.write"}),
+                evidence_kind="memory.semantic.write",
+                handler=self._execute_semantic_write,
+            ),
+            MemoryExecutor(
+                id="memory.fact.query",
+                capability_ids=frozenset({"memory.fact.query"}),
+                evidence_kind="memory.fact.query",
+                handler=self._execute_fact_query,
+            ),
+            MemoryExecutor(
+                id="memory.context.render",
+                capability_ids=frozenset({"memory.context.render"}),
+                evidence_kind="memory.context",
+                handler=self._execute_context_render,
+            ),
+        )
+
+    def declare_evidence_schemas(self):
+        return memory_evidence_schemas()
+
+    def get_context_providers(self):
+        return (MemoryContextProvider(plugin=self),)
+
     def _ensure_curation_llm(self):
         """Return the curator LLM if available, else create a standalone one.
 
@@ -222,8 +279,8 @@ class MemoryPlugin(LifecyclePlugin):
             )
         return self._curation_llm
 
-    def initialize(self, agent_id: str):
-        """Called by Agent.add_plugin() to inject agent context."""
+    def _configure_backend(self, agent_id: str) -> None:
+        """Configure the memory backend for generic-agent and runtime hosts."""
         if self.backend is not None:
             self._agent_id = agent_id
             return
@@ -390,367 +447,83 @@ class MemoryPlugin(LifecyclePlugin):
             mention_promote_count=self._graph_mention_promote_count,
         )
 
-    def get_tools(self) -> List[AgentTool]:
-        """Get memory tools for the LLM to use."""
-        if self.backend is None:
-            raise RuntimeError(
-                "MemoryPlugin not initialized. Add via agent.add_plugin()."
-            )
+    async def _execute_semantic_recall(self, payload: Any) -> Dict[str, Any]:
+        from .memory_tools import handle_recall
 
-        from .memory_tools import (
-            handle_remember,
-            handle_recall,
-            handle_list_by_category,
-            handle_update_memory,
-            handle_read_memory,
-            handle_list_memories,
-            handle_query_facts,
-            handle_scratch,
-            handle_think,
-            handle_reinforce,
-            handle_traverse_memory,
+        args = dict(payload or {})
+        results = await handle_recall(
+            self,
+            query=str(args.get("query") or ""),
+            limit=int(args.get("limit") or 5),
+            score_threshold=float(args.get("score_threshold", 0.6)),
+            min_importance=args.get("min_importance"),
+            max_importance=args.get("max_importance"),
+            category=args.get("category"),
+            since=args.get("since"),
+            before=args.get("before"),
         )
+        return {"query": str(args.get("query") or ""), "results": results}
 
-        plugin = self
+    async def _execute_semantic_write(self, payload: Any) -> Dict[str, Any]:
+        from .memory_tools import handle_remember
 
-        @tool
-        async def remember(
-            content: Union[str, List[Dict[str, Any]]],
-            importance: float = 0.5,
-            category: Optional[str] = None,
-            ttl_days: Optional[int] = None,
-            promote_key: Optional[str] = None,
-        ):
-            """
-            Store information in memory for future recall.
-
-            Use for facts, decisions, action items, and context worth preserving.
-
-            Args:
-                content: The information to store. Either:
-                    - A string (single memory, be specific and self-contained)
-                    - A list of dicts for batch storage, each with keys:
-                        "content" (required), "importance" (optional, 0.0-1.0),
-                        "category" (optional). Uses a single embedding API call.
-                promote_key: Optional key from working memory (scratch) to promote
-                    to long-term storage. When provided, uses the scratch item's
-                    content (overrides the content parameter).
-                importance: How critical this memory is (0.0-1.0), used when
-                    content is a string. Ignored for batch input (use per-item):
-                    0.9+ = critical (security issues, hard deadlines, major decisions)
-                    0.7-0.8 = important (key facts, events, action items)
-                    0.5-0.6 = useful (general context, preferences)
-                    0.3-0.4 = low priority (minor notes)
-                category: Optional tag (e.g. "security", "project", "contact", "event").
-                    Used when content is a string. Ignored for batch input.
-                ttl_days: Days until this memory expires (default: no expiry).
-                    Expired memories are pruned at session start/stop.
-
-            Returns:
-                Confirmation with chunk_id (single) or batch summary (batch)
-            """
-            return await handle_remember(
-                plugin, content, importance, category, ttl_days, promote_key
+        args = dict(payload or {})
+        if "db_memory_payload" in args:
+            from daita.db.memory import (
+                db_memory_record_from_payload,
+                write_db_memory_record,
             )
 
-        @tool
-        async def recall(
-            query: str,
-            limit: int = 5,
-            score_threshold: float = 0.6,
-            min_importance: Optional[float] = None,
-            max_importance: Optional[float] = None,
-            category: Optional[str] = None,
-            since: Optional[str] = None,
-            before: Optional[str] = None,
-        ):
-            """
-            Search previously stored agent memories by meaning.
-
-            Use this ONLY to retrieve facts that were explicitly stored with
-            remember() — things like business rules, unit conventions, or
-            analyst notes (e.g. "prices are in cents", "exclude refunded orders").
-
-            Do NOT use this to query database records or find patterns in data.
-            For anything involving rows, columns, or data similarity, write a
-            SQL query instead.
-
-            Results are ranked by relevance, weighted by importance, and
-            adjusted for age (recent memories rank slightly higher).
-
-            Args:
-                query: What you're looking for (natural language)
-                limit: Maximum results (default: 5)
-                score_threshold: Minimum relevance score 0-1 (default: 0.6)
-                min_importance: Filter to memories with importance >= this value
-                max_importance: Filter to memories with importance <= this value
-                category: Restrict search to a specific category (e.g. "fk_constraint")
-                since: Only return memories created at or after this time.
-                    Accepts ISO datetime (e.g. "2026-04-01T00:00:00") or
-                    relative shorthand: "24h", "7d", "30d".
-                before: Only return memories created before this time.
-                    Same format as since.
-
-            Returns:
-                Ranked list of relevant memories with scores and metadata
-            """
-            return await handle_recall(
-                plugin,
-                query,
-                limit,
-                score_threshold,
-                min_importance,
-                max_importance,
-                category,
-                since,
-                before,
-            )
-
-        @tool
-        async def list_by_category(
-            category: str, min_importance: float = 0.0, limit: int = 100
-        ):
-            """
-            Enumerate ALL stored memories in a category without semantic ranking.
-
-            PREFER this over recall() whenever the question asks to list or count
-            everything of a known type:
-              - "Which tables have jsonb columns?"  -> list_by_category("column_type")
-              - "List all FK constraints"           -> list_by_category("fk_constraint")
-              - "What are the row counts?"          -> list_by_category("table_stats")
-              - "What schema observations exist?"   -> list_by_category("schema_observation")
-
-            Use recall() only when you need semantic similarity ranking (e.g.
-            "what do I know about the users table?"). For exhaustive enumeration,
-            always use this tool — recall() truncates at its limit and may miss facts.
-
-            Args:
-                category: The category tag to enumerate (e.g. "fk_constraint", "column_type")
-                min_importance: Only return memories with importance >= this value (default: 0.0)
-                limit: Maximum results (default: 100)
-
-            Returns:
-                All matching memories ordered by importance descending
-            """
-            return await handle_list_by_category(
-                plugin, category, min_importance, limit
-            )
-
-        @tool
-        async def update_memory(query: str, new_content: str, importance: float = 0.5):
-            """
-            Replace an existing memory with updated information.
-
-            Use when a fact has changed, been resolved, or was incorrect.
-            Finds the closest matching memory, removes it, and stores the update.
-
-            Args:
-                query: Description of the memory to find and replace
-                new_content: The corrected or updated information
-                importance: Importance score for the updated memory (0.0-1.0)
-
-            Returns:
-                Result with count of memories replaced
-            """
-            return await handle_update_memory(plugin, query, new_content, importance)
-
-        @tool
-        async def read_memory(file: str = "MEMORY.md"):
-            """
-            Read a memory file. Accepts shorthand values or absolute paths.
-
-            Args:
-                file: "MEMORY.md" (default) for long-term memory summary,
-                      "today" for today's interaction log,
-                      or an absolute file path
-
-            Returns:
-                Full file contents
-            """
-            return await handle_read_memory(plugin, file)
-
-        @tool
-        async def list_memories(include_stats: bool = False):
-            """
-            List available memory files and optionally show memory statistics.
-
-            Args:
-                include_stats: When true, include category counts, importance
-                    distribution, time range, and pinned count. Useful for
-                    understanding what the agent already knows before storing
-                    or recalling. (default: false)
-
-            Returns:
-                Summary of available memory files with paths and sizes.
-                When include_stats=True, also includes a "stats" key with:
-                  total_memories, categories (with count and avg_importance),
-                  oldest/newest timestamps, and pinned_count.
-            """
-            return await handle_list_memories(plugin, include_stats)
-
-        tools = [
-            remember,
-            recall,
-            list_by_category,
-            update_memory,
-            read_memory,
-            list_memories,
-        ]
-
-        # Conditionally add query_facts when fact extraction is enabled.
-        if self._fact_extractor is not None:
-
-            @tool
-            async def query_facts(
-                entity: Optional[str] = None,
-                relation: Optional[str] = None,
-                value: Optional[str] = None,
-                limit: int = 50,
-            ):
-                """
-                Query structured facts extracted from memories.
-
-                Use when you need to look up specific entities, relationships,
-                or values rather than doing a semantic search. Returns facts
-                as (entity, relation, value, temporal_context) tuples.
-
-                Examples:
-                  - query_facts(entity="users") -> all facts about the users table
-                  - query_facts(relation="FK references") -> all foreign key relationships
-                  - query_facts(entity="orders", relation="has column") -> columns of orders
-
-                Args:
-                    entity: Filter by subject (partial match, case-insensitive)
-                    relation: Filter by relationship type (partial match)
-                    value: Filter by object/value (partial match)
-                    limit: Maximum results (default: 50)
-
-                Returns:
-                    List of structured facts with source content and metadata
-                """
-                return await handle_query_facts(plugin, entity, relation, value, limit)
-
-            tools.append(query_facts)
-
-        # Working memory tools
-        if self._working_memory is not None:
-
-            @tool
-            async def scratch(content: str, key: Optional[str] = None):
-                """
-                Store temporary info in session working memory.
-
-                Fast (no embedding cost). Discarded when agent stops unless
-                promoted to long-term memory via remember(promote_key=key).
-
-                Use for intermediate results, checklists, or temporary state
-                during multi-step tasks.
-
-                Args:
-                    content: Information to store temporarily
-                    key: Optional key for later reference (auto-generated if omitted)
-
-                Returns:
-                    The key assigned to this scratch item
-                """
-                return await handle_scratch(plugin, content, key)
-
-            @tool
-            async def think(query: str, limit: int = 5):
-                """
-                Search session working memory (scratch items only).
-
-                Use to retrieve temporary notes, intermediate results, or
-                scratchpad items stored during this session with scratch().
-
-                Args:
-                    query: What to search for (keyword matching)
-                    limit: Maximum results (default: 5)
-
-                Returns:
-                    Matching scratch items from this session
-                """
-                return await handle_think(plugin, query, limit)
-
-            tools.extend([scratch, think])
-
-        # Reinforcement tool
-        if self.enable_reinforcement:
-
-            @tool
-            async def reinforce(
-                memory_ids: Union[str, List[str]],
-                outcome: str,
-                signal_strength: float = 0.5,
-                context: Optional[str] = None,
-            ):
-                """
-                Record whether recalled memories led to good or bad outcomes.
-
-                Call after acting on recalled memories to improve future recall.
-                Positive reinforcement increases importance; negative flags for
-                review and accelerates pruning.
-
-                Args:
-                    memory_ids: chunk_id(s) to reinforce (from recall results).
-                        Accepts a single string or a list.
-                    outcome: "positive", "negative", or "neutral"
-                    signal_strength: How strong the signal (0.0-1.0, default 0.5)
-                    context: Optional description of what happened
-
-                Returns:
-                    Summary of reinforcement applied
-                """
-                return await handle_reinforce(
-                    plugin, memory_ids, outcome, signal_strength, context
+            try:
+                record = db_memory_record_from_payload(
+                    dict(args.get("db_memory_payload") or {}),
+                    str(args.get("db_memory_prompt") or ""),
                 )
+            except Exception as exc:
+                return {"success": False, "error": str(exc)}
+            return await write_db_memory_record(self, record)
 
-            tools.append(reinforce)
+        content = args.get("content") or args.get("memory") or ""
+        result = await handle_remember(
+            self,
+            content=content,
+            importance=float(args.get("importance", 0.5)),
+            category=args.get("category"),
+            ttl_days=args.get("ttl_days"),
+            promote_key=args.get("promote_key"),
+        )
+        return {"content": content, "result": result}
 
-        # Memory graph traversal tool
-        if self._memory_graph is not None:
+    async def _execute_fact_query(self, payload: Any) -> Dict[str, Any]:
+        from .memory_tools import handle_query_facts
 
-            @tool
-            async def traverse_memory(entity: str, max_depth: int = 2):
-                """
-                Walk the memory knowledge graph to find all connected knowledge.
+        args = dict(payload or {})
+        results = await handle_query_facts(
+            self,
+            entity=args.get("entity"),
+            relation=args.get("relation"),
+            value=args.get("value"),
+            limit=int(args.get("limit") or 50),
+        )
+        return {"results": results}
 
-                Use when you need to find everything related to a concept,
-                especially facts that semantic search might miss. For example:
-                "what are all the infrastructure constraints for Project Orion?"
+    async def _execute_context_render(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        content = await self.render_context(
+            prompt=str(args.get("prompt") or ""),
+            token_budget=int(args.get("token_budget") or 2000),
+        )
+        return {"content": content, "rendered": bool(content)}
 
-                Args:
-                    entity: Entity name to start from (e.g. "PostgreSQL",
-                        "users table", "Project Orion")
-                    max_depth: How many hops to traverse (default: 2)
+    async def render_context(self, prompt: str, token_budget: int = 2000) -> str | None:
+        """Render bounded memory context for runtime context providers."""
+        content = await self._render_relevant_context(prompt)
+        if content and token_budget:
+            return content[: max(token_budget, 0)]
+        return content
 
-                Returns:
-                    Connected entities and the memories that reference them
-                """
-                return await handle_traverse_memory(plugin, entity, max_depth)
-
-            tools.append(traverse_memory)
-
-        # Filter tools by tier or explicit whitelist
-        allowed = self.memory_tools
-        if allowed is None:
-            tier_set = _TOOL_TIERS.get(self.tier)
-            if tier_set is not None:
-                allowed = tier_set
-        if allowed is not None:
-            tools = [t for t in tools if t.name in allowed]
-
-        return tools
-
-    async def on_before_run(self, prompt: str) -> Optional[str]:
-        """
-        Auto-inject relevant memories into agent context before each run.
-
-        Called by the agent framework before the first LLM turn. Returns a
-        formatted memory block that gets prepended to the system prompt,
-        so the agent arrives with relevant context already loaded — no
-        explicit recall call needed.
-        """
+    async def _render_relevant_context(self, prompt: str) -> Optional[str]:
+        """Render relevant memories for runtime context providers."""
         if self.backend is None:
             return None
 
@@ -836,7 +609,7 @@ class MemoryPlugin(LifecyclePlugin):
             return "\n".join(lines)
         except Exception as e:
             logger.warning(
-                "Memory recall failed in on_before_run: %s. "
+                "Memory recall failed while rendering context: %s. "
                 "Agent will proceed without memory context.",
                 e,
             )
@@ -854,7 +627,7 @@ class MemoryPlugin(LifecyclePlugin):
     async def _process_deferred_contradictions(self):
         """Batch-process queued contradiction checks concurrently.
 
-        Called during on_agent_stop(). Memories are already stored — if a
+        Called during teardown(). Memories are already stored — if a
         contradiction is found the chunk is flagged (not deleted) so the
         next session or a human can resolve it. Evolutions trigger the same
         auto-replace as the former synchronous path.
@@ -904,12 +677,12 @@ class MemoryPlugin(LifecyclePlugin):
             ]
         )
 
-    async def on_agent_stop(self):
+    async def teardown(self):
         """Flush pending changes, prune stale memories, and auto-curate.
 
         MEMORY.md is a human-readable artifact for inspecting what the agent
         has learned. Agent context injection uses semantic recall via
-        on_before_run(), not MEMORY.md.
+        MemoryContextProvider, not MEMORY.md.
         """
         import asyncio
 
@@ -930,17 +703,17 @@ class MemoryPlugin(LifecyclePlugin):
         # Flush memory graph
         if self._memory_graph:
             try:
-                await self._memory_graph.flush()
+                await _maybe_await(self._memory_graph.flush())
             except Exception:
                 pass
 
         if hasattr(self.backend, "flush"):
-            await self.backend.flush()
+            await _maybe_await(self.backend.flush())
 
         # Prune expired and over-limit memories
         if hasattr(self.backend, "prune"):
             try:
-                await self.backend.prune()
+                await _maybe_await(self.backend.prune())
             except Exception:
                 pass
 
@@ -958,7 +731,7 @@ class MemoryPlugin(LifecyclePlugin):
                     msg += f", ${result.cost_usd:.4f}"
                     print(msg)
             elif hasattr(self.backend, "regenerate_memory_md"):
-                path = await self.backend.regenerate_memory_md()
+                path = await _maybe_await(self.backend.regenerate_memory_md())
                 if path is not None:
                     print(f"Memory summary written to: {path}")
 

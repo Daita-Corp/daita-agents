@@ -2,7 +2,8 @@
 CatalogPlugin — orchestrator for schema discovery and metadata management.
 
 Provides pluggable infrastructure discovery, schema profiling, and a unified
-catalog of data stores. Extends LifecyclePlugin for agent lifecycle hooks.
+catalog of data stores. Declares catalog capabilities, evidence schemas,
+context providers, and model-visible tool views.
 """
 
 import logging
@@ -10,9 +11,10 @@ import fnmatch
 import hashlib
 import re
 from collections import deque
-from typing import Any, Callable, Dict, Iterable, List, Optional, TYPE_CHECKING
+from dataclasses import asdict
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from ..base import LifecyclePlugin
+from ..base import DomainServicePlugin, PluginContext
 from .base_discoverer import (
     BaseDiscoverer,
     DiscoveredStore,
@@ -32,9 +34,15 @@ from .persistence import (
     persist_schema as _persist_schema,
     prune_stale_catalog,
 )
-
-if TYPE_CHECKING:
-    from ...core.tools import AgentTool
+from .extensions import (
+    CATALOG_MANIFEST,
+    CatalogExecutor,
+    CatalogSummaryContextProvider,
+    catalog_capabilities,
+    catalog_evidence_schemas,
+    catalog_tool_views,
+    catalog_workers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +74,7 @@ def register_catalog_backend_factory(factory: Optional[Callable[[], Any]]) -> No
     _CATALOG_BACKEND_FACTORY = factory
 
 
-class CatalogPlugin(LifecyclePlugin):
+class CatalogPlugin(DomainServicePlugin):
     """
     Plugin for schema discovery and metadata cataloging.
 
@@ -87,6 +95,8 @@ class CatalogPlugin(LifecyclePlugin):
     - Schema comparison and validation
     - Pluggable discoverers and profilers
     """
+
+    manifest = CATALOG_MANIFEST
 
     def __init__(
         self,
@@ -115,7 +125,10 @@ class CatalogPlugin(LifecyclePlugin):
             auto_persist,
         )
 
-    def initialize(self, agent_id: str) -> None:
+    async def setup(self, context: PluginContext) -> None:
+        self._configure_runtime_backends(context.agent_id)
+
+    def _configure_runtime_backends(self, agent_id: Optional[str]) -> None:
         self._agent_id = agent_id
         if self._graph_backend is None:
             from daita.core.graph.backend import auto_select_backend
@@ -139,6 +152,170 @@ class CatalogPlugin(LifecyclePlugin):
                     "Schema persistence will use local JSON.",
                     exc,
                 )
+
+    # ------------------------------------------------------------------
+    # Runtime extension declarations
+    # ------------------------------------------------------------------
+
+    def declare_capabilities(self):
+        return catalog_capabilities()
+
+    def get_executors(self):
+        return (
+            CatalogExecutor(
+                id="catalog.register_source",
+                capability_ids=frozenset({"catalog.source.register"}),
+                evidence_kind="catalog.source_registered",
+                handler=self._execute_register_source,
+            ),
+            CatalogExecutor(
+                id="catalog.profile_source",
+                capability_ids=frozenset({"catalog.source.profile"}),
+                evidence_kind="catalog.profile",
+                handler=self._execute_profile_source,
+            ),
+            CatalogExecutor(
+                id="catalog.search_schema",
+                capability_ids=frozenset({"catalog.schema.search"}),
+                evidence_kind="schema.search_result",
+                handler=self._execute_search_schema,
+            ),
+            CatalogExecutor(
+                id="catalog.inspect_asset",
+                capability_ids=frozenset({"catalog.asset.inspect"}),
+                evidence_kind="schema.asset_profile",
+                handler=self._execute_inspect_asset,
+            ),
+            CatalogExecutor(
+                id="catalog.find_relationship_paths",
+                capability_ids=frozenset({"catalog.relationship_paths.find"}),
+                evidence_kind="schema.relationship_path",
+                handler=self._execute_find_relationship_paths,
+            ),
+            CatalogExecutor(
+                id="catalog.discover_infrastructure",
+                capability_ids=frozenset({"catalog.infrastructure.discover"}),
+                evidence_kind="catalog.infrastructure_inventory",
+                handler=self._execute_discover_infrastructure,
+            ),
+            CatalogExecutor(
+                id="catalog.compare_schema",
+                capability_ids=frozenset({"catalog.schema.compare"}),
+                evidence_kind="schema.comparison",
+                handler=self._execute_compare_schema,
+            ),
+            CatalogExecutor(
+                id="catalog.export_diagram",
+                capability_ids=frozenset({"catalog.diagram.export"}),
+                evidence_kind="schema.diagram",
+                handler=self._execute_export_diagram,
+            ),
+        )
+
+    def declare_evidence_schemas(self):
+        return catalog_evidence_schemas()
+
+    def get_context_providers(self):
+        return (CatalogSummaryContextProvider(self),)
+
+    def get_tool_views(self):
+        return catalog_tool_views()
+
+    def get_workers(self):
+        return catalog_workers()
+
+    async def _execute_register_source(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        schema = args.get("schema")
+        if not isinstance(schema, dict):
+            from ...core.exceptions import ValidationError
+
+            raise ValidationError("schema is required", field="schema")
+        return await self.register_schema(
+            schema,
+            store_type=args.get("store_type"),
+            connection_string=args.get("connection_string"),
+            store_id=args.get("store_id"),
+            persist=bool(args.get("persist", False)),
+            options=args.get("options"),
+        )
+
+    async def _execute_profile_source(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        store_id = args.get("store_id")
+        if store_id:
+            return self.summarize_store(
+                store_id,
+                profile=str(args.get("profile") or "runtime"),
+                limit=int(args.get("limit") or 50),
+            )
+        result = await self.discover_and_profile(
+            concurrency=int(args.get("concurrency") or 5)
+        )
+        return {
+            "store_count": result.store_count,
+            "error_count": result.error_count,
+            "stores": [asdict(store) for store in result.stores],
+            "errors": [asdict(error) for error in result.errors],
+        }
+
+    async def _execute_search_schema(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return self.catalog_search_schema(
+            str(args["store_id"]),
+            str(args.get("query") or ""),
+            limit=int(args.get("limit") or 20),
+        )
+
+    async def _execute_inspect_asset(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return self.inspect_asset(
+            str(args["store_id"]),
+            str(args["asset_ref"]),
+            field_filter=args.get("field_filter"),
+            offset=int(args.get("offset") or 0),
+            limit=int(args.get("limit") or 100),
+            include_fields=bool(args.get("include_fields", True)),
+            include_indexes=bool(args.get("include_indexes", True)),
+            include_relationships=bool(args.get("include_relationships", True)),
+            blocked_fields=args.get("blocked_fields"),
+        )
+
+    async def _execute_find_relationship_paths(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return self.find_relationship_paths(
+            str(args["store_id"]),
+            list(args.get("from_assets") or []),
+            list(args.get("to_assets") or []),
+            relationship_types=args.get("relationship_types"),
+            max_hops=int(args.get("max_hops") or 4),
+            max_paths=int(args.get("max_paths") or 5),
+        )
+
+    async def _execute_discover_infrastructure(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        result = await self.discover_all(concurrency=int(args.get("concurrency") or 5))
+        return {
+            "store_count": result.store_count,
+            "error_count": result.error_count,
+            "stores": [asdict(store) for store in result.stores],
+            "errors": [asdict(error) for error in result.errors],
+            "last_scan": self._last_scan,
+        }
+
+    async def _execute_compare_schema(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self.compare_schemas(
+            dict(args.get("schema_a") or {}),
+            dict(args.get("schema_b") or {}),
+        )
+
+    async def _execute_export_diagram(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self.export_diagram(
+            dict(args.get("schema") or {}),
+            format=str(args.get("format") or "mermaid"),
+        )
 
     # ------------------------------------------------------------------
     # Discoverer / profiler registry
@@ -280,19 +457,10 @@ class CatalogPlugin(LifecyclePlugin):
         return self._schemas.get(store_id)
 
     # ------------------------------------------------------------------
-    # Lifecycle hooks (LifecyclePlugin)
+    # Runtime teardown
     # ------------------------------------------------------------------
 
-    async def on_before_run(self, prompt: str) -> Optional[str]:
-        """Inject catalog context into the system prompt."""
-        if self._discovered_stores:
-            return (
-                f"Catalog: {len(self._discovered_stores)} data stores known. "
-                f"Last scan: {self._last_scan or 'never'}."
-            )
-        return None
-
-    async def on_agent_stop(self) -> None:
+    async def teardown(self) -> None:
         """Persist catalog state and close discoverer sessions."""
         await self.prune_stale_catalog(max_age_seconds=7 * 86400)
         for d in self._discoverers:
@@ -823,7 +991,7 @@ class CatalogPlugin(LifecyclePlugin):
             "store_id": store_id,
             "error": (
                 f"No profiled schema for store '{store_id}'. "
-                "Run profile_store or discover_schema first."
+                "Profile or register the schema first."
             ),
         }
 
@@ -854,16 +1022,6 @@ class CatalogPlugin(LifecyclePlugin):
     async def prune_stale_catalog(self, max_age_seconds: int) -> dict:
         """Remove catalog entries whose last_seen is older than max_age_seconds."""
         return await prune_stale_catalog(max_age_seconds)
-
-    # ------------------------------------------------------------------
-    # Tools
-    # ------------------------------------------------------------------
-
-    def get_tools(self) -> List["AgentTool"]:
-        """Expose schema discovery operations as agent tools."""
-        from .tools import build_catalog_tools
-
-        return build_catalog_tools(self)
 
     # ------------------------------------------------------------------
     # Schema normalization — static method wrappers (backward compat)

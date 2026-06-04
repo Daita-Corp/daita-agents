@@ -10,11 +10,10 @@ from daita.agents.runtime.retry import (
     run_model_turn_with_retry,
 )
 from daita.agents.runtime.state import RunState
-from daita.agents.db.tools.query.facade import create_db_query_tools
 from daita.config.base import AgentConfig, RetryPolicy, RetryStrategy
 from daita.core.exceptions import LLMError, RateLimitError, TransientError
 from daita.core.streaming import EventType, LLMChunk
-from daita.core.tools import AgentTool
+from daita.core.tools import LocalTool
 from daita.llm.mock import MockLLMProvider
 
 
@@ -174,7 +173,7 @@ async def test_whole_run_retry_is_suppressed_after_committed_tool_work():
         tool_calls += 1
         return {"ok": True}
 
-    tool = AgentTool(
+    tool = LocalTool(
         name="side_effect",
         description="A tool whose work should not be replayed",
         parameters={"type": "object", "properties": {}},
@@ -221,7 +220,7 @@ def test_agent_tool_safety_defaults_are_conservative():
     async def handler(_args):
         return "ok"
 
-    tool = AgentTool(
+    tool = LocalTool(
         name="custom", description="Custom", parameters={}, handler=handler
     )
 
@@ -229,26 +228,6 @@ def test_agent_tool_safety_defaults_are_conservative():
     assert tool.replay_safe is False
     assert tool.idempotent is False
     assert tool.side_effecting is True
-
-
-def test_db_query_tools_opt_into_read_only_replay_safety():
-    async def handler(_args):
-        return {}
-
-    class Plugin:
-        read_only = True
-        sql_dialect = "postgresql"
-        _tool_query = handler
-        _tool_count = handler
-        _tool_sample = handler
-
-    tools = create_db_query_tools(Plugin(), {"database_type": "postgresql"})
-    by_name = {tool.name: tool for tool in tools}
-
-    assert by_name["db_query"].replay_safe is True
-    assert by_name["db_query"].retry_safe is True
-    assert by_name["db_query"].side_effecting is False
-    assert "db_execute" not in by_name
 
 
 def test_provider_error_helper_preserves_retry_context():

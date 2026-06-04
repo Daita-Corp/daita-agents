@@ -4,7 +4,7 @@ Tests for memory plugin data operation improvements:
 - remember batch mode
 - list_memories with include_stats
 - recall with since/before temporal filtering
-- pinned memories always-inject in on_before_run
+- pinned memories render through memory context providers
 """
 
 import json

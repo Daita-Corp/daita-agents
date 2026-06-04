@@ -7,10 +7,19 @@ File-based (or in-memory) async SQLite access via aiosqlite.
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+from .base import PluginContext
 from .base_db import BaseDatabasePlugin
+from .sqlite_extensions import (
+    SQLITE_MANIFEST,
+    SQLiteExecutor,
+    sqlite_capabilities,
+    sqlite_evidence_schemas,
+    sqlite_tool_views,
+)
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +46,7 @@ class SQLitePlugin(BaseDatabasePlugin):
     """
 
     sql_dialect = "sqlite"
+    manifest = SQLITE_MANIFEST
 
     def __init__(
         self,
@@ -81,6 +91,14 @@ class SQLitePlugin(BaseDatabasePlugin):
     # Lifecycle
     # ------------------------------------------------------------------
 
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the SQLite connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the SQLite connector from a runtime."""
+        await self.disconnect()
+
     async def connect(self) -> None:
         """Open the SQLite database connection."""
         if self._db is not None:
@@ -111,6 +129,129 @@ class SQLitePlugin(BaseDatabasePlugin):
         except Exception as e:
             self._db = None
             self._handle_connection_error(e, "connection")
+
+    # ------------------------------------------------------------------
+    # Runtime extension declarations
+    # ------------------------------------------------------------------
+
+    def declare_capabilities(self):
+        return sqlite_capabilities()
+
+    def get_executors(self):
+        return (
+            SQLiteExecutor(
+                id="sqlite.schema.inspect",
+                capability_ids=frozenset({"db.schema.inspect"}),
+                evidence_kind="schema.asset_profile",
+                handler=self._execute_schema_inspect,
+            ),
+            SQLiteExecutor(
+                id="sqlite.sql.validate",
+                capability_ids=frozenset({"db.sql.validate"}),
+                evidence_kind="sql.validation",
+                handler=self._execute_sql_validate,
+            ),
+            SQLiteExecutor(
+                id="sqlite.sql.execute_read",
+                capability_ids=frozenset({"db.sql.execute_read"}),
+                evidence_kind="query.result",
+                handler=self._execute_sql_read,
+            ),
+            SQLiteExecutor(
+                id="sqlite.sql.execute_write",
+                capability_ids=frozenset({"db.sql.execute_write"}),
+                evidence_kind="write.execution",
+                handler=self._execute_sql_write,
+            ),
+            SQLiteExecutor(
+                id="sqlite.sql.explain",
+                capability_ids=frozenset({"db.sql.explain"}),
+                evidence_kind="query.plan",
+                handler=self._execute_sql_explain,
+            ),
+        )
+
+    def declare_evidence_schemas(self):
+        return sqlite_evidence_schemas()
+
+    def get_tool_views(self):
+        return sqlite_tool_views()
+
+    async def _execute_schema_inspect(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        requested = args.get("tables")
+        all_tables = await self.tables()
+        targets = (
+            [table for table in all_tables if table in requested]
+            if requested
+            else all_tables
+        )
+        schemas = await asyncio.gather(*[self.describe(table) for table in targets])
+        tables = []
+        for table, columns in zip(targets, schemas):
+            tables.append(
+                {
+                    "name": table,
+                    "columns": [
+                        {
+                            "name": column["column_name"],
+                            "data_type": column["data_type"],
+                            "is_nullable": column["is_nullable"],
+                            "default_value": column["default_value"],
+                            "is_primary_key": column["is_primary_key"],
+                        }
+                        for column in columns
+                    ],
+                }
+            )
+        return {
+            "database_type": "sqlite",
+            "database_name": self.path,
+            "table_count": len(tables),
+            "tables": tables,
+            "foreign_keys": await self.foreign_keys(),
+        }
+
+    async def _execute_sql_validate(self, payload: Any) -> Dict[str, Any]:
+        from daita.db.query_sql_validation import sql_statement_facts
+
+        args = dict(payload or {})
+        sql = self._normalize_sql(str(args.get("sql") or ""))
+        operation = str(args.get("operation") or "query")
+        analysis = self._validate_sql_policy(sql, operation=operation)
+        return {
+            "valid": True,
+            "sql": sql,
+            "operation": operation,
+            "statement_type": analysis.statement_type,
+            "is_read": analysis.is_read,
+            "has_limit": analysis.has_limit,
+            "tables": [table.short_key for table in analysis.tables],
+            "columns": sorted(analysis.referenced_column_names),
+            "statement_facts": sql_statement_facts(sql, analysis),
+        }
+
+    async def _execute_sql_read(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._run_guarded_tool_query(
+            str(args.get("sql") or ""),
+            list(args.get("params") or []),
+            args.get("focus"),
+        )
+
+    async def _execute_sql_write(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        sql = self._prepare_tool_execute_sql(str(args.get("sql") or ""))
+        affected_rows = await self.execute(sql, list(args.get("params") or []))
+        return {"sql": sql, "affected_rows": affected_rows}
+
+    async def _execute_sql_explain(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        sql = self._prepare_tool_query_sql(str(args.get("sql") or ""))
+        rows = await self.query(
+            f"EXPLAIN QUERY PLAN {sql}", list(args.get("params") or [])
+        )
+        return {"sql": sql, "plan": rows}
 
     async def disconnect(self) -> None:
         """Close the SQLite database connection."""
@@ -345,135 +486,6 @@ class SQLitePlugin(BaseDatabasePlugin):
     # ------------------------------------------------------------------
     # Agent tools
     # ------------------------------------------------------------------
-
-    def get_tools(self) -> List["AgentTool"]:
-        """Expose SQLite operations as agent tools."""
-        from ..core.tools import AgentTool
-
-        tools = [
-            AgentTool(
-                name="sqlite_query",
-                description="Run a SELECT query on SQLite. Use ? placeholders for parameters. Include LIMIT in your SQL to control result size.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "sql": {
-                            "type": "string",
-                            "description": "SQL SELECT query with ? placeholders",
-                        },
-                        "params": {
-                            "type": "array",
-                            "description": "Optional parameter values for ? placeholders",
-                            "items": {},
-                        },
-                        "focus": {
-                            "type": "string",
-                            "description": "Focus DSL to filter/project results, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\"",
-                        },
-                    },
-                    "required": ["sql"],
-                },
-                handler=self._tool_query,
-                category="database",
-                source="plugin",
-                plugin_name="SQLite",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="sqlite_inspect",
-                description="List all tables and their column schemas in one call. Prefer this over calling sqlite_list_tables then sqlite_get_schema for each table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "tables": {
-                            "type": "array",
-                            "description": "Filter to specific tables (returns all if omitted)",
-                            "items": {"type": "string"},
-                        }
-                    },
-                    "required": [],
-                },
-                handler=self._tool_inspect,
-                category="database",
-                source="plugin",
-                plugin_name="SQLite",
-                timeout_seconds=15,
-            ),
-            AgentTool(
-                name="sqlite_count",
-                description="Count rows in a SQLite table, optionally filtered by a WHERE clause.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name",
-                        },
-                        "filter": {
-                            "type": "string",
-                            "description": "Optional WHERE clause (without WHERE keyword)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_count,
-                category="database",
-                source="plugin",
-                plugin_name="SQLite",
-                timeout_seconds=15,
-            ),
-            AgentTool(
-                name="sqlite_sample",
-                description="Return a random sample of rows from a SQLite table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name",
-                        },
-                        "n": {
-                            "type": "integer",
-                            "description": "Number of rows to sample (default: 5)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_sample,
-                category="database",
-                source="plugin",
-                plugin_name="SQLite",
-                timeout_seconds=15,
-            ),
-        ]
-        if not self.read_only:
-            tools.append(
-                AgentTool(
-                    name="sqlite_execute",
-                    description="Execute INSERT, UPDATE, or DELETE on SQLite. Use ? placeholders. Returns affected row count.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "sql": {
-                                "type": "string",
-                                "description": "SQL statement (INSERT, UPDATE, or DELETE) with ? placeholders",
-                            },
-                            "params": {
-                                "type": "array",
-                                "description": "Optional parameter values for ? placeholders",
-                                "items": {},
-                            },
-                        },
-                        "required": ["sql"],
-                    },
-                    handler=self._tool_execute,
-                    category="database",
-                    source="plugin",
-                    plugin_name="SQLite",
-                    timeout_seconds=60,
-                )
-            )
-        return tools
 
     # ------------------------------------------------------------------
     # Tool handlers

@@ -18,7 +18,7 @@ import pytest
 
 from daita.agents.agent import Agent
 from daita.core.focus import apply_focus
-from daita.core.tools import AgentTool
+from daita.core.tools import LocalTool
 
 pytestmark = pytest.mark.integration
 
@@ -343,13 +343,13 @@ def _token_estimate(data) -> int:
     return len(json.dumps(data, default=str)) // 4
 
 
-def _make_tool(name: str, description: str, data) -> AgentTool:
+def _make_tool(name: str, description: str, data) -> LocalTool:
     """Return a no-arg tool that yields a fixed dataset."""
 
     async def _handler(_args):
         return data
 
-    return AgentTool(
+    return LocalTool(
         name=name,
         description=description,
         parameters={"type": "object", "properties": {}, "required": []},
@@ -357,7 +357,7 @@ def _make_tool(name: str, description: str, data) -> AgentTool:
     )
 
 
-def _make_agent(tool: AgentTool, focus: str | None = None) -> Agent:
+def _make_agent(tool: LocalTool, focus: str | None = None) -> Agent:
     api_key = os.environ["OPENAI_API_KEY"]
     return Agent(
         name="FocusTestAgent",

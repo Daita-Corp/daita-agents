@@ -18,7 +18,7 @@ import pytest
 
 from daita.agents.agent import Agent
 from daita.core.streaming import AgentEvent, EventType, LLMChunk
-from daita.core.tools import AgentTool
+from daita.core.tools import LocalTool
 from daita.core.exceptions import AgentError
 from daita.llm.mock import MockLLMProvider
 
@@ -98,7 +98,7 @@ def make_tool(name="add"):
     async def handler(args):
         return {"sum": args.get("a", 0) + args.get("b", 0)}
 
-    return AgentTool(
+    return LocalTool(
         name=name,
         description="Add two numbers",
         parameters={
@@ -247,6 +247,44 @@ class TestStreamToolEvents:
         assert len(result_events) == 1
         assert result_events[0].tool_name == "add"
 
+    async def test_tool_stream_events_include_runtime_correlation(self):
+        tool = make_tool("add")
+        llm = StreamingSequentialLLM(
+            [
+                {
+                    "tool_calls": [
+                        {"id": "c1", "name": "add", "arguments": {"a": 2, "b": 5}}
+                    ]
+                },
+                "The answer is 7.",
+            ]
+        )
+        agent = Agent(name="ToolStreamAgent", llm_provider=llm, tools=[tool])
+
+        events = []
+        async for event in agent.stream("add 2 and 5"):
+            events.append(event)
+
+        operation_ids = {event.operation_id for event in events if event.operation_id}
+        assert len(operation_ids) == 1
+        operation_id = operation_ids.pop()
+        tool_result = next(
+            event for event in events if event.type is EventType.TOOL_RESULT
+        )
+        complete = next(event for event in events if event.type is EventType.COMPLETE)
+
+        assert tool_result.runtime_id == agent.agent_id
+        assert tool_result.runtime_kind == "chat"
+        assert tool_result.operation_id == operation_id
+        assert tool_result.task_id is not None
+        assert tool_result.capability_id == "agent.local.add"
+        assert tool_result.executor_id == "local_tool_add.execute"
+        assert tool_result.plugin_id == "local_tool_add"
+        assert tool_result.evidence_id is not None
+        assert complete.runtime_id == agent.agent_id
+        assert complete.runtime_kind == "chat"
+        assert complete.operation_id == operation_id
+
     async def test_tool_call_before_tool_result(self):
         """TOOL_CALL must come before TOOL_RESULT for the same tool."""
         tool = make_tool("add")
@@ -312,7 +350,7 @@ class TestStreamExceptionPropagation:
             await asyncio.sleep(10)
             return "done"
 
-        slow_tool = AgentTool(
+        slow_tool = LocalTool(
             name="slow",
             description="slow",
             parameters={"type": "object", "properties": {}, "required": []},

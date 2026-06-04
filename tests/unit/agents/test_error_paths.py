@@ -6,7 +6,6 @@ Covers:
 - _json_serializer: private attr filtering, to_dict, __dict__, TypeError
 - LLMResult.from_response: unexpected type fallback
 - Agent._resolve_tools: unregistered tool name
-- Agent._build_initial_conversation: plugin on_before_run exception swallowed
 - Loop detection: 3 consecutive identical tool errors -> AgentError
 - Run timeout: timeout_seconds triggers AgentError
 - BaseLLMProvider._validate_api_key: empty key raises ValueError
@@ -18,10 +17,9 @@ import json
 import pytest
 
 from daita.agents.agent import Agent, LLMResult, _execute_tool_call, _json_serializer
-from daita.core.tools import AgentTool
+from daita.core.tools import LocalTool
 from daita.core.exceptions import AgentError
 from daita.llm.mock import MockLLMProvider
-from daita.plugins.base import LifecyclePlugin
 
 from tests.conftest import SequentialMockLLM
 
@@ -32,7 +30,7 @@ from tests.conftest import SequentialMockLLM
 
 class TestExecuteToolCall:
     def _make_tool(self, name, handler, timeout=None):
-        return AgentTool(
+        return LocalTool(
             name=name,
             description="test",
             parameters={"type": "object", "properties": {}, "required": []},
@@ -188,7 +186,7 @@ class TestResolveTools:
         async def h(args):
             return {}
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="my_tool",
             description="test",
             parameters={"type": "object", "properties": {}, "required": []},
@@ -204,7 +202,7 @@ class TestResolveTools:
         async def h(args):
             return {}
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="direct_tool",
             description="test",
             parameters={"type": "object", "properties": {}, "required": []},
@@ -213,61 +211,6 @@ class TestResolveTools:
         agent = Agent(name="TestAgent", llm_provider=MockLLMProvider(delay=0))
         resolved = agent._resolve_tools([tool])
         assert resolved == [tool]
-
-
-# ---------------------------------------------------------------------------
-# Agent._build_initial_conversation — plugin on_before_run exception swallowed
-# ---------------------------------------------------------------------------
-
-
-class TestBuildInitialConversation:
-    async def test_plugin_exception_in_on_before_run_is_swallowed(self):
-        """If a plugin's on_before_run raises, the exception is silently caught
-        and the conversation is still built normally."""
-
-        class BrokenPlugin(LifecyclePlugin):
-            def get_tools(self):
-                return []
-
-            async def on_before_run(self, prompt):
-                raise RuntimeError("Plugin is broken")
-
-        agent = Agent(
-            name="TestAgent",
-            llm_provider=MockLLMProvider(delay=0),
-            prompt="System prompt",
-        )
-        agent.add_plugin(BrokenPlugin())
-
-        # Should not raise
-        conversation = await agent._build_initial_conversation("hello")
-        assert conversation[-1]["role"] == "user"
-        assert conversation[-1]["content"] == "hello"
-
-    async def test_system_prompt_included_when_plugin_ok(self):
-        agent = Agent(
-            name="TestAgent",
-            llm_provider=MockLLMProvider(delay=0),
-            prompt="You are a test agent.",
-        )
-        conversation = await agent._build_initial_conversation("hi")
-        system_msgs = [m for m in conversation if m["role"] == "system"]
-        assert any("You are a test agent." in m["content"] for m in system_msgs)
-
-    async def test_on_before_run_context_included_when_no_error(self):
-        class GoodPlugin(LifecyclePlugin):
-            def get_tools(self):
-                return []
-
-            async def on_before_run(self, prompt):
-                return "Extra context for the agent."
-
-        agent = Agent(name="TestAgent", llm_provider=MockLLMProvider(delay=0))
-        agent.add_plugin(GoodPlugin())
-
-        conversation = await agent._build_initial_conversation("hi")
-        system_msgs = [m for m in conversation if m["role"] == "system"]
-        assert any("Extra context" in m["content"] for m in system_msgs)
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +227,7 @@ class TestLoopDetection:
         async def always_fail(args):
             return {"error": "permanent failure"}
 
-        fail_tool = AgentTool(
+        fail_tool = LocalTool(
             name="fail_tool",
             description="always fails",
             parameters={
@@ -324,7 +267,7 @@ class TestLoopDetection:
                 "message": "same SQL blocked",
             }
 
-        validate_tool = AgentTool(
+        validate_tool = LocalTool(
             name="validate",
             description="validate SQL",
             parameters={
@@ -360,7 +303,7 @@ class TestFinalSynthesisWithoutTools:
         async def lookup(args):
             return {"answer": 42}
 
-        lookup_tool = AgentTool(
+        lookup_tool = LocalTool(
             name="lookup",
             description="look up a value",
             parameters={"type": "object", "properties": {}, "required": []},
@@ -404,7 +347,7 @@ class TestRunTimeout:
             await asyncio.sleep(10)
             return "done"
 
-        slow_tool = AgentTool(
+        slow_tool = LocalTool(
             name="slow_op",
             description="very slow",
             parameters={"type": "object", "properties": {}, "required": []},

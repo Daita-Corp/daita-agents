@@ -8,7 +8,7 @@ configuration required. Subclass this to add a new LLM provider.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 import logging
 
@@ -16,9 +16,6 @@ from ..core.exceptions import LLMError
 from ..core.tracing import get_trace_manager, TraceType
 from ..core.interfaces import LLMProvider
 from .pricing import CostEstimate, TokenUsage, estimate_llm_cost
-
-if TYPE_CHECKING:
-    from ..core.tools import AgentTool
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +86,7 @@ class BaseLLMProvider(LLMProvider, ABC):
     async def generate(
         self,
         messages,
-        tools: Optional[List[AgentTool]] = None,
+        tools: Optional[List[Any]] = None,
         stream: bool = False,
         **kwargs,
     ):
@@ -503,14 +500,14 @@ class BaseLLMProvider(LLMProvider, ABC):
             "avg_latency_ms": metrics.get("avg_latency_ms", 0),
         }
 
-    def _convert_tools_to_format(self, tools: List[AgentTool]) -> List[Dict[str, Any]]:
+    def _convert_tools_to_format(self, tools: List[Any]) -> List[Dict[str, Any]]:
         """
-        Convert AgentTool list to provider-specific format.
+        Convert provider-neutral tool specs to provider-specific format.
 
         Default implementation uses OpenAI format. Providers can override
         to use their own format (e.g., Anthropic).
         """
-        return [tool.to_openai_function() for tool in tools]
+        return [_tool_to_openai_function(tool) for tool in tools]
 
     @property
     def info(self) -> Dict[str, Any]:
@@ -598,6 +595,33 @@ def _get_error_status_code(error: Exception) -> Optional[int]:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _tool_to_openai_function(tool: Any) -> Dict[str, Any]:
+    """Convert LocalTool or ModelToolSpec-like objects to OpenAI tool format."""
+    converter = getattr(tool, "to_openai_function", None)
+    if callable(converter):
+        return converter()
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": dict(tool.parameters),
+        },
+    }
+
+
+def _tool_to_anthropic_tool(tool: Any) -> Dict[str, Any]:
+    """Convert LocalTool or ModelToolSpec-like objects to Anthropic tool format."""
+    converter = getattr(tool, "to_anthropic_tool", None)
+    if callable(converter):
+        return converter()
+    return {
+        "name": tool.name,
+        "description": tool.description,
+        "input_schema": dict(tool.parameters),
+    }
 
 
 # Context manager for batch LLM operations

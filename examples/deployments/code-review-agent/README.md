@@ -2,7 +2,7 @@
 
 A single agent that reviews Python code for security vulnerabilities and quality
 issues using the **skills system** — composable units of capability that bundle
-tools with domain-specific instructions.
+runtime capabilities with domain-specific instructions.
 
 ## Skills used
 
@@ -15,8 +15,8 @@ The agent also has a standalone `read_file` tool for loading source files.
 
 ## Why skills?
 
-Without skills, you'd pass tools + a massive prompt to the agent. Skills let you:
-- **Package domain knowledge** alongside the tools that use it
+Without skills, you'd pass ToolViews + a massive prompt to the agent. Skills let you:
+- **Package domain knowledge** alongside the capabilities that use it
 - **Compose capabilities** — add/remove skills without touching the agent prompt
 - **Reuse across agents** — the same `SecurityReviewSkill` works in any agent
 

@@ -11,7 +11,15 @@ import os
 import io
 from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 from pathlib import Path
-from .base import BasePlugin
+from .base import ConnectorPlugin, PluginContext
+from .s3_extensions import (
+    S3_MANIFEST,
+    S3Executor,
+    s3_capabilities,
+    s3_evidence_schemas,
+    s3_operation_definitions,
+    s3_tool_views,
+)
 from ..core.exceptions import (
     PluginError,
     NotFoundError,
@@ -21,17 +29,19 @@ from ..core.exceptions import (
 )
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
 
-class S3Plugin(BasePlugin):
+class S3Plugin(ConnectorPlugin):
     """
     Simple AWS S3 plugin for agents.
 
     Handles S3 operations with automatic format detection and focus system support.
     """
+
+    manifest = S3_MANIFEST
 
     def __init__(
         self,
@@ -70,9 +80,50 @@ class S3Plugin(BasePlugin):
 
         self._client = None
         self._session = None
+        self._executor = S3Executor(self)
         self._connect_lock = asyncio.Lock()
 
         logger.debug(f"S3 plugin configured for bucket {bucket} in region {region}")
+
+    @property
+    def is_connected(self) -> bool:
+        return self._client is not None
+
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the S3 connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the S3 connector from a runtime."""
+        await self.disconnect()
+
+    # ---------------------------------------------------------------------------
+    # Runtime extension declarations
+    # ---------------------------------------------------------------------------
+
+    def declare_capabilities(self):
+        return s3_capabilities()
+
+    def get_executors(self):
+        return (self._executor,)
+
+    def declare_evidence_schemas(self):
+        return s3_evidence_schemas()
+
+    def get_tool_views(self):
+        return s3_tool_views()
+
+    def _definition_for_capability(self, capability_id: str) -> dict:
+        for definition in s3_operation_definitions():
+            if definition["capability_id"] == capability_id:
+                return definition
+        raise KeyError(capability_id)
+
+    def _definition_for_tool(self, tool_name: str) -> dict:
+        for definition in s3_operation_definitions():
+            if definition["tool_name"] == tool_name:
+                return definition
+        raise KeyError(tool_name)
 
     # ---------------------------------------------------------------------------
     # Error mapping
@@ -81,10 +132,9 @@ class S3Plugin(BasePlugin):
     def _map_s3_error(self, error: Exception, operation: str) -> Exception:
         """Map boto3/botocore errors to framework exceptions."""
         if isinstance(error, ImportError):
-            return PluginError(
-                f"S3 {operation} failed: boto3 not installed. Install with: pip install 'daita-agents[aws]'",
-                plugin_name="S3",
-                retry_hint="permanent",
+            return ImportError(
+                "boto3 is required for S3Plugin. "
+                "Install with: pip install 'daita-agents[aws]'"
             )
         try:
             from botocore.exceptions import ClientError
@@ -168,10 +218,9 @@ class S3Plugin(BasePlugin):
                     raise self._map_s3_error(e, "connect") from e
 
             except ImportError as e:
-                raise PluginError(
-                    "boto3 not installed. Install with: pip install 'daita-agents[aws]'",
-                    plugin_name="S3",
-                    retry_hint="permanent",
+                raise ImportError(
+                    "boto3 is required for S3Plugin. "
+                    "Install with: pip install 'daita-agents[aws]'"
                 ) from e
             except (
                 PluginError,
@@ -787,132 +836,6 @@ class S3Plugin(BasePlugin):
     # ---------------------------------------------------------------------------
     # Tool definitions
     # ---------------------------------------------------------------------------
-
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose S3 operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for S3 operations
-        """
-        from ..core.tools import AgentTool
-
-        return [
-            AgentTool(
-                name="read_s3_file",
-                description="Read and parse a file from S3 bucket. Automatically detects format (CSV, JSON, Parquet, text) based on file extension.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "key": {
-                            "type": "string",
-                            "description": "S3 object key (file path within the bucket)",
-                        },
-                        "format": {
-                            "type": "string",
-                            "description": "Format hint: 'auto', 'csv', 'json', 'pandas', 'text'. Default is 'auto' which detects from extension.",
-                        },
-                        "focus": {
-                            "type": "string",
-                            "description": 'Focus DSL to filter/project results, e.g. "price > 100 | SELECT name, price"',
-                        },
-                    },
-                    "required": ["key"],
-                },
-                handler=self._tool_read_file,
-                category="storage",
-                source="plugin",
-                plugin_name="S3",
-                timeout_seconds=120,
-            ),
-            AgentTool(
-                name="write_s3_file",
-                description="Write data to S3 bucket. Accepts dictionaries or lists (saved as JSON), strings (saved as text), or binary data.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "key": {
-                            "type": "string",
-                            "description": "S3 object key (file path within the bucket)",
-                        },
-                        "data": {
-                            "description": "Data to write (dict or list for JSON, string for text, or bytes for binary)",
-                        },
-                    },
-                    "required": ["key", "data"],
-                },
-                handler=self._tool_write_file,
-                category="storage",
-                source="plugin",
-                plugin_name="S3",
-                timeout_seconds=120,
-            ),
-            AgentTool(
-                name="list_s3_objects",
-                description="List objects in S3 bucket with optional prefix filter to narrow down results",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "prefix": {
-                            "type": "string",
-                            "description": "Filter objects by prefix (folder path). Leave empty to list all objects.",
-                        },
-                        "max_keys": {
-                            "type": "integer",
-                            "description": "Maximum number of objects to return. Default is 100.",
-                        },
-                        "focus": {
-                            "type": "string",
-                            "description": 'Focus DSL to filter/project results, e.g. "SELECT Key, Size"',
-                        },
-                    },
-                    "required": [],
-                },
-                handler=self._tool_list_objects,
-                category="storage",
-                source="plugin",
-                plugin_name="S3",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="delete_s3_file",
-                description="Delete a file from S3 bucket. This operation is permanent and cannot be undone.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "key": {
-                            "type": "string",
-                            "description": "S3 object key (file path) to delete",
-                        }
-                    },
-                    "required": ["key"],
-                },
-                handler=self._tool_delete_file,
-                category="storage",
-                source="plugin",
-                plugin_name="S3",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="head_s3_object",
-                description="Get metadata for an S3 object (size, content type, last modified) without downloading it.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "key": {
-                            "type": "string",
-                            "description": "S3 object key (file path)",
-                        }
-                    },
-                    "required": ["key"],
-                },
-                handler=self._tool_head_object,
-                category="storage",
-                source="plugin",
-                plugin_name="S3",
-                timeout_seconds=15,
-            ),
-        ]
 
     # ---------------------------------------------------------------------------
     # Tool handlers

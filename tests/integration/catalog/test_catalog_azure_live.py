@@ -31,6 +31,7 @@ pytest.importorskip(
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
 from daita.core.graph import LocalGraphBackend
+from daita.plugins.base import PluginContext
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.azure import AzureDiscoverer
 
@@ -53,6 +54,16 @@ _AZURE_NATIVE_PROFILERS = {
 def _subscriptions() -> list[str]:
     raw = os.environ.get("AZURE_SUBSCRIPTIONS", "")
     return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+async def _setup_catalog(plugin: CatalogPlugin, agent_id: str) -> None:
+    await plugin.setup(
+        PluginContext(
+            runtime_id=agent_id,
+            runtime_kind="agent",
+            agent_id=agent_id,
+        )
+    )
 
 
 def _add_azure_profilers(plugin: CatalogPlugin) -> None:
@@ -101,7 +112,7 @@ async def plugin_with_azure(tmp_path, monkeypatch, azure_discoverer):
     backend = LocalGraphBackend(graph_type="catalog_azure_live")
     plugin = CatalogPlugin(backend=backend, auto_persist=False)
     plugin.add_discoverer(azure_discoverer)
-    plugin.initialize("catalog-azure-live")
+    await _setup_catalog(plugin, "catalog-azure-live")
     return plugin, backend
 
 
@@ -113,7 +124,7 @@ async def profiled_azure_catalog_with_graph(tmp_path, monkeypatch, azure_discove
     plugin = CatalogPlugin(backend=backend, auto_persist=True)
     plugin.add_discoverer(azure_discoverer)
     _add_azure_profilers(plugin)
-    plugin.initialize("catalog-azure-graph-live")
+    await _setup_catalog(plugin, "catalog-azure-graph-live")
 
     async with timed("catalog.discover_profile_graph azure"):
         await plugin.discover_and_profile()

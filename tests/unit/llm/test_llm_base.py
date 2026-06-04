@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from daita.core.tools import AgentTool
+from daita.core.tools import LocalTool
 from daita.core.tracing import get_trace_manager
 from daita.llm.anthropic import AnthropicProvider
 from daita.llm.gemini import GeminiProvider
@@ -32,7 +32,7 @@ def _make_tool(name: str, return_value: Any = "result"):
     async def h(args):
         return return_value
 
-    return AgentTool(
+    return LocalTool(
         name=name,
         description=f"Tool {name}",
         parameters={
@@ -49,7 +49,7 @@ def _make_slow_tool(name: str, sleep: float = 10.0):
         await asyncio.sleep(sleep)
         return "never"
 
-    return AgentTool(
+    return LocalTool(
         name=name,
         description="Slow",
         parameters={},

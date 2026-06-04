@@ -8,7 +8,7 @@ import asyncio
 import pytest
 
 from daita.agents.agent import Agent, FocusedTool, _execute_tool_call
-from daita.core.tools import AgentTool
+from daita.core.tools import LocalTool
 from daita.llm.mock import MockLLMProvider
 
 # ===========================================================================
@@ -20,14 +20,11 @@ def _tool(name: str):
     async def h(args):
         return f"result_from_{name}"
 
-    return AgentTool(name=name, description=f"Tool {name}", parameters={}, handler=h)
+    return LocalTool(name=name, description=f"Tool {name}", parameters={}, handler=h)
 
 
-class TwoToolPlugin:
-    """Plugin exposing two tools via get_tools()."""
-
-    def get_tools(self):
-        return [_tool("plugin_alpha"), _tool("plugin_beta")]
+class NonManifestPlugin:
+    """Non-manifest plugin with no runtime declarations."""
 
 
 # ===========================================================================
@@ -79,7 +76,7 @@ class TestCallTool:
         async def h(args):
             return args["x"] * 2
 
-        t = AgentTool(
+        t = LocalTool(
             name="double",
             description="Double",
             parameters={
@@ -110,7 +107,7 @@ class TestAvailableToolsAndNames:
         await agent._setup_tools()
         tools = agent.available_tools
         assert isinstance(tools, list)
-        assert all(isinstance(t, AgentTool) for t in tools)
+        assert all(isinstance(t, LocalTool) for t in tools)
 
     async def test_available_tools_is_copy(self, mock_llm):
         agent = Agent(name="X", llm_provider=mock_llm, tools=[_tool("ping")])
@@ -133,21 +130,20 @@ class TestAvailableToolsAndNames:
 
 
 class TestPluginToolSetup:
-    async def test_plugin_tools_registered_on_setup(self, mock_llm):
+    async def test_non_manifest_plugin_is_not_runtime_contract(self, mock_llm):
         from tests.conftest import SequentialMockLLM
 
         agent = Agent(
             name="X",
             llm_provider=SequentialMockLLM(response_sequence=["Done."]),
         )
-        agent.add_plugin(TwoToolPlugin())
+        agent.add_plugin(NonManifestPlugin())
 
-        # Tools are registered lazily on first setup
         await agent._setup_tools()
 
         names = agent.tool_names
-        assert "plugin_alpha" in names
-        assert "plugin_beta" in names
+        assert "plugin_alpha" not in names
+        assert "plugin_beta" not in names
 
     async def test_tools_setup_only_once(self, mock_llm):
         """Calling _setup_tools() twice should not double-register tools."""
@@ -157,15 +153,16 @@ class TestPluginToolSetup:
             name="X",
             llm_provider=SequentialMockLLM(response_sequence=["Done."]),
         )
-        agent.add_plugin(TwoToolPlugin())
+        agent.add_plugin(NonManifestPlugin())
 
         await agent._setup_tools()
-        count_after_first = agent.tool_registry.tool_count
+        count_after_first = len(agent.tools)
 
         await agent._setup_tools()
-        count_after_second = agent.tool_registry.tool_count
+        count_after_second = len(agent.tools)
 
         assert count_after_first == count_after_second
+        assert count_after_first == 0
 
 
 # ===========================================================================
@@ -177,7 +174,7 @@ def _make_returning_tool(name: str, return_value=None):
     async def h(args):
         return return_value
 
-    return AgentTool(name=name, description=f"Tool {name}", parameters={}, handler=h)
+    return LocalTool(name=name, description=f"Tool {name}", parameters={}, handler=h)
 
 
 def _make_slow_tool(name: str, sleep: float = 10.0):
@@ -185,7 +182,7 @@ def _make_slow_tool(name: str, sleep: float = 10.0):
         await asyncio.sleep(sleep)
         return "never"
 
-    return AgentTool(
+    return LocalTool(
         name=name, description="Slow", parameters={}, handler=h, timeout_seconds=0.01
     )
 
@@ -213,7 +210,7 @@ class TestExecuteToolCall:
         async def h(args):
             raise RuntimeError("unexpected failure")
 
-        t = AgentTool(name="broken", description="Broken", parameters={}, handler=h)
+        t = LocalTool(name="broken", description="Broken", parameters={}, handler=h)
         result = await _execute_tool_call({"name": "broken", "arguments": {}}, [t])
         assert isinstance(result, dict)
         assert "error" in result
@@ -226,12 +223,12 @@ class TestExecuteToolCall:
 
 
 def _make_tool(name: str, returns, parameters: dict | None = None):
-    """Create an AgentTool whose handler returns a fixed value."""
+    """Create an LocalTool whose handler returns a fixed value."""
 
     async def h(args):
         return returns
 
-    return AgentTool(
+    return LocalTool(
         name=name,
         description=f"Tool {name}",
         parameters=parameters or {"type": "object", "properties": {}, "required": []},
@@ -239,7 +236,7 @@ def _make_tool(name: str, returns, parameters: dict | None = None):
     )
 
 
-def _make_focused(tool: AgentTool, focus: str) -> FocusedTool:
+def _make_focused(tool: LocalTool, focus: str) -> FocusedTool:
     return FocusedTool(tool, focus)
 
 
@@ -268,7 +265,7 @@ class TestFocusedToolHandler:
                 "row_count": 1,
             }
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="postgres_query",
             description="SQL query",
             parameters={

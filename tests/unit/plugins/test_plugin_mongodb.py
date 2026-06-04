@@ -8,7 +8,10 @@ without a real MongoDB connection.
 
 import pytest
 from unittest.mock import MagicMock, AsyncMock
+from daita.plugins import ExtensionRegistry
 from daita.plugins.mongodb import MongoDBPlugin
+from daita.runtime import AccessMode, Operation, RiskLevel, Task
+from tests.unit.plugins.projection_helpers import projected_tools, projected_tool_names
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -39,6 +42,168 @@ def _wire_collection(plugin, cursor):
     collection_mock.find = MagicMock(return_value=cursor)
     plugin._db.__getitem__ = MagicMock(return_value=collection_mock)
     return collection_mock
+
+
+def _operation_and_task(capability, input_payload):
+    operation = Operation(
+        id="op-1",
+        operation_type=next(iter(capability.operation_types)),
+        request=input_payload,
+        required_evidence=capability.output_evidence,
+    )
+    task = Task(
+        id="task-1",
+        operation_id=operation.id,
+        capability_id=capability.id,
+        executor_id=capability.executor,
+        input=input_payload,
+        required_evidence=capability.output_evidence,
+    )
+    return operation, task
+
+
+# ---------------------------------------------------------------------------
+# Extension declarations
+# ---------------------------------------------------------------------------
+
+
+def test_mongodb_plugin_declares_extension_first_contract():
+    plugin = make_plugin()
+    registry = ExtensionRegistry()
+
+    registry.register(plugin)
+
+    assert plugin.manifest.id == "mongodb"
+    assert registry.plugin_ids == ("mongodb",)
+    assert {capability.id for capability in registry.capabilities} == {
+        "mongodb.document.find",
+        "mongodb.collection.list",
+        "mongodb.pipeline.aggregate",
+        "mongodb.document.count",
+        "mongodb.document.insert",
+        "mongodb.document.update",
+        "mongodb.document.delete",
+    }
+    assert {view.name for view in registry.tool_views} == {
+        "mongodb_find",
+        "mongodb_list_collections",
+        "mongodb_aggregate",
+        "mongodb_count",
+        "mongodb_insert",
+        "mongodb_update",
+        "mongodb_delete",
+    }
+    assert registry.get_tool_view_owner("mongodb_find") == "mongodb"
+    assert registry.evidence_schemas[0].kind == "mongodb.operation.result"
+
+
+def test_mongodb_read_only_filters_write_capabilities_and_tool_views():
+    plugin = make_plugin(read_only=True)
+    registry = ExtensionRegistry()
+
+    registry.register(plugin)
+
+    capability_ids = {capability.id for capability in registry.capabilities}
+    tool_view_names = {view.name for view in registry.tool_views}
+
+    assert "mongodb.document.find" in capability_ids
+    assert "mongodb.document.count" in capability_ids
+    assert "mongodb.document.insert" not in capability_ids
+    assert "mongodb.document.update" not in capability_ids
+    assert "mongodb.document.delete" not in capability_ids
+    assert "mongodb_find" in tool_view_names
+    assert "mongodb_insert" not in tool_view_names
+
+
+def test_mongodb_capabilities_carry_access_and_safety_metadata():
+    plugin = make_plugin()
+    registry = ExtensionRegistry()
+
+    registry.register(plugin)
+    by_id = {capability.id: capability for capability in registry.capabilities}
+
+    assert by_id["mongodb.document.find"].access is AccessMode.READ
+    assert by_id["mongodb.document.find"].risk is RiskLevel.LOW
+    assert by_id["mongodb.document.find"].side_effecting is False
+    assert by_id["mongodb.document.insert"].access is AccessMode.WRITE
+    assert by_id["mongodb.document.delete"].risk is RiskLevel.HIGH
+    assert by_id["mongodb.document.delete"].side_effecting is True
+
+
+async def test_mongodb_find_executor_returns_typed_operation_evidence():
+    plugin = make_plugin()
+    cursor = _make_find_cursor([{"name": "Alice"}])
+    _wire_collection(plugin, cursor)
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    capability = registry.get_capability("mongodb.document.find", owner="mongodb")
+    executor = registry.get_executor(capability.executor)
+    operation, task = _operation_and_task(
+        capability,
+        {"collection": "users", "filter": {"name": "Alice"}, "limit": 5},
+    )
+
+    evidence = await executor.execute(task, operation, {})
+
+    assert evidence[0].kind == "mongodb.operation.result"
+    assert evidence[0].owner == "mongodb"
+    assert evidence[0].payload["operation"] == "mongodb.document.find"
+    assert evidence[0].payload["request"]["collection"] == "users"
+    assert evidence[0].payload["result"] == {"documents": [{"name": "Alice"}]}
+    assert evidence[0].metadata["capability_id"] == "mongodb.document.find"
+
+
+async def test_mongodb_write_executor_uses_existing_tool_handler():
+    plugin = make_plugin()
+
+    async def fake_insert(collection, document):
+        return "doc-123"
+
+    plugin.insert = fake_insert
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    capability = registry.get_capability("mongodb.document.insert", owner="mongodb")
+    executor = registry.get_executor(capability.executor)
+    operation, task = _operation_and_task(
+        capability,
+        {"collection": "users", "document": {"name": "Grace"}},
+    )
+
+    evidence = await executor.execute(task, operation, {})
+
+    assert evidence[0].payload["operation"] == "mongodb.document.insert"
+    assert evidence[0].payload["result"] == {
+        "inserted_id": "doc-123",
+        "collection": "users",
+    }
+
+
+async def test_mongodb_registry_setup_and_teardown_use_connector_lifecycle():
+    plugin = make_plugin()
+    calls = []
+
+    async def fake_connect():
+        calls.append("connect")
+        plugin._client = object()
+        plugin._db = object()
+
+    async def fake_disconnect():
+        calls.append("disconnect")
+        plugin._client = None
+        plugin._db = None
+
+    plugin.connect = fake_connect
+    plugin.disconnect = fake_disconnect
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+
+    await registry.setup_plugin("mongodb", context=None)
+    assert plugin.is_connected is True
+
+    await registry.teardown_all()
+
+    assert calls == ["connect", "disconnect"]
+    assert plugin.is_connected is False
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +518,7 @@ class TestDeleteHandler:
 class TestToolRegistration:
     def test_default_tools_present(self):
         plugin = make_plugin()
-        names = {t.name for t in plugin.get_tools()}
+        names = projected_tool_names(plugin)
         assert "mongodb_find" in names
         assert "mongodb_insert" in names
         assert "mongodb_update" in names
@@ -363,19 +528,37 @@ class TestToolRegistration:
 
     def test_write_tools_absent_when_read_only(self):
         plugin = make_plugin(read_only=True)
-        names = {t.name for t in plugin.get_tools()}
+        names = projected_tool_names(plugin)
         assert "mongodb_insert" not in names
         assert "mongodb_update" not in names
         assert "mongodb_delete" not in names
 
     def test_read_tools_present_when_read_only(self):
         plugin = make_plugin(read_only=True)
-        names = {t.name for t in plugin.get_tools()}
+        names = projected_tool_names(plugin)
         assert "mongodb_find" in names
         assert "mongodb_count" in names
 
     def test_no_unprefixed_tool_names(self):
         plugin = make_plugin()
-        names = {t.name for t in plugin.get_tools()}
+        names = projected_tool_names(plugin)
         assert "find_documents" not in names
         assert "insert_document" not in names
+
+    def test_projected_tools_carry_declared_capability_metadata(self):
+        plugin = make_plugin()
+        tools = projected_tools(plugin)
+
+        assert tools["mongodb_find"].capability_ids == ("mongodb.document.find",)
+        assert tools["mongodb_list_collections"].capability_ids == (
+            "mongodb.collection.list",
+        )
+        assert tools["mongodb_aggregate"].capability_ids == (
+            "mongodb.pipeline.aggregate",
+        )
+        assert tools["mongodb_count"].capability_ids == ("mongodb.document.count",)
+        assert tools["mongodb_insert"].capability_ids == ("mongodb.document.insert",)
+        assert tools["mongodb_update"].capability_ids == ("mongodb.document.update",)
+        assert tools["mongodb_delete"].capability_ids == ("mongodb.document.delete",)
+        assert tools["mongodb_find"].side_effecting is False
+        assert tools["mongodb_insert"].side_effecting is True

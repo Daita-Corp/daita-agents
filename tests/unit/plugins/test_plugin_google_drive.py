@@ -19,6 +19,9 @@ from daita.plugins.google_drive import (
     _GSLIDES,
     _GFOLDER,
 )
+from daita.plugins import ExtensionRegistry
+from daita.runtime import AccessMode, Operation, RiskLevel, Task
+from tests.unit.plugins.projection_helpers import projected_tools
 from daita.core.exceptions import (
     NotFoundError,
     PermissionError as DaitaPermissionError,
@@ -106,6 +109,175 @@ def _wire_files_download(plugin, content: bytes):
         return mock_dl
 
     return fake_download_side_effect
+
+
+def _operation_and_task(capability, input_payload):
+    operation = Operation(
+        id="op-1",
+        operation_type=next(iter(capability.operation_types)),
+        request=input_payload,
+        required_evidence=capability.output_evidence,
+    )
+    task = Task(
+        id="task-1",
+        operation_id=operation.id,
+        capability_id=capability.id,
+        executor_id=capability.executor,
+        input=input_payload,
+        required_evidence=capability.output_evidence,
+    )
+    return operation, task
+
+
+# ---------------------------------------------------------------------------
+# Extension declarations
+# ---------------------------------------------------------------------------
+
+
+def test_google_drive_plugin_declares_extension_first_contract():
+    plugin = make_plugin(read_only=False)
+    registry = ExtensionRegistry()
+
+    registry.register(plugin)
+
+    assert plugin.manifest.id == "google_drive"
+    assert registry.plugin_ids == ("google_drive",)
+    assert {capability.id for capability in registry.capabilities} == {
+        "google_drive.file.search",
+        "google_drive.file.read",
+        "google_drive.folder.list",
+        "google_drive.file.info",
+        "google_drive.file.download",
+        "google_drive.file.upload",
+        "google_drive.file.organize",
+    }
+    assert {view.name for view in registry.tool_views} == {
+        "gdrive_search",
+        "gdrive_read",
+        "gdrive_list",
+        "gdrive_info",
+        "gdrive_download",
+        "gdrive_upload",
+        "gdrive_organize",
+    }
+    assert registry.get_tool_view_owner("gdrive_search") == "google_drive"
+    assert registry.evidence_schemas[0].kind == "google_drive.operation.result"
+
+
+def test_google_drive_read_only_filters_write_capabilities_and_tool_views():
+    plugin = make_plugin(read_only=True)
+    registry = ExtensionRegistry()
+
+    registry.register(plugin)
+
+    capability_ids = {capability.id for capability in registry.capabilities}
+    tool_view_names = {view.name for view in registry.tool_views}
+
+    assert "google_drive.file.search" in capability_ids
+    assert "google_drive.file.download" in capability_ids
+    assert "google_drive.file.upload" not in capability_ids
+    assert "google_drive.file.organize" not in capability_ids
+    assert "gdrive_search" in tool_view_names
+    assert "gdrive_upload" not in tool_view_names
+
+
+def test_google_drive_capabilities_carry_access_and_safety_metadata():
+    plugin = make_plugin(read_only=False)
+    registry = ExtensionRegistry()
+
+    registry.register(plugin)
+    by_id = {capability.id: capability for capability in registry.capabilities}
+
+    assert by_id["google_drive.file.search"].access is AccessMode.READ
+    assert by_id["google_drive.file.search"].risk is RiskLevel.LOW
+    assert by_id["google_drive.file.search"].side_effecting is False
+    assert by_id["google_drive.file.info"].access is AccessMode.METADATA_READ
+    assert by_id["google_drive.file.download"].side_effecting is True
+    assert by_id["google_drive.file.upload"].access is AccessMode.WRITE
+    assert by_id["google_drive.file.organize"].risk is RiskLevel.MEDIUM
+
+
+async def test_google_drive_executor_returns_typed_operation_evidence():
+    plugin = make_plugin()
+    _wire_files_list(plugin, [_drive_file(id="file-1", name="report.csv")])
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    capability = registry.get_capability(
+        "google_drive.file.search", owner="google_drive"
+    )
+    executor = registry.get_executor(capability.executor)
+    operation, task = _operation_and_task(capability, {"query": "report"})
+
+    evidence = await executor.execute(task, operation, {})
+
+    assert evidence[0].kind == "google_drive.operation.result"
+    assert evidence[0].owner == "google_drive"
+    assert evidence[0].payload["operation"] == "google_drive.file.search"
+    assert evidence[0].payload["request"] == {"query": "report"}
+    assert evidence[0].payload["result"]["count"] == 1
+    assert evidence[0].metadata["capability_id"] == "google_drive.file.search"
+
+
+async def test_google_drive_write_executor_uses_existing_tool_handler(tmp_path):
+    plugin = make_plugin(read_only=False)
+    local_file = tmp_path / "upload.txt"
+    local_file.write_text("hello")
+
+    async def fake_upload(local_path, folder_id=None, name=None):
+        return {
+            "id": "new-file",
+            "name": name or "upload.txt",
+            "type": "text/plain",
+            "mime_type": "text/plain",
+            "size": "5",
+            "modified": "2024-01-01T00:00:00Z",
+            "owners": [],
+            "web_link": "https://drive.example/new-file",
+        }
+
+    plugin.upload = fake_upload
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    capability = registry.get_capability(
+        "google_drive.file.upload", owner="google_drive"
+    )
+    executor = registry.get_executor(capability.executor)
+    operation, task = _operation_and_task(
+        capability,
+        {"local_path": str(local_file), "name": "renamed.txt"},
+    )
+
+    evidence = await executor.execute(task, operation, {})
+
+    assert evidence[0].payload["operation"] == "google_drive.file.upload"
+    assert evidence[0].payload["result"]["uploaded"] is True
+    assert evidence[0].payload["result"]["name"] == "renamed.txt"
+
+
+async def test_google_drive_registry_setup_and_teardown_use_connector_lifecycle():
+    plugin = GoogleDrivePlugin()
+    calls = []
+
+    async def fake_connect():
+        calls.append("connect")
+        plugin._service = object()
+
+    async def fake_disconnect():
+        calls.append("disconnect")
+        plugin._service = None
+
+    plugin.connect = fake_connect
+    plugin.disconnect = fake_disconnect
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+
+    await registry.setup_plugin("google_drive", context=None)
+    assert plugin.is_connected is True
+
+    await registry.teardown_all()
+
+    assert calls == ["connect", "disconnect"]
+    assert plugin.is_connected is False
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +368,7 @@ def test_error_map_import_error():
     plugin = make_plugin()
     err = ImportError("google-api-python-client missing")
     result = plugin._map_drive_error(err, "connect")
-    assert isinstance(result, PluginError)
+    assert isinstance(result, ImportError)
     assert "google-drive" in str(result)
 
 
@@ -597,11 +769,11 @@ async def test_organize_copy_calls_copy():
 # ---------------------------------------------------------------------------
 
 
-def test_get_tools_read_only_count():
+def test_projected_tools_read_only_count():
     plugin = GoogleDrivePlugin(read_only=True)
     plugin._service = MagicMock()
-    tools = plugin.get_tools()
-    names = [t.name for t in tools]
+    tools = projected_tools(plugin)
+    names = set(tools)
     assert "gdrive_search" in names
     assert "gdrive_read" in names
     assert "gdrive_list" in names
@@ -612,11 +784,11 @@ def test_get_tools_read_only_count():
     assert len(tools) == 5
 
 
-def test_get_tools_write_mode_count():
+def test_projected_tools_write_mode_count():
     plugin = GoogleDrivePlugin(read_only=False)
     plugin._service = MagicMock()
-    tools = plugin.get_tools()
-    names = [t.name for t in tools]
+    tools = projected_tools(plugin)
+    names = set(tools)
     assert "gdrive_upload" in names
     assert "gdrive_organize" in names
     assert len(tools) == 7
@@ -625,7 +797,7 @@ def test_get_tools_write_mode_count():
 def test_tool_schemas_have_required_fields():
     plugin = GoogleDrivePlugin(read_only=False)
     plugin._service = MagicMock()
-    tools = {t.name: t for t in plugin.get_tools()}
+    tools = projected_tools(plugin)
 
     # gdrive_search requires query
     assert "query" in tools["gdrive_search"].parameters["required"]
@@ -641,13 +813,29 @@ def test_tool_schemas_have_required_fields():
     assert tools["gdrive_list"].parameters["required"] == []
 
 
-def test_tool_categories_and_source():
+def test_projected_tools_use_stable_plugin_source():
     plugin = GoogleDrivePlugin(read_only=False)
     plugin._service = MagicMock()
-    for t in plugin.get_tools():
-        assert t.category == "storage"
+    for t in projected_tools(plugin).values():
         assert t.source == "plugin"
-        assert t.plugin_name == "GoogleDrive"
+        assert t.plugin_name == "google_drive"
+
+
+def test_projected_tools_carry_declared_capability_metadata():
+    plugin = GoogleDrivePlugin(read_only=False)
+    plugin._service = MagicMock()
+    tools = projected_tools(plugin)
+
+    assert tools["gdrive_search"].capability_ids == ("google_drive.file.search",)
+    assert tools["gdrive_read"].capability_ids == ("google_drive.file.read",)
+    assert tools["gdrive_list"].capability_ids == ("google_drive.folder.list",)
+    assert tools["gdrive_info"].capability_ids == ("google_drive.file.info",)
+    assert tools["gdrive_download"].capability_ids == ("google_drive.file.download",)
+    assert tools["gdrive_upload"].capability_ids == ("google_drive.file.upload",)
+    assert tools["gdrive_organize"].capability_ids == ("google_drive.file.organize",)
+    assert tools["gdrive_search"].side_effecting is False
+    assert tools["gdrive_download"].side_effecting is True
+    assert tools["gdrive_upload"].side_effecting is True
 
 
 # ---------------------------------------------------------------------------
@@ -741,8 +929,8 @@ def test_import_without_google_packages():
     # The class can be instantiated without packages installed
     plugin = GoogleDrivePlugin()
     assert plugin._service is None
-    # Tools can be introspected without a connection
-    assert isinstance(plugin.get_tools(), list)
+    # Tool views can be introspected without a connection
+    assert isinstance(plugin.get_tool_views(), tuple)
 
 
 # ---------------------------------------------------------------------------

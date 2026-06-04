@@ -8,12 +8,9 @@ from __future__ import annotations
 import os
 import logging
 import asyncio
-from typing import TYPE_CHECKING, Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List
 
-from .base import BaseLLMProvider
-
-if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+from .base import BaseLLMProvider, _tool_to_openai_function
 
 logger = logging.getLogger(__name__)
 
@@ -274,17 +271,15 @@ class GeminiProvider(BaseLLMProvider):
             logger.error(f"Gemini streaming failed: {str(e)}")
             raise self._provider_error("Gemini streaming failed", e) from e
 
-    def _convert_tools_to_format(
-        self, tools: List["AgentTool"]
-    ) -> List[Dict[str, Any]]:
+    def _convert_tools_to_format(self, tools: List[Any]) -> List[Dict[str, Any]]:
         """
-        Convert AgentTool list to Gemini function declaration format.
+        Convert provider-neutral tool specs to Gemini function declaration format.
 
         Gemini uses a simpler format than OpenAI.
         """
         gemini_tools = []
         for tool in tools:
-            openai_format = tool.to_openai_function()
+            openai_format = _tool_to_openai_function(tool)
 
             # Convert OpenAI format to Gemini dict format
             gemini_tools.append(

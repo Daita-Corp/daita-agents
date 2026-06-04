@@ -410,12 +410,12 @@ class TestAgentIntegration:
         assert contents[-1] == "What's my name?"
 
     async def test_history_with_tool_call_stores_only_final_text(self, tmp_path):
-        from daita.core.tools import AgentTool
+        from daita.core.tools import LocalTool
 
         async def calc(args):
             return args["a"] + args["b"]
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="add",
             description="Add numbers",
             parameters={

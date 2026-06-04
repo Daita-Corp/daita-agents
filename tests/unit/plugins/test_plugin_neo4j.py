@@ -8,8 +8,12 @@ No real Neo4j connection is needed.
 """
 
 import pytest
+from daita.plugins.manifest import PluginKind
 from daita.plugins.neo4j_graph import Neo4jPlugin
+from daita.plugins.registry import ExtensionRegistry
 from daita.core.exceptions import PluginError
+from daita.runtime import Operation, Task
+from tests.unit.plugins.projection_helpers import projected_tools, projected_tool_names
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -432,10 +436,102 @@ class TestErrorPropagation:
 # ---------------------------------------------------------------------------
 
 
+class TestExtensionContract:
+    def test_neo4j_plugin_declares_extension_first_contract(self):
+        plugin = make_plugin()
+        registry = ExtensionRegistry()
+
+        registry.register(plugin)
+
+        assert plugin.manifest.id == "neo4j"
+        assert plugin.manifest.kind is PluginKind.CONNECTOR
+        assert registry.plugin_ids == ("neo4j",)
+        assert {capability.id for capability in registry.capabilities} == {
+            "neo4j.query.execute",
+            "neo4j.node.find",
+            "neo4j.path.find",
+            "neo4j.neighbor.list",
+            "neo4j.schema.read",
+            "neo4j.labels.list",
+            "neo4j.relationship_types.list",
+            "neo4j.stats.read",
+            "neo4j.node.create",
+            "neo4j.relationship.create",
+            "neo4j.node.delete",
+        }
+        assert {view.name for view in registry.tool_views} == projected_tool_names(
+            plugin
+        )
+        assert registry.evidence_schemas[0].kind == "neo4j.operation.result"
+
+    def test_neo4j_read_only_contract_excludes_write_capabilities(self):
+        plugin = make_plugin(read_only=True)
+        registry = ExtensionRegistry()
+
+        registry.register(plugin)
+
+        capability_ids = {capability.id for capability in registry.capabilities}
+        view_names = {view.name for view in registry.tool_views}
+
+        assert "neo4j.node.create" not in capability_ids
+        assert "neo4j.relationship.create" not in capability_ids
+        assert "neo4j.node.delete" not in capability_ids
+        assert "neo4j_create_node" not in view_names
+        assert "neo4j_create_relationship" not in view_names
+        assert "neo4j_delete_node" not in view_names
+
+    def test_neo4j_projected_tools_carry_declared_capability_metadata(self):
+        plugin = make_plugin()
+
+        by_name = projected_tools(plugin)
+
+        assert by_name["neo4j_query"].capability_ids == ("neo4j.query.execute",)
+        assert by_name["neo4j_query"].side_effecting is False
+        assert by_name["neo4j_query"].idempotent is True
+        assert by_name["neo4j_create_node"].capability_ids == ("neo4j.node.create",)
+        assert by_name["neo4j_create_node"].side_effecting is True
+        assert by_name["neo4j_delete_node"].capability_ids == ("neo4j.node.delete",)
+
+    async def test_neo4j_executor_returns_typed_operation_evidence(self):
+        plugin = make_plugin()
+        stub_query(plugin, default_records=[{"n": {"name": "Alice"}}])
+        registry = ExtensionRegistry()
+        registry.register(plugin)
+
+        executor = registry.get_executor("neo4j.operations")
+        operation = Operation(id="op-1", operation_type="neo4j.node.find")
+        task = Task(
+            id="task-1",
+            operation_id=operation.id,
+            capability_id="neo4j.node.find",
+            executor_id="neo4j.operations",
+            input={"label": "Person", "properties": {"name": "Alice"}, "limit": 1},
+            required_evidence=frozenset({"neo4j.operation.result"}),
+        )
+
+        evidence = await executor.execute(
+            task,
+            operation,
+            {"tool_view": {"name": "neo4j_find_nodes"}},
+        )
+
+        assert len(evidence) == 1
+        assert evidence[0].kind == "neo4j.operation.result"
+        assert evidence[0].owner == "neo4j"
+        assert evidence[0].payload["operation"] == "neo4j_find_nodes"
+        assert evidence[0].payload["request"]["label"] == "Person"
+        assert evidence[0].payload["result"] == {
+            "nodes": [{"name": "Alice"}],
+            "count": 1,
+        }
+        assert evidence[0].metadata["capability_id"] == "neo4j.node.find"
+        assert evidence[0].metadata["tool_view"] == "neo4j_find_nodes"
+
+
 class TestToolRegistration:
     def test_core_read_tools_present(self):
         plugin = make_plugin()
-        names = {t.name for t in plugin.get_tools()}
+        names = projected_tool_names(plugin)
         assert "neo4j_query" in names
         assert "neo4j_find_nodes" in names
         assert "neo4j_find_path" in names
@@ -443,21 +539,21 @@ class TestToolRegistration:
 
     def test_introspection_tools_present(self):
         plugin = make_plugin()
-        names = {t.name for t in plugin.get_tools()}
+        names = projected_tool_names(plugin)
         assert "neo4j_list_labels" in names
         assert "neo4j_list_relationship_types" in names
         assert "neo4j_graph_stats" in names
 
     def test_write_tools_absent_when_read_only(self):
         plugin = make_plugin(read_only=True)
-        names = {t.name for t in plugin.get_tools()}
+        names = projected_tool_names(plugin)
         assert "neo4j_create_node" not in names
         assert "neo4j_create_relationship" not in names
         assert "neo4j_delete_node" not in names
 
     def test_write_tools_present_when_not_read_only(self):
         plugin = make_plugin(read_only=False)
-        names = {t.name for t in plugin.get_tools()}
+        names = projected_tool_names(plugin)
         assert "neo4j_create_node" in names
         assert "neo4j_create_relationship" in names
         assert "neo4j_delete_node" in names

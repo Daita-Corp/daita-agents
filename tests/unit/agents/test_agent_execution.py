@@ -19,16 +19,18 @@ from uuid import uuid4
 import pytest
 
 from daita.agents.agent import Agent
-from daita.agents.db.runtime.orchestrator import DbRunContract, DbRunOrchestrator
-from daita.agents.db.runtime.state import DbRunState, set_db_run_state
+from daita.db.capabilities import (
+    CATALOG_SCHEMA_SEARCH_CAPABILITY,
+    DB_SQL_EXECUTE_READ_CAPABILITY,
+    DB_SQL_EXPLAIN_CAPABILITY,
+)
 from daita.agents.runtime.contextvars import get_active_run_state
 from daita.core.exceptions import AgentError
 from daita.core.streaming import EventType
-from daita.core.tools import AgentTool
+from daita.core.tools import LocalTool
 from daita.core.tracing import get_trace_manager
 from daita.config.settings import Settings
 from daita.llm.mock import MockLLMProvider
-from daita.plugins.base import LifecyclePlugin
 
 from tests.conftest import SequentialMockLLM
 
@@ -44,12 +46,12 @@ def _make_agent(responses: List[Any], tools=None) -> Agent:
 
 
 def _add_tool():
-    """Return an 'add' AgentTool used in tool-calling tests."""
+    """Return an 'add' LocalTool used in tool-calling tests."""
 
     async def h(args):
         return args["a"] + args["b"]
 
-    return AgentTool(
+    return LocalTool(
         name="add",
         description="Add two numbers",
         parameters={
@@ -188,7 +190,7 @@ class TestMaxIterations:
         async def lookup(args):
             return {"answer": 7}
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="lookup",
             description="Lookup a value",
             parameters={"type": "object", "properties": {}},
@@ -217,7 +219,7 @@ class TestMaxIterations:
         async def lookup(args):
             return {"answer": 9}
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="lookup",
             description="Lookup a value",
             parameters={"type": "object", "properties": {}},
@@ -242,11 +244,12 @@ class TestMaxIterations:
         async def query(args):
             return {"rows": [{"answer": 7}]}
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="db_query",
             description="Run a database query",
             parameters={"type": "object", "properties": {}},
             handler=query,
+            capability_ids=(DB_SQL_EXECUTE_READ_CAPABILITY,),
         )
         llm = SequentialMockLLM(
             response_sequence=[
@@ -282,11 +285,12 @@ class TestMaxIterations:
         async def query(args):
             return {"rows": [{"answer": 7}]}
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="db_query",
             description="Run a database query",
             parameters={"type": "object", "properties": {}},
             handler=query,
+            capability_ids=(DB_SQL_EXECUTE_READ_CAPABILITY,),
         )
         repeated_tool_call = {
             "content": "",
@@ -313,11 +317,12 @@ class TestMaxIterations:
                 "message": "Try something else.",
             }
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="db_query",
             description="Run a database query",
             parameters={"type": "object", "properties": {}},
             handler=query,
+            capability_ids=(DB_SQL_EXECUTE_READ_CAPABILITY,),
         )
         repeated_tool_call = {
             "content": "",
@@ -346,17 +351,19 @@ class TestMaxIterations:
             return {"rows": [{"answer": 7}]}
 
         tools = [
-            AgentTool(
+            LocalTool(
                 name="db_plan_query",
                 description="Plan",
                 parameters={"type": "object", "properties": {}},
                 handler=plan,
+                capability_ids=(DB_SQL_EXPLAIN_CAPABILITY,),
             ),
-            AgentTool(
+            LocalTool(
                 name="db_query",
                 description="Query",
                 parameters={"type": "object", "properties": {}},
                 handler=query,
+                capability_ids=(DB_SQL_EXECUTE_READ_CAPABILITY,),
             ),
         ]
         llm = SequentialMockLLM(
@@ -389,11 +396,12 @@ class TestMaxIterations:
                 "suggested_next_arguments": {"goal": "answer"},
             }
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="catalog_search_schema",
             description="Search schema",
             parameters={"type": "object", "properties": {}},
             handler=search,
+            capability_ids=(CATALOG_SCHEMA_SEARCH_CAPABILITY,),
         )
         llm = SequentialMockLLM(
             response_sequence=[
@@ -426,284 +434,6 @@ class TestMaxIterations:
             result["diagnostics"]["warnings"]
         )
 
-    async def test_schema_only_db_run_answers_from_catalog_evidence(self):
-        async def search(args):
-            return {
-                "tables": [
-                    {
-                        "name": "payments",
-                        "score": 0.95,
-                        "matched_fields": [{"name": "amount", "score": 0.9}],
-                    }
-                ]
-            }
-
-        tool = AgentTool(
-            name="catalog_search_schema",
-            description="Search schema",
-            parameters={"type": "object", "properties": {}},
-            handler=search,
-            category="database",
-            source="from_db",
-        )
-        llm = SequentialMockLLM(
-            response_sequence=[
-                {
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "c1",
-                            "name": "catalog_search_schema",
-                            "arguments": {"query": "revenue"},
-                        }
-                    ],
-                },
-                "payments.amount is the safest revenue-like column.",
-            ]
-        )
-        agent = Agent(name="SchemaRuntimeAgent", llm_provider=llm, tools=[tool])
-        prompt = "Search the schema for revenue columns."
-        orchestrator = DbRunOrchestrator(agent, prompt, state=DbRunState())
-        prepared = await orchestrator.prepare()
-
-        result = await agent.run(
-            prompt,
-            tools=list(prepared.contract.tools),
-            run_orchestrator=orchestrator,
-            detailed=True,
-            max_iterations=3,
-        )
-
-        assert result["result"] == "payments.amount is the safest revenue-like column."
-        assert result["diagnostics"]["db_completeness"]["status"] == (
-            "answerable_schema"
-        )
-        assert result["diagnostics"]["db_completeness"]["queries_executed"] == 0
-
-    async def test_db_catalog_join_result_suggests_plan_query(self):
-        async def find_join_paths(args):
-            return {
-                "success": True,
-                "from_assets": ["orders"],
-                "to_assets": ["customers"],
-                "reachable": True,
-                "path_count": 1,
-                "paths": [
-                    {
-                        "tables": ["orders", "customers"],
-                        "joins": [
-                            {
-                                "left_table": "orders",
-                                "left_column": "customer_id",
-                                "right_table": "customers",
-                                "right_column": "customer_id",
-                            }
-                        ],
-                    }
-                ],
-            }
-
-        async def plan(args):
-            return {"ok": True}
-
-        tools = [
-            AgentTool(
-                name="catalog_find_join_paths",
-                description="Find joins",
-                parameters={"type": "object", "properties": {}},
-                handler=find_join_paths,
-            ),
-            AgentTool(
-                name="db_plan_query",
-                description="Plan",
-                parameters={"type": "object", "properties": {}},
-                handler=plan,
-            ),
-        ]
-        llm = SequentialMockLLM(
-            response_sequence=[
-                {
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "c1",
-                            "name": "catalog_find_join_paths",
-                            "arguments": {
-                                "from_tables": ["orders"],
-                                "to_tables": ["customers"],
-                            },
-                        }
-                    ],
-                },
-                "Ready to plan.",
-            ]
-        )
-        agent = Agent(name="T", llm_provider=llm, tools=tools)
-        prompt = "Show sales by customer and find the join path"
-        orchestrator = DbRunOrchestrator(agent, prompt, state=DbRunState())
-        prepared = await orchestrator.prepare()
-
-        result = await agent.run(
-            prompt,
-            tools=list(prepared.contract.tools),
-            run_orchestrator=orchestrator,
-            detailed=True,
-        )
-
-        assert result["result"] == "Ready to plan."
-        raw_catalog_result = result["tool_calls"][0]["result"]
-        assert raw_catalog_result["suggested_next_tool"] == "db_plan_query"
-        assert raw_catalog_result["suggested_next_arguments"] == {
-            "candidate_tables": ["orders", "customers"],
-            "required_joins": [{"from_tables": ["orders"], "to_tables": ["customers"]}],
-        }
-        second_call_tools = llm.call_history[1]["tools"]
-        assert [tool["function"]["name"] for tool in second_call_tools] == [
-            "db_plan_query"
-        ]
-
-    async def test_db_catalog_tool_uses_active_store_for_unprofiled_store_id(self):
-        seen = {}
-
-        async def search_schema(args):
-            seen["args"] = dict(args)
-            return {"store_id": args["store_id"], "tables": [{"name": "orders"}]}
-
-        tool = AgentTool(
-            name="catalog_search_schema",
-            description="Search catalog",
-            parameters={"type": "object", "properties": {}},
-            handler=search_schema,
-        )
-        llm = SequentialMockLLM(
-            response_sequence=[
-                {
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "c1",
-                            "name": "catalog_search_schema",
-                            "arguments": {
-                                "store_id": "invented-store",
-                                "query": "orders",
-                            },
-                        }
-                    ],
-                },
-                "Done.",
-            ]
-        )
-        agent = Agent(name="T", llm_provider=llm, tools=[tool])
-        agent._db_catalog_store_id = "active-store"
-        agent._db_catalog = type(
-            "Catalog",
-            (),
-            {
-                "get_schema": lambda _self, store_id: (
-                    {"tables": []} if store_id == "active-store" else None
-                ),
-                "summarize_store": lambda _self, store_id, limit=None: {},
-            },
-        )()
-        prompt = "inspect schema"
-        orchestrator = DbRunOrchestrator(agent, prompt, state=DbRunState())
-        prepared = await orchestrator.prepare()
-
-        result = await agent.run(
-            prompt,
-            tools=list(prepared.contract.tools),
-            run_orchestrator=orchestrator,
-            detailed=True,
-        )
-
-        assert result["result"] == "Done."
-        assert seen["args"]["store_id"] == "active-store"
-        assert result["tool_calls"][0]["arguments"]["store_id"] == "active-store"
-
-    def test_schema_catalog_join_result_does_not_emit_db_handoff(self):
-        state = DbRunState()
-
-        handoff = state.record_catalog_tool_result(
-            "catalog_find_join_paths",
-            {"from_tables": ["orders"], "to_tables": ["customers"]},
-            {
-                "success": True,
-                "from_assets": ["orders"],
-                "to_assets": ["customers"],
-                "reachable": True,
-                "path_count": 1,
-                "paths": [{"tables": ["orders", "customers"], "joins": [{}]}],
-            },
-        )
-
-        assert handoff is None
-        assert state.summary()["catalog_join_evidence_count"] == 1
-
-    async def test_db_tool_budget_blocks_extra_tool_calls(self):
-        async def search(args):
-            return {
-                "tables": [
-                    {
-                        "name": "payments",
-                        "score": 0.95,
-                        "matched_fields": [{"name": "amount", "score": 0.9}],
-                    }
-                ]
-            }
-
-        tool = AgentTool(
-            name="catalog_search_schema",
-            description="Search schema",
-            parameters={"type": "object", "properties": {}},
-            handler=search,
-            category="database",
-            source="from_db",
-        )
-        llm = SequentialMockLLM(
-            response_sequence=[
-                {
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "c1",
-                            "name": "catalog_search_schema",
-                            "arguments": {"query": "revenue"},
-                        },
-                        {
-                            "id": "c2",
-                            "name": "catalog_search_schema",
-                            "arguments": {"query": "amount"},
-                        },
-                    ],
-                },
-                "payments.amount is the best match.",
-            ]
-        )
-        agent = Agent(name="BudgetAgent", llm_provider=llm, tools=[tool])
-        prompt = "Search the schema for revenue columns."
-        orchestrator = DbRunOrchestrator(agent, prompt, state=DbRunState())
-        await orchestrator.prepare()
-        orchestrator.contract = DbRunContract(
-            **{
-                **orchestrator.contract.__dict__,
-                "max_tool_calls": 1,
-            }
-        )
-        orchestrator.state.run_contract = orchestrator.contract
-
-        result = await agent.run(
-            prompt,
-            tools=list(orchestrator.contract.tools),
-            run_orchestrator=orchestrator,
-            detailed=True,
-            max_iterations=3,
-        )
-
-        assert result["tool_calls"][1]["result"]["guardrail"] == (
-            "db_tool_budget_exhausted"
-        )
-        assert "db_tool_budget_exhausted" in result["diagnostics"]["warnings"]
-
     async def test_partial_exit_without_evidence_still_raises(self):
         repeated_call = {
             "content": "Calling missing tool.",
@@ -733,7 +463,7 @@ class TestToolCallingLoop:
             call_log.append(args)
             return args["a"] + args["b"]
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="add",
             description="Add",
             parameters={
@@ -792,7 +522,7 @@ class TestToolCallingLoop:
             seen_run_ids.append(run_state.run_id if run_state else None)
             return "ok"
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="stateful",
             description="Read run state",
             parameters={"type": "object", "properties": {}},
@@ -813,127 +543,6 @@ class TestToolCallingLoop:
 
         assert seen_run_ids == [result["diagnostics"]["run_id"]]
         assert get_active_run_state() is None
-
-    async def test_db_run_rejects_final_answer_without_query_evidence(self):
-        async def h(args):
-            run_state = get_active_run_state()
-            db_state = run_state.domains["db"]
-            db_state.record_executed_query(
-                {
-                    "sql": args["sql"],
-                    "row_count": 1,
-                    "returned_rows": 1,
-                    "truncated": False,
-                }
-            )
-            return {"rows": [{"customer": "Bob", "total_revenue": 250}]}
-
-        tool = AgentTool(
-            name="db_query",
-            description="Run SQL",
-            parameters={
-                "type": "object",
-                "properties": {"sql": {"type": "string"}},
-                "required": ["sql"],
-            },
-            handler=h,
-            category="database",
-            source="from_db",
-        )
-        llm = SequentialMockLLM(
-            response_sequence=[
-                "I need to inspect the schema first.",
-                {
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "c1",
-                            "name": "db_query",
-                            "arguments": {
-                                "sql": "SELECT 'Bob' AS customer, 250 AS total_revenue"
-                            },
-                        }
-                    ],
-                },
-                "Bob has the highest total order revenue: 250.",
-            ]
-        )
-        agent = Agent(name="DbRuntimeAgent", llm_provider=llm, tools=[tool])
-        set_db_run_state(agent, DbRunState())
-
-        result = await agent.run(
-            "Which customer has the highest total order revenue?",
-            tools=["db_query"],
-            detailed=True,
-            max_iterations=4,
-        )
-
-        assert result["result"] == "Bob has the highest total order revenue: 250."
-        assert [call["tool"] for call in result["tool_calls"]] == ["db_query"]
-        assert result["diagnostics"]["db_completeness"]["can_answer"] is True
-        assert (
-            "db_final_answer_without_query_evidence"
-            in result["diagnostics"]["warnings"]
-        )
-        assert len(llm.call_history) == 3
-
-    async def test_db_run_rejects_incomplete_final_answer_after_query(self):
-        async def h(args):
-            run_state = get_active_run_state()
-            db_state = run_state.domains["db"]
-            db_state.record_executed_query(
-                {
-                    "sql": args["sql"],
-                    "row_count": 1,
-                    "returned_rows": 1,
-                    "truncated": False,
-                }
-            )
-            return {"rows": [{"customer": "Bob", "total_revenue": 250}]}
-
-        tool = AgentTool(
-            name="db_query",
-            description="Run SQL",
-            parameters={
-                "type": "object",
-                "properties": {"sql": {"type": "string"}},
-                "required": ["sql"],
-            },
-            handler=h,
-            category="database",
-            source="from_db",
-        )
-        llm = SequentialMockLLM(
-            response_sequence=[
-                {
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "c1",
-                            "name": "db_query",
-                            "arguments": {
-                                "sql": "SELECT 'Bob' AS customer, 250 AS total_revenue"
-                            },
-                        }
-                    ],
-                },
-                "I will write a corrected SQL query now.",
-                "Bob has the highest total order revenue: 250.",
-            ]
-        )
-        agent = Agent(name="DbRuntimeAgent", llm_provider=llm, tools=[tool])
-        set_db_run_state(agent, DbRunState())
-
-        result = await agent.run(
-            "Which customer has the highest total order revenue?",
-            tools=["db_query"],
-            detailed=True,
-            max_iterations=4,
-        )
-
-        assert result["result"] == "Bob has the highest total order revenue: 250."
-        assert "db_final_answer_incomplete" in result["diagnostics"]["warnings"]
-        assert len(llm.call_history) == 3
 
     async def test_iterations_incremented_per_llm_call(self):
         tool = _add_tool()
@@ -957,7 +566,7 @@ class TestToolCallingLoop:
         async def broken(args):
             return {"error": "same failure"}
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="broken",
             description="Always fails",
             parameters={"type": "object", "properties": {}},
@@ -988,7 +597,7 @@ class TestToolCallingLoop:
         async def read(args):
             return {"value": 1}
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="read_value",
             description="Read a value",
             parameters={"type": "object", "properties": {}},
@@ -1036,17 +645,19 @@ class TestToolCallingLoop:
             return {"rows": [{"answer": 7}]}
 
         tools = [
-            AgentTool(
+            LocalTool(
                 name="db_plan_query",
                 description="Plan a database query",
                 parameters={"type": "object", "properties": {}},
                 handler=plan,
+                capability_ids=(DB_SQL_EXPLAIN_CAPABILITY,),
             ),
-            AgentTool(
+            LocalTool(
                 name="db_query",
                 description="Run a database query",
                 parameters={"type": "object", "properties": {}},
                 handler=query,
+                capability_ids=(DB_SQL_EXECUTE_READ_CAPABILITY,),
             ),
         ]
         repeated_plan = lambda call_id: {
@@ -1081,7 +692,7 @@ class TestToolCallingLoop:
         async def read(args):
             return {"value": 1}
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="read_value",
             description="Read a value",
             parameters={
@@ -1180,7 +791,7 @@ class TestJsonSerialiser:
         async def h(args):
             return value
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="special",
             description="Returns special type",
             parameters={},
@@ -1220,16 +831,6 @@ class TestJsonSerialiser:
 # ===========================================================================
 
 
-class MemoryPlugin(LifecyclePlugin):
-    """LifecyclePlugin that injects a fixed string via on_before_run."""
-
-    def __init__(self, context: str):
-        self._context = context
-
-    async def on_before_run(self, prompt: str):
-        return self._context
-
-
 class TestBuildInitialConversation:
     async def test_user_message_always_last(self):
         agent = _make_agent(["Done."])
@@ -1259,48 +860,6 @@ class TestBuildInitialConversation:
         assert conv[-3]["content"] == "prev"
         assert conv[-2]["content"] == "reply"
         assert conv[-1]["content"] == "new"
-
-    async def test_on_before_run_context_injected_into_system(self):
-        llm = SequentialMockLLM(["Done."])
-        plugin = MemoryPlugin("Relevant memory: user likes Python.")
-        agent = Agent(name="X", llm_provider=llm, tools=[plugin])
-        conv = await agent._build_initial_conversation("Tell me something")
-        system_msg = next(m for m in conv if m["role"] == "system")
-        assert "Relevant memory" in system_msg["content"]
-
-    async def test_multiple_plugin_contexts_combined(self):
-        llm = SequentialMockLLM(["Done."])
-        agent = Agent(
-            name="X",
-            llm_provider=llm,
-            tools=[MemoryPlugin("Memory A"), MemoryPlugin("Memory B")],
-        )
-        conv = await agent._build_initial_conversation("Go")
-        system_msg = next(m for m in conv if m["role"] == "system")
-        assert "Memory A" in system_msg["content"]
-        assert "Memory B" in system_msg["content"]
-
-    async def test_base_plugin_not_called_for_lifecycle(self):
-        # BasePlugin (not LifecyclePlugin) is never consulted for on_before_run
-        from daita.plugins.base import BasePlugin
-
-        class ToolOnlyPlugin(BasePlugin):
-            def get_tools(self):
-                return []
-
-        llm = SequentialMockLLM(["Done."])
-        agent = Agent(name="X", llm_provider=llm, tools=[ToolOnlyPlugin()])
-        conv = await agent._build_initial_conversation("Hi")
-        roles = [m["role"] for m in conv]
-        assert "system" not in roles
-
-    async def test_lifecycle_plugin_returning_none_not_added(self):
-        # LifecyclePlugin.on_before_run returns None by default — no system message
-        llm = SequentialMockLLM(["Done."])
-        agent = Agent(name="X", llm_provider=llm, tools=[LifecyclePlugin()])
-        conv = await agent._build_initial_conversation("Hi")
-        roles = [m["role"] for m in conv]
-        assert "system" not in roles
 
 
 # ===========================================================================

@@ -24,8 +24,8 @@ Usage::
     dq = data_quality(db=db)
     report = await dq.dq_report("orders")
 
-    # As agent tools
-    agent = Agent(name="quality_checker", tools=[db, data_quality(db=db)])
+    # As agent plugins
+    agent = Agent(name="quality_checker", plugins=[db, data_quality(db=db)])
 """
 
 import logging
@@ -34,10 +34,16 @@ from datetime import datetime, timezone
 from inspect import iscoroutinefunction
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from .base import BasePlugin
+from .base import BasePlugin, PluginContext
+from .data_quality_extensions import (
+    DATA_QUALITY_MANIFEST,
+    DataQualityExecutor,
+    data_quality_capabilities,
+    data_quality_evidence_schemas,
+)
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
     from .base_db import BaseDatabasePlugin
 
 logger = logging.getLogger(__name__)
@@ -118,6 +124,8 @@ class DataQualityPlugin(BasePlugin):
     enforcement at query time.
     """
 
+    manifest = DATA_QUALITY_MANIFEST
+
     def __init__(
         self,
         db: Optional[Any] = None,
@@ -137,7 +145,45 @@ class DataQualityPlugin(BasePlugin):
         self._agent_id: Optional[str] = None
         self._thresholds = thresholds or {"z_score": 3.0, "iqr_multiplier": 1.5}
 
-    def initialize(self, agent_id: str) -> None:
+    async def setup(self, context: PluginContext) -> None:
+        """Set up data-quality runtime context without taking DB ownership."""
+        self._configure_runtime(context.agent_id or context.runtime_id)
+
+    def declare_capabilities(self):
+        return data_quality_capabilities()
+
+    def get_executors(self):
+        return (
+            DataQualityExecutor(
+                id="data_quality.profile",
+                capability_ids=frozenset({"quality.profile"}),
+                evidence_kind="quality.profile",
+                handler=self._execute_quality_profile,
+            ),
+            DataQualityExecutor(
+                id="data_quality.anomaly.detect",
+                capability_ids=frozenset({"quality.anomaly.detect"}),
+                evidence_kind="quality.anomaly",
+                handler=self._execute_anomaly_detect,
+            ),
+            DataQualityExecutor(
+                id="data_quality.freshness.check",
+                capability_ids=frozenset({"quality.freshness.check"}),
+                evidence_kind="quality.freshness",
+                handler=self._execute_freshness_check,
+            ),
+            DataQualityExecutor(
+                id="data_quality.report.generate",
+                capability_ids=frozenset({"quality.report.generate"}),
+                evidence_kind="quality.report",
+                handler=self._execute_quality_report,
+            ),
+        )
+
+    def declare_evidence_schemas(self):
+        return data_quality_evidence_schemas()
+
+    def _configure_runtime(self, agent_id: str) -> None:
         self._agent_id = agent_id
         if self._graph_backend is None:
             from daita.core.graph.backend import auto_select_backend
@@ -178,134 +224,6 @@ class DataQualityPlugin(BasePlugin):
             self._graph_backend, table, store=store, agent_id=self._agent_id
         )
 
-    def get_tools(self) -> List["AgentTool"]:
-        from ..core.tools import AgentTool
-
-        return [
-            AgentTool(
-                name="dq_profile",
-                description=(
-                    "Generate statistical profile for each column in a table: "
-                    "row count, null rate, cardinality, min, max, avg."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name to profile",
-                        },
-                        "columns": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Specific columns to profile. Profiles all columns if omitted.",
-                        },
-                        "sample_size": {
-                            "type": "integer",
-                            "description": "Optional row sample size to limit scan cost.",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_profile,
-                category="data_quality",
-                source="plugin",
-                plugin_name="DataQuality",
-                timeout_seconds=120,
-            ),
-            AgentTool(
-                name="dq_detect_anomaly",
-                description=(
-                    "Detect statistical outliers in a numeric column using z-score "
-                    "(scipy if available, numpy fallback) or IQR method."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {"type": "string", "description": "Table name"},
-                        "column": {
-                            "type": "string",
-                            "description": "Numeric column to analyse",
-                        },
-                        "method": {
-                            "type": "string",
-                            "description": "'zscore' (default) or 'iqr'",
-                        },
-                        "sample_size": {
-                            "type": "integer",
-                            "description": "Optional row limit to reduce scan cost",
-                        },
-                    },
-                    "required": ["table", "column"],
-                },
-                handler=self._tool_detect_anomaly,
-                category="data_quality",
-                source="plugin",
-                plugin_name="DataQuality",
-                timeout_seconds=120,
-            ),
-            AgentTool(
-                name="dq_check_freshness",
-                description=(
-                    "Check that data in a table is recent by comparing MAX(timestamp_column) "
-                    "to an expected maximum age."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {"type": "string", "description": "Table name"},
-                        "timestamp_column": {
-                            "type": "string",
-                            "description": "Column containing event/update timestamps",
-                        },
-                        "expected_interval_hours": {
-                            "type": "number",
-                            "description": "Maximum acceptable age in hours (default: 24)",
-                        },
-                    },
-                    "required": ["table", "timestamp_column"],
-                },
-                handler=self._tool_check_freshness,
-                category="data_quality",
-                source="plugin",
-                plugin_name="DataQuality",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="dq_report",
-                description=(
-                    "Generate a consolidated data quality report for a table: "
-                    "column profiles and an overall completeness score. "
-                    "Persists results to graph backend as a stable METRIC node."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {"type": "string", "description": "Table name"},
-                        "sample_size": {
-                            "type": "integer",
-                            "description": "Optional row sample size passed to profiling.",
-                        },
-                        "store": {
-                            "type": "string",
-                            "description": (
-                                "Optional store qualifier (e.g. "
-                                "'postgres:host/db') used to disambiguate the "
-                                "table when the same name exists in multiple "
-                                "stores."
-                            ),
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_report,
-                category="data_quality",
-                source="plugin",
-                plugin_name="DataQuality",
-                timeout_seconds=180,
-            ),
-        ]
-
     # -------------------------------------------------------------------------
     # Tool handlers
     # -------------------------------------------------------------------------
@@ -344,6 +262,22 @@ class DataQualityPlugin(BasePlugin):
         store = args.get("store")
         sample_size = args.get("sample_size")
         return await self.report(db, table, sample_size=sample_size, store=store)
+
+    async def _execute_quality_profile(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._tool_profile(args)
+
+    async def _execute_anomaly_detect(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._tool_detect_anomaly(args)
+
+    async def _execute_freshness_check(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._tool_check_freshness(args)
+
+    async def _execute_quality_report(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._tool_report(args)
 
     # -------------------------------------------------------------------------
     # Core methods

@@ -23,7 +23,7 @@ import sqlite3
 import json
 import pytest
 
-from daita.core.tools import AgentTool
+from daita.core.tools import LocalTool
 from daita.agents.agent import Agent
 
 pytestmark = pytest.mark.integration
@@ -447,7 +447,7 @@ def _token_estimate(data) -> int:
     return len(json.dumps(data, default=str)) // 4
 
 
-def _make_agent(tool: AgentTool) -> Agent:
+def _make_agent(tool: LocalTool) -> Agent:
     return Agent(
         name="SQLFocusTestAgent",
         llm_provider="openai",
@@ -522,7 +522,7 @@ class TestPostgreSQLFocusPushdown:
         """
         plugin = _make_pg_plugin(ORDERS, "orders")
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="postgres_query",
             description="Run a SELECT on the orders table. Use focus to filter/project at DB level.",
             parameters={
@@ -612,7 +612,7 @@ class TestMySQLFocusPushdown:
         """
         plugin = _make_mysql_plugin(SESSIONS, "sessions")
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="mysql_query",
             description="Query the sessions table. Use focus to filter/project at DB level.",
             parameters={
@@ -713,7 +713,7 @@ class TestSnowflakeFocusPushdown:
         """
         plugin = _make_sf_plugin(SALES, "sales")
 
-        tool = AgentTool(
+        tool = LocalTool(
             name="snowflake_query",
             description="Query the Snowflake sales warehouse. Use focus to push clauses into SQL.",
             parameters={

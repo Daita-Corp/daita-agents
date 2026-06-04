@@ -476,37 +476,6 @@ class TestQueryMethods:
         assert metrics["total_operations"] == 0
         assert metrics["success_rate"] == 0
 
-    async def test_get_workflow_communications(self):
-        tm = fresh_manager()
-        span_id = tm.start_span(
-            "wf_comm",
-            TraceType.WORKFLOW_COMMUNICATION,
-            agent_id="wf1",
-            workflow_name="my_wf",
-            from_agent="a",
-            to_agent="b",
-        )
-        tm.end_span(span_id, TraceStatus.SUCCESS)
-        flush(tm)
-        comms = tm.get_workflow_communications(workflow_name="my_wf")
-        assert len(comms) >= 1
-        assert comms[0]["from_agent"] == "a"
-        assert comms[0]["to_agent"] == "b"
-
-    async def test_get_workflow_metrics(self):
-        tm = fresh_manager()
-        for _ in range(3):
-            sid = tm.start_span(
-                "wf_comm",
-                TraceType.WORKFLOW_COMMUNICATION,
-                workflow_name="wf_x",
-            )
-            tm.end_span(sid, TraceStatus.SUCCESS)
-        flush(tm)
-        m = tm.get_workflow_metrics("wf_x")
-        assert m["total_messages"] == 3
-        assert m["success_rate"] == 1.0
-
     def test_get_global_metrics_structure(self):
         tm = fresh_manager()
         m = tm.get_global_metrics()

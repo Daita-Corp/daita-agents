@@ -1,10 +1,10 @@
-"""
-daita.agents.db — database-backed Agent builder.
+"""Compatibility package for database-backed agents.
 
-Public entry point:
-    from daita.agents.db import from_db
+The public ``from daita.agents.db import from_db`` entry point now routes to
+the operation-centric ``daita.db`` runtime. Legacy helper modules under this
+package were removed during Phase 13 after their behavior moved to ``daita.db``.
 """
 
-from .builder import from_db
+from daita.db import from_db
 
 __all__ = ["from_db"]

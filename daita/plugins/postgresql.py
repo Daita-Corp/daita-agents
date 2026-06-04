@@ -9,11 +9,20 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from urllib.parse import quote
+
+from .base import PluginContext
 from .base_db import BaseDatabasePlugin
+from .postgresql_extensions import (
+    POSTGRESQL_MANIFEST,
+    PostgreSQLExecutor,
+    postgresql_capabilities,
+    postgresql_evidence_schemas,
+    postgresql_tool_views,
+)
 from ..core.exceptions import PluginError, ValidationError
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +35,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
     """
 
     sql_dialect = "postgresql"
+    manifest = POSTGRESQL_MANIFEST
 
     def __init__(
         self,
@@ -85,6 +95,131 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         )
 
         logger.debug(f"PostgreSQL plugin configured for {host}:{port}/{database}")
+
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the PostgreSQL connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the PostgreSQL connector from a runtime."""
+        await self.disconnect()
+
+    def declare_capabilities(self):
+        return postgresql_capabilities()
+
+    def get_executors(self):
+        return (
+            PostgreSQLExecutor(
+                id="postgresql.schema.inspect",
+                capability_ids=frozenset({"db.schema.inspect"}),
+                evidence_kind="schema.asset_profile",
+                handler=self._execute_schema_inspect,
+            ),
+            PostgreSQLExecutor(
+                id="postgresql.sql.validate",
+                capability_ids=frozenset({"db.sql.validate"}),
+                evidence_kind="sql.validation",
+                handler=self._execute_sql_validate,
+            ),
+            PostgreSQLExecutor(
+                id="postgresql.sql.execute_read",
+                capability_ids=frozenset({"db.sql.execute_read"}),
+                evidence_kind="query.result",
+                handler=self._execute_sql_read,
+            ),
+            PostgreSQLExecutor(
+                id="postgresql.sql.execute_write",
+                capability_ids=frozenset({"db.sql.execute_write"}),
+                evidence_kind="write.execution",
+                handler=self._execute_sql_write,
+            ),
+            PostgreSQLExecutor(
+                id="postgresql.sql.explain",
+                capability_ids=frozenset({"db.sql.explain"}),
+                evidence_kind="query.plan",
+                handler=self._execute_sql_explain,
+            ),
+        )
+
+    def declare_evidence_schemas(self):
+        return postgresql_evidence_schemas()
+
+    def get_tool_views(self):
+        return postgresql_tool_views()
+
+    async def _execute_schema_inspect(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        requested = args.get("tables")
+        all_tables = await self.tables()
+        targets = (
+            [table for table in all_tables if table in requested]
+            if requested
+            else all_tables
+        )
+        schemas = await asyncio.gather(*[self.describe(table) for table in targets])
+        tables = []
+        for table, columns in zip(targets, schemas):
+            tables.append(
+                {
+                    "name": table,
+                    "columns": [
+                        {
+                            "name": column.get("column_name") or column.get("name"),
+                            "data_type": column.get("data_type") or column.get("type"),
+                            "is_nullable": column.get("is_nullable"),
+                            "default_value": column.get("column_default"),
+                            "is_primary_key": bool(column.get("is_primary_key")),
+                        }
+                        for column in columns
+                    ],
+                }
+            )
+        return {
+            "database_type": "postgresql",
+            "database_name": self.config.get("database") or "",
+            "table_count": len(tables),
+            "tables": tables,
+            "foreign_keys": await self.foreign_keys(),
+        }
+
+    async def _execute_sql_validate(self, payload: Any) -> Dict[str, Any]:
+        from daita.db.query_sql_validation import sql_statement_facts
+
+        args = dict(payload or {})
+        sql = self._normalize_sql(str(args.get("sql") or ""))
+        operation = str(args.get("operation") or "query")
+        analysis = self._validate_sql_policy(sql, operation=operation)
+        return {
+            "valid": True,
+            "sql": sql,
+            "operation": operation,
+            "statement_type": analysis.statement_type,
+            "is_read": analysis.is_read,
+            "has_limit": analysis.has_limit,
+            "tables": [table.short_key for table in analysis.tables],
+            "columns": sorted(analysis.referenced_column_names),
+            "statement_facts": sql_statement_facts(sql, analysis),
+        }
+
+    async def _execute_sql_read(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._run_guarded_tool_query(
+            str(args.get("sql") or ""),
+            list(args.get("params") or []),
+            args.get("focus"),
+        )
+
+    async def _execute_sql_write(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        sql = self._prepare_tool_execute_sql(str(args.get("sql") or ""))
+        affected_rows = await self.execute(sql, list(args.get("params") or []))
+        return {"sql": sql, "affected_rows": affected_rows}
+
+    async def _execute_sql_explain(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        sql = self._prepare_tool_query_sql(str(args.get("sql") or ""))
+        rows = await self.query(f"EXPLAIN {sql}", list(args.get("params") or []))
+        return {"sql": sql, "plan": rows}
 
     async def connect(self):
         """Connect to PostgreSQL database."""
@@ -262,12 +397,51 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
     async def describe(self, table: str) -> List[Dict[str, Any]]:
         """Get table column information."""
         sql = """
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_name = $1
+            SELECT
+                c.column_name,
+                c.data_type,
+                c.is_nullable,
+                c.column_default,
+                EXISTS (
+                    SELECT 1
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                     AND tc.table_schema = kcu.table_schema
+                     AND tc.table_name = kcu.table_name
+                    WHERE tc.constraint_type = 'PRIMARY KEY'
+                      AND tc.table_schema = c.table_schema
+                      AND tc.table_name = c.table_name
+                      AND kcu.column_name = c.column_name
+                ) AS is_primary_key
+            FROM information_schema.columns c
+            WHERE c.table_schema = 'public'
+              AND c.table_name = $1
             ORDER BY ordinal_position
         """
         return await self.query(sql, [table])
+
+    async def foreign_keys(self) -> List[Dict[str, Any]]:
+        """Return declared PostgreSQL foreign key relationships."""
+        sql = """
+            SELECT
+                kcu.table_name AS source_table,
+                kcu.column_name AS source_column,
+                ccu.table_name AS target_table,
+                ccu.column_name AS target_column
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.table_schema = kcu.table_schema
+             AND tc.table_name = kcu.table_name
+            JOIN information_schema.constraint_column_usage ccu
+              ON ccu.constraint_name = tc.constraint_name
+             AND ccu.table_schema = tc.table_schema
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+              AND tc.table_schema = 'public'
+            ORDER BY kcu.table_name, kcu.column_name
+        """
+        return await self.query(sql)
 
     async def count_rows(self, table: str, filter: Optional[str] = None) -> int:
         """Count rows in a table with an optional WHERE clause."""
@@ -466,223 +640,6 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 f"Failed to create vector index: {e}",
                 plugin_name="PostgreSQL",
             ) from e
-
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose PostgreSQL operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for database operations
-        """
-        from ..core.tools import AgentTool
-
-        tools = [
-            AgentTool(
-                name="postgres_query",
-                description="Run a SELECT query on PostgreSQL. Use the focus DSL or add LIMIT to avoid oversized responses (default LIMIT 50 applied if omitted).",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "sql": {
-                            "type": "string",
-                            "description": "SQL SELECT query with $1, $2, etc. placeholders",
-                        },
-                        "params": {
-                            "type": "array",
-                            "description": "Optional parameter values for placeholders",
-                            "items": {},
-                        },
-                        "focus": {
-                            "type": "string",
-                            "description": "Focus DSL to filter/project at the database level, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\"",
-                        },
-                    },
-                    "required": ["sql"],
-                },
-                handler=self._tool_query,
-                category="database",
-                source="plugin",
-                plugin_name="PostgreSQL",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="postgres_inspect",
-                description="List all tables and their column schemas in one call. Use instead of calling postgres_list_tables then postgres_get_schema for each table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "tables": {
-                            "type": "array",
-                            "description": "Filter to specific tables (returns all if omitted, capped at 50)",
-                            "items": {"type": "string"},
-                        }
-                    },
-                    "required": [],
-                },
-                handler=self._tool_inspect,
-                category="database",
-                source="plugin",
-                plugin_name="PostgreSQL",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="postgres_count",
-                description="Count rows in a PostgreSQL table with an optional filter.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name",
-                        },
-                        "filter": {
-                            "type": "string",
-                            "description": "Optional SQL WHERE clause (without the WHERE keyword)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_count,
-                category="database",
-                source="plugin",
-                plugin_name="PostgreSQL",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="postgres_sample",
-                description="Return a random sample of rows from a PostgreSQL table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name",
-                        },
-                        "n": {
-                            "type": "integer",
-                            "description": "Number of rows to sample (default: 5)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_sample,
-                category="database",
-                source="plugin",
-                plugin_name="PostgreSQL",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="postgres_vector_search",
-                description="Search for similar vectors using pgvector extension. Returns matching rows with similarity scores.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name containing vector data",
-                        },
-                        "vector_column": {
-                            "type": "string",
-                            "description": "Column name with vector embeddings",
-                        },
-                        "query_vector": {
-                            "type": "array",
-                            "description": "Query vector as array of floats",
-                            "items": {"type": "number"},
-                        },
-                        "top_k": {
-                            "type": "integer",
-                            "description": "Maximum number of results to return (default: 10)",
-                        },
-                        "filter": {
-                            "type": "string",
-                            "description": "Optional SQL WHERE clause for filtering (e.g., \"category = 'tech'\")",
-                        },
-                        "distance_type": {
-                            "type": "string",
-                            "description": "Distance metric: 'cosine', 'l2', or 'inner_product' (default: 'cosine')",
-                        },
-                    },
-                    "required": ["table", "vector_column", "query_vector"],
-                },
-                handler=self._tool_vector_search,
-                category="database",
-                source="plugin",
-                plugin_name="PostgreSQL",
-                timeout_seconds=60,
-            ),
-        ]
-        if not self.read_only:
-            tools += [
-                AgentTool(
-                    name="postgres_execute",
-                    description="Execute INSERT, UPDATE, or DELETE on PostgreSQL. Returns affected row count.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "sql": {
-                                "type": "string",
-                                "description": "SQL statement (INSERT, UPDATE, or DELETE)",
-                            },
-                            "params": {
-                                "type": "array",
-                                "description": "Optional parameter values",
-                                "items": {},
-                            },
-                        },
-                        "required": ["sql"],
-                    },
-                    handler=self._tool_execute,
-                    category="database",
-                    source="plugin",
-                    plugin_name="PostgreSQL",
-                    timeout_seconds=60,
-                ),
-                AgentTool(
-                    name="postgres_vector_upsert",
-                    description="Insert or update a vector with metadata in PostgreSQL using pgvector. Uses ON CONFLICT to handle duplicates.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "table": {"type": "string", "description": "Table name"},
-                            "id_column": {
-                                "type": "string",
-                                "description": "Primary key column name",
-                            },
-                            "vector_column": {
-                                "type": "string",
-                                "description": "Vector column name",
-                            },
-                            "id": {
-                                "type": "string",
-                                "description": "ID value for the row",
-                            },
-                            "vector": {
-                                "type": "array",
-                                "description": "Vector as array of floats",
-                                "items": {"type": "number"},
-                            },
-                            "extra_columns": {
-                                "type": "object",
-                                "description": "Optional additional columns to upsert as key-value pairs",
-                            },
-                        },
-                        "required": [
-                            "table",
-                            "id_column",
-                            "vector_column",
-                            "id",
-                            "vector",
-                        ],
-                    },
-                    handler=self._tool_vector_upsert,
-                    category="database",
-                    source="plugin",
-                    plugin_name="PostgreSQL",
-                    timeout_seconds=60,
-                ),
-            ]
-        return tools
 
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_list_tables (kept for backward compat, not in get_tools)"""

@@ -27,8 +27,8 @@ Usage:
         description="Daily orders summary")
     await tx.transform_run("orders_summary")
 
-    # As agent tools
-    agent = Agent(name="transformer_agent", tools=[db, lin, tx])
+    # As agent plugins
+    agent = Agent(name="transformer_agent", plugins=[db, lin, tx])
     ```
 """
 
@@ -37,12 +37,24 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Mapping, Optional, Union, TYPE_CHECKING
 
-from .base import BasePlugin
+from daita.runtime import (
+    AccessMode,
+    Capability,
+    Evidence,
+    EvidenceSchema,
+    Operation,
+    RiskLevel,
+    Task,
+    ToolView,
+)
+
+from .base import PluginContext, RuntimeExtensionPlugin
+from .manifest import PluginKind, PluginManifest
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
     from .base_db import BaseDatabasePlugin
     from .lineage import LineagePlugin
 
@@ -55,6 +67,195 @@ _TABLE_RE = re.compile(
 )
 # Matches :param_name at a word boundary — avoids partial replacements (TX-04)
 _PARAM_RE = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)\b")
+
+_TRANSFORM_CREATE_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "description": "Unique transformation name (alphanumeric, underscore, dot only)",
+        },
+        "sql": {
+            "type": "string",
+            "description": "SQL to execute for this transformation",
+        },
+        "description": {
+            "type": "string",
+            "description": "Human-readable description of what this transformation does",
+        },
+    },
+    "required": ["name", "sql"],
+}
+
+_TRANSFORM_RUN_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "description": "Transformation name to execute",
+        },
+        "parameters": {
+            "type": "object",
+            "description": "Optional key-value parameters to substitute into SQL (:param style)",
+        },
+    },
+    "required": ["name"],
+}
+
+_TRANSFORM_NAME_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "description": "Transformation name",
+        },
+    },
+    "required": ["name"],
+}
+
+_TRANSFORM_DIFF_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "description": "Transformation name",
+        },
+        "version_a": {
+            "type": ["integer", "string"],
+            "description": "Snapshot index (0-based) or 'current' for live SQL.",
+        },
+        "version_b": {
+            "type": ["integer", "string"],
+            "description": "Snapshot index (0-based) or 'current' for live SQL.",
+        },
+    },
+    "required": ["name", "version_a", "version_b"],
+}
+
+_TRANSFORM_LIST_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "filter_tag": {
+            "type": "string",
+            "description": "Optional tag to filter transformations by",
+        }
+    },
+}
+
+_TRANSFORM_TOOL_DEFINITIONS = (
+    {
+        "name": "transform_create",
+        "handler": "_tool_create",
+        "capability_id": "transformer.definition.create",
+        "operation_type": "data.transform.create",
+        "description": (
+            "Define a named SQL transformation and store it. "
+            "Source and target tables are extracted from the SQL automatically. "
+            "Persists to graph backend when available; falls back to in-memory."
+        ),
+        "parameters": _TRANSFORM_CREATE_PARAMETERS,
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.MEDIUM,
+        "retry_safe": False,
+        "idempotent": False,
+        "side_effecting": True,
+        "timeout_seconds": 30,
+    },
+    {
+        "name": "transform_run",
+        "handler": "_tool_run",
+        "capability_id": "transformer.run",
+        "operation_type": "data.transform.run",
+        "description": (
+            "Execute a named transformation against the database. "
+            "Automatically captures lineage if a lineage plugin is configured. "
+            "Updates last_run and run_count on the transformation node."
+        ),
+        "parameters": _TRANSFORM_RUN_PARAMETERS,
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.HIGH,
+        "retry_safe": False,
+        "idempotent": False,
+        "side_effecting": True,
+        "timeout_seconds": 300,
+    },
+    {
+        "name": "transform_test",
+        "handler": "_tool_test",
+        "capability_id": "transformer.test",
+        "operation_type": "data.transform.test",
+        "description": (
+            "Dry-run validate a transformation SQL using EXPLAIN "
+            "without executing it. Substitutes dummy values for any :param "
+            "placeholders before sending to the DB. Returns the query plan or error."
+        ),
+        "parameters": _TRANSFORM_NAME_PARAMETERS,
+        "access": AccessMode.READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "timeout_seconds": 60,
+    },
+    {
+        "name": "transform_version",
+        "handler": "_tool_version",
+        "capability_id": "transformer.version",
+        "operation_type": "data.transform.version",
+        "description": (
+            "Snapshot the current SQL of a transformation as a new version. "
+            "Snapshots are indexed 0 (oldest) to N-1 (most recent). "
+            "The live, unsaved SQL is always accessible as 'current'."
+        ),
+        "parameters": _TRANSFORM_NAME_PARAMETERS,
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.MEDIUM,
+        "retry_safe": False,
+        "idempotent": False,
+        "side_effecting": True,
+        "timeout_seconds": 30,
+    },
+    {
+        "name": "transform_diff",
+        "handler": "_tool_diff",
+        "capability_id": "transformer.diff",
+        "operation_type": "data.transform.diff",
+        "description": (
+            "Show a unified diff between two versions of a transformation SQL. "
+            "Use integer indices (0 = oldest snapshot, N-1 = most recent snapshot) "
+            "or the string 'current' to refer to the live unsaved SQL."
+        ),
+        "parameters": _TRANSFORM_DIFF_PARAMETERS,
+        "access": AccessMode.READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "timeout_seconds": 10,
+    },
+    {
+        "name": "transform_list",
+        "handler": "_tool_list",
+        "capability_id": "transformer.list",
+        "operation_type": "data.transform.list",
+        "description": (
+            "List all defined transformations with their metadata, "
+            "including last_run timestamp and run_count."
+        ),
+        "parameters": _TRANSFORM_LIST_PARAMETERS,
+        "access": AccessMode.METADATA_READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+        "timeout_seconds": 30,
+    },
+)
+
+_TRANSFORM_TOOL_BY_CAPABILITY = {
+    definition["capability_id"]: definition
+    for definition in _TRANSFORM_TOOL_DEFINITIONS
+}
 
 
 def _validate_identifier(name: str) -> str:
@@ -142,13 +343,69 @@ def _make_tx_entry(
     }
 
 
-class TransformerPlugin(BasePlugin):
+class _TransformerExecutor:
+    """Executor backing Transformer plugin capability declarations."""
+
+    id = "transformer.operations"
+    capability_ids = frozenset(_TRANSFORM_TOOL_BY_CAPABILITY)
+
+    def __init__(self, plugin: "TransformerPlugin") -> None:
+        self._plugin = plugin
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        definition = _TRANSFORM_TOOL_BY_CAPABILITY.get(task.capability_id)
+        if definition is None:
+            raise ValueError(
+                f"Unsupported transformer capability: {task.capability_id}"
+            )
+
+        tool_name = definition["name"]
+        handler = self._plugin._tool_handler(tool_name)
+        result = await handler(dict(task.input))
+        tool_view = context.get("tool_view")
+        tool_view_name = (
+            tool_view.get("name") if isinstance(tool_view, Mapping) else None
+        )
+        return [
+            Evidence(
+                kind="transformer.operation.result",
+                owner="transformer",
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={
+                    "operation": tool_name,
+                    "request": dict(task.input),
+                    "result": result,
+                },
+                metadata={
+                    "capability_id": task.capability_id,
+                    "tool_view": tool_view_name,
+                },
+            )
+        ]
+
+
+class TransformerPlugin(RuntimeExtensionPlugin):
     """
     Plugin for managing, versioning, and executing named SQL transformations.
 
     Graph backend is the preferred storage. When none is available, falls back
     to an in-memory dict so the plugin remains fully functional within a session.
     """
+
+    manifest = PluginManifest(
+        id="transformer",
+        display_name="SQL Transformer",
+        version="2.0.0",
+        kind=PluginKind.RUNTIME_EXTENSION,
+        domains=frozenset({"db", "data", "transform"}),
+        provides=frozenset({"sql_transformations", "transformation_lineage"}),
+    )
 
     def __init__(
         self,
@@ -160,7 +417,7 @@ class TransformerPlugin(BasePlugin):
         Args:
             db: Optional database plugin. Required at execution time.
             lineage: Optional LineagePlugin for auto lineage capture on transform_run.
-            backend: Optional graph backend. Auto-selected during initialize() if None.
+            backend: Optional graph backend. Auto-selected during setup() if None.
         """
         self._db = db
         self._lineage = lineage
@@ -168,8 +425,13 @@ class TransformerPlugin(BasePlugin):
         self._agent_id: Optional[str] = None
         # in-memory index, always populated by transform_create
         self._definitions: Dict[str, Dict[str, Any]] = {}
+        self._executor = _TransformerExecutor(self)
 
-    def initialize(self, agent_id: str) -> None:
+    async def setup(self, context: PluginContext) -> None:
+        """Set up transformation runtime context and graph backend."""
+        self._configure_runtime(context.agent_id or context.runtime_id)
+
+    def _configure_runtime(self, agent_id: str) -> None:
         self._agent_id = agent_id
         if self._graph_backend is None:
             from daita.core.graph.backend import auto_select_backend
@@ -187,171 +449,75 @@ class TransformerPlugin(BasePlugin):
             )
         return self._db
 
-    def get_tools(self) -> List["AgentTool"]:
-        from ..core.tools import AgentTool
+    def declare_capabilities(self) -> tuple[Capability, ...]:
+        """Declare transformation operations as runtime-plannable capabilities."""
+        return tuple(
+            Capability(
+                id=definition["capability_id"],
+                owner=self.manifest.id,
+                description=definition["description"],
+                domains=frozenset({"db", "data", "transform"}),
+                operation_types=frozenset({definition["operation_type"]}),
+                access=definition["access"],
+                risk=definition["risk"],
+                input_schema=definition["parameters"],
+                output_evidence=frozenset({"transformer.operation.result"}),
+                executor=self._executor.id,
+                model_visible=True,
+                retry_safe=definition["retry_safe"],
+                idempotent=definition["idempotent"],
+                side_effecting=definition["side_effecting"],
+                timeout_seconds=definition["timeout_seconds"],
+                metadata={"tool_name": definition["name"]},
+            )
+            for definition in _TRANSFORM_TOOL_DEFINITIONS
+        )
 
-        return [
-            AgentTool(
-                name="transform_create",
-                description=(
-                    "Define a named SQL transformation and store it. "
-                    "Source and target tables are extracted from the SQL automatically. "
-                    "Persists to graph backend when available; falls back to in-memory."
-                ),
-                parameters={
+    def declare_evidence_schemas(self) -> tuple[EvidenceSchema, ...]:
+        """Declare the typed evidence returned by transformation execution."""
+        return (
+            EvidenceSchema(
+                kind="transformer.operation.result",
+                owner=self.manifest.id,
+                description="Result evidence from a SQL transformation operation.",
+                json_schema={
                     "type": "object",
                     "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Unique transformation name (alphanumeric, underscore, dot only)",
-                        },
-                        "sql": {
-                            "type": "string",
-                            "description": "SQL to execute for this transformation",
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Human-readable description of what this transformation does",
-                        },
+                        "operation": {"type": "string"},
+                        "request": {"type": "object"},
+                        "result": {"type": "object"},
                     },
-                    "required": ["name", "sql"],
+                    "required": ["operation", "request", "result"],
                 },
-                handler=self._tool_create,
-                category="transformer",
-                source="plugin",
-                plugin_name="Transformer",
-                timeout_seconds=30,
             ),
-            AgentTool(
-                name="transform_run",
-                description=(
-                    "Execute a named transformation against the database. "
-                    "Automatically captures lineage if a lineage plugin is configured. "
-                    "Updates last_run and run_count on the transformation node."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Transformation name to execute",
-                        },
-                        "parameters": {
-                            "type": "object",
-                            "description": "Optional key-value parameters to substitute into SQL (:param style)",
-                        },
-                    },
-                    "required": ["name"],
-                },
-                handler=self._tool_run,
-                category="transformer",
-                source="plugin",
-                plugin_name="Transformer",
-                timeout_seconds=300,
-            ),
-            AgentTool(
-                name="transform_test",
-                description=(
-                    "Dry-run validate a transformation SQL using EXPLAIN "
-                    "without executing it. Substitutes dummy values for any :param "
-                    "placeholders before sending to the DB. Returns the query plan or error."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Transformation name to test",
-                        },
-                    },
-                    "required": ["name"],
-                },
-                handler=self._tool_test,
-                category="transformer",
-                source="plugin",
-                plugin_name="Transformer",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="transform_version",
-                description=(
-                    "Snapshot the current SQL of a transformation as a new version. "
-                    "Snapshots are indexed 0 (oldest) to N-1 (most recent). "
-                    "The live, unsaved SQL is always accessible as 'current'."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Transformation name to snapshot",
-                        },
-                    },
-                    "required": ["name"],
-                },
-                handler=self._tool_version,
-                category="transformer",
-                source="plugin",
-                plugin_name="Transformer",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="transform_diff",
-                description=(
-                    "Show a unified diff between two versions of a transformation SQL. "
-                    "Use integer indices (0 = oldest snapshot, N-1 = most recent snapshot) "
-                    "or the string 'current' to refer to the live unsaved SQL."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Transformation name",
-                        },
-                        "version_a": {
-                            "type": ["integer", "string"],
-                            "description": "Snapshot index (0-based) or 'current' for live SQL.",
-                        },
-                        "version_b": {
-                            "type": ["integer", "string"],
-                            "description": "Snapshot index (0-based) or 'current' for live SQL.",
-                        },
-                    },
-                    "required": ["name", "version_a", "version_b"],
-                },
-                handler=self._tool_diff,
-                category="transformer",
-                source="plugin",
-                plugin_name="Transformer",
-                timeout_seconds=10,
-            ),
-            AgentTool(
-                name="transform_list",
-                description=(
-                    "List all defined transformations with their metadata, "
-                    "including last_run timestamp and run_count."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "filter_tag": {
-                            "type": "string",
-                            "description": "Optional tag to filter transformations by",
-                        }
-                    },
-                },
-                handler=self._tool_list,
-                category="transformer",
-                source="plugin",
-                plugin_name="Transformer",
-                timeout_seconds=30,
-            ),
-        ]
+        )
+
+    def get_executors(self) -> tuple[_TransformerExecutor, ...]:
+        """Return executors for declared transformation capabilities."""
+        return (self._executor,)
+
+    def get_tool_views(self) -> tuple[ToolView, ...]:
+        """Expose transformation capabilities through model-visible tools."""
+        return tuple(
+            ToolView(
+                name=definition["name"],
+                capability_id=definition["capability_id"],
+                description=definition["description"],
+                parameters=definition["parameters"],
+                metadata={"operation_type": definition["operation_type"]},
+            )
+            for definition in _TRANSFORM_TOOL_DEFINITIONS
+        )
 
     # -------------------------------------------------------------------------
     # Tool handlers
     # -------------------------------------------------------------------------
+
+    def _tool_handler(self, tool_name: str) -> Any:
+        for definition in _TRANSFORM_TOOL_DEFINITIONS:
+            if definition["name"] == tool_name:
+                return getattr(self, definition["handler"])
+        raise ValueError(f"Unsupported transformer tool: {tool_name}")
 
     async def _tool_create(self, args: Dict[str, Any]) -> Dict[str, Any]:
         name = args["name"]

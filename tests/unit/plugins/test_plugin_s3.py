@@ -17,6 +17,9 @@ botocore_exceptions = pytest.importorskip(
 ClientError = botocore_exceptions.ClientError
 
 from daita.plugins.s3 import S3Plugin
+from daita.plugins import ExtensionRegistry
+from daita.runtime import AccessMode, Operation, RiskLevel, Task
+from tests.unit.plugins.projection_helpers import projected_tools
 from daita.core.exceptions import (
     NotFoundError,
     PermissionError as DaitaPermissionError,
@@ -69,6 +72,141 @@ def _make_client_error(code: str, message: str = "test error") -> ClientError:
         {"Error": {"Code": code, "Message": message}},
         operation_name="TestOperation",
     )
+
+
+def _operation_and_task(capability, input_payload):
+    operation = Operation(
+        id="op-1",
+        operation_type=next(iter(capability.operation_types)),
+        request=input_payload,
+        required_evidence=capability.output_evidence,
+    )
+    task = Task(
+        id="task-1",
+        operation_id=operation.id,
+        capability_id=capability.id,
+        executor_id=capability.executor,
+        input=input_payload,
+        required_evidence=capability.output_evidence,
+    )
+    return operation, task
+
+
+# ---------------------------------------------------------------------------
+# Extension declarations
+# ---------------------------------------------------------------------------
+
+
+def test_s3_plugin_declares_extension_first_contract():
+    plugin = make_plugin()
+    registry = ExtensionRegistry()
+
+    registry.register(plugin)
+
+    assert plugin.manifest.id == "s3"
+    assert registry.plugin_ids == ("s3",)
+    assert {capability.id for capability in registry.capabilities} == {
+        "s3.object.read",
+        "s3.object.write",
+        "s3.object.list",
+        "s3.object.delete",
+        "s3.object.head",
+    }
+    assert {view.name for view in registry.tool_views} == {
+        "read_s3_file",
+        "write_s3_file",
+        "list_s3_objects",
+        "delete_s3_file",
+        "head_s3_object",
+    }
+    assert registry.get_tool_view_owner("read_s3_file") == "s3"
+    assert registry.evidence_schemas[0].kind == "s3.operation.result"
+
+
+def test_s3_capabilities_carry_access_and_safety_metadata():
+    plugin = make_plugin()
+    registry = ExtensionRegistry()
+
+    registry.register(plugin)
+    by_id = {capability.id: capability for capability in registry.capabilities}
+
+    assert by_id["s3.object.read"].access is AccessMode.READ
+    assert by_id["s3.object.read"].risk is RiskLevel.LOW
+    assert by_id["s3.object.read"].side_effecting is False
+    assert by_id["s3.object.write"].access is AccessMode.WRITE
+    assert by_id["s3.object.write"].risk is RiskLevel.MEDIUM
+    assert by_id["s3.object.write"].idempotent is True
+    assert by_id["s3.object.delete"].risk is RiskLevel.HIGH
+    assert by_id["s3.object.delete"].side_effecting is True
+
+
+async def test_s3_executor_returns_typed_operation_evidence():
+    plugin = make_plugin()
+    _mock_get_object(plugin, b"Hello, storage!", content_type="text/plain")
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    capability = registry.get_capability("s3.object.read", owner="s3")
+    executor = registry.get_executor(capability.executor)
+    operation, task = _operation_and_task(capability, {"key": "notes.txt"})
+
+    evidence = await executor.execute(task, operation, {})
+
+    assert evidence[0].kind == "s3.operation.result"
+    assert evidence[0].owner == "s3"
+    assert evidence[0].payload["operation"] == "s3.object.read"
+    assert evidence[0].payload["request"] == {"key": "notes.txt"}
+    assert evidence[0].payload["result"]["content"] == "Hello, storage!"
+    assert evidence[0].metadata["capability_id"] == "s3.object.read"
+
+
+async def test_s3_write_executor_uses_existing_tool_handler():
+    plugin = make_plugin()
+    _mock_put_object(plugin)
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    capability = registry.get_capability("s3.object.write", owner="s3")
+    executor = registry.get_executor(capability.executor)
+    operation, task = _operation_and_task(
+        capability,
+        {"key": "out/hello.txt", "data": "hello"},
+    )
+
+    evidence = await executor.execute(task, operation, {})
+
+    assert evidence[0].payload["operation"] == "s3.object.write"
+    assert evidence[0].payload["result"] == {
+        "key": "out/hello.txt",
+        "size": 5,
+        "location": "s3://test-bucket/out/hello.txt",
+        "bucket": "test-bucket",
+    }
+
+
+async def test_s3_registry_setup_and_teardown_use_connector_lifecycle():
+    plugin = make_plugin()
+    calls = []
+
+    async def fake_connect():
+        calls.append("connect")
+        plugin._client = object()
+
+    async def fake_disconnect():
+        calls.append("disconnect")
+        plugin._client = None
+
+    plugin._client = None
+    plugin.connect = fake_connect
+    plugin.disconnect = fake_disconnect
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+
+    await registry.setup_plugin("s3", context=None)
+    assert plugin.is_connected is True
+
+    await registry.teardown_all()
+
+    assert calls == ["connect", "disconnect"]
+    assert plugin.is_connected is False
 
 
 # ---------------------------------------------------------------------------
@@ -439,19 +577,18 @@ async def test_copy_returns_metadata():
 
 
 # ---------------------------------------------------------------------------
-# get_tools schema validation
+# Projected tool schema validation
 # ---------------------------------------------------------------------------
 
 
-def test_returns_five_tools():
+def test_projected_tools_return_five_tools():
     plugin = make_plugin()
-    tools = plugin.get_tools()
-    assert len(tools) == 5
+    assert len(projected_tools(plugin)) == 5
 
 
 def test_write_schema_no_type_constraint():
     plugin = make_plugin()
-    tools = {t.name: t for t in plugin.get_tools()}
+    tools = projected_tools(plugin)
     write_tool = tools["write_s3_file"]
     data_prop = write_tool.parameters["properties"]["data"]
     # Must NOT have "type": "object" — that blocks strings and lists
@@ -460,16 +597,31 @@ def test_write_schema_no_type_constraint():
 
 def test_read_schema_has_focus_param():
     plugin = make_plugin()
-    tools = {t.name: t for t in plugin.get_tools()}
+    tools = projected_tools(plugin)
     read_tool = tools["read_s3_file"]
     assert "focus" in read_tool.parameters["properties"]
 
 
 def test_list_schema_has_focus_param():
     plugin = make_plugin()
-    tools = {t.name: t for t in plugin.get_tools()}
+    tools = projected_tools(plugin)
     list_tool = tools["list_s3_objects"]
     assert "focus" in list_tool.parameters["properties"]
+
+
+def test_projected_tools_carry_declared_capability_metadata():
+    plugin = make_plugin()
+    tools = projected_tools(plugin)
+
+    assert tools["read_s3_file"].capability_ids == ("s3.object.read",)
+    assert tools["write_s3_file"].capability_ids == ("s3.object.write",)
+    assert tools["list_s3_objects"].capability_ids == ("s3.object.list",)
+    assert tools["delete_s3_file"].capability_ids == ("s3.object.delete",)
+    assert tools["head_s3_object"].capability_ids == ("s3.object.head",)
+    assert tools["read_s3_file"].side_effecting is False
+    assert tools["write_s3_file"].side_effecting is True
+    assert tools["delete_s3_file"].side_effecting is True
+    assert tools["head_s3_object"].retry_safe is True
 
 
 # ---------------------------------------------------------------------------
@@ -622,9 +774,9 @@ def test_unknown_client_error_to_plugin_error():
     assert isinstance(mapped, PluginError)
 
 
-def test_import_error_to_permanent_plugin_error():
+def test_import_error_to_import_error_with_extra_hint():
     plugin = make_plugin()
     err = ImportError("boto3 not found")
     mapped = plugin._map_s3_error(err, "connect")
-    assert isinstance(mapped, PluginError)
-    assert mapped.retry_hint == "permanent"
+    assert isinstance(mapped, ImportError)
+    assert "pip install 'daita-agents[aws]'" in str(mapped)

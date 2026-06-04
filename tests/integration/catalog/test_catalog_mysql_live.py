@@ -28,6 +28,7 @@ aiomysql = pytest.importorskip(
 
 from daita.core.graph import LocalGraphBackend
 from daita.core.graph.models import NodeType
+from daita.plugins.base import PluginContext
 from daita.plugins.catalog import CatalogPlugin
 
 from tests.integration._harness import (
@@ -78,6 +79,16 @@ SEED_SQL_STATEMENTS = [
 
 
 EXPECTED_TABLES = {"customers", "orders"}
+
+
+async def _setup_catalog(plugin: CatalogPlugin, agent_id: str) -> None:
+    await plugin.setup(
+        PluginContext(
+            runtime_id=agent_id,
+            runtime_kind="agent",
+            agent_id=agent_id,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +165,7 @@ async def plugin_with_backend(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     backend = LocalGraphBackend(graph_type="catalog_mysql_live")
     plugin = CatalogPlugin(backend=backend, auto_persist=False)
-    plugin.initialize("catalog-mysql-live")
+    await _setup_catalog(plugin, "catalog-mysql-live")
     return plugin, backend
 
 
@@ -166,22 +177,17 @@ async def plugin_with_backend(tmp_path, monkeypatch):
 @pytest.mark.integration
 @pytest.mark.requires_db
 class TestCatalogPluginMySQL:
-    async def test_discover_schema_returns_seeded_tables(
+    async def test_discover_mysql_returns_seeded_tables(
         self, plugin_with_backend, seeded_mysql
     ):
         plugin, _ = plugin_with_backend
 
-        discover_tool = next(
-            t for t in plugin.get_tools() if t.name == "discover_schema"
-        )
-        async with timed("discover_schema mysql"):
-            result = await discover_tool.execute(
-                {
-                    "store_type": "mysql",
-                    "connection_string": seeded_mysql,
-                    "options": {"schema": MYSQL_DB, "ssl_mode": "disable"},
-                    "persist": False,
-                }
+        async with timed("discover_mysql"):
+            result = await plugin.discover_mysql(
+                connection_string=seeded_mysql,
+                schema=MYSQL_DB,
+                ssl_mode="disable",
+                persist=False,
             )
 
         # Raw discover_* shape: tables[].table_name, columns in a flat sibling array.
@@ -209,17 +215,12 @@ class TestMySQLGraphCorrectness:
     async def test_persist_populates_graph(self, plugin_with_backend, seeded_mysql):
         plugin, backend = plugin_with_backend
 
-        discover_tool = next(
-            t for t in plugin.get_tools() if t.name == "discover_schema"
-        )
-        async with timed("discover_schema mysql + persist"):
-            await discover_tool.execute(
-                {
-                    "store_type": "mysql",
-                    "connection_string": seeded_mysql,
-                    "options": {"schema": MYSQL_DB, "ssl_mode": "disable"},
-                    "persist": True,
-                }
+        async with timed("discover_mysql + persist"):
+            await plugin.discover_mysql(
+                connection_string=seeded_mysql,
+                schema=MYSQL_DB,
+                ssl_mode="disable",
+                persist=True,
             )
 
         tables = await backend.find_nodes(NodeType.TABLE)
@@ -236,24 +237,28 @@ class TestMySQLGraphCorrectness:
 @pytest.mark.integration
 @pytest.mark.requires_db
 class TestAgentMySQLLive:
-    async def test_agent_discovers_and_describes_schema(
+    async def test_agent_searches_and_describes_registered_schema(
         self, plugin_with_backend, seeded_mysql
     ):
         plugin, _ = plugin_with_backend
+        discovery = await plugin.discover_mysql(
+            connection_string=seeded_mysql,
+            schema=MYSQL_DB,
+            ssl_mode="disable",
+            persist=True,
+        )
+        store_id = discovery["store_id"]
 
         agent = build_live_agent(name="MySQLCatalogAgent", tools=[plugin])
         async with timed("agent.run mysql describe"):
             result = await agent.run(
-                f"Use the catalog tools to profile this MySQL database: "
-                f"`{seeded_mysql}`. Important: this is a local container "
-                f"without TLS, so pass options={{'schema': '{MYSQL_DB}', "
-                f"'ssl_mode': 'disable'}} to discover_schema. Then tell me "
+                f"Use the catalog tools for store `{store_id}`. Tell me "
                 f"the names of all tables and how `orders` relates to "
                 f"`customers`. Be concise.",
                 detailed=True,
             )
 
-        assert_tool_called(result, "discover_schema")
+        assert_tool_called(result, "catalog_search_schema")
         assert_answer_mentions(result, ["customers", "orders"])
         assert_answer_mentions(
             result,

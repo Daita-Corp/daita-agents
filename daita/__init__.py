@@ -13,9 +13,8 @@ Quick start:
 
 Key components:
 - Agent / BaseAgent      — Build single or custom agents
-- Workflow / RelayManager — Multi-agent orchestration
-- tool / AgentTool       — Define tools agents can call
-- Plugins               — Database and API integrations (postgresql, s3, slack, ...)
+- tool                  — Define local model-visible functions
+- Plugins               — Extension-first database/API integrations
 - AgentConfig           — Configure retry policies, LLM settings, and more
 """
 
@@ -28,17 +27,28 @@ from .agents.agent import Agent
 from .agents.base import BaseAgent
 from .agents.conversation import ConversationHistory
 
-from .core.tools import tool, AgentTool, ToolRegistry
-
-from .core.workflow import Workflow
-from .core.relay import RelayManager
+from .core.tools import tool
 
 # ---------------------------------------------------------------------------
-# Plugins — database and API integrations
+# Plugins — extension-first database and API integrations
 # ---------------------------------------------------------------------------
 from .plugins import postgresql, mysql, mongodb, rest, s3, slack, elasticsearch, sqlite
 from .plugins.redis_messaging import redis_messaging
-from .plugins.base import BasePlugin, LifecyclePlugin
+from .plugins.base import (
+    BasePlugin,
+    ConnectorPlugin,
+    DomainServicePlugin,
+    EmptySecretProvider,
+    ObservabilityPlugin,
+    PluginContext,
+    RuntimeExtensionPlugin,
+    SecretProvider,
+    ServiceRegistry,
+    SkillPlugin,
+    WorkerProviderPlugin,
+)
+from .plugins.manifest import PluginKind, PluginManifest
+from .plugins.registry import ExtensionRegistry, RegistryDiagnostic
 
 # ---------------------------------------------------------------------------
 # Skills — composable units of agent capability
@@ -49,11 +59,6 @@ from .skills import BaseSkill, Skill
 # Configuration
 # ---------------------------------------------------------------------------
 from .config.base import AgentConfig, RetryPolicy, RetryStrategy
-
-# ---------------------------------------------------------------------------
-# Watch system — data source monitoring via @agent.watch()
-# ---------------------------------------------------------------------------
-from .core.watch import WatchEvent
 
 # ---------------------------------------------------------------------------
 # Focus DSL — pre-filter tool results before the LLM sees them
@@ -70,7 +75,6 @@ from .core.exceptions import (
     ConfigError,
     PluginError,
     SkillError,
-    WorkflowError,
     TransientError,
     RetryableError,
     PermanentError,
@@ -96,12 +100,6 @@ from .llm.factory import create_llm_provider
 # ---------------------------------------------------------------------------
 from .embeddings import BaseEmbeddingProvider
 
-# ---------------------------------------------------------------------------
-# Advanced — reliability, scaling, tracing (importable from submodules too)
-# ---------------------------------------------------------------------------
-# from daita.core.reliability import TaskManager, CircuitBreaker, BackpressureController
-# from daita.core.scaling import AgentPool, LoadBalancer, create_agent_pool
-# from daita.core.interfaces import AgentABC, LLMProvider
 from .core.tracing import get_trace_manager, configure_tracing, set_trace_context
 
 __all__ = [
@@ -109,12 +107,8 @@ __all__ = [
     "Agent",
     "BaseAgent",
     "ConversationHistory",
-    "Workflow",
-    "RelayManager",
     # Tool system
     "tool",
-    "AgentTool",
-    "ToolRegistry",
     # Tracing
     "configure_tracing",
     "get_trace_manager",
@@ -130,15 +124,26 @@ __all__ = [
     "elasticsearch",
     "redis_messaging",
     "BasePlugin",
-    "LifecyclePlugin",
+    "ConnectorPlugin",
+    "DomainServicePlugin",
+    "EmptySecretProvider",
+    "ObservabilityPlugin",
+    "PluginContext",
+    "PluginKind",
+    "PluginManifest",
+    "RuntimeExtensionPlugin",
+    "SecretProvider",
+    "ServiceRegistry",
+    "SkillPlugin",
+    "WorkerProviderPlugin",
+    "ExtensionRegistry",
+    "RegistryDiagnostic",
     "BaseSkill",
     "Skill",
     # Configuration
     "AgentConfig",
     "RetryPolicy",
     "RetryStrategy",
-    # Watch system
-    "WatchEvent",
     # Focus DSL
     "apply_focus",
     # Exceptions
@@ -148,7 +153,6 @@ __all__ = [
     "ConfigError",
     "PluginError",
     "SkillError",
-    "WorkflowError",
     "TransientError",
     "RetryableError",
     "PermanentError",

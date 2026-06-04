@@ -37,6 +37,7 @@ pytest.importorskip(
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
 from daita.core.graph import LocalGraphBackend
+from daita.plugins.base import PluginContext
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.github import GitHubScanner as GitHubDiscoverer
 
@@ -52,6 +53,16 @@ def _resolve_targets() -> tuple[list[str], str | None]:
     org = os.environ.get("DAITA_TEST_GITHUB_ORG", "").strip() or None
     repos = [r.strip() for r in repos_raw.split(",") if r.strip()]
     return repos, org
+
+
+async def _setup_catalog(plugin: CatalogPlugin, agent_id: str) -> None:
+    await plugin.setup(
+        PluginContext(
+            runtime_id=agent_id,
+            runtime_kind="agent",
+            agent_id=agent_id,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +94,7 @@ async def plugin_with_github(tmp_path, monkeypatch, github_discoverer):
     backend = LocalGraphBackend(graph_type="catalog_github_live")
     plugin = CatalogPlugin(backend=backend, auto_persist=False)
     plugin.add_discoverer(github_discoverer)
-    plugin.initialize("catalog-github-live")
+    await _setup_catalog(plugin, "catalog-github-live")
     return plugin, backend
 
 

@@ -45,12 +45,12 @@ class TestMockGenerate:
         assert "analyze" in result.lower() or "insights" in result.lower()
 
     async def test_generate_with_tools_returns_dict(self):
-        from daita.core.tools import AgentTool
+        from daita.core.tools import LocalTool
 
         async def h(args):
             return "ok"
 
-        t = AgentTool(name="t", description="T", parameters={}, handler=h)
+        t = LocalTool(name="t", description="T", parameters={}, handler=h)
         mock = MockLLMProvider(delay=0)
         # _generate_impl is called via generate() after tool conversion
         result = await mock._generate_impl(

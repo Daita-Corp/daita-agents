@@ -15,8 +15,11 @@ from typing import (
     Callable,
     Dict,
     Any,
+    Iterable,
     List,
+    Mapping,
     Optional,
+    Tuple,
     Awaitable,
     Union,
     Literal,
@@ -246,15 +249,29 @@ def _make_async_handler(func: Callable) -> Callable[[Dict[str, Any]], Awaitable[
 def tool(
     func: Optional[Callable] = None,
     *,
+    id: Optional[str] = None,
     name: Optional[str] = None,
     description: Optional[str] = None,
+    output_evidence: Optional[Union[str, Iterable[str]]] = None,
+    access: Any = None,
+    risk: Any = None,
+    domains: Iterable[str] = ("chat",),
+    operation_types: Iterable[str] = ("chat.tool_call",),
+    model_visible: bool = True,
+    runtime_only: bool = False,
+    specialist_only: bool = False,
     timeout_seconds: Optional[int] = None,
     category: Optional[str] = None,
     focus: Optional[str] = None,
+    retry_safe: bool = False,
+    replay_safe: bool = False,
+    idempotent: bool = False,
+    side_effecting: bool = True,
+    metadata: Optional[Mapping[str, Any]] = None,
     **kwargs,
-) -> Union["AgentTool", Callable]:
+) -> Union["LocalTool", Callable]:
     """
-    Convert a function into an AgentTool.
+    Convert a function into an LocalTool.
     Works as both decorator and function call.
 
     Automatically extracts parameter schema from type hints and docstring.
@@ -282,29 +299,50 @@ def tool(
         category: Tool category for organization
         focus: Focus DSL expression applied to this tool's results by default.
                Can be overridden per-agent via Agent(focus={...}).
-        **kwargs: Additional AgentTool fields
+        **kwargs: Additional LocalTool fields
 
     Returns:
-        AgentTool instance or decorator function
+        LocalTool instance or decorator function
     """
 
-    def create_tool(f: Callable) -> "AgentTool":
+    def create_tool(f: Callable) -> "LocalTool":
         tool_name = name or f.__name__
+        capability_id = id or f"agent.local.{tool_name}"
         tool_description = (
             description or (f.__doc__ or f"Execute {tool_name}").strip().split("\n")[0]
         )
         tool_parameters = _extract_parameters_from_function(f)
         handler = _make_async_handler(f)
+        if output_evidence is None:
+            evidence_kinds = (f"{capability_id}.result",)
+        elif isinstance(output_evidence, str):
+            evidence_kinds = (output_evidence,)
+        else:
+            evidence_kinds = tuple(output_evidence)
 
-        return AgentTool(
+        return LocalTool(
             name=tool_name,
             description=tool_description,
             parameters=tool_parameters,
             handler=handler,
+            capability_ids=(capability_id,),
+            output_evidence=evidence_kinds,
+            access=access,
+            risk=risk,
+            domains=tuple(domains),
+            operation_types=tuple(operation_types),
+            model_visible=model_visible,
+            runtime_only=runtime_only,
+            specialist_only=specialist_only,
             timeout_seconds=timeout_seconds,
             category=category,
             focus=focus,
             source="custom",
+            retry_safe=retry_safe,
+            replay_safe=replay_safe,
+            idempotent=idempotent,
+            side_effecting=side_effecting,
+            metadata=dict(metadata or {}),
             **kwargs,
         )
 
@@ -317,7 +355,7 @@ def tool(
 
 
 @dataclass
-class AgentTool:
+class LocalTool:
     """
     Universal tool definition for agent-LLM integration.
 
@@ -326,7 +364,7 @@ class AgentTool:
 
     Example:
         ```python
-        tool = AgentTool(
+        tool = LocalTool(
             name="search_database",
             description="Search for records in the database",
             parameters={
@@ -351,6 +389,16 @@ class AgentTool:
     category: Optional[str] = None  # "database", "storage", "api", etc
     source: str = "custom"  # "plugin", "mcp", "custom"
     plugin_name: Optional[str] = None  # Which plugin provides this tool
+    capability_ids: Tuple[str, ...] = ()  # Runtime capability ids this tool exposes
+    output_evidence: Tuple[str, ...] = ()
+    access: Any = None
+    risk: Any = None
+    domains: Tuple[str, ...] = ("chat",)
+    operation_types: Tuple[str, ...] = ("chat.tool_call",)
+    model_visible: bool = True
+    runtime_only: bool = False
+    specialist_only: bool = False
+    metadata: Dict[str, Any] = None
 
     # Safety features
     timeout_seconds: Optional[int] = None  # Execution timeout
@@ -362,6 +410,10 @@ class AgentTool:
     # Focus DSL — applied to this tool's results before the LLM sees them.
     # Can be overridden per-agent via Agent(focus={"tool_name": "..."}).
     focus: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.metadata is None:
+            self.metadata = {}
 
     def to_openai_function(self) -> Dict[str, Any]:
         """
@@ -455,16 +507,16 @@ class AgentTool:
             return await self.handler(arguments)
 
     @classmethod
-    def from_mcp_tool(cls, mcp_tool, mcp_registry) -> "AgentTool":
+    def from_mcp_tool(cls, mcp_tool, mcp_registry) -> "LocalTool":
         """
-        Create AgentTool from an MCP tool.
+        Create LocalTool from an MCP tool.
 
         Args:
             mcp_tool: MCPTool instance from MCP plugin
             mcp_registry: MCPToolRegistry for routing calls
 
         Returns:
-            AgentTool instance that wraps the MCP tool
+            LocalTool instance that wraps the MCP tool
         """
 
         # Create handler that routes to MCP registry
@@ -481,7 +533,7 @@ class AgentTool:
         )
 
 
-class ToolRegistry:
+class LocalToolCatalog:
     """
     Registry for managing tools from multiple sources.
 
@@ -491,15 +543,15 @@ class ToolRegistry:
 
     def __init__(self):
         """Initialize empty tool registry"""
-        self.tools: List[AgentTool] = []
-        self._tool_map: Dict[str, AgentTool] = {}
+        self.tools: List[LocalTool] = []
+        self._tool_map: Dict[str, LocalTool] = {}
 
-    def register(self, tool: AgentTool) -> None:
+    def register(self, tool: LocalTool) -> None:
         """
         Register a tool.
 
         Args:
-            tool: AgentTool to register
+            tool: LocalTool to register
         """
         if tool.name in self._tool_map:
             logger.warning(
@@ -515,12 +567,12 @@ class ToolRegistry:
 
         logger.debug(f"Registered tool: {tool.name} (source: {tool.source})")
 
-    def register_many(self, tools: List[AgentTool]) -> None:
+    def register_many(self, tools: List[LocalTool]) -> None:
         """
         Register multiple tools at once.
 
         Args:
-            tools: List of AgentTool instances
+            tools: List of LocalTool instances
         """
         for tool in tools:
             self.register(tool)
@@ -542,7 +594,7 @@ class ToolRegistry:
         logger.debug(f"Unregistered tool: {name}")
         return True
 
-    def get(self, name: str) -> Optional[AgentTool]:
+    def get(self, name: str) -> Optional[LocalTool]:
         """
         Get tool by name.
 
@@ -550,7 +602,7 @@ class ToolRegistry:
             name: Tool name
 
         Returns:
-            AgentTool instance or None if not found
+            LocalTool instance or None if not found
         """
         return self._tool_map.get(name)
 

@@ -13,10 +13,10 @@ from uuid import UUID
 from ...core.tracing import TraceType
 
 if TYPE_CHECKING:
-    from ...core.tools import AgentTool
+    from ...core.tools import LocalTool
 
 
-async def execute_tool_call(tool_call: Dict[str, Any], tools: List["AgentTool"]) -> Any:
+async def execute_tool_call(tool_call: Dict[str, Any], tools: List["LocalTool"]) -> Any:
     """Execute a single tool call with timeout and error handling."""
     tool_name = tool_call["name"]
     arguments = tool_call["arguments"]
@@ -38,7 +38,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], tools: List["AgentTool"])
 async def execute_and_track_tool(
     agent,
     tool_call: Dict[str, Any],
-    tools: List["AgentTool"],
+    tools: List["LocalTool"],
     on_event: Optional[Any],
 ) -> Dict[str, Any]:
     """Execute a tool, trace it, record agent history, and emit a result event."""
@@ -76,6 +76,7 @@ async def execute_and_track_tool(
             "arguments": tool_call["arguments"],
             "result": result,
             "duration_ms": duration_ms,
+            "capability_ids": tuple(getattr(tool, "capability_ids", ()) or ()),
             "retry_safe": bool(getattr(tool, "retry_safe", False)),
             "replay_safe": bool(getattr(tool, "replay_safe", False)),
             "idempotent": bool(getattr(tool, "idempotent", False)),
@@ -90,16 +91,12 @@ def append_tool_messages(
     conversation.append({"role": "assistant", "tool_calls": tool_calls})
 
     for tool_call, result in zip(tool_calls, results):
-        content_result = result["result"]
-        compactor = getattr(agent, "_compact_tool_result_for_context", None)
-        if callable(compactor):
-            content_result = compactor(tool_call["name"], content_result)
         conversation.append(
             {
                 "role": "tool",
                 "tool_call_id": tool_call["id"],
                 "name": tool_call["name"],
-                "content": json.dumps(content_result, default=json_serializer),
+                "content": json.dumps(result["result"], default=json_serializer),
             }
         )
 

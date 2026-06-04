@@ -22,9 +22,60 @@ collision-free across multiple data sources in a single CatalogPlugin.
 
 import json
 import logging
+import hashlib
 from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+
+def catalog_profile_key(source: Any, *, db_schema: Optional[str] = None) -> str:
+    """Compute a stable profile key for a source, stripping credentials."""
+    if isinstance(source, str):
+        try:
+            parsed = urlparse(source)
+            clean = parsed._replace(
+                netloc=(
+                    f"{parsed.hostname or ''}"
+                    f"{(':' + str(parsed.port)) if parsed.port else ''}"
+                )
+            )
+            key_text = clean.geturl()
+        except Exception:
+            key_text = source
+    else:
+        cls_name = type(source).__name__
+        attrs = ":".join(
+            str(getattr(source, attr, ""))
+            for attr in (
+                "host",
+                "port",
+                "database_name",
+                "database",
+                "path",
+                "connection_string",
+            )
+        )
+        key_text = f"{cls_name}:{attrs}"
+
+    if db_schema:
+        key_text = f"{key_text}|schema={db_schema}"
+    return hashlib.sha256(key_text.encode()).hexdigest()[:16]
+
+
+def load_schema_snapshot(
+    profile_key: str,
+    *,
+    catalog_keys: Optional[list[str]] = None,
+    ttl: Optional[float] = None,
+) -> tuple[Dict[str, Any], bool] | None:
+    """Load a persisted catalog schema profile and report whether it is stale."""
+    profile = _load_schema_snapshot(profile_key, catalog_keys=catalog_keys)
+    if profile is None:
+        return None
+    return profile, _is_expired(profile, ttl)
 
 
 async def persist_schema(
@@ -36,7 +87,7 @@ async def persist_schema(
     """Persist schema to the catalog store and graph backend.
 
     Storage selection (in priority order):
-    1. catalog_backend — set during initialize() when DAITA_CATALOG_BACKEND_CLASS
+    1. catalog_backend — set during setup() when DAITA_CATALOG_BACKEND_CLASS
        is present. Used in cloud deployments. Falls through to local JSON on failure.
     2. Local .daita/catalog.json — default for local development.
 
@@ -108,6 +159,62 @@ async def persist_schema(
             schema["graph_persist_error"] = str(graph_err)
 
     return persisted
+
+
+def _load_schema_snapshot(
+    profile_key: str,
+    *,
+    catalog_keys: Optional[list[str]],
+) -> Dict[str, Any] | None:
+    catalog_path = Path(".daita") / "catalog.json"
+    if not catalog_path.exists():
+        return None
+
+    try:
+        catalog = json.loads(catalog_path.read_text())
+    except Exception as exc:
+        logger.debug("Failed to load catalog profile %s: %s", catalog_path, exc)
+        return None
+
+    if not isinstance(catalog, dict):
+        return None
+
+    for key in (profile_key, *(catalog_keys or [])):
+        profile = catalog.get(key)
+        if isinstance(profile, dict) and isinstance(profile.get("tables"), list):
+            return profile
+
+    for profile in catalog.values():
+        if not isinstance(profile, dict) or not isinstance(profile.get("tables"), list):
+            continue
+        metadata = profile.get("metadata") or {}
+        if profile.get("profile_key") == profile_key:
+            return profile
+        if isinstance(metadata, dict) and metadata.get("profile_key") == profile_key:
+            return profile
+    return None
+
+
+def _is_expired(profile: Dict[str, Any], ttl: Optional[float]) -> bool:
+    if ttl is None:
+        return False
+    if ttl <= 0:
+        return True
+
+    timestamp = (
+        profile.get("last_seen")
+        or profile.get("profiled_at")
+        or profile.get("first_seen")
+    )
+    if not timestamp:
+        return True
+    try:
+        seen_at = datetime.fromisoformat(str(timestamp))
+    except ValueError:
+        return True
+    if seen_at.tzinfo is None:
+        seen_at = seen_at.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - seen_at).total_seconds() > ttl
 
 
 async def persist_schema_to_graph(

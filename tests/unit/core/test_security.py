@@ -10,7 +10,7 @@ Covers:
 - _normalize_sql: trailing semicolon stripping (LLM-appended semicolons)
 - _json_serializer: private attribute filtering prevents credential leakage
 - on_webhook: instruction string truncated at 2000 chars
-- receive_message: payload is JSON-encoded (structural containment)
+- input framing: payload is JSON-encoded (structural containment)
 """
 
 import json
@@ -251,11 +251,11 @@ class TestWebhookInstructionTruncation:
 
 
 # ---------------------------------------------------------------------------
-# receive_message — payload structural containment via JSON encoding
+# Input framing — payload structural containment via JSON encoding
 # ---------------------------------------------------------------------------
 
 
-class TestReceiveMessagePayloadContainment:
+class TestInputPayloadContainment:
     def test_dict_payload_is_json_encoded(self):
         """
         The payload is json.dumps'd before framing.

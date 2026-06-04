@@ -15,6 +15,7 @@ Requirements:
 """
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -64,24 +65,19 @@ def check_environment():
 
 
 DEMO_QUESTIONS = [
-    # Q1: Discover + batch-store in memory (tests batch remember, categories)
-    "Discover all our data stores. Batch-store each discovery in memory with "
-    "category='store' and appropriate importance (0.8 for production, 0.6 for "
-    "staging, 0.4 for dev). Then give me a summary grouped by environment.",
-    # Q2: Query from memory without re-scanning (tests recall, list_by_category)
-    "What production databases do we have? Check memory first — don't re-scan "
-    "unless memory is empty. Show me their types and regions.",
-    # Q3: Store an org rule + check memory stats (tests pinned rules, stats)
-    "Remember this org rule: 'All production databases must have encryption "
-    "enabled and automated backups configured.' Store it with importance=0.9 "
-    "and category='rule'. Then show me memory stats (list_memories with "
-    "include_stats=True) so I can see what we've cataloged.",
-    # Q4: Temporal query (tests since/before filtering)
-    "What infrastructure discoveries have been made in the last 24 hours? "
-    "Use recall with since='24h'.",
-    # Q5: Cross-reference memory (tests recall + list_by_category together)
+    # Q1: Summarize runtime discovery inventory.
+    "Summarize the runtime discovery inventory below. Group stores by "
+    "environment when possible.",
+    # Q2: Ask for a production-focused view over the same inventory/catalog.
+    "What production databases do we have? Show me their types and regions.",
+    # Q3: Ask for governance-oriented interpretation.
+    "Which discovered stores should we inspect first for encryption and backup "
+    "posture? Be concise and explain why.",
+    # Q4: Ask for source attribution.
+    "Which stores came from GitHub discoveries versus cloud inventory?",
+    # Q5: Ask for credential-risk review.
     "Are there any stores discovered from GitHub that look like they might "
-    "have real credentials? Cross-reference with our stored rules.",
+    "have real credentials? Highlight only safe display names and store IDs.",
 ]
 
 
@@ -95,7 +91,7 @@ async def ask(agent, question: str) -> tuple:
 
 
 async def run_demo():
-    from agents.catalog_agent import create_agent
+    from agents.catalog_agent import create_agent, discover_infrastructure
 
     print("=" * 65)
     print("INFRASTRUCTURE CATALOG AGENT")
@@ -116,7 +112,13 @@ async def run_demo():
     start = time.time()
 
     try:
+        discovery_inventory = await discover_infrastructure(agent)
         for i, question in enumerate(DEMO_QUESTIONS, 1):
+            if i == 1:
+                question = (
+                    f"{question}\n\nDiscovery inventory JSON:\n"
+                    f"{json.dumps(discovery_inventory, default=str)}"
+                )
             print(f"\nQ{i}: {question}")
             print("-" * 50)
             answer, ms, cost = await ask(agent, question)
@@ -133,13 +135,18 @@ async def run_demo():
 
 
 async def run_single(question: str):
-    from agents.catalog_agent import create_agent
+    from agents.catalog_agent import create_agent, discover_infrastructure
 
     agent = create_agent()
     await agent.start()
 
     try:
-        answer, ms, cost = await ask(agent, question)
+        discovery_inventory = await discover_infrastructure(agent)
+        question_with_inventory = (
+            f"{question}\n\nRuntime discovery inventory JSON:\n"
+            f"{json.dumps(discovery_inventory, default=str)}"
+        )
+        answer, ms, cost = await ask(agent, question_with_inventory)
         print(answer)
         print(f"\n[{ms:.0f}ms  ${cost:.4f}]")
     finally:

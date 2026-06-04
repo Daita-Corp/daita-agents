@@ -11,7 +11,7 @@ from typing import Any, Dict, List
 import pytest
 
 from daita.agents.agent import Agent
-from daita.core.tools import AgentTool
+from daita.core.tools import LocalTool
 from daita.llm.mock import MockLLMProvider
 
 # ---------------------------------------------------------------------------
@@ -99,12 +99,12 @@ def mock_llm_with_tool_call():
 
 @pytest.fixture
 def simple_tool():
-    """AgentTool that adds two integers (async handler)."""
+    """LocalTool that adds two integers (async handler)."""
 
     async def _add(args: Dict[str, Any]) -> int:
         return args["a"] + args["b"]
 
-    return AgentTool(
+    return LocalTool(
         name="add",
         description="Add two integers",
         parameters={
@@ -121,13 +121,13 @@ def simple_tool():
 
 @pytest.fixture
 def async_tool():
-    """AgentTool wrapping a trivially async handler."""
+    """LocalTool wrapping a trivially async handler."""
 
     async def _async_op(args: Dict[str, Any]) -> str:
         await asyncio.sleep(0)
         return f"async result: {args.get('value', 'none')}"
 
-    return AgentTool(
+    return LocalTool(
         name="async_op",
         description="An async operation",
         parameters={

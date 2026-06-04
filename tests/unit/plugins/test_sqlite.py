@@ -6,6 +6,7 @@ All tests use :memory: databases — no files, no external services required.
 
 import pytest
 from daita.plugins.sqlite import SQLitePlugin, sqlite
+from tests.unit.plugins.projection_helpers import projected_tool_names
 
 SCHEMA = """
 CREATE TABLE users (
@@ -182,18 +183,17 @@ async def test_pragma_write(db):
 
 
 # ---------------------------------------------------------------------------
-# Agent tools
+# Projected Agent tools
 # ---------------------------------------------------------------------------
 
 
-async def test_get_tools_returns_correct_tools(db):
-    tools = db.get_tools()
-    names = [t.name for t in tools]
+async def test_projected_tools_return_correct_tools(db):
+    names = projected_tool_names(db)
     assert "sqlite_query" in names
-    assert "sqlite_execute" in names
     assert "sqlite_inspect" in names
-    assert "sqlite_count" in names
-    assert "sqlite_sample" in names
+    assert "db.sql.execute_write" in {
+        capability.id for capability in db.declare_capabilities()
+    }
     # list_tables and get_schema removed from default tools
     assert "sqlite_list_tables" not in names
     assert "sqlite_get_schema" not in names

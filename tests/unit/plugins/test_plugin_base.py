@@ -1,199 +1,200 @@
-"""
-Unit tests for daita/plugins/base.py (BasePlugin contract).
+from dataclasses import dataclass
 
-Verifies the default behaviour of BasePlugin and that subclasses can
-correctly extend it to expose tools.
-"""
-
-import pytest
-
-from daita.core.tools import AgentTool
-from daita.plugins.base import BasePlugin, LifecyclePlugin
-
-# ===========================================================================
-# Helpers — concrete subclasses
-# ===========================================================================
-
-
-class NoToolPlugin(BasePlugin):
-    """Minimal plugin: does not override anything."""
-
-    pass
-
-
-class SingleToolPlugin(BasePlugin):
-    """Plugin that exposes exactly one tool."""
-
-    def get_tools(self):
-        async def h(args):
-            return "ok"
-
-        return [
-            AgentTool(
-                name="do_thing",
-                description="Does a thing",
-                parameters={},
-                handler=h,
-            )
-        ]
+import daita
+import daita.plugins as plugins
+from daita.plugins import (
+    BasePlugin,
+    ConnectorPlugin,
+    DomainServicePlugin,
+    EmptySecretProvider,
+    ObservabilityPlugin,
+    PluginContext,
+    PluginKind,
+    PluginManifest,
+    RuntimeExtensionPlugin,
+    SecretProvider,
+    ServiceRegistry,
+    SkillPlugin,
+    WorkerProviderPlugin,
+)
+import daita.plugins.base as plugin_base
+from daita.plugins.registry import ExtensionRegistry, RegistryDiagnostic
+from daita.runtime import AccessMode, Capability, RiskLevel
 
 
-class MultiToolPlugin(BasePlugin):
-    """Plugin that exposes multiple tools."""
-
-    def get_tools(self):
-        async def h(args):
-            return "ok"
-
-        return [
-            AgentTool(name="tool_1", description="T1", parameters={}, handler=h),
-            AgentTool(name="tool_2", description="T2", parameters={}, handler=h),
-            AgentTool(name="tool_3", description="T3", parameters={}, handler=h),
-        ]
+class MinimalRuntimeExtension(RuntimeExtensionPlugin):
+    manifest = PluginManifest(
+        id="minimal_runtime",
+        display_name="Minimal Runtime",
+        version="1.0.0",
+        kind=PluginKind.RUNTIME_EXTENSION,
+    )
 
 
-class InitCapturingPlugin(BasePlugin):
-    """Plugin that records the agent_id it receives during initialize()."""
+class CapturingDomainService(DomainServicePlugin):
+    manifest = PluginManifest(
+        id="catalog",
+        display_name="Catalog",
+        version="2.0.0",
+        kind=PluginKind.DOMAIN_SERVICE,
+        domains=frozenset({"db"}),
+    )
 
     def __init__(self):
-        self.received_agent_id = None
+        self.context = None
+        self.teardown_called = False
 
-    def initialize(self, agent_id: str):
-        self.received_agent_id = agent_id
+    async def setup(self, context: PluginContext) -> None:
+        self.context = context
 
+    async def teardown(self) -> None:
+        self.teardown_called = True
 
-# ===========================================================================
-# BasePlugin defaults
-# ===========================================================================
-
-
-class TestBasePluginDefaults:
-    def test_get_tools_returns_empty_list(self):
-        plugin = NoToolPlugin()
-        assert plugin.get_tools() == []
-
-    def test_has_tools_false_when_no_tools(self):
-        plugin = NoToolPlugin()
-        assert plugin.has_tools is False
-
-    def test_initialize_is_callable_without_error(self):
-        plugin = NoToolPlugin()
-        plugin.initialize(agent_id="agent-xyz")  # Should not raise
-
-    def test_initialize_is_no_op_on_base(self):
-        plugin = NoToolPlugin()
-        result = plugin.initialize(agent_id="ignored")
-        assert result is None  # No return value
+    def declare_capabilities(self):
+        return (
+            Capability(
+                id="catalog.schema.search",
+                owner="catalog",
+                description="Search catalog schema.",
+                domains=frozenset({"db"}),
+                operation_types=frozenset({"schema.query"}),
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.LOW,
+                input_schema={"type": "object"},
+                output_evidence=frozenset({"schema.search_result"}),
+                executor="catalog.schema.search",
+                side_effecting=False,
+            ),
+        )
 
 
-# ===========================================================================
-# Subclass with tools
-# ===========================================================================
-
-
-class TestPluginWithTools:
-    def test_has_tools_true_when_get_tools_nonempty(self):
-        plugin = SingleToolPlugin()
-        assert plugin.has_tools is True
-
-    def test_get_tools_returns_agent_tool_instances(self):
-        plugin = SingleToolPlugin()
-        tools = plugin.get_tools()
-        assert all(isinstance(t, AgentTool) for t in tools)
-
-    def test_get_tools_count_matches_exposed(self):
-        plugin = MultiToolPlugin()
-        assert len(plugin.get_tools()) == 3
-
-    def test_tool_names_are_strings(self):
-        plugin = SingleToolPlugin()
-        tool = plugin.get_tools()[0]
-        assert isinstance(tool.name, str)
-        assert tool.name == "do_thing"
-
-
-# ===========================================================================
-# initialize() with agent_id
-# ===========================================================================
-
-
-class TestPluginInitialize:
-    def test_initialize_receives_agent_id(self):
-        plugin = InitCapturingPlugin()
-        plugin.initialize(agent_id="test-agent-001")
-        assert plugin.received_agent_id == "test-agent-001"
-
-    def test_initialize_called_multiple_times_uses_last(self):
-        plugin = InitCapturingPlugin()
-        plugin.initialize(agent_id="first")
-        plugin.initialize(agent_id="second")
-        assert plugin.received_agent_id == "second"
-
-
-# ===========================================================================
-# LifecyclePlugin
-# ===========================================================================
-
-
-class ConcreteLifecyclePlugin(LifecyclePlugin):
-    """Minimal concrete LifecyclePlugin for testing default behaviour."""
-
-    pass
-
-
-class CustomLifecyclePlugin(LifecyclePlugin):
-    """LifecyclePlugin that records hook calls."""
+class ConcreteConnector(ConnectorPlugin):
+    manifest = PluginManifest(
+        id="sqlite",
+        display_name="SQLite",
+        version="1.0.0",
+        kind=PluginKind.CONNECTOR,
+        domains=frozenset({"db"}),
+    )
 
     def __init__(self):
-        self.before_run_prompts = []
-        self.stop_called = False
+        self.connected = False
 
-    async def on_before_run(self, prompt: str):
-        self.before_run_prompts.append(prompt)
-        return f"context for: {prompt}"
+    async def connect(self) -> None:
+        self.connected = True
 
-    async def on_agent_stop(self):
-        self.stop_called = True
+    async def disconnect(self) -> None:
+        self.connected = False
+
+    @property
+    def is_connected(self) -> bool:
+        return self.connected
 
 
-class TestLifecyclePlugin:
-    def test_is_subclass_of_base_plugin(self):
-        assert issubclass(LifecyclePlugin, BasePlugin)
+@dataclass(frozen=True)
+class RecordingSecretProvider:
+    value: str
 
-    def test_instance_is_base_plugin(self):
-        plugin = ConcreteLifecyclePlugin()
-        assert isinstance(plugin, BasePlugin)
+    def get_secret(self, name: str) -> str | None:
+        return self.value if name == "api_key" else None
 
-    def test_base_plugin_is_not_lifecycle_plugin(self):
-        plugin = NoToolPlugin()
-        assert not isinstance(plugin, LifecyclePlugin)
 
-    async def test_on_before_run_default_returns_none(self):
-        plugin = ConcreteLifecyclePlugin()
-        result = await plugin.on_before_run("some prompt")
-        assert result is None
+def test_base_plugin_declares_extension_first_noop_surfaces():
+    plugin = MinimalRuntimeExtension()
 
-    async def test_on_agent_stop_default_does_not_raise(self):
-        plugin = ConcreteLifecyclePlugin()
-        await plugin.on_agent_stop()  # Should not raise
+    assert plugin.declare_capabilities() == ()
+    assert plugin.get_executors() == ()
+    assert plugin.declare_policies() == ()
+    assert plugin.declare_evidence_schemas() == ()
+    assert plugin.get_context_providers() == ()
+    assert plugin.get_tool_views() == ()
+    assert plugin.get_workers() == ()
+    assert not hasattr(plugin, "initialize")
+    assert not hasattr(plugin, "get_tools")
 
-    async def test_on_before_run_override_called_with_prompt(self):
-        plugin = CustomLifecyclePlugin()
-        await plugin.on_before_run("hello")
-        assert plugin.before_run_prompts == ["hello"]
 
-    async def test_on_before_run_override_returns_context(self):
-        plugin = CustomLifecyclePlugin()
-        result = await plugin.on_before_run("test prompt")
-        assert result == "context for: test prompt"
+async def test_plugin_setup_receives_structured_context_and_teardown_runs():
+    services = ServiceRegistry({"catalog_backend": object()})
+    secrets = RecordingSecretProvider("secret-value")
+    context = PluginContext(
+        runtime_id="db-runtime-1",
+        runtime_kind="db",
+        agent_id="agent-1",
+        services=services,
+        config={"profile": "analyst"},
+        secrets=secrets,
+    )
+    plugin = CapturingDomainService()
 
-    async def test_on_agent_stop_override_called(self):
-        plugin = CustomLifecyclePlugin()
-        await plugin.on_agent_stop()
-        assert plugin.stop_called is True
+    await plugin.setup(context)
+    await plugin.teardown()
 
-    def test_lifecycle_plugin_still_exposes_tools(self):
-        """LifecyclePlugin inherits get_tools from BasePlugin."""
-        plugin = ConcreteLifecyclePlugin()
-        assert plugin.get_tools() == []
-        assert plugin.has_tools is False
+    assert plugin.context is context
+    assert plugin.context.services.require("catalog_backend") is services.require(
+        "catalog_backend"
+    )
+    assert plugin.context.config["profile"] == "analyst"
+    assert plugin.context.secrets.get_secret("api_key") == "secret-value"
+    assert plugin.teardown_called is True
+
+
+async def test_connector_plugin_owns_connection_lifecycle():
+    plugin = ConcreteConnector()
+
+    await plugin.connect()
+    assert plugin.is_connected is True
+
+    await plugin.disconnect()
+    assert plugin.is_connected is False
+
+
+def test_specialized_base_classes_carry_expected_plugin_kinds():
+    assert DomainServicePlugin.expected_kind is PluginKind.DOMAIN_SERVICE
+    assert RuntimeExtensionPlugin.expected_kind is PluginKind.RUNTIME_EXTENSION
+    assert WorkerProviderPlugin.expected_kind is PluginKind.WORKER_PROVIDER
+    assert ObservabilityPlugin.expected_kind is PluginKind.OBSERVABILITY
+    assert SkillPlugin.expected_kind is PluginKind.SKILL
+    assert ConcreteConnector.expected_kind is PluginKind.CONNECTOR
+
+
+def test_service_registry_and_empty_secret_provider_are_safe_defaults():
+    services = ServiceRegistry()
+    service = object()
+
+    services.register("runtime_store", service)
+
+    assert services.get("runtime_store") is service
+    assert services.get("missing", "fallback") == "fallback"
+    assert services.as_dict() == {"runtime_store": service}
+    assert EmptySecretProvider().get_secret("anything") is None
+
+
+def test_lifecycle_plugin_has_been_removed_from_plugin_surfaces():
+    assert not hasattr(plugin_base, "LifecyclePlugin")
+    assert "LifecyclePlugin" not in daita.__all__
+    assert not hasattr(daita, "LifecyclePlugin")
+    assert "LifecyclePlugin" not in plugins.__all__
+    assert not hasattr(plugins, "LifecyclePlugin")
+
+
+def test_extension_contracts_are_promoted_from_top_level_package():
+    exported = {
+        "ConnectorPlugin": ConnectorPlugin,
+        "DomainServicePlugin": DomainServicePlugin,
+        "EmptySecretProvider": EmptySecretProvider,
+        "ObservabilityPlugin": ObservabilityPlugin,
+        "PluginContext": PluginContext,
+        "PluginKind": PluginKind,
+        "PluginManifest": PluginManifest,
+        "RuntimeExtensionPlugin": RuntimeExtensionPlugin,
+        "SecretProvider": SecretProvider,
+        "ServiceRegistry": ServiceRegistry,
+        "SkillPlugin": SkillPlugin,
+        "WorkerProviderPlugin": WorkerProviderPlugin,
+        "ExtensionRegistry": ExtensionRegistry,
+        "RegistryDiagnostic": RegistryDiagnostic,
+    }
+
+    for name, value in exported.items():
+        assert name in daita.__all__
+        assert getattr(daita, name) is value

@@ -8,7 +8,11 @@ without making real HTTP connections.
 import json
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
+from daita.plugins.manifest import PluginKind
+from daita.plugins.registry import ExtensionRegistry
 from daita.plugins.rest import RESTPlugin
+from daita.runtime import Operation, Task
+from tests.unit.plugins.projection_helpers import projected_tools
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -20,6 +24,44 @@ def make_plugin():
     # Prevent any real connect() call
     plugin._session = MagicMock()
     return plugin
+
+
+def test_rest_plugin_declares_extension_first_contract():
+    plugin = make_plugin()
+    registry = ExtensionRegistry()
+
+    registry.register(plugin)
+
+    assert plugin.manifest.id == "rest"
+    assert plugin.manifest.kind is PluginKind.CONNECTOR
+    assert registry.plugin_ids == ("rest",)
+    assert {capability.id for capability in registry.capabilities} == {
+        "rest.http.get",
+        "rest.http.post",
+        "rest.http.put",
+        "rest.http.patch",
+        "rest.http.delete",
+    }
+    assert {view.name for view in registry.tool_views} == {
+        "http_get",
+        "http_post",
+        "http_put",
+        "http_patch",
+        "http_delete",
+    }
+    assert registry.evidence_schemas[0].kind == "api.http.response"
+
+
+def test_rest_projected_tools_carry_declared_capability_metadata():
+    plugin = make_plugin()
+
+    by_name = projected_tools(plugin)
+
+    assert by_name["http_get"].capability_ids == ("rest.http.get",)
+    assert by_name["http_get"].side_effecting is False
+    assert by_name["http_get"].idempotent is True
+    assert by_name["http_post"].capability_ids == ("rest.http.post",)
+    assert by_name["http_post"].side_effecting is True
 
 
 class MockResponse:
@@ -66,6 +108,38 @@ async def test_small_json_returns_parsed_object():
 
     assert result["data"] == {"users": [{"id": 1}, {"id": 2}]}
     assert "truncated" not in result
+
+
+async def test_rest_executor_returns_typed_http_response_evidence():
+    plugin = make_plugin()
+    body = json.dumps({"users": [{"id": 1}]})
+    _patch_session(plugin, MockResponse(body=body))
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+
+    executor = registry.get_executor("rest.http")
+    operation = Operation(id="op-1", operation_type="api.http.read")
+    task = Task(
+        id="task-1",
+        operation_id=operation.id,
+        capability_id="rest.http.get",
+        executor_id="rest.http",
+        input={"endpoint": "/users"},
+        required_evidence=frozenset({"api.http.response"}),
+    )
+
+    evidence = await executor.execute(
+        task,
+        operation,
+        {"tool_view": {"name": "http_get"}},
+    )
+
+    assert len(evidence) == 1
+    assert evidence[0].kind == "api.http.response"
+    assert evidence[0].owner == "rest"
+    assert evidence[0].payload["method"] == "GET"
+    assert evidence[0].payload["endpoint"] == "/users"
+    assert evidence[0].payload["response"]["data"] == {"users": [{"id": 1}]}
 
 
 async def test_large_json_truncates_without_raising():

@@ -21,41 +21,13 @@ def make_result_fingerprint(tool_call: Dict[str, Any], result: Dict[str, Any]) -
     tool_name = str(tool_call.get("name") or "")
     payload = {
         "tool": tool_name,
-        "arguments": _result_fingerprint_arguments(tool_name, tool_call),
-        "result": _result_fingerprint_result(tool_name, result.get("result")),
+        "arguments": tool_call.get("arguments", {}),
+        "result": result.get("result"),
     }
     result_hash = hashlib.md5(
         json.dumps(payload, sort_keys=True, default=str).encode()
     ).hexdigest()[:12]
     return f"{tool_call.get('name')}:{result_hash}"
-
-
-def _result_fingerprint_arguments(
-    tool_name: str, tool_call: Dict[str, Any]
-) -> Dict[str, Any]:
-    arguments = tool_call.get("arguments", {})
-    if tool_name == "db_plan_query" and isinstance(arguments, dict):
-        return {
-            key: value
-            for key, value in arguments.items()
-            if key not in {"include_diagnostics", "debug"}
-        }
-    return arguments
-
-
-def _result_fingerprint_result(tool_name: str, raw: Any) -> Any:
-    if tool_name == "db_plan_query" and isinstance(raw, dict):
-        return {
-            "ok": raw.get("ok"),
-            "route": raw.get("route"),
-            "compiled_sql": raw.get("compiled_sql"),
-            "validation_ok": bool((raw.get("validation") or {}).get("ok")),
-            "suggested_next_tool": raw.get("suggested_next_tool"),
-            "resolved_tables": raw.get("resolved_tables"),
-            "unknown_tables": raw.get("unknown_tables"),
-            "ambiguous_tables": raw.get("ambiguous_tables"),
-        }
-    return raw
 
 
 def has_terminal_tool_result(
@@ -111,7 +83,7 @@ class ToolCallGuardrails:
         """Record a tool result and return guidance or a hard stop when needed."""
         raw = result.get("result", {})
         fingerprint = _domain_retry_fingerprint(
-            run_state, tool_call, raw, kind="error"
+            run_state, tool_call, raw, kind="error", tool_result=result
         ) or make_error_fingerprint(tool_call)
         loop_error = tool_loop_error_message(raw)
         if loop_error:
@@ -143,7 +115,7 @@ class ToolCallGuardrails:
         run_state.failed_tool_fingerprints.pop(fingerprint, None)
 
         result_fingerprint = _domain_retry_fingerprint(
-            run_state, tool_call, raw, kind="result"
+            run_state, tool_call, raw, kind="result", tool_result=result
         ) or make_result_fingerprint(tool_call, result)
         count = run_state.repeated_result_fingerprints.get(result_fingerprint, 0) + 1
         run_state.repeated_result_fingerprints[result_fingerprint] = count
@@ -195,13 +167,23 @@ def _guardrail_payload(
 
 
 def _domain_retry_fingerprint(
-    run_state: Any, tool_call: Dict[str, Any], raw_result: Any, *, kind: str
+    run_state: Any,
+    tool_call: Dict[str, Any],
+    raw_result: Any,
+    *,
+    kind: str,
+    tool_result: Dict[str, Any] | None = None,
 ) -> Optional[str]:
     for domain_state in getattr(run_state, "domains", {}).values():
         callback = getattr(domain_state, "tool_retry_fingerprint", None)
         if not callable(callback):
             continue
-        fingerprint = callback(tool_call, raw_result, kind=kind)
+        try:
+            fingerprint = callback(
+                tool_call, raw_result, kind=kind, tool_result=tool_result
+            )
+        except TypeError:
+            fingerprint = callback(tool_call, raw_result, kind=kind)
         if fingerprint:
             return str(fingerprint)
     return None

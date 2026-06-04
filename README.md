@@ -4,27 +4,25 @@
 
 Daita Agents is built for AI systems that operate on real data: databases, schemas, catalogs, pipelines, metrics, files, APIs, and memory. It gives agents the context and guardrails they need to inspect data sources, generate safe queries, validate results, monitor changes, trace execution, and remember business context across runs.
 
-The framework still supports general tool-calling agents, multiple LLM providers, streaming, skills, and workflows. Its center of gravity, though, is data operations: `Agent.from_db()`, catalog discovery, governed query tools, graph-backed lineage, data quality assertions, watches, memory, and tracing.
-
 ```mermaid
 flowchart LR
     Source["Database or data source"] --> DB["Database plugin<br/>connect, policy, schema discovery"]
-    DB --> Catalog["Catalog<br/>register normalized schema<br/>schema lookup tools"]
-    Catalog --> Prompt["Schema-aware prompt<br/>catalog navigation context"]
-    Prompt --> Agent["Data agent<br/>LLM + registered tools"]
+    DB --> Catalog["Catalog<br/>normalized schema snapshots<br/>schema lookup capabilities"]
+    Catalog --> Runtime["DbRuntime<br/>typed contracts + evidence"]
+    Runtime --> Agent["DbAgent<br/>run, stream, inspect"]
 
     Catalog -.->|"persisted schema nodes"| Graph["Core graph<br/>schema, lineage, impact"]
     Lineage["Lineage plugin<br/>(optional)"] -.-> Graph
-    Memory["Memory plugin<br/>(optional)"] -.->|"business context + DB memory tools"| Agent
+    Memory["Memory plugin<br/>(optional)"] -.->|"business context evidence"| Runtime
 
-    Agent --> Query["Governed DB query tools<br/>plan, validate, query, sample"]
-    Agent --> Analyst["Analyst toolkit<br/>pivot, correlate, anomalies, forecast"]
-    Agent -.->|"quality enabled"| Quality["Data quality tools<br/>assertions + violations"]
-    Agent -.->|"lineage / graph tools"| Graph
+    Runtime --> Query["Governed DB operations<br/>plan, validate, query, sample"]
+    Runtime --> Analyst["Analyst operations<br/>pivot, correlate, anomalies, forecast"]
+    Runtime -.->|"quality enabled"| Quality["Data quality evidence<br/>assertions + violations"]
+    Runtime -.->|"lineage / graph evidence"| Graph
     Agent -.->|"agent watch"| Watch["Watches<br/>poll sources and trigger handlers"]
     Watch -.->|"trigger handler"| Agent
 
-    Agent --> Tracing["Tracing + DB audit log<br/>runs, LLM calls, tools, retries, cost"]
+    Runtime --> Tracing["Tracing + DB audit log<br/>runs, LLM calls, capability execution, retries, cost"]
     Query --> Tracing
     Analyst --> Tracing
     Quality --> Tracing
@@ -61,21 +59,21 @@ async def main():
 asyncio.run(main())
 ```
 
-`Agent.from_db()` inspects the schema, registers catalog-backed tools, and composes a governed data-agent prompt — no manual configuration needed.
+`Agent.from_db()` builds a `DbAgent` backed by `DbRuntime`, catalog-owned schema evidence, governed operation contracts, and runtime inspection/audit state — no manual configuration needed.
 
 ---
 
 ## Features
 
-- **Database-native agents** — `Agent.from_db()` connects to PostgreSQL, MySQL, MongoDB, SQLite, BigQuery, Snowflake, and more; discovers schema; builds a catalog-backed prompt; and registers governed query tools.
-- **Catalog and profiling** — `CatalogPlugin` discovers infrastructure, profiles stores, persists normalized schemas, compares live schemas against baselines, and exposes table/schema lookup tools.
+- **Database-native agents** — `Agent.from_db()` connects to PostgreSQL, MySQL, MongoDB, SQLite, BigQuery, Snowflake, and more; discovers schema through catalog-owned snapshots; and executes governed operation contracts.
+- **Catalog and profiling** — `CatalogPlugin` discovers infrastructure, profiles stores, persists normalized schemas, compares live schemas against baselines, and declares table/schema lookup capabilities with optional model-visible tool views.
 - **Governed query execution** — read-only defaults, table/column allowlists and blocklists, query limits, timeouts, result compaction, SQL validation, and audit logs are built into DB agents.
-- **Analyst toolkits** — DB agents can register higher-level data operations for pivots, correlations, anomaly detection, entity comparison, similarity search, and trend forecasting.
+- **Analyst operations** — DB agents can execute higher-level data operations for pivots, correlations, anomaly detection, entity comparison, similarity search, and trend forecasting.
 - **Data quality enforcement** — `ItemAssertion` + `query_checked()` validate every returned row and fail fast with structured `DataQualityError` violations.
 - **Graph-backed lineage and impact analysis** — the core graph layer models tables, columns, pipelines, APIs, files, metrics, queries, and transformations; expose traversal tools with `register_graph_tools()`.
 - **Data watches** — `@agent.watch()` monitors databases and APIs continuously, retries dropped connections, and triggers agent actions when thresholds are crossed or resolved.
 - **Data-aware memory** — persistent semantic memory, working memory, fact extraction, contradiction checks, and memory graphs let agents keep business context without stuffing every run into the prompt.
-- **Tracing and auditability** — OpenTelemetry-backed spans cover agent runs, LLM calls, tool executions, retries, plugin operations, latency, tokens, and cost, with optional OTLP export.
+- **Tracing and auditability** — OpenTelemetry-backed spans cover agent runs, LLM calls, capability and tool-view executions, retries, plugin operations, latency, tokens, and cost, with optional OTLP export.
 - **Plugin ecosystem** — databases, vector stores, catalogs, memory, data quality, lineage, cloud storage, APIs, messaging, MCP, and search integrations.
 - **Agent evals** — developer-preview suites check answers, tools, SQL shape, data operations, budgets, latency, plugin behavior, stability, baselines, and optional LLM judges.
 - **General agent foundations** — multi-provider LLM support, autonomous tool calling, `@tool`, skills, streaming, conversation history, workflows, retries, and the Focus DSL.
@@ -84,39 +82,38 @@ asyncio.run(main())
 
 ## Data Operations Architecture
 
-At runtime, a Daita data agent is built around a cataloged view of the data estate. The LLM is not handed a raw connection and left to improvise; it receives schema context, governed tools, compacted results, memory, tracing, and optional graph traversal.
+At runtime, a Daita data agent is built around a cataloged view of the data estate. The LLM is not handed a raw connection and left to improvise; `DbRuntime` plans against declared capabilities, verifies typed evidence, and only projects model-visible tool views when a chat loop needs them.
 
-| Layer | Where it lives | What it does |
-| ----- | -------------- | ------------ |
-| Database agent builder | `daita/agents/db` | Connects to a DB, profiles schema, builds prompts, registers query/analysis tools, attaches lineage, memory, history, and runtime audit wrappers |
-| Catalog | `daita/plugins/catalog` | Discovers infrastructure, profiles stores, normalizes schemas, persists catalog snapshots, compares schema drift, and exposes schema lookup tools |
-| Query and analysis operations | `daita/agents/db/query`, `daita/agents/db/tools` | Resolves intent, validates SQL/IR, executes governed queries, and adds analyst operations such as pivots, anomaly detection, correlation, comparison, similarity, and forecasting |
-| Graph and lineage | `daita/core/graph` | Stores tables, columns, services, files, queries, transformations, and lineage edges for impact analysis and graph traversal |
-| Assertions and quality | `daita/core/assertions.py`, `daita/plugins/data_quality.py` | Validates returned rows and structured datasets with fail-fast, inspectable violations |
-| Watches | `daita/core/watch.py` | Polls or streams data sources, handles retries, and triggers agent handlers when operational conditions activate |
-| Memory | `daita/plugins/memory` | Stores and recalls business facts, working context, extracted facts, contradiction checks, and memory graph relationships |
-| Tracing | `daita/core/tracing.py` | Captures agent runs, LLM calls, tool executions, plugin operations, retries, latency, tokens, and cost with OpenTelemetry-backed spans |
+| Layer                         | Where it lives                                              | What it does                                                                                                                                                                                                           |
+| ----------------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Database runtime              | `daita/db`                                                  | Builds `DbAgent` / `DbRuntime`, profiles schema through catalog-owned snapshots, plans typed operations, executes governed connector capabilities, and exposes runtime inspection, audit summaries, and typed evidence |
+| Catalog                       | `daita/plugins/catalog`                                     | Discovers infrastructure, profiles stores, normalizes schemas, persists catalog snapshots, compares schema drift, and declares schema lookup capabilities plus typed evidence                                          |
+| Query and analysis operations | `daita/db/query_*`, `daita/db/analyst_tools.py`             | Resolves intent, validates SQL/IR, executes governed queries, and adds analyst operations such as pivots, anomaly detection, correlation, comparison, similarity, and forecasting                                      |
+| Graph and lineage             | `daita/core/graph`                                          | Stores tables, columns, services, files, queries, transformations, and lineage edges for impact analysis and graph traversal                                                                                           |
+| Assertions and quality        | `daita/core/assertions.py`, `daita/plugins/data_quality.py` | Validates returned rows and structured datasets with fail-fast, inspectable violations                                                                                                                                 |
+| Watches                       | `daita/core/watch.py`                                       | Polls or streams data sources, handles retries, and triggers agent handlers when operational conditions activate                                                                                                       |
+| Memory                        | `daita/plugins/memory`                                      | Stores and recalls business facts, working context, extracted facts, contradiction checks, and memory graph relationships                                                                                              |
+| Tracing                       | `daita/core/tracing.py`                                     | Captures agent runs, LLM calls, capability/tool-view executions, plugin operations, retries, latency, tokens, and cost with OpenTelemetry-backed spans                                                                 |
 
 `Agent.from_db()` wires the main pieces together in one call:
 
 ```mermaid
 sequenceDiagram
     participant App
-    participant Builder as Agent.from_db()
+    participant Factory as daita.db.from_db()
+    participant Runtime as DbRuntime
     participant DB as Database plugin
     participant Catalog as CatalogPlugin
-    participant Agent as Agent
-    participant Runtime as DB runtime
 
-    App->>Builder: connection string or database plugin
-    Builder->>DB: connect and apply query policy
-    Builder->>DB: discover schema
-    Builder->>Catalog: register normalized schema
-    Builder->>Agent: create schema-aware data agent
-    Builder->>Agent: register query, analyst, catalog, optional quality tools
-    Builder->>Agent: attach optional lineage, memory, history
-    Builder->>Runtime: wrap run/stream with context, compaction, audit
-    App->>Agent: ask data questions or run data operations
+    App->>Factory: connection string or database plugin
+    Factory->>Runtime: create DB runtime with extension registry
+    Runtime->>DB: connect and apply query policy
+    Runtime->>Catalog: load fresh persisted schema snapshot
+    Runtime->>DB: refresh schema when cache is stale or missing
+    Runtime->>Catalog: persist normalized schema evidence
+    App->>Runtime: ask data questions or run data operations
+    Runtime->>DB: execute typed operation contract
+    Runtime->>App: return synthesized answer with inspection/audit evidence
 ```
 
 ---
@@ -125,7 +122,7 @@ sequenceDiagram
 
 ### Database agent with `Agent.from_db()`
 
-The fastest way to build a data agent. Pass a connection string or plugin instance and get a configured agent with schema-aware tools, a catalog-backed system prompt, result compaction, audit logging, and optional lineage/memory:
+The fastest way to build a data agent. Pass a connection string or plugin instance and get a configured runtime with schema-aware operation planning, catalog-backed evidence, result compaction, audit logging, and optional lineage/memory:
 
 ```python
 import asyncio
@@ -147,7 +144,7 @@ async def main():
 asyncio.run(main())
 ```
 
-You can also add a database plugin manually for more control:
+For generic chat agents, you can still add a database plugin manually and let the agent consume its model-visible tool views:
 
 ```python
 from daita import Agent

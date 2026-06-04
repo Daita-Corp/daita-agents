@@ -18,6 +18,7 @@ from daita.plugins.catalog.base_profiler import (
     NormalizedSchema,
     NormalizedTable,
 )
+from daita.plugins.base import PluginContext
 from daita.plugins.catalog import CatalogPlugin
 
 # ---------------------------------------------------------------------------
@@ -338,54 +339,59 @@ async def test_public_accessor_api():
     assert plugin.get_store("nonexistent") is None
 
 
-async def test_get_tools_returns_expected_set():
+async def test_catalog_exposes_registry_tool_views_not_legacy_agent_tools():
     plugin = CatalogPlugin()
-    tools = plugin.get_tools()
-    names = {t.name for t in tools}
+    views = plugin.get_tool_views()
+    names = {view.name for view in views}
+
+    assert not hasattr(plugin, "get_tools")
     assert names == {
-        "discover_infrastructure",
-        "discover_schema",
-        "profile_store",
-        "get_table_schema",
-        "search_catalog",
-        "inspect_asset",
-        "find_relationship_paths",
         "catalog_search_schema",
-        "catalog_inspect_table",
-        "catalog_find_join_paths",
-        "find_store",
-        "compare_schemas",
-        "export_diagram",
+        "catalog_inspect_asset",
+        "catalog_find_relationship_paths",
     }
 
 
-async def test_lifecycle_on_before_run_empty():
+async def test_context_provider_renders_empty_catalog_summary():
     plugin = CatalogPlugin()
-    result = await plugin.on_before_run("test prompt")
-    assert result is None
+    provider = plugin.get_context_providers()[0]
+
+    block = await provider.render(
+        {"prompt": "test prompt"},
+        next(iter(provider.audiences)),
+        2000,
+    )
+
+    assert "Catalog has no registered stores" in block.content
 
 
-async def test_lifecycle_on_before_run_with_stores():
+async def test_context_provider_renders_catalog_summary_with_stores():
     plugin = CatalogPlugin()
     plugin.add_discoverer(FakeDiscoverer(stores=[_make_store(id="s1")]))
     await plugin.discover_all()
+    provider = plugin.get_context_providers()[0]
 
-    result = await plugin.on_before_run("test prompt")
-    assert result is not None
-    assert "1 data stores known" in result
+    block = await provider.render(
+        {"prompt": "test prompt"},
+        next(iter(provider.audiences)),
+        2000,
+    )
+
+    assert block is not None
+    assert "1 known stores" in block.content
 
 
-async def test_lifecycle_on_agent_stop_closes_discoverers():
+async def test_teardown_closes_discoverers():
     d = FakeDiscoverer()
     plugin = CatalogPlugin()
     plugin.add_discoverer(d)
-    await plugin.on_agent_stop()
+
+    await plugin.teardown()
+
     assert d.closed
 
 
-async def test_find_store_tool_handler():
-    from daita.plugins.catalog.tools import _handle_find_store
-
+async def test_get_stores_supports_legacy_find_store_filters():
     plugin = CatalogPlugin()
     stores = [
         _make_store(
@@ -406,22 +412,26 @@ async def test_find_store_tool_handler():
     await plugin.discover_all()
 
     # Search by query
-    result = await _handle_find_store(plugin, {"query": "orders"})
-    assert result["total"] == 1
-    assert result["stores"][0]["id"] == "s1"
+    result = [
+        store
+        for store in plugin.get_stores()
+        if "orders" in store.display_name.lower() or "orders" in store.id.lower()
+    ]
+    assert len(result) == 1
+    assert result[0].id == "s1"
 
     # Filter by type
-    result = await _handle_find_store(plugin, {"store_type": "mysql"})
-    assert result["total"] == 1
+    result = plugin.get_stores(store_type="mysql")
+    assert len(result) == 1
 
     # Filter by tag
-    result = await _handle_find_store(plugin, {"tag": "team:backend"})
-    assert result["total"] == 1
+    result = [store for store in plugin.get_stores() if "team:backend" in store.tags]
+    assert len(result) == 1
 
     # Pagination
-    result = await _handle_find_store(plugin, {"offset": 0, "limit": 1})
-    assert len(result["stores"]) == 1
-    assert result["total"] == 2
+    result = plugin.get_stores()[0:1]
+    assert len(result) == 1
+    assert len(plugin.get_stores()) == 2
 
 
 async def test_discover_and_profile():
@@ -448,7 +458,13 @@ async def test_discover_and_profile_auto_persists_to_graph(tmp_path, monkeypatch
     stores = [_make_store(id="s1", store_type="postgresql")]
     plugin.add_discoverer(FakeDiscoverer(stores=stores))
     plugin.add_profiler(FakeProfiler(supported_types=["postgresql"]))
-    plugin.initialize("catalog-auto-persist-test")
+    await plugin.setup(
+        PluginContext(
+            runtime_id="catalog-auto-persist-test",
+            runtime_kind="agent",
+            agent_id="catalog-auto-persist-test",
+        )
+    )
 
     await plugin.discover_and_profile()
 

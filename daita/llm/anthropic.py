@@ -4,15 +4,12 @@ Anthropic LLM provider implementation with integrated tracing.
 
 from __future__ import annotations
 
-import os
 import logging
-from typing import TYPE_CHECKING, Dict, Any, Optional
+import os
+from typing import Dict, Any, Optional
 
 from ..core.exceptions import LLMError
-from .base import BaseLLMProvider
-
-if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+from .base import BaseLLMProvider, _tool_to_anthropic_tool
 
 logger = logging.getLogger(__name__)
 
@@ -294,15 +291,13 @@ class AnthropicProvider(BaseLLMProvider):
             logger.error(f"Anthropic generation with system message failed: {str(e)}")
             raise LLMError(f"Anthropic generation failed: {str(e)}")
 
-    def _convert_tools_to_format(
-        self, tools: list["AgentTool"]
-    ) -> list[Dict[str, Any]]:
+    def _convert_tools_to_format(self, tools: list[Any]) -> list[Dict[str, Any]]:
         """
-        Convert AgentTool list to Anthropic tool format.
+        Convert provider-neutral tool specs to Anthropic tool format.
 
         Anthropic uses a different tool format than OpenAI.
         """
-        return [tool.to_anthropic_tool() for tool in tools]
+        return [_tool_to_anthropic_tool(tool) for tool in tools]
 
     def _convert_messages_to_anthropic(
         self, messages: list[Dict[str, Any]]

@@ -11,6 +11,7 @@ from daita.plugins.postgresql import PostgreSQLPlugin
 from daita.plugins.base_db import BaseDatabasePlugin
 from daita.core.exceptions import ValidationError, PluginError
 from daita.core.exceptions import ConnectionError as DaitaConnectionError
+from tests.unit.plugins.projection_helpers import projected_tool_names
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -538,29 +539,30 @@ class TestVectorSearchInjectionValidation:
 class TestToolRegistration:
     def test_expected_default_tools_present(self):
         plugin = make_plugin()
-        names = {t.name for t in plugin.get_tools()}
+        names = projected_tool_names(plugin)
         assert "postgres_query" in names
-        assert "postgres_count" in names
-        assert "postgres_sample" in names
         assert "postgres_inspect" in names
 
     def test_list_tables_not_in_default_tools(self):
         plugin = make_plugin()
-        names = {t.name for t in plugin.get_tools()}
+        names = projected_tool_names(plugin)
         assert "postgres_list_tables" not in names
 
     def test_get_schema_not_in_default_tools(self):
         plugin = make_plugin()
-        names = {t.name for t in plugin.get_tools()}
+        names = projected_tool_names(plugin)
         assert "postgres_get_schema" not in names
 
     def test_write_tools_absent_when_read_only(self):
         plugin = make_plugin(read_only=True)
-        names = {t.name for t in plugin.get_tools()}
+        names = projected_tool_names(plugin)
         assert "postgres_execute" not in names
         assert "postgres_vector_upsert" not in names
 
     def test_write_tools_present_when_not_read_only(self):
         plugin = make_plugin(read_only=False)
-        names = {t.name for t in plugin.get_tools()}
-        assert "postgres_execute" in names
+        names = projected_tool_names(plugin)
+        assert "postgres_execute" not in names
+        assert "db.sql.execute_write" in {
+            capability.id for capability in plugin.declare_capabilities()
+        }

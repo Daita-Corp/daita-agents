@@ -28,6 +28,7 @@ motor = pytest.importorskip(
 )
 
 from daita.core.graph import LocalGraphBackend
+from daita.plugins.base import PluginContext
 from daita.plugins.catalog import CatalogPlugin
 
 from tests.integration._harness import (
@@ -74,6 +75,16 @@ SEED_DOCS = {
         },
     ],
 }
+
+
+async def _setup_catalog(plugin: CatalogPlugin, agent_id: str) -> None:
+    await plugin.setup(
+        PluginContext(
+            runtime_id=agent_id,
+            runtime_kind="agent",
+            agent_id=agent_id,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +143,7 @@ async def plugin_with_backend(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     backend = LocalGraphBackend(graph_type="catalog_mongo_live")
     plugin = CatalogPlugin(backend=backend, auto_persist=False)
-    plugin.initialize("catalog-mongo-live")
+    await _setup_catalog(plugin, "catalog-mongo-live")
     return plugin, backend
 
 
@@ -144,22 +155,17 @@ async def plugin_with_backend(tmp_path, monkeypatch):
 @pytest.mark.integration
 @pytest.mark.requires_db
 class TestCatalogPluginMongoDB:
-    async def test_discover_schema_returns_collections(
+    async def test_discover_mongodb_returns_collections(
         self, plugin_with_backend, seeded_mongo
     ):
         plugin, _ = plugin_with_backend
 
-        discover_tool = next(
-            t for t in plugin.get_tools() if t.name == "discover_schema"
-        )
-        async with timed("discover_schema mongodb"):
-            result = await discover_tool.execute(
-                {
-                    "store_type": "mongodb",
-                    "connection_string": seeded_mongo,
-                    "options": {"database": MONGO_DB, "sample_size": 10},
-                    "persist": False,
-                }
+        async with timed("discover_mongodb"):
+            result = await plugin.discover_mongodb(
+                connection_string=seeded_mongo,
+                database=MONGO_DB,
+                sample_size=10,
+                persist=False,
             )
 
         # Raw Mongo discovery shape: collections[].collection_name + fields[].field_name
@@ -190,17 +196,12 @@ class TestMongoDBGraphCorrectness:
 
         plugin, backend = plugin_with_backend
 
-        discover_tool = next(
-            t for t in plugin.get_tools() if t.name == "discover_schema"
-        )
-        async with timed("discover_schema mongodb + persist"):
-            await discover_tool.execute(
-                {
-                    "store_type": "mongodb",
-                    "connection_string": seeded_mongo,
-                    "options": {"database": MONGO_DB, "sample_size": 10},
-                    "persist": True,
-                }
+        async with timed("discover_mongodb + persist"):
+            await plugin.discover_mongodb(
+                connection_string=seeded_mongo,
+                database=MONGO_DB,
+                sample_size=10,
+                persist=True,
             )
 
         tables = await backend.find_nodes(NodeType.TABLE)
@@ -219,19 +220,24 @@ class TestMongoDBGraphCorrectness:
 class TestAgentMongoDBLive:
     async def test_agent_describes_collections(self, plugin_with_backend, seeded_mongo):
         plugin, _ = plugin_with_backend
+        discovery = await plugin.discover_mongodb(
+            connection_string=seeded_mongo,
+            database=MONGO_DB,
+            sample_size=10,
+            persist=True,
+        )
+        store_id = discovery["store_id"]
 
         agent = build_live_agent(name="MongoCatalogAgent", tools=[plugin])
         async with timed("agent.run mongo describe"):
             result = await agent.run(
-                f"Use the catalog tools to profile this MongoDB instance: "
-                f"`{seeded_mongo}`. MongoDB requires options.database — pass "
-                f"options={{'database': '{MONGO_DB}', 'sample_size': 10}} to "
-                f"discover_schema. Then tell me which collections exist and "
-                f"what fields the `orders` documents contain. Be concise.",
+                f"Use the catalog tools for store `{store_id}`. Tell me "
+                f"which collections exist and what fields the `orders` "
+                f"documents contain. Be concise.",
                 detailed=True,
             )
 
-        assert_tool_called(result, "discover_schema")
+        assert_tool_called(result, "catalog_search_schema")
         assert_answer_mentions(result, ["customers", "orders"])
         assert_answer_mentions(
             result,

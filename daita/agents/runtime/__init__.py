@@ -7,11 +7,9 @@ behavior still lives on BaseAgent and Agent.
 from .contextvars import active_run_state, get_active_run_state
 from .evidence import add_active_evidence, add_evidence
 from .exit import ExitDecision, RunExitPolicy
-from .loop import AgentRunController
 from .state import EvidenceRecord, RunPhase, RunState
 
 __all__ = [
-    "AgentRunController",
     "EvidenceRecord",
     "ExitDecision",
     "RunPhase",

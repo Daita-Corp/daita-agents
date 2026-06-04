@@ -20,7 +20,8 @@ Within each execution type, prefer the existing domain folder:
 - `data/`: data quality, transformation, and lineage behavior.
 - `evals/`: eval engine tests and eval factory helpers.
 - `focus/`: Focus DSL and SQL pushdown behavior.
-- `from_db/`: `Agent.from_db()` integration and graph accuracy flows.
+- `from_db/`: reserved for future `DbAgent`/`DbRuntime` integration tests. The
+  legacy generic-agent `from_db` integration suite has been removed.
 - `llm/`: LLM providers, embedding providers, pricing, and provider contracts.
 - `memory/`: memory stores, graph memory, reinforcement, and working memory.
 - `plugins/`: plugin-specific unit tests.
@@ -37,5 +38,5 @@ Single area examples:
 ```bash
 pytest tests/unit/agents -v
 pytest tests/unit/plugins -v
-pytest tests/integration/from_db -m "integration and not requires_llm and not requires_db" -v
+pytest tests/unit/db -v
 ```

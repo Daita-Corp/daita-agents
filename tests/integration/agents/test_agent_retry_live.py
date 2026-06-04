@@ -25,7 +25,7 @@ from daita.agents.agent import Agent
 from daita.config.base import AgentConfig, RetryPolicy, RetryStrategy
 from daita.core.exceptions import AgentError, TransientError
 from daita.core.streaming import EventType
-from daita.core.tools import AgentTool
+from daita.core.tools import LocalTool
 from daita.llm.factory import create_llm_provider
 
 load_dotenv(Path.cwd() / ".env")
@@ -134,11 +134,11 @@ class ScriptedLiveLLM:
         return self.live_llm.info
 
 
-def _replay_probe_tool(*, replay_safe: bool) -> AgentTool:
+def _replay_probe_tool(*, replay_safe: bool) -> LocalTool:
     async def handler(_args):
         return {"ok": True, "source": "replay_probe"}
 
-    return AgentTool(
+    return LocalTool(
         name="replay_probe",
         description="Replay probe tool used by live retry integration tests.",
         parameters={"type": "object", "properties": {}, "required": []},

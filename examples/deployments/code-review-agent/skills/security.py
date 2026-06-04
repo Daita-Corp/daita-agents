@@ -2,13 +2,15 @@
 Security review skill — BaseSkill subclass with file-based instructions.
 
 Demonstrates the subclass pattern: instructions live in a separate .md file
-(editable by prompt engineers), and tools are built in get_tools().
+(editable by prompt engineers), while callable behavior is exposed through
+skill-owned capabilities, executors, and ToolViews.
 """
 
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-from daita.core.tools import AgentTool, tool
+from daita.core.tools import tool
+from daita.runtime import AccessMode, Capability, Evidence, RiskLevel, ToolView
 from daita.skills import BaseSkill
 
 # -- Vulnerability patterns (regex) ------------------------------------------
@@ -69,6 +71,52 @@ SECURITY_PATTERNS = {
 }
 
 
+class _SecurityToolExecutor:
+    def __init__(self, executor_id: str, capability_id: str, tool_ref):
+        self.id = executor_id
+        self.capability_ids = frozenset({capability_id})
+        self._tool = tool_ref
+
+    async def execute(self, task, operation, context):
+        result = await self._tool.execute(task.input)
+        return [
+            Evidence(
+                kind="skill.tool_result",
+                owner="skill_security_review",
+                payload={"tool": self._tool.name, "result": result},
+                operation_id=operation.id,
+                task_id=task.id,
+                metadata={"capability_id": task.capability_id},
+            )
+        ]
+
+
+def _security_capability(capability_id: str, executor_id: str, tool_ref) -> Capability:
+    return Capability(
+        id=capability_id,
+        owner="skill_security_review",
+        description=tool_ref.description,
+        domains=frozenset({"agent", "code_review", "security"}),
+        operation_types=frozenset({"code.review.security"}),
+        access=AccessMode.READ,
+        risk=RiskLevel.LOW,
+        input_schema=tool_ref.parameters,
+        output_evidence=frozenset({"skill.tool_result"}),
+        executor=executor_id,
+        model_visible=True,
+        side_effecting=False,
+    )
+
+
+def _security_tool_view(tool_ref, capability_id: str) -> ToolView:
+    return ToolView(
+        name=tool_ref.name,
+        capability_id=capability_id,
+        description=tool_ref.description,
+        parameters=tool_ref.parameters,
+    )
+
+
 class SecurityReviewSkill(BaseSkill):
     """Scans Python code for common security vulnerabilities.
 
@@ -81,8 +129,42 @@ class SecurityReviewSkill(BaseSkill):
     version = "1.0.0"
     instructions_file = "prompts/security_review.md"
 
-    def get_tools(self) -> List[AgentTool]:
-        return [scan_security_patterns, check_input_validation]
+    def declare_capabilities(self):
+        return (
+            _security_capability(
+                "skill.security.scan_patterns",
+                "skill_security_review.scan_patterns",
+                scan_security_patterns,
+            ),
+            _security_capability(
+                "skill.security.check_input_validation",
+                "skill_security_review.check_input_validation",
+                check_input_validation,
+            ),
+        )
+
+    def get_executors(self):
+        return (
+            _SecurityToolExecutor(
+                "skill_security_review.scan_patterns",
+                "skill.security.scan_patterns",
+                scan_security_patterns,
+            ),
+            _SecurityToolExecutor(
+                "skill_security_review.check_input_validation",
+                "skill.security.check_input_validation",
+                check_input_validation,
+            ),
+        )
+
+    def get_tool_views(self):
+        return (
+            _security_tool_view(scan_security_patterns, "skill.security.scan_patterns"),
+            _security_tool_view(
+                check_input_validation,
+                "skill.security.check_input_validation",
+            ),
+        )
 
 
 @tool

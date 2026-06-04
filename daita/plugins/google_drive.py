@@ -15,7 +15,15 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from .base import BasePlugin
+from .base import ConnectorPlugin, PluginContext
+from .google_drive_extensions import (
+    GOOGLE_DRIVE_MANIFEST,
+    GoogleDriveExecutor,
+    google_drive_capabilities,
+    google_drive_evidence_schemas,
+    google_drive_operation_definitions,
+    google_drive_tool_views,
+)
 from ..core.exceptions import (
     PluginError,
     NotFoundError,
@@ -25,7 +33,7 @@ from ..core.exceptions import (
 )
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +77,7 @@ _EXPORT_MAP = {
 }
 
 
-class GoogleDrivePlugin(BasePlugin):
+class GoogleDrivePlugin(ConnectorPlugin):
     """
     Google Drive plugin for agents.
 
@@ -91,6 +99,7 @@ class GoogleDrivePlugin(BasePlugin):
 
     _MAX_CHARS = 50_000
     _MAX_ROWS = 200
+    manifest = GOOGLE_DRIVE_MANIFEST
 
     def __init__(
         self,
@@ -122,9 +131,50 @@ class GoogleDrivePlugin(BasePlugin):
             self.scopes = _DEFAULT_SCOPES if read_only else _WRITE_SCOPES
 
         self._service = None
+        self._executor = GoogleDriveExecutor(self)
         self._connect_lock = asyncio.Lock()
 
         logger.debug("Google Drive plugin configured")
+
+    @property
+    def is_connected(self) -> bool:
+        return self._service is not None
+
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the Google Drive connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the Google Drive connector from a runtime."""
+        await self.disconnect()
+
+    # ---------------------------------------------------------------------------
+    # Runtime extension declarations
+    # ---------------------------------------------------------------------------
+
+    def declare_capabilities(self):
+        return google_drive_capabilities(self.read_only)
+
+    def get_executors(self):
+        return (self._executor,)
+
+    def declare_evidence_schemas(self):
+        return google_drive_evidence_schemas()
+
+    def get_tool_views(self):
+        return google_drive_tool_views(self.read_only)
+
+    def _definition_for_capability(self, capability_id: str) -> dict:
+        for definition in google_drive_operation_definitions(self.read_only):
+            if definition["capability_id"] == capability_id:
+                return definition
+        raise KeyError(capability_id)
+
+    def _definition_for_tool(self, tool_name: str) -> dict:
+        for definition in google_drive_operation_definitions(self.read_only):
+            if definition["tool_name"] == tool_name:
+                return definition
+        raise KeyError(tool_name)
 
     # ---------------------------------------------------------------------------
     # Error mapping
@@ -133,11 +183,9 @@ class GoogleDrivePlugin(BasePlugin):
     def _map_drive_error(self, error: Exception, operation: str) -> Exception:
         """Map Google API errors to framework exceptions."""
         if isinstance(error, ImportError):
-            return PluginError(
-                f"Google Drive {operation} failed: google-api-python-client not installed. "
-                "Install with: pip install 'daita-agents[google-drive]'",
-                plugin_name="GoogleDrive",
-                retry_hint="permanent",
+            return ImportError(
+                "google-api-python-client is required for GoogleDrivePlugin. "
+                "Install with: pip install 'daita-agents[google-drive]'"
             )
         try:
             from googleapiclient.errors import HttpError
@@ -205,11 +253,9 @@ class GoogleDrivePlugin(BasePlugin):
                 logger.info("Connected to Google Drive")
 
             except ImportError as e:
-                raise PluginError(
-                    "google-api-python-client not installed. "
-                    "Install with: pip install 'daita-agents[google-drive]'",
-                    plugin_name="GoogleDrive",
-                    retry_hint="permanent",
+                raise ImportError(
+                    "google-api-python-client is required for GoogleDrivePlugin. "
+                    "Install with: pip install 'daita-agents[google-drive]'"
                 ) from e
             except (
                 PluginError,
@@ -902,213 +948,6 @@ class GoogleDrivePlugin(BasePlugin):
     # ---------------------------------------------------------------------------
     # Tool definitions
     # ---------------------------------------------------------------------------
-
-    def get_tools(self) -> List["AgentTool"]:
-        from ..core.tools import AgentTool
-
-        tools = [
-            AgentTool(
-                name="gdrive_search",
-                description=(
-                    "Search Google Drive for files by name, type, or date. "
-                    "Returns matching files with IDs, names, types, sizes, and links."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search text to match against file names",
-                        },
-                        "file_type": {
-                            "type": "string",
-                            "description": (
-                                "Filter by type: document, spreadsheet, presentation, "
-                                "pdf, csv, docx, xlsx, image, folder"
-                            ),
-                        },
-                        "folder_id": {
-                            "type": "string",
-                            "description": "Restrict search to files within this folder ID",
-                        },
-                        "modified_after": {
-                            "type": "string",
-                            "description": "ISO date string (e.g. '2024-01-01') to filter recently modified files",
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Max files to return (default 20, max 100)",
-                        },
-                    },
-                    "required": ["query"],
-                },
-                handler=self._tool_search,
-                category="storage",
-                source="plugin",
-                plugin_name="GoogleDrive",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="gdrive_read",
-                description=(
-                    "Read content from any Google Drive file. Automatically handles Google Docs, "
-                    "Sheets, Slides, CSV, XLSX, DOCX, PDF, and text files. Returns structured, "
-                    "LLM-friendly content — tabular data for spreadsheets, clean text for documents."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "file_id": {
-                            "type": "string",
-                            "description": "Google Drive file ID (from gdrive_search or gdrive_list)",
-                        },
-                        "sheet_name": {
-                            "type": "string",
-                            "description": "For XLSX files, the sheet name to read (default: first sheet)",
-                        },
-                    },
-                    "required": ["file_id"],
-                },
-                handler=self._tool_read,
-                category="storage",
-                source="plugin",
-                plugin_name="GoogleDrive",
-                timeout_seconds=120,
-            ),
-            AgentTool(
-                name="gdrive_list",
-                description="List files in a Google Drive folder with names, types, sizes, and modification dates.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "folder_id": {
-                            "type": "string",
-                            "description": "Folder ID to list (default: root / My Drive)",
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Max files to return (default 50, max 200)",
-                        },
-                    },
-                    "required": [],
-                },
-                handler=self._tool_list,
-                category="storage",
-                source="plugin",
-                plugin_name="GoogleDrive",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="gdrive_info",
-                description="Get detailed metadata about a Google Drive file: size, owner, sharing, and modification history.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "file_id": {
-                            "type": "string",
-                            "description": "Google Drive file ID",
-                        },
-                    },
-                    "required": ["file_id"],
-                },
-                handler=self._tool_info,
-                category="storage",
-                source="plugin",
-                plugin_name="GoogleDrive",
-                timeout_seconds=15,
-            ),
-            AgentTool(
-                name="gdrive_download",
-                description=(
-                    "Download a Google Drive file to a local path. "
-                    "Google Docs/Sheets/Slides are auto-exported to DOCX/XLSX/PPTX."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "file_id": {
-                            "type": "string",
-                            "description": "Google Drive file ID",
-                        },
-                        "local_path": {
-                            "type": "string",
-                            "description": "Local file path to save to (e.g. '/tmp/report.pdf')",
-                        },
-                    },
-                    "required": ["file_id", "local_path"],
-                },
-                handler=self._tool_download,
-                category="storage",
-                source="plugin",
-                plugin_name="GoogleDrive",
-                timeout_seconds=120,
-            ),
-        ]
-
-        if not self.read_only:
-            tools += [
-                AgentTool(
-                    name="gdrive_upload",
-                    description="Upload a local file to Google Drive.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "local_path": {
-                                "type": "string",
-                                "description": "Local file path to upload",
-                            },
-                            "folder_id": {
-                                "type": "string",
-                                "description": "Destination folder ID (default: root / My Drive)",
-                            },
-                            "name": {
-                                "type": "string",
-                                "description": "Override file name in Drive",
-                            },
-                        },
-                        "required": ["local_path"],
-                    },
-                    handler=self._tool_upload,
-                    category="storage",
-                    source="plugin",
-                    plugin_name="GoogleDrive",
-                    timeout_seconds=120,
-                ),
-                AgentTool(
-                    name="gdrive_organize",
-                    description="Move, rename, or copy a file in Google Drive.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "file_id": {
-                                "type": "string",
-                                "description": "Google Drive file ID",
-                            },
-                            "action": {
-                                "type": "string",
-                                "enum": ["move", "rename", "copy"],
-                                "description": "Action to perform on the file",
-                            },
-                            "dest_folder_id": {
-                                "type": "string",
-                                "description": "Destination folder ID (required for move/copy)",
-                            },
-                            "new_name": {
-                                "type": "string",
-                                "description": "New file name (required for rename, optional for copy)",
-                            },
-                        },
-                        "required": ["file_id", "action"],
-                    },
-                    handler=self._tool_organize,
-                    category="storage",
-                    source="plugin",
-                    plugin_name="GoogleDrive",
-                    timeout_seconds=30,
-                ),
-            ]
-
-        return tools
 
     # ---------------------------------------------------------------------------
     # Tool handlers

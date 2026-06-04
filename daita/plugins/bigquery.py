@@ -19,10 +19,19 @@ import logging
 import os
 import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from .base import PluginContext
 from .base_db import BaseDatabasePlugin
+from .bigquery_extensions import (
+    BIGQUERY_MANIFEST,
+    BigQueryExecutor,
+    bigquery_capabilities,
+    bigquery_evidence_schemas,
+    bigquery_operation_definitions,
+    bigquery_tool_views,
+)
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +45,7 @@ class BigQueryPlugin(BaseDatabasePlugin):
     """
 
     sql_dialect = "bigquery"
+    manifest = BIGQUERY_MANIFEST
 
     def __init__(
         self,
@@ -65,9 +75,44 @@ class BigQueryPlugin(BaseDatabasePlugin):
             )
 
         super().__init__(timeout=timeout, **kwargs)
+        self._executor = BigQueryExecutor(self)
         logger.debug(
             f"BigQueryPlugin configured for project={self.project}, dataset={self.dataset}"
         )
+
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the BigQuery connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the BigQuery connector from a runtime."""
+        await self.disconnect()
+
+    # ── Runtime extension declarations ───────────────────────────────
+
+    def declare_capabilities(self):
+        return bigquery_capabilities(self.read_only)
+
+    def get_executors(self):
+        return (self._executor,)
+
+    def declare_evidence_schemas(self):
+        return bigquery_evidence_schemas()
+
+    def get_tool_views(self):
+        return bigquery_tool_views(self.read_only)
+
+    def _definition_for_capability(self, capability_id: str) -> dict:
+        for definition in bigquery_operation_definitions(self.read_only):
+            if definition["capability_id"] == capability_id:
+                return definition
+        raise KeyError(capability_id)
+
+    def _definition_for_tool(self, tool_name: str) -> dict:
+        for definition in bigquery_operation_definitions(self.read_only):
+            if definition["tool_name"] == tool_name:
+                return definition
+        raise KeyError(tool_name)
 
     async def connect(self) -> None:
         if self._client is not None:
@@ -242,134 +287,6 @@ class BigQueryPlugin(BaseDatabasePlugin):
         return table
 
     # ── Tools ─────────────────────────────────────────────────────────
-
-    def get_tools(self) -> List["AgentTool"]:
-        from ..core.tools import AgentTool
-
-        _common = dict(category="database", source="plugin", plugin_name="BigQuery")
-
-        tools = [
-            AgentTool(
-                name="bigquery_query",
-                description="Run a SELECT query on BigQuery. Include LIMIT in your SQL to control result size.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "sql": {
-                            "type": "string",
-                            "description": "SQL SELECT query with %s placeholders",
-                        },
-                        "params": {
-                            "type": "array",
-                            "description": "Optional parameter values",
-                            "items": {},
-                        },
-                        "focus": {
-                            "type": "string",
-                            "description": "Focus DSL to filter/project results",
-                        },
-                    },
-                    "required": ["sql"],
-                },
-                handler=self._tool_query,
-                timeout_seconds=120,
-                **_common,
-            ),
-            AgentTool(
-                name="bigquery_inspect",
-                description="List tables and their column schemas in one call.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "dataset": {
-                            "type": "string",
-                            "description": "Dataset name (uses default if omitted)",
-                        },
-                        "tables": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Filter to specific tables",
-                        },
-                    },
-                    "required": [],
-                },
-                handler=self._tool_inspect,
-                timeout_seconds=60,
-                **_common,
-            ),
-            AgentTool(
-                name="bigquery_count",
-                description="Count rows in a BigQuery table, optionally filtered.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {"type": "string", "description": "Table name"},
-                        "filter": {
-                            "type": "string",
-                            "description": "Optional WHERE clause (without WHERE keyword)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_count,
-                timeout_seconds=60,
-                **_common,
-            ),
-            AgentTool(
-                name="bigquery_sample",
-                description="Return a random sample of rows from a BigQuery table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {"type": "string", "description": "Table name"},
-                        "n": {
-                            "type": "integer",
-                            "description": "Number of rows to sample (default: 5)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_sample,
-                timeout_seconds=60,
-                **_common,
-            ),
-            AgentTool(
-                name="bigquery_list_datasets",
-                description="List all datasets in the BigQuery project.",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_list_datasets,
-                timeout_seconds=30,
-                **_common,
-            ),
-        ]
-
-        if not self.read_only:
-            tools.append(
-                AgentTool(
-                    name="bigquery_execute",
-                    description="Execute INSERT, UPDATE, DELETE, or DDL on BigQuery. Returns affected row count.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "sql": {
-                                "type": "string",
-                                "description": "SQL DML/DDL statement",
-                            },
-                            "params": {
-                                "type": "array",
-                                "description": "Optional parameter values",
-                                "items": {},
-                            },
-                        },
-                        "required": ["sql"],
-                    },
-                    handler=self._tool_execute,
-                    timeout_seconds=120,
-                    **_common,
-                )
-            )
-
-        return tools
 
     # ── Tool handlers ─────────────────────────────────────────────────
 

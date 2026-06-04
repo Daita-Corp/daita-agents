@@ -40,7 +40,10 @@ from daita.core.graph.models import (
     EdgeType,
     NodeType,
 )
+from daita.plugins.base import PluginContext
 from daita.plugins.lineage import LineagePlugin
+from daita.agents.agent import Agent
+from daita.llm.mock import MockLLMProvider
 
 from tests.integration._harness import (
     assert_answer_mentions,
@@ -124,7 +127,13 @@ async def seeded_backend(tmp_path, monkeypatch):
 @pytest.fixture
 async def lineage_plugin(seeded_backend) -> LineagePlugin:
     plugin = LineagePlugin(backend=seeded_backend)
-    plugin.initialize("lineage-live-test")
+    await plugin.setup(
+        PluginContext(
+            runtime_id="lineage-live-test",
+            runtime_kind="agent",
+            agent_id="lineage-live-test",
+        )
+    )
     return plugin
 
 
@@ -174,12 +183,17 @@ class TestGraphCorrectness:
     async def test_find_lineage_paths_ground_truth(self, lineage_plugin):
         """All simple paths from raw_orders to fact_orders under the default
         lineage edge-type set."""
-        tool = next(
-            t for t in lineage_plugin.get_tools() if t.name == "find_lineage_paths"
+        agent = Agent(
+            name="lineage-ground-truth",
+            llm_provider=MockLLMProvider(delay=0),
+            plugins=[lineage_plugin],
         )
-        r = await tool.execute(
-            {"from_entity": "table:raw_orders", "to_entity": "table:fact_orders"}
+        result = await agent.execute_capability(
+            "lineage.path.find",
+            {"from_entity": "table:raw_orders", "to_entity": "table:fact_orders"},
+            owner="lineage",
         )
+        r = result["evidence"][0]["payload"]
         assert r["reachable"]
         # Only one path exists: raw -> stg -> fact
         assert ["table:raw_orders", "table:stg_orders", "table:fact_orders"] in r[

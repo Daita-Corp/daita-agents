@@ -40,6 +40,7 @@ pytest.importorskip(
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
 from daita.agents.agent import Agent
+from daita.plugins.base import PluginContext
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.gcp import GCPDiscoverer
 
@@ -62,6 +63,16 @@ def _gcp_projects() -> list[str]:
     if not projects and (single := os.environ.get("GOOGLE_CLOUD_PROJECT")):
         projects = [single]
     return projects
+
+
+async def _setup_catalog(plugin: CatalogPlugin, agent_id: str) -> None:
+    await plugin.setup(
+        PluginContext(
+            runtime_id=agent_id,
+            runtime_kind="agent",
+            agent_id=agent_id,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -577,9 +588,9 @@ class TestGraphEmissionLive:
         plugin = CatalogPlugin(backend=backend, auto_persist=True)
         plugin.add_discoverer(gcp_discoverer)
         plugin.add_profiler(BigQueryProfiler())
-        # CatalogPlugin.initialize() auto-selects a backend only when None —
-        # since we passed one in the constructor, no override is applied.
-        plugin.initialize(agent_id="it-agent")
+        # CatalogPlugin.setup() auto-selects a backend only when None; since we
+        # passed one in the constructor, no override is applied.
+        await _setup_catalog(plugin, "it-agent")
 
         await plugin.discover_and_profile()
 
@@ -632,7 +643,7 @@ class TestGraphEmissionLive:
         plugin = CatalogPlugin(backend=backend, auto_persist=True)
         plugin.add_discoverer(gcp_discoverer)
         plugin.add_profiler(FirestoreProfiler())
-        plugin.initialize(agent_id="it-agent")
+        await _setup_catalog(plugin, "it-agent")
 
         await plugin.discover_and_profile()
 
@@ -712,7 +723,7 @@ class TestGraphEmissionLive:
         plugin = CatalogPlugin(backend=backend, auto_persist=True)
         plugin.add_discoverer(gcp_discoverer)
         plugin.add_profiler(BigQueryProfiler())
-        plugin.initialize(agent_id="it-agent")
+        await _setup_catalog(plugin, "it-agent")
         await plugin.discover_and_profile()
 
         # Seed a synthetic postgres store with the same 'orders' table name.

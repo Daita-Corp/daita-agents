@@ -21,7 +21,7 @@ Usage:
     # Option 1: Use with agent
     agent = Agent(
         name="researcher",
-        tools=[websearch(api_key=os.getenv("TAVILY_API_KEY"))],
+        plugins=[websearch(api_key=os.getenv("TAVILY_API_KEY"))],
         model="gpt-4o-mini"
     )
 
@@ -50,9 +50,21 @@ Cost:
 
 import os
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Mapping, Optional
 
-from .base import BasePlugin
+from daita.runtime import (
+    AccessMode,
+    Capability,
+    Evidence,
+    EvidenceSchema,
+    Operation,
+    RiskLevel,
+    Task,
+    ToolView,
+)
+
+from .base import ConnectorPlugin
+from .manifest import PluginKind, PluginManifest
 from ..core.exceptions import (
     TransientError,
     RetryableError,
@@ -62,12 +74,165 @@ from ..core.exceptions import (
     ConnectionError as DaitaConnectionError,
     AuthenticationError,
 )
-from ..core.tools import AgentTool
+from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
 
-class WebSearchPlugin(BasePlugin):
+def _search_web_parameters(max_results: int, include_answer: bool) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query (e.g., 'Python async best practices', 'what is quantum computing')",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": f"Number of results to return (optional, default: {max_results})",
+            },
+            "include_answer": {
+                "type": "boolean",
+                "description": f"Include AI-extracted direct answer (optional, default: {include_answer})",
+            },
+        },
+        "required": ["query"],
+    }
+
+
+def _search_news_parameters(max_results: int) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "News search query (e.g., 'AI developments', 'Tesla earnings')",
+            },
+            "days": {
+                "type": "integer",
+                "description": "How many days back to search (optional, default: 7)",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": f"Number of results to return (optional, default: {max_results})",
+            },
+        },
+        "required": ["query"],
+    }
+
+
+_FETCH_PAGE_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "url": {
+            "type": "string",
+            "description": "URL to fetch (must be a valid HTTP/HTTPS URL)",
+        }
+    },
+    "required": ["url"],
+}
+
+
+def _tool_definitions(
+    max_results: int, include_answer: bool
+) -> tuple[Dict[str, Any], ...]:
+    return (
+        {
+            "name": "search_web",
+            "handler": "_tool_search_web",
+            "capability_id": "websearch.web.search",
+            "operation_type": "web.search",
+            "evidence_kind": "web.search.results",
+            "description": (
+                "Search the web for information using Tavily's AI-optimized search. "
+                "Returns an AI-extracted direct answer to the query plus LLM-optimized "
+                "search results with relevance scores. Use for: research, fact-checking, "
+                "current information, technical documentation, how-to guides, etc."
+            ),
+            "parameters": _search_web_parameters(max_results, include_answer),
+        },
+        {
+            "name": "search_news",
+            "handler": "_tool_search_news",
+            "capability_id": "websearch.news.search",
+            "operation_type": "web.news.search",
+            "evidence_kind": "web.search.results",
+            "description": (
+                "Search for recent news articles using Tavily. Returns news articles "
+                "with published dates and relevance scores. Use for: latest developments, "
+                "recent announcements, current events, trending topics, breaking news."
+            ),
+            "parameters": _search_news_parameters(max_results),
+        },
+        {
+            "name": "fetch_page",
+            "handler": "_tool_fetch_page",
+            "capability_id": "websearch.page.fetch",
+            "operation_type": "web.page.fetch",
+            "evidence_kind": "web.page.content",
+            "description": (
+                "Fetch and extract clean text content from a specific URL. "
+                "Use as a fallback when you have a specific URL to read but Tavily "
+                "doesn't have it cached. Returns plain text content extracted from HTML."
+            ),
+            "parameters": _FETCH_PAGE_PARAMETERS,
+        },
+    )
+
+
+_TOOL_BY_CAPABILITY = {
+    "websearch.web.search": "search_web",
+    "websearch.news.search": "search_news",
+    "websearch.page.fetch": "fetch_page",
+}
+
+
+class _WebSearchExecutor:
+    """Executor backing WebSearch plugin capability declarations."""
+
+    id = "websearch.operations"
+    capability_ids = frozenset(_TOOL_BY_CAPABILITY)
+
+    def __init__(self, plugin: "WebSearchPlugin") -> None:
+        self._plugin = plugin
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        tool_name = _TOOL_BY_CAPABILITY.get(task.capability_id)
+        if tool_name is None:
+            raise ValueError(f"Unsupported WebSearch capability: {task.capability_id}")
+
+        definition = self._plugin._definition_for_tool(tool_name)
+        handler = self._plugin._tool_handler(tool_name)
+        result = await handler(dict(task.input))
+        tool_view = context.get("tool_view")
+        tool_view_name = (
+            tool_view.get("name") if isinstance(tool_view, Mapping) else None
+        )
+        return [
+            Evidence(
+                kind=definition["evidence_kind"],
+                owner="websearch",
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={
+                    "operation": tool_name,
+                    "request": dict(task.input),
+                    "response": result,
+                },
+                metadata={
+                    "capability_id": task.capability_id,
+                    "tool_view": tool_view_name,
+                },
+            )
+        ]
+
+
+class WebSearchPlugin(ConnectorPlugin):
     """
     Web search plugin using Tavily Search API.
 
@@ -82,6 +247,16 @@ class WebSearchPlugin(BasePlugin):
         include_raw_content: Include full page HTML (default: False)
         max_page_length: Max characters for fetch_page (default: 10000)
     """
+
+    manifest = PluginManifest(
+        id="websearch",
+        display_name="Web Search",
+        version="2.0.0",
+        kind=PluginKind.CONNECTOR,
+        domains=frozenset({"web", "search"}),
+        provides=frozenset({"web_search", "news_search", "page_content"}),
+        optional_dependencies=frozenset({"tavily-python"}),
+    )
 
     def __init__(
         self,
@@ -120,9 +295,92 @@ class WebSearchPlugin(BasePlugin):
         # Initialize state
         self._client = None
         self._session = None  # For fetch_page
+        self._executor = _WebSearchExecutor(self)
 
         logger.info(
             f"WebSearchPlugin initialized (depth: {search_depth}, max_results: {max_results})"
+        )
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether Tavily and fetch-page clients are initialized."""
+        return self._client is not None and self._session is not None
+
+    async def teardown(self) -> None:
+        """Release runtime-owned WebSearch resources."""
+        await self.disconnect()
+
+    def declare_capabilities(self) -> tuple[Capability, ...]:
+        """Declare web search operations as runtime-plannable capabilities."""
+        return tuple(
+            Capability(
+                id=definition["capability_id"],
+                owner=self.manifest.id,
+                description=definition["description"],
+                domains=frozenset({"web", "search"}),
+                operation_types=frozenset({definition["operation_type"]}),
+                access=AccessMode.READ,
+                risk=RiskLevel.LOW,
+                input_schema=definition["parameters"],
+                output_evidence=frozenset({definition["evidence_kind"]}),
+                executor=self._executor.id,
+                model_visible=True,
+                retry_safe=True,
+                idempotent=True,
+                side_effecting=False,
+                timeout_seconds=30,
+                metadata={"tool_name": definition["name"]},
+            )
+            for definition in _tool_definitions(self._max_results, self._include_answer)
+        )
+
+    def declare_evidence_schemas(self) -> tuple[EvidenceSchema, ...]:
+        """Declare typed evidence returned by WebSearch execution."""
+        return (
+            EvidenceSchema(
+                kind="web.search.results",
+                owner=self.manifest.id,
+                description="Search results returned by Tavily web and news searches.",
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string"},
+                        "request": {"type": "object"},
+                        "response": {"type": "object"},
+                    },
+                    "required": ["operation", "request", "response"],
+                },
+            ),
+            EvidenceSchema(
+                kind="web.page.content",
+                owner=self.manifest.id,
+                description="Extracted text content from a fetched web page.",
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string"},
+                        "request": {"type": "object"},
+                        "response": {"type": "object"},
+                    },
+                    "required": ["operation", "request", "response"],
+                },
+            ),
+        )
+
+    def get_executors(self) -> tuple[_WebSearchExecutor, ...]:
+        """Return executors for declared WebSearch capabilities."""
+        return (self._executor,)
+
+    def get_tool_views(self) -> tuple[ToolView, ...]:
+        """Expose WebSearch capabilities as model-visible tool views."""
+        return tuple(
+            ToolView(
+                name=definition["name"],
+                capability_id=definition["capability_id"],
+                description=definition["description"],
+                parameters=definition["parameters"],
+            )
+            for definition in _tool_definitions(self._max_results, self._include_answer)
         )
 
     async def connect(self):
@@ -437,96 +695,16 @@ class WebSearchPlugin(BasePlugin):
         url = args.get("url")
         return await self.fetch_page(url)
 
-    def get_tools(self) -> List[AgentTool]:
-        """Expose web search operations as agent tools."""
-        return [
-            AgentTool(
-                name="search_web",
-                description=(
-                    "Search the web for information using Tavily's AI-optimized search. "
-                    "Returns an AI-extracted direct answer to the query plus LLM-optimized "
-                    "search results with relevance scores. Use for: research, fact-checking, "
-                    "current information, technical documentation, how-to guides, etc."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query (e.g., 'Python async best practices', 'what is quantum computing')",
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": f"Number of results to return (optional, default: {self._max_results})",
-                        },
-                        "include_answer": {
-                            "type": "boolean",
-                            "description": f"Include AI-extracted direct answer (optional, default: {self._include_answer})",
-                        },
-                    },
-                    "required": ["query"],
-                },
-                handler=self._tool_search_web,
-                category="search",
-                source="plugin",
-                plugin_name="WebSearch",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="search_news",
-                description=(
-                    "Search for recent news articles using Tavily. Returns news articles "
-                    "with published dates and relevance scores. Use for: latest developments, "
-                    "recent announcements, current events, trending topics, breaking news."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "News search query (e.g., 'AI developments', 'Tesla earnings')",
-                        },
-                        "days": {
-                            "type": "integer",
-                            "description": "How many days back to search (optional, default: 7)",
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": f"Number of results to return (optional, default: {self._max_results})",
-                        },
-                    },
-                    "required": ["query"],
-                },
-                handler=self._tool_search_news,
-                category="search",
-                source="plugin",
-                plugin_name="WebSearch",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="fetch_page",
-                description=(
-                    "Fetch and extract clean text content from a specific URL. "
-                    "Use as a fallback when you have a specific URL to read but Tavily "
-                    "doesn't have it cached. Returns plain text content extracted from HTML."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "URL to fetch (must be a valid HTTP/HTTPS URL)",
-                        }
-                    },
-                    "required": ["url"],
-                },
-                handler=self._tool_fetch_page,
-                category="search",
-                source="plugin",
-                plugin_name="WebSearch",
-                timeout_seconds=30,
-            ),
-        ]
+    def _definition_for_tool(self, name: str) -> Dict[str, Any]:
+        """Return the capability-backed definition for a tool name."""
+        for definition in _tool_definitions(self._max_results, self._include_answer):
+            if definition["name"] == name:
+                return definition
+        raise ValueError(f"Unsupported WebSearch tool: {name}")
+
+    def _tool_handler(self, name: str):
+        """Return the compatibility tool handler for a WebSearch tool name."""
+        return getattr(self, self._definition_for_tool(name)["handler"])
 
 
 def websearch(**kwargs) -> WebSearchPlugin:
@@ -559,7 +737,7 @@ def websearch(**kwargs) -> WebSearchPlugin:
         from daita import Agent
         agent = Agent(
             name="researcher",
-            tools=[websearch()],
+            plugins=[websearch()],
             model="gpt-4o-mini"
         )
         ```

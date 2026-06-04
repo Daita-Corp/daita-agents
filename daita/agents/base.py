@@ -8,7 +8,6 @@ Responsibilities:
 - Agent identity: ID generation, name, lifecycle state
 - Automatic tracing: every operation is traced via TraceManager
 - Retry infrastructure: _retry_with_tracing() shared by all subclasses
-- Reliability features: opt-in backpressure and task queue management
 - Decision tracing: retry decisions recorded with confidence scores
 - Health and metrics: real-time stats from the trace system
 """
@@ -23,20 +22,15 @@ if TYPE_CHECKING:
     from ..core.watch import WatchConfig, WatchEvent, WatchState
 
 from ..config.base import AgentConfig
-from ..core.interfaces import AgentABC, LLMProvider
+from ..core.interfaces import LLMProvider
 
 from ..core.tracing import get_trace_manager, TraceType
 from ..core.decision_tracing import record_decision_point, DecisionType
-from ..core.reliability import (
-    get_global_task_manager,
-    TaskStatus,
-    BackpressureController,
-)
 
 logger = logging.getLogger(__name__)
 
 
-class BaseAgent(AgentABC):
+class BaseAgent:
     """
     Base implementation for all Daita agents with automatic tracing.
 
@@ -90,14 +84,10 @@ class BaseAgent(AgentABC):
         # Get trace manager for automatic tracing
         self.trace_manager = get_trace_manager()
 
-        # Reliability features (enabled when reliability is configured)
-        self.task_manager = get_global_task_manager() if enable_reliability else None
-        self.backpressure_controller = None
         if enable_reliability:
-            self.backpressure_controller = BackpressureController(
-                max_concurrent_tasks=max_concurrent_tasks,
-                max_queue_size=max_queue_size,
-                agent_id=self.agent_id,
+            logger.warning(
+                "enable_reliability is ignored in 1.0; runtime work is tracked "
+                "through RuntimeStore and RuntimeKernel."
             )
 
         # Set agent ID in LLM provider for automatic LLM tracing
@@ -300,8 +290,7 @@ class BaseAgent(AgentABC):
 
         Called from start() and as a lazy fallback from Agent._run_traced().
         The fast path (no lock) handles the common single-caller case; the
-        lock + double-check guards concurrent run() calls when reliability
-        is enabled (task_manager introduces yield points in _start_watch).
+        lock + double-check guards concurrent run() calls.
         """
         if self._watches_started or not self._watches:
             return
@@ -319,17 +308,6 @@ class BaseAgent(AgentABC):
             self._watch_loop(config), name=f"watch:{config.name}"
         )
         self._tasks.append(task)
-        if self.task_manager:
-            try:
-                await self.task_manager.create_task(
-                    agent_id=self.agent_id,
-                    task_type="watch",
-                    data={"watch_name": config.name},
-                )
-            except Exception as e:
-                logger.debug(
-                    f"task_manager.create_task failed for watch '{config.name}': {e}"
-                )
 
     async def _watch_loop(self, config: "WatchConfig") -> None:
         """Core watch runtime: polls/streams the source, fires the handler on trigger.
@@ -438,7 +416,14 @@ class BaseAgent(AgentABC):
     ) -> None:
         """Call the watch handler, isolating exceptions from the watch loop."""
         try:
-            if config.handler_timeout is not None:
+            runtime_invoker = getattr(
+                self,
+                "_invoke_watch_handler_through_runtime",
+                None,
+            )
+            if runtime_invoker is not None:
+                await runtime_invoker(handler, event, config)
+            elif config.handler_timeout is not None:
                 await asyncio.wait_for(handler(event), timeout=config.handler_timeout)
             else:
                 await handler(event)
@@ -447,31 +432,9 @@ class BaseAgent(AgentABC):
             logger.error(msg)
             await self._call_on_error(config, TimeoutError(msg))
         except Exception as e:
-            logger.error(f"Watch handler '{config.name}' raised: {e}")
-            await self._call_on_error(config, e)
-
-    async def _process(
-        self,
-        task: str,
-        data: Any = None,
-        context: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """
-        INTERNAL: Override in subclasses to handle tasks.
-
-        Agent overrides this to route through run(detailed=True).
-        Custom BaseAgent subclasses can override this directly.
-        Workflow and scaling infrastructure call this as a fallback
-        when receive_message() is not available.
-        """
-        return {
-            "result": f"Task received: {task}",
-            "task": task,
-            "agent_id": self.agent_id,
-            "agent_name": self.name,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+            original = e.__cause__ or e
+            logger.error(f"Watch handler '{config.name}' raised: {original}")
+            await self._call_on_error(config, original)
 
     async def _retry_with_tracing(
         self,
@@ -689,82 +652,6 @@ class BaseAgent(AgentABC):
         from ..core.decision_tracing import get_decision_stats
 
         return get_decision_stats(agent_id=self.agent_id)
-
-    # Reliability management methods
-
-    def enable_reliability_features(
-        self, max_concurrent_tasks: int = 10, max_queue_size: int = 100
-    ) -> None:
-        """
-        Enable reliability features for this agent.
-
-        Args:
-            max_concurrent_tasks: Maximum concurrent tasks
-            max_queue_size: Maximum queue size for backpressure control
-        """
-        if self.enable_reliability:
-            logger.warning(f"Reliability already enabled for agent {self.name}")
-            return
-
-        self.enable_reliability = True
-        self.task_manager = get_global_task_manager()
-        self.backpressure_controller = BackpressureController(
-            max_concurrent_tasks=max_concurrent_tasks,
-            max_queue_size=max_queue_size,
-            agent_id=self.agent_id,
-        )
-
-        logger.info(f"Enabled reliability features for agent {self.name}")
-
-    def disable_reliability_features(self) -> None:
-        """Disable reliability features for this agent."""
-        self.enable_reliability = False
-        self.task_manager = None
-        self.backpressure_controller = None
-
-        logger.info(f"Disabled reliability features for agent {self.name}")
-
-    async def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """Get status of a specific task."""
-        if not self.task_manager:
-            return None
-        return await self.task_manager.get_task_status(task_id)
-
-    async def get_agent_tasks(
-        self, status: Optional[TaskStatus] = None
-    ) -> List[Dict[str, Any]]:
-        """Get all tasks for this agent, optionally filtered by status."""
-        if not self.task_manager:
-            return []
-
-        tasks = await self.task_manager.get_agent_tasks(self.agent_id, status)
-        return [
-            {
-                "id": task.id,
-                "status": task.status.value,
-                "progress": task.progress,
-                "error": task.error,
-                "duration": task.duration(),
-                "age": task.age(),
-                "retry_count": task.retry_count,
-            }
-            for task in tasks
-        ]
-
-    def get_backpressure_stats(self) -> Dict[str, Any]:
-        """Get current backpressure statistics."""
-        if not self.backpressure_controller:
-            return {"enabled": False}
-
-        stats = self.backpressure_controller.get_stats()
-        stats["enabled"] = True
-        return stats
-
-    async def cancel_task(self, task_id: str) -> bool:
-        """Cancel a specific task."""
-        if not self.task_manager:
-            return False
-        return await self.task_manager.cancel_task(task_id)
 
     def __repr__(self) -> str:
         return f"BaseAgent(name='{self.name}', id='{self.agent_id}', running={self._running})"
