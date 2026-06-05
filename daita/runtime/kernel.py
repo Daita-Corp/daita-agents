@@ -23,6 +23,7 @@ from .primitives import (
     GovernanceResult,
     Operation,
     OperationStatus,
+    ApprovalStatus,
     PolicyDecisionTrace,
     RuntimeEvent,
     RuntimeEventType,
@@ -43,6 +44,13 @@ _TERMINAL_TASK_STATUSES = frozenset(
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
         TaskStatus.SKIPPED,
+    }
+)
+_TERMINAL_OPERATION_STATUSES = frozenset(
+    {
+        OperationStatus.SUCCEEDED,
+        OperationStatus.FAILED,
+        OperationStatus.CANCELLED,
     }
 )
 _DEFAULT_LEASE_SECONDS = 300.0
@@ -106,8 +114,12 @@ class RuntimeKernelExecutionError(Exception):
         message: str,
         *,
         result: TaskExecutionResult | None = None,
+        operation: Operation | None = None,
+        governance: GovernanceResult | None = None,
     ) -> None:
         self.result = result
+        self.operation = operation
+        self.governance = governance
         super().__init__(message)
 
 
@@ -161,6 +173,7 @@ class RuntimeKernel:
         required_evidence: Iterable[str] = (),
         metadata: Mapping[str, Any] | None = None,
         operation_id: str | None = None,
+        evaluate_governance: bool = True,
     ) -> Operation:
         """Create and persist one operation plus an operation-created event."""
         operation = Operation(
@@ -184,9 +197,25 @@ class RuntimeKernel:
                 payload={"operation_type": operation.operation_type},
             )
         )
+        if not evaluate_governance:
+            return operation
+        await self.evaluate_operation_governance(operation.id)
+        return operation
+
+    async def evaluate_operation_governance(
+        self,
+        operation_id: str,
+        *,
+        capability: Capability | None = None,
+    ) -> GovernanceResult:
+        """Evaluate and persist operation-stage governance through the kernel."""
+        operation = await self.store.load_operation(operation_id)
+        if operation is None:
+            raise KeyError(operation_id)
         governance_persistence = await self._evaluate_governance_persistence(
             operation,
             stage="operation",
+            capability=capability,
         )
         governance = governance_persistence.result
         if governance.blocked or governance.pending_approval:
@@ -210,9 +239,11 @@ class RuntimeKernel:
             raise RuntimeKernelGovernanceBlocked(
                 "Operation blocked by governance policy.",
                 result=None,
+                operation=blocked,
+                governance=governance,
             )
         await self._commit_allowed_governance(governance_persistence)
-        return operation
+        return governance
 
     async def plan_task(
         self,
@@ -262,6 +293,242 @@ class RuntimeKernel:
             )
         )
         return task
+
+    async def append_event(
+        self,
+        type: RuntimeEventType,
+        *,
+        operation_id: str,
+        message: str,
+        task: Task | None = None,
+        capability: Capability | None = None,
+        task_id: str | None = None,
+        capability_id: str | None = None,
+        executor_id: str | None = None,
+        plugin_id: str | None = None,
+        policy_id: str | None = None,
+        approval_id: str | None = None,
+        evidence_id: str | None = None,
+        payload: Mapping[str, Any] | None = None,
+        trace_id: str | None = None,
+        span_id: str | None = None,
+    ) -> RuntimeEvent:
+        """Append one runtime-correlated event and return the persisted shape."""
+        current_trace_id, current_span_id = _current_trace_ids()
+        event = RuntimeEvent(
+            type=type,
+            runtime_id=self.runtime_id,
+            runtime_kind=self.runtime_kind,
+            operation_id=operation_id,
+            task_id=task.id if task is not None else task_id,
+            capability_id=(capability.id if capability is not None else capability_id),
+            executor_id=(
+                capability.executor
+                if capability is not None
+                else task.executor_id if task is not None else executor_id
+            ),
+            plugin_id=capability.owner if capability is not None else plugin_id,
+            policy_id=policy_id,
+            approval_id=approval_id,
+            evidence_id=evidence_id,
+            trace_id=trace_id or current_trace_id,
+            span_id=span_id or current_span_id,
+            message=message,
+            payload=dict(payload or {}),
+        )
+        await self.store.append_event(event)
+        return event
+
+    async def update_operation(
+        self,
+        operation_id: str,
+        status: OperationStatus,
+        *,
+        event_type: RuntimeEventType = RuntimeEventType.OPERATION_UPDATED,
+        message: str | None = None,
+        payload: Mapping[str, Any] | None = None,
+    ) -> Operation:
+        """Persist an operation status transition and matching runtime event."""
+        operation = await self.store.load_operation(operation_id)
+        if operation is None:
+            raise KeyError(operation_id)
+        updated = replace(operation, status=OperationStatus(status))
+        await self.store.save_operation(updated)
+        await self.append_event(
+            event_type,
+            operation_id=operation_id,
+            message=message
+            or f"Operation {operation_id} updated to {updated.status.value}.",
+            payload={"status": updated.status.value, **dict(payload or {})},
+        )
+        return updated
+
+    async def complete_operation(
+        self,
+        operation_id: str,
+        *,
+        status: OperationStatus = OperationStatus.SUCCEEDED,
+        payload: Mapping[str, Any] | None = None,
+        message: str | None = None,
+    ) -> Operation:
+        """Mark an operation terminal and emit a generic update event."""
+        status = OperationStatus(status)
+        if status not in _TERMINAL_OPERATION_STATUSES:
+            raise ValueError("complete_operation requires a terminal status")
+        return await self.update_operation(
+            operation_id,
+            status,
+            event_type=RuntimeEventType.OPERATION_UPDATED,
+            message=message
+            or f"Operation {operation_id} finished with {status.value}.",
+            payload=payload,
+        )
+
+    async def block_operation(
+        self,
+        operation_id: str,
+        *,
+        payload: Mapping[str, Any] | None = None,
+        message: str | None = None,
+    ) -> Operation:
+        """Mark an operation blocked and emit a generic update event."""
+        return await self.update_operation(
+            operation_id,
+            OperationStatus.BLOCKED,
+            event_type=RuntimeEventType.OPERATION_UPDATED,
+            message=message or f"Operation {operation_id} blocked.",
+            payload=payload,
+        )
+
+    async def block_task(
+        self,
+        task_id: str,
+        *,
+        message: str | None = None,
+        payload: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Task:
+        """Mark one persisted task blocked and emit a generic update event."""
+        task = await self.store.load_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        capability = self._capability_for_task(task)
+        blocked = replace(
+            task,
+            status=TaskStatus.BLOCKED,
+            metadata={
+                **_metadata_without_active_lease(task.metadata),
+                **dict(metadata or {}),
+            },
+        )
+        operation = await self.store.load_operation(task.operation_id)
+        if operation is None:
+            raise KeyError(task.operation_id)
+        event = self._event(
+            RuntimeEventType.TASK_UPDATED,
+            operation=operation,
+            task=blocked,
+            capability=capability,
+            message=message or f"Task {task.id} blocked.",
+            payload=payload,
+        )
+        commit = getattr(self.store, "commit_task_blocked", None)
+        if commit is not None:
+            await commit(operation=None, task=blocked, events=(event,))
+        else:
+            await self.store.save_task(blocked)
+            await self.store.append_event(event)
+        return blocked
+
+    async def apply_terminal_approval_state(
+        self,
+        operation_id: str,
+    ) -> Operation | None:
+        """Apply terminal approval status to an operation when present."""
+        approvals = await self.store.list_approval_requests(operation_id)
+        statuses = {request.status for request in approvals}
+        if ApprovalStatus.REJECTED in statuses:
+            return await self.complete_operation(
+                operation_id,
+                status=OperationStatus.FAILED,
+                message=f"Operation {operation_id} failed because approval was rejected.",
+            )
+        if ApprovalStatus.CANCELLED in statuses:
+            return await self.complete_operation(
+                operation_id,
+                status=OperationStatus.CANCELLED,
+                message=f"Operation {operation_id} cancelled by approval state.",
+            )
+        if ApprovalStatus.EXPIRED in statuses:
+            return await self.block_operation(
+                operation_id,
+                message=(
+                    f"Operation {operation_id} remains blocked because approval expired."
+                ),
+            )
+        return None
+
+    async def recover_expired_task_claims(self, operation_id: str) -> tuple[Task, ...]:
+        """Recover expired running task leases or block unsafe replays."""
+        recovered: list[Task] = []
+        now = time.time()
+        for task in await self.store.list_tasks(operation_id):
+            if task.status is not TaskStatus.RUNNING:
+                continue
+            lease_expires_at = task.metadata.get("lease_expires_at")
+            if lease_expires_at is None or float(lease_expires_at) > now:
+                continue
+            capability = self._capability_for_task(task)
+            if (
+                capability.idempotent
+                or capability.replay_safe
+                or not capability.side_effecting
+            ):
+                updated = replace(
+                    task,
+                    status=TaskStatus.PENDING,
+                    metadata={
+                        **_metadata_without_active_lease(task.metadata),
+                        "expired_lease_recovered": True,
+                    },
+                )
+                await self.store.save_task(updated)
+                recovered.append(updated)
+                continue
+            await self.block_operation(operation_id)
+            recovered.append(
+                await self.block_task(
+                    task.id,
+                    message=(
+                        f"Task {task.id} lease expired; manual recovery required "
+                        "before replaying side-effecting work."
+                    ),
+                    metadata={
+                        "manual_recovery_required": True,
+                        "manual_recovery_reason": "expired_side_effecting_lease",
+                    },
+                )
+            )
+        return tuple(recovered)
+
+    async def fail_operation_if_active(
+        self,
+        operation_id: str,
+        error: BaseException,
+    ) -> Operation | None:
+        """Fail a non-terminal operation; terminal operations are left unchanged."""
+        operation = await self.store.load_operation(operation_id)
+        if operation is None:
+            raise KeyError(operation_id)
+        if operation.status in _TERMINAL_OPERATION_STATUSES:
+            return None
+        return await self.update_operation(
+            operation_id,
+            OperationStatus.FAILED,
+            event_type=RuntimeEventType.ERROR,
+            message=f"Operation {operation_id} failed.",
+            payload={"error": {"type": type(error).__name__, "message": str(error)}},
+        )
 
     async def execute_task(
         self,
@@ -440,6 +707,8 @@ class RuntimeKernel:
             raise RuntimeKernelGovernanceBlocked(
                 "Task blocked by governance policy.",
                 result=result,
+                operation=blocked_operation,
+                governance=governance,
             )
         await self._commit_allowed_governance(governance_persistence)
         task = await self._executable_task(task, operation)

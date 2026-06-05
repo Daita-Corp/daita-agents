@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -10,23 +9,18 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any
-from uuid import uuid4
 
 from daita.core.exceptions import AgentError
 from daita.core.tracing import TraceType
-from daita.plugins.manifest import PluginKind, PluginManifest
 from daita.runtime import (
-    AccessMode,
-    Capability,
     ContextAudience,
     ContextBlock,
     Evidence,
     OperationStatus,
-    RiskLevel,
-    RuntimeEvent,
     RuntimeEventType,
     RuntimeKernelGovernanceBlocked,
     ToolView,
+    register_local_tool,
 )
 
 from .contextvars import active_run_state
@@ -159,132 +153,6 @@ class ChatRunResult:
         return result
 
 
-class LocalToolExecutor:
-    """Runtime executor for local LocalTool compatibility declarations."""
-
-    def __init__(
-        self,
-        executor_id: str,
-        capability_id: str,
-        tool_getter: Callable,
-        evidence_kind_getter: Callable[[], str],
-    ):
-        self.id = executor_id
-        self.capability_ids = frozenset({capability_id})
-        self._tool_getter = tool_getter
-        self._evidence_kind_getter = evidence_kind_getter
-
-    async def execute(self, task, operation, context):
-        tool = self._tool_getter()
-        if tool is None:
-            raise RuntimeError(f"Local tool for {task.capability_id!r} is unavailable")
-        if not callable(getattr(tool, "handler", None)):
-            raise RuntimeError(
-                f"Tool '{getattr(tool, 'name', task.capability_id)}' has non-callable handler"
-            )
-
-        async def _invoke():
-            return await tool.handler(task.input)
-
-        timeout = getattr(tool, "timeout_seconds", None)
-        if timeout:
-            result = await asyncio.wait_for(_invoke(), timeout=timeout)
-        else:
-            result = await _invoke()
-        if isinstance(result, Evidence):
-            return [result]
-        if isinstance(result, (list, tuple)) and all(
-            isinstance(item, Evidence) for item in result
-        ):
-            return list(result)
-        evidence_kind = self._evidence_kind_getter()
-        if isinstance(result, Mapping):
-            payload = dict(result)
-        else:
-            payload = {
-                "tool": getattr(tool, "name", task.capability_id),
-                "arguments": dict(task.input),
-                "result": result,
-            }
-        return [
-            Evidence(
-                kind=evidence_kind,
-                owner=context.get("tool_owner"),
-                payload=payload,
-                metadata={"source": getattr(tool, "source", "custom")},
-            )
-        ]
-
-
-class LocalToolPlugin:
-    """One local function tool represented as runtime declarations."""
-
-    def __init__(self, tool, *, plugin_id: str, capability_id: str, executor):
-        output_evidence = tuple(
-            getattr(tool, "output_evidence", ()) or (f"{capability_id}.result",)
-        )
-        self.tool = tool
-        self.manifest = PluginManifest(
-            id=plugin_id,
-            display_name=f"Local Tool {tool.name}",
-            version="1.0.0",
-            kind=PluginKind.RUNTIME_EXTENSION,
-            domains=frozenset({"chat"}),
-        )
-        access = getattr(tool, "access", None) or AccessMode.READ
-        risk = getattr(tool, "risk", None) or RiskLevel.LOW
-        self._capability = Capability(
-            id=capability_id,
-            owner=plugin_id,
-            description=tool.description,
-            domains=frozenset(getattr(tool, "domains", None) or ("chat",)),
-            operation_types=frozenset(
-                getattr(tool, "operation_types", None) or ("chat.tool_call",)
-            ),
-            access=AccessMode(access),
-            risk=RiskLevel(risk),
-            input_schema=tool.parameters,
-            output_evidence=frozenset(output_evidence),
-            executor=executor.id,
-            model_visible=bool(getattr(tool, "model_visible", True)),
-            runtime_only=bool(getattr(tool, "runtime_only", False)),
-            specialist_only=bool(getattr(tool, "specialist_only", False)),
-            timeout_seconds=tool.timeout_seconds,
-            retry_safe=tool.retry_safe,
-            replay_safe=tool.replay_safe,
-            idempotent=tool.idempotent,
-            side_effecting=tool.side_effecting,
-            metadata=dict(getattr(tool, "metadata", {}) or {}),
-        )
-        self._executor = executor
-        self._tool_view = ToolView(
-            name=tool.name,
-            capability_id=capability_id,
-            description=tool.description,
-            parameters=tool.parameters,
-            model_visible=bool(getattr(tool, "model_visible", True)),
-            metadata={
-                "adapter": "local_local_tool",
-                **dict(getattr(tool, "metadata", {}) or {}),
-            },
-        )
-
-    def declare_capabilities(self):
-        return (self._capability,)
-
-    def get_executors(self):
-        return (self._executor,)
-
-    def get_tool_views(self):
-        if (
-            not self._capability.model_visible
-            or self._capability.runtime_only
-            or self._capability.specialist_only
-        ):
-            return ()
-        return (self._tool_view,)
-
-
 class ChatRuntime:
     """Runtime owner for generic Agent chat/model/tool execution."""
 
@@ -327,8 +195,6 @@ class ChatRuntime:
         self._retry_with_tracing = retry_with_tracing
         self._final_answer_hooks_getter = final_answer_hooks_getter
         self.guardrails = ToolCallGuardrails()
-        self._local_tool_plugins: set[str] = set()
-        self._local_tools_by_name: dict[str, Any] = {}
 
     @property
     def llm(self):
@@ -585,7 +451,7 @@ class ChatRuntime:
                 run_state.set_phase(RunPhase.COMPLETE)
                 chat_state.phase = ChatRunPhase.COMPLETE
                 run_state.exit_reason = "final_answer"
-                await self._mark_operation(operation.id, OperationStatus.SUCCEEDED)
+                await self.kernel.complete_operation(operation.id)
                 return self._build_result(
                     llm_result.text,
                     operation.id,
@@ -602,7 +468,7 @@ class ChatRuntime:
                 run_state.set_phase(RunPhase.COMPLETE)
                 chat_state.phase = ChatRunPhase.COMPLETE
                 run_state.exit_reason = "terminal_evidence_synthesis"
-                await self._mark_operation(operation.id, OperationStatus.SUCCEEDED)
+                await self.kernel.complete_operation(operation.id)
                 return self._build_result(
                     self._terminal_result_text(latest_terminal_result),
                     operation.id,
@@ -618,7 +484,7 @@ class ChatRuntime:
                 run_state.exit_reason = exit_decision.reason
                 run_state.partial_result = exit_decision.result_text
                 self._evaluate_final_answer_readiness(run_state, resolved_tools, "")
-                await self._mark_operation(operation.id, OperationStatus.SUCCEEDED)
+                await self.kernel.complete_operation(operation.id)
                 return self._build_result(
                     exit_decision.result_text or "",
                     operation.id,
@@ -629,7 +495,10 @@ class ChatRuntime:
                     partial=True,
                 )
             self._evaluate_final_answer_readiness(run_state, resolved_tools, "")
-            await self._mark_operation(operation.id, OperationStatus.FAILED)
+            await self.kernel.complete_operation(
+                operation.id,
+                status=OperationStatus.FAILED,
+            )
             raise AgentError(
                 f"Max iterations ({max_iterations}) reached without final answer",
                 agent_id=self.runtime_id,
@@ -644,7 +513,7 @@ class ChatRuntime:
             )
         except Exception as error:
             mark_whole_run_retry_suppressed(error, run_state)
-            await self._mark_operation_failed_if_active(operation.id, error)
+            await self.kernel.fail_operation_if_active(operation.id, error)
             raise
         finally:
             active_run_state.reset(token)
@@ -695,6 +564,12 @@ class ChatRuntime:
         registry_tool_names = {view.name for view in self.extension_registry.tool_views}
         for tool in resolved_local_tools:
             if (
+                not bool(getattr(tool, "model_visible", True))
+                or bool(getattr(tool, "runtime_only", False))
+                or bool(getattr(tool, "specialist_only", False))
+            ):
+                continue
+            if (
                 getattr(tool, "source", None) == "plugin"
                 and tool.name in registry_tool_names
             ):
@@ -740,48 +615,17 @@ class ChatRuntime:
         return FocusedRuntimeTool(tool, effective)
 
     def _register_local_tool(self, tool) -> ModelToolSpec:
-        self._local_tools_by_name[tool.name] = tool
-        plugin_id = f"local_tool_{_identifier(tool.name)}"
-        capability_id = (
-            tuple(getattr(tool, "capability_ids", ()) or ())[0]
-            if getattr(tool, "capability_ids", ())
-            else f"agent.local.{_identifier(tool.name)}"
-        )
-        executor_id = f"{plugin_id}.execute"
-        if plugin_id not in self._local_tool_plugins:
-            executor = LocalToolExecutor(
-                executor_id,
-                capability_id,
-                lambda name=tool.name: self._local_tools_by_name.get(name),
-                lambda name=tool.name, capability_id=capability_id: tuple(
-                    getattr(self._local_tools_by_name.get(name), "output_evidence", ())
-                    or (f"{capability_id}.result",)
-                )[0],
-            )
-            self.extension_registry.register(
-                LocalToolPlugin(
-                    tool,
-                    plugin_id=plugin_id,
-                    capability_id=capability_id,
-                    executor=executor,
-                )
-            )
-            self._local_tool_plugins.add(plugin_id)
-        view = self.extension_registry.get_tool_view_owner(tool.name)
-        owner = view
-        tool_view = next(
-            item
-            for item in self.extension_registry.tool_views
-            if item.name == tool.name
-        )
+        registration = register_local_tool(self.extension_registry, tool)
+        if registration.tool_view is None:
+            raise ValueError(f"local tool {tool.name!r} is not model visible")
         return ModelToolSpec(
             name=tool.name,
             description=tool.description,
             parameters=tool.parameters,
-            capability_id=capability_id,
-            owner=owner,
-            tool_view=tool_view,
-            metadata={"adapter": "local_local_tool", "owner": owner},
+            capability_id=registration.capability_id,
+            owner=registration.plugin_id,
+            tool_view=registration.tool_view,
+            metadata={"adapter": "local_tool", "owner": registration.plugin_id},
         )
 
     async def _build_initial_conversation(
@@ -883,7 +727,7 @@ class ChatRuntime:
     async def _nonstream_llm_turn(
         self, conversation, tools, *, operation_id, run_state, **kwargs
     ) -> LLMResult:
-        await self._append_runtime_event(
+        await self.kernel.append_event(
             RuntimeEventType.LLM_REQUESTED,
             operation_id=operation_id,
             message="LLM turn requested.",
@@ -902,7 +746,7 @@ class ChatRuntime:
                 **kwargs,
             )
         )
-        await self._append_runtime_event(
+        await self.kernel.append_event(
             RuntimeEventType.LLM_COMPLETED,
             operation_id=operation_id,
             message="LLM turn completed.",
@@ -926,7 +770,7 @@ class ChatRuntime:
         finish_reason = None
         raw_metadata: dict[str, Any] = {}
         emitted_event = False
-        await self._append_runtime_event(
+        await self.kernel.append_event(
             RuntimeEventType.LLM_REQUESTED,
             operation_id=operation_id,
             message="Streaming LLM turn requested.",
@@ -980,7 +824,7 @@ class ChatRuntime:
         except Exception as error:
             if emitted_event:
                 setattr(error, "_daita_stream_event_emitted", True)
-            await self._append_runtime_event(
+            await self.kernel.append_event(
                 RuntimeEventType.ERROR,
                 operation_id=operation_id,
                 message="Streaming LLM turn failed.",
@@ -991,7 +835,7 @@ class ChatRuntime:
                 },
             )
             raise
-        await self._append_runtime_event(
+        await self.kernel.append_event(
             RuntimeEventType.LLM_COMPLETED,
             operation_id=operation_id,
             message="Streaming LLM turn completed.",
@@ -1343,71 +1187,6 @@ class ChatRuntime:
             return {}
         return self.llm.get_token_stats()
 
-    async def _mark_operation(self, operation_id: str, status: OperationStatus) -> None:
-        operation = await self.store.load_operation(operation_id)
-        if operation is not None:
-            updated = replace(operation, status=status)
-            await self.store.save_operation(updated)
-            await self._append_runtime_event(
-                RuntimeEventType.OPERATION_UPDATED,
-                operation_id=operation_id,
-                message=f"Operation {operation_id} finished with {status.value}.",
-                payload={"status": status.value},
-            )
-
-    async def _mark_operation_failed_if_active(
-        self,
-        operation_id: str,
-        error: BaseException,
-    ) -> None:
-        operation = await self.store.load_operation(operation_id)
-        if operation is None or operation.status in {
-            OperationStatus.SUCCEEDED,
-            OperationStatus.FAILED,
-            OperationStatus.CANCELLED,
-        }:
-            return
-        await self.store.save_operation(
-            replace(operation, status=OperationStatus.FAILED)
-        )
-        await self._append_runtime_event(
-            RuntimeEventType.ERROR,
-            operation_id=operation_id,
-            message=f"Operation {operation_id} failed.",
-            payload={"error": {"type": type(error).__name__, "message": str(error)}},
-        )
-
-    async def _append_runtime_event(
-        self,
-        type: RuntimeEventType,
-        *,
-        operation_id: str,
-        message: str,
-        task_id: str | None = None,
-        capability_id: str | None = None,
-        executor_id: str | None = None,
-        plugin_id: str | None = None,
-        evidence_id: str | None = None,
-        payload: Mapping[str, Any] | None = None,
-    ) -> None:
-        await self.store.append_event(
-            RuntimeEvent(
-                type=type,
-                runtime_id=self.runtime_id,
-                runtime_kind=self.runtime_kind,
-                operation_id=operation_id,
-                task_id=task_id,
-                capability_id=capability_id,
-                executor_id=executor_id,
-                plugin_id=plugin_id,
-                evidence_id=evidence_id,
-                trace_id=self.trace_manager.trace_context.current_trace_id,
-                span_id=self.trace_manager.trace_context.current_span_id,
-                message=message,
-                payload=dict(payload or {}),
-            )
-        )
-
 
 class FocusedRuntimeTool:
     """Runtime-local focused wrapper for LocalTool compatibility."""
@@ -1451,16 +1230,6 @@ def _resolve_tool_focus(agent_focus, tool) -> str | None:
     if isinstance(agent_focus, dict):
         return agent_focus.get(tool.name) or tool_default
     return agent_focus or tool_default
-
-
-def _identifier(value: str) -> str:
-    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in value)
-    cleaned = "_".join(part for part in cleaned.split("_") if part)
-    if not cleaned:
-        cleaned = f"tool_{uuid4().hex[:8]}"
-    if not cleaned[0].isalpha():
-        cleaned = f"tool_{cleaned}"
-    return cleaned
 
 
 def _first_evidence_id(evidence: tuple[Evidence, ...]) -> str | None:

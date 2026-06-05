@@ -289,7 +289,7 @@ class DbRuntime:
                 dependencies=task.dependencies
                 or _task_dependencies_for_capability(operation, capability),
             )
-            await self._persist_planned_task(task)
+            task = await self._plan_kernel_task(task)
         elif (
             stored_task.status is TaskStatus.PENDING and stored_task.input != task.input
         ):
@@ -379,128 +379,95 @@ class DbRuntime:
                     *sorted(output_evidence),
                 )
             )
-        operation = Operation(
-            id=operation_id or f"db-op-{uuid4()}",
-            operation_type=operation_type,
-            status=OperationStatus.RUNNING,
-            request={
-                "prompt": _prompt_from_direct_input(input or {}),
-                "input": input or {},
-                "capability_id": capability.id,
-                "capability_owner": capability.owner,
-            },
-            required_evidence=output_evidence,
-            metadata={
-                "runtime_id": self.runtime_id,
-                "runtime_kind": self.runtime_kind,
-                "direct_capability_id": capability.id,
-                "direct_capability_owner": capability.owner,
-            },
-        )
-        await self.store.save_operation(operation)
-        await self.store.append_event(
-            self._runtime_event(
-                type=RuntimeEventType.OPERATION_CREATED,
-                operation_id=operation.id,
-                message=f"Operation {operation.id} created.",
+        try:
+            operation = await self.kernel.create_operation(
+                operation_id=operation_id,
+                operation_type=operation_type,
+                request={
+                    "prompt": _prompt_from_direct_input(input or {}),
+                    "input": input or {},
+                    "capability_id": capability.id,
+                    "capability_owner": capability.owner,
+                },
+                required_evidence=output_evidence,
+                metadata={
+                    "direct_capability_id": capability.id,
+                    "direct_capability_owner": capability.owner,
+                    "access": capability.access.value,
+                },
+                evaluate_governance=False,
             )
-        )
-        tasks = self._direct_capability_tasks(
+        except RuntimeKernelGovernanceBlocked as exc:
+            raise DbRuntimeGovernanceBlocked(
+                operation=exc.operation
+                or await self.store.load_operation(operation_id or ""),
+                task=None,
+                governance=exc.governance or GovernanceResult(False, True, False),
+            ) from exc
+        task_plans = self._direct_capability_tasks(
             operation,
             capability,
             input or {},
             validation_capability=validation_capability,
         )
-        for task in tasks:
-            await self._persist_planned_task(task)
+        tasks = []
+        for task in task_plans:
+            tasks.append(await self._plan_kernel_task(task))
         primary_task = tasks[-1]
         if (
             capability.id == "db.sql.execute_write"
             and validation_capability is None
             and not (input or {}).get("validated_evidence_id")
         ):
-            blocked_task = replace(primary_task, status=TaskStatus.BLOCKED)
-            await self._persist_pre_execution_task_block(
-                operation=replace(operation, status=OperationStatus.BLOCKED),
-                task=blocked_task,
-                events=(
-                    self._runtime_event(
-                        type=RuntimeEventType.OPERATION_UPDATED,
-                        operation_id=operation.id,
-                        message=(
-                            "Direct write execution requires db.sql.validate "
-                            "or a validated_evidence_id."
-                        ),
-                    ),
+            blocked_task = await self.kernel.block_task(
+                primary_task.id,
+                message=(
+                    "Direct write execution requires db.sql.validate "
+                    "or a validated_evidence_id."
+                ),
+            )
+            await self.kernel.block_operation(
+                operation.id,
+                message=(
+                    "Direct write execution requires db.sql.validate "
+                    "or a validated_evidence_id."
                 ),
             )
             raise DbRuntimeTaskNotRunnable(
                 blocked_task,
                 "Direct write execution requires db.sql.validate or validated_evidence_id.",
             )
-        governance_persistence = await self._evaluate_governance(
-            operation,
-            task=None,
-            capability=capability,
-            stage="operation",
-        )
-        governance = governance_persistence.result
-        if governance.blocked or governance.pending_approval:
-            blocked_task = replace(primary_task, status=TaskStatus.BLOCKED)
-            await self.store.commit_governance_blocked(
-                operation=replace(operation, status=OperationStatus.BLOCKED),
-                task=blocked_task,
-                decisions=governance.decisions,
-                audit_record=governance_persistence.audit_record,
-                approval_requests=governance_persistence.approvals_to_request,
-                events=(
-                    *governance_persistence.events,
-                    self._runtime_event(
-                        type=RuntimeEventType.OPERATION_UPDATED,
-                        operation_id=operation.id,
-                        message=(
-                            f"Operation {operation.id} blocked by governance policy."
-                        ),
-                        payload={"governance": governance.to_dict()},
-                    ),
-                ),
+        try:
+            await self.kernel.evaluate_operation_governance(
+                operation.id,
+                capability=capability,
+            )
+        except RuntimeKernelGovernanceBlocked as exc:
+            await self.kernel.block_task(
+                primary_task.id,
+                message=f"Task {primary_task.id} blocked by operation governance.",
+                payload={
+                    "governance": (
+                        exc.governance.to_dict() if exc.governance is not None else {}
+                    )
+                },
             )
             raise DbRuntimeGovernanceBlocked(
-                operation=operation,
-                task=None,
-                governance=governance,
-            )
-        await self.store.commit_governance_evaluation(
-            decisions=governance.decisions,
-            audit_record=governance_persistence.audit_record,
-            approval_requests=governance_persistence.approvals_to_request,
-            events=governance_persistence.events,
-        )
+                operation=exc.operation or operation,
+                task=replace(primary_task, status=TaskStatus.BLOCKED),
+                governance=exc.governance or GovernanceResult(False, True, False),
+            ) from exc
         try:
             collected: list[Evidence] = []
             for task in tasks:
                 collected.extend(await self.execute_task(task, operation))
             evidence = tuple(collected)
         except DbRuntimeGovernanceBlocked:
-            await self.store.save_operation(
-                replace(operation, status=OperationStatus.BLOCKED)
-            )
             raise
-        except Exception:
-            await self.store.save_operation(
-                replace(operation, status=OperationStatus.FAILED)
-            )
+        except Exception as exc:
+            await self.kernel.fail_operation_if_active(operation.id, exc)
             raise
-        await self.store.save_operation(
-            replace(operation, status=OperationStatus.SUCCEEDED)
-        )
-        await self.store.append_event(
-            self._runtime_event(
-                type=RuntimeEventType.OPERATION_UPDATED,
-                operation_id=operation.id,
-                message=f"Operation {operation.id} succeeded.",
-            )
-        )
+        await self.kernel.complete_operation(operation.id)
         return evidence
 
     async def inspect_operation(self, operation_id: str) -> OperationSnapshot | None:
@@ -551,43 +518,47 @@ class DbRuntime:
         snapshot = await self.inspect_operation(operation_id)
         if snapshot is None:
             raise KeyError(operation_id)
-        await self.store.append_event(
-            self._runtime_event(
-                type=RuntimeEventType.OPERATION_RESUMED,
-                operation_id=operation_id,
-                message=f"Operation {operation_id} resume requested.",
-                payload={
-                    "completed_task_ids": list(snapshot.completed_task_ids),
-                    "resumable_task_ids": list(snapshot.resumable_task_ids),
-                },
-            )
+        await self.kernel.append_event(
+            RuntimeEventType.OPERATION_RESUMED,
+            operation_id=operation_id,
+            message=f"Operation {operation_id} resume requested.",
+            payload={
+                "completed_task_ids": list(snapshot.completed_task_ids),
+                "resumable_task_ids": list(snapshot.resumable_task_ids),
+            },
         )
         for task in snapshot.tasks:
             if task.id in snapshot.completed_task_ids:
-                await self.store.append_event(
-                    self._runtime_event(
-                        type=RuntimeEventType.TASK_SKIPPED,
-                        operation_id=operation_id,
-                        task_id=task.id,
-                        task=task,
-                        message=(f"Task {task.id} already completed; not re-running."),
-                    )
+                await self.kernel.append_event(
+                    RuntimeEventType.TASK_SKIPPED,
+                    operation_id=operation_id,
+                    task=task,
+                    capability=self._capability_for_task(task),
+                    message=f"Task {task.id} already completed; not re-running.",
                 )
 
-        terminal_snapshot = await self._apply_terminal_approval_state(snapshot)
-        if terminal_snapshot is not None:
+        terminal_operation = await self.kernel.apply_terminal_approval_state(
+            operation_id
+        )
+        if terminal_operation is not None:
+            terminal_snapshot = await self.inspect_operation(operation_id)
+            if terminal_snapshot is None:
+                raise KeyError(operation_id)
             return terminal_snapshot
 
         if self._has_pending_approvals(snapshot):
-            await self.store.save_operation(
-                replace(snapshot.operation, status=OperationStatus.BLOCKED)
-            )
+            await self.kernel.block_operation(operation_id)
             resumed = await self.inspect_operation(operation_id)
             if resumed is None:
                 raise KeyError(operation_id)
             return resumed
 
-        snapshot = await self._recover_expired_task_claims(snapshot)
+        recovered_tasks = await self.kernel.recover_expired_task_claims(operation_id)
+        if recovered_tasks:
+            recovered = await self.inspect_operation(operation_id)
+            if recovered is None:
+                raise KeyError(operation_id)
+            snapshot = recovered
 
         resumable_tasks = tuple(
             task
@@ -597,8 +568,11 @@ class DbRuntime:
         )
         operation = snapshot.operation
         if resumable_tasks:
-            operation = replace(snapshot.operation, status=OperationStatus.RUNNING)
-            await self.store.save_operation(operation)
+            operation = await self.kernel.update_operation(
+                operation_id,
+                OperationStatus.RUNNING,
+                message=f"Operation {operation_id} resumed execution.",
+            )
         for task in resumable_tasks:
             try:
                 await self.execute_task(task, operation)
@@ -612,10 +586,8 @@ class DbRuntime:
                 if resumed is None:
                     raise KeyError(operation_id)
                 return resumed
-            except Exception:
-                await self.store.save_operation(
-                    replace(operation, status=OperationStatus.FAILED)
-                )
+            except Exception as exc:
+                await self.kernel.fail_operation_if_active(operation.id, exc)
                 raise
 
         completed = await self.inspect_operation(operation_id)
@@ -632,15 +604,9 @@ class DbRuntime:
             completed.tasks
             and completed.operation.status is not OperationStatus.SUCCEEDED
         ):
-            await self.store.save_operation(
-                replace(completed.operation, status=OperationStatus.SUCCEEDED)
-            )
-            await self.store.append_event(
-                self._runtime_event(
-                    type=RuntimeEventType.OPERATION_UPDATED,
-                    operation_id=operation_id,
-                    message=f"Operation {operation_id} succeeded after resume.",
-                )
+            await self.kernel.complete_operation(
+                operation_id,
+                message=f"Operation {operation_id} succeeded after resume.",
             )
         resumed = await self.inspect_operation(operation_id)
         if resumed is None:
@@ -774,11 +740,8 @@ class DbRuntime:
             await self.setup()
         intent = self.classify_request(db_request)
         contract = self.build_contract(db_request, intent)
-        operation_id = f"db-op-{uuid4()}"
-        operation = Operation(
-            id=operation_id,
+        operation = await self.kernel.create_operation(
             operation_type=contract.operation_type,
-            status=OperationStatus.RUNNING,
             request={
                 "prompt": db_request.prompt,
                 "user_id": db_request.user_id,
@@ -791,8 +754,6 @@ class DbRuntime:
             },
             required_evidence=frozenset(contract.required_evidence),
             metadata={
-                "runtime_id": self.runtime_id,
-                "runtime_kind": self.runtime_kind,
                 "intent_kind": intent.kind.value,
                 "access": contract.access.value,
                 "resume_context": {
@@ -801,16 +762,9 @@ class DbRuntime:
                     "contract": _db_contract_context(contract),
                 },
             },
+            evaluate_governance=False,
         )
-        await self.store.save_operation(operation)
-        await self.store.append_event(
-            self._runtime_event(
-                type=RuntimeEventType.OPERATION_CREATED,
-                operation_id=operation.id,
-                message=f"Operation {operation.id} created.",
-                payload={"operation_type": operation.operation_type},
-            )
-        )
+        operation_id = operation.id
 
         base_diagnostics = {
             "runtime_id": self.runtime_id,
@@ -833,40 +787,28 @@ class DbRuntime:
             )
 
         await self._persist_contract_tasks(operation, contract)
-        governance_persistence = await self._evaluate_governance(
-            operation,
-            contract=contract,
-            stage="operation",
-        )
-        governance = governance_persistence.result
-        base_diagnostics = {
-            **base_diagnostics,
-            "governance": governance.to_dict(),
-        }
-        if governance.blocked:
-            await self._commit_operation_governance_blocked(
-                operation,
-                governance_persistence,
-                governance=governance,
-            )
-            return await self._record_operation_result(
-                DbOperationResult(
-                    operation_id=operation_id,
-                    request=db_request,
-                    intent=intent,
-                    contract=contract,
-                    status=OperationStatus.BLOCKED,
-                    answer="This operation was denied by governance policy.",
-                    warnings=("db_runtime_governance_denied",),
-                    diagnostics=base_diagnostics,
-                ),
-            )
-        if governance.pending_approval:
-            await self._commit_operation_governance_blocked(
-                operation,
-                governance_persistence,
-                governance=governance,
-            )
+        try:
+            governance = await self.kernel.evaluate_operation_governance(operation.id)
+        except RuntimeKernelGovernanceBlocked as exc:
+            governance = exc.governance or GovernanceResult(False, True, False)
+            base_diagnostics = {
+                **base_diagnostics,
+                "governance": governance.to_dict(),
+            }
+            if governance.blocked:
+                return await self._record_operation_result(
+                    DbOperationResult(
+                        operation_id=operation_id,
+                        request=db_request,
+                        intent=intent,
+                        contract=contract,
+                        status=OperationStatus.BLOCKED,
+                        answer="This operation was denied by governance policy.",
+                        warnings=("db_runtime_governance_denied",),
+                        diagnostics=base_diagnostics,
+                    ),
+                    operation=exc.operation or operation,
+                )
             return await self._record_operation_result(
                 DbOperationResult(
                     operation_id=operation_id,
@@ -878,13 +820,12 @@ class DbRuntime:
                     warnings=("db_runtime_approval_required",),
                     diagnostics=base_diagnostics,
                 ),
+                operation=exc.operation or operation,
             )
-        await self.store.commit_governance_evaluation(
-            decisions=governance.decisions,
-            audit_record=governance_persistence.audit_record,
-            approval_requests=governance_persistence.approvals_to_request,
-            events=governance_persistence.events,
-        )
+        base_diagnostics = {
+            **base_diagnostics,
+            "governance": governance.to_dict(),
+        }
 
         try:
             outcome = await DbOperationExecutor(self).execute(
@@ -979,23 +920,16 @@ class DbRuntime:
             operation=operation,
         )
 
-    async def _persist_planned_task(self, task: Task) -> None:
-        await self.store.save_task(replace(task, status=TaskStatus.PENDING))
-        await self.store.append_event(
-            self._runtime_event(
-                type=RuntimeEventType.TASK_CREATED,
-                operation_id=task.operation_id,
-                task_id=task.id,
-                task=task,
-                message=f"Task {task.id} planned.",
-                payload={
-                    "capability_id": task.capability_id,
-                    "executor_id": task.executor_id,
-                    "input": task.input,
-                    "required_evidence": sorted(task.required_evidence),
-                    "metadata": task.metadata,
-                },
-            )
+    async def _plan_kernel_task(self, task: Task) -> Task:
+        """Persist a DB-planned task through the shared kernel planner."""
+        return await self.kernel.plan_task(
+            task_id=task.id,
+            operation_id=task.operation_id,
+            capability_id=task.capability_id,
+            owner=str(task.metadata["owner"]) if task.metadata.get("owner") else None,
+            input=task.input,
+            metadata=task.metadata,
+            dependencies=task.dependencies,
         )
 
     async def _persist_contract_tasks(
@@ -1064,7 +998,7 @@ class DbRuntime:
                     "side_effecting": capability.side_effecting,
                 },
             )
-            await self._persist_planned_task(task)
+            await self._plan_kernel_task(task)
             existing.add(key)
             planned_by_capability[(capability.id, capability.owner)] = task
 
@@ -1128,7 +1062,10 @@ class DbRuntime:
         write_task = self._task_for_capability(
             operation,
             capability,
-            input={"sql_ref": "sql.validation"},
+            input={
+                "sql_ref": "sql.validation",
+                "params": list(input.get("params") or []),
+            },
             reason="direct",
             sequence=2,
             validation_task=validation_task,
@@ -1385,129 +1322,6 @@ class DbRuntime:
         ]
         return matches[-1] if matches else None
 
-    async def _persist_pre_execution_task_block(
-        self,
-        *,
-        operation: Operation | None,
-        task: Task,
-        events: tuple[RuntimeEvent, ...],
-    ) -> None:
-        commit = getattr(self.store, "commit_task_blocked", None)
-        if commit is not None:
-            await commit(operation=operation, task=task, events=events)
-            return
-        if operation is not None:
-            await self.store.save_operation(operation)
-        await self.store.save_task(task)
-        for event in events:
-            await self.store.append_event(event)
-
-    async def _recover_expired_task_claims(
-        self,
-        snapshot: OperationSnapshot,
-    ) -> OperationSnapshot:
-        now = time.time()
-        changed = False
-        for task in snapshot.tasks:
-            if task.status is not TaskStatus.RUNNING:
-                continue
-            lease_expires_at = task.metadata.get("lease_expires_at")
-            if lease_expires_at is None or float(lease_expires_at) > now:
-                continue
-            capability = self._capability_for_task(task)
-            if (
-                capability.idempotent
-                or capability.replay_safe
-                or not capability.side_effecting
-            ):
-                await self.store.save_task(
-                    replace(
-                        task,
-                        status=TaskStatus.PENDING,
-                        metadata={
-                            **task.metadata,
-                            "lease_owner": None,
-                            "lease_expires_at": None,
-                            "expired_lease_recovered": True,
-                        },
-                    )
-                )
-            else:
-                await self.store.save_operation(
-                    replace(snapshot.operation, status=OperationStatus.BLOCKED)
-                )
-                await self.store.save_task(
-                    replace(
-                        task,
-                        status=TaskStatus.BLOCKED,
-                        metadata={
-                            **task.metadata,
-                            "manual_recovery_required": True,
-                            "manual_recovery_reason": "expired_side_effecting_lease",
-                        },
-                    )
-                )
-                await self.store.append_event(
-                    self._runtime_event(
-                        type=RuntimeEventType.TASK_UPDATED,
-                        operation_id=snapshot.operation.id,
-                        task_id=task.id,
-                        task=task,
-                        message=(
-                            f"Task {task.id} lease expired; manual recovery required "
-                            "before replaying side-effecting work."
-                        ),
-                    )
-                )
-            changed = True
-        if not changed:
-            return snapshot
-        recovered = await self.inspect_operation(snapshot.operation.id)
-        if recovered is None:
-            raise KeyError(snapshot.operation.id)
-        return recovered
-
-    async def _apply_terminal_approval_state(
-        self,
-        snapshot: OperationSnapshot,
-    ) -> OperationSnapshot | None:
-        statuses = {request.status for request in snapshot.approval_requests}
-        if ApprovalStatus.REJECTED in statuses:
-            await self.store.save_operation(
-                replace(snapshot.operation, status=OperationStatus.FAILED)
-            )
-            message = (
-                f"Operation {snapshot.operation.id} failed because approval was "
-                "rejected."
-            )
-        elif ApprovalStatus.CANCELLED in statuses:
-            await self.store.save_operation(
-                replace(snapshot.operation, status=OperationStatus.CANCELLED)
-            )
-            message = f"Operation {snapshot.operation.id} cancelled by approval state."
-        elif ApprovalStatus.EXPIRED in statuses:
-            await self.store.save_operation(
-                replace(snapshot.operation, status=OperationStatus.BLOCKED)
-            )
-            message = (
-                f"Operation {snapshot.operation.id} remains blocked because "
-                "approval expired."
-            )
-        else:
-            return None
-
-        await self.store.append_event(
-            self._runtime_event(
-                type=RuntimeEventType.OPERATION_UPDATED,
-                operation_id=snapshot.operation.id,
-                message=message,
-            )
-        )
-        updated = await self.inspect_operation(snapshot.operation.id)
-        if updated is None:
-            raise KeyError(snapshot.operation.id)
-        return updated
-
     @staticmethod
     def _has_pending_approvals(snapshot: OperationSnapshot) -> bool:
         return any(
@@ -1566,31 +1380,6 @@ class DbRuntime:
             operation=snapshot.operation,
         )
 
-    async def _enforce_governance(
-        self,
-        operation: Operation,
-        contract: DbOperationContract | None = None,
-        *,
-        task: Task | None = None,
-        capability: Capability | None = None,
-        stage: str,
-    ) -> GovernanceResult:
-        governance = await self._evaluate_governance(
-            operation,
-            contract=contract,
-            task=task,
-            capability=capability,
-            stage=stage,
-        )
-        if not governance.result.blocked and not governance.result.pending_approval:
-            await self.store.commit_governance_evaluation(
-                decisions=governance.result.decisions,
-                audit_record=governance.audit_record,
-                approval_requests=governance.approvals_to_request,
-                events=governance.events,
-            )
-        return governance.result
-
     async def evaluate_governance_persistence(
         self,
         operation: Operation,
@@ -1600,8 +1389,14 @@ class DbRuntime:
         stage: str,
     ) -> _GovernancePersistence:
         """Build DB-owned governance facts for kernel task execution."""
+        contract = (
+            _db_contract_from_context(operation)
+            if stage == "operation" and _operation_has_run_context(operation)
+            else None
+        )
         return await self._evaluate_governance(
             operation,
+            contract=contract,
             task=task,
             capability=capability,
             stage=stage,
@@ -1720,30 +1515,6 @@ class DbRuntime:
             audit_record=audit_record,
             approvals_to_request=approvals_to_request,
             events=tuple(events),
-        )
-
-    async def _commit_operation_governance_blocked(
-        self,
-        operation: Operation,
-        governance_persistence: _GovernancePersistence,
-        *,
-        governance: GovernanceResult,
-    ) -> None:
-        await self.store.commit_governance_blocked(
-            operation=replace(operation, status=OperationStatus.BLOCKED),
-            task=None,
-            decisions=governance.decisions,
-            audit_record=governance_persistence.audit_record,
-            approval_requests=governance_persistence.approvals_to_request,
-            events=(
-                *governance_persistence.events,
-                self._runtime_event(
-                    type=RuntimeEventType.OPERATION_UPDATED,
-                    operation_id=operation.id,
-                    message=f"Operation {operation.id} blocked by governance policy.",
-                    payload={"governance": governance.to_dict()},
-                ),
-            ),
         )
 
     async def _governance_audit_record(
@@ -1939,18 +1710,35 @@ class DbRuntime:
         self._operation_results.append(result)
         self._audit_log.append(_audit_entry_from_result(result))
         if operation is not None:
-            await self.store.save_operation(replace(operation, status=result.status))
-            await self.store.append_event(
-                self._runtime_event(
-                    type=RuntimeEventType.OPERATION_UPDATED,
-                    operation_id=result.operation_id,
-                    message=(
-                        f"Operation {result.operation_id} finished with "
-                        f"{result.status.value}."
-                    ),
-                    payload={"warnings": list(result.warnings)},
-                )
+            message = (
+                f"Operation {result.operation_id} finished with "
+                f"{result.status.value}."
             )
+            payload = {"warnings": list(result.warnings)}
+            if result.status in {
+                OperationStatus.SUCCEEDED,
+                OperationStatus.FAILED,
+                OperationStatus.CANCELLED,
+            }:
+                await self.kernel.complete_operation(
+                    result.operation_id,
+                    status=result.status,
+                    message=message,
+                    payload=payload,
+                )
+            elif result.status is OperationStatus.BLOCKED:
+                await self.kernel.block_operation(
+                    result.operation_id,
+                    message=message,
+                    payload=payload,
+                )
+            else:
+                await self.kernel.update_operation(
+                    result.operation_id,
+                    result.status,
+                    message=message,
+                    payload=payload,
+                )
         return result
 
     async def _stored_operation_count(self) -> int:

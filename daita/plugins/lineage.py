@@ -105,6 +105,16 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _lineage_entity_payload(value: Any) -> Any:
+    """Ensure lineage node evidence exposes a stable entity_id key."""
+    if not isinstance(value, Mapping):
+        return value
+    payload = dict(value)
+    if "entity_id" not in payload and "node_id" in payload:
+        payload["entity_id"] = payload["node_id"]
+    return payload
+
+
 class LineagePlugin(BasePlugin):
     """
     Plugin for data lineage tracking and analysis.
@@ -327,6 +337,8 @@ class LineagePlugin(BasePlugin):
                 downstream = result
             upstream = _json_safe(upstream)
             downstream = _json_safe(downstream)
+            upstream = [_lineage_entity_payload(item) for item in upstream]
+            downstream = [_lineage_entity_payload(item) for item in downstream]
             lineage = {
                 "entity_id": entity_id,
                 "upstream": upstream,

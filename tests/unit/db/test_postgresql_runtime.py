@@ -1,4 +1,5 @@
 from daita.db import DbRequest, DbRuntime
+from daita.db.runtime import DbRuntimeGovernanceBlocked
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.postgresql import PostgreSQLPlugin
 
@@ -74,6 +75,7 @@ async def test_postgresql_schema_inspect_returns_typed_evidence_through_runtime(
     postgres.tables = fake_tables
     postgres.describe = fake_describe
     postgres.foreign_keys = fake_foreign_keys
+    postgres.connect = _noop_connect
     runtime = DbRuntime(plugins=(postgres,))
 
     evidence = await runtime.execute_capability(
@@ -106,6 +108,7 @@ async def test_postgresql_sql_executors_return_typed_evidence_without_live_db():
 
     postgres.query = fake_query
     postgres.execute = fake_execute
+    postgres.connect = _noop_connect
     runtime = DbRuntime(plugins=(postgres,))
 
     validation = await runtime.execute_capability(
@@ -126,12 +129,25 @@ async def test_postgresql_sql_executors_return_typed_evidence_without_live_db():
         operation_type="data.query",
         input={"sql": "SELECT COUNT(*) AS count FROM orders"},
     )
-    write = await runtime.execute_capability(
-        "db.sql.execute_write",
-        owner="postgresql",
-        operation_type="write.execute",
-        input={"sql": "UPDATE orders SET total = $1 WHERE id = $2", "params": [5, 1]},
-    )
+    try:
+        await runtime.execute_capability(
+            "db.sql.execute_write",
+            owner="postgresql",
+            operation_type="write.execute",
+            input={
+                "sql": "UPDATE orders SET total = $1 WHERE id = $2",
+                "params": [5, 1],
+            },
+        )
+    except DbRuntimeGovernanceBlocked as exc:
+        snapshot = await runtime.inspect_operation(exc.operation.id)
+        await runtime.approval_channel.approve(
+            snapshot.approval_requests[0].approval_id
+        )
+        resumed = await runtime.resume_operation(exc.operation.id)
+        write = tuple(
+            item for item in resumed.evidence if item.kind == "write.execution"
+        )
 
     assert validation[0].payload["valid"] is True
     assert validation[0].payload["tables"] == ["orders"]
@@ -142,3 +158,7 @@ async def test_postgresql_sql_executors_return_typed_evidence_without_live_db():
     assert plan[0].payload["plan"] == [{"QUERY PLAN": "Seq Scan on orders"}]
     assert write[0].kind == "write.execution"
     assert write[0].payload["affected_rows"] == 3
+
+
+async def _noop_connect() -> None:
+    return None

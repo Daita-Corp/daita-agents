@@ -10,9 +10,9 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from .base import PluginContext
 from .base_db import BaseDatabasePlugin
+from daita.runtime import EvidenceWrappingExecutor
 from .sqlite_extensions import (
     SQLITE_MANIFEST,
-    SQLiteExecutor,
     sqlite_capabilities,
     sqlite_evidence_schemas,
     sqlite_tool_views,
@@ -139,32 +139,37 @@ class SQLitePlugin(BaseDatabasePlugin):
 
     def get_executors(self):
         return (
-            SQLiteExecutor(
+            EvidenceWrappingExecutor(
                 id="sqlite.schema.inspect",
+                owner="sqlite",
                 capability_ids=frozenset({"db.schema.inspect"}),
                 evidence_kind="schema.asset_profile",
                 handler=self._execute_schema_inspect,
             ),
-            SQLiteExecutor(
+            EvidenceWrappingExecutor(
                 id="sqlite.sql.validate",
+                owner="sqlite",
                 capability_ids=frozenset({"db.sql.validate"}),
                 evidence_kind="sql.validation",
                 handler=self._execute_sql_validate,
             ),
-            SQLiteExecutor(
+            EvidenceWrappingExecutor(
                 id="sqlite.sql.execute_read",
+                owner="sqlite",
                 capability_ids=frozenset({"db.sql.execute_read"}),
                 evidence_kind="query.result",
                 handler=self._execute_sql_read,
             ),
-            SQLiteExecutor(
+            EvidenceWrappingExecutor(
                 id="sqlite.sql.execute_write",
+                owner="sqlite",
                 capability_ids=frozenset({"db.sql.execute_write"}),
                 evidence_kind="write.execution",
                 handler=self._execute_sql_write,
             ),
-            SQLiteExecutor(
+            EvidenceWrappingExecutor(
                 id="sqlite.sql.explain",
+                owner="sqlite",
                 capability_ids=frozenset({"db.sql.explain"}),
                 evidence_kind="query.plan",
                 handler=self._execute_sql_explain,

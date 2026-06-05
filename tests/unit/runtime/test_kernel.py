@@ -6,6 +6,8 @@ import pytest
 from daita.plugins import ExtensionRegistry, PluginKind, PluginManifest
 from daita.runtime import (
     AccessMode,
+    ApprovalRequest,
+    ApprovalStatus,
     Capability,
     Evidence,
     InMemoryRuntimeStore,
@@ -176,6 +178,134 @@ async def test_execute_task_persists_evidence_and_correlated_events():
     )
     assert evidence_event.evidence_id == result.evidence[0].id
     assert evidence_event.plugin_id == "kernel_test"
+
+
+async def test_operation_helpers_complete_and_emit_consistent_event():
+    kernel, store, _ = _kernel()
+    operation = await kernel.create_operation(
+        operation_type="kernel.echo",
+        request={"value": "alpha"},
+    )
+
+    updated = await kernel.complete_operation(
+        operation.id,
+        payload={"answer": "done"},
+    )
+    snapshot = await store.inspect_operation(operation.id)
+
+    assert updated.status is OperationStatus.SUCCEEDED
+    assert snapshot.operation.status is OperationStatus.SUCCEEDED
+    event = snapshot.events[-1]
+    assert event.type is RuntimeEventType.OPERATION_UPDATED
+    assert event.runtime_id == "runtime-1"
+    assert event.runtime_kind == "test"
+    assert event.operation_id == operation.id
+    assert event.payload["status"] == "succeeded"
+    assert event.payload["answer"] == "done"
+
+
+async def test_fail_operation_if_active_emits_error_and_terminal_noops():
+    kernel, store, _ = _kernel()
+    operation = await kernel.create_operation(
+        operation_type="kernel.echo",
+        request={"value": "alpha"},
+    )
+
+    failed = await kernel.fail_operation_if_active(
+        operation.id,
+        ValueError("boom"),
+    )
+    second = await kernel.fail_operation_if_active(
+        operation.id,
+        RuntimeError("ignored"),
+    )
+    snapshot = await store.inspect_operation(operation.id)
+
+    assert failed.status is OperationStatus.FAILED
+    assert second is None
+    assert snapshot.operation.status is OperationStatus.FAILED
+    error_events = [
+        event for event in snapshot.events if event.type is RuntimeEventType.ERROR
+    ]
+    assert len(error_events) == 1
+    assert error_events[0].payload["status"] == "failed"
+    assert error_events[0].payload["error"]["type"] == "ValueError"
+
+
+async def test_append_event_correlates_runtime_task_and_capability():
+    kernel, store, _ = _kernel()
+    operation, task = await _persist_echo_task(store)
+    capability = kernel.extension_registry.get_capability(
+        "kernel.echo",
+        owner="kernel_test",
+    )
+
+    event = await kernel.append_event(
+        RuntimeEventType.DIAGNOSTIC,
+        operation_id=operation.id,
+        task=task,
+        capability=capability,
+        message="diagnostic",
+        payload={"ok": True},
+    )
+
+    assert event.runtime_id == "runtime-1"
+    assert event.runtime_kind == "test"
+    assert event.task_id == task.id
+    assert event.capability_id == capability.id
+    assert event.executor_id == capability.executor
+    assert event.plugin_id == capability.owner
+    assert (await store.inspect_operation(operation.id)).events[-1] == event
+
+
+async def test_apply_terminal_approval_state_updates_operation():
+    kernel, store, _ = _kernel()
+    operation = await kernel.create_operation(
+        operation_type="kernel.echo",
+        request={"value": "alpha"},
+    )
+    await store.save_approval_request(
+        ApprovalRequest(
+            approval_id="approval-1",
+            operation_id=operation.id,
+            reason="Rejected.",
+            proposed_action={"approval": "human"},
+            risk=RiskLevel.MEDIUM,
+            status=ApprovalStatus.REJECTED,
+        )
+    )
+
+    updated = await kernel.apply_terminal_approval_state(operation.id)
+    snapshot = await store.inspect_operation(operation.id)
+
+    assert updated.status is OperationStatus.FAILED
+    assert snapshot.operation.status is OperationStatus.FAILED
+    assert snapshot.events[-1].type is RuntimeEventType.OPERATION_UPDATED
+
+
+async def test_recover_expired_task_claims_requeues_safe_task():
+    kernel, store, _ = _kernel()
+    operation, task = await _persist_echo_task(store)
+    await store.save_task(
+        replace(
+            task,
+            status=TaskStatus.RUNNING,
+            metadata={
+                **task.metadata,
+                "lease_id": "lease-1",
+                "lease_owner": "worker",
+                "lease_expires_at": 0.0,
+            },
+        )
+    )
+
+    recovered = await kernel.recover_expired_task_claims(operation.id)
+    stored = await store.load_task(task.id)
+
+    assert recovered[0].status is TaskStatus.PENDING
+    assert stored.status is TaskStatus.PENDING
+    assert stored.metadata["expired_lease_recovered"] is True
+    assert "lease_id" not in stored.metadata
 
 
 async def test_policy_block_prevents_executor_invocation():

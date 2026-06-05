@@ -35,6 +35,7 @@ from .primitives import (
 from .governance import PolicyEvaluator, evaluate_policies
 from .approvals import InMemoryApprovalChannel
 from .events import RuntimeStreamEvent
+from .executors import EvidenceWrappingExecutor
 from .kernel import (
     RuntimeFactProvider,
     RuntimeKernel,
@@ -46,6 +47,12 @@ from .kernel import (
     RuntimeKernelTaskNotRunnable,
     TaskExecutionResult,
     TaskLease,
+)
+from .tool_adapters import (
+    LocalToolRuntimeAdapter,
+    LocalToolRuntimeRegistration,
+    local_tool_plugin_for,
+    register_local_tool,
 )
 from .monitors import MonitorRuntime, MonitorSpec, MonitorState, MonitorTickResult
 from .scheduler import OperationScheduleResult, OperationTaskScheduler
@@ -68,6 +75,7 @@ __all__ = [
     "ContextProvider",
     "Evidence",
     "EvidenceSchema",
+    "EvidenceWrappingExecutor",
     "Executor",
     "GovernanceAuditRecord",
     "GovernanceResult",
@@ -92,6 +100,8 @@ __all__ = [
     "RuntimeKernelTaskNotRunnable",
     "RuntimeStore",
     "RuntimeStreamEvent",
+    "LocalToolRuntimeAdapter",
+    "LocalToolRuntimeRegistration",
     "InMemoryApprovalChannel",
     "InMemoryRuntimeStore",
     "MonitorRuntime",
@@ -114,4 +124,6 @@ __all__ = [
     "WorkerRuntime",
     "WorkerRuntimeOptions",
     "evaluate_policies",
+    "local_tool_plugin_for",
+    "register_local_tool",
 ]

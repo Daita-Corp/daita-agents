@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from daita.core.exceptions import SkillError
 from daita.core.tools import LocalTool
-from daita.plugins.base import PluginContext
+from daita.plugins.base import PluginContext, ServiceRegistry
 from daita.plugins.manifest import PluginManifest
 from daita.plugins.registry import RegistryDiagnostic
 from daita.runtime import (
@@ -54,16 +54,20 @@ class ChatAgentFacadeMixin:
 
     async def _setup_extension_plugins(self) -> None:
         """Set up runtime-aware plugins through the extension registry."""
-        pending_plugin_ids = self._pending_extension_setup_plugin_ids()
-        if not pending_plugin_ids:
-            return
-
         context = PluginContext(
             runtime_id=self.agent_id,
             runtime_kind="agent",
             agent_id=self.agent_id,
+            services=ServiceRegistry(
+                {
+                    "extension_registry": self.extension_registry,
+                    "runtime_store": self.runtime_store,
+                    "runtime_kernel": self.runtime_kernel,
+                }
+            ),
         )
-        for plugin_id in pending_plugin_ids:
+        while pending_plugin_ids := self._pending_extension_setup_plugin_ids():
+            plugin_id = pending_plugin_ids[0]
             await self.extension_registry.setup_plugin(plugin_id, context)
             self._extension_setup_plugin_ids.add(plugin_id)
 

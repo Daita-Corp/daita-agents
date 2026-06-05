@@ -4,17 +4,11 @@ Extension declarations for SQLitePlugin.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Mapping
-
 from daita.runtime import (
     AccessMode,
     Capability,
-    Evidence,
     EvidenceSchema,
-    Operation,
     RiskLevel,
-    Task,
     ToolView,
 )
 
@@ -159,30 +153,3 @@ def sqlite_tool_views() -> tuple[ToolView, ...]:
             parameters=parameters,
         ),
     )
-
-
-@dataclass(frozen=True)
-class SQLiteExecutor:
-    """Executor that delegates one task to a SQLitePlugin method."""
-
-    id: str
-    capability_ids: frozenset[str]
-    evidence_kind: str
-    handler: Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]]
-
-    async def execute(
-        self,
-        task: Task,
-        operation: Operation,
-        context: Mapping[str, Any],
-    ) -> list[Evidence]:
-        payload = await self.handler(task.input)
-        return [
-            Evidence(
-                kind=self.evidence_kind,
-                owner="sqlite",
-                operation_id=operation.id,
-                task_id=task.id,
-                payload=payload,
-            )
-        ]

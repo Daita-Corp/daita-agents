@@ -501,22 +501,18 @@ class DbOperationExecutor:
                     )
                 except KeyError:
                     continue
-                await self.runtime.store.append_event(
-                    self.runtime._runtime_event(
-                        type=RuntimeEventType.WORKER_DELEGATED,
-                        operation_id=operation.id,
-                        capability=capability,
-                        message=(
-                            f"Delegated {role} work to {worker.owner}:{worker.id}."
-                        ),
-                        payload={
-                            "worker_id": worker.id,
-                            "worker_owner": worker.owner,
-                            "worker_role": worker.role,
-                            "capability_id": capability.id,
-                            "prompt": request.prompt,
-                        },
-                    )
+                await self.runtime.kernel.append_event(
+                    RuntimeEventType.WORKER_DELEGATED,
+                    operation_id=operation.id,
+                    capability=capability,
+                    message=f"Delegated {role} work to {worker.owner}:{worker.id}.",
+                    payload={
+                        "worker_id": worker.id,
+                        "worker_owner": worker.owner,
+                        "worker_role": worker.role,
+                        "capability_id": capability.id,
+                        "prompt": request.prompt,
+                    },
                 )
                 task = await self._persist_worker_task(
                     capability,
@@ -585,7 +581,7 @@ class DbOperationExecutor:
         )
         tasks.append(task)
         if planned is None:
-            await self.runtime._persist_planned_task(task)
+            task = await self.runtime._plan_kernel_task(task)
         else:
             await self.runtime.store.save_task(task)
         return task

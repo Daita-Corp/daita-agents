@@ -151,13 +151,23 @@ class ExtensionRegistry:
     async def setup_all(self, context: PluginContext) -> None:
         """Call setup(context) on registered plugins."""
         completed: list[Any] = []
-        for plugin in self._plugins.values():
+        completed_ids: set[str] = set()
+        while True:
+            pending_ids = [
+                plugin_id
+                for plugin_id in self.plugin_ids
+                if plugin_id not in completed_ids
+            ]
+            if not pending_ids:
+                return
+            plugin = self.get_plugin(pending_ids[0])
             try:
                 await self._setup_plugin(plugin, context)
             except Exception:
                 await self._teardown_plugins(reversed(completed))
                 raise
             completed.append(plugin)
+            completed_ids.add(pending_ids[0])
 
     async def setup_plugin(self, plugin_id: str, context: PluginContext) -> None:
         """Call setup(context) on one registered plugin."""

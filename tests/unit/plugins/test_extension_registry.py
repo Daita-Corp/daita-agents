@@ -8,6 +8,7 @@ from daita.plugins import (
     PluginContext,
     PluginKind,
     PluginManifest,
+    ServiceRegistry,
 )
 from daita.runtime import (
     AccessMode,
@@ -555,6 +556,21 @@ class FailingSetupPlugin:
         self.teardown_called = True
 
 
+class SetupRegistersPlugin:
+    manifest = PluginManifest(
+        id="setup_registers",
+        display_name="Setup Registers",
+        version="1.0.0",
+        kind=PluginKind.RUNTIME_EXTENSION,
+    )
+
+    def __init__(self, child):
+        self.child = child
+
+    async def setup(self, context):
+        context.services.require("extension_registry").register(self.child)
+
+
 def test_manifest_is_stable_and_serializable():
     manifest = PluginManifest(
         id="data_quality",
@@ -800,6 +816,22 @@ async def test_registry_runs_setup_and_teardown_hooks():
 
     assert plugin.setup_context is context
     assert plugin.teardown_called is True
+
+
+async def test_registry_setup_all_runs_setup_time_registered_plugins():
+    child = NamedSetupTeardownPlugin("setup_child")
+    parent = SetupRegistersPlugin(child)
+    registry = ExtensionRegistry()
+    registry.register(parent)
+
+    context = PluginContext(
+        runtime_id="runtime-1",
+        runtime_kind="test",
+        services=ServiceRegistry({"extension_registry": registry}),
+    )
+    await registry.setup_all(context)
+
+    assert child.setup_context is context
 
 
 async def test_registry_rolls_back_completed_setup_on_later_failure():

@@ -1,4 +1,5 @@
 from daita.db import DbRuntime
+from daita.db.runtime import DbRuntimeGovernanceBlocked
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
 
@@ -152,15 +153,25 @@ async def test_sqlite_explain_and_write_executors_return_typed_evidence():
             operation_type="data.query",
             input={"sql": "SELECT email FROM customers"},
         )
-        write = await runtime.execute_capability(
-            "db.sql.execute_write",
-            owner="sqlite",
-            operation_type="write.execute",
-            input={
-                "sql": "UPDATE orders SET total = ? WHERE id = ?",
-                "params": [50, 10],
-            },
-        )
+        try:
+            await runtime.execute_capability(
+                "db.sql.execute_write",
+                owner="sqlite",
+                operation_type="write.execute",
+                input={
+                    "sql": "UPDATE orders SET total = ? WHERE id = ?",
+                    "params": [50, 10],
+                },
+            )
+        except DbRuntimeGovernanceBlocked as exc:
+            snapshot = await runtime.inspect_operation(exc.operation.id)
+            await runtime.approval_channel.approve(
+                snapshot.approval_requests[0].approval_id
+            )
+            resumed = await runtime.resume_operation(exc.operation.id)
+            write = tuple(
+                item for item in resumed.evidence if item.kind == "write.execution"
+            )
     finally:
         await runtime.teardown()
 
