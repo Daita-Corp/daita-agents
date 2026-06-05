@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from daita.agents.agent import Agent
-from daita.agents.chat_runtime import ChatRunResult
+from daita.agents.chat.runtime import ChatRunResult
 from daita.plugins import ExtensionRegistry, PluginKind, PluginManifest
 from daita.runtime import (
     AccessMode,

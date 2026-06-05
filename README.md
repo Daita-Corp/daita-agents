@@ -71,7 +71,7 @@ asyncio.run(main())
 - **Analyst operations** — DB agents can execute higher-level data operations for pivots, correlations, anomaly detection, entity comparison, similarity search, and trend forecasting.
 - **Data quality enforcement** — `ItemAssertion` + `query_checked()` validate every returned row and fail fast with structured `DataQualityError` violations.
 - **Graph-backed lineage and impact analysis** — the core graph layer models tables, columns, pipelines, APIs, files, metrics, queries, and transformations; expose traversal tools with `register_graph_tools()`.
-- **Data watches** — `@agent.watch()` monitors databases and APIs continuously, retries dropped connections, and triggers agent actions when thresholds are crossed or resolved.
+- **Runtime monitors** — monitor specifications and scheduler paths create runtime operations and tasks for threshold-driven work.
 - **Data-aware memory** — persistent semantic memory, working memory, fact extraction, contradiction checks, and memory graphs let agents keep business context without stuffing every run into the prompt.
 - **Tracing and auditability** — OpenTelemetry-backed spans cover agent runs, LLM calls, capability and tool-view executions, retries, plugin operations, latency, tokens, and cost, with optional OTLP export.
 - **Plugin ecosystem** — databases, vector stores, catalogs, memory, data quality, lineage, cloud storage, APIs, messaging, MCP, and search integrations.
@@ -419,32 +419,37 @@ Sessions persist to `.daita/sessions/` between process restarts.
 
 ---
 
-### Monitor data sources with `@agent.watch()`
+### Monitor data sources with runtime monitors
 
-Continuously poll a data source and trigger the agent when a threshold is crossed:
+Declare monitor specs and execute actions through the runtime kernel when a threshold is crossed:
 
 ```python
 import asyncio
-from daita import Agent, WatchEvent
-from daita.plugins import postgresql
+from daita.runtime import MonitorRuntime, MonitorSpec, RuntimeKernel, InMemoryRuntimeStore
+from daita.plugins import ExtensionRegistry
 
-db = postgresql(host="localhost", database="ops_db")
-agent = Agent(name="Ops Monitor", llm_provider="openai", model="gpt-4o")
-agent.add_plugin(db)
-
-@agent.watch(
-    source=db,
-    condition="SELECT COUNT(*) FROM failed_jobs WHERE created_at > NOW() - INTERVAL '5m'",
-    threshold=lambda v: v > 10,
-    interval="1m",
+registry = ExtensionRegistry()
+store = InMemoryRuntimeStore()
+kernel = RuntimeKernel(
+    runtime_id="ops-monitor",
+    runtime_kind="monitor",
+    extension_registry=registry,
+    runtime_store=store,
 )
-async def on_job_failures(event: WatchEvent):
-    await agent.run(f"There are {event.value} failed jobs in the last 5 minutes. Diagnose and suggest fixes.")
+monitor = MonitorRuntime(kernel=kernel)
 
-asyncio.run(agent.start())
+spec = MonitorSpec(
+    id="failed-jobs",
+    name="Failed jobs",
+    trigger={"gt": 10},
+    action_capability_id="ops.alert",
+    action_input={"severity": "warning"},
+)
+
+asyncio.run(monitor.tick(spec, value=12, execute_actions=True))
 ```
 
-Watches start lazily on the first `run()` call, or explicitly with `await agent.start()`.
+Scheduled polling belongs in `daita.runtime.scheduler`; monitor actions execute through `RuntimeKernel`.
 
 ---
 

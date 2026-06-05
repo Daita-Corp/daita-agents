@@ -15,11 +15,7 @@ Responsibilities:
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Union
-
-if TYPE_CHECKING:
-    from ..core.watch import WatchConfig, WatchEvent, WatchState
+from typing import Any, Dict, List, Optional
 
 from ..config.base import AgentConfig
 from ..core.interfaces import LLMProvider
@@ -75,12 +71,6 @@ class BaseAgent:
         self._running = False
         self._tasks = []
 
-        # Watch system state
-        self._watches: list = []
-        self._watch_states: dict = {}
-        self._watches_started: bool = False
-        self._watches_lock: asyncio.Lock = asyncio.Lock()
-
         # Get trace manager for automatic tracing
         self.trace_manager = get_trace_manager()
 
@@ -119,9 +109,6 @@ class BaseAgent:
             self._running = True
             logger.info(f"Agent {self.name} started")
 
-        # Start watches after _running is True so tasks can check agent state
-        await self._start_watches()
-
     async def stop(self) -> None:
         """Stop the agent with automatic lifecycle tracing."""
         if not self._running:
@@ -159,282 +146,6 @@ class BaseAgent:
 
             self._running = False
             logger.info(f"Agent {self.name} stopped")
-
-    # ========================================================================
-    # WATCH SYSTEM — polling/streaming data source monitoring
-    # ========================================================================
-
-    def watch(
-        self,
-        source: Any = None,
-        *,
-        condition: Any = None,
-        threshold: Optional[Callable[[Any], bool]] = None,
-        interval: Optional[Union[str, timedelta]] = None,
-        on_resolve: bool = False,
-        cooldown: Optional[Union[bool, str, timedelta]] = None,
-        topic: Optional[str] = None,
-        filter: Optional[Callable[[Any], bool]] = None,
-        relay_channel: Optional[str] = None,
-        on_error: Optional[Callable[[Exception], Awaitable[None]]] = None,
-        handler_timeout: Optional[float] = None,
-        name: Optional[str] = None,
-    ) -> Callable:
-        """Decorator: register an async handler as a watch on a data source.
-
-        Polling example::
-
-            @agent.watch(source=pg,
-                         condition="SELECT COUNT(*) FROM orders",
-                         threshold=lambda v: v > 100,
-                         interval="10s",
-                         cooldown=True)
-            async def on_spike(event: WatchEvent):
-                print(f"Order spike: {event.value}")
-
-        Watches start automatically when ``agent.start()`` is called, or lazily
-        on the first ``run()`` / ``stream()`` invocation.
-
-        Args:
-            source: Plugin or WatchSource to poll/subscribe.
-            condition: SQL string or async callable returning the watched value.
-            threshold: Called with the current value; watch fires when it returns True.
-            interval: Poll period — timedelta or string like "30s", "5m", "1h", "2d".
-            on_resolve: If True, fire again when the condition clears.
-            cooldown: Controls repeat alerting while a threshold is met.
-                False/None (default): fire every poll cycle.
-                True: fire once, then only on resolve (alarm model).
-                str/timedelta: fire once, then re-alert on this interval (e.g. "5m").
-            topic: Streaming topic (Phase 2).
-            filter: Message filter for streaming sources (Phase 2).
-            relay_channel: Relay channel to publish events to (Phase 3).
-            on_error: Called when the handler raises; receives the exception.
-            name: Override the watch name (defaults to handler.__name__).
-
-        Raises:
-            ValueError: If the configuration is invalid.
-        """
-        from ..core.watch import _parse_interval, WatchConfig, PollingWatchSource
-
-        if on_resolve and interval is None and topic is None:
-            raise ValueError(
-                "on_resolve=True requires either interval= (polling) or topic= (streaming)"
-            )
-
-        if interval is not None and condition is None and topic is None:
-            raise ValueError("interval= requires condition= to specify what to poll")
-
-        if filter is not None and threshold is not None:
-            raise ValueError(
-                "Cannot set both filter= and threshold=. "
-                "Use threshold= for polling watches, filter= for streaming watches."
-            )
-
-        if isinstance(interval, str):
-            interval = _parse_interval(interval)
-
-        # Normalize cooldown to bool | timedelta
-        if cooldown is None or cooldown is False:
-            cooldown_value: Union[bool, timedelta] = False
-        elif cooldown is True:
-            cooldown_value = True
-        elif isinstance(cooldown, str):
-            cooldown_value = _parse_interval(cooldown)
-        elif isinstance(cooldown, timedelta):
-            cooldown_value = cooldown
-        else:
-            raise ValueError(
-                f"cooldown must be bool, str, or timedelta — got {type(cooldown).__name__}"
-            )
-
-        def decorator(handler: Callable) -> Callable:
-            watch_name = name or handler.__name__
-
-            if self._watches_started:
-                raise RuntimeError(
-                    f"Cannot register watch '{watch_name}' after the agent has started. "
-                    "Register all watches before calling run() or start()."
-                )
-
-            if interval is not None:
-                watch_source = PollingWatchSource(
-                    plugin=source,
-                    condition=condition,
-                    interval=interval,
-                )
-            else:
-                watch_source = source
-
-            config = WatchConfig(
-                handler=handler,
-                source=watch_source,
-                name=watch_name,
-                threshold=threshold,
-                interval=interval,
-                on_resolve=on_resolve,
-                cooldown=cooldown_value,
-                topic=topic,
-                filter=filter,
-                relay_channel=relay_channel,
-                on_error=on_error,
-                handler_timeout=handler_timeout,
-            )
-            self._watches.append(config)
-            logger.debug(f"Registered watch '{watch_name}' on agent {self.name}")
-            return handler
-
-        return decorator
-
-    async def _start_watches(self) -> None:
-        """Start all registered watches. Idempotent, concurrency-safe.
-
-        Called from start() and as a lazy fallback from Agent._run_traced().
-        The fast path (no lock) handles the common single-caller case; the
-        lock + double-check guards concurrent run() calls.
-        """
-        if self._watches_started or not self._watches:
-            return
-        async with self._watches_lock:
-            if self._watches_started:  # re-check after acquiring
-                return
-            self._tasks = [t for t in self._tasks if not t.done()]
-            for config in self._watches:
-                await self._start_watch(config)
-            self._watches_started = True
-
-    async def _start_watch(self, config: "WatchConfig") -> None:
-        """Create and register a background task for a single watch."""
-        task = asyncio.create_task(
-            self._watch_loop(config), name=f"watch:{config.name}"
-        )
-        self._tasks.append(task)
-
-    async def _watch_loop(self, config: "WatchConfig") -> None:
-        """Core watch runtime: polls/streams the source, fires the handler on trigger.
-
-        State machine per poll cycle:
-        - Threshold met + not yet triggered → fire handler, mark triggered
-        - Threshold met + triggered + cooldown allows re-alert → fire handler
-        - Threshold met + triggered + cooldown suppresses → skip (poll continues)
-        - Threshold cleared + was triggered → reset state, fire resolve if on_resolve
-        """
-        from ..core.watch import WatchState
-
-        state = WatchState(config=config, task=asyncio.current_task(), status="running")
-        self._watch_states[config.name] = state
-
-        try:
-            async for raw_value in config.source.events():
-                try:
-                    threshold_met = self._should_trigger(config, state, raw_value)
-
-                    if threshold_met:
-                        if not state.triggered or self._should_realert(config, state):
-                            event = self._build_watch_event(config, state, raw_value)
-                            state.triggered = True
-                            state._last_trigger_time = datetime.now(timezone.utc)
-                            await self._invoke_handler(config.handler, event, config)
-                    elif state.triggered:
-                        state.triggered = False
-                        state._last_trigger_time = None
-                        if config.on_resolve:
-                            event = self._build_watch_event(
-                                config, state, raw_value, resolved=True
-                            )
-                            await self._invoke_handler(config.handler, event, config)
-
-                    state._previous_value = raw_value
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    state.last_error = e
-                    logger.error(f"Watch '{config.name}' iteration error: {e}")
-        except asyncio.CancelledError:
-            state.status = "stopped"
-        except Exception as e:
-            state.status = "error"
-            state.last_error = e
-            logger.error(
-                f"Watch '{config.name}' failed permanently: {type(e).__name__}: {e}",
-                exc_info=True,
-            )
-
-    def _should_trigger(
-        self, config: "WatchConfig", state: "WatchState", raw_value: Any
-    ) -> bool:
-        """Determine whether the threshold condition is met."""
-        if config.threshold is None:
-            return True
-        return config.threshold(raw_value)
-
-    def _should_realert(self, config: "WatchConfig", state: "WatchState") -> bool:
-        """Determine whether a triggered watch should fire again.
-
-        Called only when threshold is still met and state.triggered is True.
-        Returns False to suppress the handler (cooldown active), True to re-fire.
-        """
-        if config.cooldown is False:
-            return True  # no cooldown — fire every cycle
-        if config.cooldown is True:
-            return False  # strict cooldown — fire once until resolved
-        # timedelta cooldown — re-alert if enough time has elapsed
-        if state._last_trigger_time is None:
-            return True
-        elapsed = datetime.now(timezone.utc) - state._last_trigger_time
-        return elapsed >= config.cooldown
-
-    def _build_watch_event(
-        self,
-        config: "WatchConfig",
-        state: "WatchState",
-        raw_value: Any,
-        resolved: bool = False,
-    ) -> "WatchEvent":
-        """Construct a WatchEvent from the current state."""
-        from ..core.watch import WatchEvent
-
-        return WatchEvent(
-            value=raw_value,
-            triggered_at=datetime.now(timezone.utc),
-            source_type="polling" if config.interval else "streaming",
-            resolved=resolved,
-            previous_value=state._previous_value,
-        )
-
-    async def _call_on_error(self, config: "WatchConfig", error: Exception) -> None:
-        """Dispatch to config.on_error, swallowing any secondary exceptions."""
-        if config.on_error:
-            try:
-                await config.on_error(error)
-            except Exception:
-                logger.debug(
-                    f"on_error callback for '{config.name}' raised", exc_info=True
-                )
-
-    async def _invoke_handler(
-        self, handler: Callable, event: "WatchEvent", config: "WatchConfig"
-    ) -> None:
-        """Call the watch handler, isolating exceptions from the watch loop."""
-        try:
-            runtime_invoker = getattr(
-                self,
-                "_invoke_watch_handler_through_runtime",
-                None,
-            )
-            if runtime_invoker is not None:
-                await runtime_invoker(handler, event, config)
-            elif config.handler_timeout is not None:
-                await asyncio.wait_for(handler(event), timeout=config.handler_timeout)
-            else:
-                await handler(event)
-        except asyncio.TimeoutError:
-            msg = f"Watch handler '{config.name}' timed out after {config.handler_timeout}s"
-            logger.error(msg)
-            await self._call_on_error(config, TimeoutError(msg))
-        except Exception as e:
-            original = e.__cause__ or e
-            logger.error(f"Watch handler '{config.name}' raised: {original}")
-            await self._call_on_error(config, original)
 
     async def _retry_with_tracing(
         self,
@@ -585,21 +296,6 @@ class BaseAgent:
             )
             return should_retry
 
-    def watch_status(self) -> Dict[str, Any]:
-        """Return the current status of all registered watches.
-
-        Useful for health checks, dashboards, and debugging in production.
-        Returns an empty dict if no watches are registered.
-        """
-        return {
-            name: {
-                "status": state.status,
-                "triggered": state.triggered,
-                "last_error": str(state.last_error) if state.last_error else None,
-            }
-            for name, state in self._watch_states.items()
-        }
-
     @property
     def health(self) -> Dict[str, Any]:
         """Get agent health information from unified tracing system."""
@@ -613,7 +309,6 @@ class BaseAgent:
             "type": self.agent_type.value,
             "running": self._running,
             "metrics": metrics,
-            "watches": self.watch_status(),
             "retry_config": {
                 "enabled": self.config.retry_enabled,
                 "max_retries": retry_policy.max_retries if retry_policy else None,

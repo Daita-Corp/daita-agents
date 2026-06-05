@@ -1,18 +1,17 @@
 # Database Health Monitor
 
-Continuously monitors a PostgreSQL database for operational anomalies using the
-`@agent.watch()` system. When a threshold is crossed, the agent investigates
-with diagnostic tools and recommends corrective action.
+PostgreSQL health investigation agent with diagnostic tools for slow queries,
+connection pressure, and table bloat. Runtime-native monitoring should be
+declared through `daita.runtime.monitors` and `daita.runtime.scheduler`; this
+example focuses on the agent and tools operators can invoke from those actions.
 
-## Watches
+## Diagnostic Tools
 
-| Watch | Polls | Fires when | Interval |
-|-------|-------|------------|----------|
-| `on_slow_queries` | `pg_stat_activity` | 3+ queries > 30s | 1m |
-| `on_connection_pressure` | connection utilization % | > 80% of `max_connections` | 30s |
-| `on_table_bloat` | `pg_stat_user_tables` | any table > 100k dead tuples | 5m |
-
-All three watches use `on_resolve=True` — they fire again when the condition clears.
+| Tool | Checks |
+|------|--------|
+| `get_slow_queries` | Long-running active queries in `pg_stat_activity` |
+| `get_connection_stats` | Active, idle, total, and maximum connections |
+| `get_table_bloat` | Dead tuples and autovacuum status in user tables |
 
 ## Quick Start
 
@@ -24,22 +23,22 @@ docker compose up -d
 cp .env.example .env
 python scripts/seed.py
 
-# 3. Start the monitor (fast mode = 10-15s intervals)
-python run.py --fast
+# 3. Ask the agent for an investigation
+python run.py
 ```
 
 ## Simulating Anomalies
 
-In a separate terminal, trigger each watch:
+In a separate terminal, simulate data conditions and then ask the agent to investigate:
 
 ```bash
-# Slow queries — 4 connections sleeping 60s (threshold is 3)
+# Slow queries — 4 connections sleeping 60s
 python scripts/simulate.py slow_queries
 
 # Connection pressure — hold 13 of 20 connections for 90s
 python scripts/simulate.py connections
 
-# Table bloat — 150k dead tuples on orders (autovacuum is off)
+# Table bloat — 150k dead tuples on orders
 python scripts/simulate.py bloat
 
 # All three in sequence

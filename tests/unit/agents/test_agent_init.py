@@ -817,14 +817,6 @@ class TestPluginAndToolManagement:
         assert agent.extension_setup_plugin_ids == []
         assert agent.pending_extension_setup_plugin_ids == ["manifest_plugin"]
 
-    def test_constructor_mcp_servers_alias_configures_mcp(self, mock_llm):
-        config = {"command": "uvx", "args": ["mcp-server-filesystem", "/data"]}
-
-        agent = Agent(name="X", llm_provider=mock_llm, mcp_servers=[config])
-
-        assert agent._mcp_server_configs == [config]
-        assert "mcp_servers" not in agent._llm_kwargs
-
     async def test_manifest_plugin_prefers_setup_over_initialize(self, mock_llm):
         agent = Agent(name="X", llm_provider=mock_llm)
         plugin = SetupAndInitializePlugin()
@@ -903,7 +895,7 @@ class TestPluginAndToolManagement:
         agent = Agent(name="X", llm_provider=mock_llm, prompt="Base prompt.")
         agent.add_plugin(ContextProviderPlugin(provider))
 
-        conversation = await agent._build_initial_conversation("Hi")
+        conversation = await agent.runtime._build_initial_conversation("Hi")
         system_msg = conversation[0]["content"]
 
         assert "Base prompt." in system_msg
@@ -984,7 +976,7 @@ class TestPluginAndToolManagement:
         agent = Agent(name="X", llm_provider=mock_llm)
         agent.add_plugin(ContextProviderPlugin(provider))
 
-        conversation = await agent._build_initial_conversation("Hi")
+        conversation = await agent.runtime._build_initial_conversation("Hi")
 
         assert provider.render_calls == []
         assert conversation == [{"role": "user", "content": "Hi"}]
@@ -1140,7 +1132,6 @@ class TestHealthProperty:
             "metrics",
             "tools",
             "extensions",
-            "relay",
             "llm",
         ):
             assert key in h, f"Missing key: {key}"
@@ -1232,16 +1223,6 @@ class TestHealthProperty:
         assert extensions["pending_setup_plugin_ids"] == []
         assert extensions["setup_complete"] is True
         assert len(plugin.setup_contexts) == 1
-
-    def test_health_relay_disabled_by_default(self, mock_llm):
-        agent = Agent(name="X", llm_provider=mock_llm)
-        assert agent.health["relay"]["enabled"] is False
-
-    def test_health_relay_enabled_when_set(self, mock_llm):
-        agent = Agent(name="X", llm_provider=mock_llm, relay="my_channel")
-        h = agent.health
-        assert h["relay"]["enabled"] is True
-        assert h["relay"]["channel"] == "my_channel"
 
     def test_health_llm_available_with_mock(self, basic_agent):
         assert basic_agent.health["llm"]["available"] is True

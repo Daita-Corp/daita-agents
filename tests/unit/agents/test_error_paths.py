@@ -2,8 +2,7 @@
 Tests for critical error handling paths that were previously untested.
 
 Covers:
-- _execute_tool_call: not found / exception / timeout error dicts
-- _json_serializer: private attr filtering, to_dict, __dict__, TypeError
+- json_serializer: private attr filtering, to_dict, __dict__, TypeError
 - LLMResult.from_response: unexpected type fallback
 - Agent._resolve_tools: unregistered tool name
 - Loop detection: 3 consecutive identical tool errors -> AgentError
@@ -12,11 +11,12 @@ Covers:
 - BaseLLMProvider.generate(): string input normalization
 """
 
-import asyncio
 import json
 import pytest
 
-from daita.agents.agent import Agent, LLMResult, _execute_tool_call, _json_serializer
+from daita.agents.agent import Agent
+from daita.agents.chat.llm_turn import LLMResult
+from daita.agents.chat.tools import json_serializer
 from daita.core.tools import LocalTool
 from daita.core.exceptions import AgentError
 from daita.llm.mock import MockLLMProvider
@@ -24,70 +24,7 @@ from daita.llm.mock import MockLLMProvider
 from tests.conftest import SequentialMockLLM
 
 # ---------------------------------------------------------------------------
-# _execute_tool_call — error dict shapes
-# ---------------------------------------------------------------------------
-
-
-class TestExecuteToolCall:
-    def _make_tool(self, name, handler, timeout=None):
-        return LocalTool(
-            name=name,
-            description="test",
-            parameters={"type": "object", "properties": {}, "required": []},
-            handler=handler,
-            timeout_seconds=timeout,
-        )
-
-    async def test_tool_not_found_returns_error_dict(self):
-        result = await _execute_tool_call(
-            {"name": "nonexistent", "arguments": {}}, tools=[]
-        )
-        assert isinstance(result, dict)
-        assert "error" in result
-        assert "nonexistent" in result["error"]
-
-    async def test_handler_exception_returns_error_dict(self):
-        async def broken_handler(args):
-            raise ValueError("something went wrong")
-
-        tool = self._make_tool("broken", broken_handler)
-        result = await _execute_tool_call({"name": "broken", "arguments": {}}, [tool])
-
-        assert isinstance(result, dict)
-        assert "error" in result
-        assert "broken" in result["error"]
-        assert "something went wrong" in result["error"]
-
-    async def test_handler_timeout_returns_error_dict(self):
-        async def slow_handler(args):
-            await asyncio.sleep(10)
-
-        tool = self._make_tool("slow", slow_handler, timeout=0.001)
-        result = await _execute_tool_call({"name": "slow", "arguments": {}}, [tool])
-
-        assert isinstance(result, dict)
-        assert "error" in result
-        assert "timed out" in result["error"]
-
-    async def test_successful_handler_returns_result_directly(self):
-        async def good_handler(args):
-            return {"value": 42}
-
-        tool = self._make_tool("good", good_handler)
-        result = await _execute_tool_call({"name": "good", "arguments": {}}, [tool])
-
-        assert result == {"value": 42}
-
-    async def test_tool_error_dict_does_not_raise(self):
-        """Errors are returned as dicts, not raised as exceptions."""
-        result = await _execute_tool_call(
-            {"name": "missing", "arguments": {}}, tools=[]
-        )
-        assert isinstance(result, dict)  # Should not raise
-
-
-# ---------------------------------------------------------------------------
-# _json_serializer — edge cases
+# json_serializer — edge cases
 # ---------------------------------------------------------------------------
 
 
@@ -97,7 +34,7 @@ class TestJsonSerializer:
             def to_dict(self):
                 return {"key": "value"}
 
-        result = _json_serializer(HasToDict())
+        result = json_serializer(HasToDict())
         assert result == {"key": "value"}
 
     def test_object_with_dict_filters_private_attrs(self):
@@ -108,7 +45,7 @@ class TestJsonSerializer:
                 self.__dunder = "also_hidden"
 
         obj = HasDict()
-        result = _json_serializer(obj)
+        result = json_serializer(obj)
         assert "public" in result
         assert "_private" not in result
 
@@ -122,10 +59,10 @@ class TestJsonSerializer:
             __slots__ = ()
 
         with pytest.raises(TypeError):
-            _json_serializer(NoDict())
+            json_serializer(NoDict())
 
     def test_json_serializer_used_in_json_dumps(self):
-        """Confirm _json_serializer integrates correctly with json.dumps."""
+        """Confirm json_serializer integrates correctly with json.dumps."""
         from datetime import datetime
         from decimal import Decimal
         from uuid import UUID
@@ -137,7 +74,7 @@ class TestJsonSerializer:
             "raw": b"bytes",
         }
         # Should not raise
-        serialized = json.dumps(data, default=_json_serializer)
+        serialized = json.dumps(data, default=json_serializer)
         parsed = json.loads(serialized)
         assert parsed["amount"] == 3.14
         assert parsed["id"] == "12345678-1234-5678-1234-567812345678"
@@ -342,27 +279,10 @@ class TestFinalSynthesisWithoutTools:
 class TestRunTimeout:
     async def test_timeout_seconds_raises_agent_error(self):
         """When timeout_seconds is set and the run exceeds it, AgentError is raised."""
-
-        async def slow_handler(args):
-            await asyncio.sleep(10)
-            return "done"
-
-        slow_tool = LocalTool(
-            name="slow_op",
-            description="very slow",
-            parameters={"type": "object", "properties": {}, "required": []},
-            handler=slow_handler,
+        agent = Agent(
+            name="SlowAgent",
+            llm_provider=MockLLMProvider(delay=10),
         )
-        llm = SequentialMockLLM(
-            response_sequence=[
-                {
-                    "content": "",
-                    "tool_calls": [{"id": "c1", "name": "slow_op", "arguments": {}}],
-                },
-                "done",
-            ]
-        )
-        agent = Agent(name="SlowAgent", llm_provider=llm, tools=[slow_tool])
 
         with pytest.raises(AgentError, match="timed out"):
             await agent.run("go slow", timeout_seconds=0.05)

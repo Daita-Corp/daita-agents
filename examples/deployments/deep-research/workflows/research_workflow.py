@@ -19,8 +19,7 @@ def _print_tool_usage(result: dict, agent, stage_elapsed: float) -> None:
     """Print which tools an agent called during its run, with timing."""
     print(f"  Stage time: {stage_elapsed:.1f}s")
 
-    # Use agent's internal tool call history (has duration_ms)
-    history = getattr(agent, "_tool_call_history", [])
+    history = result.get("tool_calls", [])
     if not history:
         print(f"  Tools called: (none)")
         return

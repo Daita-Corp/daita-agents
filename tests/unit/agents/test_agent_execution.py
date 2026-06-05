@@ -24,7 +24,7 @@ from daita.db.capabilities import (
     DB_SQL_EXECUTE_READ_CAPABILITY,
     DB_SQL_EXPLAIN_CAPABILITY,
 )
-from daita.agents.runtime.contextvars import get_active_run_state
+from daita.agents.chat.contextvars import get_active_run_state
 from daita.core.exceptions import AgentError
 from daita.core.streaming import EventType
 from daita.core.tools import LocalTool
@@ -827,26 +827,26 @@ class TestJsonSerialiser:
 
 
 # ===========================================================================
-# _build_initial_conversation
+# ChatRuntime._build_initial_conversation
 # ===========================================================================
 
 
 class TestBuildInitialConversation:
     async def test_user_message_always_last(self):
         agent = _make_agent(["Done."])
-        conv = await agent._build_initial_conversation("Hello")
+        conv = await agent.runtime._build_initial_conversation("Hello")
         assert conv[-1] == {"role": "user", "content": "Hello"}
 
     async def test_no_system_when_no_prompt_and_no_plugins(self):
         agent = _make_agent(["Done."])
-        conv = await agent._build_initial_conversation("Hi")
+        conv = await agent.runtime._build_initial_conversation("Hi")
         roles = [m["role"] for m in conv]
         assert "system" not in roles
 
     async def test_system_included_when_prompt_configured(self):
         llm = SequentialMockLLM(["Done."])
         agent = Agent(name="X", llm_provider=llm, prompt="You are helpful.")
-        conv = await agent._build_initial_conversation("Hi")
+        conv = await agent.runtime._build_initial_conversation("Hi")
         assert conv[0]["role"] == "system"
         assert "You are helpful." in conv[0]["content"]
 
@@ -856,7 +856,7 @@ class TestBuildInitialConversation:
             {"role": "user", "content": "prev"},
             {"role": "assistant", "content": "reply"},
         ]
-        conv = await agent._build_initial_conversation("new", history)
+        conv = await agent.runtime._build_initial_conversation("new", history)
         assert conv[-3]["content"] == "prev"
         assert conv[-2]["content"] == "reply"
         assert conv[-1]["content"] == "new"

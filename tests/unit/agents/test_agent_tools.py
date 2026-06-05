@@ -1,15 +1,14 @@
 """
 Unit tests for tool registration and resolution on Agent
 (daita/agents/agent.py — _resolve_tools, call_tool, available_tools, tool_names,
-FocusedTool, plugin tool setup, and _execute_tool_call).
+ChatRuntime focus preparation, and plugin tool setup).
 """
 
-import asyncio
 import pytest
 
-from daita.agents.agent import Agent, FocusedTool, _execute_tool_call
+from daita.agents.agent import Agent
+from daita.agents.chat.runtime import FocusedRuntimeTool
 from daita.core.tools import LocalTool
-from daita.llm.mock import MockLLMProvider
 
 # ===========================================================================
 # Helpers
@@ -166,59 +165,7 @@ class TestPluginToolSetup:
 
 
 # ===========================================================================
-# _execute_tool_call
-# ===========================================================================
-
-
-def _make_returning_tool(name: str, return_value=None):
-    async def h(args):
-        return return_value
-
-    return LocalTool(name=name, description=f"Tool {name}", parameters={}, handler=h)
-
-
-def _make_slow_tool(name: str, sleep: float = 10.0):
-    async def h(args):
-        await asyncio.sleep(sleep)
-        return "never"
-
-    return LocalTool(
-        name=name, description="Slow", parameters={}, handler=h, timeout_seconds=0.01
-    )
-
-
-class TestExecuteToolCall:
-    async def test_finds_and_executes_tool(self):
-        t = _make_returning_tool("calc", return_value=42)
-        result = await _execute_tool_call({"name": "calc", "arguments": {}}, [t])
-        assert result == 42
-
-    async def test_unknown_tool_returns_error_dict(self):
-        result = await _execute_tool_call({"name": "ghost", "arguments": {}}, [])
-        assert isinstance(result, dict)
-        assert "error" in result
-        assert "not found" in result["error"]
-
-    async def test_tool_timeout_returns_error_dict(self):
-        t = _make_slow_tool("slow")
-        result = await _execute_tool_call({"name": "slow", "arguments": {}}, [t])
-        assert isinstance(result, dict)
-        assert "error" in result
-        assert "timed out" in result["error"]
-
-    async def test_tool_exception_returns_error_dict(self):
-        async def h(args):
-            raise RuntimeError("unexpected failure")
-
-        t = LocalTool(name="broken", description="Broken", parameters={}, handler=h)
-        result = await _execute_tool_call({"name": "broken", "arguments": {}}, [t])
-        assert isinstance(result, dict)
-        assert "error" in result
-        assert "failed" in result["error"]
-
-
-# ===========================================================================
-# FocusedTool — focus routing and result handling
+# ChatRuntime focus routing and result handling
 # ===========================================================================
 
 
@@ -236,13 +183,13 @@ def _make_tool(name: str, returns, parameters: dict | None = None):
     )
 
 
-def _make_focused(tool: LocalTool, focus: str) -> FocusedTool:
-    return FocusedTool(tool, focus)
+def _make_focused(tool: LocalTool, focus: str) -> FocusedRuntimeTool:
+    return FocusedRuntimeTool(tool, focus)
 
 
-class TestFocusedToolHandler:
+class TestFocusedRuntimeToolHandler:
     """
-    Verify FocusedTool routes correctly across three cases:
+    Verify ChatRuntime focus handling routes correctly across three cases:
       1. Tool schema has 'focus' property → inject DSL into args, skip Python apply_focus.
       2. Tool returns {"rows": [...]} wrapper → focus applied to rows only, wrapper preserved.
       3. Tool returns raw list/dict → existing Python apply_focus behaviour unchanged.
@@ -278,7 +225,7 @@ class TestFocusedToolHandler:
             },
             handler=capturing_handler,
         )
-        focused = FocusedTool(tool, "status == 'active' | SELECT id, status")
+        focused = FocusedRuntimeTool(tool, "status == 'active' | SELECT id, status")
 
         result = await focused.handler({"sql": "SELECT * FROM t"})
 
@@ -302,7 +249,7 @@ class TestFocusedToolHandler:
             "my_db_tool",
             returns={"success": True, "rows": rows, "row_count": 3},
         )
-        focused = FocusedTool(tool, "status == 'active'")
+        focused = FocusedRuntimeTool(tool, "status == 'active'")
 
         result = await focused.handler({})
 
@@ -323,7 +270,7 @@ class TestFocusedToolHandler:
         tool = _make_tool(
             "my_tool", returns={"success": True, "rows": rows, "row_count": 2}
         )
-        focused = FocusedTool(tool, "SELECT id, name")
+        focused = FocusedRuntimeTool(tool, "SELECT id, name")
 
         result = await focused.handler({})
 
@@ -335,7 +282,7 @@ class TestFocusedToolHandler:
         """row_count in the wrapper must reflect rows after focus, not before."""
         rows = [{"status": "active"}] * 3 + [{"status": "inactive"}] * 7
         tool = _make_tool("t", returns={"success": True, "rows": rows, "row_count": 10})
-        focused = FocusedTool(tool, "status == 'active'")
+        focused = FocusedRuntimeTool(tool, "status == 'active'")
 
         result = await focused.handler({})
 
@@ -350,7 +297,7 @@ class TestFocusedToolHandler:
             {"x": 3, "keep": True},
         ]
         tool = _make_tool("raw_tool", returns=rows)
-        focused = FocusedTool(tool, "keep == True")
+        focused = FocusedRuntimeTool(tool, "keep == True")
 
         result = await focused.handler({})
 
@@ -361,7 +308,7 @@ class TestFocusedToolHandler:
     async def test_none_result_passthrough(self):
         """None returned by handler should pass through without error."""
         tool = _make_tool("null_tool", returns=None)
-        focused = FocusedTool(tool, "x > 0")
+        focused = FocusedRuntimeTool(tool, "x > 0")
 
         result = await focused.handler({})
 
@@ -375,7 +322,7 @@ class TestFocusedToolHandler:
         """
         rows = [{"status": "completed", "amount": 500}]
         tool = _make_tool("t", returns={"success": True, "rows": rows, "row_count": 1})
-        focused = FocusedTool(tool, "status == 'completed'")
+        focused = FocusedRuntimeTool(tool, "status == 'completed'")
 
         result = await focused.handler({})
 

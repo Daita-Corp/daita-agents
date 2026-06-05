@@ -1,30 +1,21 @@
 """
 Database Health Monitor Agent
 
-Continuously monitors a PostgreSQL database for operational anomalies using
-the @agent.watch() system. Watches poll SQL conditions on an interval and
-fire when thresholds are crossed — the agent then diagnoses the issue and
-recommends corrective action.
-
-Three watches:
-1. Slow queries     — fires when queries running longer than 30s exceed a count
-2. Connection usage — fires when active connections approach the pool limit
-3. Dead tuples      — fires when bloat in any table exceeds a threshold
-
-Each watch also uses on_resolve=True to notify when conditions return to normal.
+Provides a PostgreSQL-focused agent with tools for investigating operational
+anomalies. Runtime-native monitor scheduling should be declared through
+``daita.runtime.monitors`` / ``daita.runtime.scheduler`` rather than an agent-owned
+polling API.
 """
 
 import os
-from datetime import timedelta
 from typing import Any, Dict, Optional
 
 from daita import Agent
 from daita.core.tools import tool
-from daita.core.watch import WatchEvent
 from daita.plugins import postgresql
 
 # ---------------------------------------------------------------------------
-# Tools — give the agent the ability to investigate further when a watch fires
+# Tools — give the agent the ability to investigate runtime monitor actions
 # ---------------------------------------------------------------------------
 
 
@@ -186,22 +177,12 @@ async def get_connection_stats() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Agent creation with watches
+# Agent creation
 # ---------------------------------------------------------------------------
 
 
-def create_agent(
-    slow_query_interval: str = "1m",
-    connection_interval: str = "30s",
-    bloat_interval: str = "5m",
-) -> Agent:
-    """Create the Database Health Monitor agent with three watches.
-
-    Args:
-        slow_query_interval: How often to check for slow queries (default "1m").
-        connection_interval: How often to check connection usage (default "30s").
-        bloat_interval: How often to check table bloat (default "5m").
-    """
+def create_agent() -> Agent:
+    """Create the Database Health Monitor investigation agent."""
     db = postgresql(
         connection_string=os.getenv("DATABASE_URL", "postgresql://localhost/mydb")
     )
@@ -210,97 +191,18 @@ def create_agent(
         name="DB Health Monitor",
         model="gpt-4o-mini",
         prompt="""\
-You are a PostgreSQL database health monitor. When a watch fires, you receive a
-WatchEvent describing an operational anomaly. Your job is to:
+You are a PostgreSQL database health monitor. When operators ask about an
+operational anomaly, your job is to:
 
 1. INVESTIGATE: Use the available tools to gather more context about the issue.
 2. DIAGNOSE: Identify the likely root cause.
 3. RECOMMEND: Suggest specific corrective actions (e.g. "VACUUM ANALYZE orders",
    "Consider adding an index on users.email", "Kill PID 12345").
 
-When a watch resolves (event.resolved=True), briefly acknowledge recovery.
-
 Keep responses concise — operators read these under pressure. Lead with severity
 (INFO / WARNING / CRITICAL) and the key metric.""",
         tools=[get_slow_queries, get_table_bloat, get_connection_stats],
         plugins=[db],
     )
-
-    # -- Watch 1: Slow queries ------------------------------------------------
-    @agent.watch(
-        source=db,
-        condition="SELECT COUNT(*) FROM pg_stat_activity "
-        "WHERE state != 'idle' "
-        "AND (now() - query_start) > interval '30 seconds' "
-        "AND pid != pg_backend_pid()",
-        threshold=lambda count: count >= 3,
-        interval=slow_query_interval,
-        on_resolve=True,
-        cooldown=True,
-    )
-    async def on_slow_queries(event: WatchEvent):
-        if event.resolved:
-            result = await agent.run(
-                f"Slow query alert RESOLVED. "
-                f"Count dropped from {event.previous_value} to {event.value}."
-            )
-        else:
-            result = await agent.run(
-                f"ALERT: {event.value} queries running longer than 30s "
-                f"(previous check: {event.previous_value}). "
-                f"Investigate with get_slow_queries and recommend action."
-            )
-        print(f"\n{'='*65}\n[SLOW QUERIES] {result}\n{'='*65}")
-
-    # -- Watch 2: Connection pool pressure ------------------------------------
-    @agent.watch(
-        source=db,
-        condition="SELECT round(count(*)::numeric / "
-        "(SELECT setting::int FROM pg_settings WHERE name = 'max_connections') "
-        "* 100, 1) FROM pg_stat_activity",
-        threshold=lambda pct: pct > 80,
-        interval=connection_interval,
-        on_resolve=True,
-        cooldown=True,
-    )
-    async def on_connection_pressure(event: WatchEvent):
-        if event.resolved:
-            result = await agent.run(
-                f"Connection pressure RESOLVED. "
-                f"Utilization dropped from {event.previous_value}% to {event.value}%."
-            )
-        else:
-            result = await agent.run(
-                f"ALERT: Connection utilization at {event.value}% "
-                f"(previous: {event.previous_value}%). "
-                f"The database is under connection pressure. If get_connection_stats "
-                f"fails with 'too many clients', that confirms the issue — diagnose "
-                f"based on the utilization percentage alone and recommend action "
-                f"(e.g. kill idle connections, increase max_connections, add pgbouncer)."
-            )
-        print(f"\n{'='*65}\n[CONNECTIONS] {result}\n{'='*65}")
-
-    # -- Watch 3: Table bloat -------------------------------------------------
-    @agent.watch(
-        source=db,
-        condition="SELECT COALESCE(MAX(n_dead_tup), 0) FROM pg_stat_user_tables",
-        threshold=lambda dead: dead > 100_000,
-        interval=bloat_interval,
-        on_resolve=True,
-        cooldown=True,
-    )
-    async def on_table_bloat(event: WatchEvent):
-        if event.resolved:
-            result = await agent.run(
-                f"Table bloat RESOLVED. "
-                f"Max dead tuples dropped from {event.previous_value} to {event.value}."
-            )
-        else:
-            result = await agent.run(
-                f"ALERT: Table bloat detected — max dead tuples: {event.value} "
-                f"(previous: {event.previous_value}). "
-                f"Investigate with get_table_bloat and recommend VACUUM targets."
-            )
-        print(f"\n{'='*65}\n[TABLE BLOAT] {result}\n{'='*65}")
 
     return agent

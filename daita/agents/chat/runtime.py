@@ -18,6 +18,8 @@ from daita.plugins.manifest import PluginKind, PluginManifest
 from daita.runtime import (
     AccessMode,
     Capability,
+    ContextAudience,
+    ContextBlock,
     Evidence,
     OperationStatus,
     RiskLevel,
@@ -27,14 +29,14 @@ from daita.runtime import (
     ToolView,
 )
 
-from .runtime.contextvars import active_run_state
-from .runtime.evidence import add_evidence
-from .runtime.exit import RunExitPolicy
-from .runtime.guardrails import ToolCallGuardrails, has_terminal_tool_result
-from .runtime.llm_turn import LLMResult
-from .runtime.retry import mark_whole_run_retry_suppressed, run_model_turn_with_retry
-from .runtime.state import FinalAnswerReadiness, RunPhase, RunState
-from .runtime.tools import json_serializer
+from .contextvars import active_run_state
+from .evidence import add_evidence
+from .exit import RunExitPolicy
+from .guardrails import ToolCallGuardrails, has_terminal_tool_result
+from .llm_turn import LLMResult
+from .retry import mark_whole_run_retry_suppressed, run_model_turn_with_retry
+from .state import FinalAnswerReadiness, RunPhase, RunState
+from .tools import json_serializer
 
 if TYPE_CHECKING:
     from daita.core.tools import LocalTool
@@ -304,11 +306,8 @@ class ChatRuntime:
         trace_manager: Any,
         setup_tools: Callable[[], Any],
         setup_extensions: Callable[[], Any],
-        start_watches: Callable[[], Any],
         emit_event: Callable[..., None],
         retry_with_tracing: Callable[..., Any],
-        context_blocks_renderer: Callable[..., Any],
-        context_formatter: Callable[..., str | None],
         final_answer_hooks_getter: Callable[[], list[Any]],
     ) -> None:
         self.runtime_id = runtime_id
@@ -324,11 +323,8 @@ class ChatRuntime:
         self.trace_manager = trace_manager
         self._setup_tools = setup_tools
         self._setup_extensions = setup_extensions
-        self._start_watches = start_watches
         self._emit_event = emit_event
         self._retry_with_tracing = retry_with_tracing
-        self._render_context_blocks = context_blocks_renderer
-        self._format_context = context_formatter
         self._final_answer_hooks_getter = final_answer_hooks_getter
         self.guardrails = ToolCallGuardrails()
         self._local_tool_plugins: set[str] = set()
@@ -372,7 +368,6 @@ class ChatRuntime:
                 f"or pass api_key parameter to Agent."
             )
 
-        await self._start_watches()
         await self._setup_tools()
         await self._setup_extensions()
 
@@ -832,6 +827,58 @@ class ChatRuntime:
             conversation.extend(initial_messages)
         conversation.append({"role": "user", "content": prompt})
         return conversation
+
+    async def render_context_blocks(
+        self,
+        prompt: str,
+        *,
+        audience: ContextAudience = ContextAudience.PRIMARY_MODEL,
+        token_budget: int = 2000,
+    ) -> list[ContextBlock]:
+        """Render context blocks from registry-owned context providers."""
+        await self._setup_extensions()
+        audience = ContextAudience(audience)
+
+        blocks: list[ContextBlock] = []
+        for provider in self.extension_registry.context_providers:
+            if audience not in provider.audiences:
+                continue
+            try:
+                block = await provider.render(
+                    {
+                        "prompt": prompt,
+                        "runtime_id": self.runtime_id,
+                        "agent_id": self.runtime_id,
+                    },
+                    audience,
+                    token_budget,
+                )
+            except Exception as error:
+                provider_name = getattr(provider, "id", provider.__class__.__name__)
+                logger.warning(
+                    "context provider '%s' failed for agent '%s': %s",
+                    provider_name,
+                    self.agent_name,
+                    error,
+                )
+                continue
+            if block is not None and block.content:
+                blocks.append(block)
+
+        return blocks
+
+    async def _render_context_blocks(self, prompt: str) -> list[ContextBlock]:
+        return await self.render_context_blocks(prompt)
+
+    def _format_context(self, blocks: list[ContextBlock]) -> str | None:
+        if not blocks:
+            return None
+
+        rendered_blocks = [
+            f"### {block.id}\n{block.content}"
+            for block in sorted(blocks, key=lambda item: item.priority, reverse=True)
+        ]
+        return "## Runtime Context\n" + "\n\n".join(rendered_blocks)
 
     async def _nonstream_llm_turn(
         self, conversation, tools, *, operation_id, run_state, **kwargs

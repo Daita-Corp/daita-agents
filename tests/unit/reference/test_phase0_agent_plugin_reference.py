@@ -1,7 +1,5 @@
 """Reference tests for generic Agent adapter boundaries."""
 
-from dataclasses import dataclass
-
 import pytest
 
 from daita.agents.agent import Agent
@@ -59,41 +57,8 @@ async def test_local_agent_tool_remains_explicit_adapter_boundary(mock_llm):
     assert await agent.call_tool("shared", {}) == "second"
 
 
-@dataclass
-class FakeMCPTool:
-    name: str = "mcp_lookup"
-    description: str = "Look up data through MCP."
-    input_schema: dict = None
-
-    def __post_init__(self):
-        if self.input_schema is None:
-            self.input_schema = {
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-            }
-
-
-class FakeMCPRegistry:
-    def __init__(self):
-        self.calls = []
-
-    async def call_tool(self, name, arguments):
-        self.calls.append((name, arguments))
-        return {"called": name, "arguments": arguments}
-
-
-async def test_current_behavior_mcp_tools_adapt_to_agent_tools():
-    registry = FakeMCPRegistry()
-    agent_tool = LocalTool.from_mcp_tool(FakeMCPTool(), registry)
-
-    result = await agent_tool.execute({"query": "orders"})
-
-    assert agent_tool.name == "mcp_lookup"
-    assert agent_tool.source == "mcp"
-    assert agent_tool.category == "mcp"
-    assert agent_tool.parameters == {"query": {"type": "string"}}
-    assert registry.calls == [("mcp_lookup", {"query": "orders"})]
-    assert result["called"] == "mcp_lookup"
+def test_mcp_tools_are_not_adapted_through_local_tool_boundary():
+    assert not hasattr(LocalTool, "from_mcp_tool")
 
 
 class RequiredExecutor:

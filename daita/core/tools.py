@@ -506,32 +506,6 @@ class LocalTool:
             # No timeout
             return await self.handler(arguments)
 
-    @classmethod
-    def from_mcp_tool(cls, mcp_tool, mcp_registry) -> "LocalTool":
-        """
-        Create LocalTool from an MCP tool.
-
-        Args:
-            mcp_tool: MCPTool instance from MCP plugin
-            mcp_registry: MCPToolRegistry for routing calls
-
-        Returns:
-            LocalTool instance that wraps the MCP tool
-        """
-
-        # Create handler that routes to MCP registry
-        async def mcp_handler(arguments: Dict[str, Any]) -> Any:
-            return await mcp_registry.call_tool(mcp_tool.name, arguments)
-
-        return cls(
-            name=mcp_tool.name,
-            description=mcp_tool.description,
-            parameters=mcp_tool.input_schema.get("properties", {}),
-            handler=mcp_handler,
-            source="mcp",
-            category="mcp",
-        )
-
 
 class LocalToolCatalog:
     """

@@ -5,11 +5,11 @@ import asyncio
 import pytest
 
 from daita.agents.agent import Agent
-from daita.agents.runtime.retry import (
+from daita.agents.chat.retry import (
     mark_whole_run_retry_suppressed,
     run_model_turn_with_retry,
 )
-from daita.agents.runtime.state import RunState
+from daita.agents.chat.state import RunState
 from daita.config.base import AgentConfig, RetryPolicy, RetryStrategy
 from daita.core.exceptions import LLMError, RateLimitError, TransientError
 from daita.core.streaming import EventType, LLMChunk
@@ -36,7 +36,7 @@ def _skip_retry_sleeps(monkeypatch):
     async def no_sleep(_delay):
         return None
 
-    monkeypatch.setattr("daita.agents.runtime.retry.asyncio.sleep", no_sleep)
+    monkeypatch.setattr("daita.agents.chat.retry.asyncio.sleep", no_sleep)
 
 
 class FlakyModelLLM(MockLLMProvider):
@@ -130,7 +130,7 @@ async def test_retry_after_delay_is_recorded_and_capped(monkeypatch):
     async def record_sleep(delay):
         delays.append(delay)
 
-    monkeypatch.setattr("daita.agents.runtime.retry.asyncio.sleep", record_sleep)
+    monkeypatch.setattr("daita.agents.chat.retry.asyncio.sleep", record_sleep)
 
     llm = FlakyModelLLM([RateLimitError(retry_after=12)], "Recovered.")
     agent = Agent(

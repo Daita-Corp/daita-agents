@@ -434,7 +434,7 @@ class TestAddSkill:
 
 
 # ===========================================================================
-# Structured prompt injection in _build_initial_conversation
+# Structured prompt injection in ChatRuntime._build_initial_conversation
 # ===========================================================================
 
 
@@ -443,7 +443,7 @@ class TestPromptInjection:
         agent = Agent(name="A", llm_provider=mock_llm, prompt="Base prompt.")
         agent.add_skill(Skill(name="report", instructions="Use tables."))
 
-        conversation = await agent._build_initial_conversation("Hello")
+        conversation = await agent.runtime._build_initial_conversation("Hello")
         system_msg = conversation[0]["content"]
 
         assert "## Skills & Expertise" in system_msg
@@ -456,7 +456,7 @@ class TestPromptInjection:
         agent.add_skill(Skill(name="alpha", instructions="Alpha instructions."))
         agent.add_skill(Skill(name="beta", instructions="Beta instructions."))
 
-        conversation = await agent._build_initial_conversation("Hi")
+        conversation = await agent.runtime._build_initial_conversation("Hi")
         system_msg = conversation[0]["content"]
 
         assert "### alpha" in system_msg
@@ -468,7 +468,7 @@ class TestPromptInjection:
         agent = Agent(name="A", llm_provider=mock_llm)
         agent.add_skill(Skill(name="empty"))
 
-        conversation = await agent._build_initial_conversation("Hi")
+        conversation = await agent.runtime._build_initial_conversation("Hi")
         # No system message if no content
         if conversation[0]["role"] == "system":
             assert "## Skills & Expertise" not in conversation[0]["content"]
@@ -491,7 +491,7 @@ class TestSkillInstructionExceptionLogging:
         agent.add_skill(FailingSkill())
 
         with caplog.at_level(logging.WARNING):
-            conversation = await agent._build_initial_conversation("Hi")
+            conversation = await agent.runtime._build_initial_conversation("Hi")
 
         assert "bad_skill" in caplog.text
         assert "bad instructions" in caplog.text

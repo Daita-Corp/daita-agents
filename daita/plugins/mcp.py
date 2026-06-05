@@ -5,22 +5,9 @@ This plugin enables agents to connect to any MCP server and autonomously use
 their tools via LLM function calling. Agents discover available tools and
 decide which ones to use based on the task.
 
-Usage:
-    ```python
-    from daita import Agent
-    from daita.plugins import mcp
-
-    # Agent with MCP tools
-    agent = Agent(
-        name="file_analyzer",
-        mcp_servers=[
-            mcp.server(command="uvx", args=["mcp-server-filesystem", "/data"])
-        ]
-    )
-
-    # Agent autonomously discovers and uses MCP tools
-    result = await agent.process("Read report.csv and calculate average revenue")
-    ```
+MCP integrations are owned by this plugin module. Agent-local MCP constructor
+arguments were removed in the clean-break runtime architecture; MCP tool calls
+should be exposed as registry declarations and executed through RuntimeKernel.
 
 MCP Protocol:
     The Model Context Protocol (MCP) is Anthropic's open standard for connecting
