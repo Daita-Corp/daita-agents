@@ -10,6 +10,7 @@ from typing import Iterable
 
 from daita.plugins import ExtensionRegistry
 from daita.runtime import AccessMode, Capability
+from daita.skills import SkillRuntimeEffects
 
 from .models import (
     DbIntent,
@@ -221,12 +222,27 @@ class DbContractBuilder:
         self.registry = registry
         self.config = config
 
-    def build(self, request: DbRequest, intent: DbIntent) -> DbOperationContract:
-        selections = self._select_capabilities(request, intent)
+    def build(
+        self,
+        request: DbRequest,
+        intent: DbIntent,
+        *,
+        skill_effects: tuple[SkillRuntimeEffects, ...] = (),
+    ) -> DbOperationContract:
+        selections = self._select_capabilities(request, intent, skill_effects)
         required_evidence = _ordered_unique(
-            evidence
-            for selection in selections
-            for evidence in selection.capability.output_evidence
+            (
+                *[
+                    evidence
+                    for selection in selections
+                    for evidence in selection.capability.output_evidence
+                ],
+                *[
+                    evidence
+                    for effect in skill_effects
+                    for evidence in effect.required_evidence
+                ],
+            )
         )
         selected_ids = _ordered_unique(
             selection.capability.id for selection in selections
@@ -234,7 +250,25 @@ class DbContractBuilder:
         access = _max_access(
             [intent.access, *(s.capability.access for s in selections)]
         )
-        policy_ids = self._policy_ids(intent)
+        policy_ids = _ordered_unique(
+            (
+                *self._policy_ids(intent),
+                *[
+                    policy_id
+                    for effect in skill_effects
+                    for policy_id in effect.policy_ids
+                ],
+            )
+        )
+        skill_contract_metadata = _merge_skill_metadata(
+            effect.contract_metadata for effect in skill_effects
+        )
+        verifier_metadata = _merge_skill_metadata(
+            effect.verifier_metadata for effect in skill_effects
+        )
+        synthesis_metadata = _merge_skill_metadata(
+            effect.synthesis_metadata for effect in skill_effects
+        )
         metadata = {
             "intent_kind": intent.kind.value,
             "profile": self.config.profile,
@@ -260,14 +294,44 @@ class DbContractBuilder:
                 for selection in selections
             ],
             "blocked_capabilities": self._blocked_capabilities(intent),
-            "missing_capabilities": self._missing_capabilities(intent, selections),
+            "missing_capabilities": self._missing_capabilities(
+                intent,
+                selections,
+                requested_requirements=(
+                    *request.requested_capabilities,
+                    *[
+                        capability_id
+                        for effect in skill_effects
+                        for capability_id in effect.requested_capabilities
+                    ],
+                ),
+            ),
             "approval_required": intent.kind
             in {DbIntentKind.WRITE_PROPOSE, DbIntentKind.WRITE_EXECUTE},
             "diagnostics": {
                 "classifier": intent.diagnostics,
                 "requested_capabilities": list(request.requested_capabilities),
+                "skill_requested_capabilities": [
+                    capability_id
+                    for effect in skill_effects
+                    for capability_id in effect.requested_capabilities
+                ],
             },
+            "skills": [
+                {
+                    "skill_id": effect.skill_id,
+                    "requested_capabilities": list(effect.requested_capabilities),
+                    "required_evidence": list(effect.required_evidence),
+                    "policy_ids": list(effect.policy_ids),
+                    "tool_view_names": list(effect.tool_view_names),
+                }
+                for effect in skill_effects
+            ],
+            "skill_contract_metadata": skill_contract_metadata,
+            "skill_verifier_metadata": verifier_metadata,
+            "skill_synthesis_metadata": synthesis_metadata,
         }
+        metadata.update(skill_contract_metadata)
         return DbOperationContract(
             operation_type=_operation_type_for_intent(intent.kind),
             required_capabilities=tuple(selected_ids),
@@ -279,9 +343,17 @@ class DbContractBuilder:
         )
 
     def _select_capabilities(
-        self, request: DbRequest, intent: DbIntent
+        self,
+        request: DbRequest,
+        intent: DbIntent,
+        skill_effects: tuple[SkillRuntimeEffects, ...],
     ) -> tuple[CapabilitySelection, ...]:
         requested = set(request.requested_capabilities)
+        skill_requested = {
+            capability_id
+            for effect in skill_effects
+            for capability_id in effect.requested_capabilities
+        }
         selections: list[CapabilitySelection] = []
 
         for capability_id in _capability_requirements_for_intent(intent.kind):
@@ -303,18 +375,26 @@ class DbContractBuilder:
                 )
 
         for capability in self.registry.capabilities:
-            if capability.id not in requested:
+            if capability.id not in requested and capability.id not in skill_requested:
                 continue
             if _forbidden_for_intent(capability, intent):
                 continue
             selections.append(
-                CapabilitySelection(capability=capability, reason="requested")
+                CapabilitySelection(
+                    capability=capability,
+                    reason=(
+                        "skill_requested"
+                        if capability.id in skill_requested
+                        and capability.id not in requested
+                        else "requested"
+                    ),
+                )
             )
 
         return _dedupe_selections(selections)
 
     def _policy_ids(self, intent: DbIntent) -> tuple[str, ...]:
-        ids = [f"{policy.owner}:{policy.id}" for policy in self.registry.policies]
+        ids: list[str] = []
         if intent.kind in {DbIntentKind.WRITE_PROPOSE, DbIntentKind.WRITE_EXECUTE}:
             ids.append("runtime:approval_required_for_writes")
         return tuple(_ordered_unique(ids))
@@ -333,12 +413,21 @@ class DbContractBuilder:
         return blocked
 
     def _missing_capabilities(
-        self, intent: DbIntent, selections: tuple[CapabilitySelection, ...]
+        self,
+        intent: DbIntent,
+        selections: tuple[CapabilitySelection, ...],
+        *,
+        requested_requirements: tuple[str, ...] = (),
     ) -> list[str]:
         selected_ids = {selection.capability.id for selection in selections}
         return [
             capability_id
-            for capability_id in _capability_requirements_for_intent(intent.kind)
+            for capability_id in _ordered_unique(
+                (
+                    *_capability_requirements_for_intent(intent.kind),
+                    *requested_requirements,
+                )
+            )
             if capability_id not in selected_ids
         ]
 
@@ -400,6 +489,21 @@ def _forbidden_for_intent(capability: Capability, intent: DbIntent) -> bool:
     ):
         return True
     return False
+
+
+def _merge_skill_metadata(values: Iterable[dict]) -> dict[str, object]:
+    merged: dict[str, object] = {}
+    for value in values:
+        for key, item in dict(value).items():
+            if (
+                key in merged
+                and isinstance(merged[key], dict)
+                and isinstance(item, dict)
+            ):
+                merged[key] = {**merged[key], **item}
+            else:
+                merged[key] = item
+    return merged
 
 
 def _access_for_intent(kind: DbIntentKind) -> AccessMode:

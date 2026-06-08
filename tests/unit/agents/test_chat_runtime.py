@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from daita.agents.agent import Agent
 from daita.agents.chat.runtime import ChatRunResult
+from daita.core.exceptions import SkillError
 from daita.plugins import ExtensionRegistry, PluginKind, PluginManifest
 from daita.runtime import (
     AccessMode,
@@ -18,6 +19,7 @@ from daita.runtime import (
     TaskStatus,
     ToolView,
 )
+from daita.skills import Skill, SkillDiscovery
 
 from tests.conftest import SequentialMockLLM
 
@@ -115,6 +117,21 @@ async def test_agent_run_delegates_to_chat_runtime():
 
     assert result == "from runtime"
     assert fake.calls[0]["prompt"] == "hello"
+
+
+async def test_agent_run_unknown_explicit_skill_selection_raises():
+    agent = Agent(
+        name="SkillChat",
+        llm_provider=SequentialMockLLM(["unused"]),
+        skills=[Skill(name="finance", instructions="Use finance context.")],
+    )
+
+    try:
+        await agent.run("hello", skills=["finacne"])
+    except SkillError as exc:
+        assert "Unknown skill selection(s): finacne" in str(exc)
+    else:
+        raise AssertionError("expected unknown skill selection to raise")
 
 
 async def test_chat_tool_call_uses_kernel_execute_capability_not_direct_executor():
@@ -387,3 +404,68 @@ async def test_tool_decorator_executes_through_runtime_kernel():
     assert calls["handler"] == 1
     assert calls["kernel"][0][0] == "math.add"
     assert calls["kernel"][0][1]["operation_type"] == "chat.tool_call"
+
+
+async def test_explicit_run_skill_selection_loads_context_and_records_events():
+    skill = Skill(
+        name="finance",
+        description="Finance analysis.",
+        instructions="Full finance instructions.",
+        context_mode="on_demand",
+        discovery=SkillDiscovery(
+            name="finance",
+            description="Finance analysis.",
+            context_mode="on_demand",
+        ),
+    )
+    llm = SequentialMockLLM(["done"])
+    agent = Agent(name="SkillSelect", llm_provider=llm, skills=[skill])
+
+    result = await agent.run("hello", skills=["finance"], detailed=True)
+    snapshot = await agent.runtime_store.inspect_operation(result["operation_id"])
+
+    system = llm.call_history[0]["messages"][0]["content"]
+    assert "Full finance instructions." in system
+    assert snapshot is not None
+    diagnostics = [event.payload.get("diagnostic") for event in snapshot.events]
+    assert "skill.selected" in diagnostics
+    assert "skill.context_loaded" in diagnostics
+
+
+async def test_tool_backed_skill_tool_execution_records_skill_event():
+    from daita.core.tools import tool
+
+    @tool(id="report.format", output_evidence="report.format.result")
+    async def format_report(title: str) -> str:
+        """Format a report."""
+        return f"# {title}"
+
+    skill = Skill.with_tools(
+        name="report_builder",
+        instructions="Use reports.",
+        tools=[format_report],
+    )
+    llm = SequentialMockLLM(
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "name": "format_report",
+                        "arguments": {"title": "Revenue"},
+                    }
+                ],
+            },
+            "done",
+        ]
+    )
+    agent = Agent(name="SkillTool", llm_provider=llm, skills=[skill])
+
+    result = await agent.run("format", detailed=True)
+    snapshot = await agent.runtime_store.inspect_operation(result["operation_id"])
+
+    assert result["tool_calls"][0]["capability_ids"] == ("report.format",)
+    assert snapshot is not None
+    diagnostics = [event.payload.get("diagnostic") for event in snapshot.events]
+    assert "skill.tool_executed" in diagnostics

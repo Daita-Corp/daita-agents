@@ -22,6 +22,8 @@ from daita.runtime import (
     ToolView,
     register_local_tool,
 )
+from daita.plugins.manifest import PluginKind
+from daita.skills import SkillResolution, SkillResolver
 
 from .contextvars import active_run_state
 from .evidence import add_evidence
@@ -236,14 +238,37 @@ class ChatRuntime:
 
         await self._setup_tools()
         await self._setup_extensions()
+        explicit_skills = kwargs.pop("skills", None)
+        if explicit_skills is None:
+            explicit_skills = kwargs.pop("selected_skills", None)
+        selected_skill_names = _normalize_skill_selection(explicit_skills)
 
         operation = await self.kernel.create_operation(
             operation_type="chat.run",
             request={"prompt": prompt},
             metadata={"agent_id": self.runtime_id, "agent_name": self.agent_name},
         )
+        skill_resolution = self._resolve_skills(
+            prompt=prompt,
+            explicit_skills=selected_skill_names,
+        )
+        operation = replace(
+            operation,
+            metadata={
+                **operation.metadata,
+                "skills": skill_resolution.to_metadata(),
+                "skill_catalog": list(
+                    SkillResolver(self.extension_registry).compact_catalog(
+                        runtime_kind=self.runtime_kind
+                    )
+                ),
+            },
+        )
+        await self.store.save_operation(operation)
+        await self._record_skill_resolution(operation.id, skill_resolution)
         run_state = RunState(agent_id=self.runtime_id)
         run_state.diagnostics["operation_id"] = operation.id
+        run_state.diagnostics["skills"] = skill_resolution.to_metadata()
         run_state.final_answer_readiness_hooks.extend(
             self._final_answer_hooks_getter() or []
         )
@@ -266,7 +291,9 @@ class ChatRuntime:
             )
 
             conversation = await self._build_initial_conversation(
-                prompt, initial_messages
+                prompt,
+                initial_messages,
+                skill_resolution=skill_resolution,
             )
             legacy_tool_calls: list[dict[str, Any]] = []
             chat_tool_calls: list[ChatToolCallResult] = []
@@ -632,6 +659,8 @@ class ChatRuntime:
         self,
         prompt: str,
         initial_messages: list[dict[str, Any]] | None = None,
+        *,
+        skill_resolution: SkillResolution | None = None,
     ) -> list[dict[str, Any]]:
         conversation: list[dict[str, Any]] = []
         system_parts: list[str] = []
@@ -639,7 +668,22 @@ class ChatRuntime:
             system_parts.append(
                 self.prompt if isinstance(self.prompt, str) else json.dumps(self.prompt)
             )
-        extension_blocks = await self._render_context_blocks(prompt)
+        skill_resolution = skill_resolution or self._resolve_skills(
+            prompt=prompt,
+            explicit_skills=(),
+        )
+        extension_blocks = [
+            *await self._render_context_blocks(
+                prompt,
+                selected_skill_ids=skill_resolution.selected_ids(),
+                selected_skill_names=skill_resolution.selected_names(),
+            ),
+            *[
+                block
+                for effect in skill_resolution.effects
+                for block in effect.context_blocks
+            ],
+        ]
         extension_context = self._format_context(
             [
                 block
@@ -663,6 +707,9 @@ class ChatRuntime:
         ]
         if skill_parts:
             system_parts.append("## Skills & Expertise\n" + "\n\n".join(skill_parts))
+        catalog_context = self._format_skill_catalog(skill_resolution)
+        if catalog_context:
+            system_parts.append(catalog_context)
         if system_parts:
             conversation.append(
                 {"role": "system", "content": "\n\n".join(system_parts)}
@@ -678,6 +725,8 @@ class ChatRuntime:
         *,
         audience: ContextAudience = ContextAudience.PRIMARY_MODEL,
         token_budget: int = 2000,
+        selected_skill_ids: tuple[str, ...] = (),
+        selected_skill_names: tuple[str, ...] = (),
     ) -> list[ContextBlock]:
         """Render context blocks from registry-owned context providers."""
         await self._setup_extensions()
@@ -688,12 +737,20 @@ class ChatRuntime:
             if audience not in provider.audiences:
                 continue
             try:
+                provider_context = {
+                    "prompt": prompt,
+                    "runtime_id": self.runtime_id,
+                    "agent_id": self.runtime_id,
+                }
+                if selected_skill_ids or selected_skill_names:
+                    provider_context.update(
+                        {
+                            "selected_skill_ids": tuple(selected_skill_ids),
+                            "selected_skill_names": tuple(selected_skill_names),
+                        }
+                    )
                 block = await provider.render(
-                    {
-                        "prompt": prompt,
-                        "runtime_id": self.runtime_id,
-                        "agent_id": self.runtime_id,
-                    },
+                    provider_context,
                     audience,
                     token_budget,
                 )
@@ -711,8 +768,18 @@ class ChatRuntime:
 
         return blocks
 
-    async def _render_context_blocks(self, prompt: str) -> list[ContextBlock]:
-        return await self.render_context_blocks(prompt)
+    async def _render_context_blocks(
+        self,
+        prompt: str,
+        *,
+        selected_skill_ids: tuple[str, ...] = (),
+        selected_skill_names: tuple[str, ...] = (),
+    ) -> list[ContextBlock]:
+        return await self.render_context_blocks(
+            prompt,
+            selected_skill_ids=selected_skill_ids,
+            selected_skill_names=selected_skill_names,
+        )
 
     def _format_context(self, blocks: list[ContextBlock]) -> str | None:
         if not blocks:
@@ -1011,6 +1078,23 @@ class ChatRuntime:
                 )
                 self.trace_manager.record_output(span_id, rendered)
 
+        if self._is_skill_owner(spec.owner) and result.task_id is not None:
+            await self.kernel.append_event(
+                RuntimeEventType.DIAGNOSTIC,
+                operation_id=operation_id,
+                message=f"Skill tool {tool_name} executed.",
+                task_id=result.task_id,
+                capability_id=result.capability_id,
+                executor_id=capability.executor,
+                plugin_id=spec.owner,
+                payload={
+                    "diagnostic": "skill.tool_executed",
+                    "skill_id": spec.owner,
+                    "tool_view": tool_name,
+                    "blocked": result.blocked,
+                    "error": result.error,
+                },
+            )
         self._emit_event(
             on_event,
             EventType.TOOL_RESULT,
@@ -1033,6 +1117,95 @@ class ChatRuntime:
         if len(evidence) == 1:
             return evidence[0].payload
         return {"evidence": [item.to_dict() for item in evidence]}
+
+    def _resolve_skills(
+        self,
+        *,
+        prompt: str,
+        explicit_skills: tuple[str, ...],
+    ) -> SkillResolution:
+        return SkillResolver(self.extension_registry).resolve(
+            runtime_kind=self.runtime_kind,
+            prompt=prompt,
+            explicit_skills=explicit_skills,
+            runtime_context={
+                "runtime_id": self.runtime_id,
+                "available_capabilities": tuple(
+                    capability.id for capability in self.extension_registry.capabilities
+                ),
+                "tool_view_names": tuple(
+                    view.name for view in self.extension_registry.tool_views
+                ),
+            },
+        )
+
+    async def _record_skill_resolution(
+        self,
+        operation_id: str,
+        resolution: SkillResolution,
+    ) -> None:
+        for activation in resolution.selected:
+            await self.kernel.append_event(
+                RuntimeEventType.DIAGNOSTIC,
+                operation_id=operation_id,
+                message=f"Skill {activation.skill_name} selected.",
+                plugin_id=activation.skill_id,
+                payload={
+                    "diagnostic": "skill.selected",
+                    "activation": activation.to_dict(),
+                },
+            )
+            if activation.context_loaded:
+                await self.kernel.append_event(
+                    RuntimeEventType.DIAGNOSTIC,
+                    operation_id=operation_id,
+                    message=f"Skill {activation.skill_name} context loaded.",
+                    plugin_id=activation.skill_id,
+                    payload={
+                        "diagnostic": "skill.context_loaded",
+                        "activation": activation.to_dict(),
+                    },
+                )
+        for activation in resolution.skipped:
+            await self.kernel.append_event(
+                RuntimeEventType.DIAGNOSTIC,
+                operation_id=operation_id,
+                message=f"Skill {activation.skill_name} activation skipped.",
+                plugin_id=activation.skill_id,
+                payload={
+                    "diagnostic": "skill.activation_skipped",
+                    "activation": activation.to_dict(),
+                },
+            )
+
+    def _format_skill_catalog(self, resolution: SkillResolution) -> str | None:
+        selected = set(resolution.selected_ids())
+        cards = [
+            activation
+            for activation in resolution.activations
+            if not activation.selected
+            and activation.skill_id not in selected
+            and activation.discovery.context_mode == "on_demand"
+        ]
+        if not cards:
+            return None
+        lines = []
+        for activation in cards:
+            hints = "; ".join(activation.discovery.when_to_use)
+            suffix = f" Use when: {hints}" if hints else ""
+            lines.append(
+                f"- {activation.skill_name} ({activation.skill_id}): "
+                f"{activation.discovery.description}{suffix}"
+            )
+        return "## Available Skills\n" + "\n".join(lines)
+
+    def _is_skill_owner(self, plugin_id: str) -> bool:
+        try:
+            plugin = self.extension_registry.get_plugin(plugin_id)
+        except KeyError:
+            return False
+        manifest = getattr(plugin, "manifest", None)
+        return manifest is not None and manifest.kind is PluginKind.SKILL
 
     def _append_tool_messages(self, conversation, tool_calls, results) -> None:
         conversation.append({"role": "assistant", "tool_calls": tool_calls})
@@ -1234,3 +1407,11 @@ def _resolve_tool_focus(agent_focus, tool) -> str | None:
 
 def _first_evidence_id(evidence: tuple[Evidence, ...]) -> str | None:
     return next((item.id for item in evidence if item.id is not None), None)
+
+
+def _normalize_skill_selection(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(item) for item in value)

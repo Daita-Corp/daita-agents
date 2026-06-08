@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from daita.agents.agent import Agent
 from daita.db.config.policies import SchemaPromptPolicy, ToolResultPolicy
-from daita.db import DbAgent, DbRuntime
+from daita.db import DbAgent, DbRequest, DbRuntime
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.catalog.persistence import catalog_profile_key
 from daita.plugins import PluginKind, PluginManifest
@@ -18,6 +18,7 @@ from daita.plugins.memory.memory_plugin import MemoryPlugin
 from daita.plugins.postgresql import PostgreSQLPlugin
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import OperationStatus
+from daita.skills import Skill, SkillRuntimeEffects
 
 import pytest
 
@@ -125,6 +126,67 @@ async def test_agent_from_db_returns_db_agent_backed_by_db_runtime(tmp_path):
         assert not hasattr(agent, "tool_names")
     finally:
         await agent.stop()
+
+
+async def test_agent_from_db_registers_skills_before_runtime_setup(tmp_path):
+    db_path = tmp_path / "skills.sqlite"
+    await _seed_sqlite(db_path)
+    skill = Skill(
+        name="finance",
+        runtime_effects=SkillRuntimeEffects(
+            skill_id="skill_finance",
+            requested_capabilities=("catalog.schema.search",),
+            contract_metadata={"planning_hints": {"finance": True}},
+        ),
+    )
+
+    agent = await Agent.from_db(str(db_path), skills=[skill])
+
+    try:
+        inspection = await agent.describe()
+        db_request = DbRequest("How many orders are there?")
+        intent = agent.runtime.classify_request(db_request)
+        skill_resolution = agent.runtime._resolve_skills(db_request)
+        contract = agent.runtime.build_contract(
+            db_request,
+            intent,
+            skill_resolution=skill_resolution,
+        )
+    finally:
+        await agent.stop()
+
+    assert "skill_finance" in inspection.plugin_ids
+    assert "catalog.schema.search" in contract.required_capabilities
+
+
+async def test_agent_from_db_skill_effects_apply_during_run_before_contract_building(
+    tmp_path,
+):
+    db_path = tmp_path / "skills_run.sqlite"
+    await _seed_sqlite(db_path)
+    skill = Skill(
+        name="quality_gate",
+        runtime_effects=SkillRuntimeEffects(
+            skill_id="skill_quality_gate",
+            requested_capabilities=("quality.profile",),
+            required_evidence=("quality.profile",),
+        ),
+    )
+
+    agent = await Agent.from_db(str(db_path), skills=[skill])
+
+    try:
+        result = await agent.run_detailed("Hello there")
+        snapshot = await agent.runtime.inspect_operation(result.operation_id)
+    finally:
+        await agent.stop()
+
+    assert result.contract.metadata["missing_capabilities"] == ["quality.profile"]
+    assert snapshot is not None
+    assert snapshot.tasks == ()
+    diagnostics = [event.payload.get("diagnostic") for event in snapshot.events]
+    assert "skill.selected" in diagnostics
+    assert "skill.contract_modified" in diagnostics
 
 
 async def test_legacy_agents_db_public_import_routes_to_db_runtime(tmp_path):

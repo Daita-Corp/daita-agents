@@ -14,6 +14,7 @@ from daita.runtime import (
     EvidenceSchema,
     Operation,
     OperationStatus,
+    PolicyDecision,
     PolicyEffect,
     RiskLevel,
     RuntimeEventType,
@@ -23,6 +24,7 @@ from daita.runtime import (
     TaskStatus,
     ApprovalRequest,
 )
+from daita.skills import Skill, SkillRuntimeEffects
 
 
 class WriteProbeExecutor:
@@ -208,6 +210,110 @@ class ReadProbePlugin(RuntimeExtensionPlugin):
                 json_schema={"type": "object"},
             )
         ]
+
+
+class RecordingPolicy:
+    def __init__(self, *, policy_id: str, owner: str, effect: PolicyEffect | None):
+        self.id = policy_id
+        self.owner = owner
+        self.effect = effect
+        self.calls = 0
+
+    def applies_to(self, request, operation_type):
+        return True
+
+    def modify_contract(self, contract):
+        return contract
+
+    def evaluate_operation(self, operation):
+        self.calls += 1
+        if self.effect is None:
+            return None
+        return PolicyDecision(
+            policy_id=self.id,
+            owner=self.owner,
+            effect=self.effect,
+            reason=f"{self.owner}:{self.id} evaluated",
+            severity=RiskLevel.LOW,
+        )
+
+
+class GovernancePolicyPlugin(RuntimeExtensionPlugin):
+    manifest = PluginManifest(
+        id="governance_probe",
+        display_name="Governance Probe",
+        version="1.0.0",
+        kind=PluginKind.RUNTIME_EXTENSION,
+        domains=frozenset({"db"}),
+    )
+
+    def __init__(self, policy: RecordingPolicy):
+        self.policy = policy
+
+    def declare_policies(self):
+        return (self.policy,)
+
+
+async def test_unselected_skill_owned_policy_does_not_evaluate():
+    skill_policy = RecordingPolicy(
+        policy_id="aggregate_only",
+        owner="skill_finance",
+        effect=PolicyEffect.WARN,
+    )
+    skill = Skill(name="finance", policies=(skill_policy,), context_mode="runtime_only")
+    runtime = DbRuntime(plugins=(skill,))
+
+    result = await runtime.run(DbRequest("Hello there"))
+    snapshot = await runtime.inspect_operation(result.operation_id)
+
+    assert skill_policy.calls == 0
+    assert result.contract.policy_ids == ()
+    assert snapshot.policy_decisions == ()
+
+
+async def test_selected_skill_owned_policy_evaluates_when_contract_references_it():
+    skill_policy = RecordingPolicy(
+        policy_id="aggregate_only",
+        owner="skill_finance",
+        effect=PolicyEffect.WARN,
+    )
+    skill = Skill(
+        name="finance",
+        policies=(skill_policy,),
+        runtime_effects=SkillRuntimeEffects(
+            skill_id="skill_finance",
+            policy_ids=("skill_finance:aggregate_only",),
+        ),
+        context_mode="runtime_only",
+    )
+    runtime = DbRuntime(plugins=(skill,))
+
+    result = await runtime.run(DbRequest("Hello there"))
+    snapshot = await runtime.inspect_operation(result.operation_id)
+
+    assert skill_policy.calls == 1
+    assert result.contract.policy_ids == ("skill_finance:aggregate_only",)
+    assert [decision.policy_identity for decision in snapshot.policy_decisions] == [
+        "skill_finance:aggregate_only@1"
+    ]
+
+
+async def test_non_skill_registry_policy_still_evaluates_without_contract_reference():
+    policy = RecordingPolicy(
+        policy_id="warn_all",
+        owner="governance_probe",
+        effect=PolicyEffect.WARN,
+    )
+    runtime = DbRuntime(plugins=(GovernancePolicyPlugin(policy),))
+
+    result = await runtime.run(DbRequest("Hello there"))
+    snapshot = await runtime.inspect_operation(result.operation_id)
+
+    assert policy.calls == 1
+    assert result.contract.policy_ids == ()
+    assert [decision.policy_identity for decision in snapshot.policy_decisions] == [
+        "governance_probe:warn_all@1"
+    ]
 
 
 async def test_db_runtime_requires_approval_for_write_before_tasks_run():

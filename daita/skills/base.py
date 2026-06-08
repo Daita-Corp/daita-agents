@@ -6,14 +6,27 @@ with domain-specific instructions. Unlike plugins (infrastructure connectors),
 skills carry behavioral intelligence.
 """
 
+from dataclasses import replace
 import inspect
 from pathlib import Path
 import re
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 from ..plugins.base import SkillPlugin
 from ..plugins.manifest import PluginKind, PluginManifest
-from ..runtime import Capability, ContextAudience, ContextBlock, Executor, ToolView
+from ..runtime import (
+    Capability,
+    ContextAudience,
+    ContextBlock,
+    ContextProvider,
+    EvidenceSchema,
+    Executor,
+    LocalToolRuntimeAdapter,
+    Policy,
+    ToolView,
+    Worker,
+)
+from .runtime import SkillActivationRules, SkillDiscovery, SkillRuntimeEffects
 
 _SKILL_ID_RE = re.compile(r"[^a-z0-9_]+")
 
@@ -50,6 +63,18 @@ class _SkillInstructionContextProvider:
             return None
         instructions = self._skill.get_instructions(str(context.get("prompt") or ""))
         if not instructions:
+            return None
+        discovery = self._skill.discovery()
+        selected_ids = set(context.get("selected_skill_ids") or ())
+        selected_names = set(context.get("selected_skill_names") or ())
+        selected = (
+            self._skill.manifest.id in selected_ids
+            or self._skill.name in selected_names
+            or discovery.name in selected_names
+        )
+        if discovery.context_mode in {"none", "runtime_only"}:
+            return None
+        if discovery.context_mode == "on_demand" and not selected:
             return None
         return ContextBlock(
             id=self.id,
@@ -128,6 +153,54 @@ class BaseSkill(SkillPlugin):
         """Declare capability IDs this skill needs from already-attached plugins."""
         return ()
 
+    def discovery(self) -> SkillDiscovery:
+        """Return compact discovery metadata for this skill."""
+        return SkillDiscovery(
+            name=self.name or self.__class__.__name__,
+            description=self.description,
+            runtime_kinds=("chat", "db"),
+            requires_capabilities=self.requires_capabilities(),
+            provides_capabilities=tuple(
+                capability.id for capability in self.declare_capabilities()
+            ),
+            context_mode=(
+                "always" if self.instructions or self.instructions_file else "none"
+            ),
+        )
+
+    def activation_rules(self) -> SkillActivationRules:
+        """Return runtime activation rules for this skill."""
+        return SkillActivationRules(
+            requires_capabilities=self.requires_capabilities(),
+            always_on=bool(self.instructions or self.instructions_file),
+        )
+
+    def runtime_effects(
+        self,
+        request: Any = None,
+        runtime_context: Mapping[str, Any] | None = None,
+    ) -> SkillRuntimeEffects:
+        """Return declarative effects for a selected runtime run."""
+        return SkillRuntimeEffects(skill_id=self.manifest.id)
+
+    def declare_capabilities(self) -> tuple[Capability, ...]:
+        return ()
+
+    def get_executors(self) -> tuple[Executor, ...]:
+        return ()
+
+    def get_tool_views(self) -> tuple[ToolView, ...]:
+        return ()
+
+    def declare_policies(self) -> tuple[Policy, ...]:
+        return ()
+
+    def declare_evidence_schemas(self) -> tuple[EvidenceSchema, ...]:
+        return ()
+
+    def get_workers(self) -> tuple[Worker, ...]:
+        return ()
+
     @property
     def resolved_capabilities(self) -> dict[str, tuple[Capability, ...]]:
         """Capabilities resolved for ``requires_capabilities()`` at attachment."""
@@ -158,6 +231,14 @@ class Skill(BaseSkill):
         capabilities: tuple[Capability, ...] = (),
         executors: tuple[Executor, ...] = (),
         tool_views: tuple[ToolView, ...] = (),
+        policies: tuple[Policy, ...] = (),
+        evidence_schemas: tuple[EvidenceSchema, ...] = (),
+        context_providers: tuple[ContextProvider, ...] = (),
+        workers: tuple[Worker, ...] = (),
+        activation_rules: SkillActivationRules | Mapping[str, Any] | None = None,
+        runtime_effects: SkillRuntimeEffects | Mapping[str, Any] | None = None,
+        discovery: SkillDiscovery | Mapping[str, Any] | None = None,
+        context_mode: str = "always",
         description: str = "",
         version: str = "0.1.0",
         **config,
@@ -187,9 +268,115 @@ class Skill(BaseSkill):
         self._capabilities = tuple(capabilities)
         self._executors = tuple(executors)
         self._tool_views = tuple(tool_views)
+        self._policies = tuple(policies)
+        self._evidence_schemas = tuple(evidence_schemas)
+        self._extra_context_providers = tuple(context_providers)
+        self._workers = tuple(workers)
+        self._discovery = _coerce_discovery(
+            discovery,
+            name=name,
+            description=description,
+            context_mode=context_mode,
+            requires_capabilities=self._requires_capabilities,
+            capabilities=self._capabilities,
+        )
+        self._activation_rules = _coerce_activation_rules(
+            activation_rules,
+            default_always_on=bool(
+                runtime_effects
+                or (context_mode == "always" and (instructions or instructions_file))
+            ),
+            requires_capabilities=self._requires_capabilities,
+        )
+        self._runtime_effects = _coerce_runtime_effects(
+            runtime_effects,
+            skill_id=self.manifest.id,
+            tool_view_names=tuple(view.name for view in self._tool_views),
+        )
+
+    @classmethod
+    def with_tools(
+        cls,
+        name: str,
+        *,
+        tools: tuple[Any, ...] | list[Any],
+        instructions: str = "",
+        description: str = "",
+        version: str = "0.1.0",
+        context_mode: str = "always",
+        requires_capabilities: tuple[str, ...] = (),
+        runtime_effects: SkillRuntimeEffects | Mapping[str, Any] | None = None,
+        **config,
+    ) -> "Skill":
+        """Create a skill from local tools using the runtime tool adapter."""
+        manifest_id = _skill_manifest_id(name, cls.__name__)
+        adapter = LocalToolRuntimeAdapter(owner_namespace=manifest_id)
+        capabilities: list[Capability] = []
+        executors: list[Executor] = []
+        evidence_schemas: list[EvidenceSchema] = []
+        tool_views: list[ToolView] = []
+        for tool in tools:
+            plugin = adapter.plugin_for(tool)
+            capability = plugin.declare_capabilities()[0]
+            rehomed_capability = replace(
+                capability,
+                owner=manifest_id,
+                metadata={
+                    **capability.metadata,
+                    "skill_id": manifest_id,
+                    "tool_owner": plugin.manifest.id,
+                },
+            )
+            capabilities.append(rehomed_capability)
+            executors.extend(plugin.get_executors())
+            evidence_schemas.extend(
+                replace(schema, owner=manifest_id)
+                for schema in plugin.declare_evidence_schemas()
+            )
+            tool_views.extend(
+                replace(
+                    view,
+                    metadata={
+                        **view.metadata,
+                        "skill_id": manifest_id,
+                        "tool_owner": plugin.manifest.id,
+                    },
+                )
+                for view in plugin.get_tool_views()
+            )
+        return cls(
+            name=name,
+            instructions=instructions,
+            requires_capabilities=requires_capabilities,
+            capabilities=tuple(capabilities),
+            executors=tuple(executors),
+            tool_views=tuple(tool_views),
+            evidence_schemas=tuple(evidence_schemas),
+            runtime_effects=runtime_effects,
+            description=description,
+            version=version,
+            context_mode=context_mode,
+            **config,
+        )
 
     def requires_capabilities(self) -> tuple[str, ...]:
         return self._requires_capabilities
+
+    def get_context_providers(self) -> tuple[ContextProvider, ...]:
+        return (*super().get_context_providers(), *self._extra_context_providers)
+
+    def discovery(self) -> SkillDiscovery:
+        return self._discovery
+
+    def activation_rules(self) -> SkillActivationRules:
+        return self._activation_rules
+
+    def runtime_effects(
+        self,
+        request: Any = None,
+        runtime_context: Mapping[str, Any] | None = None,
+    ) -> SkillRuntimeEffects:
+        return self._runtime_effects
 
     def declare_capabilities(self) -> tuple[Capability, ...]:
         return self._capabilities
@@ -199,3 +386,77 @@ class Skill(BaseSkill):
 
     def get_tool_views(self) -> tuple[ToolView, ...]:
         return self._tool_views
+
+    def declare_policies(self) -> tuple[Policy, ...]:
+        return self._policies
+
+    def declare_evidence_schemas(self) -> tuple[EvidenceSchema, ...]:
+        return self._evidence_schemas
+
+    def get_workers(self) -> tuple[Worker, ...]:
+        return self._workers
+
+
+def _coerce_discovery(
+    value: SkillDiscovery | Mapping[str, Any] | None,
+    *,
+    name: str,
+    description: str,
+    context_mode: str,
+    requires_capabilities: tuple[str, ...],
+    capabilities: tuple[Capability, ...],
+) -> SkillDiscovery:
+    if isinstance(value, SkillDiscovery):
+        return value
+    values = dict(value or {})
+    return SkillDiscovery(
+        name=str(values.pop("name", name)),
+        description=str(values.pop("description", description)),
+        requires_capabilities=tuple(
+            values.pop("requires_capabilities", requires_capabilities)
+        ),
+        provides_capabilities=tuple(
+            values.pop(
+                "provides_capabilities",
+                tuple(capability.id for capability in capabilities),
+            )
+        ),
+        context_mode=str(values.pop("context_mode", context_mode)),
+        **values,
+    )
+
+
+def _coerce_activation_rules(
+    value: SkillActivationRules | Mapping[str, Any] | None,
+    *,
+    default_always_on: bool,
+    requires_capabilities: tuple[str, ...],
+) -> SkillActivationRules:
+    if isinstance(value, SkillActivationRules):
+        return value
+    values = dict(value or {})
+    return SkillActivationRules(
+        requires_capabilities=tuple(
+            values.pop("requires_capabilities", requires_capabilities)
+        ),
+        always_on=bool(values.pop("always_on", default_always_on)),
+        **values,
+    )
+
+
+def _coerce_runtime_effects(
+    value: SkillRuntimeEffects | Mapping[str, Any] | None,
+    *,
+    skill_id: str,
+    tool_view_names: tuple[str, ...],
+) -> SkillRuntimeEffects:
+    if isinstance(value, SkillRuntimeEffects):
+        if value.skill_id == skill_id:
+            return value
+        return replace(value, skill_id=skill_id)
+    values = dict(value or {})
+    return SkillRuntimeEffects(
+        skill_id=skill_id,
+        tool_view_names=tuple(values.pop("tool_view_names", tool_view_names)),
+        **values,
+    )

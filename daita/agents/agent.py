@@ -82,6 +82,7 @@ class Agent(ChatAgentFacadeMixin, BaseAgent):
                     Seeds FK relationships into a persistent graph.
                 memory: True to auto-create MemoryPlugin, or pass an instance.
                     Enables conversational business context annotations.
+                skills: Skill instances registered before DbRuntime setup.
                 cache_ttl: Schema cache TTL in seconds. None disables caching.
                 Additional kwargs forwarded to Agent.__init__.
 

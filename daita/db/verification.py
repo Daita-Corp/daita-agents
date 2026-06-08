@@ -51,6 +51,9 @@ class DbVerifier:
         diagnostics: dict[str, Any] = {
             "required_evidence": list(contract.required_evidence),
             "accepted_evidence_kinds": [item.kind for item in evidence],
+            "skill_verifier_metadata": contract.metadata.get(
+                "skill_verifier_metadata", {}
+            ),
         }
 
         if intent.kind in {

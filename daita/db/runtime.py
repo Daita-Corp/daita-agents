@@ -14,7 +14,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
-from daita.plugins import ExtensionRegistry, PluginContext, ServiceRegistry
+from daita.plugins import ExtensionRegistry, PluginContext, PluginKind, ServiceRegistry
 from daita.runtime import (
     AccessMode,
     Capability,
@@ -45,6 +45,7 @@ from daita.runtime import (
     TaskDependency,
     TaskStatus,
 )
+from daita.skills import SkillResolution, SkillResolver
 
 from .execution import DbOperationExecutor
 from .governance import default_db_policies
@@ -725,12 +726,20 @@ class DbRuntime:
         self,
         request: DbRequest | str,
         intent: DbIntent | None = None,
+        *,
+        skill_resolution: SkillResolution | None = None,
+        include_skills: bool = True,
     ) -> DbOperationContract:
         """Build a structured operation contract from registry capabilities."""
         db_request = request if isinstance(request, DbRequest) else DbRequest(request)
         resolved_intent = intent or self.classify_request(db_request)
+        resolved_skills = skill_resolution
+        if resolved_skills is None and include_skills:
+            resolved_skills = self._resolve_skills(db_request)
         return DbContractBuilder(self.registry, self.config).build(
-            db_request, resolved_intent
+            db_request,
+            resolved_intent,
+            skill_effects=resolved_skills.effects if resolved_skills else (),
         )
 
     async def run(self, request: DbRequest | str) -> DbOperationResult:
@@ -739,7 +748,12 @@ class DbRuntime:
         if not self._is_setup:
             await self.setup()
         intent = self.classify_request(db_request)
-        contract = self.build_contract(db_request, intent)
+        skill_resolution = self._resolve_skills(db_request)
+        contract = self.build_contract(
+            db_request,
+            intent,
+            skill_resolution=skill_resolution,
+        )
         operation = await self.kernel.create_operation(
             operation_type=contract.operation_type,
             request={
@@ -756,20 +770,24 @@ class DbRuntime:
             metadata={
                 "intent_kind": intent.kind.value,
                 "access": contract.access.value,
+                "skills": skill_resolution.to_metadata(),
                 "resume_context": {
                     "request": _db_request_context(db_request),
                     "intent": _db_intent_context(intent),
                     "contract": _db_contract_context(contract),
+                    "skills": skill_resolution.to_metadata(),
                 },
             },
             evaluate_governance=False,
         )
         operation_id = operation.id
+        await self._record_skill_resolution(operation_id, skill_resolution, contract)
 
         base_diagnostics = {
             "runtime_id": self.runtime_id,
             "registered_plugins": list(self.registry.plugin_ids),
             "contract": contract.metadata,
+            "skills": skill_resolution.to_metadata(),
         }
         if contract.metadata.get("missing_capabilities"):
             return await self._record_operation_result(
@@ -1001,6 +1019,85 @@ class DbRuntime:
             await self._plan_kernel_task(task)
             existing.add(key)
             planned_by_capability[(capability.id, capability.owner)] = task
+
+    def _resolve_skills(self, request: DbRequest) -> SkillResolution:
+        return SkillResolver(self.registry).resolve(
+            runtime_kind=self.runtime_kind,
+            prompt=request.prompt,
+            request=request,
+            explicit_skills=_skill_names_from_request(request),
+            runtime_context={
+                "runtime_id": self.runtime_id,
+                "available_capabilities": tuple(
+                    capability.id for capability in self.registry.capabilities
+                ),
+                "config": self.config.metadata,
+                "request_metadata": request.metadata,
+                "mode": request.mode,
+            },
+        )
+
+    async def _record_skill_resolution(
+        self,
+        operation_id: str,
+        resolution: SkillResolution,
+        contract: DbOperationContract,
+    ) -> None:
+        for activation in resolution.selected:
+            await self.kernel.append_event(
+                RuntimeEventType.DIAGNOSTIC,
+                operation_id=operation_id,
+                message=f"Skill {activation.skill_name} selected.",
+                plugin_id=activation.skill_id,
+                payload={
+                    "diagnostic": "skill.selected",
+                    "activation": activation.to_dict(),
+                },
+            )
+            if activation.context_loaded:
+                await self.kernel.append_event(
+                    RuntimeEventType.DIAGNOSTIC,
+                    operation_id=operation_id,
+                    message=f"Skill {activation.skill_name} context loaded.",
+                    plugin_id=activation.skill_id,
+                    payload={
+                        "diagnostic": "skill.context_loaded",
+                        "activation": activation.to_dict(),
+                    },
+                )
+        for activation in resolution.skipped:
+            await self.kernel.append_event(
+                RuntimeEventType.DIAGNOSTIC,
+                operation_id=operation_id,
+                message=f"Skill {activation.skill_name} activation skipped.",
+                plugin_id=activation.skill_id,
+                payload={
+                    "diagnostic": "skill.activation_skipped",
+                    "activation": activation.to_dict(),
+                },
+            )
+        if _effects_modify_contract(resolution.effects):
+            await self.kernel.append_event(
+                RuntimeEventType.DIAGNOSTIC,
+                operation_id=operation_id,
+                message="Skills modified DB operation contract.",
+                payload={
+                    "diagnostic": "skill.contract_modified",
+                    "selected_skill_ids": list(resolution.selected_ids()),
+                    "required_capabilities": list(contract.required_capabilities),
+                    "required_evidence": list(contract.required_evidence),
+                    "policy_ids": list(contract.policy_ids),
+                    "skill_contract_metadata": contract.metadata.get(
+                        "skill_contract_metadata", {}
+                    ),
+                    "skill_verifier_metadata": contract.metadata.get(
+                        "skill_verifier_metadata", {}
+                    ),
+                    "skill_synthesis_metadata": contract.metadata.get(
+                        "skill_synthesis_metadata", {}
+                    ),
+                },
+            )
 
     async def _planned_task_for_capability(
         self,
@@ -1391,7 +1488,7 @@ class DbRuntime:
         """Build DB-owned governance facts for kernel task execution."""
         contract = (
             _db_contract_from_context(operation)
-            if stage == "operation" and _operation_has_run_context(operation)
+            if _operation_has_run_context(operation)
             else None
         )
         return await self._evaluate_governance(
@@ -1427,11 +1524,7 @@ class DbRuntime:
         capability: Capability | None = None,
         stage: str,
     ) -> _GovernancePersistence:
-        policies = (
-            *default_db_policies(),
-            *self.config.policies,
-            *self.registry.policies,
-        )
+        policies = self._active_governance_policies(contract)
         current_evidence = tuple(await self.store.list_evidence(operation.id))
         current_approvals = tuple(await self.store.list_approval_requests(operation.id))
         authoritative_validation_evidence = (
@@ -1516,6 +1609,26 @@ class DbRuntime:
             approvals_to_request=approvals_to_request,
             events=tuple(events),
         )
+
+    def _active_governance_policies(
+        self,
+        contract: DbOperationContract | None,
+    ) -> tuple[Any, ...]:
+        active_policy_ids = set(contract.policy_ids if contract is not None else ())
+        policies: list[Any] = [*default_db_policies(), *self.config.policies]
+
+        for policy in self.registry.policies:
+            identity = f"{policy.owner}:{policy.id}"
+            owner_plugin = self.registry.get_plugin(policy.owner)
+            owner_manifest = getattr(owner_plugin, "manifest", None)
+            is_skill_policy = (
+                owner_manifest is not None
+                and getattr(owner_manifest, "kind", None) is PluginKind.SKILL
+            )
+            if not is_skill_policy or identity in active_policy_ids:
+                policies.append(policy)
+
+        return tuple(policies)
 
     async def _governance_audit_record(
         self,
@@ -1873,6 +1986,29 @@ def _db_request_context(request: DbRequest) -> dict[str, Any]:
         "constraints": request.constraints,
         "metadata": request.metadata,
     }
+
+
+def _skill_names_from_request(request: DbRequest) -> tuple[str, ...]:
+    value = request.metadata.get("skills")
+    if value is None:
+        value = request.metadata.get("selected_skills")
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(item) for item in value)
+
+
+def _effects_modify_contract(effects: tuple[Any, ...]) -> bool:
+    return any(
+        effect.requested_capabilities
+        or effect.required_evidence
+        or effect.policy_ids
+        or effect.contract_metadata
+        or effect.verifier_metadata
+        or effect.synthesis_metadata
+        for effect in effects
+    )
 
 
 def _db_intent_context(intent: DbIntent) -> dict[str, Any]:

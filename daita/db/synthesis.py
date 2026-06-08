@@ -71,6 +71,9 @@ class DbSynthesizer:
                 "operation_type": contract.operation_type,
                 "context": self.context_renderer.render_evidence_summary(evidence),
                 "prompt": request.prompt,
+                "skill_synthesis_metadata": contract.metadata.get(
+                    "skill_synthesis_metadata", {}
+                ),
             },
         )
 

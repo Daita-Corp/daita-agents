@@ -53,7 +53,16 @@ from .plugins.registry import ExtensionRegistry, RegistryDiagnostic
 # ---------------------------------------------------------------------------
 # Skills — composable units of agent capability
 # ---------------------------------------------------------------------------
-from .skills import BaseSkill, Skill
+from .skills import (
+    BaseSkill,
+    Skill,
+    SkillActivation,
+    SkillActivationRules,
+    SkillDiscovery,
+    SkillResolver,
+    SkillResolution,
+    SkillRuntimeEffects,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -140,6 +149,12 @@ __all__ = [
     "RegistryDiagnostic",
     "BaseSkill",
     "Skill",
+    "SkillActivation",
+    "SkillActivationRules",
+    "SkillDiscovery",
+    "SkillResolver",
+    "SkillResolution",
+    "SkillRuntimeEffects",
     # Configuration
     "AgentConfig",
     "RetryPolicy",

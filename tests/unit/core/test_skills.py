@@ -24,7 +24,14 @@ from daita.runtime import (
     Task,
     ToolView,
 )
+from daita.skills import (
+    SkillActivationRules,
+    SkillDiscovery,
+    SkillResolver,
+    SkillRuntimeEffects,
+)
 from daita.skills.base import BaseSkill, Skill
+from tests.conftest import SequentialMockLLM
 
 # ===========================================================================
 # Helpers
@@ -123,6 +130,41 @@ class ManifestDependencyPlugin(RuntimeExtensionPlugin):
 
     def get_executors(self):
         return (self.executor,)
+
+
+class CountingSkill(BaseSkill):
+    name = "finance"
+    description = "Finance skill."
+
+    def __init__(
+        self,
+        *,
+        rules: SkillActivationRules | None = None,
+        discovery: SkillDiscovery | None = None,
+        effects: SkillRuntimeEffects | None = None,
+    ):
+        super().__init__()
+        self.rules = rules or SkillActivationRules(always_on=True)
+        self.discovery_card = discovery or SkillDiscovery(
+            name=self.name,
+            description=self.description,
+            context_mode="none",
+        )
+        self.effects = effects
+        self.effect_calls = 0
+
+    def discovery(self):
+        return self.discovery_card
+
+    def activation_rules(self):
+        return self.rules
+
+    def runtime_effects(self, request=None, runtime_context=None):
+        self.effect_calls += 1
+        return self.effects or SkillRuntimeEffects(
+            skill_id=self.manifest.id,
+            contract_metadata={"effect_calls": self.effect_calls},
+        )
 
 
 # ===========================================================================
@@ -274,6 +316,48 @@ class TestSkillFactory:
         assert skill.description == "desc"
         assert skill.version == "2.0.0"
 
+    def test_runtime_effects_are_declarative(self):
+        effects = SkillRuntimeEffects(
+            skill_id="skill_finance",
+            requested_capabilities=("catalog.schema.search",),
+            required_evidence=("schema.asset_profile",),
+            policy_ids=("skill_finance:aggregate_only",),
+            contract_metadata={"planning_hints": {"prefer_aggregate_queries": True}},
+            verifier_metadata={"checks": ["sql.validation"]},
+            synthesis_metadata={"style": "finance_summary"},
+        )
+        skill = Skill(
+            name="finance",
+            runtime_effects=effects,
+            activation_rules=SkillActivationRules(always_on=True),
+        )
+
+        resolved = skill.runtime_effects()
+
+        assert resolved.skill_id == "skill_finance"
+        assert resolved.requested_capabilities == ("catalog.schema.search",)
+        assert (
+            resolved.contract_metadata["planning_hints"]["prefer_aggregate_queries"]
+            is True
+        )
+
+    def test_on_demand_discovery_is_compact_by_default(self):
+        skill = Skill(
+            name="finance",
+            description="Finance analysis.",
+            instructions="Full finance instructions.",
+            context_mode="on_demand",
+            discovery=SkillDiscovery(
+                name="finance",
+                description="Finance analysis.",
+                context_mode="on_demand",
+                when_to_use=("revenue questions",),
+            ),
+        )
+
+        assert skill.discovery().context_mode == "on_demand"
+        assert skill.activation_rules().always_on is False
+
 
 # ===========================================================================
 # agent.add_skill() — registration and dependency resolution
@@ -372,6 +456,32 @@ class TestAddSkill:
         assert result["evidence"][0]["payload"]["input"] == {"query": "abc"}
         assert executor.calls[0][0].capability_id == "skill.lookup"
 
+    async def test_tool_backed_skill_uses_local_tool_runtime_adapter_semantics(self):
+        from daita.core.tools import tool
+
+        calls = {"handler": 0}
+
+        @tool(id="report.format", output_evidence="report.format.result")
+        async def format_report(title: str) -> str:
+            """Format a report."""
+            calls["handler"] += 1
+            return f"# {title}"
+
+        skill = Skill.with_tools(
+            name="report_builder",
+            instructions="Use report tools.",
+            tools=[format_report],
+        )
+        agent = Agent(name="A", llm_provider=SequentialMockLLM(["unused"]))
+        agent.add_skill(skill)
+
+        result = await agent.call_tool("format_report", {"title": "Revenue"})
+
+        assert calls["handler"] == 1
+        assert agent.get_tool_view_owner("format_report") == "skill_report_builder"
+        assert result["capability_id"] == "report.format"
+        assert result["evidence"][0]["owner"] == "skill_report_builder"
+
     def test_capability_requirement_resolution_success(self, mock_llm):
         class DepSkill(BaseSkill):
             name = "dep"
@@ -434,6 +544,216 @@ class TestAddSkill:
 
 
 # ===========================================================================
+# SkillResolver activation semantics
+# ===========================================================================
+
+
+class TestSkillResolver:
+    def test_unknown_explicit_skill_selection_raises_clear_error(self):
+        registry = ExtensionRegistry()
+        registry.register(CountingSkill())
+
+        with pytest.raises(SkillError, match="Unknown skill selection\\(s\\): finacne"):
+            SkillResolver(registry).resolve(
+                runtime_kind="chat",
+                prompt="hello",
+                explicit_skills=("finacne",),
+            )
+
+    def test_valid_explicit_skill_selection_matches_manifest_and_name_aliases(self):
+        registry = ExtensionRegistry()
+        skill = CountingSkill()
+        registry.register(skill)
+
+        by_manifest = SkillResolver(registry).resolve(
+            runtime_kind="chat",
+            prompt="hello",
+            explicit_skills=("skill_finance",),
+        )
+        by_name = SkillResolver(registry).resolve(
+            runtime_kind="chat",
+            prompt="hello",
+            explicit_skills=("finance",),
+        )
+
+        assert by_manifest.selected_ids() == ("skill_finance",)
+        assert by_name.selected_ids() == ("skill_finance",)
+
+    def test_empty_capability_catalog_enforces_missing_requirements(self):
+        registry = ExtensionRegistry()
+        skill = CountingSkill(
+            rules=SkillActivationRules(
+                always_on=True,
+                requires_capabilities=("db.sql.execute_read",),
+            ),
+            discovery=SkillDiscovery(
+                name="finance",
+                description="Finance skill.",
+                requires_capabilities=("catalog.schema.search",),
+                context_mode="none",
+            ),
+        )
+        registry.register(skill)
+
+        resolution = SkillResolver(registry).resolve(
+            runtime_kind="db",
+            prompt="revenue",
+            runtime_context={"available_capabilities": ()},
+        )
+
+        assert resolution.selected == ()
+        assert resolution.skipped[0].skipped_reason == "missing_capabilities"
+        assert skill.effect_calls == 0
+
+    def test_absent_capability_catalog_does_not_gate_activation(self):
+        registry = ExtensionRegistry()
+        skill = CountingSkill(
+            rules=SkillActivationRules(
+                always_on=True,
+                requires_capabilities=("db.sql.execute_read",),
+            )
+        )
+        registry.register(skill)
+
+        resolution = SkillResolver(registry).resolve(
+            runtime_kind="db",
+            prompt="revenue",
+            runtime_context={},
+        )
+
+        assert resolution.selected_ids() == ("skill_finance",)
+        assert skill.effect_calls == 1
+
+    def test_runtime_effects_run_only_for_selected_skills(self):
+        registry = ExtensionRegistry()
+        unselected = CountingSkill(
+            rules=SkillActivationRules(always_on=False, allow_prompt_match=False)
+        )
+        registry.register(unselected)
+
+        implicit = SkillResolver(registry).resolve(
+            runtime_kind="chat",
+            prompt="hello",
+        )
+        assert implicit.selected == ()
+        assert unselected.effect_calls == 0
+
+        explicit = SkillResolver(registry).resolve(
+            runtime_kind="chat",
+            prompt="hello",
+            explicit_skills=("finance",),
+        )
+
+        assert unselected.effect_calls == 1
+        assert explicit.selected_ids() == ("skill_finance",)
+
+    def test_modes_gate_skill_activation(self):
+        registry = ExtensionRegistry()
+        skill = CountingSkill(
+            rules=SkillActivationRules(always_on=True, modes=("schema.query",))
+        )
+        registry.register(skill)
+
+        selected = SkillResolver(registry).resolve(
+            runtime_kind="db",
+            prompt="schema",
+            runtime_context={"mode": "schema.query"},
+        )
+        skipped = SkillResolver(registry).resolve(
+            runtime_kind="db",
+            prompt="schema",
+            runtime_context={"mode": "data.query"},
+        )
+
+        assert selected.selected_ids() == ("skill_finance",)
+        assert skipped.skipped[0].skipped_reason == "mode"
+
+    def test_config_env_and_package_requirements_skip_without_effects(
+        self, monkeypatch
+    ):
+        registry = ExtensionRegistry()
+        skill = CountingSkill(
+            rules=SkillActivationRules(
+                always_on=True,
+                requires_config=("tenant_id",),
+                requires_env=("DAITA_SKILL_TEST_ENV",),
+                requires_packages=("definitely_missing_daita_skill_pkg",),
+            )
+        )
+        registry.register(skill)
+        monkeypatch.delenv("DAITA_SKILL_TEST_ENV", raising=False)
+
+        resolution = SkillResolver(registry).resolve(
+            runtime_kind="db",
+            prompt="schema",
+            runtime_context={"config": {}},
+        )
+
+        assert resolution.skipped[0].skipped_reason == "missing_config"
+        assert skill.effect_calls == 0
+
+    def test_env_requirement_skip_without_effects(self, monkeypatch):
+        registry = ExtensionRegistry()
+        skill = CountingSkill(
+            rules=SkillActivationRules(
+                always_on=True,
+                requires_env=("DAITA_SKILL_TEST_ENV",),
+            )
+        )
+        registry.register(skill)
+        monkeypatch.delenv("DAITA_SKILL_TEST_ENV", raising=False)
+
+        resolution = SkillResolver(registry).resolve(
+            runtime_kind="db",
+            prompt="schema",
+        )
+
+        assert resolution.skipped[0].skipped_reason == "missing_env"
+        assert skill.effect_calls == 0
+
+    def test_package_requirement_skip_without_effects(self):
+        registry = ExtensionRegistry()
+        skill = CountingSkill(
+            rules=SkillActivationRules(
+                always_on=True,
+                requires_packages=("definitely_missing_daita_skill_pkg",),
+            )
+        )
+        registry.register(skill)
+
+        resolution = SkillResolver(registry).resolve(
+            runtime_kind="db",
+            prompt="schema",
+        )
+
+        assert resolution.skipped[0].skipped_reason == "missing_packages"
+        assert skill.effect_calls == 0
+
+    def test_package_requirement_uses_find_spec_without_importing(
+        self, tmp_path, monkeypatch
+    ):
+        module = tmp_path / "probe_skill_package.py"
+        module.write_text("raise AssertionError('module was imported')\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        registry = ExtensionRegistry()
+        skill = CountingSkill(
+            rules=SkillActivationRules(
+                always_on=True,
+                requires_packages=("probe_skill_package",),
+            )
+        )
+        registry.register(skill)
+
+        resolution = SkillResolver(registry).resolve(
+            runtime_kind="db",
+            prompt="schema",
+        )
+
+        assert resolution.selected_ids() == ("skill_finance",)
+        assert skill.effect_calls == 1
+
+
+# ===========================================================================
 # Structured prompt injection in ChatRuntime._build_initial_conversation
 # ===========================================================================
 
@@ -472,6 +792,39 @@ class TestPromptInjection:
         # No system message if no content
         if conversation[0]["role"] == "system":
             assert "## Skills & Expertise" not in conversation[0]["content"]
+
+    async def test_on_demand_skill_omits_full_context_until_explicitly_selected(self):
+        skill = Skill(
+            name="finance",
+            description="Finance analysis.",
+            instructions="Full finance instructions.",
+            context_mode="on_demand",
+            discovery=SkillDiscovery(
+                name="finance",
+                description="Finance analysis.",
+                context_mode="on_demand",
+                when_to_use=("revenue questions",),
+            ),
+        )
+        agent = Agent(
+            name="A", llm_provider=SequentialMockLLM(["done"]), skills=[skill]
+        )
+
+        unselected = await agent.runtime._build_initial_conversation("Hello")
+        unselected_system = unselected[0]["content"]
+        selected_resolution = agent.runtime._resolve_skills(
+            prompt="Hello",
+            explicit_skills=("finance",),
+        )
+        selected = await agent.runtime._build_initial_conversation(
+            "Hello",
+            skill_resolution=selected_resolution,
+        )
+        selected_system = selected[0]["content"]
+
+        assert "Full finance instructions." not in unselected_system
+        assert "Finance analysis." in unselected_system
+        assert "Full finance instructions." in selected_system
 
 
 # ===========================================================================

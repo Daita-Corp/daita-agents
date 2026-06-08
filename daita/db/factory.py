@@ -89,6 +89,7 @@ async def from_db(
     schema_prompt_policy: Any | None = None,
     tool_result_policy: Any | None = None,
     plugins: tuple[Any, ...] | list[Any] = (),
+    skills: tuple[Any, ...] | list[Any] = (),
     read_only: bool | None = None,
     query_default_limit: int | None = None,
     query_max_rows: int | None = None,
@@ -176,6 +177,7 @@ async def from_db(
             *service_plugins,
             *db_config.plugins,
             *tuple(plugins),
+            *tuple(skills),
         )
         if plugin is not None
     )
