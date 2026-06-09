@@ -1,4 +1,4 @@
-"""Configuration models for Daita eval suites."""
+"""Configuration models for runtime-native Daita eval suites."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 RunMode = Literal["sequential_same_agent"]
 PassRule = Literal["all_runs"]
@@ -20,12 +20,26 @@ class EvalConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class AgentConfig(EvalConfigModel):
-    """Factory configuration for the runnable target under evaluation."""
+class FromDbConfig(EvalConfigModel):
+    """First-class ``daita.db.from_db`` target configuration."""
 
-    factory: str
+    source: str
     kwargs: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentConfig(EvalConfigModel):
+    """Runtime-native target configuration."""
+
+    factory: str | None = None
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+    from_db: FromDbConfig | None = None
     label: str | None = None
+
+    @model_validator(mode="after")
+    def validate_target(self) -> "AgentConfig":
+        if bool(self.factory) == bool(self.from_db):
+            raise ValueError("agent must configure exactly one of factory or from_db")
+        return self
 
 
 class SuiteDefaults(EvalConfigModel):
@@ -37,7 +51,7 @@ class SuiteDefaults(EvalConfigModel):
     max_iterations: int = Field(default=20, ge=1)
     timeout_seconds: float | None = Field(default=None, gt=0)
     max_cost: float | None = Field(default=None, ge=0)
-    max_tool_calls: int | None = Field(default=None, ge=0)
+    max_capability_calls: int | None = Field(default=None, ge=0)
 
 
 class NumericExpectation(EvalConfigModel):
@@ -54,9 +68,11 @@ class AnswerExpectations(EvalConfigModel):
     numeric: list[NumericExpectation] = Field(default_factory=list)
 
 
-class ToolExpectations(EvalConfigModel):
+class CapabilityExpectations(EvalConfigModel):
     required: list[str] = Field(default_factory=list)
     forbidden: list[str] = Field(default_factory=list)
+    required_owners: list[str] = Field(default_factory=list)
+    forbidden_owners: list[str] = Field(default_factory=list)
     max_calls: int | None = Field(default=None, ge=0)
 
 
@@ -77,56 +93,52 @@ class SQLExpectations(EvalConfigModel):
     max_rows_returned: int | None = Field(default=None, ge=0)
 
 
-class OperationExpectations(EvalConfigModel):
-    """Generic data-operation expectations across plugins and services."""
+class TaskExpectations(EvalConfigModel):
+    """Runtime task lifecycle expectations."""
 
-    required_categories: list[str] = Field(default_factory=list)
-    forbidden_categories: list[str] = Field(default_factory=list)
-    required_resources: list[str] = Field(default_factory=list)
-    forbidden_resources: list[str] = Field(default_factory=list)
-    max_write_operations: int | None = Field(default=None, ge=0)
-    max_delete_operations: int | None = Field(default=None, ge=0)
+    required_statuses: list[str] = Field(default_factory=list)
+    forbidden_statuses: list[str] = Field(default_factory=lambda: ["failed"])
+    max_errors: int | None = Field(default=None, ge=0)
 
 
-class FileExpectations(EvalConfigModel):
-    required_read: list[str] = Field(default_factory=list)
-    forbidden_read: list[str] = Field(default_factory=list)
-    forbidden_write: list[str] = Field(default_factory=list)
-    must_use_schema: bool = False
+class EvidenceExpectations(EvalConfigModel):
+    required_kinds: list[str] = Field(default_factory=list)
+    forbidden_kinds: list[str] = Field(default_factory=list)
+    required_owners: list[str] = Field(default_factory=list)
+    forbidden_owners: list[str] = Field(default_factory=list)
+    require_accepted: bool = True
 
 
-class APIExpectations(EvalConfigModel):
-    required_methods: list[str] = Field(default_factory=list)
-    forbidden_methods: list[str] = Field(default_factory=list)
-    required_hosts: list[str] = Field(default_factory=list)
-    forbidden_hosts: list[str] = Field(default_factory=list)
+class ResultExpectations(EvalConfigModel):
+    """Expectations over runtime ``query.result`` evidence payloads."""
+
+    required_columns: list[str] = Field(default_factory=list)
+    required_rows: list[dict[str, Any]] = Field(default_factory=list)
+    forbidden_rows: list[dict[str, Any]] = Field(default_factory=list)
+    min_rows: int | None = Field(default=None, ge=0)
+    max_rows: int | None = Field(default=None, ge=0)
 
 
-class StorageExpectations(EvalConfigModel):
-    required_buckets: list[str] = Field(default_factory=list)
-    forbidden_buckets: list[str] = Field(default_factory=list)
-    forbidden_write: bool = False
+class GovernanceExpectations(EvalConfigModel):
+    allowed: bool | None = None
+    blocked: bool | None = None
+    pending_approval: bool | None = None
+    required_policies: list[str] = Field(default_factory=list)
+    forbidden_policies: list[str] = Field(default_factory=list)
 
 
-class VectorExpectations(EvalConfigModel):
-    max_top_k: int | None = Field(default=None, ge=1)
-    required_filters: list[str] = Field(default_factory=list)
+class ApprovalExpectations(EvalConfigModel):
+    required_statuses: list[str] = Field(default_factory=list)
+    forbidden_statuses: list[str] = Field(default_factory=list)
+    required_policies: list[str] = Field(default_factory=list)
 
 
 class StabilityExpectations(EvalConfigModel):
-    require_same_tools: bool = False
+    require_same_capabilities: bool = False
     max_answer_variants: int | None = Field(default=None, ge=1)
     max_cost_delta_pct: float | None = Field(default=None, ge=0)
     max_latency_delta_pct: float | None = Field(default=None, ge=0)
     max_token_delta_pct: float | None = Field(default=None, ge=0)
-
-
-class ExecutionExpectations(EvalConfigModel):
-    required: list[str] = Field(default_factory=list)
-    forbidden: list[str] = Field(default_factory=list)
-    max_calls: int | None = Field(default=None, ge=0)
-    max_latency_ms: float | None = Field(default=None, ge=0)
-    max_errors: int | None = Field(default=None, ge=0)
 
 
 class JudgeCriterion(EvalConfigModel):
@@ -145,23 +157,21 @@ class JudgeExpectations(EvalConfigModel):
     criteria: list[JudgeCriterion] = Field(default_factory=list)
     require_all_criteria_pass: bool = False
     run_when: JudgeRunWhen = "after_deterministic_pass"
-    include_tool_outputs: bool = False
-    max_tool_output_chars: int = Field(default=4000, ge=0)
+    include_evidence_payloads: bool = False
+    max_evidence_payload_chars: int = Field(default=4000, ge=0)
 
 
 class Expectations(EvalConfigModel):
     answer: AnswerExpectations = Field(default_factory=AnswerExpectations)
-    tools: ToolExpectations = Field(default_factory=ToolExpectations)
+    capabilities: CapabilityExpectations = Field(default_factory=CapabilityExpectations)
+    tasks: TaskExpectations = Field(default_factory=TaskExpectations)
+    evidence: EvidenceExpectations = Field(default_factory=EvidenceExpectations)
+    result: ResultExpectations = Field(default_factory=ResultExpectations)
+    governance: GovernanceExpectations = Field(default_factory=GovernanceExpectations)
+    approvals: ApprovalExpectations = Field(default_factory=ApprovalExpectations)
     budgets: BudgetExpectations = Field(default_factory=BudgetExpectations)
     sql: SQLExpectations = Field(default_factory=SQLExpectations)
-    operations: OperationExpectations = Field(default_factory=OperationExpectations)
-    files: FileExpectations = Field(default_factory=FileExpectations)
-    api: APIExpectations = Field(default_factory=APIExpectations)
-    storage: StorageExpectations = Field(default_factory=StorageExpectations)
-    vector: VectorExpectations = Field(default_factory=VectorExpectations)
     stability: StabilityExpectations = Field(default_factory=StabilityExpectations)
-    skills: ExecutionExpectations = Field(default_factory=ExecutionExpectations)
-    plugins: ExecutionExpectations = Field(default_factory=ExecutionExpectations)
     judge: JudgeExpectations | None = None
 
 
@@ -197,7 +207,7 @@ class ArtifactConfig(EvalConfigModel):
     output_dir: str = ".daita/evals/runs"
     max_chars: int = Field(default=50000, ge=100)
     include_full_answers: bool = True
-    include_tool_outputs: bool = False
+    include_evidence_payloads: bool = False
     redact_patterns: list[str] = Field(default_factory=list)
 
 
@@ -206,7 +216,7 @@ class BaselineFailPolicy(EvalConfigModel):
     cost_increase_pct_gt: float | None = Field(default=None, ge=0)
     latency_increase_pct_gt: float | None = Field(default=None, ge=0)
     new_failures: bool = True
-    tool_sequence_changed: bool = False
+    capability_sequence_changed: bool = False
 
 
 class BaselineConfig(EvalConfigModel):

@@ -6,6 +6,10 @@ LIMIT injection edge cases, specific exception types from injection validation,
 and connection state helpers — without requiring a live PostgreSQL connection.
 """
 
+from datetime import date, datetime, time
+from decimal import Decimal
+from uuid import UUID
+
 import pytest
 from daita.plugins.postgresql import PostgreSQLPlugin
 from daita.plugins.base_db import BaseDatabasePlugin
@@ -147,6 +151,29 @@ class TestSqlGuardrails:
         assert result["total_rows"] == 2
         assert result["truncated"] is True
         assert result["rows"] == [{"id": 1}]
+
+
+class TestPostgresJsonSafety:
+    def test_query_row_values_are_json_safe(self):
+        from daita.plugins.postgresql import _json_safe_row
+
+        row = {
+            "amount": Decimal("12.34"),
+            "created_on": date(2026, 1, 2),
+            "created_at": datetime(2026, 1, 2, 3, 4, 5),
+            "at_time": time(3, 4, 5),
+            "id": UUID("12345678-1234-5678-1234-567812345678"),
+            "nested": {"values": [Decimal("1.5")]},
+        }
+
+        assert _json_safe_row(row) == {
+            "amount": 12.34,
+            "created_on": "2026-01-02",
+            "created_at": "2026-01-02T03:04:05",
+            "at_time": "03:04:05",
+            "id": "12345678-1234-5678-1234-567812345678",
+            "nested": {"values": [1.5]},
+        }
 
 
 # ---------------------------------------------------------------------------

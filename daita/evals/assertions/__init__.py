@@ -8,17 +8,16 @@ from ..models import AssertionResult, StabilitySummary
 from .answer import answer_assertions
 from .budgets import budget_assertions
 from .common import has_errors
-from .execution import execution_assertions
-from .operations import (
-    api_assertions,
-    file_assertions,
-    operation_assertions,
-    storage_assertions,
-    vector_assertions,
+from .runtime import (
+    approval_assertions,
+    capability_assertions,
+    evidence_assertions,
+    governance_assertions,
+    task_assertions,
 )
+from .results import result_assertions
 from .sql import sql_assertions
 from .stability import stability_assertions
-from .tools import tool_assertions
 
 
 def evaluate_run_assertions(
@@ -29,15 +28,14 @@ def evaluate_run_assertions(
     expectations = case.expectations
     results: list[AssertionResult] = []
     results.extend(answer_assertions(expectations, evidence))
-    results.extend(tool_assertions(expectations, evidence, defaults))
+    results.extend(capability_assertions(expectations, evidence, defaults))
+    results.extend(task_assertions(expectations, evidence))
+    results.extend(evidence_assertions(expectations, evidence))
+    results.extend(result_assertions(expectations, evidence))
+    results.extend(governance_assertions(expectations, evidence))
+    results.extend(approval_assertions(expectations, evidence))
     results.extend(budget_assertions(expectations, evidence, case, defaults))
     results.extend(sql_assertions(expectations, evidence))
-    results.extend(execution_assertions(expectations, evidence))
-    results.extend(operation_assertions(expectations, evidence))
-    results.extend(file_assertions(expectations, evidence))
-    results.extend(api_assertions(expectations, evidence))
-    results.extend(storage_assertions(expectations, evidence))
-    results.extend(vector_assertions(expectations, evidence))
     return results
 
 

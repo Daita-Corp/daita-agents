@@ -75,7 +75,7 @@ def answer_assertions(
                     observed=observed,
                     expected=numeric.expected,
                     fix_hints=[
-                        "Inspect aggregation logic and units in the tool output."
+                        "Inspect aggregation logic and units in accepted runtime evidence."
                     ],
                 )
             )

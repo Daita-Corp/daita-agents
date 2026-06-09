@@ -1,9 +1,18 @@
 import json
 
 from daita.evals import EvalSuite, EvalSuiteConfig
+from daita.evals.analysis import extract_run_evidence
 from daita.evals.config import JudgeCriterion, JudgeExpectations
 from daita.evals.judges import build_judge_result
 from daita.evals.reporters import render_junit, render_pretty
+from daita.db.models import (
+    DbIntent,
+    DbIntentKind,
+    DbOperationContract,
+    DbOperationResult,
+    DbRequest,
+)
+from daita.runtime import Evidence, OperationStatus
 
 
 def test_load_yaml_config(tmp_path):
@@ -61,7 +70,13 @@ async def test_suite_runs_factory_agent_and_writes_artifacts(tmp_path):
                             }
                         ],
                     },
-                    "tools": {"required": ["sqlite_query"], "max_calls": 1},
+                    "capabilities": {
+                        "required": ["db.sql.execute_read"],
+                        "max_calls": 2,
+                    },
+                    "evidence": {
+                        "required_kinds": ["sql.validation", "query.result"],
+                    },
                     "sql": {
                         "require_limit": True,
                         "must_include": ["GROUP BY"],
@@ -80,6 +95,60 @@ async def test_suite_runs_factory_agent_and_writes_artifacts(tmp_path):
     assert (
         tmp_path / report.run_id / "cases" / "top-products" / "run-001.json"
     ).exists()
+
+
+def test_extracts_real_db_operation_result_dataclasses():
+    result = DbOperationResult(
+        operation_id="operation-real",
+        request=DbRequest("How many?"),
+        intent=DbIntent(DbIntentKind.DATA_QUERY),
+        contract=DbOperationContract(
+            operation_type="db.query",
+            required_evidence=("query.result",),
+        ),
+        status=OperationStatus.SUCCEEDED,
+        answer="The count is 1.",
+        evidence=(
+            Evidence(
+                id="evidence-real",
+                kind="query.result",
+                owner="sqlite",
+                operation_id="operation-real",
+                task_id="task-real",
+                payload={"sql": "SELECT COUNT(*) AS count FROM customers", "rows": []},
+            ),
+        ),
+        diagnostics={
+            "execution": {
+                "task_count": 1,
+                "tasks": [
+                    {
+                        "id": "task-real",
+                        "operation_id": "operation-real",
+                        "capability_id": "db.sql.execute_read",
+                        "executor_id": "db.sql.execute_read",
+                        "input": {},
+                        "status": "succeeded",
+                        "required_evidence": ["query.result"],
+                        "dependencies": [],
+                        "metadata": {"owner": "sqlite"},
+                    }
+                ],
+            },
+            "governance": {
+                "allowed": True,
+                "blocked": False,
+                "pending_approval": False,
+            },
+        },
+    )
+
+    evidence = extract_run_evidence("How many?", {"runtime_result": result})
+
+    assert evidence.operation_type == "db.query"
+    assert evidence.intent == "data.query"
+    assert evidence.tasks[0].capability_id == "db.sql.execute_read"
+    assert evidence.evidence[0].kind == "query.result"
 
 
 async def test_sql_assertions_fail_with_stable_codes():
@@ -136,35 +205,89 @@ async def test_sql_required_table_and_row_count_assertions_fail():
     }
 
 
-async def test_non_sql_data_operation_inspectors_pass():
-    config = EvalSuiteConfig(
-        name="data-ops",
-        agent={"factory": "tests.fixtures.eval_agents:create_data_ops_agent"},
+async def test_query_result_content_assertions_pass_and_fail():
+    passing = EvalSuiteConfig(
+        name="result-evals",
+        agent={"factory": "tests.fixtures.eval_agents:create_passing_agent"},
         cases=[
             {
-                "id": "data-services",
+                "id": "gold-row",
+                "prompt": "Which product won?",
+                "expectations": {
+                    "result": {
+                        "required_columns": ["product", "revenue"],
+                        "required_rows": [{"product": "Widget A", "revenue": 12840.50}],
+                        "min_rows": 1,
+                        "max_rows": 1,
+                    }
+                },
+            }
+        ],
+    )
+    failing = EvalSuiteConfig(
+        name="result-evals",
+        agent={"factory": "tests.fixtures.eval_agents:create_passing_agent"},
+        cases=[
+            {
+                "id": "missing-gold-row",
+                "prompt": "Which product won?",
+                "expectations": {
+                    "result": {
+                        "required_columns": ["margin"],
+                        "required_rows": [{"product": "Widget B"}],
+                    }
+                },
+            }
+        ],
+    )
+
+    passing_report = await EvalSuite(passing).run(write_artifacts=False)
+    failing_report = await EvalSuite(failing).run(write_artifacts=False)
+
+    assert passing_report.status == "passed"
+    assert failing_report.status == "failed"
+    assert {failure.code for failure in failing_report.failures} == {
+        "query_result_required_column_missing",
+        "query_result_required_row_missing",
+    }
+
+
+async def test_legacy_tool_call_results_are_rejected():
+    config = EvalSuiteConfig(
+        name="legacy-rejected",
+        agent={"factory": "tests.fixtures.eval_agents:create_legacy_agent"},
+        cases=[{"id": "legacy", "prompt": "Use the old shape"}],
+    )
+
+    report = await EvalSuite(config).run(write_artifacts=False)
+
+    assert report.status == "failed"
+    assert report.failures[0].code == "run_error"
+    assert "no longer accepts legacy tool_calls results" in report.failures[0].message
+
+
+async def test_runtime_capability_and_evidence_assertions_pass():
+    config = EvalSuiteConfig(
+        name="runtime-contracts",
+        agent={"factory": "tests.fixtures.eval_agents:create_runtime_capability_agent"},
+        cases=[
+            {
+                "id": "runtime-capabilities",
                 "prompt": "Load customer context",
                 "expectations": {
-                    "operations": {
-                        "required_categories": ["file", "api", "storage", "vector"],
-                        "forbidden_categories": ["workflow"],
-                        "max_write_operations": 0,
-                        "max_delete_operations": 0,
+                    "capabilities": {
+                        "required": ["catalog.schema.search", "db.sql.execute_read"],
+                        "required_owners": ["catalog", "sqlite"],
+                        "forbidden": ["memory.semantic.write"],
+                        "max_calls": 3,
                     },
-                    "files": {"required_read": ["sales.csv"]},
-                    "api": {
-                        "required_methods": ["GET"],
-                        "required_hosts": ["api.example.com"],
-                        "forbidden_methods": ["POST", "DELETE"],
-                    },
-                    "storage": {
-                        "required_buckets": ["analytics"],
-                        "forbidden_buckets": ["prod-secrets"],
-                        "forbidden_write": True,
-                    },
-                    "vector": {
-                        "max_top_k": 10,
-                        "required_filters": ["tenant_id"],
+                    "evidence": {
+                        "required_kinds": [
+                            "schema.search_result",
+                            "sql.validation",
+                            "query.result",
+                        ],
+                        "required_owners": ["catalog", "sqlite"],
                     },
                 },
             }
@@ -177,28 +300,24 @@ async def test_non_sql_data_operation_inspectors_pass():
     assert report.summary.runs_passed == 1
 
 
-async def test_skill_and_plugin_execution_assertions_and_artifacts(tmp_path):
+async def test_governance_assertions_and_runtime_artifacts(tmp_path):
     config = EvalSuiteConfig(
-        name="execution-evals",
-        agent={"factory": "tests.fixtures.eval_agents:create_execution_agent"},
+        name="governance-evals",
+        agent={"factory": "tests.fixtures.eval_agents:create_governance_agent"},
         cases=[
             {
-                "id": "skill-plugin-run",
+                "id": "governed-run",
                 "prompt": "Inspect schema and query sales.",
                 "expectations": {
-                    "skills": {
-                        "required": ["schema_discovery"],
-                        "forbidden": ["web_search"],
-                        "max_calls": 2,
-                        "max_latency_ms": 100,
-                        "max_errors": 0,
+                    "capabilities": {
+                        "required": ["db.sql.validate"],
+                        "required_owners": ["sqlite"],
                     },
-                    "plugins": {
-                        "required": ["sqlite"],
-                        "forbidden": ["s3"],
-                        "max_calls": 2,
-                        "max_latency_ms": 100,
-                        "max_errors": 0,
+                    "governance": {
+                        "allowed": True,
+                        "blocked": False,
+                        "pending_approval": False,
+                        "required_policies": ["read_only_sql"],
                     },
                 },
             }
@@ -209,17 +328,17 @@ async def test_skill_and_plugin_execution_assertions_and_artifacts(tmp_path):
     run = report.cases[0].runs[0]
     payload = json.loads(
         (
-            tmp_path / report.run_id / "cases" / "skill-plugin-run" / "run-001.json"
+            tmp_path / report.run_id / "cases" / "governed-run" / "run-001.json"
         ).read_text()
     )
 
     assert report.status == "passed"
-    assert {span.kind for span in run.execution_spans} == {"skill", "plugin", "tool"}
-    assert any(span.name == "schema_discovery" for span in run.execution_spans)
-    assert any(span.name == "sqlite" for span in run.execution_spans)
-    assert payload["execution_spans"]
-    assert "skills: schema_discovery.inspect 25ms" in render_pretty(report)
-    assert "plugins: sqlite.query 18ms" in render_pretty(report)
+    assert run.tasks[0].capability_id == "db.sql.validate"
+    assert run.governance.allowed is True
+    assert payload["tasks"]
+    assert payload["governance"]["allowed"] is True
+    assert "capabilities: db.sql.validate" in render_pretty(report)
+    assert "owners: sqlite" in render_pretty(report)
 
 
 async def test_repeat_runs_evaluate_stability():
@@ -233,7 +352,7 @@ async def test_repeat_runs_evaluate_stability():
                 "prompt": "Answer consistently",
                 "expectations": {
                     "stability": {
-                        "require_same_tools": True,
+                        "require_same_capabilities": True,
                         "max_answer_variants": 1,
                     }
                 },
@@ -245,7 +364,7 @@ async def test_repeat_runs_evaluate_stability():
 
     assert report.status == "failed"
     assert {failure.code for failure in report.failures} == {
-        "unstable_tools",
+        "unstable_capabilities",
         "unstable_answer",
     }
 
@@ -265,11 +384,11 @@ async def test_reporters_render_output():
     assert "<testsuite" in render_junit(report)
 
 
-async def test_artifact_privacy_flags_strip_full_answer_and_tool_outputs(tmp_path):
+async def test_artifact_privacy_flags_strip_full_answer_and_evidence_payloads(tmp_path):
     config = EvalSuiteConfig(
         name="privacy-evals",
         agent={"factory": "tests.fixtures.eval_agents:create_passing_agent"},
-        artifacts={"include_full_answers": False, "include_tool_outputs": False},
+        artifacts={"include_full_answers": False, "include_evidence_payloads": False},
         cases=[{"id": "case-1", "prompt": "hello"}],
     )
 
@@ -278,7 +397,7 @@ async def test_artifact_privacy_flags_strip_full_answer_and_tool_outputs(tmp_pat
     payload = json.loads(run_path.read_text())
 
     assert payload["final_answer"] is None
-    assert payload["tool_calls"][0]["result"] is None
+    assert payload["evidence"][0]["payload"] is None
 
 
 async def test_dataset_records_expand_into_cases(tmp_path):
@@ -302,7 +421,7 @@ async def test_dataset_records_expand_into_cases(tmp_path):
         dataset={"path": str(dataset_path)},
         case_template={
             "expectations": {
-                "tools": {"required": ["sqlite_query"]},
+                "capabilities": {"required": ["db.sql.execute_read"]},
                 "sql": {"require_limit": True},
             }
         },
@@ -380,7 +499,7 @@ def test_structured_judge_result_requires_required_criteria_to_pass():
                     "id": "grounding",
                     "passed": False,
                     "score": 0.2,
-                    "evidence": "No tool output evidence cited.",
+                    "evidence": "No runtime evidence cited.",
                 }
             ],
         },

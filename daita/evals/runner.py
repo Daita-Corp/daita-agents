@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,7 @@ from .baselines import (
     record_baseline as record_report_baseline,
     write_baseline_comparison,
 )
-from .config import EvalCaseConfig, EvalSuiteConfig
+from .config import AgentConfig, EvalCaseConfig, EvalSuiteConfig
 from .datasets import expand_cases
 from .judges import JudgeEvaluation, evaluate_judge
 from .models import (
@@ -52,11 +53,16 @@ async def run_suite(
 ) -> EvalReport:
     run_id = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
     cases = expand_cases(config, config_path=config_path)
-    target = await load_factory(config.agent.factory, config.agent.kwargs)
+    target = await load_target(config.agent)
     adapter = RunnableAdapter(target)
 
     agent_info = {
         "factory": config.agent.factory,
+        "from_db": (
+            config.agent.from_db.model_dump(mode="json")
+            if config.agent.from_db is not None
+            else None
+        ),
         "agent_id": getattr(target, "agent_id", None),
         "agent_name": config.agent.label or getattr(target, "name", None),
         "model": _get_model(target),
@@ -111,6 +117,14 @@ async def run_suite(
     return report
 
 
+async def load_target(config: AgentConfig) -> Any:
+    if config.from_db is not None:
+        return await load_from_db(config.from_db.source, config.from_db.kwargs)
+    if config.factory is None:
+        raise ValueError("agent.factory is required when agent.from_db is not set")
+    return await load_factory(config.factory, config.kwargs)
+
+
 async def load_factory(factory_path: str, kwargs: dict[str, Any]) -> Any:
     module_name, sep, func_name = factory_path.partition(":")
     if not sep or not module_name or not func_name:
@@ -121,6 +135,12 @@ async def load_factory(factory_path: str, kwargs: dict[str, Any]) -> Any:
     if inspect.isawaitable(result):
         result = await result
     return result
+
+
+async def load_from_db(source: str, kwargs: dict[str, Any]) -> Any:
+    from daita.db import from_db
+
+    return await from_db(source, **kwargs)
 
 
 class RunnableAdapter:
@@ -150,29 +170,35 @@ class RunnableAdapter:
         max_iterations: int,
         timeout_seconds: float | None,
     ) -> Any:
-        run = getattr(self.target, "run", None)
+        run = getattr(self.target, "run_detailed", None) or getattr(
+            self.target, "run", None
+        )
         if run is None:
-            raise TypeError("Eval target must provide a run(prompt, ...) method")
+            raise TypeError(
+                "Eval target must provide run_detailed(prompt, ...) or run(prompt, ...)"
+            )
 
         kwargs: dict[str, Any] = {}
-        if _accepts_kwarg(run, "detailed"):
-            kwargs["detailed"] = True
         if _accepts_kwarg(run, "max_iterations"):
             kwargs["max_iterations"] = max_iterations
         if _accepts_kwarg(run, "timeout_seconds"):
             kwargs["timeout_seconds"] = timeout_seconds
 
         before = metric_snapshot(self.target)
+        start = time.perf_counter()
         result = run(prompt, **kwargs)
         if inspect.isawaitable(result):
             if timeout_seconds and not _accepts_kwarg(run, "timeout_seconds"):
                 result = await asyncio.wait_for(result, timeout=timeout_seconds)
             else:
                 result = await result
+        latency_ms = (time.perf_counter() - start) * 1000
         after = metric_snapshot(self.target)
-        if isinstance(result, dict):
-            result.setdefault("_eval_metric_delta", metric_delta(before, after))
-        return result
+        return {
+            "runtime_result": result,
+            "latency_ms": latency_ms,
+            "_eval_metric_delta": metric_delta(before, after),
+        }
 
 
 async def _run_case(
@@ -262,10 +288,17 @@ def _to_run_result(
         answer_hash=evidence.answer_hash,
         final_answer_preview=preview_text(evidence.answer),
         final_answer=evidence.answer,
-        tool_calls=evidence.tool_calls,
-        execution_spans=evidence.execution_spans,
         metrics=evidence.metrics,
         trace_id=evidence.trace_id,
+        operation_id=evidence.operation_id,
+        operation_status=evidence.operation_status,
+        operation_type=evidence.operation_type,
+        intent=evidence.intent,
+        tasks=evidence.tasks,
+        evidence=evidence.evidence,
+        governance=evidence.governance,
+        approvals=evidence.approvals,
+        warnings=evidence.warnings,
         assertions=assertions,
         judges=judge_results,
     )
@@ -348,7 +381,8 @@ def _collect_failures(cases: list[CaseResult]) -> list[EvalFailure]:
                             expected=assertion.expected,
                             artifact_path=f"cases/{case.case_id}/{run.run_id}.json",
                             fix_hints=assertion.fix_hints,
-                            related_tool_calls=assertion.related_tool_calls,
+                            related_task_ids=assertion.related_task_ids,
+                            related_evidence_ids=assertion.related_evidence_ids,
                             related_trace_ids=[run.trace_id] if run.trace_id else [],
                         )
                     )

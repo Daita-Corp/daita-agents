@@ -5,10 +5,13 @@ Simple database connection and querying - no over-engineering.
 """
 
 import asyncio
+from datetime import date, datetime, time
+from decimal import Decimal
 import logging
 import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from urllib.parse import quote
+from uuid import UUID
 
 from .base import PluginContext
 from .base_db import BaseDatabasePlugin
@@ -317,7 +320,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             else:
                 rows = await conn.fetch(sql)
 
-            return [dict(row) for row in rows]
+            return [_json_safe_row(dict(row)) for row in rows]
 
     async def execute(self, sql: str, params: Optional[List] = None) -> int:
         """
@@ -746,3 +749,21 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
 def postgresql(**kwargs) -> PostgreSQLPlugin:
     """Create PostgreSQL plugin with simplified interface."""
     return PostgreSQLPlugin(**kwargs)
+
+
+def _json_safe_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: _json_safe_value(value) for key, value in row.items()}
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    return value

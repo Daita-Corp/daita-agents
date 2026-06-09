@@ -1,4 +1,4 @@
-"""Result models for Daita evals."""
+"""Result models for runtime-native Daita evals."""
 
 from __future__ import annotations
 
@@ -20,7 +20,8 @@ class AssertionResult(BaseModel):
     observed: Any = None
     expected: Any = None
     fix_hints: list[str] = Field(default_factory=list)
-    related_tool_calls: list[int] = Field(default_factory=list)
+    related_task_ids: list[str] = Field(default_factory=list)
+    related_evidence_ids: list[str] = Field(default_factory=list)
 
 
 class RunMetrics(BaseModel):
@@ -30,21 +31,35 @@ class RunMetrics(BaseModel):
     iterations: int | None = None
 
 
-class ToolCallEvidence(BaseModel):
-    name: str
-    arguments: dict[str, Any] = Field(default_factory=dict)
-    result: Any = None
+class RuntimeTaskEvidence(BaseModel):
+    id: str
+    capability_id: str
+    executor_id: str
+    owner: str | None = None
+    status: str
+    input: dict[str, Any] = Field(default_factory=dict)
+    required_evidence: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class ExecutionSpan(BaseModel):
-    kind: Literal["skill", "plugin", "tool", "workflow"]
-    name: str
-    operation: str | None = None
-    status: str = "passed"
-    latency_ms: float | None = None
-    error: str | None = None
-    parent_id: str | None = None
-    trace_id: str | None = None
+class RuntimeEvidenceRecord(BaseModel):
+    id: str | None = None
+    kind: str
+    owner: str | None = None
+    operation_id: str | None = None
+    task_id: str | None = None
+    accepted: bool = True
+    payload: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RuntimeGovernanceRecord(BaseModel):
+    allowed: bool | None = None
+    blocked: bool | None = None
+    pending_approval: bool | None = None
+    decisions: list[dict[str, Any]] = Field(default_factory=list)
+    approval_requests: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class JudgeCriterionResult(BaseModel):
@@ -81,8 +96,15 @@ class RunResult(BaseModel):
     answer_hash: str
     final_answer_preview: str
     final_answer: str | None = None
-    tool_calls: list[ToolCallEvidence] = Field(default_factory=list)
-    execution_spans: list[ExecutionSpan] = Field(default_factory=list)
+    operation_id: str | None = None
+    operation_status: str | None = None
+    operation_type: str | None = None
+    intent: str | None = None
+    tasks: list[RuntimeTaskEvidence] = Field(default_factory=list)
+    evidence: list[RuntimeEvidenceRecord] = Field(default_factory=list)
+    governance: RuntimeGovernanceRecord | None = None
+    approvals: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     metrics: RunMetrics = Field(default_factory=RunMetrics)
     trace_id: str | None = None
     assertions: list[AssertionResult] = Field(default_factory=list)
@@ -92,7 +114,7 @@ class RunResult(BaseModel):
 
 class StabilitySummary(BaseModel):
     answer_variants: int = 0
-    tool_sequence_variants: int = 0
+    capability_sequence_variants: int = 0
     cost_min: float | None = None
     cost_max: float | None = None
     latency_ms_min: float | None = None
@@ -124,7 +146,8 @@ class EvalFailure(BaseModel):
     expected: Any = None
     artifact_path: str | None = None
     fix_hints: list[str] = Field(default_factory=list)
-    related_tool_calls: list[int] = Field(default_factory=list)
+    related_task_ids: list[str] = Field(default_factory=list)
+    related_evidence_ids: list[str] = Field(default_factory=list)
     related_trace_ids: list[str] = Field(default_factory=list)
 
 

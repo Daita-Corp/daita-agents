@@ -72,7 +72,7 @@ class ArtifactWriter:
             for key, child in value.items():
                 if key == "final_answer" and not self.config.include_full_answers:
                     result[key] = None
-                elif key == "result" and not self.config.include_tool_outputs:
+                elif key == "payload" and not self.config.include_evidence_payloads:
                     result[key] = None
                 else:
                     result[key] = self._apply_privacy_policy(child)

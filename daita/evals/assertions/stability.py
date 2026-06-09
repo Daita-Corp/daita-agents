@@ -15,14 +15,14 @@ def stability_assertions(
 ) -> list[AssertionResult]:
     exp = case.expectations.stability
     results: list[AssertionResult] = []
-    if exp.require_same_tools and stability.tool_sequence_variants > 1:
+    if exp.require_same_capabilities and stability.capability_sequence_variants > 1:
         results.append(
             fail(
-                "stability.require_same_tools",
-                "unstable_tools",
-                f"{stability.tool_sequence_variants} tool sequences observed.",
-                "expectations.stability.require_same_tools",
-                observed=stability.tool_sequence_variants,
+                "stability.require_same_capabilities",
+                "unstable_capabilities",
+                f"{stability.capability_sequence_variants} capability sequences observed.",
+                "expectations.stability.require_same_capabilities",
+                observed=stability.capability_sequence_variants,
                 expected=1,
             )
         )

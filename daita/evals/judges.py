@@ -54,15 +54,32 @@ def build_judge_input(
     config: JudgeExpectations,
 ) -> dict[str, Any]:
     criteria = normalized_criteria(config)
-    tool_calls: list[dict[str, Any]] = []
-    for call in evidence.tool_calls:
-        item = {
-            "name": call.name,
-            "arguments": call.arguments,
+    runtime_tasks = [
+        {
+            "id": task.id,
+            "capability_id": task.capability_id,
+            "executor_id": task.executor_id,
+            "owner": task.owner,
+            "status": task.status,
+            "input": task.input,
+            "required_evidence": task.required_evidence,
         }
-        if config.include_tool_outputs:
-            item["result"] = preview_text(call.result, config.max_tool_output_chars)
-        tool_calls.append(item)
+        for task in evidence.tasks
+    ]
+    runtime_evidence: list[dict[str, Any]] = []
+    for item in evidence.evidence:
+        record = {
+            "id": item.id,
+            "kind": item.kind,
+            "owner": item.owner,
+            "task_id": item.task_id,
+            "accepted": item.accepted,
+        }
+        if config.include_evidence_payloads:
+            record["payload"] = preview_text(
+                item.payload, config.max_evidence_payload_chars
+            )
+        runtime_evidence.append(record)
 
     return {
         "task": (
@@ -77,7 +94,7 @@ def build_judge_input(
                     "id": "criterion id",
                     "passed": "boolean",
                     "score": "number from 0 to 1",
-                    "evidence": "brief evidence from answer or tool calls",
+                    "evidence": "brief evidence from answer or runtime evidence",
                 }
             ],
         },
@@ -85,7 +102,21 @@ def build_judge_input(
         "require_all_criteria_pass": config.require_all_criteria_pass,
         "user_prompt": prompt,
         "final_answer": evidence.answer,
-        "tool_calls": tool_calls,
+        "runtime": {
+            "operation_id": evidence.operation_id,
+            "operation_status": evidence.operation_status,
+            "operation_type": evidence.operation_type,
+            "intent": evidence.intent,
+            "tasks": runtime_tasks,
+            "evidence": runtime_evidence,
+            "governance": (
+                evidence.governance.model_dump(mode="json")
+                if evidence.governance is not None
+                else None
+            ),
+            "approvals": evidence.approvals,
+            "warnings": evidence.warnings,
+        },
         "criteria": [
             {
                 "id": criterion.id,
