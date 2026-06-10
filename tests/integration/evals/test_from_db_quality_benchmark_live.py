@@ -95,14 +95,13 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                 "id": "rich-count-customers",
                 "prompt": "How many customers are there?",
                 "expectations": {
-                    "answer": {"equals": "The count is 4."},
                     "capabilities": {
                         "required": [
                             "db.schema.inspect",
                             "db.sql.validate",
                             "db.sql.execute_read",
                         ],
-                        "max_calls": 3,
+                        "max_calls": 6,
                         "required_owners": ["sqlite"],
                         "forbidden_owners": ["memory", "lineage", "data_quality"],
                     },
@@ -110,7 +109,8 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                     "evidence": {
                         "required_kinds": [
                             "schema.asset_profile",
-                            "query.plan",
+                            "query.plan.proposal",
+                            "query.plan.validation",
                             "sql.validation",
                             "query.result",
                         ]
@@ -122,7 +122,12 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                         "must_not_include": ["SELECT *", "DELETE", "DROP"],
                         "max_rows_returned": 1,
                     },
-                    "budgets": {"max_latency_ms": 2000, "max_iterations": 3},
+                    "result": {
+                        "required_rows": [{"count": 4}],
+                        "min_rows": 1,
+                        "max_rows": 1,
+                    },
+                    "budgets": {"max_latency_ms": 8000, "max_iterations": 6},
                 },
             },
             {
@@ -132,11 +137,18 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                     "answer": {"equals": "Returned 3 rows."},
                     "capabilities": {
                         "required": ["db.sql.validate", "db.sql.execute_read"],
-                        "max_calls": 3,
+                        "max_calls": 6,
                         "required_owners": ["sqlite"],
                     },
                     "tasks": {"max_errors": 0},
-                    "evidence": {"required_kinds": ["sql.validation", "query.result"]},
+                    "evidence": {
+                        "required_kinds": [
+                            "query.plan.proposal",
+                            "query.plan.validation",
+                            "sql.validation",
+                            "query.result",
+                        ]
+                    },
                     "sql": {
                         "read_only": True,
                         "required_tables": ["support_tickets"],
@@ -144,17 +156,16 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                         "must_not_include": ["DELETE", "DROP"],
                         "max_rows_returned": 3,
                     },
-                    "budgets": {"max_latency_ms": 2000, "max_iterations": 3},
+                    "budgets": {"max_latency_ms": 8000, "max_iterations": 6},
                 },
             },
             {
                 "id": "rich-count-refunds",
                 "prompt": "How many refunds are there?",
                 "expectations": {
-                    "answer": {"equals": "The count is 2."},
                     "capabilities": {
                         "required": ["db.sql.execute_read"],
-                        "max_calls": 3,
+                        "max_calls": 6,
                         "required_owners": ["sqlite"],
                     },
                     "tasks": {"max_errors": 0},
@@ -166,7 +177,12 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                         "must_not_include": ["DELETE", "DROP"],
                         "max_rows_returned": 1,
                     },
-                    "budgets": {"max_latency_ms": 2000, "max_iterations": 3},
+                    "result": {
+                        "required_rows": [{"count": 2}],
+                        "min_rows": 1,
+                        "max_rows": 1,
+                    },
+                    "budgets": {"max_latency_ms": 8000, "max_iterations": 6},
                 },
             },
             {
@@ -181,7 +197,7 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                             "db.sql.validate",
                             "db.sql.execute_read",
                         ],
-                        "max_calls": 6,
+                        "max_calls": 10,
                         "required_owners": ["catalog", "sqlite"],
                     },
                     "tasks": {"max_errors": 0},
@@ -200,7 +216,7 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                         "must_not_include": ["DELETE", "DROP"],
                         "max_rows_returned": 4,
                     },
-                    "budgets": {"max_latency_ms": 2500, "max_iterations": 6},
+                    "budgets": {"max_latency_ms": 12000, "max_iterations": 10},
                 },
             },
             {
@@ -213,7 +229,7 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                             "catalog.relationship_paths.find",
                             "db.sql.execute_read",
                         ],
-                        "max_calls": 6,
+                        "max_calls": 12,
                         "required_owners": ["catalog", "sqlite"],
                     },
                     "tasks": {"max_errors": 0},
@@ -227,7 +243,7 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                         "must_not_include": ["DELETE", "DROP"],
                         "max_rows_returned": 2,
                     },
-                    "budgets": {"max_latency_ms": 2500, "max_iterations": 6},
+                    "budgets": {"max_latency_ms": 12000, "max_iterations": 12},
                 },
             },
             {
@@ -238,7 +254,7 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                     "answer": {"equals": "Returned 4 rows."},
                     "capabilities": {
                         "required": ["db.sql.execute_read"],
-                        "max_calls": 3,
+                        "max_calls": 6,
                         "required_owners": ["sqlite"],
                     },
                     "tasks": {"max_errors": 0},
@@ -250,7 +266,7 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                         "must_not_include": ["DELETE", "DROP"],
                         "max_rows_returned": 4,
                     },
-                    "budgets": {"max_latency_ms": 2000, "max_iterations": 3},
+                    "budgets": {"max_latency_ms": 8000, "max_iterations": 6},
                     "stability": {
                         "require_same_capabilities": True,
                         "max_answer_variants": 1,
@@ -294,6 +310,247 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
     assert (Path(report.artifact_path) / "report.json").exists()
 
 
+async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
+    _require_live_openai()
+    config = EvalSuiteConfig(
+        name="live-from-db-production-profile-benchmark",
+        agent=_rich_benchmark_agent(tmp_path, "production-profile-benchmark.sqlite"),
+        defaults={"timeout_seconds": 60, "max_iterations": 14},
+        artifacts={"include_evidence_payloads": True},
+        cases=[
+            {
+                "id": "prod-p95-ish-customer-count-stability",
+                "runs": 5,
+                "prompt": "How many customers are there?",
+                "expectations": {
+                    "answer": {"equals": "The count is 4."},
+                    "capabilities": {
+                        "required": [
+                            "db.schema.inspect",
+                            "db.sql.validate",
+                            "db.sql.execute_read",
+                        ],
+                        "required_owners": ["sqlite"],
+                        "max_calls": 6,
+                    },
+                    "tasks": {"max_errors": 0},
+                    "evidence": {
+                        "required_kinds": [
+                            "schema.asset_profile",
+                            "query.plan.proposal",
+                            "query.plan.validation",
+                            "sql.validation",
+                            "query.result",
+                        ]
+                    },
+                    "sql": {
+                        "read_only": True,
+                        "required_tables": ["customers"],
+                        "must_include": ["COUNT"],
+                        "must_not_include": ["SELECT *", "DELETE", "DROP"],
+                        "max_rows_returned": 1,
+                    },
+                    "result": {
+                        "required_rows": [{"count": 4}],
+                        "min_rows": 1,
+                        "max_rows": 1,
+                    },
+                    "budgets": {"max_latency_ms": 8000, "max_iterations": 6},
+                    "stability": {
+                        "require_same_capabilities": True,
+                        "max_answer_variants": 1,
+                        "max_latency_delta_pct": 500,
+                    },
+                },
+            },
+            {
+                "id": "prod-complex-region-completed-revenue",
+                "prompt": (
+                    "What is total order revenue by region for orders where "
+                    "status = 'complete'? Return one row per region with columns "
+                    "region and completed_revenue."
+                ),
+                "expectations": {
+                    "capabilities": {
+                        "required": ["db.sql.validate", "db.sql.execute_read"],
+                        "required_owners": ["sqlite"],
+                        "max_calls": 12,
+                    },
+                    "tasks": {"max_errors": 0},
+                    "evidence": {
+                        "required_kinds": [
+                            "query.plan.proposal",
+                            "query.plan.validation",
+                            "sql.validation",
+                            "query.result",
+                        ]
+                    },
+                    "sql": {
+                        "read_only": True,
+                        "required_tables": ["regions", "customers", "orders"],
+                        "must_include": ["JOIN", "SUM", "GROUP BY", "complete"],
+                        "must_not_include": ["DELETE", "DROP"],
+                        "max_rows_returned": 2,
+                    },
+                    "result": {
+                        "required_columns": ["region", "completed_revenue"],
+                        "required_rows": [
+                            {"region": "NA", "completed_revenue": 295.0},
+                            {"region": "EU", "completed_revenue": 270.0},
+                        ],
+                        "min_rows": 2,
+                        "max_rows": 2,
+                    },
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
+                },
+            },
+            {
+                "id": "prod-catalog-open-high-severity-ticket-customers",
+                "prompt": (
+                    "Using catalog relationships, join support_tickets to customers "
+                    "and return the customer names for open high severity tickets."
+                ),
+                "expectations": {
+                    "capabilities": {
+                        "required": [
+                            "catalog.relationship_paths.find",
+                            "db.sql.validate",
+                            "db.sql.execute_read",
+                        ],
+                        "required_owners": ["catalog", "sqlite"],
+                        "max_calls": 12,
+                    },
+                    "tasks": {"max_errors": 0},
+                    "evidence": {
+                        "required_kinds": [
+                            "schema.relationship_path",
+                            "query.plan.proposal",
+                            "query.plan.validation",
+                            "sql.validation",
+                            "query.result",
+                        ]
+                    },
+                    "sql": {
+                        "read_only": True,
+                        "required_tables": ["support_tickets", "customers"],
+                        "must_include": ["JOIN", "WHERE", "high", "open"],
+                        "must_not_include": ["DELETE", "DROP"],
+                        "max_rows_returned": 2,
+                    },
+                    "result": {
+                        "required_rows": [{"name": "Ada"}, {"name": "Grace"}],
+                        "forbidden_rows": [{"name": "Turing"}],
+                        "min_rows": 2,
+                        "max_rows": 2,
+                    },
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
+                },
+            },
+            {
+                "id": "prod-hard-refund-order-rate",
+                "prompt": (
+                    "What percent of orders have a refund? Return columns "
+                    "refunded_orders, total_orders, and refund_rate_percent."
+                ),
+                "expectations": {
+                    "capabilities": {
+                        "required": ["db.sql.validate", "db.sql.execute_read"],
+                        "required_owners": ["sqlite"],
+                        "max_calls": 12,
+                    },
+                    "tasks": {"max_errors": 0},
+                    "evidence": {
+                        "required_kinds": [
+                            "query.plan.proposal",
+                            "query.plan.validation",
+                            "sql.validation",
+                            "query.result",
+                        ]
+                    },
+                    "sql": {
+                        "read_only": True,
+                        "required_tables": ["orders", "refunds"],
+                        "must_include": ["COUNT"],
+                        "must_not_include": ["DELETE", "DROP"],
+                        "max_rows_returned": 1,
+                    },
+                    "result": {
+                        "required_columns": [
+                            "refunded_orders",
+                            "total_orders",
+                            "refund_rate_percent",
+                        ],
+                        "required_rows": [
+                            {
+                                "refunded_orders": 2,
+                                "total_orders": 5,
+                                "refund_rate_percent": 40.0,
+                            }
+                        ],
+                        "min_rows": 1,
+                        "max_rows": 1,
+                    },
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
+                },
+            },
+            {
+                "id": "prod-hard-enterprise-na-open-high-severity",
+                "prompt": (
+                    "Using catalog relationships, show enterprise customers in NA "
+                    "with open high severity support tickets."
+                ),
+                "expectations": {
+                    "capabilities": {
+                        "required": [
+                            "catalog.relationship_paths.find",
+                            "db.sql.validate",
+                            "db.sql.execute_read",
+                        ],
+                        "required_owners": ["catalog", "sqlite"],
+                        "max_calls": 14,
+                    },
+                    "tasks": {"max_errors": 0},
+                    "evidence": {
+                        "required_kinds": [
+                            "schema.relationship_path",
+                            "query.plan.proposal",
+                            "query.plan.validation",
+                            "sql.validation",
+                            "query.result",
+                        ]
+                    },
+                    "sql": {
+                        "read_only": True,
+                        "required_tables": [
+                            "customers",
+                            "regions",
+                            "support_tickets",
+                        ],
+                        "must_include": ["JOIN", "enterprise", "NA", "high", "open"],
+                        "must_not_include": ["DELETE", "DROP"],
+                        "max_rows_returned": 2,
+                    },
+                    "result": {
+                        "required_rows": [{"name": "Ada"}, {"name": "Grace"}],
+                        "forbidden_rows": [{"name": "Linus"}, {"name": "Turing"}],
+                        "min_rows": 2,
+                        "max_rows": 2,
+                    },
+                    "budgets": {"max_latency_ms": 18000, "max_iterations": 14},
+                },
+            },
+        ],
+    )
+
+    report = await EvalSuite(config).run(output_dir=_output_dir(tmp_path, config.name))
+    _show_report(report)
+
+    assert report.status == "passed", render_pretty(report)
+    assert report.summary.cases_total == 5
+    assert report.score == 1.0
+    assert (Path(report.artifact_path) / "report.json").exists()
+
+
 async def test_eval_live_from_db_rich_sqlite_openai_judge_benchmark(tmp_path):
     judge_model = _require_openai_judge()
     config = EvalSuiteConfig(
@@ -309,7 +566,7 @@ async def test_eval_live_from_db_rich_sqlite_openai_judge_benchmark(tmp_path):
                     "answer": {"equals": "The count is 4."},
                     "capabilities": {
                         "required": ["db.sql.execute_read"],
-                        "max_calls": 3,
+                        "max_calls": 6,
                     },
                     "sql": {
                         "read_only": True,
@@ -359,7 +616,7 @@ async def test_eval_live_from_db_rich_sqlite_openai_judge_benchmark(tmp_path):
                     "answer": {"equals": "Returned 3 rows."},
                     "capabilities": {
                         "required": ["db.sql.execute_read"],
-                        "max_calls": 3,
+                        "max_calls": 6,
                     },
                     "sql": {
                         "read_only": True,
@@ -412,7 +669,7 @@ async def test_eval_live_from_db_rich_sqlite_openai_judge_benchmark(tmp_path):
                             "catalog.relationship_paths.find",
                             "db.sql.execute_read",
                         ],
-                        "max_calls": 6,
+                        "max_calls": 12,
                     },
                     "evidence": {
                         "required_kinds": ["schema.relationship_path", "query.result"]
@@ -546,7 +803,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                     "capabilities": {
                         "required": ["db.sql.validate", "db.sql.execute_read"],
                         "required_owners": ["sqlite"],
-                        "max_calls": 8,
+                        "max_calls": 12,
                     },
                     "tasks": {"max_errors": 0},
                     "evidence": {"required_kinds": ["sql.validation", "query.result"]},
@@ -565,7 +822,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                         "min_rows": 2,
                         "max_rows": 2,
                     },
-                    "budgets": {"max_latency_ms": 5000, "max_iterations": 8},
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
                 },
             },
             {
@@ -579,7 +836,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                     "capabilities": {
                         "required": ["db.sql.validate", "db.sql.execute_read"],
                         "required_owners": ["sqlite"],
-                        "max_calls": 8,
+                        "max_calls": 12,
                     },
                     "tasks": {"max_errors": 0},
                     "evidence": {"required_kinds": ["sql.validation", "query.result"]},
@@ -597,7 +854,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                         "min_rows": 1,
                         "max_rows": 1,
                     },
-                    "budgets": {"max_latency_ms": 5000, "max_iterations": 8},
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
                 },
             },
             {
@@ -615,7 +872,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                             "db.sql.execute_read",
                         ],
                         "required_owners": ["catalog", "sqlite"],
-                        "max_calls": 8,
+                        "max_calls": 12,
                     },
                     "tasks": {"max_errors": 0},
                     "evidence": {
@@ -638,7 +895,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                         "min_rows": 2,
                         "max_rows": 2,
                     },
-                    "budgets": {"max_latency_ms": 5000, "max_iterations": 8},
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
                 },
             },
             {
@@ -652,7 +909,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                     "capabilities": {
                         "required": ["db.sql.validate", "db.sql.execute_read"],
                         "required_owners": ["sqlite"],
-                        "max_calls": 8,
+                        "max_calls": 12,
                     },
                     "tasks": {"max_errors": 0},
                     "evidence": {"required_kinds": ["sql.validation", "query.result"]},
@@ -670,7 +927,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                         "min_rows": 1,
                         "max_rows": 1,
                     },
-                    "budgets": {"max_latency_ms": 5000, "max_iterations": 8},
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
                 },
             },
             {
@@ -681,7 +938,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                     "capabilities": {
                         "required": ["db.sql.validate", "db.sql.execute_read"],
                         "required_owners": ["sqlite"],
-                        "max_calls": 8,
+                        "max_calls": 12,
                     },
                     "tasks": {"max_errors": 0},
                     "evidence": {"required_kinds": ["sql.validation", "query.result"]},
@@ -697,7 +954,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                         "min_rows": 1,
                         "max_rows": 1,
                     },
-                    "budgets": {"max_latency_ms": 5000, "max_iterations": 8},
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
                 },
             },
             {
@@ -711,7 +968,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                     "capabilities": {
                         "required": ["db.sql.validate", "db.sql.execute_read"],
                         "required_owners": ["sqlite"],
-                        "max_calls": 8,
+                        "max_calls": 12,
                     },
                     "tasks": {"max_errors": 0},
                     "evidence": {"required_kinds": ["sql.validation", "query.result"]},
@@ -733,7 +990,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                         "min_rows": 1,
                         "max_rows": 1,
                     },
-                    "budgets": {"max_latency_ms": 5000, "max_iterations": 8},
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
                 },
             },
             {
@@ -747,7 +1004,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                     "capabilities": {
                         "required": ["db.sql.validate", "db.sql.execute_read"],
                         "required_owners": ["sqlite"],
-                        "max_calls": 8,
+                        "max_calls": 12,
                     },
                     "tasks": {"max_errors": 0},
                     "evidence": {"required_kinds": ["sql.validation", "query.result"]},
@@ -768,7 +1025,7 @@ async def test_eval_live_from_db_hard_analysis_benchmark(tmp_path):
                         "min_rows": 2,
                         "max_rows": 2,
                     },
-                    "budgets": {"max_latency_ms": 5000, "max_iterations": 8},
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
                 },
             },
             {

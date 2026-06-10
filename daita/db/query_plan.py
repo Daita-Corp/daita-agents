@@ -6,6 +6,22 @@ from dataclasses import asdict, dataclass, field
 import json
 from typing import Any, Literal, Mapping
 
+_PLAN_OPERATION_ALIASES = {
+    "query": "read",
+    "query_planning": "read",
+    "data_query": "read",
+    "data.query": "read",
+    "read_query": "read",
+    "read_only": "read",
+    "select": "read",
+    "sql_select": "read",
+    "schema_query": "schema",
+    "schema.query": "schema",
+    "write": "write_propose",
+    "write_proposal": "write_propose",
+    "write.propose": "write_propose",
+}
+
 
 def _tuple_strings(values: Any) -> tuple[str, ...]:
     if values is None:
@@ -215,7 +231,7 @@ class DbQueryPlan:
             if isinstance(item, Mapping)
         )
         return cls(
-            operation=str(value.get("operation") or "read"),  # type: ignore[arg-type]
+            operation=_normalize_operation(value.get("operation")),  # type: ignore[arg-type]
             selected_sql=(
                 str(value["selected_sql"]) if value.get("selected_sql") else None
             ),
@@ -266,6 +282,11 @@ class DbQueryPlan:
             "confidence": self.confidence,
             "planner": self.planner,
         }
+
+
+def _normalize_operation(value: Any) -> str:
+    operation = str(value or "read").strip().lower()
+    return _PLAN_OPERATION_ALIASES.get(operation, operation)
 
 
 @dataclass(frozen=True)

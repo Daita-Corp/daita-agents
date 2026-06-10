@@ -1,4 +1,4 @@
-"""Canonical runtime capability IDs used by DB-facing compatibility tools."""
+"""Canonical runtime IDs used by DB-facing compatibility tools."""
 
 from __future__ import annotations
 
@@ -28,6 +28,16 @@ LINEAGE_FLOW_REGISTER_CAPABILITY = "lineage.flow.register"
 LINEAGE_PATH_FIND_CAPABILITY = "lineage.path.find"
 
 ANALYST_CAPABILITY_PREFIX = "db.analyst."
+
+SCHEMA_ASSET_PROFILE_EVIDENCE = "schema.asset_profile"
+SCHEMA_SEARCH_RESULT_EVIDENCE = "schema.search_result"
+SCHEMA_RELATIONSHIP_PATH_EVIDENCE = "schema.relationship_path"
+PLANNING_CONTEXT_EVIDENCE = "planning.context"
+QUERY_PLAN_PROPOSAL_EVIDENCE = "query.plan.proposal"
+QUERY_PLAN_VALIDATION_EVIDENCE = "query.plan.validation"
+QUERY_PLAN_REPAIR_EVIDENCE = "query.plan.repair"
+SQL_VALIDATION_EVIDENCE = "sql.validation"
+QUERY_RESULT_EVIDENCE = "query.result"
 
 
 def tool_capabilities(tool: Any) -> tuple[str, ...]:

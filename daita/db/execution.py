@@ -23,6 +23,14 @@ from daita.runtime import (
 )
 
 from .analysis import with_analysis_evidence_trace
+from .capabilities import (
+    PLANNING_CONTEXT_EVIDENCE,
+    QUERY_PLAN_PROPOSAL_EVIDENCE,
+    QUERY_PLAN_VALIDATION_EVIDENCE,
+    SCHEMA_RELATIONSHIP_PATH_EVIDENCE,
+    SCHEMA_SEARCH_RESULT_EVIDENCE,
+    SQL_VALIDATION_EVIDENCE,
+)
 from .evidence import DbEvidenceStore, InMemoryDbEvidenceStore
 from .models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
 from .query_planning import DbQueryPlanner
@@ -121,12 +129,12 @@ class DbOperationExecutor:
                     item
                     for item in evidence_store.list()
                     if item.kind.startswith("catalog.")
-                    or item.kind in {"schema.search_result", "catalog.source"}
+                    or item.kind in {SCHEMA_SEARCH_RESULT_EVIDENCE, "catalog.source"}
                 ),
                 relationship_evidence=tuple(
                     item
                     for item in evidence_store.list()
-                    if item.kind == "relationship.paths"
+                    if item.kind == SCHEMA_RELATIONSHIP_PATH_EVIDENCE
                 ),
             )
             plan_evidence, strategy_warnings, strategy_diagnostics = (
@@ -572,13 +580,14 @@ class DbOperationExecutor:
             dependencies=(
                 TaskDependency(
                     kind="evidence",
-                    evidence_kind="query.plan.proposal",
+                    evidence_kind=QUERY_PLAN_PROPOSAL_EVIDENCE,
                     evidence_id=plan_evidence.id,
+                    evidence_accepted=plan_evidence.accepted,
                     operation_id=operation.id,
                 ),
                 TaskDependency(
                     kind="evidence",
-                    evidence_kind="planning.context",
+                    evidence_kind=PLANNING_CONTEXT_EVIDENCE,
                     evidence_id=planning_context.id,
                     operation_id=operation.id,
                 ),
@@ -612,7 +621,7 @@ class DbOperationExecutor:
             dependencies=(
                 TaskDependency(
                     kind="evidence",
-                    evidence_kind="query.plan.validation",
+                    evidence_kind=QUERY_PLAN_VALIDATION_EVIDENCE,
                     evidence_id=plan_validation.id,
                     evidence_payload={"valid": True},
                     operation_id=operation.id,
@@ -654,7 +663,7 @@ class DbOperationExecutor:
             dependencies=(
                 TaskDependency(
                     kind="evidence",
-                    evidence_kind="sql.validation",
+                    evidence_kind=SQL_VALIDATION_EVIDENCE,
                     evidence_id=validation.id,
                     evidence_owner=validation.owner,
                     producer_task_id=validation.task_id,
@@ -698,14 +707,15 @@ class DbOperationExecutor:
             dependencies=(
                 TaskDependency(
                     kind="evidence",
-                    evidence_kind="planning.context",
+                    evidence_kind=PLANNING_CONTEXT_EVIDENCE,
                     evidence_id=planning_context.id,
                     operation_id=operation.id,
                 ),
                 TaskDependency(
                     kind="evidence",
-                    evidence_kind="query.plan.proposal",
+                    evidence_kind=QUERY_PLAN_PROPOSAL_EVIDENCE,
                     evidence_id=prior_plan.id,
+                    evidence_accepted=prior_plan.accepted,
                     operation_id=operation.id,
                 ),
                 TaskDependency(
@@ -717,7 +727,9 @@ class DbOperationExecutor:
                 ),
             ),
         )
-        proposals = [item for item in evidence if item.kind == "query.plan.proposal"]
+        proposals = [
+            item for item in evidence if item.kind == QUERY_PLAN_PROPOSAL_EVIDENCE
+        ]
         return proposals[-1] if proposals else None
 
     async def _persist_runtime_evidence(

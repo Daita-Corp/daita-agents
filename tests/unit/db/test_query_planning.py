@@ -1,4 +1,4 @@
-from daita.db import DbIntent, DbIntentKind, DbQueryPlanner, DbRequest
+from daita.db import DbIntent, DbIntentKind, DbQueryPlan, DbQueryPlanner, DbRequest
 from daita.runtime import AccessMode, Operation
 
 
@@ -45,6 +45,19 @@ def test_query_planner_builds_count_plan_without_executing_sql():
     assert plan.sql == 'SELECT COUNT(*) AS count FROM "orders"'
     assert plan.evidence.kind == "query.plan.proposal"
     assert plan.evidence.payload["strategy"] == "single_table"
+
+
+def test_query_plan_normalizes_common_llm_operation_aliases():
+    plan = DbQueryPlan.from_mapping(
+        {
+            "operation": "query_planning",
+            "selected_sql": "SELECT COUNT(*) AS count FROM customers",
+            "selected_tables": ["customers"],
+            "confidence": 0.8,
+        }
+    )
+
+    assert plan.operation == "read"
 
 
 def test_query_planner_uses_catalog_metadata_business_name_for_table_match():

@@ -58,10 +58,10 @@ async def _runtime_with_llm(tmp_path, responses):
     return runtime, sqlite
 
 
-def _plan(sql, *, tables=("orders", "customers"), confidence=0.92):
+def _plan(sql, *, tables=("orders", "customers"), confidence=0.92, operation="read"):
     return json.dumps(
         {
-            "operation": "read",
+            "operation": operation,
             "selected_sql": sql,
             "candidates": [
                 {
@@ -85,6 +85,47 @@ def _plan(sql, *, tables=("orders", "customers"), confidence=0.92):
             "assumptions": [],
             "clarification_question": None,
             "confidence": confidence,
+            "planner": "llm",
+        }
+    )
+
+
+def _join_plan(*, operation="read"):
+    sql = (
+        "SELECT o.id, o.customer_id, o.total, c.id AS customer_id, c.name "
+        "FROM orders o JOIN customers c ON o.customer_id = c.id"
+    )
+    return json.dumps(
+        {
+            "operation": operation,
+            "selected_sql": sql,
+            "candidates": [
+                {
+                    "sql": sql,
+                    "purpose": "join orders to customers",
+                    "confidence": 0.9,
+                    "tables": ["orders", "customers"],
+                }
+            ],
+            "selected_tables": ["orders", "customers"],
+            "joins": [
+                {
+                    "left_table": "orders",
+                    "left_column": "customer_id",
+                    "right_table": "customers",
+                    "right_column": "id",
+                    "type": "INNER",
+                    "relationship": "orders.customer_id -> customers.id",
+                }
+            ],
+            "filters": [],
+            "aggregations": [],
+            "group_by": [],
+            "order_by": [],
+            "limit": None,
+            "assumptions": [],
+            "clarification_question": None,
+            "confidence": 0.9,
             "planner": "llm",
         }
     )
@@ -146,6 +187,30 @@ async def test_analytical_prompt_routes_to_llm_planner_and_executes_validated_re
     assert dependency.payload_fingerprint
 
 
+async def test_catalog_relationship_evidence_reaches_llm_planning_context(tmp_path):
+    runtime, sqlite = await _runtime_with_llm(
+        tmp_path, [_join_plan(operation="query_planning")]
+    )
+    try:
+        result = await runtime.run("Join orders to customers using their relationship")
+        snapshot = await runtime.inspect_operation(result.operation_id)
+    finally:
+        await sqlite.disconnect()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert result.answer == "Returned 3 rows."
+    assert snapshot is not None
+    planning_context = next(
+        item for item in snapshot.evidence if item.kind == "planning.context"
+    )
+    assert planning_context.payload["relationship_evidence_refs"]
+    proposal = next(
+        item for item in snapshot.evidence if item.kind == "query.plan.proposal"
+    )
+    assert proposal.payload["structured_plan"]["operation"] == "read"
+    assert "schema.relationship_path" in {item.kind for item in snapshot.evidence}
+
+
 async def test_llm_validation_failure_creates_repair_with_fresh_tasks(tmp_path):
     bad_sql = "SELECT SUM(total) AS total FROM payments LIMIT 5"
     good_sql = (
@@ -192,3 +257,44 @@ async def test_llm_validation_failure_creates_repair_with_fresh_tasks(tmp_path):
         and dep.evidence_id == failed_validations[0].id
     )
     assert failure_dependency.evidence_accepted is False
+
+
+async def test_invalid_llm_proposal_artifact_can_reach_repair(tmp_path):
+    good_sql = (
+        "SELECT c.name, SUM(o.total) AS total "
+        "FROM orders o JOIN customers c ON o.customer_id = c.id "
+        "GROUP BY c.name ORDER BY total DESC LIMIT 5"
+    )
+    runtime, sqlite = await _runtime_with_llm(
+        tmp_path,
+        [
+            "not json",
+            _plan(good_sql, confidence=0.7),
+        ],
+    )
+    try:
+        result = await runtime.run("Show top customers by total revenue")
+        snapshot = await runtime.inspect_operation(result.operation_id)
+    finally:
+        await sqlite.disconnect()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert snapshot is not None
+    failed_proposals = [
+        item
+        for item in snapshot.evidence
+        if item.kind == "query.plan.proposal"
+        and item.payload.get("failure") == "planner_json_invalid"
+    ]
+    assert failed_proposals
+    assert failed_proposals[0].accepted is True
+    repair_task = next(
+        task for task in snapshot.tasks if task.capability_id == "db.query.repair"
+    )
+    proposal_dependency = next(
+        dep
+        for dep in repair_task.dependencies
+        if dep.evidence_kind == "query.plan.proposal"
+        and dep.evidence_id == failed_proposals[0].id
+    )
+    assert proposal_dependency.evidence_accepted is True

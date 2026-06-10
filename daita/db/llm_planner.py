@@ -56,7 +56,6 @@ class DbLLMPlannerExecutor:
                     owner=self.owner,
                     operation_id=operation.id,
                     task_id=task.id,
-                    accepted=False,
                     payload={
                         "valid": False,
                         "failure": "planner_json_invalid",
@@ -192,7 +191,9 @@ def _planner_messages(context_payload: dict[str, Any]) -> list[dict[str, str]]:
                 "You are a database query planner inside a governed runtime. "
                 "Return only strict JSON matching the requested schema. You may "
                 "propose SQL or a clarification question, but you must never "
-                "execute database work."
+                "execute database work. The operation field must be one of: "
+                "read, write_propose, schema, analysis. Use read for SELECT "
+                "queries."
             ),
         },
         {
@@ -202,7 +203,8 @@ def _planner_messages(context_payload: dict[str, Any]) -> list[dict[str, str]]:
                 "Return JSON with keys: operation, selected_sql, candidates, "
                 "selected_tables, joins, filters, aggregations, group_by, "
                 "order_by, limit, assumptions, clarification_question, "
-                "confidence, planner."
+                "confidence, planner. For read queries set operation exactly "
+                'to "read".'
             ),
         },
     ]
@@ -224,7 +226,9 @@ def _repair_messages(
             "content": (
                 "Repair a failed database query plan. Return only strict JSON "
                 "for a complete revised plan. Do not repeat the same SQL unless "
-                "the failure facts show the context changed."
+                "the failure facts show the context changed. The operation "
+                "field must be one of: read, write_propose, schema, analysis. "
+                "Use read for SELECT queries."
             ),
         },
         {

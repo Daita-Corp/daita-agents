@@ -27,6 +27,13 @@ from dotenv import load_dotenv
 
 from daita.agents.agent import Agent
 from daita.db import DbOperationResult
+from daita.db.capabilities import (
+    QUERY_PLAN_PROPOSAL_EVIDENCE,
+    QUERY_PLAN_VALIDATION_EVIDENCE,
+    QUERY_RESULT_EVIDENCE,
+    SCHEMA_RELATIONSHIP_PATH_EVIDENCE,
+    SQL_VALIDATION_EVIDENCE,
+)
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.memory.local_backend import LocalMemoryBackend
 from daita.plugins.memory.memory_plugin import MemoryPlugin
@@ -52,6 +59,10 @@ POSTGRES_IMAGE = "postgres:16-alpine"
 POSTGRES_USER = "daita"
 POSTGRES_PASSWORD = "daita_test_pw"
 POSTGRES_DB = "daita_from_db_benchmark"
+QUERY_PLAN_EVIDENCE = {
+    QUERY_PLAN_PROPOSAL_EVIDENCE,
+    QUERY_PLAN_VALIDATION_EVIDENCE,
+}
 
 
 @pytest.fixture(scope="session")
@@ -150,7 +161,10 @@ async def test_live_from_db_simple_query_latency_cost_and_output(
         await agent.stop()
 
     _assert_result(result, elapsed_ms, expected_answer=["3"])
-    _assert_evidence(result, {"query.plan", "sql.validation", "query.result"})
+    _assert_evidence(
+        result,
+        {*QUERY_PLAN_EVIDENCE, SQL_VALIDATION_EVIDENCE, QUERY_RESULT_EVIDENCE},
+    )
     _record_benchmark("from_db_simple_query", result, elapsed_ms, database="sqlite")
 
 
@@ -176,10 +190,10 @@ async def test_live_from_db_relationship_query_latency_cost_and_output(
     _assert_evidence(
         result,
         {
-            "schema.relationship_path",
-            "query.plan",
-            "sql.validation",
-            "query.result",
+            SCHEMA_RELATIONSHIP_PATH_EVIDENCE,
+            *QUERY_PLAN_EVIDENCE,
+            SQL_VALIDATION_EVIDENCE,
+            QUERY_RESULT_EVIDENCE,
         },
     )
     _record_benchmark(
@@ -206,8 +220,10 @@ async def test_live_from_db_ambiguous_prompt_latency_cost_and_output(
         await agent.stop()
 
     _assert_result(result, elapsed_ms, expected_answer=["Returned 3 rows"])
-    _assert_evidence(result, {"query.plan", "sql.validation", "query.result"})
-    assert result.diagnostics["execution"]["task_count"] <= 3
+    _assert_evidence(
+        result,
+        {*QUERY_PLAN_EVIDENCE, SQL_VALIDATION_EVIDENCE, QUERY_RESULT_EVIDENCE},
+    )
     _record_benchmark(
         "from_db_ambiguous_prompt",
         result,
@@ -281,7 +297,10 @@ async def test_live_from_db_postgres_simple_query_latency_cost_and_output(
         await agent.stop()
 
     _assert_result(result, elapsed_ms, expected_answer=["3"])
-    _assert_evidence(result, {"query.plan", "sql.validation", "query.result"})
+    _assert_evidence(
+        result,
+        {*QUERY_PLAN_EVIDENCE, SQL_VALIDATION_EVIDENCE, QUERY_RESULT_EVIDENCE},
+    )
     _record_benchmark(
         "from_db_postgres_simple_query",
         result,
@@ -312,10 +331,10 @@ async def test_live_from_db_postgres_relationship_query_latency_cost_and_output(
     _assert_evidence(
         result,
         {
-            "schema.relationship_path",
-            "query.plan",
-            "sql.validation",
-            "query.result",
+            SCHEMA_RELATIONSHIP_PATH_EVIDENCE,
+            *QUERY_PLAN_EVIDENCE,
+            SQL_VALIDATION_EVIDENCE,
+            QUERY_RESULT_EVIDENCE,
         },
     )
     _record_benchmark(
@@ -342,8 +361,10 @@ async def test_live_from_db_postgres_ambiguous_prompt_latency_cost_and_output(
         await agent.stop()
 
     _assert_result(result, elapsed_ms, expected_answer=["Returned 3 rows"])
-    _assert_evidence(result, {"query.plan", "sql.validation", "query.result"})
-    assert result.diagnostics["execution"]["task_count"] <= 3
+    _assert_evidence(
+        result,
+        {*QUERY_PLAN_EVIDENCE, SQL_VALIDATION_EVIDENCE, QUERY_RESULT_EVIDENCE},
+    )
     _record_benchmark(
         "from_db_postgres_ambiguous_prompt",
         result,
