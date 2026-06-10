@@ -178,6 +178,24 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 replay_safe=True,
                 idempotent=True,
             ),
+            Capability(
+                id="db.analysis.replan",
+                owner="db_runtime",
+                description="Persist an auditable multi-step analysis plan revision.",
+                domains=frozenset({"db"}),
+                operation_types=frozenset(
+                    {"data.query", "data.query.catalog_assisted"}
+                ),
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.LOW,
+                input_schema=common_schema,
+                output_evidence=frozenset({"analysis.plan.revision"}),
+                executor="db.analysis.replan.runtime",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
         ]
         if self.llm_capable:
             capabilities.extend(
@@ -225,6 +243,7 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
             DbAnalysisPlanValidationExecutor(self),
             DbAnalysisCheckpointExecutor(self),
             DbAnalysisSummarizeExecutor(self),
+            DbAnalysisReplanExecutor(self),
         ]
         if self.llm_capable:
             executors.append(DbLLMPlannerExecutor(runtime=self))
@@ -294,6 +313,12 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 json_schema=object_schema,
                 description="Final or partial synthesis over accepted analysis evidence.",
             ),
+            EvidenceSchema(
+                kind="analysis.plan.revision",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Auditable multi-step analysis replan or repair revision.",
+            ),
         )
 
 
@@ -348,6 +373,7 @@ class DbPlanningContextExecutor:
             schema_evidence=schema_evidence,
             catalog_evidence=catalog_evidence,
             relationship_evidence=relationship_evidence,
+            capability_summaries=_planner_capability_summaries(runtime),
             source=runtime.source,
         )
         return [builder.evidence_for(planning_context)]
@@ -420,6 +446,73 @@ async def _load_evidence(
         if evidence.id == evidence_id:
             return evidence
     return None
+
+
+def _planner_capability_summaries(runtime: Any) -> tuple[dict[str, Any], ...]:
+    interesting_owners = {"catalog", "memory", "lineage", "data_quality", "metrics"}
+    interesting_prefixes = ("catalog.", "memory.", "lineage.", "quality.", "metric.")
+    summaries = []
+    for capability in runtime.registry.capabilities:
+        if capability.owner not in interesting_owners and not capability.id.startswith(
+            interesting_prefixes
+        ):
+            continue
+        summaries.append(
+            {
+                "id": capability.id,
+                "owner": capability.owner,
+                "description": capability.description,
+                "access": capability.access.value,
+                "risk": capability.risk.value,
+                "output_evidence": sorted(capability.output_evidence),
+                "runtime_only": capability.runtime_only,
+                "side_effecting": capability.side_effecting,
+            }
+        )
+    return tuple(sorted(summaries, key=lambda item: (item["owner"], item["id"])))
+
+
+async def _analysis_context_ref_errors(
+    runtime: Any,
+    operation_id: str,
+    plan_payload: Mapping[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    evidence_by_id = {
+        item.id: item
+        for item in await runtime.store.list_evidence(operation_id)
+        if item.id
+    }
+    for step in plan_payload.get("steps") or ():
+        if not isinstance(step, Mapping):
+            continue
+        step_id = str(step.get("id") or "")
+        for ref in step.get("context_evidence_refs") or ():
+            if not isinstance(ref, Mapping):
+                continue
+            evidence_id = ref.get("id")
+            if not evidence_id:
+                errors.append(f"context_evidence_id_required:{step_id}")
+                continue
+            evidence = evidence_by_id.get(str(evidence_id))
+            if evidence is None:
+                errors.append(f"context_evidence_missing:{step_id}:{evidence_id}")
+                continue
+            if not evidence.accepted or evidence.operation_id != operation_id:
+                errors.append(
+                    "context_evidence_not_accepted_same_operation:"
+                    f"{step_id}:{evidence_id}"
+                )
+                continue
+            fingerprint = ref.get("payload_fingerprint")
+            actual = evidence.metadata.get("payload_fingerprint") or stable_fingerprint(
+                evidence.payload
+            )
+            if fingerprint is not None and str(fingerprint) != actual:
+                errors.append(
+                    f"context_evidence_fingerprint_mismatch:{step_id}:{evidence_id}"
+                )
+    return errors
 
 
 @dataclass(frozen=True)
@@ -579,10 +672,25 @@ class DbAnalysisPlanValidationExecutor:
             plan_evidence.payload,
             plan_evidence=plan_evidence,
             registered_capabilities={
-                capability.id for capability in runtime.registry.capabilities
+                (capability.owner, capability.id): capability
+                for capability in runtime.registry.capabilities
             },
         )
         payload = validation.to_dict()
+        context_errors = await _analysis_context_ref_errors(
+            runtime,
+            operation.id,
+            plan_evidence.payload,
+        )
+        if context_errors:
+            payload = {
+                **payload,
+                "valid": False,
+                "errors": [
+                    *list(payload.get("errors") or ()),
+                    *context_errors,
+                ],
+            }
         if not plan_evidence.accepted:
             errors = list(payload.get("errors") or ())
             errors.append(
@@ -745,6 +853,9 @@ class DbAnalysisSummarizeExecutor:
         payload = {
             **payload,
             "analysis_id": analysis_id,
+            "partial": bool(task.input.get("partial")),
+            "pause_reason": task.input.get("pause_reason"),
+            "remaining_step_ids": list(task.input.get("remaining_step_ids") or ()),
             "diagnostics": {
                 **dict(payload.get("diagnostics") or {}),
                 "dependency_evidence_refs": [evidence_ref(item) for item in cited],
@@ -770,7 +881,134 @@ class DbAnalysisSummarizeExecutor:
                         plan_evidence_id=task.metadata.get("analysis_plan_evidence_id"),
                     ),
                     "cited_evidence_refs": [item.id for item in cited if item.id],
+                    "partial": bool(task.input.get("partial")),
                     "payload_fingerprint": stable_fingerprint(payload),
+                },
+            )
+        ]
+
+
+@dataclass(frozen=True)
+class DbAnalysisReplanExecutor:
+    """Executor that persists typed analysis revision evidence."""
+
+    plugin: DbRuntimePlanningPlugin
+    id: str = "db.analysis.replan.runtime"
+    owner: str = "db_runtime"
+    capability_ids: frozenset[str] = frozenset({"db.analysis.replan"})
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        runtime = self.plugin.runtime
+        parent = await _load_evidence(
+            runtime,
+            operation.id,
+            task.input.get("parent_plan_evidence_id"),
+        )
+        trigger_ids = [
+            str(item) for item in task.input.get("trigger_evidence_ids") or ()
+        ]
+        triggers = tuple(
+            item
+            for item in [
+                await _load_evidence(runtime, operation.id, evidence_id)
+                for evidence_id in trigger_ids
+            ]
+            if item is not None
+        )
+        errors: list[str] = []
+        if parent is None:
+            errors.append("parent_plan_evidence_missing")
+            analysis_id = str(
+                task.input.get("analysis_id") or f"analysis-{operation.id}"
+            )
+            parent_ref = None
+            parent_steps: tuple[Any, ...] = ()
+        else:
+            analysis_id = str(
+                parent.payload.get("analysis_id")
+                or parent.metadata.get("analysis_id")
+                or task.input.get("analysis_id")
+                or f"analysis-{operation.id}"
+            )
+            parent_ref = evidence_ref(parent)
+            if not parent.accepted or parent.operation_id != operation.id:
+                errors.append("parent_plan_evidence_not_accepted_same_operation")
+            try:
+                parent_steps = DbAnalysisPlan.from_mapping(parent.payload).steps
+            except Exception as exc:
+                errors.append(f"parent_plan_invalid:{type(exc).__name__}")
+                parent_steps = ()
+        if len(triggers) != len(trigger_ids):
+            errors.append("trigger_evidence_missing")
+        if any(
+            not item.accepted or item.operation_id != operation.id for item in triggers
+        ):
+            errors.append("trigger_evidence_not_accepted_same_operation")
+        existing_revisions = [
+            item
+            for item in await runtime.store.list_evidence(operation.id)
+            if item.kind == "analysis.plan.revision"
+            and item.accepted
+            and item.payload.get("parent_plan_evidence_id")
+            == (parent.id if parent is not None else None)
+        ]
+        failed_step_ids = [
+            str(item) for item in task.input.get("failed_step_ids") or ()
+        ]
+        replacement_steps = [
+            dict(item)
+            for item in task.input.get("replacement_steps") or ()
+            if isinstance(item, Mapping)
+        ]
+        unchanged_step_ids = [
+            step.id for step in parent_steps if step.id not in set(failed_step_ids)
+        ]
+        prior_sql_fingerprints = sorted(
+            {
+                str(item.metadata.get("sql_fingerprint"))
+                for item in await runtime.store.list_evidence(operation.id)
+                if item.metadata.get("sql_fingerprint")
+            }
+        )
+        payload = {
+            "analysis_id": analysis_id,
+            "parent_plan_evidence_id": parent.id if parent is not None else None,
+            "parent_plan_evidence_ref": parent_ref,
+            "revision_number": len(existing_revisions) + 1,
+            "trigger_evidence_refs": [evidence_ref(item) for item in triggers],
+            "failed_or_invalidated_step_ids": failed_step_ids,
+            "replacement_steps": replacement_steps,
+            "unchanged_step_ids": unchanged_step_ids,
+            "budget_usage": dict(task.input.get("budget_usage") or {}),
+            "retry_rationale": str(task.input.get("retry_rationale") or ""),
+            "prior_sql_fingerprints": prior_sql_fingerprints,
+            "diagnostics": {
+                "mode": "runtime",
+                "errors": errors,
+            },
+        }
+        return [
+            Evidence(
+                kind="analysis.plan.revision",
+                owner=self.owner,
+                operation_id=operation.id,
+                task_id=task.id,
+                accepted=not errors,
+                payload=payload,
+                metadata={
+                    **analysis_metadata(
+                        analysis_id=analysis_id,
+                        step_id="analysis_replan",
+                        phase="replan",
+                        plan_evidence_id=parent.id if parent is not None else None,
+                    ),
+                    "payload_fingerprint": stable_fingerprint(payload),
+                    "analysis_revision_number": payload["revision_number"],
                 },
             )
         ]
@@ -811,6 +1049,10 @@ def _analysis_plan_messages(
             "role": "user",
             "content": (
                 f"{context_payload.get('rendered_context', '')}\n\n"
+                "Source evidence refs: "
+                f"{json.dumps(context_payload.get('source_evidence_refs') or [], sort_keys=True, default=str)}\n"
+                "Capability summaries: "
+                f"{json.dumps(context_payload.get('capability_summaries') or [], sort_keys=True, default=str)}\n"
                 "Return JSON with analysis_id, goal, steps, budgets, diagnostics. "
                 f"Use analysis_id {analysis_id!r}. Budgets: "
                 f"{budgets}. Each step needs id, kind, purpose, depends_on, "

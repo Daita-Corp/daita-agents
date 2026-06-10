@@ -25,6 +25,13 @@ class DbPlanningContext:
     schema_evidence_refs: tuple[str, ...] = ()
     catalog_evidence_refs: tuple[str, ...] = ()
     relationship_evidence_refs: tuple[str, ...] = ()
+    source_evidence_refs: tuple[dict[str, Any], ...] = ()
+    source_fingerprints: dict[str, str] = field(default_factory=dict)
+    capability_summaries: tuple[dict[str, Any], ...] = ()
+    included_sections: tuple[str, ...] = ()
+    omitted_sections: tuple[str, ...] = ()
+    budget_usage: dict[str, Any] = field(default_factory=dict)
+    context_selection_diagnostics: dict[str, Any] = field(default_factory=dict)
     policy_summary: dict[str, Any] = field(default_factory=dict)
     limit_summary: dict[str, Any] = field(default_factory=dict)
     redaction_policy: dict[str, Any] = field(default_factory=dict)
@@ -43,6 +50,13 @@ class DbPlanningContext:
             "schema_evidence_refs": list(self.schema_evidence_refs),
             "catalog_evidence_refs": list(self.catalog_evidence_refs),
             "relationship_evidence_refs": list(self.relationship_evidence_refs),
+            "source_evidence_refs": [dict(item) for item in self.source_evidence_refs],
+            "source_fingerprints": dict(self.source_fingerprints),
+            "capability_summaries": [dict(item) for item in self.capability_summaries],
+            "included_sections": list(self.included_sections),
+            "omitted_sections": list(self.omitted_sections),
+            "budget_usage": dict(self.budget_usage),
+            "context_selection_diagnostics": dict(self.context_selection_diagnostics),
             "policy_summary": self.policy_summary,
             "limit_summary": self.limit_summary,
             "redaction_policy": self.redaction_policy,
@@ -67,6 +81,7 @@ class DbPlanningContextBuilder:
         schema_evidence: Evidence | None,
         catalog_evidence: tuple[Evidence, ...] = (),
         relationship_evidence: tuple[Evidence, ...] = (),
+        capability_summaries: tuple[dict[str, Any], ...] = (),
         source: Any = None,
     ) -> DbPlanningContext:
         schema = dict(schema_evidence.payload) if schema_evidence is not None else {}
@@ -80,11 +95,31 @@ class DbPlanningContextBuilder:
             or None
         )
         options = _from_db_options(self.config.metadata)
+        source_evidence = tuple(
+            item
+            for item in (schema_evidence, *catalog_evidence, *relationship_evidence)
+            if item is not None and item.accepted
+        )
+        source_refs = tuple(_evidence_ref(item) for item in source_evidence)
+        source_fingerprints = {
+            str(item.id): str(
+                item.metadata.get("payload_fingerprint") or _fingerprint(item.payload)
+            )
+            for item in source_evidence
+            if item.id
+        }
+        included_sections = ["schema", "limits", "policy", "capabilities"]
+        if catalog_evidence:
+            included_sections.append("catalog")
+        if relationship_evidence:
+            included_sections.append("relationships")
         diagnostics = {
             "schema_table_count": len(schema.get("tables", []) or []),
             "context_budget": options.get("planner_context_budget"),
             "omitted_sections": [],
             "schema_fingerprint": schema_fingerprint,
+            "source_evidence_count": len(source_evidence),
+            "capability_summary_count": len(capability_summaries),
         }
         context = DbPlanningContext(
             operation_id=operation.id,
@@ -96,6 +131,26 @@ class DbPlanningContextBuilder:
             schema_evidence_refs=_evidence_refs((schema_evidence,)),
             catalog_evidence_refs=_evidence_refs(catalog_evidence),
             relationship_evidence_refs=_evidence_refs(relationship_evidence),
+            source_evidence_refs=source_refs,
+            source_fingerprints=source_fingerprints,
+            capability_summaries=tuple(capability_summaries),
+            included_sections=tuple(included_sections),
+            omitted_sections=(),
+            budget_usage={
+                "rendered_context_chars": 0,
+                "capability_summary_count": len(capability_summaries),
+                "source_evidence_count": len(source_evidence),
+            },
+            context_selection_diagnostics={
+                "mode": "runtime_bounded",
+                "capability_summary_owners": sorted(
+                    {
+                        str(item.get("owner"))
+                        for item in capability_summaries
+                        if item.get("owner")
+                    }
+                ),
+            },
             policy_summary={
                 "read_only": getattr(source, "read_only", None),
                 "allowed_tables": sorted(
@@ -128,6 +183,10 @@ class DbPlanningContextBuilder:
             **{
                 **context.__dict__,
                 "rendered_context": _render_context_summary(context),
+                "budget_usage": {
+                    **context.budget_usage,
+                    "rendered_context_chars": len(_render_context_summary(context)),
+                },
             }
         )
 
@@ -198,6 +257,17 @@ def _render_context_summary(context: DbPlanningContext) -> str:
 
 def _evidence_refs(values: tuple[Evidence | None, ...]) -> tuple[str, ...]:
     return tuple(item.id for item in values if item is not None and item.id)
+
+
+def _evidence_ref(evidence: Evidence) -> dict[str, Any]:
+    return {
+        "id": evidence.id,
+        "kind": evidence.kind,
+        "owner": evidence.owner,
+        "task_id": evidence.task_id,
+        "payload_fingerprint": evidence.metadata.get("payload_fingerprint")
+        or _fingerprint(evidence.payload),
+    }
 
 
 def _fingerprint(value: Any) -> str:

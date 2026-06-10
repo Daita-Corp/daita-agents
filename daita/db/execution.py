@@ -444,6 +444,7 @@ class DbOperationExecutor:
         catalog_evidence: tuple[Evidence, ...],
         relationship_evidence: tuple[Evidence, ...],
         analysis_metadata: dict[str, Any] | None = None,
+        extra_dependencies: tuple[TaskDependency, ...] = (),
     ) -> Evidence:
         if schema_evidence is not None and schema_evidence.id is None:
             schema_evidence = await self._persist_runtime_evidence(
@@ -471,6 +472,7 @@ class DbOperationExecutor:
             },
             reason="planning_context",
             metadata=analysis_metadata,
+            dependencies=extra_dependencies,
         )
         if not evidence:
             raise RuntimeError("planning.context evidence was not produced")
@@ -487,6 +489,7 @@ class DbOperationExecutor:
         tasks: list[Task],
         evidence_store: DbEvidenceStore,
         analysis_metadata: dict[str, Any] | None = None,
+        extra_dependencies: tuple[TaskDependency, ...] = (),
     ) -> tuple[Evidence, tuple[str, ...], dict[str, Any]]:
         route = _planner_route(
             request,
@@ -515,6 +518,7 @@ class DbOperationExecutor:
                         evidence_id=planning_context.id,
                         operation_id=operation.id,
                     ),
+                    *extra_dependencies,
                 ),
             )
             if not evidence:
@@ -549,6 +553,7 @@ class DbOperationExecutor:
         plan_evidence: Evidence,
         planning_context: Evidence,
         analysis_metadata: dict[str, Any] | None = None,
+        extra_dependencies: tuple[TaskDependency, ...] = (),
     ) -> Evidence:
         capability = self.runtime.registry.get_capability(
             "db.query.plan.validate", owner="db_runtime"
@@ -577,6 +582,7 @@ class DbOperationExecutor:
                     evidence_id=planning_context.id,
                     operation_id=operation.id,
                 ),
+                *extra_dependencies,
             ),
         )
         if not evidence:
@@ -593,6 +599,7 @@ class DbOperationExecutor:
         *,
         plan_validation: Evidence,
         analysis_metadata: dict[str, Any] | None = None,
+        extra_dependencies: tuple[TaskDependency, ...] = (),
     ) -> Evidence:
         evidence = await self._execute_capability(
             "db.sql.validate",
@@ -610,6 +617,7 @@ class DbOperationExecutor:
                     evidence_payload={"valid": True},
                     operation_id=operation.id,
                 ),
+                *extra_dependencies,
             ),
         )
         if not evidence:
@@ -624,6 +632,7 @@ class DbOperationExecutor:
         evidence_store: DbEvidenceStore,
         validation: Evidence,
         analysis_metadata: dict[str, Any] | None = None,
+        extra_dependencies: tuple[TaskDependency, ...] = (),
     ) -> tuple[Evidence, ...]:
         fingerprint = (
             validation.payload.get("sql_fingerprint")
@@ -654,6 +663,7 @@ class DbOperationExecutor:
                     operation_id=operation.id,
                     payload_fingerprint=validation.metadata.get("payload_fingerprint"),
                 ),
+                *extra_dependencies,
             ),
         )
 

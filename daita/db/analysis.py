@@ -10,7 +10,39 @@ from uuid import uuid4
 
 from daita.runtime import Evidence
 
-ANALYSIS_STEP_KINDS = frozenset({"query", "checkpoint", "synthesis"})
+CAPABILITY_ANALYSIS_STEP_CONTRACTS = {
+    "catalog_search": {
+        "owners": frozenset({"catalog"}),
+        "capabilities": frozenset(
+            {
+                "catalog.schema.search",
+                "catalog.asset.inspect",
+                "catalog.relationship_paths.find",
+            }
+        ),
+        "evidence": frozenset(
+            {"schema.search_result", "schema.asset_profile", "schema.relationship_path"}
+        ),
+    },
+    "quality_profile": {
+        "owners": frozenset({"data_quality"}),
+        "capabilities": frozenset({"quality.profile"}),
+        "evidence": frozenset({"quality.profile"}),
+    },
+    "lineage_trace": {
+        "owners": frozenset({"lineage"}),
+        "capabilities": frozenset({"lineage.trace"}),
+        "evidence": frozenset({"lineage.trace"}),
+    },
+    "memory_recall": {
+        "owners": frozenset({"memory"}),
+        "capabilities": frozenset({"memory.semantic.recall", "memory.fact.query"}),
+        "evidence": frozenset({"memory.semantic.recall", "memory.fact.query"}),
+    },
+}
+ANALYSIS_STEP_KINDS = frozenset(
+    {"query", "checkpoint", "synthesis", *CAPABILITY_ANALYSIS_STEP_CONTRACTS}
+)
 
 
 @dataclass(frozen=True)
@@ -88,6 +120,10 @@ class DbAnalysisStep:
     depends_on: tuple[str, ...] = ()
     input_refs: tuple[dict[str, Any], ...] = ()
     expected_evidence: tuple[str, ...] = ()
+    capability_id: str | None = None
+    capability_owner: str | None = None
+    input: dict[str, Any] = field(default_factory=dict)
+    context_evidence_refs: tuple[dict[str, Any], ...] = ()
     budgets: DbAnalysisStepBudgets = field(default_factory=DbAnalysisStepBudgets)
 
     @classmethod
@@ -111,6 +147,26 @@ class DbAnalysisStep:
                 if isinstance(item, Mapping)
             ),
             expected_evidence=_string_tuple(data.get("expected_evidence")),
+            capability_id=(
+                str(data.get("capability_id")).strip()
+                if data.get("capability_id")
+                else None
+            ),
+            capability_owner=(
+                str(data.get("capability_owner")).strip()
+                if data.get("capability_owner")
+                else None
+            ),
+            input=(
+                dict(data.get("input"))
+                if isinstance(data.get("input"), Mapping)
+                else {}
+            ),
+            context_evidence_refs=tuple(
+                dict(item)
+                for item in data.get("context_evidence_refs") or ()
+                if isinstance(item, Mapping)
+            ),
             budgets=DbAnalysisStepBudgets.from_mapping(data.get("budgets")),
         )
 
@@ -122,6 +178,12 @@ class DbAnalysisStep:
             "depends_on": list(self.depends_on),
             "input_refs": [dict(item) for item in self.input_refs],
             "expected_evidence": list(self.expected_evidence),
+            "capability_id": self.capability_id,
+            "capability_owner": self.capability_owner,
+            "input": dict(self.input),
+            "context_evidence_refs": [
+                dict(item) for item in self.context_evidence_refs
+            ],
             "budgets": self.budgets.to_dict(),
         }
 
@@ -200,7 +262,7 @@ def validate_analysis_plan_payload(
     payload: Mapping[str, Any],
     *,
     plan_evidence: Evidence | None = None,
-    registered_capabilities: set[str] | None = None,
+    registered_capabilities: set[str] | Mapping[str, Any] | None = None,
 ) -> DbAnalysisPlanValidation:
     """Validate DAG shape, step kinds, dependency refs, and budgets."""
     errors: list[str] = []
@@ -238,6 +300,7 @@ def validate_analysis_plan_payload(
     if len(ids) != len(set(ids)):
         errors.append("duplicate_step_ids")
     id_set = set(ids)
+    capability_ids = _registered_capability_ids(registered_capabilities)
     for step in plan.steps:
         if step.kind not in ANALYSIS_STEP_KINDS:
             errors.append(f"unsupported_step_kind:{step.id}:{step.kind}")
@@ -252,8 +315,14 @@ def validate_analysis_plan_payload(
                 "db.sql.validate",
                 "db.sql.execute_read",
             ):
-                if capability_id not in registered_capabilities:
+                if capability_ids is not None and capability_id not in capability_ids:
                     errors.append(f"missing_capability:{capability_id}")
+        if step.kind in CAPABILITY_ANALYSIS_STEP_CONTRACTS:
+            _validate_capability_step(
+                step,
+                registered_capabilities=registered_capabilities,
+                errors=errors,
+            )
 
     errors.extend(_cycle_errors(plan.steps))
     return DbAnalysisPlanValidation(
@@ -271,6 +340,66 @@ def validate_analysis_plan_payload(
             "budgets": plan.budgets.to_dict(),
         },
     )
+
+
+def capability_contract_for_step_kind(kind: str) -> Mapping[str, Any] | None:
+    contract = CAPABILITY_ANALYSIS_STEP_CONTRACTS.get(kind)
+    return dict(contract) if contract is not None else None
+
+
+def _validate_capability_step(
+    step: DbAnalysisStep,
+    *,
+    registered_capabilities: set[str] | Mapping[str, Any] | None,
+    errors: list[str],
+) -> None:
+    contract = CAPABILITY_ANALYSIS_STEP_CONTRACTS[step.kind]
+    if not step.capability_id:
+        errors.append(f"capability_id_required:{step.id}")
+        return
+    if step.capability_id not in contract["capabilities"]:
+        errors.append(f"unsupported_step_capability:{step.id}:{step.capability_id}")
+    if not step.capability_owner:
+        errors.append(f"capability_owner_required:{step.id}")
+    elif step.capability_owner not in contract["owners"]:
+        errors.append(
+            f"unsupported_step_capability_owner:{step.id}:{step.capability_owner}"
+        )
+    expected = set(step.expected_evidence)
+    if expected and not expected <= set(contract["evidence"]):
+        errors.append(f"unsupported_step_expected_evidence:{step.id}")
+    if registered_capabilities is None:
+        return
+    if isinstance(registered_capabilities, Mapping):
+        capability = registered_capabilities.get(
+            (step.capability_owner, step.capability_id)
+        ) or registered_capabilities.get(step.capability_id)
+        if capability is None:
+            errors.append(f"missing_capability:{step.capability_id}")
+            return
+        if getattr(capability, "owner", None) != step.capability_owner:
+            errors.append(f"wrong_capability_owner:{step.id}:{step.capability_id}")
+        output_evidence = set(getattr(capability, "output_evidence", frozenset()))
+        if expected and not expected <= output_evidence:
+            errors.append(f"wrong_capability_output:{step.id}:{step.capability_id}")
+        if getattr(capability, "side_effecting", False):
+            errors.append(f"side_effecting_capability_not_allowed:{step.id}")
+    elif step.capability_id not in registered_capabilities:
+        errors.append(f"missing_capability:{step.capability_id}")
+
+
+def _registered_capability_ids(
+    registered_capabilities: set[str] | Mapping[str, Any] | None,
+) -> set[str] | None:
+    if registered_capabilities is None:
+        return None
+    ids = set()
+    for key in registered_capabilities:
+        if isinstance(key, tuple) and len(key) == 2:
+            ids.add(str(key[1]))
+        else:
+            ids.add(str(key))
+    return ids
 
 
 def stable_fingerprint(value: Any) -> str:
