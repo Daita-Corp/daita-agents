@@ -168,7 +168,7 @@ def test_db_runtime_owns_registry_and_accepts_config_plugins():
     )
 
     assert runtime.runtime_id == "db-runtime-test"
-    assert runtime.registry.plugin_ids == ("runtime_probe",)
+    assert runtime.registry.plugin_ids == ("db_runtime", "runtime_probe")
     assert runtime.registry.get_capability("runtime_probe.inspect").owner == (
         "runtime_probe"
     )
@@ -179,7 +179,7 @@ def test_db_runtime_can_register_plugins_before_setup():
 
     runtime.register_plugin(CapturingRuntimePlugin())
 
-    assert runtime.registry.plugin_ids == ("runtime_probe",)
+    assert runtime.registry.plugin_ids == ("db_runtime", "runtime_probe")
     assert runtime.registry.get_capability("runtime_probe.inspect").executor == (
         "runtime_probe.inspect"
     )
@@ -247,19 +247,21 @@ async def test_db_runtime_inspect_reports_registry_diagnostics_and_redacts_sourc
     assert inspection.runtime_kind == "db"
     assert inspection.source_repr == "postgresql://user:***@localhost/sales"
     assert inspection.plugin_ids == ("runtime_probe",)
-    assert inspection.capability_count == 1
-    assert inspection.executor_count == 1
-    assert inspection.evidence_schema_count == 1
-    assert inspection.capability_ids == ("runtime_probe:runtime_probe.inspect",)
-    assert inspection.executor_ids == ("runtime_probe.inspect",)
-    assert inspection.evidence_schema_kinds == (
-        "runtime_probe:runtime_probe.inspection",
-    )
-    assert inspection.diagnostics[0]["plugin_id"] == "runtime_probe"
+    assert inspection.capability_count == len(inspection.capability_ids)
+    assert inspection.executor_count == len(inspection.executor_ids)
+    assert inspection.evidence_schema_count == len(inspection.evidence_schema_kinds)
+    assert "runtime_probe:runtime_probe.inspect" in inspection.capability_ids
+    assert "db_runtime:db.analysis.plan" in inspection.capability_ids
+    assert "db_runtime:db.analysis.summarize" in inspection.capability_ids
+    assert "runtime_probe.inspect" in inspection.executor_ids
+    assert "runtime_probe:runtime_probe.inspection" in inspection.evidence_schema_kinds
+    assert "db_runtime:analysis.plan" in inspection.evidence_schema_kinds
+    assert "db_runtime:analysis.synthesis" in inspection.evidence_schema_kinds
+    assert any(item["plugin_id"] == "runtime_probe" for item in inspection.diagnostics)
     assert inspection.to_dict()["plugin_ids"] == ["runtime_probe"]
-    assert inspection.to_dict()["capability_ids"] == [
-        "runtime_probe:runtime_probe.inspect"
-    ]
+    assert (
+        "runtime_probe:runtime_probe.inspect" in inspection.to_dict()["capability_ids"]
+    )
 
 
 async def test_db_runtime_persists_operation_state_for_inspection_and_resume():

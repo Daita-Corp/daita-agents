@@ -99,7 +99,7 @@ def postgresql_capabilities() -> tuple[Capability, ...]:
             access=AccessMode.METADATA_READ,
             risk=RiskLevel.LOW,
             input_schema=common_schema,
-            output_evidence=frozenset({"query.plan"}),
+            output_evidence=frozenset({"sql.explain.plan"}),
             executor="postgresql.sql.explain",
             runtime_only=True,
             side_effecting=False,
@@ -135,10 +135,10 @@ def postgresql_evidence_schemas() -> tuple[EvidenceSchema, ...]:
             description="PostgreSQL write execution result.",
         ),
         EvidenceSchema(
-            kind="query.plan",
+            kind="sql.explain.plan",
             owner="postgresql",
             json_schema=object_schema,
-            description="PostgreSQL query plan.",
+            description="PostgreSQL connector explain plan.",
         ),
     )
 

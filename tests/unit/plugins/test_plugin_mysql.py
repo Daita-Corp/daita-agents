@@ -173,7 +173,7 @@ async def test_mysql_write_and_explain_executors_delegate_to_plugin_methods():
     assert plugin.executed == [
         ("UPDATE users SET name = %s WHERE id = %s", ["Grace", 1])
     ]
-    assert explain_evidence[0].kind == "query.plan"
+    assert explain_evidence[0].kind == "sql.explain.plan"
     assert explain_evidence[0].payload["plan"] == [{"id": 1, "select_type": "SIMPLE"}]
 
 

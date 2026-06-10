@@ -99,7 +99,7 @@ def mysql_capabilities() -> tuple[Capability, ...]:
             access=AccessMode.METADATA_READ,
             risk=RiskLevel.LOW,
             input_schema=common_schema,
-            output_evidence=frozenset({"query.plan"}),
+            output_evidence=frozenset({"sql.explain.plan"}),
             executor="mysql.sql.explain",
             runtime_only=True,
             side_effecting=False,
@@ -135,10 +135,10 @@ def mysql_evidence_schemas() -> tuple[EvidenceSchema, ...]:
             description="MySQL write execution result.",
         ),
         EvidenceSchema(
-            kind="query.plan",
+            kind="sql.explain.plan",
             owner="mysql",
             json_schema=object_schema,
-            description="MySQL query plan.",
+            description="MySQL connector explain plan.",
         ),
     )
 

@@ -40,7 +40,15 @@ from .memory import (
     write_db_memory_records,
 )
 from .planning import DbContractBuilder, DbIntentClassifier
-from .query_planning import DbQueryPlan, DbQueryPlanner
+from .query_plan import (
+    DbAggregationSpec,
+    DbFilterSpec,
+    DbJoinSpec,
+    DbQueryPlan,
+    DbQueryPlanCandidate,
+    DbQueryPlanValidation,
+)
+from .query_planning import DbQueryPlanner
 from .query_metadata import (
     IdentityMode,
     column_name,
@@ -69,7 +77,12 @@ from .query_sql_validation import (
     validate_sql_against_schema,
 )
 from .runtime import DbRuntime
-from .synthesis import DbSynthesizer, DbSynthesisResult
+from .synthesis import (
+    DbAnswerCitation,
+    DbAnswerSynthesisPayload,
+    DbSynthesizer,
+    DbSynthesisResult,
+)
 from .sql_analysis import (
     SqlAnalysis,
     SqlAnalysisError,
@@ -106,6 +119,11 @@ __all__ = [
     "DbContractBuilder",
     "DbIntentClassifier",
     "DbQueryPlan",
+    "DbQueryPlanCandidate",
+    "DbQueryPlanValidation",
+    "DbJoinSpec",
+    "DbFilterSpec",
+    "DbAggregationSpec",
     "DbQueryPlanner",
     "validate_sql_against_schema",
     "catalog_schema_snapshot",
@@ -136,6 +154,8 @@ __all__ = [
     "DbVerificationResult",
     "DbSynthesizer",
     "DbSynthesisResult",
+    "DbAnswerCitation",
+    "DbAnswerSynthesisPayload",
     "DbContextRenderer",
     "DBPromptReadModel",
     "build_db_prompt_read_model",

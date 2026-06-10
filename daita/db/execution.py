@@ -17,13 +17,16 @@ from daita.runtime import (
     RuntimeKernelGovernanceBlocked,
     RuntimeKernelTaskNotRunnable,
     Task,
+    TaskDependency,
     WorkerRuntime,
     WorkerRuntimeOptions,
 )
 
+from .analysis import with_analysis_evidence_trace
 from .evidence import DbEvidenceStore, InMemoryDbEvidenceStore
 from .models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
 from .query_planning import DbQueryPlanner
+from .query_sql_validation import sql_fingerprint
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,7 @@ class DbOperationExecutor:
         diagnostics: dict[str, Any] = {
             "planned_sql": None,
             "query_plan": None,
+            "planner_strategy": None,
             "store_id": _store_id_for_request(request, self.runtime),
         }
 
@@ -107,35 +111,152 @@ class DbOperationExecutor:
                 evidence_store,
                 diagnostics["store_id"],
             )
-            plan = self.query_planner.plan_read_query(
+            planning_context = await self._build_planning_context(
                 request,
-                intent,
                 operation,
-                schema,
-                relationship_payload=relationship_payload,
+                tasks,
+                evidence_store,
+                schema_evidence=schema_evidence,
+                catalog_evidence=tuple(
+                    item
+                    for item in evidence_store.list()
+                    if item.kind.startswith("catalog.")
+                    or item.kind in {"schema.search_result", "catalog.source"}
+                ),
+                relationship_evidence=tuple(
+                    item
+                    for item in evidence_store.list()
+                    if item.kind == "relationship.paths"
+                ),
             )
-            evidence_store.add(plan.evidence)
-            warnings.extend(plan.warnings)
-            diagnostics["planned_sql"] = plan.sql
-            diagnostics["query_plan"] = plan.diagnostics
+            plan_evidence, strategy_warnings, strategy_diagnostics = (
+                await self._plan_query(
+                    request,
+                    intent,
+                    operation,
+                    schema,
+                    relationship_payload,
+                    planning_context,
+                    tasks,
+                    evidence_store,
+                )
+            )
+            warnings.extend(strategy_warnings)
+            diagnostics["planner_strategy"] = strategy_diagnostics.get("strategy")
+            diagnostics["query_plan"] = strategy_diagnostics
 
-            if plan.sql:
-                await self._execute_capability(
-                    "db.sql.validate",
-                    contract,
+            validation = await self._validate_query_plan(
+                operation,
+                tasks,
+                evidence_store,
+                plan_evidence=plan_evidence,
+                planning_context=planning_context,
+            )
+            if (
+                not validation.payload.get("valid")
+                and self.runtime.db_llm_service.available
+            ):
+                repaired = await self._repair_query_plan(
                     operation,
                     tasks,
                     evidence_store,
-                    {"sql": plan.sql, "operation": "query"},
+                    planning_context=planning_context,
+                    prior_plan=plan_evidence,
+                    failure=validation,
+                    repair_attempt=1,
                 )
-                await self._execute_capability(
-                    "db.sql.execute_read",
-                    contract,
-                    operation,
-                    tasks,
-                    evidence_store,
-                    {"sql": plan.sql},
-                )
+                if repaired is not None:
+                    plan_evidence = repaired
+                    validation = await self._validate_query_plan(
+                        operation,
+                        tasks,
+                        evidence_store,
+                        plan_evidence=plan_evidence,
+                        planning_context=planning_context,
+                    )
+
+            sql = validation.payload.get("accepted_sql")
+            diagnostics["planned_sql"] = sql
+            if sql:
+                try:
+                    sql_validation = await self._execute_sql_validation(
+                        contract,
+                        operation,
+                        tasks,
+                        evidence_store,
+                        sql,
+                        plan_validation=validation,
+                    )
+                    await self._execute_validated_read(
+                        contract,
+                        operation,
+                        tasks,
+                        evidence_store,
+                        sql_validation,
+                    )
+                except Exception as exc:
+                    if self.runtime.db_llm_service.available:
+                        failure = await self._record_failure_evidence(
+                            operation,
+                            evidence_store,
+                            "query.plan.validation",
+                            {
+                                "valid": False,
+                                "failure": "execution_failed",
+                                "error": {
+                                    "type": type(exc).__name__,
+                                    "message": str(exc),
+                                },
+                            },
+                        )
+                        repaired = await self._repair_query_plan(
+                            operation,
+                            tasks,
+                            evidence_store,
+                            planning_context=planning_context,
+                            prior_plan=plan_evidence,
+                            failure=failure,
+                            repair_attempt=1,
+                        )
+                        if repaired is not None:
+                            validation = await self._validate_query_plan(
+                                operation,
+                                tasks,
+                                evidence_store,
+                                plan_evidence=repaired,
+                                planning_context=planning_context,
+                            )
+                            repaired_sql = validation.payload.get("accepted_sql")
+                            if repaired_sql:
+                                sql_validation = await self._execute_sql_validation(
+                                    contract,
+                                    operation,
+                                    tasks,
+                                    evidence_store,
+                                    repaired_sql,
+                                    plan_validation=validation,
+                                )
+                                await self._execute_validated_read(
+                                    contract,
+                                    operation,
+                                    tasks,
+                                    evidence_store,
+                                    sql_validation,
+                                )
+                                diagnostics["planned_sql"] = repaired_sql
+                                return DbExecutionOutcome(
+                                    evidence=evidence_store.list(),
+                                    tasks=tuple(tasks),
+                                    diagnostics={
+                                        **diagnostics,
+                                        "evidence_kinds": [
+                                            item.kind for item in evidence_store.list()
+                                        ],
+                                        "evidence_refs": list(evidence_store.refs()),
+                                    },
+                                    warnings=tuple(warnings),
+                                )
+                    raise
         elif intent.kind is DbIntentKind.QUALITY_CHECK:
             await self._execute_quality_steps(
                 request,
@@ -312,6 +433,321 @@ class DbOperationExecutor:
         )
         evidence_store.add_many(evidence)
 
+    async def _build_planning_context(
+        self,
+        request: DbRequest,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        schema_evidence: Evidence | None,
+        catalog_evidence: tuple[Evidence, ...],
+        relationship_evidence: tuple[Evidence, ...],
+        analysis_metadata: dict[str, Any] | None = None,
+    ) -> Evidence:
+        if schema_evidence is not None and schema_evidence.id is None:
+            schema_evidence = await self._persist_runtime_evidence(
+                operation,
+                schema_evidence,
+            )
+            evidence_store.add(schema_evidence)
+        capability = self.runtime.registry.get_capability(
+            "db.planning.context.build", owner="db_runtime"
+        )
+        evidence = await self._execute_direct_capability(
+            capability,
+            operation,
+            tasks,
+            evidence_store,
+            {
+                "prompt": request.prompt,
+                "schema_evidence_id": schema_evidence.id if schema_evidence else None,
+                "catalog_evidence_ids": [
+                    item.id for item in catalog_evidence if item.id is not None
+                ],
+                "relationship_evidence_ids": [
+                    item.id for item in relationship_evidence if item.id is not None
+                ],
+            },
+            reason="planning_context",
+            metadata=analysis_metadata,
+        )
+        if not evidence:
+            raise RuntimeError("planning.context evidence was not produced")
+        return evidence[0]
+
+    async def _plan_query(
+        self,
+        request: DbRequest,
+        intent: DbIntent,
+        operation: Operation,
+        schema: dict[str, Any],
+        relationship_payload: dict[str, Any] | None,
+        planning_context: Evidence,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        analysis_metadata: dict[str, Any] | None = None,
+    ) -> tuple[Evidence, tuple[str, ...], dict[str, Any]]:
+        route = _planner_route(
+            request,
+            schema,
+            llm_available=self.runtime.db_llm_service.available,
+        )
+        if route["strategy"] == "llm":
+            capability = self.runtime.registry.get_capability(
+                "db.query.plan", owner="db_runtime"
+            )
+            evidence = await self._execute_direct_capability(
+                capability,
+                operation,
+                tasks,
+                evidence_store,
+                {
+                    "planning_context_evidence_id": planning_context.id,
+                    "prompt": request.prompt,
+                },
+                reason="llm_query_planning",
+                metadata=analysis_metadata,
+                dependencies=(
+                    TaskDependency(
+                        kind="evidence",
+                        evidence_kind="planning.context",
+                        evidence_id=planning_context.id,
+                        operation_id=operation.id,
+                    ),
+                ),
+            )
+            if not evidence:
+                raise RuntimeError("query.plan.proposal evidence was not produced")
+            return evidence[-1], (), route
+
+        plan = self.query_planner.plan_read_query(
+            request,
+            intent,
+            operation,
+            schema,
+            relationship_payload=relationship_payload,
+        )
+        plan_evidence = (
+            replace(
+                plan.evidence,
+                metadata={**plan.evidence.metadata, **analysis_metadata},
+            )
+            if analysis_metadata
+            else plan.evidence
+        )
+        persisted = await self._persist_runtime_evidence(operation, plan_evidence)
+        evidence_store.add(persisted)
+        return persisted, plan.warnings, {**route, **plan.diagnostics}
+
+    async def _validate_query_plan(
+        self,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        plan_evidence: Evidence,
+        planning_context: Evidence,
+        analysis_metadata: dict[str, Any] | None = None,
+    ) -> Evidence:
+        capability = self.runtime.registry.get_capability(
+            "db.query.plan.validate", owner="db_runtime"
+        )
+        evidence = await self._execute_direct_capability(
+            capability,
+            operation,
+            tasks,
+            evidence_store,
+            {
+                "plan_evidence_id": plan_evidence.id,
+                "planning_context_evidence_id": planning_context.id,
+            },
+            reason="query_plan_validation",
+            metadata=analysis_metadata,
+            dependencies=(
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind="query.plan.proposal",
+                    evidence_id=plan_evidence.id,
+                    operation_id=operation.id,
+                ),
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind="planning.context",
+                    evidence_id=planning_context.id,
+                    operation_id=operation.id,
+                ),
+            ),
+        )
+        if not evidence:
+            raise RuntimeError("query.plan.validation evidence was not produced")
+        return evidence[0]
+
+    async def _execute_sql_validation(
+        self,
+        contract: DbOperationContract,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        sql: str,
+        *,
+        plan_validation: Evidence,
+        analysis_metadata: dict[str, Any] | None = None,
+    ) -> Evidence:
+        evidence = await self._execute_capability(
+            "db.sql.validate",
+            contract,
+            operation,
+            tasks,
+            evidence_store,
+            {"sql": sql, "operation": "query"},
+            metadata=analysis_metadata,
+            dependencies=(
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind="query.plan.validation",
+                    evidence_id=plan_validation.id,
+                    evidence_payload={"valid": True},
+                    operation_id=operation.id,
+                ),
+            ),
+        )
+        if not evidence:
+            raise RuntimeError("sql.validation evidence was not produced")
+        return evidence[0]
+
+    async def _execute_validated_read(
+        self,
+        contract: DbOperationContract,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        validation: Evidence,
+        analysis_metadata: dict[str, Any] | None = None,
+    ) -> tuple[Evidence, ...]:
+        fingerprint = (
+            validation.payload.get("sql_fingerprint")
+            or (validation.payload.get("statement_facts") or {}).get("sql_fingerprint")
+            or sql_fingerprint(str(validation.payload.get("sql") or ""))
+        )
+        return await self._execute_capability(
+            "db.sql.execute_read",
+            contract,
+            operation,
+            tasks,
+            evidence_store,
+            {
+                "validated_evidence_id": validation.id,
+                "sql_ref": "sql.validation",
+                "sql_fingerprint": fingerprint,
+            },
+            metadata=analysis_metadata,
+            dependencies=(
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind="sql.validation",
+                    evidence_id=validation.id,
+                    evidence_owner=validation.owner,
+                    producer_task_id=validation.task_id,
+                    producer_capability_id="db.sql.validate",
+                    evidence_payload={"valid": True},
+                    operation_id=operation.id,
+                    payload_fingerprint=validation.metadata.get("payload_fingerprint"),
+                ),
+            ),
+        )
+
+    async def _repair_query_plan(
+        self,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        planning_context: Evidence,
+        prior_plan: Evidence,
+        failure: Evidence,
+        repair_attempt: int,
+    ) -> Evidence | None:
+        if repair_attempt > 1:
+            return None
+        capability = self.runtime.registry.get_capability(
+            "db.query.repair", owner="db_runtime"
+        )
+        evidence = await self._execute_direct_capability(
+            capability,
+            operation,
+            tasks,
+            evidence_store,
+            {
+                "planning_context_evidence_id": planning_context.id,
+                "prior_plan_evidence_id": prior_plan.id,
+                "failure_evidence_id": failure.id,
+                "repair_attempt": repair_attempt,
+            },
+            reason="query_plan_repair",
+            dependencies=(
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind="planning.context",
+                    evidence_id=planning_context.id,
+                    operation_id=operation.id,
+                ),
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind="query.plan.proposal",
+                    evidence_id=prior_plan.id,
+                    operation_id=operation.id,
+                ),
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind=failure.kind,
+                    evidence_id=failure.id,
+                    evidence_accepted=failure.accepted,
+                    operation_id=operation.id,
+                ),
+            ),
+        )
+        proposals = [item for item in evidence if item.kind == "query.plan.proposal"]
+        return proposals[-1] if proposals else None
+
+    async def _persist_runtime_evidence(
+        self,
+        operation: Operation,
+        evidence: Evidence,
+    ) -> Evidence:
+        evidence_id = evidence.id or f"evidence-{uuid4()}"
+        persisted = replace(
+            evidence,
+            id=evidence_id,
+            operation_id=evidence.operation_id or operation.id,
+            metadata={
+                **evidence.metadata,
+                "payload_fingerprint": _stable_hash(evidence.payload),
+            },
+        )
+        await self.runtime.store.save_evidence(persisted)
+        return persisted
+
+    async def _record_failure_evidence(
+        self,
+        operation: Operation,
+        evidence_store: DbEvidenceStore,
+        kind: str,
+        payload: dict[str, Any],
+    ) -> Evidence:
+        evidence = await self._persist_runtime_evidence(
+            operation,
+            Evidence(
+                kind=kind,
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=False,
+                payload=payload,
+            ),
+        )
+        evidence_store.add(evidence)
+        return evidence
+
     async def _relationship_payload_if_needed(
         self,
         request: DbRequest,
@@ -435,6 +871,9 @@ class DbOperationExecutor:
         tasks: list[Task],
         evidence_store: DbEvidenceStore,
         input: dict[str, Any],
+        *,
+        dependencies: tuple[TaskDependency, ...] = (),
+        metadata: dict[str, Any] | None = None,
     ) -> tuple[Evidence, ...]:
         capability = _selected_capability(contract, capability_id)
         if capability is None:
@@ -443,7 +882,13 @@ class DbOperationExecutor:
             capability["id"], owner=capability["owner"]
         )
         return await self._execute_direct_capability(
-            resolved, operation, tasks, evidence_store, input
+            resolved,
+            operation,
+            tasks,
+            evidence_store,
+            input,
+            dependencies=dependencies,
+            metadata=metadata,
         )
 
     async def _execute_direct_capability(
@@ -455,9 +900,20 @@ class DbOperationExecutor:
         input: dict[str, Any],
         *,
         reason: str | None = None,
+        dependencies: tuple[TaskDependency, ...] = (),
+        metadata: dict[str, Any] | None = None,
     ) -> tuple[Evidence, ...]:
         planned = await self.runtime._planned_task_for_capability(
-            operation.id, capability
+            operation.id,
+            capability,
+            metadata_match=metadata,
+        )
+        task_metadata = with_analysis_evidence_trace(
+            {
+                "owner": capability.owner,
+                "reason": reason or "contract",
+                **dict(metadata or {}),
+            }
         )
         task = (
             Task(
@@ -467,10 +923,27 @@ class DbOperationExecutor:
                 executor_id=capability.executor,
                 input=input,
                 required_evidence=capability.output_evidence,
-                metadata={"owner": capability.owner, "reason": reason or "contract"},
+                metadata=task_metadata,
+                dependencies=dependencies,
             )
             if planned is None
-            else replace(planned, input=input)
+            else replace(
+                planned,
+                input=input,
+                dependencies=dependencies or planned.dependencies,
+                metadata={
+                    **with_analysis_evidence_trace(
+                        {
+                            **planned.metadata,
+                            "owner": capability.owner,
+                            "reason": reason
+                            or planned.metadata.get("reason")
+                            or "contract",
+                            **dict(metadata or {}),
+                        }
+                    ),
+                },
+            )
         )
         tasks.append(task)
         evidence = await self.runtime.execute_task(
@@ -512,6 +985,11 @@ class DbOperationExecutor:
                         "worker_role": worker.role,
                         "capability_id": capability.id,
                         "prompt": request.prompt,
+                        **{
+                            key: value
+                            for key, value in input.items()
+                            if key.startswith("analysis_")
+                        },
                     },
                 )
                 task = await self._persist_worker_task(
@@ -555,8 +1033,21 @@ class DbOperationExecutor:
         *,
         worker_id: str,
     ) -> Task:
+        analysis_trace = {
+            key: value
+            for key, value in input.items()
+            if key
+            in {
+                "analysis_id",
+                "analysis_step_id",
+                "analysis_step_kind",
+                "analysis_plan_evidence_id",
+            }
+        }
         planned = await self.runtime._planned_task_for_capability(
-            operation.id, capability
+            operation.id,
+            capability,
+            metadata_match=analysis_trace or None,
         )
         task = (
             Task(
@@ -566,16 +1057,29 @@ class DbOperationExecutor:
                 executor_id=capability.executor,
                 input=input,
                 required_evidence=capability.output_evidence,
-                metadata={"owner": capability.owner, "reason": f"worker:{worker_id}"},
+                metadata={
+                    **with_analysis_evidence_trace(
+                        {
+                            "owner": capability.owner,
+                            "reason": f"worker:{worker_id}",
+                            **analysis_trace,
+                        }
+                    )
+                },
             )
             if planned is None
             else replace(
                 planned,
                 input=input,
                 metadata={
-                    **planned.metadata,
-                    "owner": capability.owner,
-                    "reason": f"worker:{worker_id}",
+                    **with_analysis_evidence_trace(
+                        {
+                            **planned.metadata,
+                            "owner": capability.owner,
+                            "reason": f"worker:{worker_id}",
+                            **analysis_trace,
+                        }
+                    ),
                 },
             )
         )
@@ -645,6 +1149,66 @@ def _runtime_from_db_option(runtime: Any | None, key: str) -> Any | None:
     if isinstance(options, dict):
         return options.get(key)
     return None
+
+
+def _planner_route(
+    request: DbRequest,
+    schema: dict[str, Any],
+    *,
+    llm_available: bool,
+) -> dict[str, Any]:
+    prompt = request.prompt.lower()
+    explicit_sql = request.metadata.get("sql") or request.constraints.get("sql")
+    if explicit_sql:
+        return {
+            "strategy": "deterministic",
+            "reason_codes": ["explicit_sql"],
+            "estimated_complexity": "low",
+        }
+    analytical_terms = {
+        "top",
+        "highest",
+        "lowest",
+        "average",
+        "avg",
+        "sum",
+        "total",
+        "by",
+        "per",
+        "rate",
+        "percent",
+        "revenue",
+        "churn",
+        "active",
+        "enterprise",
+    }
+    reason_codes = sorted(term for term in analytical_terms if term in prompt)
+    table_mentions = [
+        str(table.get("name"))
+        for table in schema.get("tables", []) or []
+        if table.get("name") and str(table.get("name")).lower() in prompt
+    ]
+    if len(table_mentions) > 1:
+        reason_codes.append("multiple_table_mentions")
+    if llm_available and reason_codes:
+        return {
+            "strategy": "llm",
+            "reason_codes": reason_codes,
+            "estimated_complexity": "medium",
+        }
+    return {
+        "strategy": "deterministic",
+        "reason_codes": reason_codes or ["simple_fast_path"],
+        "estimated_complexity": "low",
+    }
+
+
+def _stable_hash(value: Any) -> str:
+    import hashlib
+    import json
+
+    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _raise_db_worker_error(error: BaseException, execution: Any | None) -> None:

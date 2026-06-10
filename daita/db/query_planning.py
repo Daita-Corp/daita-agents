@@ -5,12 +5,16 @@ Deterministic query planning for the first DB runtime slice.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import re
 from typing import Any
 
 from daita.runtime import Evidence, Operation
 
 from .models import DbIntent, DbIntentKind, DbRequest
+from .query_plan import DbQueryPlan as StructuredDbQueryPlan
+from .query_sql_validation import sql_fingerprint
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,13 @@ class DbQueryPlanner:
         if not sql:
             warnings.append("db_runtime_sql_planning_failed")
 
+        tables = _tables_referenced_by_sql(sql, schema) if sql else ()
+        structured = StructuredDbQueryPlan.deterministic(
+            sql=sql,
+            tables=tables,
+            confidence=0.9 if sql else 0.0,
+            strategy=strategy,
+        )
         diagnostics = {
             "planner": "deterministic",
             "strategy": strategy,
@@ -73,14 +84,17 @@ class DbQueryPlanner:
         return DbQueryPlan(
             sql=sql,
             evidence=Evidence(
-                kind="query.plan",
-                owner="db.runtime",
+                kind="query.plan.proposal",
+                owner="db_runtime",
                 operation_id=operation.id,
                 payload={
                     "sql": sql,
+                    "structured_plan": structured.to_dict(),
                     "strategy": strategy,
                     "valid": sql is not None,
                     "warnings": warnings,
+                    "plan_fingerprint": _stable_hash(structured.to_dict()),
+                    "sql_fingerprint": sql_fingerprint(sql) if sql else None,
                 },
             ),
             diagnostics=diagnostics,
@@ -208,6 +222,16 @@ def _single_table_sql(
     return sql
 
 
+def _tables_referenced_by_sql(sql: str, schema: dict[str, Any]) -> tuple[str, ...]:
+    lowered = sql.lower()
+    tables = []
+    for table in _table_map(schema):
+        quoted = f'"{table.lower()}"'
+        if table.lower() in lowered or quoted in lowered:
+            tables.append(table)
+    return tuple(tables)
+
+
 def _is_count_prompt(prompt: str) -> bool:
     lowered = prompt.lower()
     return "count" in lowered or "how many" in lowered or "number of" in lowered
@@ -327,3 +351,8 @@ def _sql_literal(value: str) -> str:
     if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
         return value
     return "'" + value.replace("'", "''") + "'"
+
+
+def _stable_hash(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

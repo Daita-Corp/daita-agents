@@ -151,10 +151,10 @@ async def test_postgresql_sql_executors_return_typed_evidence_without_live_db():
 
     assert validation[0].payload["valid"] is True
     assert validation[0].payload["tables"] == ["orders"]
-    assert query[0].kind == "query.result"
-    assert query[0].payload["rows"] == [{"count": 2}]
-    assert query[0].payload["sql"].endswith("LIMIT 50")
-    assert plan[0].kind == "query.plan"
+    query_result = next(item for item in query if item.kind == "query.result")
+    assert query_result.payload["rows"] == [{"count": 2}]
+    assert query_result.payload["sql"].endswith("LIMIT 50")
+    assert plan[0].kind == "sql.explain.plan"
     assert plan[0].payload["plan"] == [{"QUERY PLAN": "Seq Scan on orders"}]
     assert write[0].kind == "write.execution"
     assert write[0].payload["affected_rows"] == 3

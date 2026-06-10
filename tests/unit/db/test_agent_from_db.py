@@ -351,11 +351,15 @@ async def test_agent_from_db_executes_count_query_with_typed_evidence(tmp_path):
 
     assert answer == "The count is 2."
     assert result.status is OperationStatus.SUCCEEDED
-    assert {"query.plan", "sql.validation", "query.result"} <= {
-        item.kind for item in result.evidence
-    }
+    assert {
+        "planning.context",
+        "query.plan.proposal",
+        "query.plan.validation",
+        "sql.validation",
+        "query.result",
+    } <= {item.kind for item in result.evidence}
     assert result.diagnostics["verification"]["passed"] is True
-    assert result.diagnostics["synthesis"]["evidence_refs"]
+    assert result.diagnostics["synthesis"]["cited_evidence_refs"]
 
 
 async def test_agent_from_db_stream_yields_typed_runtime_result(tmp_path):

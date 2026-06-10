@@ -43,7 +43,7 @@ def test_query_planner_builds_count_plan_without_executing_sql():
     )
 
     assert plan.sql == 'SELECT COUNT(*) AS count FROM "orders"'
-    assert plan.evidence.kind == "query.plan"
+    assert plan.evidence.kind == "query.plan.proposal"
     assert plan.evidence.payload["strategy"] == "single_table"
 
 

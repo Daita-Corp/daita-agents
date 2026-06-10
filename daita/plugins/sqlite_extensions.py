@@ -93,7 +93,7 @@ def sqlite_capabilities() -> tuple[Capability, ...]:
             access=AccessMode.METADATA_READ,
             risk=RiskLevel.LOW,
             input_schema=common_schema,
-            output_evidence=frozenset({"query.plan"}),
+            output_evidence=frozenset({"sql.explain.plan"}),
             executor="sqlite.sql.explain",
             runtime_only=True,
             side_effecting=False,
@@ -129,10 +129,10 @@ def sqlite_evidence_schemas() -> tuple[EvidenceSchema, ...]:
             description="SQLite write execution result.",
         ),
         EvidenceSchema(
-            kind="query.plan",
+            kind="sql.explain.plan",
             owner="sqlite",
             json_schema=object_schema,
-            description="SQLite query plan.",
+            description="SQLite connector explain plan.",
         ),
     )
 

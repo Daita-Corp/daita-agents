@@ -47,8 +47,17 @@ from daita.runtime import (
 )
 from daita.skills import SkillResolution, SkillResolver
 
+from .analysis import (
+    DbAnalysisPlan,
+    analysis_metadata,
+    evidence_ref,
+    stable_fingerprint,
+    with_analysis_evidence_trace,
+)
+from .evidence import DbEvidenceStore
 from .execution import DbOperationExecutor
 from .governance import default_db_policies
+from .llm_service import DbLLMService, db_llm_service_from_metadata
 from .models import (
     DbIntent,
     DbIntentKind,
@@ -60,6 +69,7 @@ from .models import (
     DbRuntimeInspection,
 )
 from .planning import DbContractBuilder, DbIntentClassifier
+from .runtime_extensions import DbRuntimePlanningPlugin
 from .synthesis import DbSynthesizer
 from .verification import DbVerifier
 
@@ -102,6 +112,7 @@ class DbRuntime:
         store: RuntimeStore | None = None,
         approval_channel: InMemoryApprovalChannel | None = None,
         runtime_id: str | None = None,
+        db_llm_service: DbLLMService | None = None,
     ) -> None:
         self.source = source
         self.config = config or DbRuntimeConfig()
@@ -112,6 +123,9 @@ class DbRuntime:
         self.intent_classifier = DbIntentClassifier()
         self.verifier = DbVerifier()
         self.synthesizer = DbSynthesizer()
+        self.db_llm_service = db_llm_service or db_llm_service_from_metadata(
+            self.config.metadata
+        )
         self._setup_context: PluginContext | None = None
         self._is_setup = False
         self._schema_profile_cache: dict[str, Any] | None = None
@@ -126,6 +140,9 @@ class DbRuntime:
             fact_provider=self,
         )
 
+        self.registry.register(
+            DbRuntimePlanningPlugin(llm_capable=self.db_llm_service.available)
+        )
         self.registry.register_many(self.config.plugins)
         self.registry.register_many(tuple(plugins))
 
@@ -168,6 +185,7 @@ class DbRuntime:
                 "db_runtime": self,
                 "extension_registry": self.registry,
                 "runtime_store": self.store,
+                "db_llm_service": self.db_llm_service,
             }
         )
         context = PluginContext(
@@ -180,6 +198,7 @@ class DbRuntime:
                     "profile": self.config.profile,
                     "limits": self.config.limits.to_dict(),
                     "metadata": self.config.metadata,
+                    "db_llm": self.db_llm_service.safe_metadata,
                 }
             ),
         )
@@ -214,7 +233,11 @@ class DbRuntime:
             ),
             source_repr=_safe_source_repr(self.source),
             profile=self.config.profile,
-            plugin_ids=self.registry.plugin_ids,
+            plugin_ids=tuple(
+                plugin_id
+                for plugin_id in self.registry.plugin_ids
+                if plugin_id != "db_runtime"
+            ),
             capability_count=len(self.registry.capabilities),
             executor_count=len(self.registry.executors),
             evidence_schema_count=len(self.registry.evidence_schemas),
@@ -294,7 +317,19 @@ class DbRuntime:
         elif (
             stored_task.status is TaskStatus.PENDING and stored_task.input != task.input
         ):
-            task = replace(stored_task, input=task.input)
+            task = replace(
+                stored_task,
+                input=task.input,
+                dependencies=task.dependencies or stored_task.dependencies,
+                metadata={
+                    **stored_task.metadata,
+                    **{
+                        key: value
+                        for key, value in task.metadata.items()
+                        if key in {"owner", "reason"}
+                    },
+                },
+            )
             await self.store.save_task(task)
         else:
             task = stored_task
@@ -369,9 +404,13 @@ class DbRuntime:
             await self.setup()
         capability = self.registry.get_capability(capability_id, owner=owner)
         output_evidence = capability.output_evidence
-        validation_capability = self._validation_capability_for_write(capability)
+        validation_capability = self._validation_capability_for_sql_execute(capability)
         if (
-            capability.id == "db.sql.execute_write"
+            capability.id
+            in {
+                "db.sql.execute_read",
+                "db.sql.execute_write",
+            }
             and validation_capability is not None
         ):
             output_evidence = frozenset(
@@ -516,6 +555,8 @@ class DbRuntime:
 
     async def resume_operation(self, operation_id: str) -> OperationSnapshot:
         """Resume persisted operation state without re-running completed tasks."""
+        if not self._is_setup:
+            await self.setup()
         snapshot = await self.inspect_operation(operation_id)
         if snapshot is None:
             raise KeyError(operation_id)
@@ -598,6 +639,36 @@ class DbRuntime:
             return completed
         if completed.resumable_task_ids:
             return completed
+        if completed.operation.status is OperationStatus.SUCCEEDED:
+            return completed
+
+        if _snapshot_has_incomplete_analysis(completed):
+            request = _db_request_from_context(completed.operation)
+            intent = _db_intent_from_context(completed.operation)
+            contract = _db_contract_from_context(completed.operation)
+            operation = await self.kernel.update_operation(
+                operation_id,
+                OperationStatus.RUNNING,
+                message=f"Operation {operation_id} resumed analysis materialization.",
+            )
+            await self._run_multi_step_analysis(
+                request,
+                intent,
+                contract,
+                operation,
+                base_diagnostics={
+                    "runtime_id": self.runtime_id,
+                    "resume": {
+                        "operation_id": operation_id,
+                        "completed_task_ids": list(completed.completed_task_ids),
+                    },
+                },
+                reuse_existing_plan=True,
+            )
+            resumed_analysis = await self.inspect_operation(operation_id)
+            if resumed_analysis is None:
+                raise KeyError(operation_id)
+            return resumed_analysis
 
         if _operation_has_run_context(completed.operation):
             await self._complete_resumed_run_operation(completed)
@@ -742,6 +813,15 @@ class DbRuntime:
             skill_effects=resolved_skills.effects if resolved_skills else (),
         )
 
+    def _db_request_from_operation(self, operation: Operation) -> DbRequest:
+        return _db_request_from_context(operation)
+
+    def _db_intent_from_operation(self, operation: Operation) -> DbIntent:
+        return _db_intent_from_context(operation)
+
+    def _db_contract_from_context(self, operation: Operation) -> DbOperationContract:
+        return _db_contract_from_context(operation)
+
     async def run(self, request: DbRequest | str) -> DbOperationResult:
         """Plan and execute a DB operation through typed runtime capabilities."""
         db_request = request if isinstance(request, DbRequest) else DbRequest(request)
@@ -804,7 +884,9 @@ class DbRuntime:
                 operation=operation,
             )
 
-        await self._persist_contract_tasks(operation, contract)
+        analysis_route = self._should_route_multi_step_analysis(db_request, intent)
+        if not analysis_route:
+            await self._persist_contract_tasks(operation, contract)
         try:
             governance = await self.kernel.evaluate_operation_governance(operation.id)
         except RuntimeKernelGovernanceBlocked as exc:
@@ -844,6 +926,15 @@ class DbRuntime:
             **base_diagnostics,
             "governance": governance.to_dict(),
         }
+
+        if analysis_route:
+            return await self._run_multi_step_analysis(
+                db_request,
+                intent,
+                contract,
+                operation,
+                base_diagnostics=base_diagnostics,
+            )
 
         try:
             outcome = await DbOperationExecutor(self).execute(
@@ -911,9 +1002,18 @@ class DbRuntime:
                 operation=operation,
             )
 
-        synthesis = self.synthesizer.synthesize(
-            db_request, intent, contract, outcome.evidence, verification
+        verification_evidence = await self._persist_verification_result_evidence(
+            operation,
+            verification,
+            outcome.evidence,
         )
+        synthesis_evidence, synthesis_task = await self._execute_answer_synthesis(
+            operation=operation,
+            intent=intent,
+            outcome_evidence=(*outcome.evidence, verification_evidence),
+        )
+        final_evidence = (*outcome.evidence, verification_evidence, synthesis_evidence)
+        final_tasks = (*outcome.tasks, synthesis_task)
         return await self._record_operation_result(
             DbOperationResult(
                 operation_id=operation_id,
@@ -921,22 +1021,843 @@ class DbRuntime:
                 intent=intent,
                 contract=contract,
                 status=OperationStatus.SUCCEEDED,
-                answer=synthesis.answer,
-                evidence=outcome.evidence,
-                warnings=tuple((*outcome.warnings, *synthesis.warnings)),
+                answer=_answer_from_synthesis_evidence(synthesis_evidence),
+                evidence=final_evidence,
+                warnings=tuple(
+                    (
+                        *outcome.warnings,
+                        *(
+                            synthesis_evidence.payload.get("warnings")
+                            if isinstance(
+                                synthesis_evidence.payload.get("warnings"), list
+                            )
+                            else ()
+                        ),
+                    )
+                ),
                 diagnostics={
                     **base_diagnostics,
                     "execution": {
                         **outcome.diagnostics,
-                        "task_count": len(outcome.tasks),
-                        "tasks": [task.to_dict() for task in outcome.tasks],
+                        "task_count": len(final_tasks),
+                        "tasks": [task.to_dict() for task in final_tasks],
                     },
                     "verification": verification.to_dict(),
-                    "synthesis": synthesis.to_dict(),
+                    "synthesis": synthesis_evidence.payload,
                 },
             ),
             operation=operation,
         )
+
+    def _should_route_multi_step_analysis(
+        self,
+        request: DbRequest,
+        intent: DbIntent,
+    ) -> bool:
+        if intent.kind not in {
+            DbIntentKind.DATA_QUERY,
+            DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
+        }:
+            return False
+        if request.metadata.get("analysis_mode") == "multi_step":
+            return True
+        prompt = request.prompt.lower()
+        explicit = (
+            "multi-step",
+            "multiple queries",
+            "long-running",
+            "deep analysis",
+            "investigate",
+            "explain why",
+            "why did",
+            "root cause",
+            "break down and compare",
+            "compare drivers",
+            "then drill",
+            "step by step analysis",
+        )
+        return self.db_llm_service.available and any(
+            term in prompt for term in explicit
+        )
+
+    async def _run_multi_step_analysis(
+        self,
+        request: DbRequest,
+        intent: DbIntent,
+        contract: DbOperationContract,
+        operation: Operation,
+        *,
+        base_diagnostics: dict[str, Any],
+        reuse_existing_plan: bool = False,
+    ) -> DbOperationResult:
+        executor = DbOperationExecutor(self)
+        evidence_store = DbEvidenceStore()
+        tasks: list[Task] = []
+        warnings: list[str] = []
+        started_at = time.monotonic()
+        diagnostics: dict[str, Any] = {
+            "planner_strategy": "analysis",
+            "phase": "multi_step_analysis",
+            "evidence_refs": [],
+            "evidence_kinds": [],
+        }
+        try:
+            schema_evidence = await executor._inspect_schema_if_available(
+                operation, tasks, evidence_store
+            )
+            schema = schema_evidence.payload if schema_evidence is not None else {}
+            planning_context = await executor._build_planning_context(
+                request,
+                operation,
+                tasks,
+                evidence_store,
+                schema_evidence=schema_evidence,
+                catalog_evidence=tuple(
+                    item
+                    for item in evidence_store.list()
+                    if item.kind.startswith("catalog.")
+                    or item.kind in {"schema.search_result", "catalog.source"}
+                ),
+                relationship_evidence=(),
+                analysis_metadata={
+                    "analysis_id": f"analysis-{operation.id}",
+                    "analysis_step_id": "analysis_context",
+                    "analysis_phase": "context",
+                },
+            )
+            plan_evidence = (
+                await self._latest_accepted_evidence(operation.id, "analysis.plan")
+                if reuse_existing_plan
+                else None
+            )
+            validation_evidence = (
+                await self._latest_accepted_evidence(
+                    operation.id, "analysis.plan.validation", payload={"valid": True}
+                )
+                if plan_evidence is not None
+                else None
+            )
+            if plan_evidence is None:
+                plan_evidence = await self._execute_analysis_plan_task(
+                    operation,
+                    tasks,
+                    evidence_store,
+                    planning_context=planning_context,
+                )
+            if validation_evidence is None:
+                validation_evidence = await self._execute_analysis_validation_task(
+                    operation,
+                    tasks,
+                    evidence_store,
+                    plan_evidence=plan_evidence,
+                )
+            if not plan_evidence.accepted or not validation_evidence.accepted:
+                warnings.append("analysis_plan_unavailable_or_invalid")
+                checkpoint = await self._execute_analysis_checkpoint_task(
+                    operation,
+                    tasks,
+                    evidence_store,
+                    analysis_id=str(
+                        plan_evidence.payload.get("analysis_id")
+                        or plan_evidence.metadata.get("analysis_id")
+                        or f"analysis-{operation.id}"
+                    ),
+                    step_id="analysis_blocked",
+                    plan_evidence=plan_evidence,
+                    cited_evidence=(plan_evidence, validation_evidence),
+                    remaining_step_ids=(),
+                    diagnostics={"blocked_reason": "analysis_plan_invalid"},
+                )
+                all_evidence = (*evidence_store.list(), checkpoint)
+                return await self._record_operation_result(
+                    DbOperationResult(
+                        operation_id=operation.id,
+                        request=request,
+                        intent=intent,
+                        contract=contract,
+                        status=OperationStatus.BLOCKED,
+                        answer=str(
+                            plan_evidence.payload.get("clarification_question")
+                            or "The multi-step analysis plan could not be validated."
+                        ),
+                        evidence=all_evidence,
+                        warnings=tuple(warnings),
+                        diagnostics={
+                            **base_diagnostics,
+                            "execution": {
+                                **diagnostics,
+                                "tasks": [task.to_dict() for task in tasks],
+                            },
+                            "analysis_plan_validation": validation_evidence.payload,
+                        },
+                    ),
+                    operation=operation,
+                )
+
+            plan = DbAnalysisPlan.from_mapping(plan_evidence.payload)
+            analysis_id = plan.analysis_id
+            completed_by_step = self._accepted_analysis_step_evidence_map(
+                await self.store.list_evidence(operation.id),
+                analysis_id=analysis_id,
+            )
+            for step in self._analysis_steps_in_order(plan):
+                if step.id in completed_by_step:
+                    continue
+                budget_failure = self._analysis_budget_failure(
+                    plan,
+                    tuple(await self.store.list_evidence(operation.id)),
+                    started_at=started_at,
+                )
+                if budget_failure is not None:
+                    await self._execute_analysis_checkpoint_task(
+                        operation,
+                        tasks,
+                        evidence_store,
+                        analysis_id=analysis_id,
+                        step_id="budget_checkpoint",
+                        plan_evidence=plan_evidence,
+                        cited_evidence=tuple(
+                            evidence
+                            for values in completed_by_step.values()
+                            for evidence in values
+                            if evidence.accepted and evidence.id
+                        ),
+                        remaining_step_ids=tuple(
+                            item.id
+                            for item in plan.steps
+                            if item.id not in completed_by_step
+                        ),
+                        diagnostics=budget_failure,
+                    )
+                    break
+                dependencies = tuple(
+                    evidence
+                    for dependency_id in step.depends_on
+                    for evidence in completed_by_step.get(dependency_id, ())
+                    if evidence.accepted and evidence.id
+                )
+                if len(step.depends_on) != len(
+                    {item.metadata.get("analysis_step_id") for item in dependencies}
+                ):
+                    break
+                step_meta = analysis_metadata(
+                    analysis_id=analysis_id,
+                    step_id=step.id,
+                    step_kind=step.kind,
+                    plan_evidence_id=plan_evidence.id,
+                )
+                if step.kind == "query":
+                    produced = await self._execute_analysis_query_step(
+                        executor,
+                        request,
+                        intent,
+                        contract,
+                        operation,
+                        tasks,
+                        evidence_store,
+                        schema=schema,
+                        schema_evidence=schema_evidence,
+                        step_prompt=f"{request.prompt}\n\nAnalysis step {step.id}: {step.purpose}",
+                        step_metadata=step_meta,
+                    )
+                    verification_evidence = (
+                        await self._persist_analysis_verification_result_evidence(
+                            operation,
+                            contract,
+                            intent,
+                            produced,
+                            tuple(tasks),
+                            step_metadata=step_meta,
+                        )
+                    )
+                    evidence_store.add(verification_evidence)
+                    produced = (*produced, verification_evidence)
+                    completed_by_step[step.id] = produced
+                    step_budget_failure = self._analysis_step_budget_failure(
+                        step,
+                        produced,
+                    )
+                    checkpoint = await self._execute_analysis_checkpoint_task(
+                        operation,
+                        tasks,
+                        evidence_store,
+                        analysis_id=analysis_id,
+                        step_id=f"{step.id}_checkpoint",
+                        plan_evidence=plan_evidence,
+                        cited_evidence=produced,
+                        remaining_step_ids=tuple(
+                            item.id
+                            for item in plan.steps
+                            if item.id not in completed_by_step
+                        ),
+                        diagnostics=step_budget_failure or {},
+                    )
+                    completed_by_step.setdefault(f"{step.id}_checkpoint", (checkpoint,))
+                    if step_budget_failure is not None:
+                        break
+                elif step.kind == "checkpoint":
+                    checkpoint = await self._execute_analysis_checkpoint_task(
+                        operation,
+                        tasks,
+                        evidence_store,
+                        analysis_id=analysis_id,
+                        step_id=step.id,
+                        plan_evidence=plan_evidence,
+                        cited_evidence=dependencies,
+                        remaining_step_ids=tuple(
+                            item.id
+                            for item in plan.steps
+                            if item.id not in completed_by_step
+                        ),
+                    )
+                    completed_by_step[step.id] = (checkpoint,)
+                elif step.kind == "synthesis":
+                    synthesis = await self._execute_analysis_synthesis_task(
+                        operation,
+                        tasks,
+                        evidence_store,
+                        analysis_id=analysis_id,
+                        step_id=step.id,
+                        plan_evidence=plan_evidence,
+                        cited_evidence=dependencies
+                        or tuple(
+                            evidence
+                            for values in completed_by_step.values()
+                            for evidence in values
+                            if evidence.accepted and evidence.id
+                        ),
+                    )
+                    completed_by_step[step.id] = (synthesis,)
+
+            synthesis = await self._latest_accepted_evidence(
+                operation.id, "analysis.synthesis"
+            )
+            if synthesis is None:
+                synthesis = await self._execute_analysis_synthesis_task(
+                    operation,
+                    tasks,
+                    evidence_store,
+                    analysis_id=analysis_id,
+                    step_id="final_synthesis",
+                    plan_evidence=plan_evidence,
+                    cited_evidence=tuple(
+                        evidence
+                        for values in completed_by_step.values()
+                        for evidence in values
+                        if evidence.accepted and evidence.id
+                    ),
+                )
+            all_evidence = tuple(await self.store.list_evidence(operation.id))
+            all_tasks = tuple(await self.store.list_tasks(operation.id))
+            return await self._record_operation_result(
+                DbOperationResult(
+                    operation_id=operation.id,
+                    request=request,
+                    intent=intent,
+                    contract=contract,
+                    status=OperationStatus.SUCCEEDED,
+                    answer=_answer_from_analysis_synthesis_evidence(synthesis),
+                    evidence=all_evidence,
+                    warnings=tuple(warnings),
+                    diagnostics={
+                        **base_diagnostics,
+                        "execution": {
+                            **diagnostics,
+                            "evidence_kinds": [item.kind for item in all_evidence],
+                            "evidence_refs": [item.id for item in all_evidence],
+                            "task_count": len(all_tasks),
+                            "tasks": [task.to_dict() for task in all_tasks],
+                        },
+                        "analysis": synthesis.payload,
+                    },
+                ),
+                operation=operation,
+            )
+        except DbRuntimeGovernanceBlocked as exc:
+            return await self._record_operation_result(
+                DbOperationResult(
+                    operation_id=operation.id,
+                    request=request,
+                    intent=intent,
+                    contract=contract,
+                    status=OperationStatus.BLOCKED,
+                    answer=_governance_blocked_answer(exc.governance),
+                    evidence=tuple(await self.store.list_evidence(operation.id)),
+                    warnings=(_governance_blocked_warning(exc.governance),),
+                    diagnostics={
+                        **base_diagnostics,
+                        "governance": exc.governance.to_dict(),
+                    },
+                ),
+                operation=operation,
+            )
+        except Exception as exc:
+            return await self._record_operation_result(
+                DbOperationResult(
+                    operation_id=operation.id,
+                    request=request,
+                    intent=intent,
+                    contract=contract,
+                    status=OperationStatus.FAILED,
+                    answer=f"DB analysis failed: {exc}",
+                    evidence=tuple(await self.store.list_evidence(operation.id)),
+                    warnings=("db_runtime_analysis_failed",),
+                    diagnostics={
+                        **base_diagnostics,
+                        "error": {"type": type(exc).__name__, "message": str(exc)},
+                    },
+                ),
+                operation=operation,
+            )
+
+    async def _execute_analysis_plan_task(
+        self,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        planning_context: Evidence,
+    ) -> Evidence:
+        analysis_id = f"analysis-{operation.id}"
+        capability = self.registry.get_capability(
+            "db.analysis.plan", owner="db_runtime"
+        )
+        task = self._analysis_task(
+            operation,
+            capability,
+            input={
+                "analysis_id": analysis_id,
+                "planning_context_evidence_id": planning_context.id,
+            },
+            metadata=analysis_metadata(
+                analysis_id=analysis_id,
+                step_id="analysis_plan",
+                phase="plan",
+            ),
+            dependencies=(_dependency_for_evidence(planning_context),),
+            sequence=100,
+        )
+        tasks.append(task)
+        evidence = await self.execute_task(task, operation)
+        evidence_store.add_many(evidence)
+        plan = next((item for item in evidence if item.kind == "analysis.plan"), None)
+        if plan is None:
+            raise RuntimeError("analysis.plan evidence was not produced")
+        return plan
+
+    async def _execute_analysis_validation_task(
+        self,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        plan_evidence: Evidence,
+    ) -> Evidence:
+        analysis_id = str(
+            plan_evidence.payload.get("analysis_id")
+            or plan_evidence.metadata.get("analysis_id")
+            or f"analysis-{operation.id}"
+        )
+        capability = self.registry.get_capability(
+            "db.analysis.plan.validate", owner="db_runtime"
+        )
+        task = self._analysis_task(
+            operation,
+            capability,
+            input={"analysis_plan_evidence_id": plan_evidence.id},
+            metadata=analysis_metadata(
+                analysis_id=analysis_id,
+                step_id="analysis_plan_validation",
+                plan_evidence_id=plan_evidence.id,
+                phase="validation",
+            ),
+            dependencies=(
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind=plan_evidence.kind,
+                    evidence_id=plan_evidence.id,
+                    evidence_owner=plan_evidence.owner,
+                    producer_task_id=plan_evidence.task_id,
+                    evidence_accepted=plan_evidence.accepted,
+                    operation_id=plan_evidence.operation_id,
+                    payload_fingerprint=plan_evidence.metadata.get(
+                        "payload_fingerprint"
+                    )
+                    or _payload_fingerprint(plan_evidence.payload),
+                ),
+            ),
+            sequence=101,
+        )
+        tasks.append(task)
+        evidence = await self.execute_task(task, operation)
+        evidence_store.add_many(evidence)
+        validation = next(
+            (item for item in evidence if item.kind == "analysis.plan.validation"),
+            None,
+        )
+        if validation is None:
+            raise RuntimeError("analysis.plan.validation evidence was not produced")
+        return validation
+
+    async def _execute_analysis_query_step(
+        self,
+        executor: DbOperationExecutor,
+        request: DbRequest,
+        intent: DbIntent,
+        contract: DbOperationContract,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        schema: dict[str, Any],
+        schema_evidence: Evidence | None,
+        step_prompt: str,
+        step_metadata: dict[str, Any],
+    ) -> tuple[Evidence, ...]:
+        from dataclasses import replace as dataclass_replace
+
+        before_ids = {item.id for item in await self.store.list_evidence(operation.id)}
+        step_request = dataclass_replace(request, prompt=step_prompt)
+        planning_context = await executor._build_planning_context(
+            step_request,
+            operation,
+            tasks,
+            evidence_store,
+            schema_evidence=schema_evidence,
+            catalog_evidence=(),
+            relationship_evidence=(),
+            analysis_metadata=step_metadata,
+        )
+        plan_evidence, strategy_warnings, _ = await executor._plan_query(
+            step_request,
+            intent,
+            operation,
+            schema,
+            None,
+            planning_context,
+            tasks,
+            evidence_store,
+            analysis_metadata=step_metadata,
+        )
+        validation = await executor._validate_query_plan(
+            operation,
+            tasks,
+            evidence_store,
+            plan_evidence=plan_evidence,
+            planning_context=planning_context,
+            analysis_metadata=step_metadata,
+        )
+        sql = validation.payload.get("accepted_sql")
+        if sql:
+            sql_validation = await executor._execute_sql_validation(
+                contract,
+                operation,
+                tasks,
+                evidence_store,
+                sql,
+                plan_validation=validation,
+                analysis_metadata=step_metadata,
+            )
+            await executor._execute_validated_read(
+                contract,
+                operation,
+                tasks,
+                evidence_store,
+                sql_validation,
+                analysis_metadata=step_metadata,
+            )
+        produced = tuple(
+            item
+            for item in await self.store.list_evidence(operation.id)
+            if item.id not in before_ids
+            and item.metadata.get("analysis_step_id")
+            == step_metadata.get("analysis_step_id")
+        )
+        if strategy_warnings:
+            await self.kernel.append_event(
+                RuntimeEventType.DIAGNOSTIC,
+                operation_id=operation.id,
+                message="Analysis query step produced planner warnings.",
+                payload={
+                    "analysis_step_id": step_metadata.get("analysis_step_id"),
+                    "warnings": list(strategy_warnings),
+                },
+            )
+        return produced
+
+    async def _persist_analysis_verification_result_evidence(
+        self,
+        operation: Operation,
+        contract: DbOperationContract,
+        intent: DbIntent,
+        evidence: tuple[Evidence, ...],
+        tasks: tuple[Task, ...],
+        *,
+        step_metadata: dict[str, Any],
+    ) -> Evidence:
+        verification = self.verifier.verify(contract, intent, evidence, tasks)
+        evidence_details = [
+            evidence_ref(item) for item in evidence if item.accepted and item.id
+        ]
+        payload = {
+            "passed": bool(verification.passed),
+            "evidence_refs": [item["id"] for item in evidence_details],
+            "evidence_details": evidence_details,
+            "warnings": list(verification.warnings),
+            "missing_evidence": list(verification.missing_evidence),
+            "diagnostics": verification.diagnostics,
+            "input_fingerprint": stable_fingerprint(evidence_details),
+            "verified_at": datetime.now(timezone.utc).isoformat(),
+        }
+        verification_evidence = Evidence(
+            id=f"evidence-{uuid4()}",
+            kind="verification.result",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=verification.passed,
+            payload=payload,
+            metadata={
+                **step_metadata,
+                "payload_fingerprint": stable_fingerprint(payload),
+                "input_fingerprint": payload["input_fingerprint"],
+            },
+        )
+        await self.store.save_evidence(verification_evidence)
+        return verification_evidence
+
+    async def _execute_analysis_checkpoint_task(
+        self,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        analysis_id: str,
+        step_id: str,
+        plan_evidence: Evidence,
+        cited_evidence: tuple[Evidence, ...],
+        remaining_step_ids: tuple[str, ...],
+        diagnostics: dict[str, Any] | None = None,
+    ) -> Evidence:
+        capability = self.registry.get_capability(
+            "db.analysis.checkpoint", owner="db_runtime"
+        )
+        dependencies = tuple(
+            TaskDependency(
+                kind="evidence",
+                evidence_kind=item.kind,
+                evidence_id=item.id,
+                evidence_owner=item.owner,
+                producer_task_id=item.task_id,
+                evidence_accepted=item.accepted,
+                operation_id=item.operation_id,
+                payload_fingerprint=item.metadata.get("payload_fingerprint")
+                or _payload_fingerprint(item.payload),
+            )
+            for item in cited_evidence
+            if item.id
+        )
+        metadata = analysis_metadata(
+            analysis_id=analysis_id,
+            step_id=step_id,
+            step_kind="checkpoint",
+            plan_evidence_id=plan_evidence.id,
+        )
+        task = self._analysis_task(
+            operation,
+            capability,
+            input={
+                "analysis_id": analysis_id,
+                "analysis_step_id": step_id,
+                "remaining_step_ids": list(remaining_step_ids),
+                "diagnostics": dict(diagnostics or {}),
+            },
+            metadata=metadata,
+            dependencies=dependencies,
+            sequence=8000 + len(tasks),
+        )
+        tasks.append(task)
+        evidence = await self.execute_task(task, operation)
+        evidence_store.add_many(evidence)
+        checkpoint = next(
+            (item for item in evidence if item.kind == "analysis.checkpoint"),
+            None,
+        )
+        if checkpoint is None:
+            raise RuntimeError("analysis.checkpoint evidence was not produced")
+        return checkpoint
+
+    async def _execute_analysis_synthesis_task(
+        self,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        analysis_id: str,
+        step_id: str,
+        plan_evidence: Evidence,
+        cited_evidence: tuple[Evidence, ...],
+    ) -> Evidence:
+        capability = self.registry.get_capability(
+            "db.analysis.summarize", owner="db_runtime"
+        )
+        dependencies = tuple(
+            _dependency_for_evidence(item)
+            for item in cited_evidence
+            if item.id and item.accepted and item.operation_id == operation.id
+        )
+        metadata = analysis_metadata(
+            analysis_id=analysis_id,
+            step_id=step_id,
+            step_kind="synthesis",
+            plan_evidence_id=plan_evidence.id,
+        )
+        task = self._analysis_task(
+            operation,
+            capability,
+            input={"analysis_id": analysis_id, "analysis_step_id": step_id},
+            metadata=metadata,
+            dependencies=dependencies,
+            sequence=9000 + len(tasks),
+        )
+        tasks.append(task)
+        evidence = await self.execute_task(task, operation)
+        evidence_store.add_many(evidence)
+        synthesis = next(
+            (item for item in evidence if item.kind == "analysis.synthesis"),
+            None,
+        )
+        if synthesis is None:
+            raise RuntimeError("analysis.synthesis evidence was not produced")
+        return synthesis
+
+    def _analysis_task(
+        self,
+        operation: Operation,
+        capability: Capability,
+        *,
+        input: dict[str, Any],
+        metadata: dict[str, Any],
+        dependencies: tuple[TaskDependency, ...],
+        sequence: int,
+    ) -> Task:
+        task_input = {**input}
+        input_hash = _stable_hash(task_input)
+        return Task(
+            id=f"db-task-{uuid4()}",
+            operation_id=operation.id,
+            capability_id=capability.id,
+            executor_id=capability.executor,
+            input={**task_input, "input_hash": input_hash},
+            required_evidence=capability.output_evidence,
+            dependencies=dependencies,
+            metadata=with_analysis_evidence_trace(
+                {
+                    "owner": capability.owner,
+                    "reason": "analysis",
+                    "sequence": sequence,
+                    "input_hash": input_hash,
+                    "idempotency_key": _stable_hash(
+                        {
+                            "operation_id": operation.id,
+                            "capability_id": capability.id,
+                            "input": task_input,
+                            **metadata,
+                        }
+                    ),
+                    "idempotent": capability.idempotent,
+                    "replay_safe": capability.replay_safe,
+                    "side_effecting": capability.side_effecting,
+                    **metadata,
+                }
+            ),
+        )
+
+    def _accepted_analysis_step_evidence_map(
+        self,
+        evidence: tuple[Evidence, ...],
+        *,
+        analysis_id: str,
+    ) -> dict[str, tuple[Evidence, ...]]:
+        grouped: dict[str, list[Evidence]] = {}
+        for item in evidence:
+            if not item.accepted:
+                continue
+            if item.metadata.get("analysis_id") != analysis_id:
+                continue
+            step_id = item.metadata.get("analysis_step_id")
+            if not isinstance(step_id, str) or not step_id:
+                continue
+            if item.kind in {
+                "analysis.plan",
+                "analysis.plan.validation",
+                "planning.context",
+            }:
+                continue
+            grouped.setdefault(step_id, []).append(item)
+        return {key: tuple(value) for key, value in grouped.items()}
+
+    def _analysis_budget_failure(
+        self,
+        plan: DbAnalysisPlan,
+        evidence: tuple[Evidence, ...],
+        *,
+        started_at: float,
+    ) -> dict[str, Any] | None:
+        usage = _analysis_budget_usage(evidence, started_at=started_at)
+        failures = []
+        budgets = plan.budgets
+        if usage["total_rows"] > budgets.max_total_rows:
+            failures.append("budget_max_total_rows_exceeded")
+        if usage["llm_calls"] > budgets.max_llm_calls:
+            failures.append("budget_max_llm_calls_exceeded")
+        if usage["context_chars"] > budgets.max_context_chars:
+            failures.append("budget_max_context_chars_exceeded")
+        if usage["duration_seconds"] > budgets.max_duration_seconds:
+            failures.append("budget_max_duration_seconds_exceeded")
+        if not failures:
+            return None
+        return {
+            "budget_exceeded": True,
+            "failures": failures,
+            "budget_usage": usage,
+            "budgets": budgets.to_dict(),
+        }
+
+    @staticmethod
+    def _analysis_step_budget_failure(
+        step: Any,
+        evidence: tuple[Evidence, ...],
+    ) -> dict[str, Any] | None:
+        rows = sum(
+            _analysis_query_result_rows(item)
+            for item in evidence
+            if item.kind == "query.result"
+        )
+        if rows <= step.budgets.max_rows:
+            return None
+        return {
+            "budget_exceeded": True,
+            "failures": ["step_max_rows_exceeded"],
+            "budget_usage": {"step_rows": rows},
+            "budgets": step.budgets.to_dict(),
+        }
+
+    @staticmethod
+    def _analysis_steps_in_order(plan: DbAnalysisPlan) -> tuple[Any, ...]:
+        remaining = {step.id: step for step in plan.steps}
+        ordered = []
+        while remaining:
+            ready = [
+                step
+                for step in remaining.values()
+                if all(dependency not in remaining for dependency in step.depends_on)
+            ]
+            if not ready:
+                return tuple((*ordered, *remaining.values()))
+            for step in ready:
+                ordered.append(step)
+                remaining.pop(step.id, None)
+        return tuple(ordered)
 
     async def _plan_kernel_task(self, task: Task) -> Task:
         """Persist a DB-planned task through the shared kernel planner."""
@@ -1103,6 +2024,8 @@ class DbRuntime:
         self,
         operation_id: str,
         capability: Capability,
+        *,
+        metadata_match: dict[str, Any] | None = None,
     ) -> Task | None:
         for task in await self.store.list_tasks(operation_id):
             if task.status is not TaskStatus.PENDING:
@@ -1113,14 +2036,168 @@ class DbRuntime:
                 continue
             if task.metadata.get("owner") != capability.owner:
                 continue
+            if metadata_match and any(
+                task.metadata.get(key) != value for key, value in metadata_match.items()
+            ):
+                continue
             return task
         return None
 
-    def _validation_capability_for_write(
+    async def _persist_verification_result_evidence(
+        self,
+        operation: Operation,
+        verification: Any,
+        evidence: tuple[Evidence, ...],
+    ) -> Evidence:
+        existing = await self._latest_accepted_evidence(
+            operation.id,
+            "verification.result",
+            payload={"passed": True},
+        )
+        if existing is not None:
+            return existing
+        accepted = tuple(item for item in evidence if item.accepted and item.id)
+        evidence_details = [
+            {
+                "id": item.id,
+                "kind": item.kind,
+                "owner": item.owner,
+                "task_id": item.task_id,
+                "payload_fingerprint": item.metadata.get("payload_fingerprint")
+                or _payload_fingerprint(item.payload),
+            }
+            for item in accepted
+        ]
+        payload = {
+            "passed": bool(verification.passed),
+            "evidence_refs": [item["id"] for item in evidence_details],
+            "evidence_details": evidence_details,
+            "warnings": list(verification.warnings),
+            "missing_evidence": list(verification.missing_evidence),
+            "diagnostics": verification.diagnostics,
+            "input_fingerprint": _stable_hash(
+                {
+                    "operation_id": operation.id,
+                    "evidence": evidence_details,
+                    "warnings": list(verification.warnings),
+                    "missing_evidence": list(verification.missing_evidence),
+                }
+            ),
+            "verified_at": datetime.now(timezone.utc).isoformat(),
+        }
+        verification_evidence = Evidence(
+            id=f"evidence-{uuid4()}",
+            kind="verification.result",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=True,
+            payload=payload,
+            metadata={
+                "payload_fingerprint": _payload_fingerprint(payload),
+                "input_fingerprint": payload["input_fingerprint"],
+            },
+        )
+        await self.store.save_evidence(verification_evidence)
+        return verification_evidence
+
+    async def _execute_answer_synthesis(
+        self,
+        *,
+        operation: Operation,
+        intent: DbIntent,
+        outcome_evidence: tuple[Evidence, ...],
+    ) -> tuple[Evidence, Task]:
+        existing = await self._latest_accepted_evidence(
+            operation.id,
+            "answer.synthesis",
+        )
+        if existing is not None:
+            task = next(
+                (
+                    item
+                    for item in await self.store.list_tasks(operation.id)
+                    if item.id == existing.task_id
+                ),
+                Task(
+                    id=str(existing.task_id or f"db-task-{uuid4()}"),
+                    operation_id=operation.id,
+                    capability_id="db.answer.synthesize",
+                    executor_id="db.answer.synthesize.runtime",
+                    required_evidence=frozenset({"answer.synthesis"}),
+                    metadata={"owner": "db_runtime", "reason": "answer_synthesis"},
+                ),
+            )
+            return existing, task
+
+        capability = self.registry.get_capability(
+            "db.answer.synthesize", owner="db_runtime"
+        )
+        dependencies = _synthesis_dependencies(operation, intent, outcome_evidence)
+        task_input = {
+            "evidence_refs": [
+                {
+                    "id": dependency.evidence_id,
+                    "kind": dependency.evidence_kind,
+                    "payload_fingerprint": dependency.payload_fingerprint,
+                }
+                for dependency in dependencies
+            ],
+            "row_budget": _synthesis_context_option(
+                self.config.metadata, "synthesis_row_budget", 25
+            ),
+            "char_budget": _synthesis_context_option(
+                self.config.metadata, "synthesis_context_char_budget", 16000
+            ),
+        }
+        input_hash = _stable_hash(task_input)
+        task = Task(
+            id=f"db-task-{uuid4()}",
+            operation_id=operation.id,
+            capability_id=capability.id,
+            executor_id=capability.executor,
+            input={**task_input, "input_hash": input_hash},
+            required_evidence=capability.output_evidence,
+            dependencies=dependencies,
+            metadata={
+                "owner": capability.owner,
+                "reason": "answer_synthesis",
+                "sequence": 10_000,
+                "input_hash": input_hash,
+                "idempotency_key": _stable_hash(
+                    {
+                        "operation_id": operation.id,
+                        "capability_id": capability.id,
+                        "evidence_refs": task_input["evidence_refs"],
+                    }
+                ),
+                "idempotent": capability.idempotent,
+                "replay_safe": capability.replay_safe,
+                "side_effecting": capability.side_effecting,
+            },
+        )
+        evidence = await self.execute_task(
+            task,
+            operation,
+            context={"capability_owner": capability.owner},
+        )
+        synthesis = next(
+            (
+                item
+                for item in evidence
+                if item.kind == "answer.synthesis" and item.accepted
+            ),
+            None,
+        )
+        if synthesis is None:
+            raise RuntimeError("answer.synthesis evidence was not produced")
+        stored_task = await self.store.load_task(task.id)
+        return synthesis, stored_task or task
+
+    def _validation_capability_for_sql_execute(
         self,
         capability: Capability,
     ) -> Capability | None:
-        if capability.id != "db.sql.execute_write":
+        if capability.id not in {"db.sql.execute_read", "db.sql.execute_write"}:
             return None
         try:
             return self.registry.get_capability(
@@ -1137,7 +2214,10 @@ class DbRuntime:
         *,
         validation_capability: Capability | None,
     ) -> tuple[Task, ...]:
-        if capability.id != "db.sql.execute_write" or validation_capability is None:
+        if (
+            capability.id not in {"db.sql.execute_read", "db.sql.execute_write"}
+            or validation_capability is None
+        ):
             task = self._task_for_capability(
                 operation,
                 capability,
@@ -1151,23 +2231,35 @@ class DbRuntime:
             validation_capability,
             input={
                 "sql": str(input.get("sql") or ""),
-                "operation": operation.operation_type,
+                "operation": (
+                    "query"
+                    if capability.id == "db.sql.execute_read"
+                    else operation.operation_type
+                ),
             },
             reason="direct_validation",
             sequence=1,
         )
-        write_task = self._task_for_capability(
-            operation,
-            capability,
-            input={
+        execute_input = (
+            {
                 "sql_ref": "sql.validation",
                 "params": list(input.get("params") or []),
-            },
+            }
+            if capability.id == "db.sql.execute_read"
+            else {
+                "sql_ref": "sql.validation",
+                "params": list(input.get("params") or []),
+            }
+        )
+        execute_task = self._task_for_capability(
+            operation,
+            capability,
+            input=execute_input,
             reason="direct",
             sequence=2,
             validation_task=validation_task,
         )
-        return (validation_task, write_task)
+        return (validation_task, execute_task)
 
     def _task_for_capability(
         self,
@@ -1310,7 +2402,10 @@ class DbRuntime:
         task: Task,
         operation: Operation,
     ) -> dict[str, Any]:
-        if task.capability_id != "db.sql.execute_write":
+        if task.capability_id not in {
+            "db.sql.execute_read",
+            "db.sql.execute_write",
+        }:
             return task.input
         validation_dependency = next(
             (
@@ -1384,7 +2479,10 @@ class DbRuntime:
         operation: Operation,
         task: Task | None,
     ) -> tuple[Evidence, ...]:
-        if task is None or task.capability_id != "db.sql.execute_write":
+        if task is None or task.capability_id not in {
+            "db.sql.execute_read",
+            "db.sql.execute_write",
+        }:
             return ()
         validation_dependency = next(
             (
@@ -1453,9 +2551,18 @@ class DbRuntime:
             )
             return
 
-        synthesis = self.synthesizer.synthesize(
-            request, intent, contract, evidence, verification
+        verification_evidence = await self._persist_verification_result_evidence(
+            snapshot.operation,
+            verification,
+            evidence,
         )
+        synthesis_evidence, synthesis_task = await self._execute_answer_synthesis(
+            operation=snapshot.operation,
+            intent=intent,
+            outcome_evidence=(*evidence, verification_evidence),
+        )
+        final_evidence = (*evidence, verification_evidence, synthesis_evidence)
+        final_tasks = (*tasks, synthesis_task) if synthesis_task not in tasks else tasks
         await self._record_operation_result(
             DbOperationResult(
                 operation_id=snapshot.operation.id,
@@ -1463,14 +2570,14 @@ class DbRuntime:
                 intent=intent,
                 contract=contract,
                 status=OperationStatus.SUCCEEDED,
-                answer=synthesis.answer,
-                evidence=evidence,
+                answer=_answer_from_synthesis_evidence(synthesis_evidence),
+                evidence=final_evidence,
                 diagnostics={
                     "verification": verification.to_dict(),
-                    "synthesis": synthesis.to_dict(),
+                    "synthesis": synthesis_evidence.payload,
                     "execution": {
-                        "task_count": len(tasks),
-                        "tasks": [task.to_dict() for task in tasks],
+                        "task_count": len(final_tasks),
+                        "tasks": [task.to_dict() for task in final_tasks],
                     },
                 },
             ),
@@ -1524,7 +2631,10 @@ class DbRuntime:
         capability: Capability | None = None,
         stage: str,
     ) -> _GovernancePersistence:
-        policies = self._active_governance_policies(contract)
+        policies = self._active_governance_policies(
+            contract,
+            capability=capability,
+        )
         current_evidence = tuple(await self.store.list_evidence(operation.id))
         current_approvals = tuple(await self.store.list_approval_requests(operation.id))
         authoritative_validation_evidence = (
@@ -1613,9 +2723,20 @@ class DbRuntime:
     def _active_governance_policies(
         self,
         contract: DbOperationContract | None,
+        *,
+        capability: Capability | None = None,
     ) -> tuple[Any, ...]:
         active_policy_ids = set(contract.policy_ids if contract is not None else ())
         policies: list[Any] = [*default_db_policies(), *self.config.policies]
+        if (
+            capability is not None
+            and capability.id == "db.answer.synthesize"
+            and capability.access is AccessMode.NONE
+            and not capability.side_effecting
+        ):
+            # Final prose consumes already-governed evidence and never touches
+            # connector state, so extension policies stay scoped to DB work.
+            return tuple(policies)
 
         for policy in self.registry.policies:
             identity = f"{policy.owner}:{policy.id}"
@@ -1971,8 +3092,69 @@ def _operation_has_run_context(operation: Operation) -> bool:
     return isinstance(operation.metadata.get("resume_context"), dict)
 
 
+def _snapshot_has_incomplete_analysis(snapshot: OperationSnapshot) -> bool:
+    has_plan = any(
+        evidence.kind == "analysis.plan" and evidence.accepted
+        for evidence in snapshot.evidence
+    )
+    has_validation = any(
+        evidence.kind == "analysis.plan.validation"
+        and evidence.accepted
+        and evidence.payload.get("valid") is True
+        for evidence in snapshot.evidence
+    )
+    has_synthesis = any(
+        evidence.kind == "analysis.synthesis" and evidence.accepted
+        for evidence in snapshot.evidence
+    )
+    return has_plan and has_validation and not has_synthesis
+
+
 def _has_running_tasks(tasks: tuple[Task, ...]) -> bool:
     return any(task.status is TaskStatus.RUNNING for task in tasks)
+
+
+def _analysis_budget_usage(
+    evidence: tuple[Evidence, ...],
+    *,
+    started_at: float,
+) -> dict[str, Any]:
+    return {
+        "total_rows": sum(
+            _analysis_query_result_rows(item)
+            for item in evidence
+            if item.kind == "query.result" and item.accepted
+        ),
+        "llm_calls": sum(1 for item in evidence if _analysis_evidence_used_llm(item)),
+        "context_chars": sum(
+            len(str(item.payload.get("rendered_context") or ""))
+            for item in evidence
+            if item.kind == "planning.context" and item.accepted
+        ),
+        "duration_seconds": time.monotonic() - started_at,
+    }
+
+
+def _analysis_query_result_rows(evidence: Evidence) -> int:
+    rows = evidence.payload.get("rows")
+    if isinstance(rows, list):
+        return len(rows)
+    try:
+        return int(evidence.payload.get("total_rows") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _analysis_evidence_used_llm(evidence: Evidence) -> bool:
+    if not evidence.accepted:
+        return False
+    diagnostics = evidence.payload.get("diagnostics")
+    if isinstance(diagnostics, dict) and diagnostics.get("mode") == "llm":
+        return True
+    planner_diagnostics = evidence.payload.get("planner_diagnostics")
+    return isinstance(planner_diagnostics, dict) and bool(
+        planner_diagnostics.get("model") or planner_diagnostics.get("provider")
+    )
 
 
 def _db_request_context(request: DbRequest) -> dict[str, Any]:
@@ -2085,11 +3267,147 @@ def _db_contract_from_context(operation: Operation) -> DbOperationContract:
 
 def _planned_task_input(operation: Operation, capability: Capability) -> dict[str, Any]:
     prompt = str(operation.request.get("prompt") or "")
-    if capability.id == "db.sql.execute_write":
+    if capability.id in {"db.sql.execute_read", "db.sql.execute_write"}:
         return {"sql_ref": "sql.validation"}
     if capability.id == "db.sql.validate":
         return {"sql": prompt, "operation": operation.operation_type}
     return {"prompt": prompt}
+
+
+def _synthesis_dependencies(
+    operation: Operation,
+    intent: DbIntent,
+    evidence: tuple[Evidence, ...],
+) -> tuple[TaskDependency, ...]:
+    accepted = tuple(
+        item
+        for item in evidence
+        if item.accepted and item.operation_id == operation.id and item.id
+    )
+    dependencies: list[TaskDependency] = []
+    if intent.kind in {
+        DbIntentKind.DATA_QUERY,
+        DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
+    }:
+        _append_dependency_for_kind(dependencies, accepted, "planning.context")
+        if not any(item.evidence_kind == "planning.context" for item in dependencies):
+            _append_dependency_for_any(
+                dependencies,
+                accepted,
+                ("schema.asset_profile", "catalog.source", "schema.search_result"),
+            )
+        for kind in (
+            "query.result",
+            "query.plan.proposal",
+            "query.plan.validation",
+            "sql.validation",
+            "verification.result",
+        ):
+            _append_dependency_for_kind(dependencies, accepted, kind)
+    elif intent.kind is DbIntentKind.SCHEMA_QUERY:
+        _append_dependency_for_any(
+            dependencies,
+            accepted,
+            (
+                "planning.context",
+                "schema.asset_profile",
+                "catalog.source",
+                "schema.search_result",
+                "catalog.asset.profile",
+            ),
+        )
+        _append_dependency_for_kind(dependencies, accepted, "verification.result")
+    else:
+        _append_dependency_for_kind(dependencies, accepted, "verification.result")
+    seen: set[tuple[str | None, str | None]] = set()
+    unique: list[TaskDependency] = []
+    for dependency in dependencies:
+        key = (dependency.evidence_kind, dependency.evidence_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(dependency)
+    return tuple(unique)
+
+
+def _append_dependency_for_kind(
+    dependencies: list[TaskDependency],
+    evidence: tuple[Evidence, ...],
+    kind: str,
+) -> None:
+    item = next(
+        (candidate for candidate in reversed(evidence) if candidate.kind == kind),
+        None,
+    )
+    if item is not None:
+        dependencies.append(_dependency_for_evidence(item))
+
+
+def _append_dependency_for_any(
+    dependencies: list[TaskDependency],
+    evidence: tuple[Evidence, ...],
+    kinds: tuple[str, ...],
+) -> None:
+    for kind in kinds:
+        item = next(
+            (candidate for candidate in reversed(evidence) if candidate.kind == kind),
+            None,
+        )
+        if item is not None:
+            dependencies.append(_dependency_for_evidence(item))
+            return
+    catalog = next(
+        (
+            candidate
+            for candidate in reversed(evidence)
+            if candidate.kind.startswith("catalog.")
+        ),
+        None,
+    )
+    if catalog is not None:
+        dependencies.append(_dependency_for_evidence(catalog))
+
+
+def _dependency_for_evidence(evidence: Evidence) -> TaskDependency:
+    return TaskDependency(
+        kind="evidence",
+        evidence_kind=evidence.kind,
+        evidence_id=evidence.id,
+        evidence_owner=evidence.owner,
+        producer_task_id=evidence.task_id,
+        evidence_accepted=True,
+        operation_id=evidence.operation_id,
+        payload_fingerprint=evidence.metadata.get("payload_fingerprint")
+        or _payload_fingerprint(evidence.payload),
+    )
+
+
+def _synthesis_context_option(
+    metadata: dict[str, Any],
+    key: str,
+    default: int,
+) -> int:
+    options = metadata.get("from_db_options")
+    if isinstance(options, dict) and options.get(key) is not None:
+        try:
+            return int(options[key])
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
+def _answer_from_synthesis_evidence(evidence: Evidence) -> str:
+    answer = evidence.payload.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        raise RuntimeError("accepted answer.synthesis evidence is missing answer")
+    return answer
+
+
+def _answer_from_analysis_synthesis_evidence(evidence: Evidence) -> str:
+    answer = evidence.payload.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        raise RuntimeError("accepted analysis.synthesis evidence is missing answer")
+    return answer
 
 
 def _task_dependencies_for_capability(
@@ -2098,28 +3416,31 @@ def _task_dependencies_for_capability(
     *,
     validation_task: Task | None = None,
 ) -> tuple[TaskDependency, ...]:
-    if capability.id != "db.sql.execute_write":
+    if capability.id not in {"db.sql.execute_read", "db.sql.execute_write"}:
         return ()
-    return (
-        TaskDependency(
-            kind="evidence",
-            evidence_kind="sql.validation",
-            evidence_owner=(
-                validation_task.metadata.get("owner") if validation_task else None
-            ),
-            producer_task_id=validation_task.id if validation_task else None,
-            producer_capability_id=(
-                validation_task.capability_id if validation_task else "db.sql.validate"
-            ),
-            producer_executor_id=(
-                validation_task.executor_id if validation_task else None
-            ),
-            evidence_payload={"valid": True},
-            operation_id=operation.id,
-            input_hash=(
-                validation_task.metadata.get("input_hash") if validation_task else None
-            ),
+    if capability.id == "db.sql.execute_read" and validation_task is None:
+        return ()
+    validation_dependency = TaskDependency(
+        kind="evidence",
+        evidence_kind="sql.validation",
+        evidence_owner=(
+            validation_task.metadata.get("owner") if validation_task else None
         ),
+        producer_task_id=validation_task.id if validation_task else None,
+        producer_capability_id=(
+            validation_task.capability_id if validation_task else "db.sql.validate"
+        ),
+        producer_executor_id=(validation_task.executor_id if validation_task else None),
+        evidence_payload={"valid": True},
+        operation_id=operation.id,
+        input_hash=(
+            validation_task.metadata.get("input_hash") if validation_task else None
+        ),
+    )
+    if capability.id == "db.sql.execute_read":
+        return (validation_dependency,)
+    return (
+        validation_dependency,
         TaskDependency(
             kind="approval",
             approval_status=ApprovalStatus.APPROVED,

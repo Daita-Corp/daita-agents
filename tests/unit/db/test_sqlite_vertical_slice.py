@@ -87,10 +87,10 @@ async def test_sqlite_read_query_returns_typed_query_result_through_runtime():
     assert validation[0].kind == "sql.validation"
     assert validation[0].payload["valid"] is True
     assert validation[0].payload["tables"] == ["orders"]
-    assert result[0].kind == "query.result"
-    assert result[0].owner == "sqlite"
-    assert result[0].payload["rows"] == [{"order_count": 1}]
-    assert result[0].payload["sql"].endswith("LIMIT 10")
+    query_result = next(item for item in result if item.kind == "query.result")
+    assert query_result.owner == "sqlite"
+    assert query_result.payload["rows"] == [{"order_count": 1}]
+    assert query_result.payload["sql"].endswith("LIMIT 10")
 
 
 async def test_sqlite_and_catalog_vertical_slice_through_db_runtime():
@@ -136,8 +136,8 @@ async def test_sqlite_and_catalog_vertical_slice_through_db_runtime():
     assert registered[0].payload["store_id"] == "store:sqlite"
     assert search[0].kind == "schema.search_result"
     assert search[0].payload["tables"][0]["name"] == "customers"
-    assert query[0].kind == "query.result"
-    assert query[0].payload["rows"] == [{"email": "ada@example.com"}]
+    query_result = next(item for item in query if item.kind == "query.result")
+    assert query_result.payload["rows"] == [{"email": "ada@example.com"}]
 
 
 async def test_sqlite_explain_and_write_executors_return_typed_evidence():
@@ -175,7 +175,7 @@ async def test_sqlite_explain_and_write_executors_return_typed_evidence():
     finally:
         await runtime.teardown()
 
-    assert plan[0].kind == "query.plan"
+    assert plan[0].kind == "sql.explain.plan"
     assert plan[0].payload["plan"]
     assert write[0].kind == "write.execution"
     assert write[0].payload["affected_rows"] == 1

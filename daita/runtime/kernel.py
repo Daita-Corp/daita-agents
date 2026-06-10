@@ -1451,10 +1451,25 @@ class RuntimeKernel:
             task_id=evidence.task_id or task.id,
             metadata={
                 **evidence.metadata,
+                **_evidence_trace_metadata(task.metadata),
                 "payload_fingerprint": _payload_fingerprint(evidence.payload),
                 "task_input_hash": task.metadata.get("input_hash"),
             },
         )
+
+
+def _evidence_trace_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    trace_metadata = metadata.get("evidence_trace_metadata")
+    if isinstance(trace_metadata, Mapping):
+        return {str(key): value for key, value in trace_metadata.items()}
+    trace_keys = metadata.get("evidence_trace_keys")
+    if not isinstance(trace_keys, (list, tuple, set)):
+        return {}
+    return {
+        str(key): metadata[key]
+        for key in trace_keys
+        if key in metadata and metadata[key] is not None
+    }
 
 
 def _metadata_without_active_lease(metadata: Mapping[str, Any]) -> dict[str, Any]:

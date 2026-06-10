@@ -136,7 +136,7 @@ class MySQLPlugin(BaseDatabasePlugin):
             MySQLExecutor(
                 id="mysql.sql.explain",
                 capability_ids=frozenset({"db.sql.explain"}),
-                evidence_kind="query.plan",
+                evidence_kind="sql.explain.plan",
                 handler=self._execute_sql_explain,
             ),
         )

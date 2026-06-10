@@ -1049,10 +1049,13 @@ async def test_resume_run_operation_uses_persisted_plan_context_for_completion()
     assert [task.status for task in resumed.tasks] == [
         TaskStatus.SUCCEEDED,
         TaskStatus.SUCCEEDED,
+        TaskStatus.SUCCEEDED,
     ]
     assert {item.kind for item in resumed.evidence} == {
         "sql.validation",
         "write.execution",
+        "verification.result",
+        "answer.synthesis",
     }
     write_task = next(
         task for task in resumed.tasks if task.capability_id == "db.sql.execute_write"
@@ -1436,10 +1439,13 @@ async def test_approved_write_resume_survives_sqlite_store_restart(tmp_path):
     assert [task.status for task in resumed.tasks] == [
         TaskStatus.SUCCEEDED,
         TaskStatus.SUCCEEDED,
+        TaskStatus.SUCCEEDED,
     ]
     assert {item.kind for item in resumed.evidence} == {
         "sql.validation",
         "write.execution",
+        "verification.result",
+        "answer.synthesis",
     }
     assert resumed.approval_requests[0].status is ApprovalStatus.APPROVED
     assert (
@@ -1449,6 +1455,6 @@ async def test_approved_write_resume_survives_sqlite_store_restart(tmp_path):
         )
         == blocked_audit_ids
     )
-    assert len(resumed.governance_audit_records) == len(blocked_audit_ids) + 2
+    assert len(resumed.governance_audit_records) == len(blocked_audit_ids) + 3
     assert resumed.governance_audit_records[0].pending_approval is True
     assert resumed.governance_audit_records[-1].allowed is True

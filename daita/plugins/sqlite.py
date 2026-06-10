@@ -171,7 +171,7 @@ class SQLitePlugin(BaseDatabasePlugin):
                 id="sqlite.sql.explain",
                 owner="sqlite",
                 capability_ids=frozenset({"db.sql.explain"}),
-                evidence_kind="query.plan",
+                evidence_kind="sql.explain.plan",
                 handler=self._execute_sql_explain,
             ),
         )

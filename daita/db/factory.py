@@ -18,6 +18,7 @@ from daita.plugins.sqlite import SQLitePlugin
 
 from .agent import DbAgent
 from .memory import calibrate_db_memory
+from .llm_service import db_llm_service_from_config
 from .models import DbLimits, DbRuntimeConfig
 from .runtime import DbRuntime
 
@@ -188,7 +189,18 @@ async def from_db(
         policies=db_config.policies,
         metadata=runtime_metadata,
     )
-    runtime = DbRuntime(source=source, config=runtime_config)
+    db_llm_service = db_llm_service_from_config(
+        model=model,
+        llm_provider=llm_provider,
+        api_key=api_key,
+        temperature=temperature,
+        agent_id=name,
+    )
+    runtime = DbRuntime(
+        source=source,
+        config=runtime_config,
+        db_llm_service=db_llm_service if db_llm_service.available else None,
+    )
     try:
         await runtime.setup(agent_id=name)
         if calibrate_memory:
