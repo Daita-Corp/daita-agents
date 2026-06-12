@@ -19,6 +19,8 @@ from .base_discoverer import (
 from .base_profiler import (
     BaseProfiler,
     NormalizedColumn,
+    NormalizedColumnValue,
+    NormalizedColumnValueProfile,
     NormalizedForeignKey,
     NormalizedIndex,
     NormalizedSchema,
@@ -38,6 +40,8 @@ __all__ = [
     "DiscoveryResult",
     "BaseProfiler",
     "NormalizedColumn",
+    "NormalizedColumnValue",
+    "NormalizedColumnValueProfile",
     "NormalizedForeignKey",
     "NormalizedIndex",
     "NormalizedSchema",

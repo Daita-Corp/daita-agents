@@ -19,8 +19,18 @@ async def test_postgresql_registers_provider_neutral_db_capabilities():
     assert "postgresql:db.sql.execute_read" in inspection.capability_ids
     assert "postgresql:db.sql.execute_write" in inspection.capability_ids
     assert "postgresql:db.sql.explain" in inspection.capability_ids
+    assert "postgresql:db.column_values.profile" in inspection.capability_ids
     assert "postgresql.sql.execute_read" in inspection.executor_ids
     assert "postgresql:query.result" in inspection.evidence_schema_kinds
+    assert "postgresql:column_values.profile" in inspection.evidence_schema_kinds
+    profile_capability = runtime.registry.get_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+    )
+    policy = profile_capability.metadata["profile_policy"]
+    assert policy["bounded_aggregate"] is True
+    assert policy["fingerprint_only_supported"] is True
+    assert policy["profile_only_readable_tables"] is True
 
 
 def test_db_runtime_selects_postgresql_owned_capabilities_for_postgresql_source():
@@ -158,6 +168,346 @@ async def test_postgresql_sql_executors_return_typed_evidence_without_live_db():
     assert plan[0].payload["plan"] == [{"QUERY PLAN": "Seq Scan on orders"}]
     assert write[0].kind == "write.execution"
     assert write[0].payload["affected_rows"] == 3
+
+
+async def test_postgresql_column_value_profile_uses_bounded_aggregate_sql():
+    postgres = _postgres()
+    captured = []
+
+    async def fake_query(sql, params=None):
+        captured.append((sql, params))
+        if "COUNT(DISTINCT" in sql:
+            return [
+                {
+                    "row_count": 3,
+                    "null_count": 0,
+                    "distinct_count": 2,
+                    "max_value_length": 8,
+                }
+            ]
+        return [
+            {"value": "complete", "count": 2},
+            {"value": "pending", "count": 1},
+        ]
+
+    postgres.query = fake_query
+    postgres.connect = _noop_connect
+    runtime = DbRuntime(plugins=(CatalogPlugin(auto_persist=False), postgres))
+
+    raw_profile = await runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={"table": "orders", "column": "status", "max_values": 25},
+    )
+    registered = await runtime.execute_capability(
+        "catalog.source.register",
+        owner="catalog",
+        operation_type="schema.register",
+        input={
+            "schema": {
+                "database_type": "postgresql",
+                "database_name": "shop",
+                "tables": [
+                    {
+                        "name": "orders",
+                        "columns": [
+                            {"name": "id", "data_type": "integer"},
+                            {"name": "status", "data_type": "text"},
+                        ],
+                    }
+                ],
+            },
+            "store_type": "postgresql",
+            "store_id": "store:pg",
+            "persist": False,
+        },
+    )
+    catalog_profile = await runtime.execute_capability(
+        "catalog.column_values.register",
+        owner="catalog",
+        operation_type="source.profile",
+        input={
+            "store_id": "store:pg",
+            "profiles": [raw_profile[0].payload],
+            "source_evidence_id": raw_profile[0].id,
+        },
+    )
+
+    assert raw_profile[0].kind == "column_values.profile"
+    assert raw_profile[0].owner == "postgresql"
+    assert raw_profile[0].payload["table"] == "orders"
+    assert raw_profile[0].payload["schema"] == "public"
+    assert raw_profile[0].payload["top_values"] == [
+        {"value": "complete", "count": 2},
+        {"value": "pending", "count": 1},
+    ]
+    assert raw_profile[0].payload["source_fingerprint"]
+    assert raw_profile[0].payload["policy"]["policy_owner"] == "postgresql"
+    assert raw_profile[0].payload["policy"]["bounded_aggregate"] is True
+    assert raw_profile[0].payload["policy"]["profile_only_readable_tables"] is True
+    assert "max_profile_rows" in raw_profile[0].payload["policy"]["eligibility_checks"]
+    stats_sql = captured[0][0]
+    values_sql = captured[1][0]
+    assert 'FROM "public"."orders"' in stats_sql
+    assert 'COUNT(DISTINCT "status")::bigint AS distinct_count' in stats_sql
+    assert 'GROUP BY "status"' in values_sql
+    assert values_sql.endswith("LIMIT 25")
+    assert registered[0].kind == "catalog.source_registered"
+    assert catalog_profile[0].kind == "schema.column_value_profile"
+    assert (
+        catalog_profile[0].payload["profiles"][0]["source_evidence_id"]
+        == raw_profile[0].id
+    )
+
+
+async def test_postgresql_column_value_profile_fingerprint_only_uses_catalog_stats():
+    postgres = _postgres()
+    captured = []
+
+    async def fake_query(sql, params=None):
+        captured.append(sql)
+        assert "COUNT(DISTINCT" not in sql
+        return [
+            {
+                "table_oid": "123",
+                "relfilenode": "456",
+                "relpages": 2,
+                "reltuples": 3,
+                "n_tup_ins": 4,
+                "n_tup_upd": 5,
+                "n_tup_del": 6,
+            }
+        ]
+
+    postgres.query = fake_query
+    postgres.connect = _noop_connect
+    runtime = DbRuntime(plugins=(postgres,))
+
+    fingerprint = await runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={
+            "table": "orders",
+            "column": "status",
+            "fingerprint_only": True,
+        },
+    )
+
+    assert fingerprint[0].kind == "column_values.profile"
+    assert fingerprint[0].payload["profile_status"] == "fingerprint"
+    assert fingerprint[0].payload["profile_kind"] == "source_fingerprint"
+    assert fingerprint[0].payload["source_fingerprint"]
+    assert "n_tup_ins:4" in fingerprint[0].payload["source_revision"]
+    assert fingerprint[0].payload["source_fingerprint_status"] == "best_effort"
+    assert (
+        fingerprint[0].payload["source_fingerprint_reason"]
+        == "postgresql_catalog_stats"
+    )
+    assert "FROM pg_class" in captured[0]
+
+
+async def test_postgresql_column_value_profile_fingerprint_unavailable_has_no_fake_revision():
+    postgres = _postgres()
+
+    async def fake_query(sql, params=None):
+        raise RuntimeError("stats unavailable")
+
+    postgres.query = fake_query
+    postgres.connect = _noop_connect
+    runtime = DbRuntime(plugins=(postgres,))
+
+    fingerprint = await runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={
+            "table": "orders",
+            "column": "status",
+            "fingerprint_only": True,
+        },
+    )
+
+    assert fingerprint[0].payload["profile_status"] == "fingerprint"
+    assert fingerprint[0].payload["source_fingerprint_status"] == "unavailable"
+    assert (
+        fingerprint[0].payload["source_fingerprint_reason"]
+        == "postgresql_stats_unavailable"
+    )
+    assert "source_revision" not in fingerprint[0].payload
+    assert "source_fingerprint" not in fingerprint[0].payload
+
+
+async def test_postgresql_column_value_profile_fingerprint_only_respects_blocked_table():
+    postgres = PostgreSQLPlugin(
+        connection_string="postgresql://localhost/testdb",
+        blocked_tables=["orders"],
+    )
+
+    async def fail_query(sql, params=None):
+        raise AssertionError("blocked table should not be queried")
+
+    postgres.query = fail_query
+    postgres.connect = _noop_connect
+    runtime = DbRuntime(plugins=(postgres,))
+
+    full_profile = await runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={"table": "orders", "column": "status"},
+    )
+    fingerprint = await runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={
+            "table": "orders",
+            "column": "status",
+            "fingerprint_only": True,
+        },
+    )
+
+    for evidence in (full_profile[0], fingerprint[0]):
+        assert evidence.payload["profile_status"] == "skipped"
+        assert evidence.payload["skipped_reason"] == "blocked_table"
+        assert evidence.payload["top_values"] == []
+        assert "source_revision" not in evidence.payload
+        assert "source_fingerprint" not in evidence.payload
+        assert "row_count" not in evidence.payload
+
+
+async def test_postgresql_column_value_profile_fingerprint_only_respects_sensitive_column():
+    postgres = _postgres()
+
+    async def fail_query(sql, params=None):
+        raise AssertionError("sensitive column should not be queried")
+
+    postgres.query = fail_query
+    postgres.connect = _noop_connect
+    runtime = DbRuntime(plugins=(postgres,))
+
+    full_profile = await runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={"table": "customers", "column": "email"},
+    )
+    fingerprint = await runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={
+            "table": "customers",
+            "column": "email",
+            "fingerprint_only": True,
+        },
+    )
+
+    for evidence in (full_profile[0], fingerprint[0]):
+        assert evidence.payload["profile_status"] == "skipped"
+        assert evidence.payload["redacted"] is True
+        assert evidence.payload["skipped_reason"] == "sensitive_or_blocked_column"
+        assert evidence.payload["top_values"] == []
+        assert "source_revision" not in evidence.payload
+        assert "source_fingerprint" not in evidence.payload
+        assert "row_count" not in evidence.payload
+
+
+async def test_postgresql_column_value_profile_handles_schema_qualified_table():
+    postgres = _postgres()
+    captured = []
+
+    async def fake_query(sql, params=None):
+        captured.append(sql)
+        if "COUNT(DISTINCT" in sql:
+            return [
+                {
+                    "row_count": 1,
+                    "null_count": 0,
+                    "distinct_count": 1,
+                    "max_value_length": 4,
+                }
+            ]
+        return [{"value": "open", "count": 1}]
+
+    postgres.query = fake_query
+    postgres.connect = _noop_connect
+    runtime = DbRuntime(plugins=(postgres,))
+
+    evidence = await runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={"table": "tenant.orders", "column": "state", "max_values": 5},
+    )
+
+    assert evidence[0].payload["table"] == "tenant.orders"
+    assert evidence[0].payload["schema"] == "tenant"
+    assert 'FROM "tenant"."orders"' in captured[0]
+    assert captured[1].endswith("LIMIT 5")
+
+
+async def test_postgresql_column_value_profile_skips_sensitive_columns_without_query():
+    postgres = _postgres()
+
+    async def fake_query(sql, params=None):
+        raise AssertionError("sensitive column should not be queried")
+
+    postgres.query = fake_query
+    postgres.connect = _noop_connect
+    runtime = DbRuntime(plugins=(postgres,))
+
+    evidence = await runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={"table": "customers", "column": "email"},
+    )
+
+    assert evidence[0].payload["profile_status"] == "skipped"
+    assert evidence[0].payload["redacted"] is True
+    assert evidence[0].payload["skipped_reason"] == "sensitive_or_blocked_column"
+
+
+async def test_postgresql_column_value_profile_skips_when_row_count_exceeds_limit():
+    postgres = _postgres()
+    captured = []
+
+    async def fake_query(sql, params=None):
+        captured.append(sql)
+        if "COUNT(DISTINCT" not in sql:
+            raise AssertionError("value aggregation should not run after row limit")
+        return [
+            {
+                "row_count": 10,
+                "null_count": 0,
+                "distinct_count": 2,
+                "max_value_length": 8,
+            }
+        ]
+
+    postgres.query = fake_query
+    postgres.connect = _noop_connect
+    runtime = DbRuntime(plugins=(postgres,))
+
+    evidence = await runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={
+            "table": "orders",
+            "column": "status",
+            "max_profile_rows": 2,
+        },
+    )
+
+    assert len(captured) == 1
+    assert evidence[0].payload["profile_status"] == "skipped"
+    assert evidence[0].payload["skipped_reason"] == "row_count_exceeds_profile_limit"
+    assert evidence[0].payload["row_count"] == 10
+    assert evidence[0].payload["top_values"] == []
 
 
 async def _noop_connect() -> None:

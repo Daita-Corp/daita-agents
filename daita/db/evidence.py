@@ -27,6 +27,12 @@ class DbEvidenceStore:
         for item in evidence:
             self.add(item)
 
+    def discard(self, evidence_id: str | None) -> None:
+        """Remove one evidence item from the accepted operation view."""
+        if not evidence_id:
+            return
+        self._items = [item for item in self._items if item.id != evidence_id]
+
     def list(self) -> tuple[Evidence, ...]:
         """Return accepted evidence in insertion order."""
         return tuple(self._items)

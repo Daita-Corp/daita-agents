@@ -36,6 +36,7 @@ PLANNING_CONTEXT_EVIDENCE = "planning.context"
 QUERY_PLAN_PROPOSAL_EVIDENCE = "query.plan.proposal"
 QUERY_PLAN_VALIDATION_EVIDENCE = "query.plan.validation"
 QUERY_PLAN_REPAIR_EVIDENCE = "query.plan.repair"
+QUERY_ZERO_ROW_DIAGNOSIS_EVIDENCE = "query.zero_row_diagnosis"
 SQL_VALIDATION_EVIDENCE = "sql.validation"
 QUERY_RESULT_EVIDENCE = "query.result"
 

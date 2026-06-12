@@ -38,6 +38,54 @@ def _json_dict(value: Mapping[str, Any] | None) -> dict[str, Any]:
     return copied
 
 
+def _join_columns_from_text(
+    text: str | None,
+    *,
+    left_table: str,
+    right_table: str,
+) -> tuple[str, str] | None:
+    if not text or not left_table or not right_table:
+        return None
+    normalized = text.replace("->", "=")
+    if normalized.count("=") != 1:
+        return None
+    left_ref, right_ref = (
+        _parse_column_ref(part) for part in normalized.split("=", maxsplit=1)
+    )
+    if left_ref is None or right_ref is None:
+        return None
+    left_ref_table, left_ref_column = left_ref
+    right_ref_table, right_ref_column = right_ref
+    left_key = left_table.lower()
+    right_key = right_table.lower()
+    if left_ref_table == left_key and right_ref_table == right_key:
+        return left_ref_column, right_ref_column
+    if left_ref_table == right_key and right_ref_table == left_key:
+        return right_ref_column, left_ref_column
+    return None
+
+
+def _parse_column_ref(value: str) -> tuple[str, str] | None:
+    cleaned = value.strip().strip(";")
+    for token in ('"', "`", "[", "]"):
+        cleaned = cleaned.replace(token, "")
+    parts = [part.strip().lower() for part in cleaned.split(".") if part.strip()]
+    if len(parts) < 2:
+        return None
+    return parts[-2], parts[-1]
+
+
+def _column_from_join_key(value: Any) -> str:
+    if value is None:
+        return ""
+    cleaned = str(value).strip()
+    if not cleaned:
+        return ""
+    for token in ('"', "`", "[", "]"):
+        cleaned = cleaned.replace(token, "")
+    return cleaned.split(".")[-1].strip()
+
+
 @dataclass(frozen=True)
 class DbJoinSpec:
     """Join relationship proposed by a planner."""
@@ -50,16 +98,34 @@ class DbJoinSpec:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "DbJoinSpec":
+        left_table = str(value.get("left_table") or "")
+        right_table = str(value.get("right_table") or "")
+        left_column = str(value.get("left_column") or "") or _column_from_join_key(
+            value.get("left_key")
+        )
+        right_column = str(value.get("right_column") or "") or _column_from_join_key(
+            value.get("right_key")
+        )
+        relationship_ref = (
+            str(value["relationship_ref"])
+            if value.get("relationship_ref")
+            else str(value["relationship"]) if value.get("relationship") else None
+        )
+        if not left_column or not right_column:
+            inferred = _join_columns_from_text(
+                relationship_ref or str(value.get("condition") or ""),
+                left_table=left_table,
+                right_table=right_table,
+            )
+            if inferred is not None:
+                left_column = left_column or inferred[0]
+                right_column = right_column or inferred[1]
         return cls(
-            left_table=str(value.get("left_table") or ""),
-            left_column=str(value.get("left_column") or ""),
-            right_table=str(value.get("right_table") or ""),
-            right_column=str(value.get("right_column") or ""),
-            relationship_ref=(
-                str(value["relationship_ref"])
-                if value.get("relationship_ref")
-                else None
-            ),
+            left_table=left_table,
+            left_column=left_column,
+            right_table=right_table,
+            right_column=right_column,
+            relationship_ref=relationship_ref,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -195,6 +261,7 @@ class DbQueryPlan:
         sql: str | None,
         tables: tuple[str, ...] = (),
         columns: tuple[str, ...] = (),
+        filters: tuple[DbFilterSpec, ...] = (),
         confidence: float = 0.85,
         strategy: str = "deterministic",
         assumptions: tuple[str, ...] = (),
@@ -218,6 +285,7 @@ class DbQueryPlan:
             selected_sql=sql,
             candidates=candidates,
             selected_tables=tables,
+            filters=filters,
             assumptions=assumptions,
             confidence=confidence if sql else 0.0,
             planner="deterministic",

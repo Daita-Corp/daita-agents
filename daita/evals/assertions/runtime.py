@@ -91,6 +91,71 @@ def capability_assertions(
                 related_task_ids=[task.id for task in evidence.tasks],
             )
         )
+    if (
+        exp.capabilities.exact_sequence
+        and capabilities != exp.capabilities.exact_sequence
+    ):
+        results.append(
+            fail(
+                "capabilities.exact_sequence",
+                "capability_sequence_mismatch",
+                "Runtime capability sequence did not match exactly.",
+                "expectations.capabilities.exact_sequence",
+                observed=capabilities,
+                expected=exp.capabilities.exact_sequence,
+                related_task_ids=[task.id for task in evidence.tasks],
+            )
+        )
+    if exp.capabilities.allowed_sequences and capabilities not in (
+        exp.capabilities.allowed_sequences
+    ):
+        results.append(
+            fail(
+                "capabilities.allowed_sequences",
+                "capability_sequence_not_allowed",
+                "Runtime capability sequence was not in the allowed set.",
+                "expectations.capabilities.allowed_sequences",
+                observed=capabilities,
+                expected=exp.capabilities.allowed_sequences,
+                related_task_ids=[task.id for task in evidence.tasks],
+            )
+        )
+    for index, subsequence in enumerate(exp.capabilities.forbidden_subsequences):
+        matched_indexes = _find_subsequence(capabilities, subsequence)
+        if matched_indexes:
+            results.append(
+                fail(
+                    f"capabilities.forbidden_subsequences[{index}]",
+                    "forbidden_capability_subsequence",
+                    "Forbidden capability subsequence was observed.",
+                    f"expectations.capabilities.forbidden_subsequences[{index}]",
+                    observed=[capabilities[i] for i in matched_indexes],
+                    expected=f"not {subsequence}",
+                    related_task_ids=[
+                        evidence.tasks[i].id
+                        for i in matched_indexes
+                        if i < len(evidence.tasks)
+                    ],
+                )
+            )
+    for capability_id, limit in exp.capabilities.max_per_capability.items():
+        matched = [
+            task.id
+            for task in evidence.tasks
+            if matches(capability_id, task.capability_id)
+        ]
+        if len(matched) > limit:
+            results.append(
+                fail(
+                    f"capabilities.max_per_capability.{capability_id}",
+                    "too_many_capability_calls_by_id",
+                    f"Capability {capability_id} executed too many times.",
+                    f"expectations.capabilities.max_per_capability.{capability_id}",
+                    observed=len(matched),
+                    expected=limit,
+                    related_task_ids=matched,
+                )
+            )
     return results
 
 
@@ -135,6 +200,24 @@ def task_assertions(exp: Expectations, evidence: RunEvidence) -> list[AssertionR
                     observed=[task.status for task in errored],
                     expected=exp.tasks.max_errors,
                     related_task_ids=[task.id for task in errored],
+                )
+            )
+    for capability_id, limit in exp.tasks.max_per_capability.items():
+        matched = [
+            task.id
+            for task in evidence.tasks
+            if matches(capability_id, task.capability_id)
+        ]
+        if len(matched) > limit:
+            results.append(
+                fail(
+                    f"tasks.max_per_capability.{capability_id}",
+                    "too_many_tasks_by_capability",
+                    f"Task capability {capability_id} was observed too many times.",
+                    f"expectations.tasks.max_per_capability.{capability_id}",
+                    observed=len(matched),
+                    expected=limit,
+                    related_task_ids=matched,
                 )
             )
     return results
@@ -200,6 +283,20 @@ def evidence_assertions(
                     f"expectations.evidence.forbidden_owners[{index}]",
                     observed=owner,
                     expected=f"not {owner}",
+                    related_evidence_ids=[item for item in matched if item],
+                )
+            )
+    for kind, limit in exp.evidence.max_per_kind.items():
+        matched = [record.id or "" for record in records if matches(kind, record.kind)]
+        if len(matched) > limit:
+            results.append(
+                fail(
+                    f"evidence.max_per_kind.{kind}",
+                    "too_many_evidence_records_by_kind",
+                    f"Evidence kind {kind} was produced too many times.",
+                    f"expectations.evidence.max_per_kind.{kind}",
+                    observed=len(matched),
+                    expected=limit,
                     related_evidence_ids=[item for item in matched if item],
                 )
             )
@@ -385,3 +482,14 @@ def _policy_ids(decisions: list[dict]) -> list[str]:
         for item in decisions
         if item.get("policy_id") or item.get("id")
     ]
+
+
+def _find_subsequence(sequence: list[str], subsequence: list[str]) -> list[int]:
+    if not subsequence or len(subsequence) > len(sequence):
+        return []
+    end = len(sequence) - len(subsequence) + 1
+    for start in range(end):
+        indexes = list(range(start, start + len(subsequence)))
+        if [sequence[index] for index in indexes] == subsequence:
+            return indexes
+    return []

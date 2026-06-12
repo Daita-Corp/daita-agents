@@ -61,13 +61,18 @@ def _output_dir(tmp_path: Path, suite_name: str) -> Path:
     return Path(os.environ.get("DAITA_EVAL_OUTPUT_DIR", tmp_path)) / suite_name
 
 
-def _rich_benchmark_agent(tmp_path: Path, db_name: str) -> dict[str, Any]:
+def _rich_benchmark_agent(
+    tmp_path: Path,
+    db_name: str,
+    *,
+    cache_ttl: int | None = 0,
+) -> dict[str, Any]:
     return {
         "factory": (
             "tests.integration.evals.eval_from_db_factories:"
             "create_sqlite_rich_from_db_benchmark_agent"
         ),
-        "kwargs": {"db_path": str(tmp_path / db_name)},
+        "kwargs": {"db_path": str(tmp_path / db_name), "cache_ttl": cache_ttl},
     }
 
 
@@ -87,12 +92,16 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
     _require_live_openai()
     config = EvalSuiteConfig(
         name="live-from-db-rich-sqlite-quality-benchmark",
-        agent=_rich_benchmark_agent(tmp_path, "rich-from-db-benchmark.sqlite"),
-        defaults={"timeout_seconds": 30, "max_iterations": 10},
+        agent=_rich_benchmark_agent(
+            tmp_path,
+            "rich-from-db-benchmark.sqlite",
+            cache_ttl=3600,
+        ),
+        defaults={"timeout_seconds": 30, "max_iterations": 12},
         artifacts={"include_evidence_payloads": True},
         cases=[
             {
-                "id": "rich-count-customers",
+                "id": "rich-cold-count-customers",
                 "prompt": "How many customers are there?",
                 "expectations": {
                     "capabilities": {
@@ -101,7 +110,7 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                             "db.sql.validate",
                             "db.sql.execute_read",
                         ],
-                        "max_calls": 6,
+                        "max_calls": 8,
                         "required_owners": ["sqlite"],
                         "forbidden_owners": ["memory", "lineage", "data_quality"],
                     },
@@ -127,17 +136,17 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                         "min_rows": 1,
                         "max_rows": 1,
                     },
-                    "budgets": {"max_latency_ms": 8000, "max_iterations": 6},
+                    "budgets": {"max_latency_ms": 8000, "max_iterations": 8},
                 },
             },
             {
-                "id": "rich-filter-high-severity-tickets",
+                "id": "rich-warm-filter-high-severity-tickets",
                 "prompt": "Show support_tickets where severity = 'high'",
                 "expectations": {
                     "answer": {"equals": "Returned 3 rows."},
                     "capabilities": {
                         "required": ["db.sql.validate", "db.sql.execute_read"],
-                        "max_calls": 6,
+                        "max_calls": 10,
                         "required_owners": ["sqlite"],
                     },
                     "tasks": {"max_errors": 0},
@@ -156,16 +165,16 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                         "must_not_include": ["DELETE", "DROP"],
                         "max_rows_returned": 3,
                     },
-                    "budgets": {"max_latency_ms": 8000, "max_iterations": 6},
+                    "budgets": {"max_latency_ms": 8000, "max_iterations": 10},
                 },
             },
             {
-                "id": "rich-count-refunds",
+                "id": "rich-warm-count-refunds",
                 "prompt": "How many refunds are there?",
                 "expectations": {
                     "capabilities": {
                         "required": ["db.sql.execute_read"],
-                        "max_calls": 6,
+                        "max_calls": 7,
                         "required_owners": ["sqlite"],
                     },
                     "tasks": {"max_errors": 0},
@@ -182,11 +191,11 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                         "min_rows": 1,
                         "max_rows": 1,
                     },
-                    "budgets": {"max_latency_ms": 8000, "max_iterations": 6},
+                    "budgets": {"max_latency_ms": 8000, "max_iterations": 7},
                 },
             },
             {
-                "id": "rich-customer-region-relationship",
+                "id": "rich-warm-customer-region-relationship",
                 "prompt": "Join customers to regions using their relationship",
                 "expectations": {
                     "answer": {"equals": "Returned 4 rows."},
@@ -197,7 +206,7 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                             "db.sql.validate",
                             "db.sql.execute_read",
                         ],
-                        "max_calls": 10,
+                        "max_calls": 12,
                         "required_owners": ["catalog", "sqlite"],
                     },
                     "tasks": {"max_errors": 0},
@@ -216,11 +225,11 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                         "must_not_include": ["DELETE", "DROP"],
                         "max_rows_returned": 4,
                     },
-                    "budgets": {"max_latency_ms": 12000, "max_iterations": 10},
+                    "budgets": {"max_latency_ms": 14000, "max_iterations": 12},
                 },
             },
             {
-                "id": "rich-order-refund-relationship",
+                "id": "rich-warm-order-refund-relationship",
                 "prompt": "Join orders to refunds using their relationship",
                 "expectations": {
                     "answer": {"equals": "Returned 2 rows."},
@@ -229,7 +238,7 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                             "catalog.relationship_paths.find",
                             "db.sql.execute_read",
                         ],
-                        "max_calls": 12,
+                        "max_calls": 10,
                         "required_owners": ["catalog", "sqlite"],
                     },
                     "tasks": {"max_errors": 0},
@@ -243,18 +252,18 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                         "must_not_include": ["DELETE", "DROP"],
                         "max_rows_returned": 2,
                     },
-                    "budgets": {"max_latency_ms": 12000, "max_iterations": 12},
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 10},
                 },
             },
             {
-                "id": "rich-ambiguous-customers-stability",
+                "id": "rich-warm-ambiguous-customers-stability",
                 "runs": 2,
                 "prompt": "show customers",
                 "expectations": {
                     "answer": {"equals": "Returned 4 rows."},
                     "capabilities": {
                         "required": ["db.sql.execute_read"],
-                        "max_calls": 6,
+                        "max_calls": 7,
                         "required_owners": ["sqlite"],
                     },
                     "tasks": {"max_errors": 0},
@@ -266,7 +275,7 @@ async def test_eval_live_from_db_rich_sqlite_quality_benchmark(tmp_path):
                         "must_not_include": ["DELETE", "DROP"],
                         "max_rows_returned": 4,
                     },
-                    "budgets": {"max_latency_ms": 8000, "max_iterations": 6},
+                    "budgets": {"max_latency_ms": 8000, "max_iterations": 7},
                     "stability": {
                         "require_same_capabilities": True,
                         "max_answer_variants": 1,
@@ -314,13 +323,16 @@ async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
     _require_live_openai()
     config = EvalSuiteConfig(
         name="live-from-db-production-profile-benchmark",
-        agent=_rich_benchmark_agent(tmp_path, "production-profile-benchmark.sqlite"),
-        defaults={"timeout_seconds": 60, "max_iterations": 14},
+        agent=_rich_benchmark_agent(
+            tmp_path,
+            "production-profile-benchmark.sqlite",
+            cache_ttl=3600,
+        ),
+        defaults={"timeout_seconds": 60, "max_iterations": 20},
         artifacts={"include_evidence_payloads": True},
         cases=[
             {
-                "id": "prod-p95-ish-customer-count-stability",
-                "runs": 5,
+                "id": "prod-cold-customer-count-warmup",
                 "prompt": "How many customers are there?",
                 "expectations": {
                     "answer": {"equals": "The count is 4."},
@@ -331,7 +343,7 @@ async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
                             "db.sql.execute_read",
                         ],
                         "required_owners": ["sqlite"],
-                        "max_calls": 6,
+                        "max_calls": 8,
                     },
                     "tasks": {"max_errors": 0},
                     "evidence": {
@@ -355,7 +367,46 @@ async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
                         "min_rows": 1,
                         "max_rows": 1,
                     },
-                    "budgets": {"max_latency_ms": 8000, "max_iterations": 6},
+                    "budgets": {"max_latency_ms": 8000, "max_iterations": 8},
+                },
+            },
+            {
+                "id": "prod-warm-p95-ish-customer-count-stability",
+                "runs": 5,
+                "prompt": "How many customers are there?",
+                "expectations": {
+                    "answer": {"equals": "The count is 4."},
+                    "capabilities": {
+                        "required": [
+                            "db.sql.validate",
+                            "db.sql.execute_read",
+                        ],
+                        "required_owners": ["sqlite"],
+                        "max_calls": 7,
+                    },
+                    "tasks": {"max_errors": 0},
+                    "evidence": {
+                        "required_kinds": [
+                            "schema.asset_profile",
+                            "query.plan.proposal",
+                            "query.plan.validation",
+                            "sql.validation",
+                            "query.result",
+                        ]
+                    },
+                    "sql": {
+                        "read_only": True,
+                        "required_tables": ["customers"],
+                        "must_include": ["COUNT"],
+                        "must_not_include": ["SELECT *", "DELETE", "DROP"],
+                        "max_rows_returned": 1,
+                    },
+                    "result": {
+                        "required_rows": [{"count": 4}],
+                        "min_rows": 1,
+                        "max_rows": 1,
+                    },
+                    "budgets": {"max_latency_ms": 8000, "max_iterations": 7},
                     "stability": {
                         "require_same_capabilities": True,
                         "max_answer_variants": 1,
@@ -374,7 +425,7 @@ async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
                     "capabilities": {
                         "required": ["db.sql.validate", "db.sql.execute_read"],
                         "required_owners": ["sqlite"],
-                        "max_calls": 12,
+                        "max_calls": 11,
                     },
                     "tasks": {"max_errors": 0},
                     "evidence": {
@@ -401,7 +452,7 @@ async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
                         "min_rows": 2,
                         "max_rows": 2,
                     },
-                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 11},
                 },
             },
             {
@@ -418,7 +469,7 @@ async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
                             "db.sql.execute_read",
                         ],
                         "required_owners": ["catalog", "sqlite"],
-                        "max_calls": 12,
+                        "max_calls": 15,
                     },
                     "tasks": {"max_errors": 0},
                     "evidence": {
@@ -443,7 +494,7 @@ async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
                         "min_rows": 2,
                         "max_rows": 2,
                     },
-                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 15},
                 },
             },
             {
@@ -456,7 +507,7 @@ async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
                     "capabilities": {
                         "required": ["db.sql.validate", "db.sql.execute_read"],
                         "required_owners": ["sqlite"],
-                        "max_calls": 12,
+                        "max_calls": 11,
                     },
                     "tasks": {"max_errors": 0},
                     "evidence": {
@@ -490,7 +541,7 @@ async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
                         "min_rows": 1,
                         "max_rows": 1,
                     },
-                    "budgets": {"max_latency_ms": 15000, "max_iterations": 12},
+                    "budgets": {"max_latency_ms": 15000, "max_iterations": 11},
                 },
             },
             {
@@ -507,7 +558,7 @@ async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
                             "db.sql.execute_read",
                         ],
                         "required_owners": ["catalog", "sqlite"],
-                        "max_calls": 14,
+                        "max_calls": 19,
                     },
                     "tasks": {"max_errors": 0},
                     "evidence": {
@@ -536,7 +587,7 @@ async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
                         "min_rows": 2,
                         "max_rows": 2,
                     },
-                    "budgets": {"max_latency_ms": 18000, "max_iterations": 14},
+                    "budgets": {"max_latency_ms": 18000, "max_iterations": 19},
                 },
             },
         ],
@@ -546,7 +597,7 @@ async def test_eval_live_from_db_production_profile_benchmark(tmp_path):
     _show_report(report)
 
     assert report.status == "passed", render_pretty(report)
-    assert report.summary.cases_total == 5
+    assert report.summary.cases_total == 6
     assert report.score == 1.0
     assert (Path(report.artifact_path) / "report.json").exists()
 

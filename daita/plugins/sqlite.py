@@ -174,6 +174,13 @@ class SQLitePlugin(BaseDatabasePlugin):
                 evidence_kind="sql.explain.plan",
                 handler=self._execute_sql_explain,
             ),
+            EvidenceWrappingExecutor(
+                id="sqlite.column_values.profile",
+                owner="sqlite",
+                capability_ids=frozenset({"db.column_values.profile"}),
+                evidence_kind="column_values.profile",
+                handler=self._execute_column_values_profile,
+            ),
         )
 
     def declare_evidence_schemas(self):
@@ -257,6 +264,185 @@ class SQLitePlugin(BaseDatabasePlugin):
             f"EXPLAIN QUERY PLAN {sql}", list(args.get("params") or [])
         )
         return {"sql": sql, "plan": rows}
+
+    async def _execute_column_values_profile(self, payload: Any) -> Dict[str, Any]:
+        from datetime import datetime, timezone
+
+        args = dict(payload or {})
+        table = _validate_sqlite_identifier(str(args.get("table") or ""))
+        column = _validate_sqlite_identifier(str(args.get("column") or ""))
+        max_values = max(1, min(int(args.get("max_values") or 25), 100))
+        max_distinct = max(1, int(args.get("max_distinct_count") or 100))
+        max_value_length = max(1, int(args.get("max_value_length") or 80))
+        max_profile_rows = max(1, int(args.get("max_profile_rows") or 1_000_000))
+        timeout_seconds = max(1, min(int(args.get("profile_timeout_seconds") or 5), 60))
+        fingerprint_only = bool(args.get("fingerprint_only", False))
+        include_source_revision = bool(
+            args.get("include_source_revision") or fingerprint_only
+        )
+
+        blocked_tables = {
+            item.lower() for item in getattr(self, "blocked_tables", set())
+        }
+        blocked_columns = {
+            item.lower() for item in getattr(self, "blocked_columns", set())
+        }
+        profile = {
+            "table": table,
+            "column": column,
+            "profile_kind": "categorical_values",
+            "profile_status": "profiled",
+            "max_values": max_values,
+            "sampled": False,
+            "truncated": False,
+            "redacted": False,
+            "top_values": [],
+            "policy": {
+                "policy_owner": "sqlite",
+                "bounded_aggregate": True,
+                "eligibility_checks": [
+                    "blocked_table",
+                    "sensitive_or_blocked_column",
+                    "max_profile_rows",
+                    "max_distinct_count",
+                    "max_value_length",
+                    "profile_timeout",
+                ],
+                "max_distinct_count": max_distinct,
+                "max_value_length": max_value_length,
+                "max_profile_rows": max_profile_rows,
+                "profile_timeout_seconds": timeout_seconds,
+                "fingerprint_only_supported": True,
+                "include_source_revision": include_source_revision,
+                "redact_pii_columns": True,
+            },
+            "profiled_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if table.lower() in blocked_tables:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "blocked_table",
+            }
+        if column.lower() in blocked_columns or _looks_sensitive_column(column):
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "redacted": True,
+                "skipped_reason": "sensitive_or_blocked_column",
+            }
+
+        source_info = (
+            await _sqlite_live_source_revision(self, timeout_seconds=timeout_seconds)
+            if include_source_revision
+            else {
+                "revision": None,
+                "status": "best_effort",
+                "reason": "source_revision_not_requested",
+            }
+        )
+        source_revision = source_info.get("revision")
+        source_status = str(source_info.get("status") or "unavailable")
+        profile["source_fingerprint_status"] = source_status
+        if source_info.get("reason"):
+            profile["source_fingerprint_reason"] = source_info["reason"]
+        if source_revision is not None:
+            profile["source_revision"] = source_revision
+        if source_status != "unavailable":
+            profile["source_fingerprint"] = _sqlite_source_fingerprint(
+                self.path,
+                table,
+                column,
+                max_values=max_values,
+                max_distinct=max_distinct,
+                max_value_length=max_value_length,
+                source_revision=source_revision,
+            )
+        if fingerprint_only:
+            return {
+                **profile,
+                "profile_kind": "source_fingerprint",
+                "profile_status": "fingerprint",
+                "policy": {
+                    **profile["policy"],
+                    "fingerprint_only": True,
+                    "include_source_revision": True,
+                },
+            }
+
+        quoted_table = _quote_sqlite_identifier(table)
+        quoted_column = _quote_sqlite_identifier(column)
+        try:
+            stats_rows = await asyncio.wait_for(
+                self.query(
+                    "SELECT COUNT(*) AS row_count, "
+                    f"SUM(CASE WHEN {quoted_column} IS NULL THEN 1 ELSE 0 END) AS null_count, "
+                    f"COUNT(DISTINCT {quoted_column}) AS distinct_count, "
+                    f"MAX(LENGTH(CAST({quoted_column} AS TEXT))) AS max_value_length "
+                    f"FROM {quoted_table}"
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "profile_timeout",
+            }
+        stats = stats_rows[0] if stats_rows else {}
+        distinct_count = stats.get("distinct_count") or 0
+        profile.update(
+            {
+                "row_count": stats.get("row_count") or 0,
+                "null_count": stats.get("null_count") or 0,
+                "distinct_count": distinct_count,
+                "max_observed_value_length": stats.get("max_value_length") or 0,
+            }
+        )
+        if (stats.get("row_count") or 0) > max_profile_rows:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "row_count_exceeds_profile_limit",
+            }
+        if distinct_count > max_distinct:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "high_distinct_count",
+            }
+        if (stats.get("max_value_length") or 0) > max_value_length:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "redacted": True,
+                "skipped_reason": "value_too_long",
+            }
+
+        try:
+            rows = await asyncio.wait_for(
+                self.query(
+                    f"SELECT {quoted_column} AS value, COUNT(*) AS count "
+                    f"FROM {quoted_table} "
+                    f"WHERE {quoted_column} IS NOT NULL "
+                    f"GROUP BY {quoted_column} "
+                    f"ORDER BY COUNT(*) DESC, {quoted_column} ASC "
+                    "LIMIT ?",
+                    [max_values],
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "profile_timeout",
+            }
+        profile["top_values"] = [
+            {"value": row.get("value"), "count": row.get("count")} for row in rows
+        ]
+        profile["truncated"] = distinct_count > len(rows)
+        return profile
 
     async def disconnect(self) -> None:
         """Close the SQLite database connection."""
@@ -560,3 +746,105 @@ def sqlite(**kwargs) -> SQLitePlugin:
             rows = await db.query("SELECT * FROM products WHERE price < ?", [50])
     """
     return SQLitePlugin(**kwargs)
+
+
+def _validate_sqlite_identifier(value: str) -> str:
+    import re
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value or ""):
+        from ..core.exceptions import ValidationError
+
+        raise ValidationError("Invalid SQLite identifier", field="identifier")
+    return value
+
+
+def _quote_sqlite_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _looks_sensitive_column(column: str) -> bool:
+    lowered = column.lower()
+    sensitive = {
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "credential",
+        "email",
+        "phone",
+        "address",
+        "ssn",
+        "comment",
+        "message",
+        "body",
+        "notes",
+        "note",
+    }
+    return any(term in lowered for term in sensitive)
+
+
+def _sqlite_source_fingerprint(
+    path: str,
+    table: str,
+    column: str,
+    *,
+    max_values: int,
+    max_distinct: int,
+    max_value_length: int,
+    source_revision: str | None = None,
+) -> str:
+    import hashlib
+
+    payload = (
+        f"sqlite:{path}:{table.lower()}.{column.lower()}:"
+        f"{max_values}:{max_distinct}:{max_value_length}"
+    )
+    if source_revision:
+        payload = f"{payload}:{source_revision}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+async def _sqlite_live_source_revision(
+    plugin: SQLitePlugin,
+    *,
+    timeout_seconds: int,
+) -> dict[str, str | None]:
+    import os
+
+    parts: list[str] = []
+    status = "best_effort"
+    reason = "sqlite_data_version"
+    if plugin.path and plugin.path != ":memory:":
+        try:
+            stat = os.stat(plugin.path)
+            parts.append(f"file:{stat.st_mtime_ns}:{stat.st_size}")
+            status = "authoritative"
+            reason = "sqlite_file_metadata"
+        except OSError:
+            reason = "sqlite_file_metadata_unavailable"
+    else:
+        reason = "sqlite_in_memory_data_version"
+    try:
+        rows = await asyncio.wait_for(
+            plugin.query("PRAGMA data_version"),
+            timeout=timeout_seconds,
+        )
+        if rows:
+            value = next(iter(rows[0].values()))
+            parts.append(f"data_version:{value}")
+    except Exception:
+        if not parts:
+            return {
+                "revision": None,
+                "status": "unavailable",
+                "reason": "sqlite_data_version_unavailable",
+            }
+    if not parts:
+        return {
+            "revision": None,
+            "status": "unavailable",
+            "reason": "sqlite_source_revision_unavailable",
+        }
+    return {"revision": "|".join(parts), "status": status, "reason": reason}

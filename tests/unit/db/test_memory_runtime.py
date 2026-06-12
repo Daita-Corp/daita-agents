@@ -8,6 +8,7 @@ from daita.db.memory import (
     has_db_memory_marker,
     normalize_db_memory_record,
     recall_db_memory_records,
+    write_db_memory_record,
     write_db_memory_records,
 )
 from daita.embeddings.mock import MockEmbeddingProvider
@@ -343,6 +344,98 @@ async def test_db_memory_helpers_write_metric_definitions_and_business_rules():
         first_call.kwargs["extra_metadata"]["db_memory"]["kind"] == "metric_definition"
     )
     assert second_call.kwargs["extra_metadata"]["db_memory"]["kind"] == "business_rule"
+
+
+async def test_db_memory_allows_catalog_cited_value_alias_without_observed_values():
+    backend = MagicMock()
+    backend.list_by_category = AsyncMock(return_value=[])
+    backend.remember = AsyncMock(
+        return_value={"status": "success", "chunk_id": "mem-1"}
+    )
+    memory = MemoryPlugin()
+    memory.backend = backend
+
+    result = await write_db_memory_record(
+        memory,
+        DBMemoryRecord(
+            kind="value_alias",
+            key="value_alias:shipments.status:completed",
+            text=(
+                "When users say completed shipments, consult catalog profile "
+                "shipments.status for the authoritative observed value."
+            ),
+            metadata={
+                "table": "shipments",
+                "column": "status",
+                "alias": "completed shipments",
+                "catalog_profile_ref": "shipments.status",
+                "catalog_evidence_id": "evidence-1",
+            },
+        ),
+    )
+
+    assert result["success"] is True
+    assert result["kind"] == "value_alias"
+    assert result["category"] == "db_semantics"
+    backend.remember.assert_awaited_once()
+    stored = backend.remember.await_args.kwargs["extra_metadata"]["db_memory"]
+    assert stored["metadata"]["catalog_profile_ref"] == "shipments.status"
+    assert "observed_value" not in stored["metadata"]
+    assert "top_values" not in stored["metadata"]
+
+
+async def test_db_memory_rejects_value_alias_without_catalog_citation():
+    backend = MagicMock()
+    backend.list_by_category = AsyncMock(return_value=[])
+    backend.remember = AsyncMock(
+        return_value={"status": "success", "chunk_id": "mem-1"}
+    )
+    memory = MemoryPlugin()
+    memory.backend = backend
+
+    result = await write_db_memory_record(
+        memory,
+        {
+            "kind": "value_alias",
+            "key": "value_alias:shipments.status:completed",
+            "text": "completed shipments means the status users usually ask for",
+            "metadata": {"table": "shipments", "column": "status"},
+        },
+    )
+
+    assert result["success"] is False
+    assert "catalog_profile_ref or catalog_evidence_id" in result["error"]
+    backend.remember.assert_not_awaited()
+
+
+async def test_db_memory_rejects_value_alias_observed_values_in_metadata():
+    backend = MagicMock()
+    backend.list_by_category = AsyncMock(return_value=[])
+    backend.remember = AsyncMock(
+        return_value={"status": "success", "chunk_id": "mem-1"}
+    )
+    memory = MemoryPlugin()
+    memory.backend = backend
+
+    result = await write_db_memory_record(
+        memory,
+        {
+            "kind": "value_alias",
+            "key": "value_alias:shipments.status:completed",
+            "text": "completed shipments should resolve through the catalog profile",
+            "metadata": {
+                "table": "shipments",
+                "column": "status",
+                "alias": "completed shipments",
+                "catalog_profile_ref": "shipments.status",
+                "observed_value": "complete",
+            },
+        },
+    )
+
+    assert result["success"] is False
+    assert "cannot store observed value field 'observed_value'" in result["error"]
+    backend.remember.assert_not_awaited()
 
 
 async def test_db_memory_helpers_recall_single_category_and_filter_kind():

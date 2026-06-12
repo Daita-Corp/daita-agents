@@ -164,6 +164,132 @@ INSERT INTO refunds (id, order_id, amount, reason) VALUES
     (2, 4, 35.00, 'service credit');
 """
 
+RICH_BENCHMARK_POSTGRES_SQL = """
+DROP TABLE IF EXISTS refunds;
+DROP TABLE IF EXISTS support_tickets;
+DROP TABLE IF EXISTS order_items;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS products;
+DROP TABLE IF EXISTS customers;
+DROP TABLE IF EXISTS regions;
+
+CREATE TABLE regions (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    quota NUMERIC(10, 2) NOT NULL
+);
+CREATE TABLE customers (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    region_id INTEGER NOT NULL REFERENCES regions(id),
+    segment TEXT NOT NULL,
+    lifecycle_stage TEXT NOT NULL
+);
+CREATE TABLE products (
+    id INTEGER PRIMARY KEY,
+    sku TEXT NOT NULL,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL
+);
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    order_date DATE NOT NULL,
+    status TEXT NOT NULL,
+    total NUMERIC(10, 2) NOT NULL
+);
+CREATE TABLE order_items (
+    id INTEGER PRIMARY KEY,
+    order_id INTEGER NOT NULL REFERENCES orders(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    quantity INTEGER NOT NULL,
+    unit_price NUMERIC(10, 2) NOT NULL
+);
+CREATE TABLE support_tickets (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES customers(id),
+    severity TEXT NOT NULL,
+    status TEXT NOT NULL,
+    opened_at DATE NOT NULL
+);
+CREATE TABLE refunds (
+    id INTEGER PRIMARY KEY,
+    order_id INTEGER NOT NULL REFERENCES orders(id),
+    amount NUMERIC(10, 2) NOT NULL,
+    reason TEXT NOT NULL
+);
+
+INSERT INTO regions (id, name, quota) VALUES
+    (1, 'NA', 500.00),
+    (2, 'EU', 300.00);
+
+INSERT INTO customers (id, name, region_id, segment, lifecycle_stage) VALUES
+    (1, 'Ada', 1, 'enterprise', 'active'),
+    (2, 'Linus', 2, 'startup', 'active'),
+    (3, 'Grace', 1, 'enterprise', 'expansion'),
+    (4, 'Turing', 2, 'enterprise', 'active');
+
+INSERT INTO products (id, sku, name, category) VALUES
+    (1, 'HW-A', 'Widget A', 'hardware'),
+    (2, 'HW-B', 'Widget B', 'hardware'),
+    (3, 'SVC-PLAN', 'Service Plan', 'services');
+
+INSERT INTO orders (id, customer_id, order_date, status, total) VALUES
+    (1, 1, '2026-01-05', 'complete', 120.00),
+    (2, 1, '2026-01-20', 'pending', 80.00),
+    (3, 2, '2026-02-12', 'complete', 50.00),
+    (4, 3, '2026-02-18', 'complete', 175.00),
+    (5, 4, '2026-03-03', 'complete', 220.00);
+
+INSERT INTO order_items (id, order_id, product_id, quantity, unit_price) VALUES
+    (1, 1, 1, 2, 40.00),
+    (2, 1, 3, 1, 40.00),
+    (3, 2, 2, 1, 80.00),
+    (4, 3, 3, 1, 50.00),
+    (5, 4, 1, 1, 75.00),
+    (6, 4, 2, 1, 100.00),
+    (7, 5, 1, 3, 60.00),
+    (8, 5, 3, 1, 40.00);
+
+INSERT INTO support_tickets (id, customer_id, severity, status, opened_at) VALUES
+    (1, 1, 'high', 'open', '2026-01-07'),
+    (2, 2, 'medium', 'closed', '2026-01-15'),
+    (3, 3, 'high', 'open', '2026-02-21'),
+    (4, 4, 'low', 'open', '2026-03-05'),
+    (5, 4, 'high', 'closed', '2026-03-08');
+
+INSERT INTO refunds (id, order_id, amount, reason) VALUES
+    (1, 2, 20.00, 'partial return'),
+    (2, 4, 35.00, 'service credit');
+"""
+
+
+def wide_benchmark_postgres_sql(table_count: int = 48) -> str:
+    """Generate a wide, ambiguous Postgres schema around the rich benchmark data."""
+
+    decoys = []
+    for index in range(1, table_count + 1):
+        table = f"customer_activity_decoy_{index:02d}"
+        decoys.append(f"DROP TABLE IF EXISTS {table};")
+    statements = ["\n".join(decoys), RICH_BENCHMARK_POSTGRES_SQL]
+    for index in range(1, table_count + 1):
+        table = f"customer_activity_decoy_{index:02d}"
+        statements.append(f"""
+CREATE TABLE {table} (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER,
+    customer_name TEXT,
+    status TEXT,
+    region TEXT,
+    severity TEXT,
+    total NUMERIC(10, 2)
+);
+INSERT INTO {table} (id, customer_id, customer_name, status, region, severity, total)
+VALUES
+    (1, {index}, 'Decoy {index}', 'inactive', 'ZZ', 'low', 0.00);
+""")
+    return "\n".join(statements)
+
 
 class FromDbEvalTarget:
     """Runnable eval adapter for DB runtime results."""
@@ -197,13 +323,17 @@ class FromDbEvalTarget:
             self._cleanup()
 
 
-async def create_sqlite_from_db_eval_agent(db_path: str) -> FromDbEvalTarget:
+async def create_sqlite_from_db_eval_agent(
+    db_path: str,
+    *,
+    cache_ttl: int | None = 0,
+) -> FromDbEvalTarget:
     path = Path(db_path)
     await _seed_sqlite(path)
     agent = await Agent.from_db(
         str(path),
         name="EvalFromDbSQLite",
-        cache_ttl=0,
+        cache_ttl=cache_ttl,
         **_openai_kwargs(),
     )
     return FromDbEvalTarget(agent, name="EvalFromDbSQLite")
@@ -212,6 +342,8 @@ async def create_sqlite_from_db_eval_agent(db_path: str) -> FromDbEvalTarget:
 async def create_sqlite_data_team_from_db_eval_agent(
     db_path: str,
     memory_dir: str,
+    *,
+    cache_ttl: int | None = 0,
 ) -> FromDbEvalTarget:
     path = Path(db_path)
     await _seed_sqlite(path)
@@ -222,7 +354,7 @@ async def create_sqlite_data_team_from_db_eval_agent(
         quality=True,
         lineage=True,
         memory=_memory_plugin(Path(memory_dir)),
-        cache_ttl=0,
+        cache_ttl=cache_ttl,
         **_openai_kwargs(),
     )
     return FromDbEvalTarget(agent, name="EvalFromDbSQLiteDataTeam")
@@ -230,19 +362,24 @@ async def create_sqlite_data_team_from_db_eval_agent(
 
 async def create_sqlite_rich_from_db_benchmark_agent(
     db_path: str,
+    *,
+    cache_ttl: int | None = 0,
 ) -> FromDbEvalTarget:
     path = Path(db_path)
     await _seed_sqlite_script(path, RICH_BENCHMARK_SQLITE_SQL)
     agent = await Agent.from_db(
         str(path),
         name="BenchmarkFromDbSQLiteRich",
-        cache_ttl=0,
+        cache_ttl=cache_ttl,
         **_openai_kwargs(),
     )
     return FromDbEvalTarget(agent, name="BenchmarkFromDbSQLiteRich")
 
 
-async def create_postgres_from_db_eval_agent() -> FromDbEvalTarget:
+async def create_postgres_from_db_eval_agent(
+    *,
+    cache_ttl: int | None = 0,
+) -> FromDbEvalTarget:
     container = start_container(
         POSTGRES_IMAGE,
         container_port=5432,
@@ -262,7 +399,7 @@ async def create_postgres_from_db_eval_agent() -> FromDbEvalTarget:
         agent = await Agent.from_db(
             url,
             name="EvalFromDbPostgres",
-            cache_ttl=0,
+            cache_ttl=cache_ttl,
             **_openai_kwargs(),
         )
     except Exception:
@@ -273,6 +410,66 @@ async def create_postgres_from_db_eval_agent() -> FromDbEvalTarget:
         name="EvalFromDbPostgres",
         cleanup=container.remove,
     )
+
+
+async def create_postgres_rich_from_db_benchmark_agent(
+    *,
+    cache_ttl: int | None = 0,
+) -> FromDbEvalTarget:
+    return await _postgres_agent_from_sql(
+        RICH_BENCHMARK_POSTGRES_SQL,
+        name="BenchmarkFromDbPostgresRich",
+        cache_ttl=cache_ttl,
+        tag_prefix="daita-from-db-rich-eval-pg",
+    )
+
+
+async def create_postgres_wide_from_db_benchmark_agent(
+    *,
+    cache_ttl: int | None = 0,
+    table_count: int = 48,
+) -> FromDbEvalTarget:
+    return await _postgres_agent_from_sql(
+        wide_benchmark_postgres_sql(table_count),
+        name="BenchmarkFromDbPostgresWide",
+        cache_ttl=cache_ttl,
+        tag_prefix="daita-from-db-wide-eval-pg",
+    )
+
+
+async def _postgres_agent_from_sql(
+    sql: str,
+    *,
+    name: str,
+    cache_ttl: int | None,
+    tag_prefix: str,
+) -> FromDbEvalTarget:
+    container = start_container(
+        POSTGRES_IMAGE,
+        container_port=5432,
+        env={
+            "POSTGRES_USER": POSTGRES_USER,
+            "POSTGRES_PASSWORD": POSTGRES_PASSWORD,
+            "POSTGRES_DB": POSTGRES_DB,
+        },
+        tag_prefix=tag_prefix,
+    )
+    url = (
+        f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
+        f"@{container.host}:{container.host_port}/{POSTGRES_DB}"
+    )
+    try:
+        await _seed_postgres_script(url, sql)
+        agent = await Agent.from_db(
+            url,
+            name=name,
+            cache_ttl=cache_ttl,
+            **_openai_kwargs(),
+        )
+    except Exception:
+        container.remove()
+        raise
+    return FromDbEvalTarget(agent, name=name, cleanup=container.remove)
 
 
 async def _seed_sqlite(path: Path) -> None:
@@ -288,6 +485,10 @@ async def _seed_sqlite_script(path: Path, sql: str) -> None:
 
 
 async def _seed_postgres(url: str) -> None:
+    await _seed_postgres_script(url, SALES_POSTGRES_SQL)
+
+
+async def _seed_postgres_script(url: str, sql: str) -> None:
     try:
         import asyncpg
     except ImportError as exc:
@@ -300,7 +501,7 @@ async def _seed_postgres(url: str) -> None:
     while time.time() < deadline:
         try:
             connection = await asyncpg.connect(url, ssl=False)
-            await connection.execute(SALES_POSTGRES_SQL)
+            await connection.execute(sql)
             await connection.close()
             return
         except Exception as exc:  # noqa: BLE001

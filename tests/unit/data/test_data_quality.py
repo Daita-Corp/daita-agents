@@ -349,6 +349,84 @@ async def test_profile_discovers_columns_sqlite():
     assert "email" in result["profile"]
 
 
+async def test_profile_consumes_catalog_value_profile_for_quality_signal_only():
+    async def mock_query(sql, params=None):
+        if "count(*) as total" in sql.lower():
+            return [{"total": 10, "non_null": 10, "distinct_count": 3}]
+        if "min(" in sql.lower():
+            return [{"min_val": None, "max_val": None, "avg_val": None}]
+        return []
+
+    db = MagicMock()
+    db.sql_dialect = "postgresql"
+    db.query = mock_query
+    plugin = make_dq(db=db)
+
+    result = await plugin.profile(
+        db,
+        "orders",
+        columns=["status"],
+        column_value_profiles={
+            "orders.status": {
+                "table": "orders",
+                "column": "status",
+                "distinct_count": 2,
+                "profile_status": "profiled",
+                "source_fingerprint": "fingerprint-1",
+                "top_values": [{"value": "complete", "count": 8}],
+            }
+        },
+    )
+
+    signal = result["profile"]["status"]["catalog_value_profile"]
+    assert signal["source"] == "catalog.metadata.column_value_profiles"
+    assert signal["profile_ref"] == "orders.status"
+    assert signal["catalog_distinct_count"] == 2
+    assert signal["current_distinct_count"] == 3
+    assert signal["source_fingerprint"] == "fingerprint-1"
+    assert signal["quality_notes"] == ["distinct_count_changed_since_catalog_profile"]
+    assert "top_values" not in signal
+    assert "observed_values" not in signal
+
+
+async def test_report_passes_catalog_value_profiles_to_quality_profile():
+    async def mock_query(sql, params=None):
+        if "information_schema" in sql.lower() or "pragma_table_info" in sql.lower():
+            return [{"column_name": "status"}]
+        if "count(*) as total" in sql.lower():
+            return [{"total": 10, "non_null": 10, "distinct_count": 2}]
+        if "min(" in sql.lower():
+            return [{"min_val": None, "max_val": None, "avg_val": None}]
+        return []
+
+    db = MagicMock()
+    db.sql_dialect = "postgresql"
+    db.query = mock_query
+    plugin = make_dq(db=db)
+
+    result = await plugin.report(
+        db,
+        "orders",
+        column_value_profiles=[
+            {
+                "profile_ref": "orders.status",
+                "table": "orders",
+                "column": "status",
+                "distinct_count": 2,
+                "profile_status": "stale",
+                "stale": True,
+                "stale_reason": "schema_fingerprint_mismatch",
+            }
+        ],
+    )
+
+    signal = result["profile"]["status"]["catalog_value_profile"]
+    assert signal["profile_status"] == "stale"
+    assert signal["stale"] is True
+    assert signal["stale_reason"] == "schema_fingerprint_mismatch"
+    assert signal["quality_notes"] == ["catalog_profile_stale"]
+
+
 # ---------------------------------------------------------------------------
 # detect_anomaly
 # ---------------------------------------------------------------------------

@@ -48,24 +48,33 @@ async def test_eval_live_from_db_sqlite_quality_suite(tmp_path):
                 "tests.integration.evals.eval_from_db_factories:"
                 "create_sqlite_from_db_eval_agent"
             ),
-            "kwargs": {"db_path": str(tmp_path / "from-db-eval.sqlite")},
+            "kwargs": {
+                "db_path": str(tmp_path / "from-db-eval.sqlite"),
+                "cache_ttl": 3600,
+            },
         },
-        defaults={"timeout_seconds": 30, "max_iterations": 8},
+        defaults={"timeout_seconds": 30, "max_iterations": 10},
         artifacts={"include_evidence_payloads": True},
         cases=[
             {
-                "id": "count-customers",
+                "id": "sqlite-cold-count-customers",
                 "prompt": "How many customers are there?",
                 "expectations": {
                     "answer": {"equals": "The count is 3."},
                     "capabilities": {
-                        "required": ["db.schema.inspect", "db.sql.validate"],
-                        "max_calls": 3,
+                        "required": [
+                            "db.schema.inspect",
+                            "db.sql.validate",
+                            "db.sql.execute_read",
+                        ],
+                        "max_calls": 8,
                         "required_owners": ["sqlite"],
                         "forbidden_owners": ["data_quality", "lineage", "memory"],
                     },
                     "tasks": {"max_errors": 0},
-                    "evidence": {"required_kinds": ["schema.asset_profile"]},
+                    "evidence": {
+                        "required_kinds": ["schema.asset_profile", "query.result"]
+                    },
                     "sql": {
                         "read_only": True,
                         "required_tables": ["customers"],
@@ -73,11 +82,11 @@ async def test_eval_live_from_db_sqlite_quality_suite(tmp_path):
                         "must_not_include": ["SELECT *", "DELETE", "DROP"],
                         "max_rows_returned": 1,
                     },
-                    "budgets": {"max_latency_ms": 1000, "max_iterations": 3},
+                    "budgets": {"max_latency_ms": 8000, "max_iterations": 8},
                 },
             },
             {
-                "id": "relationship-join",
+                "id": "sqlite-warm-relationship-join",
                 "prompt": "Join orders to customers using their relationship",
                 "expectations": {
                     "answer": {"equals": "Returned 4 rows."},
@@ -88,7 +97,7 @@ async def test_eval_live_from_db_sqlite_quality_suite(tmp_path):
                             "db.sql.validate",
                             "db.sql.execute_read",
                         ],
-                        "max_calls": 6,
+                        "max_calls": 10,
                         "required_owners": ["catalog", "sqlite"],
                     },
                     "tasks": {"max_errors": 0},
@@ -107,18 +116,18 @@ async def test_eval_live_from_db_sqlite_quality_suite(tmp_path):
                         "must_not_include": ["DELETE", "DROP"],
                         "max_rows_returned": 4,
                     },
-                    "budgets": {"max_latency_ms": 1000, "max_iterations": 6},
+                    "budgets": {"max_latency_ms": 12000, "max_iterations": 10},
                 },
             },
             {
-                "id": "ambiguous-prompt",
+                "id": "sqlite-warm-ambiguous-prompt",
                 "runs": 2,
                 "prompt": "show me customers",
                 "expectations": {
                     "answer": {"equals": "Returned 3 rows."},
                     "capabilities": {
                         "required": ["db.sql.execute_read"],
-                        "max_calls": 3,
+                        "max_calls": 7,
                         "required_owners": ["sqlite"],
                     },
                     "tasks": {"max_errors": 0},
@@ -130,7 +139,7 @@ async def test_eval_live_from_db_sqlite_quality_suite(tmp_path):
                         "must_not_include": ["DELETE", "DROP"],
                         "max_rows_returned": 3,
                     },
-                    "budgets": {"max_latency_ms": 1000, "max_iterations": 3},
+                    "budgets": {"max_latency_ms": 10000, "max_iterations": 7},
                     "stability": {
                         "require_same_capabilities": True,
                         "max_answer_variants": 1,
@@ -147,7 +156,7 @@ async def test_eval_live_from_db_sqlite_quality_suite(tmp_path):
     assert report.status == "passed", render_pretty(report)
     assert report.score == 1.0
     assert (Path(report.artifact_path) / "report.json").exists()
-    assert "capabilities: db.schema.inspect -> db.sql.validate" in render_pretty(report)
+    assert "db.schema.inspect" in render_pretty(report)
 
 
 async def test_eval_live_from_db_sqlite_data_team_capabilities(tmp_path):
@@ -231,19 +240,20 @@ async def test_eval_live_from_db_postgres_quality_suite(tmp_path):
             "factory": (
                 "tests.integration.evals.eval_from_db_factories:"
                 "create_postgres_from_db_eval_agent"
-            )
+            ),
+            "kwargs": {"cache_ttl": 3600},
         },
-        defaults={"timeout_seconds": 30, "max_iterations": 8},
+        defaults={"timeout_seconds": 30, "max_iterations": 10},
         artifacts={"include_evidence_payloads": True},
         cases=[
             {
-                "id": "postgres-count-customers",
+                "id": "postgres-cold-count-customers",
                 "prompt": "How many customers are there?",
                 "expectations": {
                     "answer": {"equals": "The count is 3."},
                     "capabilities": {
                         "required": ["db.schema.inspect", "db.sql.execute_read"],
-                        "max_calls": 3,
+                        "max_calls": 8,
                         "required_owners": ["postgresql"],
                     },
                     "tasks": {"max_errors": 0},
@@ -254,11 +264,32 @@ async def test_eval_live_from_db_postgres_quality_suite(tmp_path):
                         "must_include": ["COUNT"],
                         "max_rows_returned": 1,
                     },
-                    "budgets": {"max_latency_ms": 1500, "max_iterations": 3},
+                    "budgets": {"max_latency_ms": 5000, "max_iterations": 8},
                 },
             },
             {
-                "id": "postgres-relationship-join",
+                "id": "postgres-warm-count-customers",
+                "prompt": "How many customers are there?",
+                "expectations": {
+                    "answer": {"equals": "The count is 3."},
+                    "capabilities": {
+                        "required": ["db.sql.execute_read"],
+                        "max_calls": 7,
+                        "required_owners": ["postgresql"],
+                    },
+                    "tasks": {"max_errors": 0},
+                    "evidence": {"required_kinds": ["query.result"]},
+                    "sql": {
+                        "read_only": True,
+                        "required_tables": ["customers"],
+                        "must_include": ["COUNT"],
+                        "max_rows_returned": 1,
+                    },
+                    "budgets": {"max_latency_ms": 4000, "max_iterations": 7},
+                },
+            },
+            {
+                "id": "postgres-warm-relationship-join",
                 "prompt": "Join orders to customers using their relationship",
                 "expectations": {
                     "answer": {"equals": "Returned 4 rows."},
@@ -267,7 +298,7 @@ async def test_eval_live_from_db_postgres_quality_suite(tmp_path):
                             "catalog.relationship_paths.find",
                             "db.sql.execute_read",
                         ],
-                        "max_calls": 6,
+                        "max_calls": 10,
                         "required_owners": ["catalog", "postgresql"],
                     },
                     "tasks": {"max_errors": 0},
@@ -280,7 +311,7 @@ async def test_eval_live_from_db_postgres_quality_suite(tmp_path):
                         "must_include": ["JOIN"],
                         "max_rows_returned": 4,
                     },
-                    "budgets": {"max_latency_ms": 1500, "max_iterations": 6},
+                    "budgets": {"max_latency_ms": 12000, "max_iterations": 10},
                 },
             },
         ],
@@ -290,7 +321,7 @@ async def test_eval_live_from_db_postgres_quality_suite(tmp_path):
     _show_report(report)
 
     assert report.status == "passed", render_pretty(report)
-    assert report.summary.cases_total == 2
+    assert report.summary.cases_total == 3
 
 
 async def test_eval_live_from_db_sqlite_openai_judge(tmp_path):

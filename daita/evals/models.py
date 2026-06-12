@@ -119,6 +119,9 @@ class StabilitySummary(BaseModel):
     cost_max: float | None = None
     latency_ms_min: float | None = None
     latency_ms_max: float | None = None
+    latency_ms_p50: float | None = None
+    latency_ms_p95: float | None = None
+    latency_ms_p99: float | None = None
     token_min: int | None = None
     token_max: int | None = None
 

@@ -74,6 +74,10 @@ class CapabilityExpectations(EvalConfigModel):
     required_owners: list[str] = Field(default_factory=list)
     forbidden_owners: list[str] = Field(default_factory=list)
     max_calls: int | None = Field(default=None, ge=0)
+    exact_sequence: list[str] = Field(default_factory=list)
+    allowed_sequences: list[list[str]] = Field(default_factory=list)
+    forbidden_subsequences: list[list[str]] = Field(default_factory=list)
+    max_per_capability: dict[str, int] = Field(default_factory=dict)
 
 
 class BudgetExpectations(EvalConfigModel):
@@ -99,6 +103,7 @@ class TaskExpectations(EvalConfigModel):
     required_statuses: list[str] = Field(default_factory=list)
     forbidden_statuses: list[str] = Field(default_factory=lambda: ["failed"])
     max_errors: int | None = Field(default=None, ge=0)
+    max_per_capability: dict[str, int] = Field(default_factory=dict)
 
 
 class EvidenceExpectations(EvalConfigModel):
@@ -106,6 +111,7 @@ class EvidenceExpectations(EvalConfigModel):
     forbidden_kinds: list[str] = Field(default_factory=list)
     required_owners: list[str] = Field(default_factory=list)
     forbidden_owners: list[str] = Field(default_factory=list)
+    max_per_kind: dict[str, int] = Field(default_factory=dict)
     require_accepted: bool = True
 
 
@@ -139,6 +145,9 @@ class StabilityExpectations(EvalConfigModel):
     max_cost_delta_pct: float | None = Field(default=None, ge=0)
     max_latency_delta_pct: float | None = Field(default=None, ge=0)
     max_token_delta_pct: float | None = Field(default=None, ge=0)
+    max_latency_p50_ms: float | None = Field(default=None, ge=0)
+    max_latency_p95_ms: float | None = Field(default=None, ge=0)
+    max_latency_p99_ms: float | None = Field(default=None, ge=0)
 
 
 class JudgeCriterion(EvalConfigModel):

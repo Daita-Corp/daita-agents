@@ -159,6 +159,35 @@ async def test_from_db_live_catalog_assisted_join_records_relationship_path(tmp_
     assert result.diagnostics["verification"]["passed"] is True
 
 
+async def test_from_db_live_grounds_completed_orders_to_observed_status(tmp_path):
+    db_path = tmp_path / "sales.sqlite"
+    await _seed_sales_db(db_path)
+    agent = await Agent.from_db(
+        str(db_path),
+        name="LiveFromDbValueGrounding",
+        cache_ttl=0,
+        **_require_live_openai(),
+    )
+
+    try:
+        result = await agent.run_detailed("Show completed orders by status")
+    finally:
+        await agent.stop()
+
+    query_result = next(item for item in result.evidence if item.kind == "query.result")
+    planning_context = next(
+        item for item in result.evidence if item.kind == "planning.context"
+    )
+    statuses = {row.get("status") for row in query_result.payload.get("rows", [])}
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert result.intent.kind is DbIntentKind.DATA_QUERY
+    assert statuses == {"complete"}
+    assert len(query_result.payload["rows"]) == 3
+    assert "orders.status: complete" in planning_context.payload["rendered_context"]
+    assert result.diagnostics["verification"]["passed"] is True
+
+
 async def test_from_db_live_plugins_register_and_execute_runtime_capabilities(tmp_path):
     db_path = tmp_path / "sales.sqlite"
     await _seed_sales_db(db_path)

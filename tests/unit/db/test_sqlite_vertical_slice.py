@@ -32,8 +32,19 @@ async def test_sqlite_registers_provider_neutral_db_capabilities():
     assert "sqlite:db.sql.execute_read" in inspection.capability_ids
     assert "sqlite:db.sql.execute_write" in inspection.capability_ids
     assert "sqlite:db.sql.explain" in inspection.capability_ids
+    assert "sqlite:db.column_values.profile" in inspection.capability_ids
     assert "sqlite.sql.execute_read" in inspection.executor_ids
     assert "sqlite:query.result" in inspection.evidence_schema_kinds
+    assert "sqlite:column_values.profile" in inspection.evidence_schema_kinds
+    profile_capability = runtime.registry.get_capability(
+        "db.column_values.profile",
+        owner="sqlite",
+    )
+    assert profile_capability.metadata["profile_policy"]["bounded_aggregate"] is True
+    assert (
+        profile_capability.metadata["profile_policy"]["fingerprint_only_supported"]
+        is True
+    )
 
 
 async def test_sqlite_schema_inspect_returns_typed_evidence_through_runtime():
@@ -138,6 +149,223 @@ async def test_sqlite_and_catalog_vertical_slice_through_db_runtime():
     assert search[0].payload["tables"][0]["name"] == "customers"
     query_result = next(item for item in query if item.kind == "query.result")
     assert query_result.payload["rows"] == [{"email": "ada@example.com"}]
+
+
+async def test_sqlite_column_value_profile_registers_with_catalog():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(plugins=(catalog, sqlite))
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO orders (status)
+        VALUES ('complete'), ('complete'), ('pending');
+        """)
+
+    try:
+        schema_evidence = await runtime.execute_capability(
+            "db.schema.inspect",
+            owner="sqlite",
+            operation_type="schema.query",
+        )
+        await runtime.execute_capability(
+            "catalog.source.register",
+            owner="catalog",
+            operation_type="schema.register",
+            input={
+                "schema": schema_evidence[0].payload,
+                "store_type": "sqlite",
+                "store_id": "store:sqlite",
+                "persist": False,
+            },
+        )
+        raw_profile = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={"table": "orders", "column": "status", "max_values": 25},
+        )
+        registered = await runtime.execute_capability(
+            "catalog.column_values.register",
+            owner="catalog",
+            operation_type="source.profile",
+            input={
+                "store_id": "store:sqlite",
+                "profiles": [raw_profile[0].payload],
+                "source_evidence_id": raw_profile[0].id,
+            },
+        )
+    finally:
+        await runtime.teardown()
+
+    assert raw_profile[0].kind == "column_values.profile"
+    assert raw_profile[0].payload["top_values"] == [
+        {"value": "complete", "count": 2},
+        {"value": "pending", "count": 1},
+    ]
+    assert raw_profile[0].payload["source_fingerprint"]
+    assert raw_profile[0].payload["policy"]["policy_owner"] == "sqlite"
+    assert raw_profile[0].payload["policy"]["bounded_aggregate"] is True
+    assert "max_profile_rows" in raw_profile[0].payload["policy"]["eligibility_checks"]
+    assert registered[0].kind == "schema.column_value_profile"
+    stored = catalog.get_schema("store:sqlite").metadata["column_value_profiles"]
+    assert stored["orders.status"]["distinct_count"] == 2
+    assert (
+        stored["orders.status"]["source_fingerprint"]
+        == raw_profile[0].payload["source_fingerprint"]
+    )
+
+
+async def test_sqlite_column_value_profile_fingerprint_only_uses_live_revision():
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(plugins=(sqlite,))
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO orders (status) VALUES ('complete'), ('pending');
+        """)
+
+    try:
+        fingerprint = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={
+                "table": "orders",
+                "column": "status",
+                "fingerprint_only": True,
+            },
+        )
+    finally:
+        await runtime.teardown()
+
+    assert fingerprint[0].kind == "column_values.profile"
+    assert fingerprint[0].payload["profile_status"] == "fingerprint"
+    assert fingerprint[0].payload["profile_kind"] == "source_fingerprint"
+    assert fingerprint[0].payload["source_fingerprint"]
+    assert "data_version:" in fingerprint[0].payload["source_revision"]
+    assert fingerprint[0].payload["source_fingerprint_status"] == "best_effort"
+    assert (
+        fingerprint[0].payload["source_fingerprint_reason"]
+        == "sqlite_in_memory_data_version"
+    )
+    assert fingerprint[0].payload["top_values"] == []
+
+
+async def test_sqlite_column_value_profile_fingerprint_only_respects_blocked_table():
+    sqlite = SQLitePlugin(path=":memory:", blocked_tables=["orders"])
+    runtime = DbRuntime(plugins=(sqlite,))
+    await runtime.setup(agent_id="db-runtime-test")
+
+    async def fail_query(sql, params=None):
+        raise AssertionError("blocked table should not be queried")
+
+    sqlite.query = fail_query
+    try:
+        full_profile = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={"table": "orders", "column": "status"},
+        )
+        fingerprint = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={
+                "table": "orders",
+                "column": "status",
+                "fingerprint_only": True,
+            },
+        )
+    finally:
+        await runtime.teardown()
+
+    for evidence in (full_profile[0], fingerprint[0]):
+        assert evidence.payload["profile_status"] == "skipped"
+        assert evidence.payload["skipped_reason"] == "blocked_table"
+        assert evidence.payload["top_values"] == []
+        assert "source_revision" not in evidence.payload
+        assert "source_fingerprint" not in evidence.payload
+        assert "row_count" not in evidence.payload
+
+
+async def test_sqlite_column_value_profile_fingerprint_only_respects_sensitive_column():
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(plugins=(sqlite,))
+    await runtime.setup(agent_id="db-runtime-test")
+
+    async def fail_query(sql, params=None):
+        raise AssertionError("sensitive column should not be queried")
+
+    sqlite.query = fail_query
+    try:
+        full_profile = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={"table": "customers", "column": "email"},
+        )
+        fingerprint = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={
+                "table": "customers",
+                "column": "email",
+                "fingerprint_only": True,
+            },
+        )
+    finally:
+        await runtime.teardown()
+
+    for evidence in (full_profile[0], fingerprint[0]):
+        assert evidence.payload["profile_status"] == "skipped"
+        assert evidence.payload["redacted"] is True
+        assert evidence.payload["skipped_reason"] == "sensitive_or_blocked_column"
+        assert evidence.payload["top_values"] == []
+        assert "source_revision" not in evidence.payload
+        assert "source_fingerprint" not in evidence.payload
+        assert "row_count" not in evidence.payload
+
+
+async def test_sqlite_column_value_profile_skips_when_row_count_exceeds_limit():
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(plugins=(sqlite,))
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO orders (status)
+        VALUES ('complete'), ('complete'), ('pending');
+        """)
+
+    try:
+        raw_profile = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={
+                "table": "orders",
+                "column": "status",
+                "max_profile_rows": 2,
+            },
+        )
+    finally:
+        await runtime.teardown()
+
+    assert raw_profile[0].payload["profile_status"] == "skipped"
+    assert raw_profile[0].payload["skipped_reason"] == "row_count_exceeds_profile_limit"
+    assert raw_profile[0].payload["row_count"] == 3
+    assert raw_profile[0].payload["top_values"] == []
 
 
 async def test_sqlite_explain_and_write_executors_return_typed_evidence():

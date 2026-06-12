@@ -104,6 +104,40 @@ def postgresql_capabilities() -> tuple[Capability, ...]:
             runtime_only=True,
             side_effecting=False,
         ),
+        Capability(
+            id="db.column_values.profile",
+            owner="postgresql",
+            description="Profile bounded observed values for one PostgreSQL column.",
+            domains=frozenset({"db"}),
+            operation_types=frozenset({"source.profile", "data.query"}),
+            access=AccessMode.READ,
+            risk=RiskLevel.MEDIUM,
+            input_schema=common_schema,
+            output_evidence=frozenset({"column_values.profile"}),
+            executor="postgresql.column_values.profile",
+            runtime_only=True,
+            side_effecting=False,
+            metadata={
+                "profile_policy": {
+                    "bounded_aggregate": True,
+                    "max_values_limit": 100,
+                    "default_max_distinct_count": 100,
+                    "default_max_profile_rows": 1_000_000,
+                    "default_timeout_seconds": 5,
+                    "fingerprint_only_supported": True,
+                    "redacts_sensitive_columns": True,
+                    "profile_only_readable_tables": True,
+                    "skip_reasons": [
+                        "blocked_table",
+                        "sensitive_or_blocked_column",
+                        "profile_timeout",
+                        "row_count_exceeds_profile_limit",
+                        "high_distinct_count",
+                        "value_too_long",
+                    ],
+                }
+            },
+        ),
     )
 
 
@@ -139,6 +173,12 @@ def postgresql_evidence_schemas() -> tuple[EvidenceSchema, ...]:
             owner="postgresql",
             json_schema=object_schema,
             description="PostgreSQL connector explain plan.",
+        ),
+        EvidenceSchema(
+            kind="column_values.profile",
+            owner="postgresql",
+            json_schema=object_schema,
+            description="PostgreSQL bounded column value profile.",
         ),
     )
 

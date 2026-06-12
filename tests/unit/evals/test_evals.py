@@ -1,9 +1,20 @@
 import json
 
 from daita.evals import EvalSuite, EvalSuiteConfig
-from daita.evals.analysis import extract_run_evidence
+from daita.evals.analysis import RunEvidence, extract_run_evidence, summarize_stability
+from daita.evals.assertions.runtime import (
+    capability_assertions,
+    evidence_assertions,
+    task_assertions,
+)
+from daita.evals.assertions.stability import stability_assertions
 from daita.evals.config import JudgeCriterion, JudgeExpectations
 from daita.evals.judges import build_judge_result
+from daita.evals.models import (
+    RunMetrics,
+    RuntimeEvidenceRecord,
+    RuntimeTaskEvidence,
+)
 from daita.evals.reporters import render_junit, render_pretty
 from daita.db.models import (
     DbIntent,
@@ -555,3 +566,250 @@ async def test_record_and_compare_baseline_detects_new_failure(tmp_path):
     assert report.status == "failed"
     assert report.baseline_comparison["status"] == "failed"
     assert any(failure.code == "baseline_regression" for failure in report.failures)
+
+
+def test_exact_capability_sequence_assertion_fails_on_order_drift():
+    config = EvalSuiteConfig(
+        name="sequence-evals",
+        agent={"factory": "tests.fixtures.eval_agents:create_passing_agent"},
+        cases=[
+            {
+                "id": "warm-read",
+                "prompt": "How many customers?",
+                "expectations": {
+                    "capabilities": {
+                        "exact_sequence": [
+                            "db.query.prepare_read",
+                            "db.sql.validate",
+                            "db.sql.execute_read",
+                            "db.answer.synthesize",
+                        ]
+                    }
+                },
+            }
+        ],
+    )
+    evidence = _run_evidence(
+        capabilities=[
+            "db.query.prepare_read",
+            "db.sql.execute_read",
+            "db.sql.validate",
+            "db.answer.synthesize",
+        ]
+    )
+
+    results = capability_assertions(
+        config.cases[0].expectations,
+        evidence,
+        config.defaults,
+    )
+
+    assert {result.code for result in results} == {"capability_sequence_mismatch"}
+
+
+def test_allowed_capability_sequences_accept_only_declared_traces():
+    config = EvalSuiteConfig(
+        name="allowed-sequence-evals",
+        agent={"factory": "tests.fixtures.eval_agents:create_passing_agent"},
+        cases=[
+            {
+                "id": "warm-read",
+                "prompt": "How many customers?",
+                "expectations": {
+                    "capabilities": {
+                        "allowed_sequences": [
+                            [
+                                "db.query.prepare_read",
+                                "db.sql.validate",
+                                "db.sql.execute_read",
+                                "db.answer.synthesize",
+                            ]
+                        ]
+                    }
+                },
+            }
+        ],
+    )
+    evidence = _run_evidence(
+        capabilities=[
+            "db.query.prepare_read",
+            "db.query.plan",
+            "db.sql.validate",
+            "db.sql.execute_read",
+            "db.answer.synthesize",
+        ]
+    )
+
+    results = capability_assertions(
+        config.cases[0].expectations,
+        evidence,
+        config.defaults,
+    )
+
+    assert {result.code for result in results} == {"capability_sequence_not_allowed"}
+
+
+def test_forbidden_capability_subsequence_assertion_reports_matching_tasks():
+    config = EvalSuiteConfig(
+        name="forbidden-subsequence-evals",
+        agent={"factory": "tests.fixtures.eval_agents:create_passing_agent"},
+        cases=[
+            {
+                "id": "warm-read",
+                "prompt": "How many customers?",
+                "expectations": {
+                    "capabilities": {
+                        "forbidden_subsequences": [
+                            ["db.schema.inspect", "catalog.source.register"]
+                        ]
+                    }
+                },
+            }
+        ],
+    )
+    evidence = _run_evidence(
+        capabilities=[
+            "db.schema.inspect",
+            "catalog.source.register",
+            "db.sql.execute_read",
+        ]
+    )
+
+    results = capability_assertions(
+        config.cases[0].expectations,
+        evidence,
+        config.defaults,
+    )
+
+    assert {result.code for result in results} == {"forbidden_capability_subsequence"}
+    assert results[0].related_task_ids == ["task-1", "task-2"]
+
+
+def test_max_per_capability_assertions_fail_when_a_capability_repeats():
+    config = EvalSuiteConfig(
+        name="max-capability-evals",
+        agent={"factory": "tests.fixtures.eval_agents:create_passing_agent"},
+        cases=[
+            {
+                "id": "warm-read",
+                "prompt": "How many customers?",
+                "expectations": {
+                    "capabilities": {"max_per_capability": {"db.query.plan": 0}},
+                    "tasks": {"max_per_capability": {"db.query.plan": 0}},
+                },
+            }
+        ],
+    )
+    evidence = _run_evidence(
+        capabilities=["db.query.plan", "db.sql.validate", "db.sql.execute_read"]
+    )
+
+    capability_results = capability_assertions(
+        config.cases[0].expectations,
+        evidence,
+        config.defaults,
+    )
+    task_results = task_assertions(config.cases[0].expectations, evidence)
+
+    assert {result.code for result in capability_results} == {
+        "too_many_capability_calls_by_id"
+    }
+    assert {result.code for result in task_results} == {"too_many_tasks_by_capability"}
+
+
+def test_evidence_max_per_kind_assertion_fails_on_extra_records():
+    config = EvalSuiteConfig(
+        name="evidence-count-evals",
+        agent={"factory": "tests.fixtures.eval_agents:create_passing_agent"},
+        cases=[
+            {
+                "id": "warm-read",
+                "prompt": "How many customers?",
+                "expectations": {
+                    "evidence": {"max_per_kind": {"catalog.column_values.search": 0}}
+                },
+            }
+        ],
+    )
+    evidence = _run_evidence(
+        capabilities=["catalog.column_values.search"],
+        evidence_kinds=["catalog.column_values.search"],
+    )
+
+    results = evidence_assertions(config.cases[0].expectations, evidence)
+
+    assert {result.code for result in results} == {"too_many_evidence_records_by_kind"}
+
+
+def test_stability_latency_percentile_gates_fail_independently():
+    config = EvalSuiteConfig(
+        name="latency-percentile-evals",
+        agent={"factory": "tests.fixtures.eval_agents:create_passing_agent"},
+        cases=[
+            {
+                "id": "warm-count-50-runs",
+                "prompt": "How many customers?",
+                "expectations": {
+                    "stability": {
+                        "max_latency_p50_ms": 10,
+                        "max_latency_p95_ms": 10,
+                        "max_latency_p99_ms": 10,
+                    }
+                },
+            }
+        ],
+    )
+    runs = [
+        _run_evidence(capabilities=["db.sql.execute_read"], latency_ms=latency)
+        for latency in [5, 10, 20, 30]
+    ]
+
+    results = stability_assertions(config.cases[0], summarize_stability(runs))
+
+    assert {result.code for result in results} == {
+        "latency_p50_too_high",
+        "latency_p95_too_high",
+        "latency_p99_too_high",
+    }
+
+
+def _run_evidence(
+    *,
+    capabilities: list[str],
+    evidence_kinds: list[str] | None = None,
+    latency_ms: float | None = None,
+) -> RunEvidence:
+    tasks = [
+        RuntimeTaskEvidence(
+            id=f"task-{index}",
+            capability_id=capability_id,
+            executor_id=capability_id,
+            owner="sqlite",
+            status="succeeded",
+        )
+        for index, capability_id in enumerate(capabilities, start=1)
+    ]
+    records = [
+        RuntimeEvidenceRecord(
+            id=f"evidence-{index}",
+            kind=kind,
+            owner="sqlite",
+            task_id=tasks[min(index - 1, len(tasks) - 1)].id if tasks else None,
+        )
+        for index, kind in enumerate(evidence_kinds or [], start=1)
+    ]
+    return RunEvidence(
+        answer="ok",
+        prompt_hash="prompt",
+        answer_hash="answer",
+        operation_id="operation-1",
+        operation_status="succeeded",
+        operation_type="db.query",
+        intent="query",
+        tasks=tasks,
+        evidence=records,
+        governance=None,
+        approvals=[],
+        warnings=[],
+        metrics=RunMetrics(latency_ms=latency_ms),
+    )

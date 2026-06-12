@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import importlib
 
 import pytest
@@ -11,6 +12,7 @@ from daita.runtime import (
     InMemoryRuntimeStore,
     MonitorRuntime,
     MonitorSpec,
+    OperationStatus,
     OperationScheduleResult,
     OperationTaskScheduler,
     RiskLevel,
@@ -145,6 +147,29 @@ async def test_monitor_creates_runtime_operation_and_task_without_direct_handler
     }.issubset({event.type for event in await store.list_events()})
 
 
+async def test_monitor_action_execution_completes_operation_status():
+    kernel, store, plugin = _kernel()
+    monitor = MonitorRuntime(kernel=kernel)
+
+    result = await monitor.tick(
+        MonitorSpec(
+            id="orders_backlog",
+            name="Orders Backlog",
+            trigger={"path": "count", "gt": 5},
+            action_capability_id="phase5.monitor.action",
+            action_input={"severity": "high"},
+        ),
+        value={"count": 8},
+    )
+    snapshot = await store.inspect_operation(result.operation_id)
+
+    assert result.triggered is True
+    assert plugin.executor.calls == 1
+    assert snapshot.operation.status is OperationStatus.SUCCEEDED
+    assert snapshot.tasks[0].status is TaskStatus.SUCCEEDED
+    assert [item.kind for item in snapshot.evidence] == ["phase5.result"]
+
+
 async def test_worker_handoff_claims_and_executes_through_kernel_events():
     kernel, store, plugin = _kernel()
     operation = await kernel.create_operation(
@@ -169,6 +194,7 @@ async def test_worker_handoff_claims_and_executes_through_kernel_events():
     assert plugin.executor.calls == 1
     assert result.execution.task.status is TaskStatus.SUCCEEDED
     assert result.execution.evidence[0].payload["worker_id"] == "phase5.worker"
+    assert snapshot.operation.status.value == "succeeded"
     event_types = {event.type for event in snapshot.events}
     assert RuntimeEventType.WORKER_HANDOFF in event_types
     assert RuntimeEventType.WORKER_LEASE_CLAIMED in event_types
@@ -215,6 +241,44 @@ async def test_worker_lease_fencing_prevents_duplicate_execution():
     )
     assert sum(result.error is not None for result in results) == 1
     assert snapshot.tasks[0].status is TaskStatus.SUCCEEDED
+
+
+async def test_worker_polling_recovers_expired_safe_lease_before_claiming():
+    kernel, store, plugin = _kernel()
+    operation = await kernel.create_operation(
+        operation_type="phase5.execute",
+        request={"kind": "worker"},
+    )
+    task = await kernel.plan_task(
+        operation_id=operation.id,
+        capability_id="phase5.worker.task",
+        owner="phase5",
+        input={"value": "expired"},
+    )
+    await store.save_task(
+        replace(
+            task,
+            status=TaskStatus.RUNNING,
+            metadata={
+                **task.metadata,
+                "lease_id": "expired-lease",
+                "lease_owner": "worker-1",
+                "lease_expires_at": 0.0,
+            },
+        )
+    )
+    worker = WorkerRuntime(
+        kernel=kernel,
+        options=WorkerRuntimeOptions(worker_id="phase5.worker", owner="phase5"),
+    )
+
+    result = await worker.run_once()
+    snapshot = await store.inspect_operation(operation.id)
+
+    assert plugin.executor.calls == 1
+    assert result.execution.task.status is TaskStatus.SUCCEEDED
+    assert snapshot.tasks[0].metadata["expired_lease_recovered"] is True
+    assert snapshot.operation.status.value == "succeeded"
 
 
 async def test_operation_scheduler_skips_completed_and_resumes_pending_tasks():

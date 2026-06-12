@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .kernel import (
@@ -13,17 +13,11 @@ from .kernel import (
     RuntimeKernelTaskNotRunnable,
     TaskExecutionResult,
 )
-from .primitives import OperationStatus, RuntimeEventType, TaskStatus
+from .primitives import RuntimeEventType, TaskStatus
+from .status import TERMINAL_TASK_STATUSES, reconcile_operation_status
 from .store import OperationSnapshot
 
-_TERMINAL_TASK_STATUSES = frozenset(
-    {
-        TaskStatus.SUCCEEDED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-        TaskStatus.SKIPPED,
-    }
-)
+_TERMINAL_TASK_STATUSES = TERMINAL_TASK_STATUSES
 
 
 @dataclass(frozen=True)
@@ -136,40 +130,17 @@ class OperationTaskScheduler:
         snapshot = await inspect(operation_id)
         if snapshot is None:
             raise KeyError(operation_id)
-        tasks = snapshot.tasks
-        failed = any(task.status is TaskStatus.FAILED for task in tasks)
-        cancelled = any(task.status is TaskStatus.CANCELLED for task in tasks)
-        pending = any(
-            task.status in {TaskStatus.PENDING, TaskStatus.RUNNING} for task in tasks
-        )
-        blocked_now = any(task.status is TaskStatus.BLOCKED for task in tasks)
-        complete = bool(tasks) and all(
-            task.status in _TERMINAL_TASK_STATUSES for task in tasks
-        )
-        status = snapshot.operation.status
-        if failed:
-            status = OperationStatus.FAILED
-        elif cancelled:
-            status = OperationStatus.CANCELLED
-        elif blocked_now:
-            status = OperationStatus.BLOCKED
-        elif complete:
-            status = OperationStatus.SUCCEEDED
-        elif pending:
-            status = OperationStatus.RUNNING
-        if status is not snapshot.operation.status:
-            await self.store.save_operation(replace(snapshot.operation, status=status))
-            snapshot = await inspect(operation_id)
-            if snapshot is None:
-                raise KeyError(operation_id)
+        reconciliation = await reconcile_operation_status(self.kernel, operation_id)
+        if reconciliation is not None:
+            snapshot = reconciliation.snapshot
         return OperationScheduleResult(
             snapshot=snapshot,
             executed_task_ids=tuple(dict.fromkeys(executed)),
             skipped_task_ids=tuple(dict.fromkeys(skipped)),
             blocked_task_ids=tuple(dict.fromkeys(blocked)),
-            complete=complete and not failed and not cancelled,
-            blocked=blocked_now,
-            failed=failed,
-            cancelled=cancelled,
-            pending=pending,
+            complete=reconciliation.complete if reconciliation else False,
+            blocked=reconciliation.blocked if reconciliation else False,
+            failed=reconciliation.failed if reconciliation else False,
+            cancelled=reconciliation.cancelled if reconciliation else False,
+            pending=reconciliation.pending if reconciliation else False,
         )

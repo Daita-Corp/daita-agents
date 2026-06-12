@@ -25,6 +25,7 @@ from .primitives import (
     TaskStatus,
     Worker,
 )
+from .status import TERMINAL_TASK_STATUSES, reconcile_operation_status
 
 
 @dataclass(frozen=True)
@@ -205,6 +206,7 @@ class WorkerRuntime:
                 },
             )
             await self.store.append_event(completed_event)
+            await reconcile_operation_status(self.kernel, execution.operation.id)
             return WorkerRunResult(
                 handoff=handoff,
                 lease=lease,
@@ -279,8 +281,11 @@ class WorkerRuntime:
         context: Mapping[str, Any] | None = None,
     ) -> WorkerRunResult | None:
         """Discover one pending worker-capable task and execute it."""
+        await self._recover_expired_worker_claims()
         for task in await self.store.list_tasks():
             if task.status not in {TaskStatus.PENDING, TaskStatus.BLOCKED}:
+                continue
+            if task.metadata.get("manual_recovery_required"):
                 continue
             capability = self._capability_for_task(task)
             if not self._task_matches_worker(task, capability):
@@ -356,6 +361,13 @@ class WorkerRuntime:
             return self.registry.get_capability(task.capability_id, owner=str(owner))
         return self.registry.get_capability(task.capability_id)
 
+    async def _recover_expired_worker_claims(self) -> None:
+        list_operations = getattr(self.store, "list_operations", None)
+        if list_operations is None:
+            return
+        for operation in await list_operations():
+            await self.kernel.recover_expired_task_claims(operation.id)
+
     def _event(
         self,
         type: RuntimeEventType,
@@ -390,6 +402,9 @@ def _worker_failure_type(exc: RuntimeKernelExecutionError) -> RuntimeEventType:
     if isinstance(exc, RuntimeKernelTaskNotRunnable):
         return RuntimeEventType.WORKER_FAILED
     return RuntimeEventType.WORKER_FAILED
+
+
+_TERMINAL_TASK_STATUSES = TERMINAL_TASK_STATUSES
 
 
 def _latest_trace_id(operation: Operation, task: Task) -> str | None:

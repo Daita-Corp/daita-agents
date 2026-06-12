@@ -133,9 +133,32 @@ def summarize_stability(runs: list[RunEvidence]) -> StabilitySummary:
         cost_max=max(costs) if costs else None,
         latency_ms_min=min(latencies) if latencies else None,
         latency_ms_max=max(latencies) if latencies else None,
+        latency_ms_p50=percentile(latencies, 50) if latencies else None,
+        latency_ms_p95=percentile(latencies, 95) if latencies else None,
+        latency_ms_p99=percentile(latencies, 99) if latencies else None,
         token_min=min(tokens) if tokens else None,
         token_max=max(tokens) if tokens else None,
     )
+
+
+def percentile(values: list[float], percentile_value: float) -> float:
+    """Return an interpolated percentile for runtime latency gates."""
+
+    if not values:
+        raise ValueError("percentile requires at least one value")
+    if percentile_value <= 0:
+        return min(values)
+    if percentile_value >= 100:
+        return max(values)
+
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * (percentile_value / 100)
+    lower = int(rank)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = rank - lower
+    return ordered[lower] + ((ordered[upper] - ordered[lower]) * fraction)
 
 
 def metric_delta_pct(

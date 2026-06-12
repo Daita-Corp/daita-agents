@@ -107,6 +107,14 @@ class _AnalysisPlanState:
         return self.revision_evidence or self.plan_evidence
 
 
+@dataclass(frozen=True)
+class _SourcePreparationSnapshot:
+    evidence: Evidence
+    store_id: str
+    schema_fingerprint: str
+    cached_at: float
+
+
 class DbRuntime:
     """Operation-centric database runtime.
 
@@ -144,6 +152,7 @@ class DbRuntime:
         self._setup_context: PluginContext | None = None
         self._is_setup = False
         self._schema_profile_cache: dict[str, Any] | None = None
+        self._catalog_source_cache: _SourcePreparationSnapshot | None = None
         self._operation_results: list[DbOperationResult] = []
         self._audit_log: list[dict[str, Any]] = []
         self.kernel = RuntimeKernel(
@@ -729,6 +738,40 @@ class DbRuntime:
             },
         )
 
+    def cached_catalog_source_evidence(
+        self,
+        *,
+        operation_id: str,
+        schema: dict[str, Any],
+        store_id: str,
+    ) -> Evidence | None:
+        """Return fresh catalog source-registration evidence for this schema."""
+        cached = self._catalog_source_cache
+        if cached is None:
+            return None
+        ttl = _schema_cache_ttl(self.config.metadata)
+        if ttl is not None:
+            if ttl <= 0:
+                return None
+            if time.monotonic() - cached.cached_at > ttl:
+                return None
+        if cached.store_id != store_id:
+            return None
+        if cached.schema_fingerprint != _source_schema_fingerprint(schema):
+            return None
+        return replace(
+            cached.evidence,
+            id=None,
+            operation_id=operation_id,
+            task_id=None,
+            metadata={
+                **dict(cached.evidence.metadata),
+                "catalog_source_cache": "hit",
+                "reused_evidence_id": cached.evidence.id,
+                "schema_fingerprint": cached.schema_fingerprint,
+            },
+        )
+
     def persisted_schema_evidence(self, *, operation_id: str) -> Evidence | None:
         """Return persisted catalog schema profile evidence when fresh enough."""
         from daita.plugins.catalog.persistence import load_schema_snapshot
@@ -809,6 +852,23 @@ class DbRuntime:
             "metadata": {"schema_cache": "stored"},
             "cached_at": time.monotonic(),
         }
+
+    def remember_catalog_source_evidence(
+        self,
+        evidence: Evidence,
+        *,
+        schema: dict[str, Any],
+        store_id: str,
+    ) -> None:
+        """Remember an accepted catalog source-registration evidence reference."""
+        if evidence.kind != "catalog.source_registered" or not evidence.accepted:
+            return
+        self._catalog_source_cache = _SourcePreparationSnapshot(
+            evidence=evidence,
+            store_id=store_id,
+            schema_fingerprint=_source_schema_fingerprint(schema),
+            cached_at=time.monotonic(),
+        )
 
     def classify_request(self, request: DbRequest | str) -> DbIntent:
         """Classify a prompt into a DB intent."""
@@ -5149,6 +5209,11 @@ def _schema_cache_ttl(metadata: dict[str, Any]) -> float | None:
         value = options.get("cache_ttl")
         return None if value is None else float(value)
     return None
+
+
+def _source_schema_fingerprint(schema: dict[str, Any]) -> str:
+    encoded = json.dumps(schema, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _analysis_replan_enabled(metadata: dict[str, Any]) -> bool:

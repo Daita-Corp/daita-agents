@@ -54,6 +54,24 @@ def stability_assertions(
         stability.token_max,
         exp.max_token_delta_pct,
     )
+    _latency_percentile_check(
+        results,
+        "p50",
+        stability.latency_ms_p50,
+        exp.max_latency_p50_ms,
+    )
+    _latency_percentile_check(
+        results,
+        "p95",
+        stability.latency_ms_p95,
+        exp.max_latency_p95_ms,
+    )
+    _latency_percentile_check(
+        results,
+        "p99",
+        stability.latency_ms_p99,
+        exp.max_latency_p99_ms,
+    )
     return results
 
 
@@ -78,3 +96,23 @@ def _delta_check(
                 expected=allowed,
             )
         )
+
+
+def _latency_percentile_check(
+    results: list[AssertionResult],
+    percentile: str,
+    observed: float | None,
+    allowed: float | None,
+) -> None:
+    if allowed is None or observed is None or observed <= allowed:
+        return
+    results.append(
+        fail(
+            f"stability.max_latency_{percentile}_ms",
+            f"latency_{percentile}_too_high",
+            f"Latency {percentile} was {observed:.1f} ms.",
+            f"expectations.stability.max_latency_{percentile}_ms",
+            observed=observed,
+            expected=allowed,
+        )
+    )

@@ -115,6 +115,101 @@ def _column_discovery_sql(table_name: str, dialect: str) -> tuple:
     )
 
 
+def _catalog_value_profile_quality_signal(
+    table: str,
+    column: str,
+    profiles: Any,
+    *,
+    observed_distinct_count: int,
+) -> Optional[Dict[str, Any]]:
+    """Project catalog-owned value profiles into DQ freshness/drift metadata."""
+    profile = _find_catalog_value_profile(table, column, profiles)
+    if not profile:
+        return None
+
+    catalog_distinct_count = profile.get("distinct_count")
+    notes: List[str] = []
+    if profile.get("stale") or profile.get("profile_status") == "stale":
+        notes.append("catalog_profile_stale")
+    if profile.get("redacted"):
+        notes.append("catalog_profile_redacted")
+    if profile.get("sampled"):
+        notes.append("catalog_profile_sampled")
+    if profile.get("truncated"):
+        notes.append("catalog_profile_truncated")
+    catalog_distinct_int = _optional_int(catalog_distinct_count)
+    if (
+        catalog_distinct_int is not None
+        and not profile.get("stale")
+        and profile.get("profile_status") not in {"stale", "skipped", "redacted"}
+        and catalog_distinct_int != int(observed_distinct_count)
+    ):
+        notes.append("distinct_count_changed_since_catalog_profile")
+
+    return {
+        "source": "catalog.metadata.column_value_profiles",
+        "profile_ref": profile.get("profile_ref")
+        or profile.get("ref")
+        or f"{profile.get('table')}.{profile.get('column')}",
+        "profile_status": profile.get("profile_status") or "profiled",
+        "stale": bool(profile.get("stale", False)),
+        "stale_reason": profile.get("stale_reason"),
+        "catalog_distinct_count": catalog_distinct_count,
+        "current_distinct_count": observed_distinct_count,
+        "source_fingerprint": profile.get("source_fingerprint"),
+        "profiled_at": profile.get("profiled_at"),
+        "quality_notes": notes,
+    }
+
+
+def _find_catalog_value_profile(
+    table: str,
+    column: str,
+    profiles: Any,
+) -> Optional[Dict[str, Any]]:
+    if not profiles:
+        return None
+    profile_map: Dict[str, Any] = {}
+    if isinstance(profiles, dict):
+        if "profiles" in profiles and isinstance(profiles["profiles"], list):
+            for item in profiles["profiles"]:
+                if isinstance(item, dict):
+                    ref = item.get("profile_ref") or item.get("ref")
+                    if not ref:
+                        ref = f"{item.get('table')}.{item.get('column')}"
+                    profile_map[str(ref).lower()] = item
+        else:
+            profile_map = {str(key).lower(): value for key, value in profiles.items()}
+    elif isinstance(profiles, list):
+        for item in profiles:
+            if not isinstance(item, dict):
+                continue
+            ref = item.get("profile_ref") or item.get("ref")
+            if not ref:
+                ref = f"{item.get('table')}.{item.get('column')}"
+            profile_map[str(ref).lower()] = item
+
+    candidates = (
+        f"{table}.{column}".lower(),
+        f"{table.split('.', 1)[-1]}.{column}".lower(),
+        column.lower(),
+    )
+    for candidate in candidates:
+        profile = profile_map.get(candidate)
+        if isinstance(profile, dict):
+            return profile
+    return None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class DataQualityPlugin(BasePlugin):
     """
     Plugin for analytical data quality: profiling, anomaly detection,
@@ -233,8 +328,15 @@ class DataQualityPlugin(BasePlugin):
         table = _validate_identifier(args["table"])
         columns = [_validate_identifier(c) for c in args.get("columns", [])]
         sample_size = args.get("sample_size")
+        value_profiles = args.get("column_value_profiles") or args.get(
+            "catalog_value_profiles"
+        )
         return await self.profile(
-            db, table, columns=columns or None, sample_size=sample_size
+            db,
+            table,
+            columns=columns or None,
+            sample_size=sample_size,
+            column_value_profiles=value_profiles,
         )
 
     async def _tool_detect_anomaly(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -261,7 +363,16 @@ class DataQualityPlugin(BasePlugin):
         table = _validate_identifier(args["table"])
         store = args.get("store")
         sample_size = args.get("sample_size")
-        return await self.report(db, table, sample_size=sample_size, store=store)
+        value_profiles = args.get("column_value_profiles") or args.get(
+            "catalog_value_profiles"
+        )
+        return await self.report(
+            db,
+            table,
+            sample_size=sample_size,
+            store=store,
+            column_value_profiles=value_profiles,
+        )
 
     async def _execute_quality_profile(self, payload: Any) -> Dict[str, Any]:
         args = dict(payload or {})
@@ -289,6 +400,7 @@ class DataQualityPlugin(BasePlugin):
         table: str,
         columns: Optional[List[str]] = None,
         sample_size: Optional[int] = None,
+        column_value_profiles: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Generate statistical profile for columns in a table.
@@ -398,6 +510,14 @@ class DataQualityPlugin(BasePlugin):
                     "max": max_v,
                     "avg": avg_v,
                 }
+                catalog_profile = _catalog_value_profile_quality_signal(
+                    table,
+                    col,
+                    column_value_profiles,
+                    observed_distinct_count=distinct_count,
+                )
+                if catalog_profile:
+                    col_profiles[col]["catalog_value_profile"] = catalog_profile
             except Exception as exc:
                 col_profiles[col] = {"error": str(exc)}
 
@@ -558,6 +678,7 @@ class DataQualityPlugin(BasePlugin):
         table: str,
         sample_size: Optional[int] = None,
         store: Optional[str] = None,
+        column_value_profiles: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Generate a consolidated quality report: column profiles + completeness score.
@@ -577,7 +698,12 @@ class DataQualityPlugin(BasePlugin):
                 ambiguous names raise unless the graph contains exactly one
                 match.
         """
-        profile_result = await self.profile(db, table, sample_size=sample_size)
+        profile_result = await self.profile(
+            db,
+            table,
+            sample_size=sample_size,
+            column_value_profiles=column_value_profiles,
+        )
 
         # Completeness: average non-null rate across successfully profiled columns
         profile_data = profile_result.get("profile", {})

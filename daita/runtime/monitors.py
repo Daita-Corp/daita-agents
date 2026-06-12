@@ -16,6 +16,7 @@ from .primitives import (
     RuntimeEventType,
     Task,
 )
+from .status import reconcile_operation_status
 
 
 @dataclass(frozen=True)
@@ -306,8 +307,10 @@ class MonitorRuntime:
                 task.id,
                 context={"monitor_id": spec.id, **dict(context or {})},
             )
+            await reconcile_operation_status(self.kernel, operation.id)
             return operation, (task,), execution.events
         except RuntimeKernelExecutionError as exc:
+            await reconcile_operation_status(self.kernel, operation.id)
             if raise_action_errors:
                 raise
             return operation, (task,), exc.result.events if exc.result else ()

@@ -44,11 +44,15 @@ async def _runtime_with_llm(tmp_path, responses):
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             customer_id INTEGER REFERENCES customers(id),
-            total REAL NOT NULL
+            total REAL NOT NULL,
+            status TEXT NOT NULL
         );
         INSERT INTO customers (id, name) VALUES (1, 'Ada'), (2, 'Linus');
-        INSERT INTO orders (customer_id, total)
-        VALUES (1, 10.0), (1, 30.0), (2, 20.0);
+        INSERT INTO orders (customer_id, total, status)
+        VALUES
+            (1, 10.0, 'complete'),
+            (1, 30.0, 'complete'),
+            (2, 20.0, 'pending');
         """)
     runtime = DbRuntime(
         plugins=(CatalogPlugin(auto_persist=False), sqlite),
@@ -131,6 +135,41 @@ def _join_plan(*, operation="read"):
     )
 
 
+def _status_plan(sql, *, value, confidence=0.9, operator="="):
+    return json.dumps(
+        {
+            "operation": "read",
+            "selected_sql": sql,
+            "candidates": [
+                {
+                    "sql": sql,
+                    "purpose": "filter orders by status",
+                    "confidence": confidence,
+                    "tables": ["orders"],
+                    "columns": ["orders.status"],
+                }
+            ],
+            "selected_tables": ["orders"],
+            "joins": [],
+            "filters": [
+                {
+                    "column": "orders.status",
+                    "operator": operator,
+                    "value": value,
+                }
+            ],
+            "aggregations": [],
+            "group_by": [],
+            "order_by": [],
+            "limit": 10,
+            "assumptions": [],
+            "clarification_question": None,
+            "confidence": confidence,
+            "planner": "llm",
+        }
+    )
+
+
 async def test_from_db_model_config_registers_llm_planning_capability(tmp_path):
     db_path = tmp_path / "from_db_llm.sqlite"
     sqlite = SQLitePlugin(path=str(db_path))
@@ -200,9 +239,9 @@ async def test_catalog_relationship_evidence_reaches_llm_planning_context(tmp_pa
     assert result.status is OperationStatus.SUCCEEDED
     assert result.answer == "Returned 3 rows."
     assert snapshot is not None
-    planning_context = next(
+    planning_context = [
         item for item in snapshot.evidence if item.kind == "planning.context"
-    )
+    ][-1]
     assert planning_context.payload["relationship_evidence_refs"]
     proposal = next(
         item for item in snapshot.evidence if item.kind == "query.plan.proposal"
@@ -257,6 +296,146 @@ async def test_llm_validation_failure_creates_repair_with_fresh_tasks(tmp_path):
         and dep.evidence_id == failed_validations[0].id
     )
     assert failure_dependency.evidence_accepted is False
+
+
+async def test_value_profile_validation_drives_repair_to_observed_literal(tmp_path):
+    bad_sql = "SELECT id, status FROM orders WHERE status = 'completed' LIMIT 10"
+    good_sql = "SELECT id, status FROM orders WHERE status = 'complete' LIMIT 10"
+    runtime, sqlite = await _runtime_with_llm(
+        tmp_path,
+        [
+            _status_plan(bad_sql, value="completed", confidence=0.82),
+            _status_plan(good_sql, value="complete", confidence=0.76),
+        ],
+    )
+    try:
+        result = await runtime.run("Show completed orders by status")
+        snapshot = await runtime.inspect_operation(result.operation_id)
+    finally:
+        await sqlite.disconnect()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert snapshot is not None
+    planning_context = [
+        item for item in snapshot.evidence if item.kind == "planning.context"
+    ][-1]
+    assert (
+        "orders.status: complete (2), pending (1)"
+        in planning_context.payload["rendered_context"]
+    )
+    failed_validation = next(
+        item
+        for item in snapshot.evidence
+        if item.kind == "query.plan.validation" and not item.accepted
+    )
+    assert any(
+        error.startswith("unobserved_filter_literal:orders.status=completed")
+        for error in failed_validation.payload["errors"]
+    )
+    assert any(item.kind == "query.plan.repair" for item in snapshot.evidence)
+    query_result = next(item for item in result.evidence if item.kind == "query.result")
+    assert query_result.payload["rows"] == [
+        {"id": 1, "status": "complete"},
+        {"id": 2, "status": "complete"},
+    ]
+
+
+async def test_predicate_profile_fills_missing_value_hint_before_repair(tmp_path):
+    bad_sql = "SELECT id, status FROM orders WHERE status = 'completed' LIMIT 10"
+    good_sql = "SELECT id, status FROM orders WHERE status = 'complete' LIMIT 10"
+    runtime, sqlite = await _runtime_with_llm(
+        tmp_path,
+        [
+            _status_plan(bad_sql, value="completed", confidence=0.82),
+            _status_plan(good_sql, value="complete", confidence=0.76),
+        ],
+    )
+    try:
+        result = await runtime.run("Show completed rows by status")
+        snapshot = await runtime.inspect_operation(result.operation_id)
+    finally:
+        await sqlite.disconnect()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert snapshot is not None
+    predicate_profile_task = next(
+        task
+        for task in snapshot.tasks
+        if task.capability_id == "db.column_values.profile"
+        and task.metadata.get("reason") == "column_value_predicate_profile"
+    )
+    assert predicate_profile_task.input["table"] == "orders"
+    assert predicate_profile_task.input["column"] == "status"
+    planning_contexts = [
+        item for item in snapshot.evidence if item.kind == "planning.context"
+    ]
+    assert len(planning_contexts) >= 2
+    assert planning_contexts[-1].payload["diagnostics"]["column_value_hint_count"] >= 1
+    assert (
+        "orders.status: complete (2), pending (1)"
+        in planning_contexts[-1].payload["rendered_context"]
+    )
+    failed_validation = next(
+        item
+        for item in snapshot.evidence
+        if item.kind == "query.plan.validation" and not item.accepted
+    )
+    assert any(
+        error.startswith("unobserved_filter_literal:orders.status=completed")
+        for error in failed_validation.payload["errors"]
+    )
+    query_result = next(item for item in result.evidence if item.kind == "query.result")
+    assert query_result.payload["rows"] == [
+        {"id": 1, "status": "complete"},
+        {"id": 2, "status": "complete"},
+    ]
+
+
+async def test_zero_row_backstop_repairs_text_predicate_once(tmp_path):
+    bad_sql = "SELECT id, status FROM orders WHERE status LIKE 'completed%' LIMIT 10"
+    good_sql = "SELECT id, status FROM orders WHERE status = 'complete' LIMIT 10"
+    runtime, sqlite = await _runtime_with_llm(
+        tmp_path,
+        [
+            _status_plan(
+                bad_sql,
+                value="completed%",
+                confidence=0.82,
+                operator="like",
+            ),
+            _status_plan(good_sql, value="complete", confidence=0.76),
+        ],
+    )
+    try:
+        result = await runtime.run("Show completed rows by status")
+        snapshot = await runtime.inspect_operation(result.operation_id)
+    finally:
+        await sqlite.disconnect()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert result.diagnostics["execution"]["planned_sql"] == good_sql
+    assert snapshot is not None
+    diagnosis = next(
+        item for item in snapshot.evidence if item.kind == "query.zero_row_diagnosis"
+    )
+    assert diagnosis.accepted is False
+    assert diagnosis.payload["failure"] == "zero_row_result"
+    assert diagnosis.payload["predicates"][0]["operator"] == "like"
+    assert diagnosis.payload["column_value_hints"][0]["observed_values"][0] == {
+        "value": "complete",
+        "count": 2,
+    }
+    repair = next(
+        item for item in snapshot.evidence if item.kind == "query.plan.repair"
+    )
+    assert repair.payload["failure_evidence_id"] == diagnosis.id
+    query_results = [item for item in result.evidence if item.kind == "query.result"]
+    assert len(query_results) == 1
+    assert query_results[0].payload["sql"] == good_sql
+    assert query_results[0].payload["rows"] == [
+        {"id": 1, "status": "complete"},
+        {"id": 2, "status": "complete"},
+    ]
 
 
 async def test_invalid_llm_proposal_artifact_can_reach_repair(tmp_path):

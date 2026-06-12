@@ -25,6 +25,8 @@ class DbPlanningContext:
     schema_evidence_refs: tuple[str, ...] = ()
     catalog_evidence_refs: tuple[str, ...] = ()
     relationship_evidence_refs: tuple[str, ...] = ()
+    column_value_evidence_refs: tuple[str, ...] = ()
+    column_value_hints: tuple[dict[str, Any], ...] = ()
     source_evidence_refs: tuple[dict[str, Any], ...] = ()
     source_fingerprints: dict[str, str] = field(default_factory=dict)
     capability_summaries: tuple[dict[str, Any], ...] = ()
@@ -50,6 +52,8 @@ class DbPlanningContext:
             "schema_evidence_refs": list(self.schema_evidence_refs),
             "catalog_evidence_refs": list(self.catalog_evidence_refs),
             "relationship_evidence_refs": list(self.relationship_evidence_refs),
+            "column_value_evidence_refs": list(self.column_value_evidence_refs),
+            "column_value_hints": [dict(item) for item in self.column_value_hints],
             "source_evidence_refs": [dict(item) for item in self.source_evidence_refs],
             "source_fingerprints": dict(self.source_fingerprints),
             "capability_summaries": [dict(item) for item in self.capability_summaries],
@@ -113,6 +117,27 @@ class DbPlanningContextBuilder:
             included_sections.append("catalog")
         if relationship_evidence:
             included_sections.append("relationships")
+        column_value_hints = _column_value_hints(
+            catalog_evidence,
+            schema,
+            profiles_stale=bool(
+                schema_evidence is not None
+                and schema_evidence.metadata.get("schema_cache")
+                == "persistent_stale_fallback"
+            ),
+        )
+        column_value_evidence = tuple(
+            item
+            for item in catalog_evidence
+            if item.kind
+            in {
+                "schema.column_value_profile",
+                "schema.column_value_search_result",
+                "schema.column_value_hint",
+            }
+        )
+        if column_value_hints:
+            included_sections.append("column_value_hints")
         diagnostics = {
             "schema_table_count": len(schema.get("tables", []) or []),
             "context_budget": options.get("planner_context_budget"),
@@ -120,6 +145,7 @@ class DbPlanningContextBuilder:
             "schema_fingerprint": schema_fingerprint,
             "source_evidence_count": len(source_evidence),
             "capability_summary_count": len(capability_summaries),
+            "column_value_hint_count": len(column_value_hints),
         }
         context = DbPlanningContext(
             operation_id=operation.id,
@@ -131,6 +157,8 @@ class DbPlanningContextBuilder:
             schema_evidence_refs=_evidence_refs((schema_evidence,)),
             catalog_evidence_refs=_evidence_refs(catalog_evidence),
             relationship_evidence_refs=_evidence_refs(relationship_evidence),
+            column_value_evidence_refs=_evidence_refs(column_value_evidence),
+            column_value_hints=column_value_hints,
             source_evidence_refs=source_refs,
             source_fingerprints=source_fingerprints,
             capability_summaries=tuple(capability_summaries),
@@ -252,7 +280,142 @@ def _render_context_summary(context: DbPlanningContext) -> str:
                 f"{item.get('source_table')}.{item.get('source_column')} -> "
                 f"{item.get('target_table')}.{item.get('target_column')}"
             )
+    if context.column_value_hints:
+        lines.append("Known filter values:")
+        for hint in context.column_value_hints[:20]:
+            values = []
+            for item in hint.get("observed_values", []) or []:
+                if isinstance(item, dict):
+                    label = str(item.get("value"))
+                    if item.get("count") is not None:
+                        label = f"{label} ({item.get('count')})"
+                    values.append(label)
+                else:
+                    values.append(str(item))
+            if values:
+                lines.append(
+                    f"- {hint.get('table')}.{hint.get('column')}: "
+                    + ", ".join(values[:25])
+                )
     return "\n".join(lines)
+
+
+def _column_value_hints(
+    catalog_evidence: tuple[Evidence, ...],
+    schema: dict[str, Any],
+    *,
+    profiles_stale: bool = False,
+) -> tuple[dict[str, Any], ...]:
+    hints: list[dict[str, Any]] = []
+    for evidence in catalog_evidence:
+        if evidence.kind == "schema.column_value_hint":
+            for hint in evidence.payload.get("hints", []) or []:
+                if isinstance(hint, dict):
+                    hints.append(_compact_column_value_hint(hint))
+        elif evidence.kind == "schema.column_value_profile":
+            for profile in evidence.payload.get("profiles", []) or []:
+                if isinstance(profile, dict):
+                    hints.append(_hint_from_profile(profile))
+        elif evidence.kind == "schema.column_value_search_result":
+            for profile in evidence.payload.get("profiles", []) or []:
+                if isinstance(profile, dict):
+                    hints.append(_hint_from_profile(profile))
+
+    if not hints:
+        metadata = schema.get("metadata") or {}
+        profiles = (
+            metadata.get("column_value_profiles") if isinstance(metadata, dict) else {}
+        )
+        if isinstance(profiles, dict):
+            for profile in profiles.values():
+                if isinstance(profile, dict):
+                    hints.append(_hint_from_profile(profile, stale=profiles_stale))
+
+    deduped: dict[tuple[str, str], dict[str, Any]] = {}
+    for hint in hints:
+        key = (str(hint.get("table") or ""), str(hint.get("column") or ""))
+        if (
+            key[0]
+            and key[1]
+            and key not in deduped
+            and planner_eligible_column_value_hint(hint)
+        ):
+            deduped[key] = hint
+    return tuple(deduped.values())
+
+
+def _hint_from_profile(
+    profile: dict[str, Any], *, stale: bool = False
+) -> dict[str, Any]:
+    return _compact_column_value_hint(
+        {
+            "table": profile.get("table"),
+            "column": profile.get("column"),
+            "profile_ref": profile.get("profile_ref")
+            or f"{profile.get('table')}.{profile.get('column')}",
+            "distinct_count": profile.get("distinct_count"),
+            "observed_values": profile.get("top_values") or [],
+            "profile_status": "stale" if stale else profile.get("profile_status"),
+            "sampled": profile.get("sampled"),
+            "truncated": profile.get("truncated"),
+            "redacted": profile.get("redacted"),
+            "stale": stale,
+            "stale_reason": profile.get("stale_reason"),
+        }
+    )
+
+
+def _compact_column_value_hint(hint: dict[str, Any]) -> dict[str, Any]:
+    observed = []
+    for item in hint.get("observed_values", []) or []:
+        if isinstance(item, dict):
+            observed.append(
+                {
+                    "value": item.get("value"),
+                    **(
+                        {"count": item.get("count")}
+                        if item.get("count") is not None
+                        else {}
+                    ),
+                }
+            )
+        else:
+            observed.append({"value": item})
+    result = {
+        "table": hint.get("table"),
+        "column": hint.get("column"),
+        "profile_ref": hint.get("profile_ref")
+        or f"{hint.get('table')}.{hint.get('column')}",
+        "distinct_count": hint.get("distinct_count"),
+        "observed_values": observed[:25],
+        "profile_status": hint.get("profile_status") or "profiled",
+        "sampled": bool(hint.get("sampled", False)),
+        "truncated": bool(hint.get("truncated", False)),
+        "redacted": bool(hint.get("redacted", False)),
+        "stale": bool(hint.get("stale", False)),
+    }
+    if hint.get("stale_reason"):
+        result["stale_reason"] = hint.get("stale_reason")
+    if hint.get("candidate_mapping"):
+        result["candidate_mapping"] = dict(hint["candidate_mapping"])
+    return result
+
+
+def planner_eligible_column_value_hint(hint: dict[str, Any]) -> bool:
+    if hint.get("profile_status") != "profiled":
+        return False
+    if hint.get("stale") or hint.get("redacted") or hint.get("sampled"):
+        return False
+    if hint.get("truncated"):
+        return False
+    observed = hint.get("observed_values")
+    if not isinstance(observed, list) or not observed or len(observed) > 25:
+        return False
+    for item in observed:
+        value = item.get("value") if isinstance(item, dict) else item
+        if value is None:
+            return False
+    return True
 
 
 def _evidence_refs(values: tuple[Evidence | None, ...]) -> tuple[str, ...]:

@@ -59,6 +59,13 @@ class SqlSelectItem:
 
 
 @dataclass(frozen=True)
+class SqlLiteralPredicate:
+    column: SqlColumnRef
+    operator: str
+    values: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class SqlAnalysis:
     sql: str
     dialect: str
@@ -69,6 +76,7 @@ class SqlAnalysis:
     tables: tuple[SqlTableRef, ...]
     columns: tuple[SqlColumnRef, ...]
     select_items: tuple[SqlSelectItem, ...]
+    literal_predicates: tuple[SqlLiteralPredicate, ...] = field(default_factory=tuple)
     mutating_statement_types: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -122,6 +130,7 @@ def analyze_sql(sql: str, *, dialect: str = "") -> SqlAnalysis:
             tables=inner.tables,
             columns=inner.columns,
             select_items=inner.select_items,
+            literal_predicates=inner.literal_predicates,
             mutating_statement_types=inner.mutating_statement_types,
         )
 
@@ -129,6 +138,7 @@ def analyze_sql(sql: str, *, dialect: str = "") -> SqlAnalysis:
     tables = tuple(_table_refs(root, exp, cte_names))
     alias_to_table = _alias_to_table(tables)
     columns = tuple(_column_refs(root, exp))
+    resolved_columns = _resolve_column_qualifiers(columns, alias_to_table, cte_names)
     select_items = tuple(_select_items(root, exp, normalized_dialect))
     mutating_types = tuple(sorted(_mutating_statement_types(root, exp)))
 
@@ -140,8 +150,11 @@ def analyze_sql(sql: str, *, dialect: str = "") -> SqlAnalysis:
         is_read=_is_read_statement(root, exp) and not mutating_types,
         has_limit=bool(root.find(exp.Limit)),
         tables=tables,
-        columns=_resolve_column_qualifiers(columns, alias_to_table, cte_names),
+        columns=resolved_columns,
         select_items=select_items,
+        literal_predicates=tuple(
+            _literal_predicates(root, exp, alias_to_table, cte_names)
+        ),
         mutating_statement_types=mutating_types,
     )
 
@@ -334,3 +347,135 @@ def _select_items(root: Any, exp: Any, dialect: str) -> list[SqlSelectItem]:
             )
         )
     return items
+
+
+def _literal_predicates(
+    root: Any,
+    exp: Any,
+    alias_to_table: dict[str, SqlTableRef],
+    cte_names: set[str],
+) -> list[SqlLiteralPredicate]:
+    predicates: list[SqlLiteralPredicate] = []
+    binary_operators = (
+        (exp.EQ, "=", "="),
+        (exp.NEQ, "!=", "!="),
+        (exp.GT, ">", "<"),
+        (exp.GTE, ">=", "<="),
+        (exp.LT, "<", ">"),
+        (exp.LTE, "<=", ">="),
+    )
+    for node in root.walk():
+        for klass, operator, reversed_operator in binary_operators:
+            if isinstance(node, klass):
+                predicate = _binary_literal_predicate(
+                    node,
+                    operator=operator,
+                    reversed_operator=reversed_operator,
+                    exp=exp,
+                    alias_to_table=alias_to_table,
+                    cte_names=cte_names,
+                )
+                if predicate is not None:
+                    predicates.append(predicate)
+                break
+        else:
+            predicate = None
+        if predicate is not None:
+            continue
+        if isinstance(node, exp.In):
+            column = _column_expression(node.this, exp)
+            values = tuple(
+                _literal_value(item, exp)
+                for item in node.expressions
+                if _literal_value(item, exp) is not None
+            )
+            if column is not None and values:
+                predicates.append(
+                    SqlLiteralPredicate(
+                        column=_resolve_column_qualifiers(
+                            (_sql_column_ref(column),),
+                            alias_to_table,
+                            cte_names,
+                        )[0],
+                        operator="in",
+                        values=values,
+                    )
+                )
+            continue
+        like_classes = tuple(
+            cls
+            for cls in (
+                getattr(exp, "Like", None),
+                getattr(exp, "ILike", None),
+            )
+            if cls is not None
+        )
+        if like_classes and isinstance(node, like_classes):
+            predicate = _binary_literal_predicate(
+                node,
+                operator="like",
+                exp=exp,
+                alias_to_table=alias_to_table,
+                cte_names=cte_names,
+            )
+            if predicate is not None:
+                predicates.append(predicate)
+    return predicates
+
+
+def _binary_literal_predicate(
+    node: Any,
+    *,
+    operator: str,
+    reversed_operator: str | None = None,
+    exp: Any,
+    alias_to_table: dict[str, SqlTableRef],
+    cte_names: set[str],
+) -> SqlLiteralPredicate | None:
+    left_column = _column_expression(node.this, exp)
+    right_column = _column_expression(node.expression, exp)
+    left_value = _literal_value(node.this, exp)
+    right_value = _literal_value(node.expression, exp)
+    if left_column is not None and right_value is not None:
+        column = left_column
+        value = right_value
+    elif right_column is not None and left_value is not None:
+        column = right_column
+        value = left_value
+        operator = reversed_operator or operator
+    else:
+        return None
+    return SqlLiteralPredicate(
+        column=_resolve_column_qualifiers(
+            (_sql_column_ref(column),),
+            alias_to_table,
+            cte_names,
+        )[0],
+        operator=operator,
+        values=(value,),
+    )
+
+
+def _column_expression(value: Any, exp: Any) -> Any | None:
+    return value if isinstance(value, exp.Column) else None
+
+
+def _sql_column_ref(column: Any) -> SqlColumnRef:
+    parts = tuple(str(part.name) for part in column.parts if getattr(part, "name", ""))
+    name = parts[-1] if parts else str(column.name or "")
+    qualifier = str(column.table or "")
+    return SqlColumnRef(name=name, table=qualifier, parts=parts or (name,))
+
+
+def _string_literal_value(value: Any, exp: Any) -> str | None:
+    if not isinstance(value, exp.Literal) or not getattr(value, "is_string", False):
+        return None
+    return str(value.this)
+
+
+def _literal_value(value: Any, exp: Any) -> str | None:
+    if not isinstance(value, exp.Literal):
+        return None
+    if getattr(value, "is_string", False) or getattr(value, "is_number", False):
+        return str(value.this)
+    return None

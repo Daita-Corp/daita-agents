@@ -9,6 +9,7 @@ context providers, and model-visible tool views.
 import logging
 import fnmatch
 import hashlib
+import json
 import re
 from collections import deque
 from dataclasses import asdict
@@ -21,7 +22,12 @@ from .base_discoverer import (
     DiscoveryError,
     DiscoveryResult,
 )
-from .base_profiler import BaseProfiler, NormalizedSchema
+from .base_profiler import (
+    BaseProfiler,
+    NormalizedColumnValue,
+    NormalizedColumnValueProfile,
+    NormalizedSchema,
+)
 from .normalizer import (
     normalize_postgresql as _normalize_postgresql,
     normalize_mysql as _normalize_mysql,
@@ -51,6 +57,7 @@ MAX_ASSET_FIELD_LIMIT = 200
 MAX_RELATIONSHIP_HOPS = 6
 MAX_RELATIONSHIP_PATHS = 8
 MATCHED_FIELDS_LIMIT = 12
+MAX_COLUMN_VALUE_HINTS = 12
 
 # Module-level registry. Set once at startup via register_catalog_backend_factory().
 # None means persist to .daita/catalog.json (local default).
@@ -193,6 +200,24 @@ class CatalogPlugin(DomainServicePlugin):
                 handler=self._execute_find_relationship_paths,
             ),
             CatalogExecutor(
+                id="catalog.register_column_values",
+                capability_ids=frozenset({"catalog.column_values.register"}),
+                evidence_kind="schema.column_value_profile",
+                handler=self._execute_register_column_values,
+            ),
+            CatalogExecutor(
+                id="catalog.search_column_values",
+                capability_ids=frozenset({"catalog.column_values.search"}),
+                evidence_kind="schema.column_value_search_result",
+                handler=self._execute_search_column_values,
+            ),
+            CatalogExecutor(
+                id="catalog.resolve_column_value_hints",
+                capability_ids=frozenset({"catalog.column_value_hints.resolve"}),
+                evidence_kind="schema.column_value_hint",
+                handler=self._execute_resolve_column_value_hints,
+            ),
+            CatalogExecutor(
                 id="catalog.discover_infrastructure",
                 capability_ids=frozenset({"catalog.infrastructure.discover"}),
                 evidence_kind="catalog.infrastructure_inventory",
@@ -290,6 +315,45 @@ class CatalogPlugin(DomainServicePlugin):
             relationship_types=args.get("relationship_types"),
             max_hops=int(args.get("max_hops") or 4),
             max_paths=int(args.get("max_paths") or 5),
+        )
+
+    async def _execute_register_column_values(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        profile = args.get("profile")
+        profiles = args.get("profiles")
+        if profile is not None and profiles is None:
+            profiles = [profile]
+        return await self.register_column_value_profiles(
+            str(args["store_id"]),
+            list(profiles or []),
+            persist=bool(args.get("persist", False)),
+            source_evidence_id=args.get("source_evidence_id"),
+        )
+
+    async def _execute_search_column_values(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return self.search_column_value_profiles(
+            str(args["store_id"]),
+            str(args.get("query") or ""),
+            tables=args.get("tables"),
+            columns=args.get("columns"),
+            limit=int(args.get("limit") or 20),
+            include_ineligible=bool(args.get("include_ineligible", False)),
+            max_age_seconds=(
+                float(args["max_profile_age_seconds"])
+                if args.get("max_profile_age_seconds") is not None
+                else None
+            ),
+        )
+
+    async def _execute_resolve_column_value_hints(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return self.resolve_column_value_hints(
+            str(args["store_id"]),
+            str(args.get("prompt") or args.get("query") or ""),
+            tables=args.get("tables"),
+            columns=args.get("columns"),
+            limit=int(args.get("limit") or MAX_COLUMN_VALUE_HINTS),
         )
 
     async def _execute_discover_infrastructure(self, payload: Any) -> Dict[str, Any]:
@@ -678,11 +742,22 @@ class CatalogPlugin(DomainServicePlugin):
             "store_id": store_id,
             "asset": _asset_summary(table, store_id=store_id),
         }
+        value_profiles = _column_value_profiles(schema)
         if include_fields:
             result.update(
                 {
                     "fields": [
-                        _field_summary(field, blocked_fields=blocked) for field in page
+                        _field_summary(
+                            field,
+                            blocked_fields=blocked,
+                            value_profile=_fresh_column_value_profile(
+                                value_profiles.get(
+                                    f"{table.get('name')}.{field.get('name')}"
+                                ),
+                                schema,
+                            ),
+                        )
+                        for field in page
                     ],
                     "field_count": len(fields),
                     "matched_field_count": len(filtered_fields),
@@ -812,6 +887,193 @@ class CatalogPlugin(DomainServicePlugin):
             "paths": paths,
         }
 
+    async def register_column_value_profiles(
+        self,
+        store_id: str,
+        profiles: List[Dict[str, Any]],
+        *,
+        persist: bool = False,
+        source_evidence_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Register canonical column value profiles under schema metadata."""
+        schema = self.get_schema(store_id)
+        if schema is None:
+            return self._missing_schema_response(store_id)
+
+        stored: list[dict[str, Any]] = []
+        metadata = dict(schema.metadata or {})
+        canonical = dict(metadata.get("column_value_profiles") or {})
+        profile_key = metadata.get("profile_key") or schema.metadata.get("profile_key")
+        schema_fingerprint = _schema_structure_fingerprint(schema.to_dict())
+
+        for raw in profiles:
+            if not isinstance(raw, dict):
+                continue
+            profile = _normalize_column_value_profile(
+                raw,
+                source_evidence_id=source_evidence_id,
+            )
+            if not profile.table or not profile.column:
+                continue
+            if profile_key and "profile_key" not in profile.policy:
+                profile.policy["profile_key"] = str(profile_key)
+            profile.policy.setdefault("schema_fingerprint", schema_fingerprint)
+            canonical[profile.ref] = profile.to_dict()
+            stored.append(profile.to_dict())
+
+        metadata["column_value_profiles"] = canonical
+        schema.metadata = metadata
+
+        persisted = await self._persist_schema(schema.to_dict()) if persist else False
+        return {
+            "success": True,
+            "store_id": store_id,
+            "profile_count": len(stored),
+            "profiles": stored,
+            "persisted": persisted,
+            "canonical_path": "metadata.column_value_profiles",
+        }
+
+    def search_column_value_profiles(
+        self,
+        store_id: str,
+        query: str,
+        *,
+        tables: Optional[Iterable[str]] = None,
+        columns: Optional[Iterable[str]] = None,
+        limit: int = 20,
+        include_ineligible: bool = False,
+        max_age_seconds: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Search canonical column value profiles for prompt-relevant values."""
+        schema = self._schema_dict_for_store(store_id)
+        if schema is None:
+            return self._missing_schema_response(store_id)
+        limit = _clamp_int(limit, default=20, minimum=1, maximum=50)
+        tokens = _query_tokens(query)
+        table_filter = {str(item).lower() for item in tables or []}
+        column_filter = {str(item).lower() for item in columns or []}
+
+        matches = []
+        for ref, profile in _column_value_profiles(schema).items():
+            profile = _profile_with_freshness(
+                profile,
+                schema,
+                max_age_seconds=max_age_seconds,
+            )
+            table = str(profile.get("table") or ref.rsplit(".", 1)[0])
+            column = str(profile.get("column") or ref.rsplit(".", 1)[-1])
+            if table_filter and table.lower() not in table_filter:
+                continue
+            if column_filter and column.lower() not in column_filter:
+                continue
+            if not include_ineligible and (
+                profile.get("redacted") or profile.get("profile_status") == "skipped"
+            ):
+                continue
+            score, reasons = _score_column_value_profile(profile, tokens)
+            if tokens and score <= 0:
+                continue
+            matches.append(
+                {
+                    "store_id": store_id,
+                    "profile_ref": ref,
+                    "table": table,
+                    "column": column,
+                    "score": round(score, 3),
+                    "match_reasons": reasons[:8],
+                    "distinct_count": profile.get("distinct_count"),
+                    "top_values": list(profile.get("top_values") or [])[:25],
+                    "profile_status": profile.get("profile_status") or "profiled",
+                    "sampled": bool(profile.get("sampled", False)),
+                    "redacted": bool(profile.get("redacted", False)),
+                    "truncated": bool(profile.get("truncated", False)),
+                    "stale": bool(profile.get("stale", False)),
+                    "stale_reason": profile.get("stale_reason"),
+                    "source_fingerprint": profile.get("source_fingerprint"),
+                    "source_fingerprint_status": profile.get(
+                        "source_fingerprint_status"
+                    ),
+                    "source_fingerprint_reason": profile.get(
+                        "source_fingerprint_reason"
+                    ),
+                }
+            )
+
+        matches.sort(key=lambda item: (-item["score"], item["profile_ref"]))
+        return {
+            "success": True,
+            "store_id": store_id,
+            "query": query,
+            "tokens": tokens,
+            "profile_count": len(matches),
+            "profiles": matches[:limit],
+            "truncated": len(matches) > limit,
+            "include_ineligible": include_ineligible,
+            "max_profile_age_seconds": max_age_seconds,
+        }
+
+    def resolve_column_value_hints(
+        self,
+        store_id: str,
+        prompt: str,
+        *,
+        tables: Optional[Iterable[str]] = None,
+        columns: Optional[Iterable[str]] = None,
+        limit: int = MAX_COLUMN_VALUE_HINTS,
+    ) -> Dict[str, Any]:
+        """Resolve prompt-scoped value hints from canonical profiles."""
+        result = self.search_column_value_profiles(
+            store_id,
+            prompt,
+            tables=tables,
+            columns=columns,
+            limit=limit,
+        )
+        if not result.get("success"):
+            return result
+        tokens = _query_tokens(prompt)
+        hints = []
+        for profile in result.get("profiles", []) or []:
+            top_values = (
+                [
+                    item
+                    for item in profile.get("top_values", []) or []
+                    if isinstance(item, dict)
+                ]
+                if _catalog_inline_value_profile_eligible(profile)
+                else []
+            )
+            hint: Dict[str, Any] = {
+                "table": profile.get("table"),
+                "column": profile.get("column"),
+                "profile_ref": profile.get("profile_ref"),
+                "distinct_count": profile.get("distinct_count"),
+                "observed_values": top_values[:25],
+                "profile_status": profile.get("profile_status") or "profiled",
+                "sampled": bool(profile.get("sampled", False)),
+                "truncated": bool(profile.get("truncated", False)),
+                "redacted": bool(profile.get("redacted", False)),
+                "stale": bool(profile.get("stale", False)),
+                "stale_reason": profile.get("stale_reason"),
+                "source_fingerprint": profile.get("source_fingerprint"),
+                "source_fingerprint_status": profile.get("source_fingerprint_status"),
+                "source_fingerprint_reason": profile.get("source_fingerprint_reason"),
+            }
+            mapping = _candidate_value_mapping(tokens, top_values)
+            if mapping:
+                hint["candidate_mapping"] = mapping
+            hints.append(hint)
+        return {
+            "success": True,
+            "store_id": store_id,
+            "prompt": prompt,
+            "prompt_terms": tokens,
+            "hints": hints,
+            "hint_count": len(hints),
+            "truncated": result.get("truncated", False),
+        }
+
     def collect_evidence(
         self,
         store_id: str,
@@ -918,6 +1180,11 @@ class CatalogPlugin(DomainServicePlugin):
         normalized["store_id"] = resolved_store_id
         normalized.setdefault("profiled_at", profiled_at)
         metadata = dict(normalized.get("metadata", {}) or {})
+        existing = self._schemas.get(resolved_store_id)
+        existing_metadata = dict(getattr(existing, "metadata", {}) or {})
+        existing_profiles = existing_metadata.get("column_value_profiles")
+        if existing_profiles and "column_value_profiles" not in metadata:
+            metadata["column_value_profiles"] = existing_profiles
         if connection_string:
             metadata.setdefault("connection_hint", _connection_hint(connection_string))
         metadata.setdefault("source", "manual")
@@ -1197,7 +1464,10 @@ def _asset_summary(
 
 
 def _field_summary(
-    field: Dict[str, Any], *, blocked_fields: set[str]
+    field: Dict[str, Any],
+    *,
+    blocked_fields: set[str],
+    value_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     out = {
         "name": field.get("name"),
@@ -1210,7 +1480,300 @@ def _field_summary(
         out["comment"] = _truncate(str(comment), 160)
     if str(field.get("name", "")).lower() in blocked_fields:
         out["blocked_by_policy"] = True
+    if value_profile and _catalog_inline_value_profile_eligible(value_profile):
+        out["column_value_hint"] = _column_value_hint_projection(value_profile)
     return out
+
+
+def _column_value_profiles(schema: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    metadata = schema.get("metadata") or {}
+    raw = metadata.get("column_value_profiles") if isinstance(metadata, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(key): dict(value) for key, value in raw.items() if isinstance(value, dict)
+    }
+
+
+def _profile_with_freshness(
+    profile: Dict[str, Any],
+    schema: Dict[str, Any],
+    *,
+    max_age_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    metadata = schema.get("metadata") or {}
+    schema_profile_key = (
+        str(metadata.get("profile_key"))
+        if isinstance(metadata, dict) and metadata.get("profile_key")
+        else None
+    )
+    policy = profile.get("policy") if isinstance(profile.get("policy"), dict) else {}
+    profile_key = str(policy.get("profile_key")) if policy.get("profile_key") else None
+    if schema_profile_key and profile_key and profile_key != schema_profile_key:
+        return {
+            **profile,
+            "profile_status": "stale",
+            "stale": True,
+            "stale_reason": "profile_key_mismatch",
+        }
+    schema_fingerprint = _schema_structure_fingerprint(schema)
+    profile_schema_fingerprint = (
+        str(policy.get("schema_fingerprint"))
+        if policy.get("schema_fingerprint")
+        else None
+    )
+    if (
+        schema_fingerprint
+        and profile_schema_fingerprint
+        and profile_schema_fingerprint != schema_fingerprint
+    ):
+        return {
+            **profile,
+            "profile_status": "stale",
+            "stale": True,
+            "stale_reason": "schema_fingerprint_mismatch",
+        }
+    if max_age_seconds is not None and _profile_age_exceeds(
+        profile.get("profiled_at"),
+        max_age_seconds=max_age_seconds,
+    ):
+        return {
+            **profile,
+            "profile_status": "stale",
+            "stale": True,
+            "stale_reason": "profile_ttl_expired",
+        }
+    return profile
+
+
+def _profile_age_exceeds(value: Any, *, max_age_seconds: float) -> bool:
+    if max_age_seconds < 0:
+        return True
+    if value is None:
+        return True
+    from datetime import datetime, timezone
+
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)
+    return age.total_seconds() > max_age_seconds
+
+
+def _schema_structure_fingerprint(schema: Dict[str, Any]) -> str:
+    """Fingerprint schema shape without catalog-owned value profile metadata."""
+    tables = []
+    for table in schema.get("tables", []) or []:
+        if not isinstance(table, dict):
+            continue
+        tables.append(
+            {
+                "name": table.get("name"),
+                "columns": [
+                    {
+                        "name": column.get("name"),
+                        "type": column.get("type") or column.get("data_type"),
+                        "nullable": column.get("nullable"),
+                        "is_primary_key": column.get("is_primary_key"),
+                        "comment": column.get("column_comment")
+                        or column.get("comment"),
+                    }
+                    for column in table.get("columns", []) or []
+                    if isinstance(column, dict)
+                ],
+                "indexes": [
+                    {
+                        "name": index.get("name"),
+                        "type": index.get("type"),
+                        "columns": list(index.get("columns", []) or []),
+                        "unique": index.get("unique"),
+                        "metadata": dict(index.get("metadata", {}) or {}),
+                    }
+                    for index in table.get("indexes", []) or []
+                    if isinstance(index, dict)
+                ],
+                "metadata": dict(table.get("metadata", {}) or {}),
+            }
+        )
+    structural = {
+        "database_type": schema.get("database_type"),
+        "database_name": schema.get("database_name"),
+        "tables": tables,
+        "foreign_keys": [
+            dict(item)
+            for item in schema.get("foreign_keys", []) or []
+            if isinstance(item, dict)
+        ],
+    }
+    payload = json.dumps(structural, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _column_value_hint_projection(profile: Dict[str, Any]) -> Dict[str, Any]:
+    values = []
+    for item in profile.get("top_values", []) or []:
+        if not isinstance(item, dict):
+            continue
+        values.append(item.get("value"))
+    return {
+        "distinct_count": profile.get("distinct_count"),
+        "top_values": values[:10],
+        "profile_ref": f"{profile.get('table')}.{profile.get('column')}",
+    }
+
+
+def _fresh_column_value_profile(
+    profile: Optional[Dict[str, Any]],
+    schema: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if profile is None:
+        return None
+    return _profile_with_freshness(profile, schema)
+
+
+def _catalog_inline_value_profile_eligible(profile: Dict[str, Any]) -> bool:
+    if profile.get("profile_status") != "profiled":
+        return False
+    if profile.get("stale") or profile.get("redacted") or profile.get("sampled"):
+        return False
+    if profile.get("truncated"):
+        return False
+    top_values = profile.get("top_values")
+    if not isinstance(top_values, list) or not top_values or len(top_values) > 25:
+        return False
+    for item in top_values:
+        if not isinstance(item, dict) or item.get("value") is None:
+            return False
+    return True
+
+
+def _normalize_column_value_profile(
+    raw: Dict[str, Any],
+    *,
+    source_evidence_id: Optional[str],
+) -> NormalizedColumnValueProfile:
+    from datetime import datetime, timezone
+
+    top_values = raw.get("top_values")
+    if top_values is None:
+        top_values = raw.get("values")
+    normalized_values: list[NormalizedColumnValue] = []
+    for item in top_values or []:
+        if isinstance(item, dict):
+            normalized_values.append(NormalizedColumnValue.from_dict(item))
+        else:
+            normalized_values.append(NormalizedColumnValue(value=item))
+
+    profile = NormalizedColumnValueProfile(
+        table=str(raw.get("table") or raw.get("table_name") or ""),
+        column=str(raw.get("column") or raw.get("column_name") or ""),
+        profile_kind=str(raw.get("profile_kind") or "categorical_values"),
+        profile_status=str(raw.get("profile_status") or "profiled"),
+        distinct_count=raw.get("distinct_count"),
+        null_count=raw.get("null_count"),
+        row_count=raw.get("row_count"),
+        top_values=normalized_values,
+        max_values=int(raw.get("max_values") or len(normalized_values) or 25),
+        sampled=bool(raw.get("sampled", False)),
+        truncated=bool(raw.get("truncated", False)),
+        redacted=bool(raw.get("redacted", False)),
+        skipped_reason=raw.get("skipped_reason"),
+        policy=dict(raw.get("policy", {}) or {}),
+        profiled_at=raw.get("profiled_at") or datetime.now(timezone.utc).isoformat(),
+        source_evidence_id=raw.get("source_evidence_id") or source_evidence_id,
+        source_fingerprint=raw.get("source_fingerprint"),
+        source_fingerprint_status=raw.get("source_fingerprint_status"),
+        source_fingerprint_reason=raw.get("source_fingerprint_reason"),
+        source_revision=raw.get("source_revision"),
+    )
+    if profile.profile_status == "profiled" and profile.redacted:
+        profile.profile_status = "redacted"
+    return profile
+
+
+def _score_column_value_profile(
+    profile: Dict[str, Any], tokens: List[str]
+) -> tuple[float, List[str]]:
+    if not tokens:
+        return 1.0, ["no_query_tokens"]
+    score = 0.0
+    reasons: list[str] = []
+    table = str(profile.get("table") or "").lower()
+    column = str(profile.get("column") or "").lower()
+    table_parts = set(_split_identifier(table))
+    column_parts = set(_split_identifier(column))
+    for token in tokens:
+        if token == table or token in table_parts:
+            score += 3.0
+            reasons.append(f"table:{token}")
+        if token == column or token in column_parts:
+            score += 4.0
+            reasons.append(f"column:{token}")
+        for value in profile.get("top_values", []) or []:
+            if not isinstance(value, dict):
+                continue
+            observed = str(value.get("value") or "").lower()
+            if not observed:
+                continue
+            if token == observed:
+                score += 6.0
+                reasons.append(f"value:{token}")
+            elif _lexical_value_match(token, observed):
+                score += 2.5
+                reasons.append(f"value_like:{token}->{observed}")
+    return score, reasons
+
+
+def _candidate_value_mapping(
+    tokens: List[str], values: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    best: tuple[float, str, Any, str] | None = None
+    for token in tokens:
+        for item in values:
+            observed = item.get("value")
+            observed_text = str(observed or "").lower()
+            if not observed_text:
+                continue
+            confidence = 0.0
+            reason = ""
+            if token == observed_text:
+                confidence = 1.0
+                reason = "exact_match"
+            elif _lexical_value_match(token, observed_text):
+                confidence = 0.78
+                reason = "lexical_stem_match"
+            if confidence and (best is None or confidence > best[0]):
+                best = (confidence, token, observed, reason)
+    if best is None:
+        return None
+    confidence, token, observed, reason = best
+    return {
+        "prompt_term": token,
+        "closest_value": observed,
+        "confidence": confidence,
+        "reason": reason,
+    }
+
+
+def _lexical_value_match(left: str, right: str) -> bool:
+    left_stem = _simple_stem(left)
+    right_stem = _simple_stem(right)
+    return (
+        left_stem == right_stem
+        or left_stem + "e" == right_stem
+        or left_stem == right_stem + "e"
+    )
+
+
+def _simple_stem(value: str) -> str:
+    text = value.lower().strip()
+    for suffix in ("ing", "ed", "es", "s"):
+        if len(text) > len(suffix) + 3 and text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
 
 
 def _find_asset(schema: Dict[str, Any], asset_ref: str) -> Optional[Dict[str, Any]]:

@@ -1,6 +1,7 @@
 from daita.db import DbRuntime
 from daita.plugins import ExtensionRegistry, PluginKind
 from daita.plugins.catalog import CatalogPlugin
+from daita.plugins.catalog.base_profiler import NormalizedColumn
 from daita.runtime import ContextAudience, Evidence, Operation, Task
 
 
@@ -66,6 +67,9 @@ def test_catalog_capabilities_are_visible_in_extension_registry():
         "catalog.schema.search",
         "catalog.asset.inspect",
         "catalog.relationship_paths.find",
+        "catalog.column_values.register",
+        "catalog.column_values.search",
+        "catalog.column_value_hints.resolve",
         "catalog.infrastructure.discover",
         "catalog.schema.compare",
         "catalog.diagram.export",
@@ -76,6 +80,9 @@ def test_catalog_capabilities_are_visible_in_extension_registry():
         "catalog.search_schema",
         "catalog.inspect_asset",
         "catalog.find_relationship_paths",
+        "catalog.register_column_values",
+        "catalog.search_column_values",
+        "catalog.resolve_column_value_hints",
         "catalog.discover_infrastructure",
         "catalog.compare_schema",
         "catalog.export_diagram",
@@ -86,6 +93,9 @@ def test_catalog_capabilities_are_visible_in_extension_registry():
         "schema.search_result",
         "schema.asset_profile",
         "schema.relationship_path",
+        "schema.column_value_profile",
+        "schema.column_value_search_result",
+        "schema.column_value_hint",
         "catalog.infrastructure_inventory",
         "schema.comparison",
     } <= evidence_kinds
@@ -195,6 +205,325 @@ async def test_catalog_inspect_relationship_and_profile_executors_return_evidenc
     assert relationship_evidence[0].payload["reachable"] is True
     assert profile_evidence[0].kind == "catalog.profile"
     assert profile_evidence[0].payload["table_count"] == 2
+
+
+async def test_catalog_registers_searches_and_resolves_column_value_profiles():
+    catalog = CatalogPlugin(auto_persist=False)
+    await catalog.register_schema(
+        {
+            **_reference_schema(),
+            "tables": [
+                *_reference_schema()["tables"],
+                {
+                    "name": "shipments",
+                    "columns": [
+                        {"name": "id", "data_type": "INTEGER"},
+                        {"name": "status", "data_type": "TEXT"},
+                    ],
+                },
+            ],
+        },
+        store_type="sqlite",
+        store_id="store:shop",
+        persist=False,
+    )
+    registry = ExtensionRegistry()
+    registry.register(catalog)
+    operation = Operation(id="op-values", operation_type="data.query")
+
+    registered = await _executor(registry, "catalog.register_column_values").execute(
+        Task(
+            id="task-values-register",
+            operation_id=operation.id,
+            capability_id="catalog.column_values.register",
+            executor_id="catalog.register_column_values",
+            input={
+                "store_id": "store:shop",
+                "profiles": [
+                    {
+                        "table": "shipments",
+                        "column": "status",
+                        "distinct_count": 2,
+                        "top_values": [
+                            {"value": "complete", "count": 4},
+                            {"value": "pending", "count": 1},
+                        ],
+                    }
+                ],
+            },
+        ),
+        operation,
+        {},
+    )
+    search = await _executor(registry, "catalog.search_column_values").execute(
+        Task(
+            id="task-values-search",
+            operation_id=operation.id,
+            capability_id="catalog.column_values.search",
+            executor_id="catalog.search_column_values",
+            input={"store_id": "store:shop", "query": "completed shipments"},
+        ),
+        operation,
+        {},
+    )
+    hints = await _executor(registry, "catalog.resolve_column_value_hints").execute(
+        Task(
+            id="task-values-hints",
+            operation_id=operation.id,
+            capability_id="catalog.column_value_hints.resolve",
+            executor_id="catalog.resolve_column_value_hints",
+            input={"store_id": "store:shop", "prompt": "completed shipments"},
+        ),
+        operation,
+        {},
+    )
+    inspected = catalog.inspect_asset("store:shop", "shipments")
+
+    assert registered[0].kind == "schema.column_value_profile"
+    assert registered[0].payload["canonical_path"] == "metadata.column_value_profiles"
+    stored = catalog.get_schema("store:shop").metadata["column_value_profiles"]
+    assert stored["shipments.status"]["top_values"][0]["value"] == "complete"
+    assert search[0].kind == "schema.column_value_search_result"
+    assert search[0].payload["profiles"][0]["profile_ref"] == "shipments.status"
+    assert hints[0].kind == "schema.column_value_hint"
+    assert (
+        hints[0].payload["hints"][0]["candidate_mapping"]["closest_value"] == "complete"
+    )
+    status = next(field for field in inspected["fields"] if field["name"] == "status")
+    assert status["column_value_hint"]["top_values"] == ["complete", "pending"]
+
+
+async def test_catalog_inspect_asset_omits_inline_values_for_stale_profiles():
+    catalog = CatalogPlugin(auto_persist=False)
+    await catalog.register_schema(
+        {
+            **_reference_schema(),
+            "metadata": {"profile_key": "fresh-key"},
+            "tables": [
+                *_reference_schema()["tables"],
+                {
+                    "name": "shipments",
+                    "columns": [
+                        {"name": "id", "data_type": "INTEGER"},
+                        {"name": "status", "data_type": "TEXT"},
+                    ],
+                },
+            ],
+        },
+        store_type="sqlite",
+        store_id="store:inline-stale",
+        persist=False,
+    )
+    await catalog.register_column_value_profiles(
+        "store:inline-stale",
+        [
+            {
+                "table": "shipments",
+                "column": "status",
+                "distinct_count": 2,
+                "top_values": [
+                    {"value": "complete", "count": 4},
+                    {"value": "pending", "count": 1},
+                ],
+            }
+        ],
+    )
+
+    catalog.get_schema("store:inline-stale").metadata["profile_key"] = "new-key"
+    inspected = catalog.inspect_asset("store:inline-stale", "shipments")
+    hints = catalog.resolve_column_value_hints(
+        "store:inline-stale",
+        "completed shipments",
+    )
+
+    status = next(field for field in inspected["fields"] if field["name"] == "status")
+    assert "column_value_hint" not in status
+    assert hints["hints"][0]["profile_status"] == "stale"
+    assert hints["hints"][0]["stale"] is True
+    assert hints["hints"][0]["observed_values"] == []
+    assert "candidate_mapping" not in hints["hints"][0]
+
+
+async def test_catalog_profiles_preserve_fingerprint_and_mark_profile_key_mismatch_stale():
+    catalog = CatalogPlugin(auto_persist=False)
+    await catalog.register_schema(
+        {
+            **_reference_schema(),
+            "metadata": {"profile_key": "fresh-key"},
+            "tables": [
+                *_reference_schema()["tables"],
+                {
+                    "name": "shipments",
+                    "columns": [
+                        {"name": "id", "data_type": "INTEGER"},
+                        {"name": "status", "data_type": "TEXT"},
+                    ],
+                },
+            ],
+        },
+        store_type="sqlite",
+        store_id="store:fresh",
+        persist=False,
+    )
+    await catalog.register_column_value_profiles(
+        "store:fresh",
+        [
+            {
+                "table": "shipments",
+                "column": "status",
+                "distinct_count": 2,
+                "source_fingerprint": "fingerprint-1",
+                "top_values": [
+                    {"value": "complete", "count": 4},
+                    {"value": "pending", "count": 1},
+                ],
+            }
+        ],
+    )
+    stored = catalog.get_schema("store:fresh").metadata["column_value_profiles"]
+
+    assert stored["shipments.status"]["source_fingerprint"] == "fingerprint-1"
+    assert stored["shipments.status"]["policy"]["profile_key"] == "fresh-key"
+
+    catalog.get_schema("store:fresh").metadata["profile_key"] = "new-key"
+    search = catalog.search_column_value_profiles(
+        "store:fresh",
+        "completed shipments",
+    )
+    hints = catalog.resolve_column_value_hints(
+        "store:fresh",
+        "completed shipments",
+    )
+
+    assert search["profiles"][0]["profile_status"] == "stale"
+    assert search["profiles"][0]["stale"] is True
+    assert search["profiles"][0]["stale_reason"] == "profile_key_mismatch"
+    assert search["profiles"][0]["source_fingerprint"] == "fingerprint-1"
+    assert hints["hints"][0]["profile_status"] == "stale"
+    assert hints["hints"][0]["stale"] is True
+
+
+async def test_catalog_profiles_mark_schema_fingerprint_mismatch_stale():
+    catalog = CatalogPlugin(auto_persist=False)
+    await catalog.register_schema(
+        {
+            **_reference_schema(),
+            "metadata": {"profile_key": "fresh-key"},
+            "tables": [
+                *_reference_schema()["tables"],
+                {
+                    "name": "shipments",
+                    "columns": [
+                        {"name": "id", "data_type": "INTEGER"},
+                        {"name": "status", "data_type": "TEXT"},
+                    ],
+                },
+            ],
+        },
+        store_type="sqlite",
+        store_id="store:fresh-schema",
+        persist=False,
+    )
+    await catalog.register_column_value_profiles(
+        "store:fresh-schema",
+        [
+            {
+                "table": "shipments",
+                "column": "status",
+                "distinct_count": 2,
+                "source_fingerprint": "fingerprint-1",
+                "top_values": [
+                    {"value": "complete", "count": 4},
+                    {"value": "pending", "count": 1},
+                ],
+            }
+        ],
+    )
+    schema = catalog.get_schema("store:fresh-schema")
+    stored = schema.metadata["column_value_profiles"]
+
+    assert stored["shipments.status"]["policy"]["profile_key"] == "fresh-key"
+    assert stored["shipments.status"]["policy"]["schema_fingerprint"]
+
+    shipments = next(table for table in schema.tables if table.name == "shipments")
+    shipments.columns.append(
+        NormalizedColumn(
+            name="carrier",
+            type="TEXT",
+            nullable=True,
+            is_primary_key=False,
+        )
+    )
+
+    search = catalog.search_column_value_profiles(
+        "store:fresh-schema",
+        "completed shipments",
+    )
+    hints = catalog.resolve_column_value_hints(
+        "store:fresh-schema",
+        "completed shipments",
+    )
+
+    assert search["profiles"][0]["profile_status"] == "stale"
+    assert search["profiles"][0]["stale"] is True
+    assert search["profiles"][0]["stale_reason"] == "schema_fingerprint_mismatch"
+    assert hints["hints"][0]["profile_status"] == "stale"
+    assert hints["hints"][0]["stale"] is True
+
+
+async def test_catalog_source_registration_preserves_existing_column_value_profiles():
+    catalog = CatalogPlugin(auto_persist=False)
+    await catalog.register_schema(
+        {
+            **_reference_schema(),
+            "tables": [
+                *_reference_schema()["tables"],
+                {
+                    "name": "shipments",
+                    "columns": [
+                        {"name": "id", "data_type": "INTEGER"},
+                        {"name": "status", "data_type": "TEXT"},
+                    ],
+                },
+            ],
+        },
+        store_type="sqlite",
+        store_id="store:preserve",
+        persist=False,
+    )
+    await catalog.register_column_value_profiles(
+        "store:preserve",
+        [
+            {
+                "table": "shipments",
+                "column": "status",
+                "distinct_count": 2,
+                "top_values": [{"value": "complete", "count": 4}],
+            }
+        ],
+    )
+
+    await catalog.register_schema(
+        {
+            **_reference_schema(),
+            "tables": [
+                *_reference_schema()["tables"],
+                {
+                    "name": "shipments",
+                    "columns": [
+                        {"name": "id", "data_type": "INTEGER"},
+                        {"name": "status", "data_type": "TEXT"},
+                    ],
+                },
+            ],
+        },
+        store_type="sqlite",
+        store_id="store:preserve",
+        persist=False,
+    )
+
+    stored = catalog.get_schema("store:preserve").metadata["column_value_profiles"]
+    assert stored["shipments.status"]["top_values"][0]["value"] == "complete"
 
 
 async def test_catalog_discovery_compare_diagram_and_context_providers():

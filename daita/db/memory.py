@@ -26,6 +26,7 @@ DB_MEMORY_KINDS = frozenset(
         "business_rule",
         "data_contract_note",
         "schema_interpretation",
+        "value_alias",
         "cache_marker",
     }
 )
@@ -35,6 +36,7 @@ DB_SEMANTIC_MEMORY_KINDS = (
     "business_rule",
     "data_contract_note",
     "schema_interpretation",
+    "value_alias",
 )
 
 PII_COLUMN_PATTERNS = (
@@ -219,7 +221,8 @@ def create_db_memory_tools(db_memory: DBMemory) -> list[Any]:
             description=(
                 "Store or revise durable database semantics for this from_db agent. "
                 "Use only for metric definitions, business rules, unit conventions, "
-                "data contracts, or schema interpretation; never store row values."
+                "data contracts, schema interpretation, or catalog-cited value "
+                "aliases; never store row values."
             ),
             parameters={
                 "type": "object",
@@ -759,6 +762,8 @@ def normalize_db_memory_record(raw: Any) -> DBMemoryRecord:
         raise ValueError("DB memory record requires a key")
     if not record.text:
         raise ValueError("DB memory record requires text")
+    if record.kind == "value_alias":
+        _validate_value_alias_memory(record)
     return DBMemoryRecord(
         kind=record.kind,
         key=record.key,
@@ -766,6 +771,24 @@ def normalize_db_memory_record(raw: Any) -> DBMemoryRecord:
         metadata=_json_safe(record.metadata),
         importance=max(0.0, min(1.0, record.importance)),
     )
+
+
+def _validate_value_alias_memory(record: DBMemoryRecord) -> None:
+    """Require catalog citation and keep observed values out of memory metadata."""
+    metadata = record.metadata
+    catalog_ref = str(metadata.get("catalog_profile_ref") or "").strip()
+    catalog_evidence_id = str(metadata.get("catalog_evidence_id") or "").strip()
+    if not catalog_ref and not catalog_evidence_id:
+        raise ValueError(
+            "value_alias memory requires catalog_profile_ref or catalog_evidence_id"
+        )
+
+    forbidden = _find_forbidden_value_alias_key(metadata)
+    if forbidden:
+        raise ValueError(
+            f"value_alias memory cannot store observed value field {forbidden!r}; "
+            "cite catalog evidence instead"
+        )
 
 
 def db_memory_pii_error(*, key: str, text: str, metadata: dict[str, Any]) -> str | None:
@@ -790,6 +813,32 @@ def db_memory_pii_error(*, key: str, text: str, metadata: dict[str, Any]) -> str
             f"DB memory metadata cannot store row-level or PII values ({metadata_value}); "
             "store durable database semantics only."
         )
+    return None
+
+
+def _find_forbidden_value_alias_key(value: Any, prefix: str = "") -> str | None:
+    forbidden_keys = {
+        "canonical_value",
+        "observed_value",
+        "observed_values",
+        "top_values",
+        "value",
+        "values",
+    }
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key)
+            path = f"{prefix}.{key_text}" if prefix else key_text
+            if key_text.lower() in forbidden_keys:
+                return path
+            nested = _find_forbidden_value_alias_key(item, path)
+            if nested:
+                return nested
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            nested = _find_forbidden_value_alias_key(item, f"{prefix}[{index}]")
+            if nested:
+                return nested
     return None
 
 
