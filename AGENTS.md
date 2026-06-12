@@ -88,7 +88,7 @@ Manifest plugins register through `ExtensionRegistry` and declare runtime contra
 
 `DbRuntime` owns DB operation planning, task execution, governance, approval state, resume, evidence, verification, and synthesis. Runtime-owned DB work must execute through declared capabilities, persisted `Task` records, registered executors, and the shared governance boundary.
 
-`execute_task()` is the executor-invocation choke point. `DbRuntime.run()`, `DbRuntime.execute_capability()`, specialist delegation, operation executor dispatch, monitors, scheduled work, and resume flows must pass through `execute_task()` before any executor runs.
+`execute_task()` is the executor-invocation choke point. `DbRuntime.run()`, `DbRuntime.execute_capability()`, worker execution, operation executor dispatch, monitors, scheduled work, and resume flows must pass through `execute_task()` before any executor runs.
 
 Runtime policy consumes facts produced by existing owners: planning, SQL validation, connector guardrails, capability metadata, evidence storage, and operation context. Do not duplicate those systems inside policy; policy decides permission from their facts.
 

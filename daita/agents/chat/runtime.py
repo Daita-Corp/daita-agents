@@ -568,7 +568,7 @@ class ChatRuntime:
                 view.capability_id,
                 owner=owner,
             )
-            if capability.runtime_only or capability.specialist_only:
+            if capability.runtime_only:
                 continue
             spec = ModelToolSpec(
                 name=view.name,
@@ -590,10 +590,8 @@ class ChatRuntime:
 
         registry_tool_names = {view.name for view in self.extension_registry.tool_views}
         for tool in resolved_local_tools:
-            if (
-                not bool(getattr(tool, "model_visible", True))
-                or bool(getattr(tool, "runtime_only", False))
-                or bool(getattr(tool, "specialist_only", False))
+            if not bool(getattr(tool, "model_visible", True)) or bool(
+                getattr(tool, "runtime_only", False)
             ):
                 continue
             if (

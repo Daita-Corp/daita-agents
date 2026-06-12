@@ -171,7 +171,6 @@ async def test_synthesis_task_depends_on_accepted_evidence_fingerprints(tmp_path
         dependency.evidence_kind: dependency for dependency in task.dependencies
     }
     assert {
-        "planning.context",
         "query.result",
         "query.plan.proposal",
         "query.plan.validation",

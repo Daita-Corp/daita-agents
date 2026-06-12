@@ -132,7 +132,6 @@ class LocalToolPlugin:
             executor=executor.id,
             model_visible=bool(getattr(tool, "model_visible", True)),
             runtime_only=bool(getattr(tool, "runtime_only", False)),
-            specialist_only=bool(getattr(tool, "specialist_only", False)),
             timeout_seconds=getattr(tool, "timeout_seconds", None),
             retry_safe=bool(getattr(tool, "retry_safe", False)),
             replay_safe=bool(getattr(tool, "replay_safe", False)),
@@ -179,11 +178,7 @@ class LocalToolPlugin:
         return (self._evidence_schema,)
 
     def get_tool_views(self):
-        if (
-            not self._capability.model_visible
-            or self._capability.runtime_only
-            or self._capability.specialist_only
-        ):
+        if not self._capability.model_visible or self._capability.runtime_only:
             return ()
         return (self._tool_view,)
 

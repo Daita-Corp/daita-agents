@@ -18,8 +18,6 @@ from daita.runtime import (
     RuntimeKernelTaskNotRunnable,
     Task,
     TaskDependency,
-    WorkerRuntime,
-    WorkerRuntimeOptions,
 )
 
 from .analysis import with_analysis_evidence_trace
@@ -514,14 +512,6 @@ class DbOperationExecutor:
                 evidence_store,
                 {"store_id": store_id, "asset_ref": table, "limit": 100},
             )
-        await self._delegate_worker(
-            "schema_specialist",
-            request,
-            operation,
-            tasks,
-            evidence_store,
-            {"prompt": request.prompt, "schema": schema, "store_id": store_id},
-        )
 
     async def _execute_quality_steps(
         self,
@@ -1577,142 +1567,6 @@ class DbOperationExecutor:
         )
         evidence_store.add_many(evidence)
         return evidence
-
-    async def _delegate_worker(
-        self,
-        role: str,
-        request: DbRequest,
-        operation: Operation,
-        tasks: list[Task],
-        evidence_store: DbEvidenceStore,
-        input: dict[str, Any],
-    ) -> tuple[Evidence, ...]:
-        for worker in self.runtime.registry.workers:
-            if worker.role != role:
-                continue
-            for capability_id in worker.capability_ids:
-                try:
-                    capability = self.runtime.registry.get_capability(
-                        capability_id,
-                        owner=worker.owner,
-                    )
-                except KeyError:
-                    continue
-                await self.runtime.kernel.append_event(
-                    RuntimeEventType.WORKER_DELEGATED,
-                    operation_id=operation.id,
-                    capability=capability,
-                    message=f"Delegated {role} work to {worker.owner}:{worker.id}.",
-                    payload={
-                        "worker_id": worker.id,
-                        "worker_owner": worker.owner,
-                        "worker_role": worker.role,
-                        "capability_id": capability.id,
-                        "prompt": request.prompt,
-                        **{
-                            key: value
-                            for key, value in input.items()
-                            if key.startswith("analysis_")
-                        },
-                    },
-                )
-                task = await self._persist_worker_task(
-                    capability,
-                    operation,
-                    tasks,
-                    input,
-                    worker_id=worker.id,
-                )
-                worker_runtime = WorkerRuntime(
-                    kernel=self.runtime.kernel,
-                    options=WorkerRuntimeOptions(
-                        worker_id=worker.id,
-                        owner=worker.owner,
-                        max_concurrency=worker.max_concurrency,
-                    ),
-                )
-                handoff = await worker_runtime.handoff_task(
-                    task.id,
-                    reason=f"db_delegate:{role}",
-                    metadata={"worker_role": worker.role, "prompt": request.prompt},
-                )
-                result = await worker_runtime.execute_handoff(
-                    handoff,
-                    context={"capability_owner": capability.owner},
-                )
-                if result.error is not None:
-                    _raise_db_worker_error(result.error, result.execution)
-                if result.execution is None:
-                    return ()
-                evidence_store.add_many(result.execution.evidence)
-                return result.execution.evidence
-        return ()
-
-    async def _persist_worker_task(
-        self,
-        capability: Capability,
-        operation: Operation,
-        tasks: list[Task],
-        input: dict[str, Any],
-        *,
-        worker_id: str,
-    ) -> Task:
-        analysis_trace = {
-            key: value
-            for key, value in input.items()
-            if key
-            in {
-                "analysis_id",
-                "analysis_step_id",
-                "analysis_step_kind",
-                "analysis_plan_evidence_id",
-            }
-        }
-        planned = await self.runtime._planned_task_for_capability(
-            operation.id,
-            capability,
-            metadata_match=analysis_trace or None,
-        )
-        task = (
-            Task(
-                id=f"db-task-{uuid4()}",
-                operation_id=operation.id,
-                capability_id=capability.id,
-                executor_id=capability.executor,
-                input=input,
-                required_evidence=capability.output_evidence,
-                metadata={
-                    **with_analysis_evidence_trace(
-                        {
-                            "owner": capability.owner,
-                            "reason": f"worker:{worker_id}",
-                            **analysis_trace,
-                        }
-                    )
-                },
-            )
-            if planned is None
-            else replace(
-                planned,
-                input=input,
-                metadata={
-                    **with_analysis_evidence_trace(
-                        {
-                            **planned.metadata,
-                            "owner": capability.owner,
-                            "reason": f"worker:{worker_id}",
-                            **analysis_trace,
-                        }
-                    ),
-                },
-            )
-        )
-        tasks.append(task)
-        if planned is None:
-            task = await self.runtime._plan_kernel_task(task)
-        else:
-            await self.runtime.store.save_task(task)
-        return task
 
     def _first_capability(self, capability_id: str) -> Capability | None:
         for capability in self.runtime.registry.capabilities:

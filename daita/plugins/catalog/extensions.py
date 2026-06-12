@@ -342,7 +342,6 @@ class CatalogSummaryContextProvider:
     audiences: frozenset[ContextAudience] = frozenset(
         {
             ContextAudience.PRIMARY_MODEL,
-            ContextAudience.SCHEMA_SPECIALIST,
             ContextAudience.OPERATION_INSPECTOR,
         }
     )

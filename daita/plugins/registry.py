@@ -454,12 +454,10 @@ class ExtensionRegistry:
                 if capability.id == tool_view.capability_id
                 and capability.owner == manifest.id
             )
-            if capability.runtime_only or capability.specialist_only:
+            if capability.runtime_only:
                 hidden_flags = []
                 if capability.runtime_only:
                     hidden_flags.append("runtime_only")
-                if capability.specialist_only:
-                    hidden_flags.append("specialist_only")
                 raise ValueError(
                     f"tool view {tool_view.name!r} cannot expose hidden capability "
                     f"{tool_view.capability_id!r} ({', '.join(hidden_flags)})"

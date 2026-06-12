@@ -212,7 +212,6 @@ class LiveRuntimeDbPlugin:
                 description="Run live Postgres worker query.",
                 operation_types=frozenset({"worker.query"}),
                 output_evidence=frozenset({"live_runtime.worker.result"}),
-                specialist_only=True,
                 **common,
             ),
             Capability(
@@ -227,7 +226,6 @@ class LiveRuntimeDbPlugin:
                 output_evidence=frozenset({"live_runtime.worker.result"}),
                 executor=self.executor.id,
                 runtime_only=True,
-                specialist_only=True,
                 replay_safe=False,
                 side_effecting=True,
             ),

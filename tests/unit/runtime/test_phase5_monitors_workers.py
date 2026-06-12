@@ -84,7 +84,7 @@ class Phase5Plugin:
         }
         return (
             Capability(id="phase5.monitor.action", **common),
-            Capability(id="phase5.worker.task", specialist_only=True, **common),
+            Capability(id="phase5.worker.task", **common),
         )
 
     def get_executors(self):

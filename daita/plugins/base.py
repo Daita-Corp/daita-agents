@@ -119,7 +119,7 @@ class BasePlugin(ABC):
         return ()
 
     def get_workers(self) -> tuple[Worker, ...]:
-        """Return specialist or background worker declarations."""
+        """Return leased or background worker declarations."""
         return ()
 
 
@@ -155,7 +155,7 @@ class RuntimeExtensionPlugin(BasePlugin):
 
 
 class WorkerProviderPlugin(BasePlugin):
-    """Base for plugins that contribute specialist or background workers."""
+    """Base for plugins that contribute leased or background workers."""
 
     expected_kind: ClassVar[PluginKind] = PluginKind.WORKER_PROVIDER
 

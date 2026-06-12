@@ -5143,7 +5143,6 @@ def _capability_governance_facts(capability: Capability) -> dict[str, Any]:
         "access": capability.access.value,
         "risk": capability.risk.value,
         "runtime_only": capability.runtime_only,
-        "specialist_only": capability.specialist_only,
         "side_effecting": capability.side_effecting,
         "executor": capability.executor,
         "output_evidence": sorted(capability.output_evidence),

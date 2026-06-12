@@ -259,7 +259,6 @@ def tool(
     operation_types: Iterable[str] = ("chat.tool_call",),
     model_visible: bool = True,
     runtime_only: bool = False,
-    specialist_only: bool = False,
     timeout_seconds: Optional[int] = None,
     category: Optional[str] = None,
     focus: Optional[str] = None,
@@ -333,7 +332,6 @@ def tool(
             operation_types=tuple(operation_types),
             model_visible=model_visible,
             runtime_only=runtime_only,
-            specialist_only=specialist_only,
             timeout_seconds=timeout_seconds,
             category=category,
             focus=focus,
@@ -397,7 +395,6 @@ class LocalTool:
     operation_types: Tuple[str, ...] = ("chat.tool_call",)
     model_visible: bool = True
     runtime_only: bool = False
-    specialist_only: bool = False
     metadata: Dict[str, Any] = None
 
     # Safety features

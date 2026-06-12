@@ -151,9 +151,9 @@ def test_tool_view_validates_model_tool_name_and_serializes_parameters():
 
 def test_worker_validates_capabilities_and_concurrency():
     worker = Worker(
-        id="schema.specialist",
+        id="catalog.refresh.worker",
         owner="catalog",
-        role="schema_specialist",
+        role="catalog_refresh",
         capability_ids=frozenset({"catalog.schema.search"}),
         input_schema={"type": "object"},
         output_evidence=frozenset({"schema.search_result"}),
@@ -164,9 +164,9 @@ def test_worker_validates_capabilities_and_concurrency():
 
     with pytest.raises(ValueError):
         Worker(
-            id="schema.specialist",
+            id="catalog.refresh.worker",
             owner="catalog",
-            role="schema_specialist",
+            role="catalog_refresh",
             capability_ids=frozenset({"catalog.schema.search"}),
             input_schema={"type": "object"},
             output_evidence=frozenset({"schema.search_result"}),

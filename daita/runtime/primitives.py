@@ -4,7 +4,7 @@ Framework-level runtime primitives.
 These records are intentionally domain-neutral. They describe capabilities,
 tasks, evidence, context, workers, operations, and events in a form that can be
 shared by the generic chat runtime, the upcoming DB runtime, and future
-specialized runtimes.
+focused runtimes.
 """
 
 from __future__ import annotations
@@ -44,9 +44,6 @@ class ContextAudience(str, Enum):
 
     PRIMARY_MODEL = "primary_model"
     FINAL_SYNTHESIZER = "final_synthesizer"
-    SQL_REPAIR_SPECIALIST = "sql_repair_specialist"
-    SCHEMA_SPECIALIST = "schema_specialist"
-    QUALITY_SPECIALIST = "quality_specialist"
     HUMAN_REVIEWER = "human_reviewer"
     OPERATION_INSPECTOR = "operation_inspector"
 
@@ -187,7 +184,6 @@ class Capability:
     executor: str
     model_visible: bool = False
     runtime_only: bool = False
-    specialist_only: bool = False
     retry_safe: bool = False
     replay_safe: bool = False
     idempotent: bool = False
@@ -225,7 +221,6 @@ class Capability:
             "executor": self.executor,
             "model_visible": self.model_visible,
             "runtime_only": self.runtime_only,
-            "specialist_only": self.specialist_only,
             "retry_safe": self.retry_safe,
             "replay_safe": self.replay_safe,
             "idempotent": self.idempotent,

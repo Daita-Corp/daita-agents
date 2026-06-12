@@ -352,7 +352,6 @@ async def test_agent_from_db_executes_count_query_with_typed_evidence(tmp_path):
     assert answer == "The count is 2."
     assert result.status is OperationStatus.SUCCEEDED
     assert {
-        "planning.context",
         "query.plan.proposal",
         "query.plan.validation",
         "sql.validation",
