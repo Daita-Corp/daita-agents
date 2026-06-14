@@ -57,29 +57,6 @@ class DbMonitorObservationResult:
     summary: dict[str, Any] | None = None
 
 
-@dataclass(frozen=True)
-class DbMonitorActionResult:
-    """Compact action execution provenance for a triggered monitor child op."""
-
-    status: str
-    evidence_id: str | None = None
-    report_evidence_id: str | None = None
-    task_ids: tuple[str, ...] = ()
-    evidence_ids: tuple[str, ...] = ()
-    summary: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class DbMonitorDeliveryResult:
-    """Compact delivery provenance for a triggered monitor child op."""
-
-    status: str
-    evidence_id: str | None = None
-    task_ids: tuple[str, ...] = ()
-    plugin_evidence_refs: tuple[dict[str, Any], ...] = ()
-    summary: dict[str, Any] | None = None
-
-
 class DbMonitorObservationBlocked(RuntimeError):
     """Raised when a persisted observation plan cannot safely execute."""
 
@@ -1544,18 +1521,6 @@ def _runtime_spec_for_decision(spec: MonitorSpec, trigger_ready: bool) -> Monito
         cursor=spec.cursor,
         metadata=spec.metadata,
     )
-
-
-def _monitor_tick_value(monitor: DbMonitor) -> Any:
-    if "tick_value" in monitor.metadata:
-        return monitor.metadata["tick_value"]
-    if "observed_value" in monitor.metadata:
-        return monitor.metadata["observed_value"]
-    if "value" in monitor.observation_plan:
-        return monitor.observation_plan["value"]
-    if monitor.trigger.get("type") in {"schedule", "scheduled"}:
-        return True
-    return None
 
 
 def _trigger_decision(

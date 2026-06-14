@@ -256,31 +256,6 @@ def _known_table_key(table_key: str, table_columns: dict[str, set[str]]) -> str 
     return None
 
 
-def _analysis_references_sources(
-    analysis: SqlAnalysis, requirement: AnswerRequirement
-) -> bool:
-    for source in requirement.source_columns:
-        if not source.column:
-            continue
-        source_column = source.column.lower()
-        source_table = source.table.lower()
-        for column in analysis.columns:
-            if column.key != source_column:
-                continue
-            if not source_table:
-                return True
-            qualifier = column.qualifier_key
-            if not qualifier:
-                return True
-            if (
-                qualifier == source_table
-                or qualifier.split(".")[-1] == source_table.split(".")[-1]
-            ):
-                return True
-        return False
-    return True
-
-
 def _tables_to_inspect(
     unknown_tables: set[str], missing_columns: list[dict[str, str]]
 ) -> list[str]:

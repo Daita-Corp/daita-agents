@@ -467,12 +467,6 @@ def _sql_column_ref(column: Any) -> SqlColumnRef:
     return SqlColumnRef(name=name, table=qualifier, parts=parts or (name,))
 
 
-def _string_literal_value(value: Any, exp: Any) -> str | None:
-    if not isinstance(value, exp.Literal) or not getattr(value, "is_string", False):
-        return None
-    return str(value.this)
-
-
 def _literal_value(value: Any, exp: Any) -> str | None:
     if not isinstance(value, exp.Literal):
         return None

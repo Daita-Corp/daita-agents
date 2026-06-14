@@ -11,11 +11,7 @@ from uuid import uuid4
 from daita.runtime import (
     Capability,
     Evidence,
-    GovernanceResult,
     Operation,
-    RuntimeEventType,
-    RuntimeKernelGovernanceBlocked,
-    RuntimeKernelTaskNotRunnable,
     Task,
     TaskDependency,
 )
@@ -31,7 +27,7 @@ from .capabilities import (
     SCHEMA_SEARCH_RESULT_EVIDENCE,
     SQL_VALIDATION_EVIDENCE,
 )
-from .evidence import DbEvidenceStore, InMemoryDbEvidenceStore
+from .evidence import DbEvidenceStore
 from .models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
 from .query_planning import DbQueryPlanner
 from .query_sql_validation import sql_fingerprint
@@ -2160,28 +2156,6 @@ def _stable_hash(value: Any) -> str:
 
     encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def _raise_db_worker_error(error: BaseException, execution: Any | None) -> None:
-    if isinstance(error, RuntimeKernelGovernanceBlocked):
-        from .runtime import DbRuntimeGovernanceBlocked
-
-        if execution is None:
-            raise error
-        raise DbRuntimeGovernanceBlocked(
-            operation=execution.operation,
-            task=execution.task,
-            governance=(
-                execution.governance
-                if execution.governance is not None
-                else GovernanceResult(False, False, True)
-            ),
-        ) from error
-    if isinstance(error, RuntimeKernelTaskNotRunnable) and execution is not None:
-        from .runtime import DbRuntimeTaskNotRunnable
-
-        raise DbRuntimeTaskNotRunnable(execution.task, str(error)) from error
-    raise error
 
 
 def _lineage_entity_for_request(request: DbRequest, table: str | None) -> str:
