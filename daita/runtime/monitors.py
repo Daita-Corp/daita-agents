@@ -129,7 +129,7 @@ class MonitorRuntime:
                 value=value,
                 context=context,
             )
-            state.last_value_summary = _summarize_value(observed_value)
+            state.last_value_summary = summarize_monitor_value(observed_value)
             if state.cooldown_until is not None and state.cooldown_until > now:
                 skipped = self._event(
                     RuntimeEventType.MONITOR_SKIPPED,
@@ -145,7 +145,7 @@ class MonitorRuntime:
                 events.append(skipped)
                 return MonitorTickResult(spec.id, False, events=tuple(events))
 
-            if not _trigger_matches(observed_value, spec.trigger):
+            if not monitor_trigger_matches(observed_value, spec.trigger):
                 skipped = self._event(
                     RuntimeEventType.MONITOR_SKIPPED,
                     spec=spec,
@@ -334,7 +334,8 @@ class MonitorRuntime:
         )
 
 
-def _trigger_matches(value: Any, trigger: Mapping[str, Any]) -> bool:
+def monitor_trigger_matches(value: Any, trigger: Mapping[str, Any]) -> bool:
+    """Evaluate the generic monitor predicate language."""
     if not trigger:
         return True
     candidate = (
@@ -373,7 +374,8 @@ def _extract_path(value: Any, path: str) -> Any:
     return current
 
 
-def _summarize_value(value: Any) -> Any:
+def summarize_monitor_value(value: Any) -> Any:
+    """Return a compact, JSON-friendly summary of an observed monitor value."""
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     if isinstance(value, Mapping):

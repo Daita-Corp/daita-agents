@@ -32,6 +32,7 @@ from daita.runtime import (
     OperationStatus,
     OperationSnapshot,
     PolicyEvaluator,
+    PolicyEffect,
     PolicyDecisionTrace,
     RuntimeEvent,
     RuntimeEventType,
@@ -42,6 +43,7 @@ from daita.runtime import (
     RuntimeKernelTaskAlreadyTerminal,
     RuntimeKernelTaskNotRunnable,
     RuntimeStore,
+    SQLiteRuntimeStore,
     Task,
     TaskDependency,
     TaskStatus,
@@ -71,9 +73,33 @@ from .models import (
     DbRuntimeConfig,
     DbRuntimeInspection,
 )
+from .monitor_plugin_planning import (
+    MonitorPluginPlanner,
+    MonitorPluginPlanningBlocked,
+    monitor_delivery_source_refs,
+    monitor_report_fingerprint,
+    monitor_source_observed_value,
+)
+from .monitors import (
+    DbMonitor,
+    DbMonitorInspection,
+    DbMonitorMutation,
+    DbMonitorRun,
+    DbMonitorState,
+    DbMonitorStore,
+    InMemoryDbMonitorStore,
+    SQLiteDbMonitorStore,
+    monitor_with_updates,
+)
+from .monitor_scheduler import DbMonitorScheduler
 from .planning import DbContractBuilder, DbIntentClassifier
 from .runtime_extensions import DbRuntimePlanningPlugin
 from .synthesis import DbSynthesizer
+from .sql_evidence import (
+    blocked_scope_resources,
+    effective_source_scope,
+    sql_validation_facts_from_evidence,
+)
 from .verification import DbVerifier
 
 _TERMINAL_TASK_STATUSES = frozenset(
@@ -93,6 +119,18 @@ class _GovernancePersistence:
     audit_record: GovernanceAuditRecord
     approvals_to_request: tuple[ApprovalRequest, ...]
     events: tuple[RuntimeEvent, ...]
+
+
+@dataclass(frozen=True)
+class _MonitorEffectGovernanceDecision:
+    status: str
+    reason: str | None
+    result: GovernanceResult
+    audit_record: GovernanceAuditRecord
+
+    @property
+    def allowed(self) -> bool:
+        return self.status == "allowed"
 
 
 @dataclass(frozen=True)
@@ -133,6 +171,7 @@ class DbRuntime:
         registry: ExtensionRegistry | None = None,
         plugins: tuple[Any, ...] | list[Any] = (),
         store: RuntimeStore | None = None,
+        monitor_store: DbMonitorStore | None = None,
         approval_channel: InMemoryApprovalChannel | None = None,
         runtime_id: str | None = None,
         db_llm_service: DbLLMService | None = None,
@@ -141,6 +180,7 @@ class DbRuntime:
         self.config = config or DbRuntimeConfig()
         self.registry = registry or ExtensionRegistry()
         self.store = store or InMemoryRuntimeStore()
+        self.monitor_store = monitor_store or _default_monitor_store(self.store)
         self.approval_channel = approval_channel or InMemoryApprovalChannel(self.store)
         self.runtime_id = runtime_id or f"db-runtime-{uuid4()}"
         self.intent_classifier = DbIntentClassifier()
@@ -189,6 +229,436 @@ class DbRuntime:
     def audit_log(self) -> tuple[dict[str, Any], ...]:
         """Redacted operation audit summaries retained by this runtime."""
         return tuple(dict(entry) for entry in self._audit_log)
+
+    async def create_monitor(self, monitor: DbMonitor) -> DbMonitor:
+        """Persist a DB monitor definition and audit the create operation."""
+        operation, evidence, events = self._monitor_management_artifacts(
+            "create",
+            monitor=monitor,
+            evidence_kind="monitor.definition",
+            payload={"monitor": monitor.to_dict()},
+        )
+        await self.monitor_store.commit_monitor_mutation(
+            DbMonitorMutation(
+                action="create",
+                operation=operation,
+                evidence=evidence,
+                events=events,
+                monitor_after=monitor,
+                state_after=DbMonitorState(
+                    monitor_id=monitor.id,
+                    last_operation_id=operation.id,
+                    last_management_operation_id=operation.id,
+                ),
+            )
+        )
+        return monitor
+
+    async def list_monitors(
+        self, *, status: str | None = None
+    ) -> tuple[DbMonitor, ...]:
+        """List durable DB monitor definitions."""
+        return await self.monitor_store.list_monitors(status=status)
+
+    async def inspect_monitor(self, monitor_id: str) -> DbMonitorInspection | None:
+        """Return a monitor definition with durable state and run summaries."""
+        monitor = await self.monitor_store.load_monitor(monitor_id)
+        if monitor is None:
+            return None
+        state = await self.monitor_store.load_monitor_state(monitor_id)
+        runs = await self.monitor_store.list_monitor_runs(monitor_id)
+        return DbMonitorInspection(monitor=monitor, state=state, runs=runs)
+
+    async def update_monitor(
+        self,
+        monitor_id: str,
+        patch: dict[str, Any],
+    ) -> DbMonitor:
+        """Patch a durable monitor definition and audit the update."""
+        monitor = await self.monitor_store.load_monitor(monitor_id)
+        if monitor is None:
+            raise ValueError(f"monitor {monitor_id!r} does not exist")
+        updated = monitor_with_updates(monitor, patch)
+        operation, evidence, events = self._monitor_management_artifacts(
+            "update",
+            monitor=updated,
+            evidence_kind="monitor.state_update",
+            payload={
+                "monitor_id": monitor_id,
+                "before": monitor.to_dict(),
+                "after": updated.to_dict(),
+                "patch": dict(patch),
+            },
+        )
+        state = await self.monitor_store.load_monitor_state(monitor_id)
+        state = state or DbMonitorState(monitor_id=monitor_id)
+        await self.monitor_store.commit_monitor_mutation(
+            DbMonitorMutation(
+                action="update",
+                operation=operation,
+                evidence=evidence,
+                events=events,
+                monitor_before=monitor,
+                monitor_after=updated,
+                state_after=DbMonitorState.from_dict(
+                    {
+                        **state.to_dict(),
+                        "last_operation_id": operation.id,
+                        "last_management_operation_id": operation.id,
+                    }
+                ),
+            )
+        )
+        return updated
+
+    async def pause_monitor(
+        self,
+        monitor_id: str,
+        *,
+        paused_until: str | None = None,
+    ) -> DbMonitor:
+        """Mark a monitor paused and persist its pause state."""
+        monitor = await self.monitor_store.load_monitor(monitor_id)
+        if monitor is None:
+            raise ValueError(f"monitor {monitor_id!r} does not exist")
+        updated = monitor_with_updates(monitor, {"status": "paused"})
+        operation, evidence, events = self._monitor_management_artifacts(
+            "pause",
+            monitor=updated,
+            evidence_kind="monitor.state_update",
+            payload={
+                "monitor_id": monitor_id,
+                "before": monitor.to_dict(),
+                "after": updated.to_dict(),
+                "paused_until": paused_until,
+            },
+        )
+        state = await self.monitor_store.load_monitor_state(monitor_id)
+        state = state or DbMonitorState(monitor_id=monitor_id)
+        await self.monitor_store.commit_monitor_mutation(
+            DbMonitorMutation(
+                action="pause",
+                operation=operation,
+                evidence=evidence,
+                events=events,
+                monitor_before=monitor,
+                monitor_after=updated,
+                state_after=DbMonitorState.from_dict(
+                    {
+                        **state.to_dict(),
+                        "last_operation_id": operation.id,
+                        "last_management_operation_id": operation.id,
+                        "paused_until": paused_until,
+                    }
+                ),
+            )
+        )
+        return updated
+
+    async def resume_monitor(self, monitor_id: str) -> DbMonitor:
+        """Resume a paused monitor."""
+        monitor = await self.monitor_store.load_monitor(monitor_id)
+        if monitor is None:
+            raise ValueError(f"monitor {monitor_id!r} does not exist")
+        updated = monitor_with_updates(monitor, {"status": "active"})
+        operation, evidence, events = self._monitor_management_artifacts(
+            "resume",
+            monitor=updated,
+            evidence_kind="monitor.state_update",
+            payload={
+                "monitor_id": monitor_id,
+                "before": monitor.to_dict(),
+                "after": updated.to_dict(),
+            },
+        )
+        state = await self.monitor_store.load_monitor_state(monitor_id)
+        state = state or DbMonitorState(monitor_id=monitor_id)
+        await self.monitor_store.commit_monitor_mutation(
+            DbMonitorMutation(
+                action="resume",
+                operation=operation,
+                evidence=evidence,
+                events=events,
+                monitor_before=monitor,
+                monitor_after=updated,
+                state_after=DbMonitorState.from_dict(
+                    {
+                        **state.to_dict(),
+                        "last_operation_id": operation.id,
+                        "last_management_operation_id": operation.id,
+                        "paused_until": None,
+                    }
+                ),
+            )
+        )
+        return updated
+
+    async def delete_monitor(self, monitor_id: str) -> DbMonitor:
+        """Delete a monitor control-plane record and audit the removal."""
+        monitor = await self.monitor_store.load_monitor(monitor_id)
+        if monitor is None:
+            raise ValueError(f"monitor {monitor_id!r} does not exist")
+        operation, evidence, events = self._monitor_management_artifacts(
+            "delete",
+            monitor=monitor,
+            evidence_kind="monitor.definition",
+            payload={"deleted_monitor": monitor.to_dict()},
+        )
+        await self.monitor_store.commit_monitor_mutation(
+            DbMonitorMutation(
+                action="delete",
+                operation=operation,
+                evidence=evidence,
+                events=events,
+                monitor_before=monitor,
+            )
+        )
+        return monitor
+
+    async def list_monitor_approvals(
+        self,
+        *,
+        monitor_id: str | None = None,
+        monitor_run_id: str | None = None,
+        pending_only: bool = True,
+    ) -> tuple[dict[str, Any], ...]:
+        """List monitor-related approvals without mutating approval state."""
+
+        approvals: list[dict[str, Any]] = []
+        for approval in await self.store.list_approval_requests():
+            if pending_only and approval.status is not ApprovalStatus.PENDING:
+                continue
+            context = await self._monitor_approval_context(approval)
+            if not context:
+                continue
+            if monitor_id is not None and context.get("monitor_id") != monitor_id:
+                continue
+            if (
+                monitor_run_id is not None
+                and context.get("monitor_run_id") != monitor_run_id
+            ):
+                continue
+            approvals.append(
+                {
+                    "approval_id": approval.approval_id,
+                    "operation_id": approval.operation_id,
+                    "task_id": getattr(approval, "task_id", None),
+                    "status": approval.status.value,
+                    "reason": approval.reason,
+                    "risk": approval.risk.value,
+                    "requested_by_policy_id": approval.requested_by_policy_id,
+                    "owner": approval.owner,
+                    "context": context,
+                }
+            )
+        return tuple(approvals)
+
+    async def approve_monitor_approval(self, approval_id: str) -> ApprovalRequest:
+        """Approve a monitor approval through the configured approval channel."""
+
+        return await self.approval_channel.approve(approval_id)
+
+    async def reject_monitor_approval(self, approval_id: str) -> ApprovalRequest:
+        """Reject a monitor approval through the configured approval channel."""
+
+        return await self.approval_channel.reject(approval_id)
+
+    async def cancel_monitor_approval(self, approval_id: str) -> ApprovalRequest:
+        """Cancel a monitor approval through the configured approval channel."""
+
+        return await self.approval_channel.cancel(approval_id)
+
+    async def tick_monitors(
+        self, *, now: datetime | str | None = None
+    ) -> tuple[DbMonitorRun, ...]:
+        """Run one durable DB monitor scheduler pass."""
+        if not self._is_setup:
+            await self.setup()
+        scheduler = DbMonitorScheduler(runtime=self)
+        results = await scheduler.run_once(now=now)
+        return tuple(result.run for result in results)
+
+    async def record_monitor_command_result(
+        self,
+        *,
+        request: DbRequest,
+        kind: str,
+        command: dict[str, Any],
+        status: OperationStatus,
+        answer: str,
+        operation_id: str | None = None,
+        evidence: tuple[Evidence, ...] = (),
+        evidence_kind: str | None = None,
+        payload: dict[str, Any] | None = None,
+        warnings: tuple[str, ...] = (),
+        diagnostics: dict[str, Any] | None = None,
+        persist_operation: bool = True,
+    ) -> DbOperationResult:
+        """Record a prompt-level monitor command result through runtime audit.
+
+        This is a control-plane audit path only. It persists operation/evidence/
+        event records for monitor management commands without planning SQL,
+        creating tasks, invoking executors, or evaluating governance.
+        """
+        command_payload = dict(command)
+        operation_id = operation_id or f"monitor-command-{kind}-{uuid4()}"
+        persisted_evidence = tuple(evidence)
+        if persist_operation:
+            operation = Operation(
+                id=operation_id,
+                operation_type=f"monitor.{kind}",
+                status=status,
+                request={
+                    "kind": f"monitor.{kind}",
+                    "prompt": request.prompt,
+                    "command": command_payload,
+                },
+                required_evidence=(
+                    frozenset({evidence_kind})
+                    if evidence_kind is not None
+                    else frozenset()
+                ),
+                metadata={
+                    "runtime_id": self.runtime_id,
+                    "runtime_kind": self.runtime_kind,
+                    "control_plane": "db.monitor",
+                    "monitor_id": command_payload.get("monitor_id"),
+                    "command_kind": kind,
+                },
+            )
+            if evidence_kind is not None:
+                persisted_evidence = (
+                    Evidence(
+                        id=f"monitor-command-evidence-{uuid4()}",
+                        kind=evidence_kind,
+                        owner="db.monitor",
+                        operation_id=operation_id,
+                        payload=dict(payload or {}),
+                        accepted=status is OperationStatus.SUCCEEDED,
+                    ),
+                )
+            created_event = RuntimeEvent(
+                id=f"monitor-command-event-{uuid4()}",
+                type=RuntimeEventType.OPERATION_CREATED,
+                operation_id=operation_id,
+                runtime_id=self.runtime_id,
+                runtime_kind=self.runtime_kind,
+                message=f"Monitor command operation {operation_id} created.",
+                payload={"operation_type": operation.operation_type},
+            )
+            completed_event = RuntimeEvent(
+                id=f"monitor-command-event-{uuid4()}",
+                type=RuntimeEventType.OPERATION_UPDATED,
+                operation_id=operation_id,
+                runtime_id=self.runtime_id,
+                runtime_kind=self.runtime_kind,
+                evidence_id=(persisted_evidence[0].id if persisted_evidence else None),
+                message=f"Monitor command {kind} finished with {status.value}.",
+                payload={
+                    "status": status.value,
+                    "command_kind": kind,
+                    "monitor_id": command_payload.get("monitor_id"),
+                    "warnings": list(warnings),
+                },
+            )
+            await self.store.save_operation(operation)
+            for item in persisted_evidence:
+                await self.store.save_evidence(item)
+            await self.store.append_event(created_event)
+            await self.store.append_event(completed_event)
+
+        result = DbOperationResult(
+            operation_id=operation_id,
+            request=request,
+            intent=DbIntent(
+                kind=DbIntentKind.ADMIN,
+                confidence=float(command_payload.get("confidence") or 0.0),
+                access=AccessMode.NONE,
+                diagnostics={
+                    "command_kind": kind,
+                    **dict(command_payload.get("diagnostics") or {}),
+                },
+            ),
+            contract=DbOperationContract(
+                operation_type=f"monitor.{kind}",
+                required_evidence=tuple(item.kind for item in persisted_evidence),
+                access=AccessMode.NONE,
+                metadata={
+                    "control_plane": "db.monitor",
+                    "command": command_payload,
+                },
+            ),
+            status=status,
+            answer=answer,
+            evidence=persisted_evidence,
+            warnings=warnings,
+            diagnostics={
+                "command": command_payload,
+                **dict(diagnostics or {}),
+            },
+        )
+        return await self._record_operation_result(result)
+
+    def _monitor_management_artifacts(
+        self,
+        action: str,
+        *,
+        monitor: DbMonitor,
+        evidence_kind: str,
+        payload: dict[str, Any],
+    ) -> tuple[Operation, tuple[Evidence, ...], tuple[RuntimeEvent, ...]]:
+        operation_id = f"monitor-{action}-{uuid4()}"
+        operation = Operation(
+            id=operation_id,
+            operation_type=f"monitor.{action}",
+            status=OperationStatus.SUCCEEDED,
+            request={
+                "kind": f"monitor.{action}",
+                "monitor_id": monitor.id,
+                "monitor_name": monitor.name,
+            },
+            required_evidence=frozenset({evidence_kind}),
+            metadata={
+                "runtime_id": self.runtime_id,
+                "runtime_kind": self.runtime_kind,
+                "monitor_id": monitor.id,
+                "monitor_name": monitor.name,
+                "monitor_status": monitor.status,
+                "control_plane": "db.monitor",
+            },
+        )
+        evidence = Evidence(
+            id=f"monitor-evidence-{uuid4()}",
+            kind=evidence_kind,
+            owner="db.monitor",
+            operation_id=operation_id,
+            payload=payload,
+        )
+        created_event = RuntimeEvent(
+            id=f"monitor-event-{uuid4()}",
+            type=RuntimeEventType.OPERATION_CREATED,
+            operation_id=operation_id,
+            runtime_id=self.runtime_id,
+            runtime_kind=self.runtime_kind,
+            message=f"Monitor operation {operation_id} created.",
+            payload={"operation_type": operation.operation_type},
+        )
+        completed_event = RuntimeEvent(
+            id=f"monitor-event-{uuid4()}",
+            type=RuntimeEventType.OPERATION_UPDATED,
+            operation_id=operation_id,
+            runtime_id=self.runtime_id,
+            runtime_kind=self.runtime_kind,
+            evidence_id=evidence.id,
+            message=f"Monitor {monitor.id} {action} committed.",
+            payload={
+                "status": OperationStatus.SUCCEEDED.value,
+                "monitor_id": monitor.id,
+                "monitor_name": monitor.name,
+                "action": action,
+            },
+        )
+        return operation, (evidence,), (created_event, completed_event)
 
     def register_plugin(self, plugin: Any) -> None:
         """Register a plugin before runtime setup.
@@ -534,6 +1004,2662 @@ class DbRuntime:
         await self.kernel.complete_operation(operation.id)
         return evidence
 
+    async def execute_monitor_action(
+        self,
+        operation_id: str,
+        *,
+        monitor_id: str,
+        monitor_name: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan: dict[str, Any],
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+        source_scope: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Execute a persisted DB monitor action inside its child operation."""
+
+        if not self._is_setup:
+            await self.setup()
+        operation = await self.store.load_operation(operation_id)
+        if operation is None:
+            raise KeyError(operation_id)
+        normalized = _normalize_monitor_action_plan(
+            action_plan,
+            operation_id=operation_id,
+        )
+        fingerprint = stable_fingerprint(normalized)
+        operation = await self._prepare_monitor_action_operation(
+            operation,
+            monitor_id=monitor_id,
+            monitor_name=monitor_name,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_plan=normalized,
+            action_kind=str(normalized.get("kind") or "invalid"),
+            action_fingerprint=fingerprint,
+            tick_evidence_refs=tick_evidence_refs,
+            source_scope=source_scope,
+        )
+        existing_result = await self._latest_monitor_action_result(
+            operation.id,
+            action_plan_fingerprint=fingerprint,
+        )
+        if existing_result is not None:
+            return dict(existing_result.payload)
+
+        plan_evidence = await self._persist_monitor_action_plan_evidence(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_plan=normalized,
+            action_plan_fingerprint=fingerprint,
+            tick_evidence_refs=tick_evidence_refs,
+        )
+        if normalized.get("valid") is False:
+            return await self._block_monitor_action(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=normalized,
+                action_plan_fingerprint=fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                reason=str(normalized.get("block_reason") or "invalid_action_plan"),
+            )
+
+        kind = str(normalized.get("kind") or "")
+        if kind == "investigation":
+            return await self._execute_monitor_investigation_action(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=normalized,
+                action_plan_fingerprint=fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+            )
+        if kind == "scheduled_report":
+            return await self._execute_monitor_scheduled_report_action(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=normalized,
+                action_plan_fingerprint=fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                source_scope=source_scope,
+            )
+        if kind == "write_proposal":
+            return await self._execute_monitor_write_proposal_action(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=normalized,
+                action_plan_fingerprint=fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                source_scope=source_scope,
+            )
+        return await self._block_monitor_action(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_plan=normalized,
+            action_plan_fingerprint=fingerprint,
+            tick_evidence_refs=tick_evidence_refs,
+            plan_evidence=plan_evidence,
+            reason="unsupported_action_kind",
+        )
+
+    async def execute_monitor_source_observation(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        source_step: dict[str, Any],
+        cursor: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute one deterministic read-only plugin source step for a tick."""
+
+        if not self._is_setup:
+            await self.setup()
+        step = dict(source_step or {})
+        try:
+            plan = MonitorPluginPlanner(tuple(self.registry.capabilities)).plan_source(
+                step,
+                cursor=cursor or {},
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+            )
+        except MonitorPluginPlanningBlocked as exc:
+            return {
+                "status": "blocked",
+                "block_reason": exc.reason,
+                "details": exc.details,
+                "task_ids": [],
+                "plugin_evidence_refs": [],
+            }
+
+        task = self._monitor_plugin_task_for_capability(
+            operation,
+            plan.capability,
+            input_payload=plan.input_payload,
+            input_hash=plan.input_hash,
+            idempotency_key=plan.idempotency_key,
+            reason=plan.reason,
+            sequence=plan.sequence,
+            metadata=plan.metadata,
+        )
+        try:
+            evidence = await self._execute_or_reuse_monitor_plugin_task(
+                task,
+                operation,
+                context={
+                    "monitor_id": monitor_id,
+                    "monitor_run_id": monitor_run_id,
+                    "tick_operation_id": tick_operation_id,
+                    "db_monitor_phase": 6,
+                    "monitor_observation_role": "plugin_source",
+                },
+            )
+        except DbRuntimeGovernanceBlocked:
+            return {
+                "status": "blocked",
+                "block_reason": "governance_blocked",
+                "capability_id": plan.capability.id,
+                "capability_owner": plan.capability.owner,
+                "task_ids": [task.id],
+                "plugin_evidence_refs": [],
+            }
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "block_reason": "plugin_source_failed",
+                "details": {"type": type(exc).__name__, "message": str(exc)},
+                "capability_id": plan.capability.id,
+                "capability_owner": plan.capability.owner,
+                "task_ids": [task.id],
+                "plugin_evidence_refs": [],
+            }
+        if not evidence:
+            return {
+                "status": "blocked",
+                "block_reason": "plugin_source_evidence_missing",
+                "capability_id": plan.capability.id,
+                "capability_owner": plan.capability.owner,
+                "task_ids": [task.id],
+                "plugin_evidence_refs": [],
+            }
+        return {
+            "status": "succeeded",
+            "source_kind": plan.intent_payload.get("source_kind"),
+            "capability_id": plan.capability.id,
+            "capability_owner": plan.capability.owner,
+            "task_ids": [task.id],
+            "plugin_evidence_refs": [evidence_ref(item) for item in evidence],
+            "value": monitor_source_observed_value(step, evidence),
+        }
+
+    async def execute_monitor_delivery(
+        self,
+        operation_id: str,
+        *,
+        monitor_id: str,
+        monitor_name: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        report_evidence_id: str | None = None,
+        governed: bool = False,
+    ) -> dict[str, Any]:
+        """Deliver Phase 5 monitor report evidence through a registered capability."""
+
+        if not self._is_setup:
+            await self.setup()
+        operation = await self.store.load_operation(operation_id)
+        if operation is None:
+            raise KeyError(operation_id)
+        report = await self._monitor_report_for_delivery(
+            operation.id,
+            report_evidence_id=report_evidence_id,
+        )
+        if report is None:
+            return await self._persist_monitor_delivery_result(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                delivery_kind=None,
+                capability=None,
+                action_plan_fingerprint="",
+                report_fingerprint="",
+                source_evidence_refs=(),
+                task_ids=(),
+                plugin_result_evidence=(),
+                status="blocked",
+                idempotency_key="",
+                block_reason="missing_monitor_report",
+            )
+
+        intent = dict(report.payload.get("delivery_intent") or {})
+        action_fingerprint = str(report.payload.get("action_plan_fingerprint") or "")
+        report_fingerprint = monitor_report_fingerprint(report)
+        source_refs = monitor_delivery_source_refs(
+            report,
+            tuple(await self.store.list_evidence(operation.id)),
+        )
+        if not intent:
+            return {
+                "status": "skipped",
+                "block_reason": "missing_delivery_intent",
+                "report_evidence_id": report.id,
+                "source_evidence_refs": [dict(item) for item in source_refs],
+            }
+
+        operation = await self._prepare_monitor_delivery_operation(
+            operation,
+            monitor_id=monitor_id,
+            monitor_name=monitor_name,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            report=report,
+            source_evidence_refs=source_refs,
+        )
+        existing = await self._latest_evidence(
+            operation.id,
+            "monitor.delivery_result",
+            payload={"report_fingerprint": report_fingerprint},
+        )
+        if existing is not None and not await self._monitor_delivery_can_resume(
+            operation.id, existing
+        ):
+            return dict(existing.payload)
+
+        try:
+            plan = MonitorPluginPlanner(
+                tuple(self.registry.capabilities)
+            ).plan_delivery(
+                intent,
+                report=report,
+                source_evidence_refs=source_refs,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+            )
+        except MonitorPluginPlanningBlocked as exc:
+            await self._persist_monitor_delivery_plan(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                delivery_intent=intent,
+                report=report,
+                source_evidence_refs=source_refs,
+                accepted=False,
+                block_reason=exc.reason,
+                details=exc.details,
+            )
+            return await self._persist_monitor_delivery_result(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                delivery_kind=str(
+                    intent.get("delivery_kind") or intent.get("mode") or ""
+                ),
+                capability=None,
+                action_plan_fingerprint=action_fingerprint,
+                report_fingerprint=report_fingerprint,
+                source_evidence_refs=source_refs,
+                task_ids=(),
+                plugin_result_evidence=(),
+                status="blocked",
+                idempotency_key="",
+                block_reason=exc.reason,
+            )
+
+        capability = plan.capability
+        idempotency_key = plan.idempotency_key
+        existing = await self._latest_evidence(
+            operation.id,
+            "monitor.delivery_result",
+            payload={"idempotency_key": idempotency_key},
+        )
+        if existing is not None and not await self._monitor_delivery_can_resume(
+            operation.id, existing
+        ):
+            return dict(existing.payload)
+
+        plan_evidence = await self._persist_monitor_delivery_plan(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            delivery_intent=intent,
+            report=report,
+            source_evidence_refs=source_refs,
+            capability=capability,
+            idempotency_key=idempotency_key,
+            accepted=True,
+        )
+        governance_decision = await self.evaluate_monitor_effect_governance(
+            operation,
+            capability=capability,
+            intent=plan.intent_payload,
+            phase="delivery",
+            mutate_approvals=governed,
+        )
+        if not governance_decision.allowed:
+            task_ids: tuple[str, ...] = ()
+            if (
+                governed
+                and governance_decision.result.pending_approval
+                and governance_decision.result.approval_requests
+            ):
+                task = self._monitor_plugin_task_for_capability(
+                    operation,
+                    capability,
+                    input_payload=plan.input_payload,
+                    input_hash=plan.input_hash,
+                    idempotency_key=idempotency_key,
+                    reason=plan.reason,
+                    sequence=plan.sequence,
+                    metadata=plan.metadata,
+                    approval_requests=governance_decision.result.approval_requests,
+                )
+                await self._plan_kernel_task(task)
+                task_ids = (task.id,)
+            return await self._persist_monitor_delivery_result(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                delivery_kind=str(plan.intent_payload.get("delivery_kind") or ""),
+                capability=capability,
+                action_plan_fingerprint=action_fingerprint,
+                report_fingerprint=report_fingerprint,
+                source_evidence_refs=source_refs,
+                task_ids=task_ids,
+                plugin_result_evidence=(),
+                status=governance_decision.status,
+                idempotency_key=idempotency_key,
+                block_reason=governance_decision.reason,
+                plan_evidence=plan_evidence,
+            )
+
+        task = self._monitor_plugin_task_for_capability(
+            operation,
+            capability,
+            input_payload=plan.input_payload,
+            input_hash=plan.input_hash,
+            idempotency_key=idempotency_key,
+            reason=plan.reason,
+            sequence=plan.sequence,
+            metadata=plan.metadata,
+        )
+        try:
+            plugin_evidence = await self._execute_or_reuse_monitor_plugin_task(
+                task,
+                operation,
+                context={
+                    "monitor_id": monitor_id,
+                    "monitor_run_id": monitor_run_id,
+                    "tick_operation_id": tick_operation_id,
+                    "db_monitor_phase": 6,
+                    "monitor_action_role": "delivery",
+                },
+            )
+        except DbRuntimeGovernanceBlocked:
+            return await self._persist_monitor_delivery_result(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                delivery_kind=str(
+                    intent.get("delivery_kind") or intent.get("mode") or ""
+                ),
+                capability=capability,
+                action_plan_fingerprint=action_fingerprint,
+                report_fingerprint=report_fingerprint,
+                source_evidence_refs=source_refs,
+                task_ids=(task.id,),
+                plugin_result_evidence=(),
+                status="blocked",
+                idempotency_key=idempotency_key,
+                block_reason="governance_blocked",
+                plan_evidence=plan_evidence,
+            )
+        except Exception as exc:
+            return await self._persist_monitor_delivery_result(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                delivery_kind=str(
+                    intent.get("delivery_kind") or intent.get("mode") or ""
+                ),
+                capability=capability,
+                action_plan_fingerprint=action_fingerprint,
+                report_fingerprint=report_fingerprint,
+                source_evidence_refs=source_refs,
+                task_ids=(task.id,),
+                plugin_result_evidence=(),
+                status="failed",
+                idempotency_key=idempotency_key,
+                block_reason=str(exc),
+                plan_evidence=plan_evidence,
+            )
+        return await self._persist_monitor_delivery_result(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            delivery_kind=str(intent.get("delivery_kind") or intent.get("mode") or ""),
+            capability=capability,
+            action_plan_fingerprint=action_fingerprint,
+            report_fingerprint=report_fingerprint,
+            source_evidence_refs=source_refs,
+            task_ids=(task.id,),
+            plugin_result_evidence=plugin_evidence,
+            status="succeeded",
+            idempotency_key=idempotency_key,
+            plan_evidence=plan_evidence,
+            supersede_approval_block=True,
+        )
+
+    async def _prepare_monitor_action_operation(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_name: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan: dict[str, Any],
+        action_kind: str,
+        action_fingerprint: str,
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+        source_scope: tuple[str, ...],
+    ) -> Operation:
+        request = DbRequest(
+            prompt=f"Monitor action {action_kind} for {monitor_name}",
+            source_scope=source_scope,
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_action_kind": action_kind,
+                "monitor_action_fingerprint": action_fingerprint,
+            },
+        )
+        intent = DbIntent(
+            kind=(
+                DbIntentKind.REPORT_GENERATE
+                if action_kind == "scheduled_report"
+                else DbIntentKind.ANOMALY_INVESTIGATE
+            ),
+            access=(
+                AccessMode.WRITE if action_kind == "write_proposal" else AccessMode.READ
+            ),
+            evidence_mode="analysis",
+            requested_outputs=("analysis.synthesis", "monitor.action_result"),
+        )
+        contract = DbOperationContract(
+            operation_type=operation.operation_type,
+            required_capabilities=(
+                "db.analysis.plan.validate",
+                "db.analysis.checkpoint",
+                "db.analysis.summarize",
+            ),
+            required_evidence=(
+                "monitor.action_plan",
+                "analysis.plan",
+                "analysis.plan.validation",
+                "monitor.action_result",
+            ),
+            access=(
+                AccessMode.WRITE if action_kind == "write_proposal" else AccessMode.READ
+            ),
+            limits=self.config.limits,
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_action_kind": action_kind,
+                "monitor_action_fingerprint": action_fingerprint,
+            },
+        )
+        metadata = {
+            **operation.metadata,
+            "monitor_id": monitor_id,
+            "monitor_name": monitor_name,
+            "monitor_run_id": monitor_run_id,
+            "tick_operation_id": tick_operation_id,
+            "monitor_action_kind": action_kind,
+            "monitor_action_fingerprint": action_fingerprint,
+            "monitor_action_context": {
+                "monitor_id": monitor_id,
+                "monitor_name": monitor_name,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "action_kind": action_kind,
+                "action_plan_fingerprint": action_fingerprint,
+                "normalized_action_plan": action_plan,
+                "source_scope": list(source_scope),
+                "cited_tick_evidence_refs": [dict(item) for item in tick_evidence_refs],
+            },
+            "resume_context": {
+                "request": _db_request_context(request),
+                "intent": _db_intent_context(intent),
+                "contract": _db_contract_context(contract),
+            },
+        }
+        updated = replace(
+            operation,
+            status=OperationStatus.RUNNING,
+            required_evidence=frozenset(
+                {
+                    *operation.required_evidence,
+                    "monitor.action_plan",
+                    "monitor.action_result",
+                }
+            ),
+            metadata=metadata,
+        )
+        await self.store.save_operation(updated)
+        return updated
+
+    async def _persist_monitor_action_plan_evidence(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan: dict[str, Any],
+        action_plan_fingerprint: str,
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+    ) -> Evidence:
+        existing = await self._latest_evidence(
+            operation.id,
+            "monitor.action_plan",
+            payload={"action_plan_fingerprint": action_plan_fingerprint},
+        )
+        if existing is not None:
+            return existing
+        payload = {
+            "monitor_id": monitor_id,
+            "monitor_run_id": monitor_run_id,
+            "tick_operation_id": tick_operation_id,
+            "action_kind": action_plan.get("kind"),
+            "action_plan_fingerprint": action_plan_fingerprint,
+            "normalized_action_plan": action_plan,
+            "cited_tick_evidence_refs": [dict(item) for item in tick_evidence_refs],
+        }
+        evidence = Evidence(
+            id=f"monitor-action-plan-{uuid4()}",
+            kind="monitor.action_plan",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=action_plan.get("valid") is not False,
+            payload=payload,
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_action_kind": action_plan.get("kind"),
+                "monitor_action_fingerprint": action_plan_fingerprint,
+                "payload_fingerprint": _payload_fingerprint(payload),
+            },
+        )
+        await self.store.save_evidence(evidence)
+        return evidence
+
+    async def _execute_monitor_investigation_action(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan: dict[str, Any],
+        action_plan_fingerprint: str,
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+        plan_evidence: Evidence,
+    ) -> dict[str, Any]:
+        analysis_plan = DbAnalysisPlan.from_mapping(action_plan["analysis_plan"])
+        seeded = await self._seed_monitor_analysis_plan(
+            operation,
+            analysis_plan=analysis_plan,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_plan_fingerprint=action_plan_fingerprint,
+            tick_evidence_refs=tick_evidence_refs,
+        )
+        request = _db_request_from_context(operation)
+        intent = _db_intent_from_context(operation)
+        contract = _db_contract_from_context(operation)
+        try:
+            result = await self._run_multi_step_analysis(
+                request,
+                intent,
+                contract,
+                operation,
+                base_diagnostics={
+                    "runtime_id": self.runtime_id,
+                    "monitor_action": {
+                        "monitor_id": monitor_id,
+                        "monitor_run_id": monitor_run_id,
+                        "tick_operation_id": tick_operation_id,
+                        "action_plan_fingerprint": action_plan_fingerprint,
+                        "seeded_analysis_plan_evidence_id": seeded.id,
+                    },
+                },
+                reuse_existing_plan=True,
+            )
+        except Exception as exc:
+            await self.kernel.fail_operation_if_active(operation.id, exc)
+            return await self._persist_monitor_action_result(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_kind="investigation",
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                status="failed",
+                block_reason=str(exc),
+            )
+        return await self._persist_monitor_action_result(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_kind="investigation",
+            action_plan_fingerprint=action_plan_fingerprint,
+            tick_evidence_refs=tick_evidence_refs,
+            plan_evidence=plan_evidence,
+            status=result.status.value,
+        )
+
+    async def _execute_monitor_scheduled_report_action(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan: dict[str, Any],
+        action_plan_fingerprint: str,
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+        plan_evidence: Evidence,
+        source_scope: tuple[str, ...],
+    ) -> dict[str, Any]:
+        tasks: list[Task] = []
+        evidence_store = DbEvidenceStore()
+        produced: list[Evidence] = []
+        try:
+            for sequence, step in enumerate(action_plan.get("steps") or (), start=1):
+                if step["kind"] in {"metric_sql", "freshness_sql", "planned_read"}:
+                    produced.extend(
+                        await self._execute_monitor_report_read_step(
+                            operation,
+                            monitor_id=monitor_id,
+                            monitor_run_id=monitor_run_id,
+                            tick_operation_id=tick_operation_id,
+                            action_plan_fingerprint=action_plan_fingerprint,
+                            source_scope=source_scope,
+                            step=step,
+                            sequence=sequence * 10,
+                            tasks=tasks,
+                        )
+                    )
+            analysis_plan = DbAnalysisPlan.from_mapping(action_plan["analysis_plan"])
+            analysis_plan_evidence = await self._seed_monitor_analysis_plan(
+                operation,
+                analysis_plan=analysis_plan,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+            )
+            if _monitor_report_has_analysis_work(analysis_plan):
+                result = await self._run_multi_step_analysis(
+                    _db_request_from_context(operation),
+                    _db_intent_from_context(operation),
+                    _db_contract_from_context(operation),
+                    operation,
+                    base_diagnostics={
+                        "runtime_id": self.runtime_id,
+                        "monitor_action": {
+                            "monitor_id": monitor_id,
+                            "monitor_run_id": monitor_run_id,
+                            "tick_operation_id": tick_operation_id,
+                            "action_plan_fingerprint": action_plan_fingerprint,
+                        },
+                    },
+                    reuse_existing_plan=True,
+                )
+                if result.status is not OperationStatus.SUCCEEDED:
+                    return await self._persist_monitor_action_result(
+                        operation,
+                        monitor_id=monitor_id,
+                        monitor_run_id=monitor_run_id,
+                        tick_operation_id=tick_operation_id,
+                        action_kind="scheduled_report",
+                        action_plan_fingerprint=action_plan_fingerprint,
+                        tick_evidence_refs=tick_evidence_refs,
+                        plan_evidence=plan_evidence,
+                        status=result.status.value,
+                        block_reason=(
+                            "analysis_blocked"
+                            if result.status is OperationStatus.BLOCKED
+                            else None
+                        ),
+                    )
+                produced = [
+                    item
+                    for item in await self.store.list_evidence(operation.id)
+                    if item.accepted
+                    and item.kind
+                    in {
+                        "query.result",
+                        "quality.profile",
+                        "quality.report",
+                        "schema.search_result",
+                        "schema.asset_profile",
+                        "schema.relationship_path",
+                        "lineage.trace",
+                        "memory.semantic.recall",
+                        "memory.fact.query",
+                        "analysis.checkpoint",
+                        "analysis.synthesis",
+                    }
+                ]
+                report = await self._persist_monitor_report_evidence(
+                    operation,
+                    monitor_id=monitor_id,
+                    monitor_run_id=monitor_run_id,
+                    tick_operation_id=tick_operation_id,
+                    action_plan=action_plan,
+                    action_plan_fingerprint=action_plan_fingerprint,
+                    tick_evidence_refs=tick_evidence_refs,
+                    produced_evidence=tuple(produced),
+                )
+                return await self._persist_monitor_action_result(
+                    operation,
+                    monitor_id=monitor_id,
+                    monitor_run_id=monitor_run_id,
+                    tick_operation_id=tick_operation_id,
+                    action_kind="scheduled_report",
+                    action_plan_fingerprint=action_plan_fingerprint,
+                    tick_evidence_refs=tick_evidence_refs,
+                    plan_evidence=plan_evidence,
+                    status="succeeded",
+                    extra_produced_evidence=(report,),
+                )
+            validation_evidence = await self._execute_analysis_validation_task(
+                operation,
+                tasks,
+                evidence_store,
+                plan_evidence=analysis_plan_evidence,
+            )
+            if not validation_evidence.accepted:
+                return await self._block_monitor_action(
+                    operation,
+                    monitor_id=monitor_id,
+                    monitor_run_id=monitor_run_id,
+                    tick_operation_id=tick_operation_id,
+                    action_plan=action_plan,
+                    action_plan_fingerprint=action_plan_fingerprint,
+                    tick_evidence_refs=tick_evidence_refs,
+                    plan_evidence=plan_evidence,
+                    reason="analysis_plan_invalid",
+                )
+            synthesis = await self._execute_analysis_synthesis_task(
+                operation,
+                tasks,
+                evidence_store,
+                analysis_id=analysis_plan.analysis_id,
+                step_id="report_summary",
+                plan_evidence=analysis_plan_evidence,
+                cited_evidence=tuple(
+                    item
+                    for item in await self.store.list_evidence(operation.id)
+                    if item.accepted
+                    and item.kind
+                    in {
+                        "query.result",
+                        "quality.profile",
+                        "analysis.checkpoint",
+                    }
+                ),
+            )
+            produced.append(synthesis)
+            report = await self._persist_monitor_report_evidence(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=action_plan,
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                produced_evidence=tuple(produced),
+            )
+            await self.kernel.complete_operation(
+                operation.id,
+                status=OperationStatus.SUCCEEDED,
+                message=f"Monitor report action {operation.id} succeeded.",
+            )
+            return await self._persist_monitor_action_result(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_kind="scheduled_report",
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                status="succeeded",
+                extra_produced_evidence=(report,),
+            )
+        except DbRuntimeGovernanceBlocked as exc:
+            blocked_evidence = tuple(await self.store.list_evidence(operation.id))
+            await self._checkpoint_blocked_analysis_state(
+                operation,
+                tasks,
+                evidence_store,
+                governance=exc.governance,
+                evidence=blocked_evidence,
+            )
+            return await self._block_monitor_action(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=action_plan,
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                reason="governance_blocked",
+            )
+        except Exception as exc:
+            await self.kernel.fail_operation_if_active(operation.id, exc)
+            return await self._persist_monitor_action_result(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_kind="scheduled_report",
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                status="failed",
+                block_reason=str(exc),
+            )
+
+    async def _execute_monitor_write_proposal_action(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan: dict[str, Any],
+        action_plan_fingerprint: str,
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+        plan_evidence: Evidence,
+        source_scope: tuple[str, ...],
+    ) -> dict[str, Any]:
+        sql = str(action_plan.get("sql") or "").strip()
+        if not sql:
+            return await self._block_monitor_action(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=action_plan,
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                reason="missing_write_sql",
+            )
+        owner = action_plan.get("capability_owner")
+        try:
+            write_capability = self.registry.get_capability(
+                "db.sql.execute_write",
+                owner=str(owner) if owner else None,
+            )
+            validation_capability = self._validation_capability_for_sql_execute(
+                write_capability
+            )
+            if validation_capability is None:
+                raise KeyError("db.sql.validate")
+        except (KeyError, ValueError) as exc:
+            return await self._block_monitor_action(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=action_plan,
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                reason=(
+                    "ambiguous_write_capability"
+                    if isinstance(exc, ValueError)
+                    else "missing_write_capability"
+                ),
+            )
+        validation_task = self._task_for_capability(
+            operation,
+            validation_capability,
+            input={"sql": sql, "operation": "write.execute"},
+            reason="monitor_write_validation",
+            sequence=500,
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_action_role": "write_validation",
+            },
+        )
+        validation_evidence_items = await self.execute_task(
+            validation_task,
+            operation,
+            context={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "db_monitor_phase": 7,
+                "monitor_action_role": "write_validation",
+            },
+        )
+        validation_evidence = next(
+            (
+                item
+                for item in validation_evidence_items
+                if item.kind == "sql.validation"
+            ),
+            None,
+        )
+        if validation_evidence is None:
+            return await self._block_monitor_action(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=action_plan,
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                reason="write_validation_missing",
+            )
+        validation_facts = sql_validation_facts_from_evidence(validation_evidence)
+        sql_fingerprint = validation_facts.sql_fingerprint or _stable_hash({"sql": sql})
+        proposal_fingerprint = _stable_hash(
+            {
+                "action_plan_fingerprint": action_plan_fingerprint,
+                "sql_fingerprint": sql_fingerprint,
+                "validation_evidence_id": validation_evidence.id,
+                "source_evidence_refs": tick_evidence_refs,
+            }
+        )
+        validation_payload_fingerprint = validation_evidence.metadata.get(
+            "payload_fingerprint"
+        ) or _payload_fingerprint(validation_evidence.payload)
+        proposal = await self._persist_monitor_write_proposal(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_plan_fingerprint=action_plan_fingerprint,
+            proposal_fingerprint=proposal_fingerprint,
+            sql_fingerprint=sql_fingerprint,
+            validation_evidence=validation_evidence,
+            source_evidence_refs=tick_evidence_refs,
+            status="validating",
+            approval_ids=(),
+        )
+        write_task = self._task_for_capability(
+            operation,
+            write_capability,
+            input={
+                "sql_ref": "sql.validation",
+                "params": list(action_plan.get("params") or ()),
+                "proposal_fingerprint": proposal_fingerprint,
+                "validation_evidence_id": validation_evidence.id,
+                "validation_payload_fingerprint": validation_payload_fingerprint,
+            },
+            reason="monitor_write_execution",
+            sequence=510,
+            validation_task=validation_task,
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_action_role": "write_execution",
+                "proposal_fingerprint": proposal_fingerprint,
+                "sql_fingerprint": sql_fingerprint,
+                "validation_evidence_id": validation_evidence.id,
+                "validation_payload_fingerprint": validation_payload_fingerprint,
+                "source_scope": list(effective_source_scope(source_scope, action_plan)),
+                "proposal_evidence_id": proposal.id,
+            },
+        )
+        authoritative = _sql_validation_governance_facts((validation_evidence,))
+        operation_override = {
+            "operation_type": "write.execute",
+            "access": AccessMode.WRITE.value,
+        }
+        if authoritative.get("destructive_statement_classes") or authoritative.get(
+            "admin_statement_classes"
+        ):
+            governance_decision = await self.evaluate_monitor_effect_governance(
+                operation,
+                capability=write_capability,
+                task=write_task,
+                intent={
+                    "kind": "monitor.write_execution",
+                    "monitor_id": monitor_id,
+                    "monitor_run_id": monitor_run_id,
+                    "tick_operation_id": tick_operation_id,
+                    "proposal_fingerprint": proposal_fingerprint,
+                    "sql_fingerprint": sql_fingerprint,
+                },
+                phase="write_execution",
+                mutate_approvals=True,
+                operation_override=operation_override,
+            )
+            return await self._block_monitor_write_action(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=action_plan,
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                proposal=proposal,
+                reason=(
+                    _governance_policy_block_reason(governance_decision.result)
+                    or governance_decision.reason
+                    or "governance_blocked"
+                ),
+            )
+        if validation_facts.valid is not True:
+            return await self._block_monitor_write_action(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=action_plan,
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                proposal=proposal,
+                reason="write_sql_validation_failed",
+            )
+        blocked_resources = blocked_scope_resources(
+            validation_facts.target_resources,
+            effective_source_scope(source_scope, action_plan),
+        )
+        if blocked_resources:
+            return await self._block_monitor_write_action(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=action_plan,
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                proposal=proposal,
+                reason="write_source_scope_blocked",
+            )
+        governance_decision = await self.evaluate_monitor_effect_governance(
+            operation,
+            capability=write_capability,
+            task=write_task,
+            intent={
+                "kind": "monitor.write_execution",
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "proposal_fingerprint": proposal_fingerprint,
+                "sql_fingerprint": sql_fingerprint,
+                "target_resources": list(validation_facts.target_resources),
+                "source_evidence_refs": [dict(item) for item in tick_evidence_refs],
+            },
+            phase="write_execution",
+            mutate_approvals=True,
+            operation_override=operation_override,
+        )
+        approval_requests = governance_decision.result.approval_requests
+        if approval_requests:
+            approval_dependencies = tuple(
+                dependency
+                for dependency in write_task.dependencies
+                if not (
+                    dependency.kind.value == "approval"
+                    and dependency.approval_id is None
+                    and dependency.approval_policy_id == "approval_required_for_writes"
+                )
+            )
+            write_task = replace(
+                write_task,
+                dependencies=(
+                    *approval_dependencies,
+                    *(
+                        TaskDependency(
+                            kind="approval",
+                            approval_status=ApprovalStatus.APPROVED,
+                            approval_id=request.approval_id,
+                            approval_policy_id=request.requested_by_policy_id,
+                            approval_name=str(
+                                request.proposed_action.get("approval") or ""
+                            ),
+                            operation_id=operation.id,
+                        )
+                        for request in approval_requests
+                    ),
+                ),
+            )
+        await self._plan_kernel_task(write_task)
+        status = (
+            "approval_required"
+            if governance_decision.result.pending_approval or approval_requests
+            else "blocked"
+        )
+        block_reason = (
+            governance_decision.reason
+            if not governance_decision.allowed
+            else "write_approval_required"
+        )
+        proposal = await self._persist_monitor_write_proposal(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_plan_fingerprint=action_plan_fingerprint,
+            proposal_fingerprint=proposal_fingerprint,
+            sql_fingerprint=sql_fingerprint,
+            validation_evidence=validation_evidence,
+            source_evidence_refs=tick_evidence_refs,
+            status=status,
+            approval_ids=tuple(request.approval_id for request in approval_requests),
+            block_reason=block_reason,
+            supersede=True,
+        )
+        stored_write_task = await self.store.load_task(write_task.id)
+        if stored_write_task is not None:
+            await self.store.save_task(
+                replace(
+                    stored_write_task,
+                    metadata={
+                        **stored_write_task.metadata,
+                        "proposal_evidence_id": proposal.id,
+                    },
+                )
+            )
+        await self.kernel.block_operation(
+            operation.id,
+            message=(
+                "Monitor write execution requires approval."
+                if status == "approval_required"
+                else "Monitor write execution blocked by governance."
+            ),
+        )
+        return await self._persist_monitor_action_result(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_kind="write_proposal",
+            action_plan_fingerprint=action_plan_fingerprint,
+            tick_evidence_refs=tick_evidence_refs,
+            plan_evidence=plan_evidence,
+            status=status,
+            block_reason=block_reason,
+            extra_produced_evidence=(proposal,),
+        )
+
+    async def _execute_monitor_report_read_step(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan_fingerprint: str,
+        source_scope: tuple[str, ...],
+        step: dict[str, Any],
+        sequence: int,
+        tasks: list[Task],
+    ) -> tuple[Evidence, ...]:
+        validation_task, read_task = self.plan_validated_read_tasks(
+            operation,
+            sql=str(step.get("sql") or ""),
+            params=list(step.get("parameters") or step.get("params") or ()),
+            owner=(
+                str(step.get("capability_owner"))
+                if step.get("capability_owner")
+                else None
+            ),
+            reason="monitor_report_read",
+            sequence=sequence,
+            focus=step.get("metric") or step.get("purpose") or step.get("id"),
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_action_kind": "scheduled_report",
+                "monitor_action_fingerprint": action_plan_fingerprint,
+                "monitor_report_step_id": step.get("id"),
+                "monitor_report_step_kind": step.get("kind"),
+            },
+        )
+        validation_task = await self._plan_kernel_task(validation_task)
+        read_task = await self._plan_kernel_task(read_task)
+        tasks.extend([validation_task, read_task])
+        validation_evidence = await self.execute_task(
+            validation_task,
+            operation,
+            context={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "db_monitor_phase": 5,
+                "monitor_action_role": "report_validation",
+            },
+        )
+        validation = next(
+            (item for item in validation_evidence if item.kind == "sql.validation"),
+            None,
+        )
+        if validation is None or not validation.accepted:
+            raise RuntimeError("report_sql_validation_failed")
+        facts = sql_validation_facts_from_evidence(validation)
+        if facts.is_read is False or facts.valid is False:
+            raise RuntimeError("unsafe_report_sql")
+        blocked = blocked_scope_resources(
+            facts.target_resources,
+            effective_source_scope(source_scope, step),
+        )
+        if blocked:
+            raise RuntimeError("report_source_scope_blocked")
+        read_evidence = await self.execute_task(
+            read_task,
+            operation,
+            context={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "db_monitor_phase": 5,
+                "monitor_action_role": "report_read",
+            },
+        )
+        return (*validation_evidence, *read_evidence)
+
+    async def _seed_monitor_analysis_plan(
+        self,
+        operation: Operation,
+        *,
+        analysis_plan: DbAnalysisPlan,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan_fingerprint: str,
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+    ) -> Evidence:
+        fingerprint = stable_fingerprint(analysis_plan.to_dict())
+        existing = await self._latest_accepted_evidence(
+            operation.id,
+            "analysis.plan",
+            payload={"analysis_id": analysis_plan.analysis_id},
+        )
+        if (
+            existing is not None
+            and existing.payload.get("plan_fingerprint") == fingerprint
+        ):
+            return existing
+        payload = {
+            **analysis_plan.to_dict(),
+            "plan_fingerprint": fingerprint,
+        }
+        evidence = Evidence(
+            id=f"monitor-analysis-plan-{uuid4()}",
+            kind="analysis.plan",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=True,
+            payload=payload,
+            metadata={
+                **analysis_metadata(
+                    analysis_id=analysis_plan.analysis_id,
+                    step_id="monitor_action_plan",
+                    phase="plan",
+                ),
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_action_fingerprint": action_plan_fingerprint,
+                "cited_tick_evidence_refs": [dict(item) for item in tick_evidence_refs],
+                "payload_fingerprint": _payload_fingerprint(payload),
+            },
+        )
+        await self.store.save_evidence(evidence)
+        return evidence
+
+    async def _block_monitor_action(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan: dict[str, Any],
+        action_plan_fingerprint: str,
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+        plan_evidence: Evidence,
+        reason: str,
+    ) -> dict[str, Any]:
+        checkpoint = await self._persist_monitor_action_checkpoint(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_kind=str(action_plan.get("kind") or "invalid"),
+            action_plan_fingerprint=action_plan_fingerprint,
+            reason=reason,
+            plan_evidence=plan_evidence,
+        )
+        await self.kernel.block_operation(
+            operation.id,
+            message=f"Monitor action blocked: {reason}.",
+        )
+        return await self._persist_monitor_action_result(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_kind=str(action_plan.get("kind") or "invalid"),
+            action_plan_fingerprint=action_plan_fingerprint,
+            tick_evidence_refs=tick_evidence_refs,
+            plan_evidence=plan_evidence,
+            status="blocked",
+            block_reason=reason,
+            extra_produced_evidence=(checkpoint,),
+        )
+
+    async def _persist_monitor_action_checkpoint(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_kind: str,
+        action_plan_fingerprint: str,
+        reason: str,
+        plan_evidence: Evidence,
+    ) -> Evidence:
+        payload = {
+            "monitor_id": monitor_id,
+            "monitor_run_id": monitor_run_id,
+            "tick_operation_id": tick_operation_id,
+            "action_kind": action_kind,
+            "action_plan_fingerprint": action_plan_fingerprint,
+            "pause_reason": reason,
+            "plan_evidence_id": plan_evidence.id,
+        }
+        evidence = Evidence(
+            id=f"monitor-action-checkpoint-{uuid4()}",
+            kind="analysis.checkpoint",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=True,
+            payload=payload,
+            metadata={
+                "analysis_id": f"monitor-action-{operation.id}",
+                "analysis_step_id": "monitor_action_blocked",
+                "analysis_step_kind": "checkpoint",
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_action_kind": action_kind,
+                "monitor_action_fingerprint": action_plan_fingerprint,
+                "payload_fingerprint": _payload_fingerprint(payload),
+            },
+        )
+        await self.store.save_evidence(evidence)
+        return evidence
+
+    async def _persist_monitor_report_evidence(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan: dict[str, Any],
+        action_plan_fingerprint: str,
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+        produced_evidence: tuple[Evidence, ...],
+    ) -> Evidence:
+        existing = await self._latest_evidence(
+            operation.id,
+            "monitor.report",
+            payload={"action_plan_fingerprint": action_plan_fingerprint},
+        )
+        if existing is not None:
+            return existing
+        payload = {
+            "monitor_id": monitor_id,
+            "monitor_run_id": monitor_run_id,
+            "tick_operation_id": tick_operation_id,
+            "action_kind": "scheduled_report",
+            "action_plan_fingerprint": action_plan_fingerprint,
+            "title": action_plan.get("title"),
+            "format": dict(action_plan.get("output") or {}).get("format"),
+            "delivery_status": "deferred",
+            "delivery_phase": 6,
+            "delivery_intent": dict(action_plan.get("delivery_intent") or {}),
+            "cited_tick_evidence_refs": [dict(item) for item in tick_evidence_refs],
+            "produced_evidence_refs": [
+                evidence_ref(item) for item in produced_evidence if item.id
+            ],
+        }
+        evidence = Evidence(
+            id=f"monitor-report-{uuid4()}",
+            kind="monitor.report",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=True,
+            payload=payload,
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_action_kind": "scheduled_report",
+                "monitor_action_fingerprint": action_plan_fingerprint,
+                "payload_fingerprint": _payload_fingerprint(payload),
+            },
+        )
+        await self.store.save_evidence(evidence)
+        return evidence
+
+    async def _persist_monitor_write_proposal(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan_fingerprint: str,
+        proposal_fingerprint: str,
+        sql_fingerprint: str,
+        validation_evidence: Evidence,
+        source_evidence_refs: tuple[dict[str, Any], ...],
+        status: str,
+        approval_ids: tuple[str, ...],
+        block_reason: str | None = None,
+        supersede: bool = False,
+    ) -> Evidence:
+        existing = await self._latest_evidence(
+            operation.id,
+            "monitor.write_proposal",
+            payload={"proposal_fingerprint": proposal_fingerprint},
+        )
+        if existing is not None and not supersede:
+            return existing
+        evidence_id = f"monitor-write-proposal-{uuid4()}"
+        payload = {
+            "monitor_id": monitor_id,
+            "monitor_run_id": monitor_run_id,
+            "tick_operation_id": tick_operation_id,
+            "action_operation_id": operation.id,
+            "action_plan_fingerprint": action_plan_fingerprint,
+            "proposal_fingerprint": proposal_fingerprint,
+            "sql_fingerprint": sql_fingerprint,
+            "validation_evidence_id": validation_evidence.id,
+            "validation_payload_fingerprint": (
+                validation_evidence.metadata.get("payload_fingerprint")
+                or _payload_fingerprint(validation_evidence.payload)
+            ),
+            "source_evidence_refs": [dict(item) for item in source_evidence_refs],
+            "status": status,
+            "approval_ids": list(approval_ids),
+            "block_reason": block_reason,
+        }
+        evidence = Evidence(
+            id=evidence_id,
+            kind="monitor.write_proposal",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=status
+            in {"validating", "approval_required", "approved", "executed"},
+            payload=payload,
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_action_kind": "write_proposal",
+                "monitor_action_fingerprint": action_plan_fingerprint,
+                "proposal_fingerprint": proposal_fingerprint,
+                "sql_fingerprint": sql_fingerprint,
+                "payload_fingerprint": _payload_fingerprint(payload),
+            },
+        )
+        await self.store.save_evidence(evidence)
+        return evidence
+
+    async def _block_monitor_write_action(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan: dict[str, Any],
+        action_plan_fingerprint: str,
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+        plan_evidence: Evidence,
+        proposal: Evidence,
+        reason: str,
+    ) -> dict[str, Any]:
+        blocked_proposal = await self._persist_monitor_write_proposal(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_plan_fingerprint=action_plan_fingerprint,
+            proposal_fingerprint=str(proposal.payload.get("proposal_fingerprint")),
+            sql_fingerprint=str(proposal.payload.get("sql_fingerprint")),
+            validation_evidence=next(
+                item
+                for item in await self.store.list_evidence(operation.id)
+                if item.id == proposal.payload.get("validation_evidence_id")
+            ),
+            source_evidence_refs=tick_evidence_refs,
+            status="blocked",
+            approval_ids=tuple(proposal.payload.get("approval_ids") or ()),
+            block_reason=reason,
+            supersede=True,
+        )
+        await self.kernel.block_operation(
+            operation.id,
+            message=f"Monitor write action blocked: {reason}.",
+        )
+        return await self._persist_monitor_action_result(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_kind=str(action_plan.get("kind") or "write_proposal"),
+            action_plan_fingerprint=action_plan_fingerprint,
+            tick_evidence_refs=tick_evidence_refs,
+            plan_evidence=plan_evidence,
+            status="blocked",
+            block_reason=reason,
+            extra_produced_evidence=(blocked_proposal,),
+        )
+
+    async def _persist_monitor_write_execution_result(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan_fingerprint: str,
+        proposal: Evidence,
+        write_task: Task,
+        write_evidence: tuple[Evidence, ...],
+        status: str,
+        block_reason: str | None = None,
+    ) -> Evidence:
+        existing = await self._latest_evidence(
+            operation.id,
+            "monitor.write_execution",
+            payload={
+                "proposal_fingerprint": str(
+                    proposal.payload.get("proposal_fingerprint") or ""
+                )
+            },
+        )
+        if existing is not None:
+            return existing
+        payload = {
+            "monitor_id": monitor_id,
+            "monitor_run_id": monitor_run_id,
+            "tick_operation_id": tick_operation_id,
+            "action_operation_id": operation.id,
+            "action_plan_fingerprint": action_plan_fingerprint,
+            "proposal_evidence_id": proposal.id,
+            "proposal_fingerprint": proposal.payload.get("proposal_fingerprint"),
+            "sql_fingerprint": proposal.payload.get("sql_fingerprint"),
+            "validation_evidence_id": proposal.payload.get("validation_evidence_id"),
+            "task_id": write_task.id,
+            "write_evidence_refs": [
+                evidence_ref(item) for item in write_evidence if item.id
+            ],
+            "status": status,
+            "block_reason": block_reason,
+        }
+        evidence = Evidence(
+            id=f"monitor-write-execution-{uuid4()}",
+            kind="monitor.write_execution",
+            owner="db_runtime",
+            operation_id=operation.id,
+            task_id=write_task.id,
+            accepted=status == "executed",
+            payload=payload,
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_action_kind": "write_proposal",
+                "monitor_action_fingerprint": action_plan_fingerprint,
+                "proposal_fingerprint": proposal.payload.get("proposal_fingerprint"),
+                "payload_fingerprint": _payload_fingerprint(payload),
+            },
+        )
+        await self.store.save_evidence(evidence)
+        return evidence
+
+    async def _persist_monitor_action_result(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_kind: str,
+        action_plan_fingerprint: str,
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+        plan_evidence: Evidence,
+        status: str,
+        block_reason: str | None = None,
+        extra_produced_evidence: tuple[Evidence, ...] = (),
+        supersede_approval_block: bool = False,
+    ) -> dict[str, Any]:
+        existing = await self._latest_monitor_action_result(
+            operation.id,
+            action_plan_fingerprint=action_plan_fingerprint,
+        )
+        if existing is not None and not (
+            supersede_approval_block
+            and existing.payload.get("block_reason")
+            in {"governance_approval_required", "approval_required"}
+        ):
+            return dict(existing.payload)
+        tasks = tuple(await self.store.list_tasks(operation.id))
+        evidence_items = tuple(await self.store.list_evidence(operation.id))
+        produced_refs = [
+            evidence_ref(item)
+            for item in (*evidence_items, *extra_produced_evidence)
+            if item.id
+            and item.kind
+            in {
+                "analysis.plan",
+                "analysis.plan.validation",
+                "analysis.checkpoint",
+                "analysis.synthesis",
+                "query.result",
+                "quality.report",
+                "quality.profile",
+                "monitor.report",
+                "monitor.write_proposal",
+                "monitor.write_execution",
+                "write.execution",
+                "sql.execution",
+            }
+        ]
+        budget_usage = _monitor_action_budget_usage(evidence_items)
+        evidence_id = f"monitor-action-result-{uuid4()}"
+        payload = {
+            "monitor_id": monitor_id,
+            "monitor_run_id": monitor_run_id,
+            "tick_operation_id": tick_operation_id,
+            "action_kind": action_kind,
+            "action_plan_fingerprint": action_plan_fingerprint,
+            "status": status,
+            "block_reason": block_reason,
+            "action_result_evidence_id": evidence_id,
+            "cited_tick_evidence_refs": [dict(item) for item in tick_evidence_refs],
+            "plan_evidence_id": plan_evidence.id,
+            "task_ids": [task.id for task in tasks],
+            "produced_evidence_refs": produced_refs,
+            "budget_usage": budget_usage,
+        }
+        evidence = Evidence(
+            id=evidence_id,
+            kind="monitor.action_result",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=status == "succeeded",
+            payload=payload,
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_action_kind": action_kind,
+                "monitor_action_fingerprint": action_plan_fingerprint,
+                "payload_fingerprint": _payload_fingerprint(payload),
+            },
+        )
+        await self.store.save_evidence(evidence)
+        return payload
+
+    async def _finalize_resumed_monitor_action(
+        self,
+        snapshot: OperationSnapshot,
+    ) -> None:
+        context = _monitor_action_context(snapshot.operation)
+        if not context:
+            return
+        fingerprint = str(context.get("action_plan_fingerprint") or "")
+        if not fingerprint:
+            return
+        existing = await self._latest_monitor_action_result(
+            snapshot.operation.id,
+            action_plan_fingerprint=fingerprint,
+        )
+        if existing is not None:
+            is_resumable_write = context.get("action_kind") == "write_proposal" and (
+                _terminal_monitor_approval_reason(snapshot.approval_requests)
+                or (
+                    snapshot.operation.status is OperationStatus.BLOCKED
+                    and not self._has_pending_approvals(snapshot)
+                )
+                or any(
+                    task.metadata.get("monitor_action_role") == "write_execution"
+                    and task.status is TaskStatus.SUCCEEDED
+                    for task in snapshot.tasks
+                )
+            )
+            if not is_resumable_write:
+                await self._refresh_monitor_action_run_summary(
+                    snapshot.operation,
+                    result_payload=dict(existing.payload),
+                )
+                return
+
+        action_plan = dict(context.get("normalized_action_plan") or {})
+        monitor_id = str(context.get("monitor_id") or "")
+        monitor_run_id = str(context.get("monitor_run_id") or "")
+        tick_operation_id = str(context.get("tick_operation_id") or "")
+        tick_evidence_refs = tuple(
+            dict(item)
+            for item in context.get("cited_tick_evidence_refs") or ()
+            if isinstance(item, dict)
+        )
+        plan_evidence = await self._latest_evidence(
+            snapshot.operation.id,
+            "monitor.action_plan",
+            payload={"action_plan_fingerprint": fingerprint},
+        )
+        if plan_evidence is None:
+            plan_evidence = await self._persist_monitor_action_plan_evidence(
+                snapshot.operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=action_plan,
+                action_plan_fingerprint=fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+            )
+
+        if action_plan.get("kind") == "write_proposal":
+            result_payload = await self._finalize_resumed_monitor_write_action(
+                snapshot,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=action_plan,
+                action_plan_fingerprint=fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+            )
+            await self._refresh_monitor_action_run_summary(
+                snapshot.operation,
+                result_payload=result_payload,
+            )
+            return
+
+        status = _monitor_action_status_from_operation(snapshot.operation)
+        if action_plan.get("kind") == "scheduled_report":
+            report = await self._latest_evidence(
+                snapshot.operation.id,
+                "monitor.report",
+                payload={"action_plan_fingerprint": fingerprint},
+            )
+            if report is None and status == "succeeded":
+                report = await self._persist_monitor_report_evidence(
+                    snapshot.operation,
+                    monitor_id=monitor_id,
+                    monitor_run_id=monitor_run_id,
+                    tick_operation_id=tick_operation_id,
+                    action_plan=action_plan,
+                    action_plan_fingerprint=fingerprint,
+                    tick_evidence_refs=tick_evidence_refs,
+                    produced_evidence=tuple(
+                        item
+                        for item in await self.store.list_evidence(
+                            snapshot.operation.id
+                        )
+                        if item.accepted
+                        and item.kind
+                        in {
+                            "analysis.synthesis",
+                            "analysis.checkpoint",
+                            "query.result",
+                            "quality.profile",
+                            "quality.report",
+                            "schema.search_result",
+                            "schema.asset_profile",
+                            "schema.relationship_path",
+                            "lineage.trace",
+                            "memory.semantic.recall",
+                            "memory.fact.query",
+                        }
+                    ),
+                )
+            extra = (report,) if report is not None else ()
+        else:
+            extra = ()
+
+        result_payload = await self._persist_monitor_action_result(
+            snapshot.operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_kind=str(action_plan.get("kind") or context.get("action_kind")),
+            action_plan_fingerprint=fingerprint,
+            tick_evidence_refs=tick_evidence_refs,
+            plan_evidence=plan_evidence,
+            status=status,
+            block_reason=(
+                snapshot.operation.metadata.get("block_reason")
+                if status in {"blocked", "failed"}
+                else None
+            ),
+            extra_produced_evidence=extra,
+        )
+        await self._refresh_monitor_action_run_summary(
+            snapshot.operation,
+            result_payload=result_payload,
+        )
+
+    async def _finalize_resumed_monitor_write_action(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan: dict[str, Any],
+        action_plan_fingerprint: str,
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+        plan_evidence: Evidence,
+    ) -> dict[str, Any]:
+        write_task = next(
+            (
+                task
+                for task in snapshot.tasks
+                if task.metadata.get("monitor_action_role") == "write_execution"
+            ),
+            None,
+        )
+        proposal_fingerprint = (
+            str(write_task.metadata.get("proposal_fingerprint") or "")
+            if write_task is not None
+            else ""
+        )
+        proposal = (
+            await self._latest_evidence(
+                snapshot.operation.id,
+                "monitor.write_proposal",
+                payload={"proposal_fingerprint": proposal_fingerprint},
+            )
+            if proposal_fingerprint
+            else None
+        )
+        if write_task is None or proposal is None:
+            return await self._persist_monitor_action_result(
+                snapshot.operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_kind="write_proposal",
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                status="blocked",
+                block_reason="missing_write_execution_task",
+                supersede_approval_block=True,
+            )
+        if write_task.status is TaskStatus.SUCCEEDED:
+            write_evidence = tuple(
+                item for item in snapshot.evidence if item.task_id == write_task.id
+            )
+            execution = await self._persist_monitor_write_execution_result(
+                snapshot.operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan_fingerprint=action_plan_fingerprint,
+                proposal=proposal,
+                write_task=write_task,
+                write_evidence=write_evidence,
+                status="executed",
+            )
+            executed_proposal = await self._persist_monitor_write_proposal(
+                snapshot.operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan_fingerprint=action_plan_fingerprint,
+                proposal_fingerprint=str(proposal.payload.get("proposal_fingerprint")),
+                sql_fingerprint=str(proposal.payload.get("sql_fingerprint")),
+                validation_evidence=next(
+                    item
+                    for item in snapshot.evidence
+                    if item.id == proposal.payload.get("validation_evidence_id")
+                ),
+                source_evidence_refs=tick_evidence_refs,
+                status="executed",
+                approval_ids=tuple(proposal.payload.get("approval_ids") or ()),
+                supersede=True,
+            )
+            return await self._persist_monitor_action_result(
+                snapshot.operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_kind="write_proposal",
+                action_plan_fingerprint=action_plan_fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+                status="succeeded",
+                extra_produced_evidence=(executed_proposal, execution, *write_evidence),
+                supersede_approval_block=True,
+            )
+        terminal_reason = _terminal_monitor_approval_reason(snapshot.approval_requests)
+        return await self._persist_monitor_action_result(
+            snapshot.operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_kind=str(action_plan.get("kind") or "write_proposal"),
+            action_plan_fingerprint=action_plan_fingerprint,
+            tick_evidence_refs=tick_evidence_refs,
+            plan_evidence=plan_evidence,
+            status="blocked",
+            block_reason=terminal_reason or "write_execution_not_completed",
+            extra_produced_evidence=(proposal,),
+            supersede_approval_block=True,
+        )
+
+    async def _refresh_monitor_action_run_summary(
+        self,
+        operation: Operation,
+        *,
+        result_payload: dict[str, Any],
+    ) -> None:
+        monitor_id = str(result_payload.get("monitor_id") or "")
+        monitor_run_id = str(result_payload.get("monitor_run_id") or "")
+        if not monitor_id or not monitor_run_id:
+            return
+        monitor = await self.monitor_store.load_monitor(monitor_id)
+        if monitor is None:
+            return
+        runs = await self.monitor_store.list_monitor_runs(monitor_id)
+        run = next((item for item in runs if item.id == monitor_run_id), None)
+        if run is None:
+            return
+        produced_refs = [
+            dict(item)
+            for item in result_payload.get("produced_evidence_refs") or ()
+            if isinstance(item, dict)
+        ]
+        report_evidence_id = next(
+            (
+                str(item.get("id"))
+                for item in produced_refs
+                if item.get("kind") == "monitor.report" and item.get("id")
+            ),
+            None,
+        )
+        summary = {
+            **run.summary,
+            "action_status": result_payload.get("status"),
+            "action_kind": result_payload.get("action_kind"),
+            "action_plan_fingerprint": result_payload.get("action_plan_fingerprint"),
+            "action_evidence_id": result_payload.get("action_result_evidence_id"),
+            "report_evidence_id": report_evidence_id,
+            "action_task_ids": list(result_payload.get("task_ids") or ()),
+            "action_produced_evidence_refs": produced_refs,
+            "action_block_reason": result_payload.get("block_reason"),
+            "action_budget_usage": dict(result_payload.get("budget_usage") or {}),
+        }
+        if summary == run.summary:
+            return
+        updated_run = DbMonitorRun.from_dict({**run.to_dict(), "summary": summary})
+        state = await self.monitor_store.load_monitor_state(monitor_id)
+        await self.monitor_store.commit_monitor_mutation(
+            DbMonitorMutation(
+                action="run",
+                operation=operation,
+                events=(
+                    RuntimeEvent(
+                        id=f"monitor-action-resume-event-{uuid4()}",
+                        type=RuntimeEventType.OPERATION_UPDATED,
+                        operation_id=operation.id,
+                        runtime_id=self.runtime_id,
+                        runtime_kind=self.runtime_kind,
+                        evidence_id=result_payload.get("action_result_evidence_id"),
+                        message=(
+                            f"Monitor {monitor_id} action resume summary refreshed."
+                        ),
+                        payload={
+                            "monitor_id": monitor_id,
+                            "monitor_run_id": monitor_run_id,
+                            "tick_operation_id": result_payload.get(
+                                "tick_operation_id"
+                            ),
+                            "status": result_payload.get("status"),
+                            "action_evidence_id": result_payload.get(
+                                "action_result_evidence_id"
+                            ),
+                        },
+                    ),
+                ),
+                monitor_before=monitor,
+                state_before=state,
+                state_after=state,
+                run_after=updated_run,
+            )
+        )
+
+    async def _monitor_report_for_delivery(
+        self,
+        operation_id: str,
+        *,
+        report_evidence_id: str | None,
+    ) -> Evidence | None:
+        reports = [
+            item
+            for item in await self.store.list_evidence(operation_id)
+            if item.kind == "monitor.report" and item.accepted
+        ]
+        if report_evidence_id is not None:
+            return next(
+                (item for item in reports if item.id == report_evidence_id), None
+            )
+        return reports[-1] if reports else None
+
+    async def _prepare_monitor_delivery_operation(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_name: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        report: Evidence,
+        source_evidence_refs: tuple[dict[str, Any], ...],
+    ) -> Operation:
+        metadata = {
+            **operation.metadata,
+            "monitor_delivery_context": {
+                "monitor_id": monitor_id,
+                "monitor_name": monitor_name,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "report_evidence_id": report.id,
+                "report_fingerprint": (
+                    report.metadata.get("payload_fingerprint")
+                    or _payload_fingerprint(report.payload)
+                ),
+                "action_plan_fingerprint": report.payload.get(
+                    "action_plan_fingerprint"
+                ),
+                "source_evidence_refs": [dict(item) for item in source_evidence_refs],
+            },
+        }
+        updated = replace(
+            operation,
+            status=OperationStatus.RUNNING,
+            required_evidence=frozenset(
+                {
+                    *operation.required_evidence,
+                    "monitor.delivery_plan",
+                    "monitor.delivery_result",
+                }
+            ),
+            metadata=metadata,
+        )
+        await self.store.save_operation(updated)
+        return updated
+
+    async def _persist_monitor_delivery_plan(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        delivery_intent: dict[str, Any],
+        report: Evidence,
+        source_evidence_refs: tuple[dict[str, Any], ...],
+        capability: Capability | None = None,
+        idempotency_key: str | None = None,
+        accepted: bool,
+        block_reason: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> Evidence:
+        report_fingerprint = str(
+            report.metadata.get("payload_fingerprint") or ""
+        ) or _payload_fingerprint(report.payload)
+        existing = await self._latest_evidence(
+            operation.id,
+            "monitor.delivery_plan",
+            payload={"report_fingerprint": report_fingerprint},
+            accepted=accepted,
+        )
+        if existing is not None:
+            return existing
+        payload = {
+            "monitor_id": monitor_id,
+            "monitor_run_id": monitor_run_id,
+            "tick_operation_id": tick_operation_id,
+            "delivery_kind": delivery_intent.get("delivery_kind")
+            or delivery_intent.get("mode"),
+            "capability_id": capability.id if capability is not None else None,
+            "capability_owner": capability.owner if capability is not None else None,
+            "report_evidence_id": report.id,
+            "report_fingerprint": report_fingerprint,
+            "action_plan_fingerprint": report.payload.get("action_plan_fingerprint"),
+            "source_evidence_refs": [dict(item) for item in source_evidence_refs],
+            "delivery_intent": dict(delivery_intent),
+            "idempotency_key": idempotency_key,
+            "status": "planned" if accepted else "blocked",
+            "block_reason": block_reason,
+            "details": dict(details or {}),
+        }
+        evidence = Evidence(
+            id=f"monitor-delivery-plan-{uuid4()}",
+            kind="monitor.delivery_plan",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=accepted,
+            payload=payload,
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_delivery_kind": payload["delivery_kind"],
+                "monitor_report_fingerprint": report_fingerprint,
+                "payload_fingerprint": _payload_fingerprint(payload),
+            },
+        )
+        await self.store.save_evidence(evidence)
+        return evidence
+
+    async def _persist_monitor_delivery_result(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        delivery_kind: str | None,
+        capability: Capability | None,
+        action_plan_fingerprint: str,
+        report_fingerprint: str,
+        source_evidence_refs: tuple[dict[str, Any], ...],
+        task_ids: tuple[str, ...],
+        plugin_result_evidence: tuple[Evidence, ...],
+        status: str,
+        idempotency_key: str,
+        block_reason: str | None = None,
+        plan_evidence: Evidence | None = None,
+        supersede_approval_block: bool = False,
+    ) -> dict[str, Any]:
+        if idempotency_key:
+            existing = await self._latest_evidence(
+                operation.id,
+                "monitor.delivery_result",
+                payload={"idempotency_key": idempotency_key},
+            )
+            if existing is not None and not (
+                supersede_approval_block
+                and existing.payload.get("block_reason")
+                == "governance_approval_required"
+            ):
+                return dict(existing.payload)
+        evidence_id = f"monitor-delivery-result-{uuid4()}"
+        plugin_refs = [evidence_ref(item) for item in plugin_result_evidence if item.id]
+        payload = {
+            "monitor_id": monitor_id,
+            "monitor_run_id": monitor_run_id,
+            "tick_operation_id": tick_operation_id,
+            "delivery_operation_id": operation.id,
+            "delivery_kind": delivery_kind,
+            "capability_id": capability.id if capability is not None else None,
+            "capability_owner": capability.owner if capability is not None else None,
+            "action_plan_fingerprint": action_plan_fingerprint,
+            "report_fingerprint": report_fingerprint,
+            "source_evidence_refs": [dict(item) for item in source_evidence_refs],
+            "task_ids": list(task_ids),
+            "plugin_result_evidence_refs": plugin_refs,
+            "status": status,
+            "idempotency_key": idempotency_key,
+            "block_reason": block_reason,
+            "plan_evidence_id": plan_evidence.id if plan_evidence is not None else None,
+            "delivery_result_evidence_id": evidence_id,
+            "report_delivery_status": (
+                "delivered"
+                if status == "succeeded"
+                else "blocked" if status == "blocked" else "failed"
+            ),
+        }
+        evidence = Evidence(
+            id=evidence_id,
+            kind="monitor.delivery_result",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=status == "succeeded",
+            payload=payload,
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_delivery_kind": delivery_kind,
+                "monitor_report_fingerprint": report_fingerprint,
+                "payload_fingerprint": _payload_fingerprint(payload),
+            },
+        )
+        await self.store.save_evidence(evidence)
+        if status == "succeeded":
+            await self.kernel.complete_operation(
+                operation.id,
+                status=OperationStatus.SUCCEEDED,
+                message=f"Monitor delivery {operation.id} succeeded.",
+            )
+        elif status == "blocked":
+            await self.kernel.block_operation(
+                operation.id,
+                message=f"Monitor delivery blocked: {block_reason}.",
+            )
+        else:
+            await self.kernel.fail_operation_if_active(
+                operation.id, RuntimeError(block_reason or status)
+            )
+        return payload
+
+    def _monitor_plugin_task_for_capability(
+        self,
+        operation: Operation,
+        capability: Capability,
+        *,
+        input_payload: dict[str, Any],
+        input_hash: str,
+        idempotency_key: str,
+        reason: str,
+        sequence: int,
+        metadata: dict[str, Any],
+        approval_requests: tuple[ApprovalRequest, ...] = (),
+    ) -> Task:
+        task_key = _stable_hash(
+            {
+                "operation_id": operation.id,
+                "capability_id": capability.id,
+                "capability_owner": capability.owner,
+                "idempotency_key": idempotency_key,
+            }
+        )
+        task = Task(
+            id=f"monitor-plugin-task-{task_key[:32]}",
+            operation_id=operation.id,
+            capability_id=capability.id,
+            executor_id=capability.executor,
+            input={**input_payload, "input_hash": input_hash},
+            required_evidence=capability.output_evidence,
+            metadata={
+                **dict(metadata),
+                "owner": capability.owner,
+                "reason": reason,
+                "sequence": sequence,
+                "input_hash": input_hash,
+                "idempotency_key": idempotency_key,
+                "idempotent": capability.idempotent,
+                "replay_safe": capability.replay_safe,
+                "side_effecting": capability.side_effecting,
+            },
+        )
+        approval_dependencies = tuple(
+            TaskDependency(
+                kind="approval",
+                approval_status=ApprovalStatus.APPROVED,
+                approval_id=request.approval_id,
+                approval_policy_id=request.requested_by_policy_id,
+                approval_name=str(request.proposed_action.get("approval") or ""),
+                operation_id=operation.id,
+            )
+            for request in approval_requests
+        )
+        if approval_dependencies:
+            task = replace(
+                task,
+                dependencies=(*task.dependencies, *approval_dependencies),
+            )
+        return task
+
+    async def _execute_or_reuse_monitor_plugin_task(
+        self,
+        task: Task,
+        operation: Operation,
+        *,
+        context: dict[str, Any],
+    ) -> tuple[Evidence, ...]:
+        stored = await self.store.load_task(task.id)
+        if stored is None:
+            stored = await self._plan_kernel_task(task)
+        elif stored.status in _TERMINAL_TASK_STATUSES:
+            return tuple(
+                item
+                for item in await self.store.list_evidence(operation.id)
+                if item.task_id == stored.id
+            )
+        elif stored.input != task.input and stored.status is TaskStatus.PENDING:
+            stored = replace(
+                stored,
+                input=task.input,
+                metadata={**stored.metadata, **task.metadata},
+            )
+            await self.store.save_task(stored)
+        return await self.execute_task(stored, operation, context=context)
+
+    async def _monitor_delivery_can_resume(
+        self,
+        operation_id: str,
+        result: Evidence,
+    ) -> bool:
+        if result.payload.get("block_reason") != "governance_approval_required":
+            return False
+        approvals = await self.store.list_approval_requests(operation_id)
+        if not approvals:
+            return False
+        if any(
+            approval.status
+            in {
+                ApprovalStatus.REJECTED,
+                ApprovalStatus.CANCELLED,
+                ApprovalStatus.EXPIRED,
+            }
+            for approval in approvals
+        ):
+            return False
+        return all(approval.status is ApprovalStatus.APPROVED for approval in approvals)
+
+    async def _monitor_approval_context(
+        self,
+        approval: ApprovalRequest,
+    ) -> dict[str, Any]:
+        operation = await self.store.load_operation(approval.operation_id)
+        metadata = operation.metadata if operation is not None else {}
+        context: dict[str, Any] = {}
+        action_context = metadata.get("monitor_action_context")
+        if isinstance(action_context, dict):
+            context.update(
+                {
+                    "kind": f"monitor.{action_context.get('action_kind')}",
+                    "monitor_id": action_context.get("monitor_id"),
+                    "monitor_run_id": action_context.get("monitor_run_id"),
+                    "tick_operation_id": action_context.get("tick_operation_id"),
+                    "operation_id": approval.operation_id,
+                    "action_plan_fingerprint": action_context.get(
+                        "action_plan_fingerprint"
+                    ),
+                    "source_evidence_refs": list(
+                        action_context.get("cited_tick_evidence_refs") or ()
+                    ),
+                }
+            )
+        delivery_context = metadata.get("monitor_delivery_context")
+        if isinstance(delivery_context, dict):
+            context.update(
+                {
+                    "kind": "monitor.delivery",
+                    "monitor_id": delivery_context.get("monitor_id"),
+                    "monitor_run_id": delivery_context.get("monitor_run_id"),
+                    "tick_operation_id": delivery_context.get("tick_operation_id"),
+                    "operation_id": approval.operation_id,
+                    "report_fingerprint": delivery_context.get("report_fingerprint"),
+                    "action_plan_fingerprint": delivery_context.get(
+                        "action_plan_fingerprint"
+                    ),
+                    "source_evidence_refs": list(
+                        delivery_context.get("source_evidence_refs") or ()
+                    ),
+                }
+            )
+        governance_facts = (
+            approval.proposed_action.get("request", {}).get("governance_facts", {})
+            if isinstance(approval.proposed_action.get("request"), dict)
+            else {}
+        )
+        monitor_effect = (
+            governance_facts.get("monitor_effect")
+            if isinstance(governance_facts, dict)
+            else {}
+        )
+        monitor_effect = monitor_effect if isinstance(monitor_effect, dict) else {}
+        intent = monitor_effect.get("intent")
+        intent = intent if isinstance(intent, dict) else {}
+        context.update(
+            {
+                key: value
+                for key, value in {
+                    "capability_id": (
+                        approval.proposed_action.get("request", {})
+                        .get("capability", {})
+                        .get("id")
+                        if isinstance(approval.proposed_action.get("request"), dict)
+                        and isinstance(
+                            approval.proposed_action["request"].get("capability"),
+                            dict,
+                        )
+                        else None
+                    ),
+                    "capability_owner": (
+                        approval.proposed_action.get("request", {})
+                        .get("capability", {})
+                        .get("owner")
+                        if isinstance(approval.proposed_action.get("request"), dict)
+                        and isinstance(
+                            approval.proposed_action["request"].get("capability"),
+                            dict,
+                        )
+                        else None
+                    ),
+                    "target": intent.get("target"),
+                    "risk": approval.risk.value,
+                    "reason": approval.reason,
+                }.items()
+                if value is not None
+            }
+        )
+        return context if context.get("monitor_id") else {}
+
+    async def _finalize_resumed_monitor_delivery(
+        self,
+        snapshot: OperationSnapshot,
+    ) -> None:
+        context = _monitor_delivery_context(snapshot.operation)
+        if not context:
+            return
+        report_id = context.get("report_evidence_id")
+        result = await self._latest_evidence(
+            snapshot.operation.id,
+            "monitor.delivery_result",
+            payload={
+                "report_fingerprint": str(context.get("report_fingerprint") or "")
+            },
+        )
+        terminal_reason = _terminal_monitor_approval_reason(snapshot.approval_requests)
+        if result is not None and terminal_reason:
+            payload = await self._persist_monitor_delivery_result(
+                snapshot.operation,
+                monitor_id=str(context.get("monitor_id") or ""),
+                monitor_run_id=str(context.get("monitor_run_id") or ""),
+                tick_operation_id=str(context.get("tick_operation_id") or ""),
+                delivery_kind=result.payload.get("delivery_kind"),
+                capability=(
+                    self.registry.get_capability(
+                        str(result.payload.get("capability_id")),
+                        owner=str(result.payload.get("capability_owner")),
+                    )
+                    if result.payload.get("capability_id")
+                    and result.payload.get("capability_owner")
+                    else None
+                ),
+                action_plan_fingerprint=str(
+                    result.payload.get("action_plan_fingerprint") or ""
+                ),
+                report_fingerprint=str(result.payload.get("report_fingerprint") or ""),
+                source_evidence_refs=tuple(
+                    dict(item)
+                    for item in result.payload.get("source_evidence_refs") or ()
+                    if isinstance(item, dict)
+                ),
+                task_ids=tuple(
+                    str(item) for item in result.payload.get("task_ids") or ()
+                ),
+                plugin_result_evidence=(),
+                status="blocked",
+                idempotency_key=str(result.payload.get("idempotency_key") or ""),
+                block_reason=terminal_reason,
+                supersede_approval_block=True,
+            )
+            await self._refresh_monitor_delivery_run_summary(
+                snapshot.operation,
+                result_payload=payload,
+            )
+            return
+        if result is not None and not await self._monitor_delivery_can_resume(
+            snapshot.operation.id, result
+        ):
+            await self._refresh_monitor_delivery_run_summary(
+                snapshot.operation,
+                result_payload=dict(result.payload),
+            )
+            return
+        payload = await self.execute_monitor_delivery(
+            snapshot.operation.id,
+            monitor_id=str(context.get("monitor_id") or ""),
+            monitor_name=str(context.get("monitor_name") or ""),
+            monitor_run_id=str(context.get("monitor_run_id") or ""),
+            tick_operation_id=str(context.get("tick_operation_id") or ""),
+            report_evidence_id=str(report_id) if report_id else None,
+            governed=True,
+        )
+        await self._refresh_monitor_delivery_run_summary(
+            snapshot.operation,
+            result_payload=payload,
+        )
+
+    async def _refresh_monitor_delivery_run_summary(
+        self,
+        operation: Operation,
+        *,
+        result_payload: dict[str, Any],
+    ) -> None:
+        monitor_id = str(result_payload.get("monitor_id") or "")
+        monitor_run_id = str(result_payload.get("monitor_run_id") or "")
+        if not monitor_id or not monitor_run_id:
+            return
+        monitor = await self.monitor_store.load_monitor(monitor_id)
+        if monitor is None:
+            return
+        runs = await self.monitor_store.list_monitor_runs(monitor_id)
+        run = next((item for item in runs if item.id == monitor_run_id), None)
+        if run is None:
+            return
+        summary = {
+            **run.summary,
+            "delivery_status": result_payload.get("status"),
+            "delivery_kind": result_payload.get("delivery_kind"),
+            "delivery_operation_id": result_payload.get("delivery_operation_id"),
+            "delivery_result_evidence_id": result_payload.get(
+                "delivery_result_evidence_id"
+            ),
+            "delivery_plugin_result_evidence_refs": list(
+                result_payload.get("plugin_result_evidence_refs") or ()
+            ),
+            "delivery_task_ids": list(result_payload.get("task_ids") or ()),
+            "delivery_block_reason": result_payload.get("block_reason"),
+            "delivery_idempotency_key": result_payload.get("idempotency_key"),
+        }
+        if summary == run.summary:
+            return
+        updated_run = DbMonitorRun.from_dict({**run.to_dict(), "summary": summary})
+        state = await self.monitor_store.load_monitor_state(monitor_id)
+        state_after = state
+        if state is not None:
+            state_after = DbMonitorState.from_dict(
+                {
+                    **state.to_dict(),
+                    "cursor": {
+                        **state.cursor,
+                        "last_delivery_status": result_payload.get("status"),
+                        "last_delivery_result_evidence_id": result_payload.get(
+                            "delivery_result_evidence_id"
+                        ),
+                    },
+                }
+            )
+        await self.monitor_store.commit_monitor_mutation(
+            DbMonitorMutation(
+                action="run",
+                operation=operation,
+                events=(
+                    RuntimeEvent(
+                        id=f"monitor-delivery-resume-event-{uuid4()}",
+                        type=RuntimeEventType.OPERATION_UPDATED,
+                        operation_id=operation.id,
+                        runtime_id=self.runtime_id,
+                        runtime_kind=self.runtime_kind,
+                        evidence_id=result_payload.get("delivery_result_evidence_id"),
+                        message=(
+                            f"Monitor {monitor_id} delivery resume summary refreshed."
+                        ),
+                        payload={
+                            "monitor_id": monitor_id,
+                            "monitor_run_id": monitor_run_id,
+                            "status": result_payload.get("status"),
+                        },
+                    ),
+                ),
+                monitor_before=monitor,
+                state_before=state,
+                state_after=state_after,
+                run_after=updated_run,
+            )
+        )
+
     async def inspect_operation(self, operation_id: str) -> OperationSnapshot | None:
         """Inspect persisted state for one operation."""
         inspect = getattr(self.store, "inspect_operation", None)
@@ -617,7 +3743,22 @@ class DbRuntime:
             terminal_snapshot = await self.inspect_operation(operation_id)
             if terminal_snapshot is None:
                 raise KeyError(operation_id)
+            if _monitor_action_context(terminal_snapshot.operation):
+                await self._finalize_resumed_monitor_action(terminal_snapshot)
+                terminal_snapshot = await self.inspect_operation(operation_id)
+                if terminal_snapshot is None:
+                    raise KeyError(operation_id)
+            if _monitor_delivery_context(terminal_snapshot.operation):
+                await self._finalize_resumed_monitor_delivery(terminal_snapshot)
+                terminal_snapshot = await self.inspect_operation(operation_id)
+                if terminal_snapshot is None:
+                    raise KeyError(operation_id)
             return terminal_snapshot
+
+        refreshed = await self.inspect_operation(operation_id)
+        if refreshed is None:
+            raise KeyError(operation_id)
+        snapshot = refreshed
 
         if self._has_pending_approvals(snapshot):
             await self.kernel.block_operation(operation_id)
@@ -660,6 +3801,21 @@ class DbRuntime:
                     raise KeyError(operation_id)
                 return resumed
             except Exception as exc:
+                if _monitor_action_context(operation) and str(exc).startswith(
+                    "monitor_write_"
+                ):
+                    await self.kernel.block_operation(
+                        operation.id,
+                        message=f"Monitor write execution blocked: {exc}.",
+                    )
+                    resumed = await self.inspect_operation(operation_id)
+                    if resumed is None:
+                        raise KeyError(operation_id)
+                    await self._finalize_resumed_monitor_action(resumed)
+                    finalized = await self.inspect_operation(operation_id)
+                    if finalized is None:
+                        raise KeyError(operation_id)
+                    return finalized
                 await self.kernel.fail_operation_if_active(operation.id, exc)
                 raise
 
@@ -670,6 +3826,24 @@ class DbRuntime:
             return completed
         if completed.resumable_task_ids:
             return completed
+        if _monitor_action_context(completed.operation):
+            await self._finalize_resumed_monitor_action(completed)
+            action_finalized = await self.inspect_operation(operation_id)
+            if action_finalized is None:
+                raise KeyError(operation_id)
+            if _monitor_delivery_context(action_finalized.operation):
+                await self._finalize_resumed_monitor_delivery(action_finalized)
+                delivery_finalized = await self.inspect_operation(operation_id)
+                if delivery_finalized is None:
+                    raise KeyError(operation_id)
+                return delivery_finalized
+            return action_finalized
+        if _monitor_delivery_context(completed.operation):
+            await self._finalize_resumed_monitor_delivery(completed)
+            finalized = await self.inspect_operation(operation_id)
+            if finalized is None:
+                raise KeyError(operation_id)
+            return finalized
         if completed.operation.status is OperationStatus.SUCCEEDED:
             return completed
 
@@ -699,6 +3873,18 @@ class DbRuntime:
             resumed_analysis = await self.inspect_operation(operation_id)
             if resumed_analysis is None:
                 raise KeyError(operation_id)
+            if _monitor_action_context(resumed_analysis.operation):
+                await self._finalize_resumed_monitor_action(resumed_analysis)
+                finalized = await self.inspect_operation(operation_id)
+                if finalized is None:
+                    raise KeyError(operation_id)
+                if _monitor_delivery_context(finalized.operation):
+                    await self._finalize_resumed_monitor_delivery(finalized)
+                    delivery_finalized = await self.inspect_operation(operation_id)
+                    if delivery_finalized is None:
+                        raise KeyError(operation_id)
+                    return delivery_finalized
+                return finalized
             return resumed_analysis
 
         if _operation_has_run_context(completed.operation):
@@ -2856,6 +6042,54 @@ class DbRuntime:
         )
         return (validation_task, execute_task)
 
+    def plan_validated_read_tasks(
+        self,
+        operation: Operation,
+        *,
+        sql: str,
+        params: tuple[Any, ...] | list[Any] = (),
+        owner: str | None = None,
+        reason: str = "validated_read",
+        sequence: int = 1,
+        focus: Any = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[Task, Task]:
+        """Plan a DB SQL validation/read task pair under an existing operation."""
+
+        read_capability = self.registry.get_capability(
+            "db.sql.execute_read",
+            owner=owner,
+        )
+        validation_capability = self._validation_capability_for_sql_execute(
+            read_capability
+        )
+        if validation_capability is None:
+            raise KeyError("db.sql.validate")
+        validation_task = self._task_for_capability(
+            operation,
+            validation_capability,
+            input={"sql": sql, "operation": "query"},
+            reason=f"{reason}_validation",
+            sequence=sequence,
+            metadata=metadata,
+        )
+        execute_input: dict[str, Any] = {
+            "sql_ref": "sql.validation",
+            "params": list(params),
+        }
+        if focus is not None:
+            execute_input["focus"] = focus
+        read_task = self._task_for_capability(
+            operation,
+            read_capability,
+            input=execute_input,
+            reason=reason,
+            sequence=sequence + 1,
+            validation_task=validation_task,
+            metadata=metadata,
+        )
+        return validation_task, read_task
+
     def _task_for_capability(
         self,
         operation: Operation,
@@ -2865,6 +6099,7 @@ class DbRuntime:
         reason: str,
         sequence: int,
         validation_task: Task | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> Task:
         input_hash = _stable_hash(input)
         task = Task(
@@ -2875,6 +6110,7 @@ class DbRuntime:
             input={**input, "input_hash": input_hash},
             required_evidence=capability.output_evidence,
             metadata={
+                **dict(metadata or {}),
                 "owner": capability.owner,
                 "reason": reason,
                 "sequence": sequence,
@@ -3025,6 +6261,43 @@ class DbRuntime:
         )
         if validation is None:
             return task.input
+        if task.metadata.get("monitor_action_role") == "write_execution":
+            proposal_fingerprint = str(task.metadata.get("proposal_fingerprint") or "")
+            proposal_evidence_id = str(task.metadata.get("proposal_evidence_id") or "")
+            proposal_matches = [
+                item
+                for item in await self.store.list_evidence(operation.id)
+                if item.kind == "monitor.write_proposal"
+                and item.id == proposal_evidence_id
+            ]
+            proposal = proposal_matches[-1] if proposal_matches else None
+            expected_validation_id = str(
+                task.metadata.get("validation_evidence_id") or ""
+            )
+            expected_validation_fingerprint = str(
+                task.metadata.get("validation_payload_fingerprint") or ""
+            )
+            actual_validation_fingerprint = validation.metadata.get(
+                "payload_fingerprint"
+            ) or _payload_fingerprint(validation.payload)
+            if (
+                proposal is None
+                or proposal.payload.get("status")
+                not in {"approval_required", "approved"}
+                or proposal.payload.get("proposal_fingerprint") != proposal_fingerprint
+                or validation.id != expected_validation_id
+                or actual_validation_fingerprint != expected_validation_fingerprint
+                or proposal.payload.get("validation_payload_fingerprint")
+                != expected_validation_fingerprint
+            ):
+                raise RuntimeError("monitor_write_proposal_stale")
+            facts = sql_validation_facts_from_evidence(validation)
+            blocked_resources = blocked_scope_resources(
+                facts.target_resources,
+                tuple(task.metadata.get("source_scope") or ()),
+            )
+            if facts.valid is not True or blocked_resources:
+                raise RuntimeError("monitor_write_validation_stale")
         sql = validation.payload.get("sql")
         if not sql:
             return task.input
@@ -3079,6 +6352,20 @@ class DbRuntime:
             "db.sql.execute_write",
         }:
             return ()
+        if task.metadata.get("monitor_action_role") == "write_execution":
+            expected_validation_id = str(
+                task.metadata.get("validation_evidence_id") or ""
+            )
+            if expected_validation_id:
+                matches = [
+                    evidence
+                    for evidence in await self.store.list_evidence(operation.id)
+                    if evidence.kind == "sql.validation"
+                    and evidence.id == expected_validation_id
+                    and evidence.accepted
+                ]
+                if matches:
+                    return (matches[-1],)
         validation_dependency = next(
             (
                 dependency
@@ -3111,6 +6398,35 @@ class DbRuntime:
             and _payload_contains(evidence.payload, payload or {})
         ]
         return matches[-1] if matches else None
+
+    async def _latest_evidence(
+        self,
+        operation_id: str,
+        kind: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        accepted: bool | None = None,
+    ) -> Evidence | None:
+        matches = [
+            evidence
+            for evidence in await self.store.list_evidence(operation_id)
+            if evidence.kind == kind
+            and (accepted is None or evidence.accepted is accepted)
+            and _payload_contains(evidence.payload, payload or {})
+        ]
+        return matches[-1] if matches else None
+
+    async def _latest_monitor_action_result(
+        self,
+        operation_id: str,
+        *,
+        action_plan_fingerprint: str,
+    ) -> Evidence | None:
+        return await self._latest_evidence(
+            operation_id,
+            "monitor.action_result",
+            payload={"action_plan_fingerprint": action_plan_fingerprint},
+        )
 
     async def _analysis_plan_state(
         self,
@@ -3423,6 +6739,72 @@ class DbRuntime:
             stage=stage,
         )
 
+    async def evaluate_monitor_effect_governance(
+        self,
+        operation: Operation,
+        *,
+        capability: Capability,
+        task: Task | None = None,
+        intent: dict[str, Any],
+        phase: str,
+        mutate_approvals: bool = False,
+        operation_override: dict[str, Any] | None = None,
+    ) -> _MonitorEffectGovernanceDecision:
+        """Evaluate monitor side-effect governance without owning approval state."""
+
+        contract = (
+            _db_contract_from_context(operation)
+            if _operation_has_run_context(operation)
+            else None
+        )
+        monitor_context = {}
+        for key in ("monitor_action_context", "monitor_delivery_context"):
+            value = operation.metadata.get(key)
+            if isinstance(value, dict):
+                monitor_context.update(value)
+        extra_governance_facts: dict[str, Any] = {
+            "monitor_effect": {
+                "phase": phase,
+                **monitor_context,
+                "intent": dict(intent),
+                "mutate_approvals": mutate_approvals,
+            }
+        }
+        if operation_override:
+            extra_governance_facts["operation_override"] = dict(operation_override)
+        persistence = await self._evaluate_governance(
+            operation,
+            contract=contract,
+            task=task,
+            capability=capability,
+            stage=f"monitor.{phase}",
+            extra_governance_facts=extra_governance_facts,
+            mutate_approvals=mutate_approvals,
+        )
+        await self.store.commit_governance_evaluation(
+            decisions=persistence.result.decisions,
+            audit_record=persistence.audit_record,
+            approval_requests=(
+                persistence.approvals_to_request if mutate_approvals else ()
+            ),
+            events=persistence.events,
+        )
+        if persistence.result.blocked:
+            status = "blocked"
+            reason = "governance_blocked"
+        elif persistence.result.pending_approval:
+            status = "blocked"
+            reason = "governance_approval_required"
+        else:
+            status = "allowed"
+            reason = None
+        return _MonitorEffectGovernanceDecision(
+            status=status,
+            reason=reason,
+            result=persistence.result,
+            audit_record=persistence.audit_record,
+        )
+
     async def task_readiness(
         self,
         task: Task,
@@ -3447,6 +6829,8 @@ class DbRuntime:
         task: Task | None = None,
         capability: Capability | None = None,
         stage: str,
+        extra_governance_facts: dict[str, Any] | None = None,
+        mutate_approvals: bool = True,
     ) -> _GovernancePersistence:
         policies = self._active_governance_policies(
             contract,
@@ -3468,6 +6852,24 @@ class DbRuntime:
             authoritative_validation_evidence=authoritative_validation_evidence,
             approvals=current_approvals,
         )
+        if extra_governance_facts:
+            governance_facts = {
+                **governance_facts,
+                **extra_governance_facts,
+                "fact_source": {
+                    **dict(governance_facts.get("fact_source") or {}),
+                    "sources": _ordered_unique(
+                        (
+                            *(
+                                governance_facts.get("fact_source", {}).get("sources")
+                                or ()
+                            ),
+                            "monitor",
+                        )
+                    ),
+                    "monitor": True,
+                },
+            }
         governance_operation = _operation_for_governance(
             operation,
             task=task,
@@ -3487,7 +6889,10 @@ class DbRuntime:
             governance_operation,
             contract=governance_contract,
         )
-        result, approvals_to_request = await self._reconcile_approval_state(result)
+        if mutate_approvals:
+            result, approvals_to_request = await self._reconcile_approval_state(result)
+        else:
+            approvals_to_request = ()
         audit_record = await self._governance_audit_record(
             operation,
             result,
@@ -4375,6 +7780,324 @@ def _payload_fingerprint(payload: dict[str, Any]) -> str:
     return _stable_hash(payload)
 
 
+def _normalize_monitor_action_plan(
+    action_plan: dict[str, Any],
+    *,
+    operation_id: str,
+) -> dict[str, Any]:
+    raw = dict(action_plan or {})
+    if raw.get("valid") is not None and isinstance(raw.get("analysis_plan"), dict):
+        if raw.get("kind") == "scheduled_report" and "delivery_intent" not in raw:
+            return {
+                **raw,
+                "delivery_intent": dict(raw.get("delivery") or {}),
+                "delivery_status": raw.get("delivery_status") or "deferred",
+            }
+        return raw
+    kind = str(raw.get("kind") or raw.get("type") or "").strip()
+    steps = [dict(item) for item in raw.get("steps") or () if isinstance(item, dict)]
+    if not kind:
+        if any(str(step.get("kind") or "") == "report_generate" for step in steps):
+            kind = "scheduled_report"
+        elif steps:
+            kind = "investigation"
+    if kind in {"report", "scheduled-report", "scheduled_report"}:
+        kind = "scheduled_report"
+    if kind in {"investigate", "investigation"}:
+        kind = "investigation"
+    if kind in {
+        "write",
+        "write-proposal",
+        "write_proposal",
+        "remediation_sql",
+        "propose_write",
+    }:
+        kind = "write_proposal"
+
+    if kind == "investigation":
+        analysis_steps = [
+            _normalize_monitor_analysis_step(step)
+            for step in steps
+            if str(step.get("kind") or "") != "report_generate"
+        ]
+        if not analysis_steps:
+            return _invalid_monitor_action(
+                raw,
+                kind=kind,
+                reason="missing_executable_investigation_steps",
+            )
+        analysis_payload = {
+            "analysis_id": str(
+                raw.get("analysis_id") or f"monitor-action-{operation_id}"
+            ),
+            "goal": str(
+                raw.get("goal") or raw.get("purpose") or "Investigate monitor trigger"
+            ),
+            "steps": analysis_steps,
+            "budgets": dict(raw.get("budgets") or {}),
+            "diagnostics": {
+                **dict(raw.get("diagnostics") or {}),
+                "source": "monitor.action_plan",
+                "monitor_action_kind": "investigation",
+            },
+        }
+        try:
+            DbAnalysisPlan.from_mapping(analysis_payload)
+        except Exception as exc:
+            return _invalid_monitor_action(raw, kind=kind, reason=str(exc))
+        return {
+            "valid": True,
+            "kind": "investigation",
+            "goal": analysis_payload["goal"],
+            "analysis_plan": analysis_payload,
+            "original_action_plan": raw,
+        }
+
+    if kind == "scheduled_report":
+        report_steps = _normalize_monitor_report_steps(steps)
+        if not report_steps:
+            return _invalid_monitor_action(
+                raw,
+                kind=kind,
+                reason="missing_deterministic_report_steps",
+            )
+        analysis_steps = [
+            _normalize_monitor_analysis_step(step)
+            for step in steps
+            if _is_monitor_report_analysis_step(step)
+        ]
+        if not any(step["kind"] == "synthesis" for step in analysis_steps):
+            depends_on = [
+                str(step.get("id"))
+                for step in analysis_steps
+                if step.get("id") and step.get("kind") != "checkpoint"
+            ]
+            analysis_steps.append(
+                {
+                    "id": "report_summary",
+                    "kind": "synthesis",
+                    "purpose": str(
+                        raw.get("summary_purpose")
+                        or "Generate the durable monitor report narrative"
+                    ),
+                    "depends_on": [],
+                    "expected_evidence": ["analysis.synthesis"],
+                    "input": {"report_step_ids": depends_on},
+                }
+            )
+        analysis_payload = {
+            "analysis_id": str(
+                raw.get("analysis_id") or f"monitor-report-{operation_id}"
+            ),
+            "goal": str(
+                raw.get("title")
+                or raw.get("goal")
+                or "Generate scheduled monitor report"
+            ),
+            "steps": analysis_steps,
+            "budgets": dict(raw.get("budgets") or {}),
+            "diagnostics": {
+                **dict(raw.get("diagnostics") or {}),
+                "source": "monitor.action_plan",
+                "monitor_action_kind": "scheduled_report",
+            },
+        }
+        try:
+            DbAnalysisPlan.from_mapping(analysis_payload)
+        except Exception as exc:
+            return _invalid_monitor_action(raw, kind=kind, reason=str(exc))
+        return {
+            "valid": True,
+            "kind": "scheduled_report",
+            "title": raw.get("title") or raw.get("goal"),
+            "steps": report_steps,
+            "analysis_plan": analysis_payload,
+            "output": dict(
+                raw.get("output") or {"kind": "report", "format": "markdown"}
+            ),
+            "delivery_status": "deferred",
+            "delivery_phase": 6,
+            "delivery_intent": dict(
+                raw.get("delivery_intent") or raw.get("delivery") or {}
+            ),
+            "original_action_plan": raw,
+        }
+
+    if kind == "write_proposal":
+        proposal = raw.get("proposal")
+        proposal = proposal if isinstance(proposal, dict) else {}
+        sql = str(raw.get("sql") or proposal.get("sql") or "").strip()
+        if not sql:
+            return _invalid_monitor_action(
+                raw,
+                kind=kind,
+                reason="missing_write_sql",
+            )
+        normalized = {
+            "valid": True,
+            "kind": "write_proposal",
+            "sql": sql,
+            "params": list(raw.get("params") or proposal.get("params") or ()),
+            "source_scope": list(raw.get("source_scope") or ()),
+            "purpose": str(
+                raw.get("purpose")
+                or proposal.get("purpose")
+                or "Monitor write proposal"
+            ),
+            "original_action_plan": raw,
+        }
+        for key in ("capability_id", "capability_owner"):
+            if raw.get(key) or proposal.get(key):
+                normalized[key] = str(raw.get(key) or proposal.get(key))
+        return normalized
+
+    return _invalid_monitor_action(
+        raw,
+        kind=kind or "unknown",
+        reason="unsupported_action_kind",
+    )
+
+
+def _normalize_monitor_analysis_step(step: dict[str, Any]) -> dict[str, Any]:
+    kind = str(step.get("kind") or "").strip()
+    normalized = {
+        "id": str(step.get("id") or f"{kind}_step").strip(),
+        "kind": kind,
+        "purpose": str(step.get("purpose") or step.get("metric") or kind).strip(),
+        "depends_on": [str(item) for item in step.get("depends_on") or ()],
+        "input_refs": [
+            dict(item)
+            for item in step.get("input_refs") or ()
+            if isinstance(item, dict)
+        ],
+        "expected_evidence": [
+            str(item) for item in step.get("expected_evidence") or ()
+        ],
+        "input": dict(step.get("input") or {}),
+        "context_evidence_refs": [
+            dict(item)
+            for item in step.get("context_evidence_refs") or ()
+            if isinstance(item, dict)
+        ],
+        "budgets": dict(step.get("budgets") or {}),
+    }
+    for key in ("capability_id", "capability_owner"):
+        if step.get(key):
+            normalized[key] = str(step[key])
+    return normalized
+
+
+def _normalize_monitor_report_steps(
+    steps: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for index, step in enumerate(steps, start=1):
+        kind = str(step.get("kind") or "").strip()
+        if kind == "report_generate":
+            continue
+        if kind == "query" and step.get("sql"):
+            kind = "metric_sql"
+        if kind not in {"metric_sql", "freshness_sql", "planned_read"}:
+            continue
+        sql = str(step.get("sql") or "").strip()
+        if not sql:
+            continue
+        normalized.append(
+            {
+                "id": str(step.get("id") or f"report_step_{index}"),
+                "kind": kind,
+                "metric": step.get("metric"),
+                "purpose": str(step.get("purpose") or step.get("metric") or kind),
+                "sql": sql,
+                "value_path": step.get("value_path"),
+                "source_scope": list(step.get("source_scope") or ()),
+                "parameters": list(step.get("parameters") or step.get("params") or ()),
+                **(
+                    {"capability_owner": str(step["capability_owner"])}
+                    if step.get("capability_owner")
+                    else {}
+                ),
+            }
+        )
+    return normalized
+
+
+def _is_monitor_report_analysis_step(step: dict[str, Any]) -> bool:
+    kind = str(step.get("kind") or "").strip()
+    if kind in {"metric_sql", "freshness_sql", "planned_read", "report_generate"}:
+        return False
+    if kind == "query" and step.get("sql"):
+        return False
+    return kind in {"query", "checkpoint", "synthesis"} or (
+        capability_contract_for_step_kind(kind) is not None
+    )
+
+
+def _invalid_monitor_action(
+    raw: dict[str, Any],
+    *,
+    kind: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "valid": False,
+        "kind": kind,
+        "block_reason": reason,
+        "original_action_plan": raw,
+    }
+
+
+def _monitor_action_budget_usage(evidence: tuple[Evidence, ...]) -> dict[str, Any]:
+    total_rows = 0
+    for item in evidence:
+        if item.kind != "query.result":
+            continue
+        rows = item.payload.get("rows")
+        if isinstance(rows, list):
+            total_rows += len(rows)
+    return {
+        "evidence_count": len(evidence),
+        "query_result_rows": total_rows,
+    }
+
+
+def _monitor_report_has_analysis_work(plan: DbAnalysisPlan) -> bool:
+    return any(step.kind not in {"checkpoint", "synthesis"} for step in plan.steps)
+
+
+def _monitor_action_context(operation: Operation) -> dict[str, Any]:
+    context = operation.metadata.get("monitor_action_context")
+    return context if isinstance(context, dict) else {}
+
+
+def _monitor_delivery_context(operation: Operation) -> dict[str, Any]:
+    context = operation.metadata.get("monitor_delivery_context")
+    return context if isinstance(context, dict) else {}
+
+
+def _terminal_monitor_approval_reason(
+    approvals: tuple[ApprovalRequest, ...],
+) -> str | None:
+    statuses = {approval.status for approval in approvals}
+    if ApprovalStatus.REJECTED in statuses:
+        return "approval_rejected"
+    if ApprovalStatus.CANCELLED in statuses:
+        return "approval_cancelled"
+    if ApprovalStatus.EXPIRED in statuses:
+        return "approval_expired"
+    return None
+
+
+def _monitor_action_status_from_operation(operation: Operation) -> str:
+    if operation.status is OperationStatus.BLOCKED:
+        return "blocked"
+    if operation.status is OperationStatus.FAILED:
+        return "failed"
+    if operation.status is OperationStatus.SUCCEEDED:
+        return "succeeded"
+    return operation.status.value
+
+
 def _audit_entry_from_result(result: DbOperationResult) -> dict[str, Any]:
     """Build a redacted, JSON-safe summary for operation inspection."""
     return {
@@ -5072,6 +8795,16 @@ def _operation_for_governance(
     request = dict(operation.request)
     request["governance_stage"] = stage
     request["governance_facts"] = governance_facts
+    operation_override = _governance_operation_override(governance_facts)
+    override_access = operation_override.get("access")
+    if override_access:
+        request["access"] = str(override_access)
+        request_metadata = request.get("metadata")
+        if isinstance(request_metadata, dict):
+            request["metadata"] = {
+                **request_metadata,
+                "access": str(override_access),
+            }
     if task is not None:
         request["task"] = {
             "id": task.id,
@@ -5086,12 +8819,22 @@ def _operation_for_governance(
         **operation.metadata,
         "governance_stage": stage,
     }
+    if override_access:
+        metadata["access"] = str(override_access)
     if task is not None:
         metadata["task_id"] = task.id
     if capability is not None:
         metadata["capability_id"] = capability.id
         metadata["capability_owner"] = capability.owner
-    return replace(operation, request=request, metadata=metadata)
+    operation_type = str(
+        operation_override.get("operation_type") or operation.operation_type
+    )
+    return replace(
+        operation,
+        operation_type=operation_type,
+        request=request,
+        metadata=metadata,
+    )
 
 
 def _governance_contract(
@@ -5121,6 +8864,11 @@ def _governance_contract(
         }
     shaped["governance_stage"] = stage
     shaped["governance_facts"] = governance_facts
+    operation_override = _governance_operation_override(governance_facts)
+    if operation_override.get("operation_type"):
+        shaped["operation_type"] = str(operation_override["operation_type"])
+    if operation_override.get("access"):
+        shaped["access"] = str(operation_override["access"])
     if task is not None:
         shaped["task"] = {
             "id": task.id,
@@ -5132,6 +8880,13 @@ def _governance_contract(
     if capability is not None:
         shaped["capability"] = _capability_governance_facts(capability)
     return shaped
+
+
+def _governance_operation_override(
+    governance_facts: dict[str, Any],
+) -> dict[str, Any]:
+    override = governance_facts.get("operation_override")
+    return dict(override) if isinstance(override, dict) else {}
 
 
 def _capability_governance_facts(capability: Capability) -> dict[str, Any]:
@@ -5173,6 +8928,17 @@ def _governance_blocked_answer(governance: GovernanceResult) -> str:
     if governance.pending_approval:
         return "This operation requires approval before execution."
     return "This operation was blocked by governance policy."
+
+
+def _governance_policy_block_reason(governance: GovernanceResult) -> str | None:
+    for decision in governance.decisions:
+        if decision.effect is PolicyEffect.DENY:
+            return decision.policy_id
+    if governance.blocked:
+        return "governance_blocked"
+    if governance.pending_approval:
+        return "governance_approval_required"
+    return None
 
 
 def _governance_blocked_warning(governance: GovernanceResult) -> str:
@@ -5234,3 +9000,9 @@ def _analysis_max_concurrency(metadata: dict[str, Any]) -> int:
 def _from_db_options(metadata: dict[str, Any]) -> dict[str, Any]:
     options = metadata.get("from_db_options")
     return options if isinstance(options, dict) else {}
+
+
+def _default_monitor_store(store: RuntimeStore) -> DbMonitorStore:
+    if isinstance(store, SQLiteRuntimeStore):
+        return SQLiteDbMonitorStore(store.path)
+    return InMemoryDbMonitorStore(store)
