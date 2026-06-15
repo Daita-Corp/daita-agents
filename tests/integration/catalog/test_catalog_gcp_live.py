@@ -778,8 +778,7 @@ class TestAgentWithGCPCatalog:
         self, catalog_with_gcp: CatalogPlugin, capsys
     ):
         """
-        The agent must use the catalog's discover_infrastructure tool to
-        enumerate GCP resources and summarise them back to the user.
+        Infrastructure discovery is runtime-owned and produces catalog evidence.
         """
         _require_env("OPENAI_API_KEY")
 
@@ -791,42 +790,17 @@ class TestAgentWithGCPCatalog:
             tools=[catalog_with_gcp],
         )
 
-        result = await agent.run(
-            "Use the discover_infrastructure tool to scan the configured GCP "
-            "account, then tell me how many data stores were found and list "
-            "the unique store types (e.g. bigquery, gcs). Be concise.",
-            detailed=True,
+        result = await agent.execute_capability(
+            "catalog.infrastructure.discover",
+            {"concurrency": 5},
+            owner="catalog",
         )
 
-        answer = result["result"]
-        tool_names = [c.get("tool") for c in result.get("tool_calls", [])]
-        print(f"\n[AGENT] tools={tool_names}")
-        print(f"[AGENT] answer={answer[:300]}")
-
-        assert (
-            "discover_infrastructure" in tool_names
-        ), f"Agent did not call discover_infrastructure; saw: {tool_names}"
-        assert answer, "Agent returned an empty answer"
-        # Agent must reflect the real store count it observed — accept digits
-        # or English word form (LLMs switch between "2" and "two" freely).
+        evidence = result["evidence"][0]
+        print(f"\n[AGENT] evidence={evidence['kind']}")
+        assert evidence["kind"] == "catalog.infrastructure_inventory"
         expected_count = len(catalog_with_gcp.get_stores())
-        word_forms = {
-            0: "zero",
-            1: "one",
-            2: "two",
-            3: "three",
-            4: "four",
-            5: "five",
-            6: "six",
-            7: "seven",
-            8: "eight",
-            9: "nine",
-            10: "ten",
-        }
-        forms = {str(expected_count), word_forms.get(expected_count, "")}
-        assert any(
-            f and f.lower() in answer.lower() for f in forms
-        ), f"Expected count {expected_count} (digit or word) in answer: {answer}"
+        assert evidence["payload"]["store_count"] == expected_count
 
     async def test_agent_finds_store_by_type(
         self, catalog_with_gcp: CatalogPlugin, capsys

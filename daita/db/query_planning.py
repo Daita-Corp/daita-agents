@@ -227,7 +227,11 @@ def _term_variants(value: str) -> tuple[str, ...]:
     singular = collapsed[:-1] if collapsed.endswith("s") else collapsed
     if singular != collapsed:
         variants.append(singular)
-    return tuple(variants)
+    if collapsed.endswith("ed") and len(collapsed) > 2:
+        variants.append(collapsed[:-2])
+    if collapsed.endswith("e"):
+        variants.append(f"{collapsed}d")
+    return tuple(dict.fromkeys(variants))
 
 
 def _normalize_phrase(value: str) -> str:
@@ -530,7 +534,10 @@ def _natural_language_filters_from_hints(
             value = item.get("value") if isinstance(item, dict) else item
             if value is None:
                 continue
-            if not _term_in_prompt(str(value), normalized_prompt):
+            if not any(
+                _term_in_prompt(variant, normalized_prompt)
+                for variant in _term_variants(str(value))
+            ):
                 continue
             filters.append(
                 DbFilterSpec(

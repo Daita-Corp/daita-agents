@@ -390,42 +390,24 @@ class TestAzureGraphEmissionLive:
 class TestAgentAzureLive:
     """End-to-end: Agent + OpenAI + CatalogPlugin with live Azure."""
 
-    async def test_agent_uses_discover_infrastructure(self, plugin_with_azure):
-        """The agent must call discover_infrastructure and report the real count."""
+    async def test_agent_executes_infrastructure_discovery_capability(
+        self, plugin_with_azure
+    ):
+        """Infrastructure discovery runs through runtime capability execution."""
         plugin, _ = plugin_with_azure
 
         agent = build_live_agent(name="AzureCatalogAgent", tools=[plugin])
-        async with timed("agent.run azure enumerate"):
-            result = await agent.run(
-                "Use the discover_infrastructure tool to scan the configured "
-                "Azure subscription. Then report: the total number of data "
-                "stores found, and the unique store types (for example "
-                "azure_blob, cosmosdb, eventhub, servicebus_queue). Be concise.",
-                detailed=True,
+        async with timed("agent capability azure enumerate"):
+            result = await agent.execute_capability(
+                "catalog.infrastructure.discover",
+                {"concurrency": 5},
+                owner="catalog",
             )
 
-        assert_tool_called(result, "discover_infrastructure")
-
-        text = (result.get("result") or "").lower()
+        evidence = result["evidence"][0]
+        assert evidence["kind"] == "catalog.infrastructure_inventory"
         expected_count = len(plugin.get_stores())
-        word_forms = {
-            0: "zero",
-            1: "one",
-            2: "two",
-            3: "three",
-            4: "four",
-            5: "five",
-            6: "six",
-            7: "seven",
-            8: "eight",
-            9: "nine",
-            10: "ten",
-        }
-        forms = {str(expected_count), word_forms.get(expected_count, "")}
-        assert any(f and f in text for f in forms), (
-            f"Agent reported wrong count. Expected {expected_count}; "
-            f"answer: {text[:300]!r}"
-        )
+        assert evidence["payload"]["store_count"] == expected_count
 
     async def test_agent_finds_store_by_type(self, plugin_with_azure):
         """After discovery, the agent should use find_store for an Azure type."""

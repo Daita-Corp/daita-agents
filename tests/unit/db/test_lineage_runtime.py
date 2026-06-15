@@ -40,6 +40,11 @@ async def test_lineage_registers_domain_service_capabilities():
     runtime = DbRuntime(plugins=(LineagePlugin(),))
 
     inspection = await runtime.inspect()
+    capabilities = {
+        capability.id: capability
+        for capability in runtime.registry.capabilities
+        if capability.owner == "lineage"
+    }
 
     assert inspection.plugin_ids == ("lineage",)
     assert "lineage:lineage.trace" in inspection.capability_ids
@@ -48,6 +53,15 @@ async def test_lineage_registers_domain_service_capabilities():
     assert "lineage:lineage.path.find" in inspection.capability_ids
     assert "lineage.trace" in inspection.executor_ids
     assert "lineage:lineage.trace" in inspection.evidence_schema_kinds
+    assert {
+        "trace_lineage",
+        "find_lineage_paths",
+        "analyze_impact",
+    } <= set(inspection.tool_view_names)
+    assert capabilities["lineage.trace"].model_visible is True
+    assert capabilities["lineage.path.find"].model_visible is True
+    assert capabilities["lineage.impact.analyze"].model_visible is True
+    assert capabilities["lineage.flow.register"].runtime_only is True
 
 
 def test_db_runtime_can_require_lineage_evidence_when_service_registered():

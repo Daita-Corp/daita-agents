@@ -5,6 +5,7 @@ from dataclasses import replace
 from daita.agents.agent import Agent
 from daita.agents.chat.runtime import ChatRunResult
 from daita.core.exceptions import SkillError
+from daita.core.tools import LocalTool
 from daita.plugins import ExtensionRegistry, PluginKind, PluginManifest
 from daita.runtime import (
     AccessMode,
@@ -309,6 +310,68 @@ async def test_model_visible_tool_views_map_to_capabilities():
     projected = await spec(None)
     assert projected[0].capability_id == "chat.lookup"
     assert projected[0].owner == "chat_test"
+
+
+async def test_selected_attached_local_tool_is_deduped_by_model_name():
+    async def handler(args):
+        return {"ok": True, "args": args}
+
+    tool = LocalTool(
+        name="replay_probe",
+        description="Replay probe.",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        replay_safe=True,
+    )
+    agent = Agent(
+        name="LocalDedup",
+        llm_provider=SequentialMockLLM(["final"]),
+        tools=[tool],
+    )
+
+    await agent.runtime._prepare_model_tools(None)
+    projected = await agent.runtime._prepare_model_tools([tool, "replay_probe"])
+
+    assert [spec.name for spec in projected] == ["replay_probe"]
+    assert projected[0].owner == "local_tool_replay_probe"
+
+
+async def test_default_focus_applies_to_attached_local_tools():
+    async def handler(args):
+        return [
+            {"product": "Pro Plan", "amount": 299.0, "status": "completed"},
+            {"product": "Enterprise", "amount": 999.0, "status": "refunded"},
+            {"product": "Pro Plan", "amount": 299.0, "status": "completed"},
+        ]
+
+    tool = LocalTool(
+        name="get_orders",
+        description="Fetch orders.",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+    )
+    llm = SequentialMockLLM(
+        [
+            {
+                "content": "",
+                "tool_calls": [{"id": "call-1", "name": "get_orders", "arguments": {}}],
+            },
+            "Pro Plan generated $598.",
+        ]
+    )
+    agent = Agent(
+        name="LocalFocus",
+        llm_provider=llm,
+        tools=[tool],
+        focus="status == 'completed' | SELECT product, amount",
+    )
+
+    result = await agent.run("orders", detailed=True)
+
+    assert result["tool_calls"][0]["result"] == [
+        {"product": "Pro Plan", "amount": 299.0},
+        {"product": "Pro Plan", "amount": 299.0},
+    ]
 
 
 async def test_runtime_only_capabilities_are_not_model_visible():

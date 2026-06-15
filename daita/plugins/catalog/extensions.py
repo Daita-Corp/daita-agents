@@ -278,25 +278,132 @@ def catalog_evidence_schemas() -> tuple[EvidenceSchema, ...]:
 
 def catalog_tool_views() -> tuple[ToolView, ...]:
     """Return optional model-visible tool views over catalog capabilities."""
-    parameters = {"type": "object"}
+    search_parameters = {
+        "type": "object",
+        "properties": {
+            "store_id": {
+                "type": "string",
+                "description": "Catalog store id to search.",
+            },
+            "query": {
+                "type": "string",
+                "description": "Natural language or schema term to search for.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Maximum number of matching assets to return.",
+            },
+        },
+        "required": ["store_id"],
+        "additionalProperties": False,
+    }
+    inspect_parameters = {
+        "type": "object",
+        "properties": {
+            "store_id": {
+                "type": "string",
+                "description": "Catalog store id containing the asset.",
+            },
+            "asset_ref": {
+                "type": "string",
+                "description": "Asset name or reference to inspect.",
+            },
+            "field_filter": {
+                "type": "string",
+                "description": "Optional field name pattern to narrow returned fields.",
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Zero-based field offset for pagination.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of fields to return.",
+            },
+            "include_fields": {
+                "type": "boolean",
+                "description": "Whether to include field details.",
+            },
+            "include_indexes": {
+                "type": "boolean",
+                "description": "Whether to include index metadata.",
+            },
+            "include_relationships": {
+                "type": "boolean",
+                "description": "Whether to include relationship metadata.",
+            },
+            "blocked_fields": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Field names whose values should be omitted.",
+            },
+        },
+        "required": ["store_id", "asset_ref"],
+        "additionalProperties": False,
+    }
+    relationship_parameters = {
+        "type": "object",
+        "properties": {
+            "store_id": {
+                "type": "string",
+                "description": "Catalog store id containing the assets.",
+            },
+            "from_assets": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": "Starting asset names or references.",
+            },
+            "to_assets": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": "Destination asset names or references.",
+            },
+            "relationship_types": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional relationship types to include.",
+            },
+            "max_hops": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 6,
+                "description": "Maximum relationship hops to traverse.",
+            },
+            "max_paths": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 8,
+                "description": "Maximum relationship paths to return.",
+            },
+        },
+        "required": ["store_id", "from_assets", "to_assets"],
+        "additionalProperties": False,
+    }
     return (
         ToolView(
             name="catalog_search_schema",
             capability_id="catalog.schema.search",
             description="Search catalog schema assets and fields.",
-            parameters=parameters,
+            parameters=search_parameters,
         ),
         ToolView(
             name="catalog_inspect_asset",
             capability_id="catalog.asset.inspect",
             description="Inspect one catalog asset.",
-            parameters=parameters,
+            parameters=inspect_parameters,
         ),
         ToolView(
             name="catalog_find_relationship_paths",
             capability_id="catalog.relationship_paths.find",
             description="Find relationship paths between catalog assets.",
-            parameters=parameters,
+            parameters=relationship_parameters,
         ),
     )
 

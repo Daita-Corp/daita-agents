@@ -8,15 +8,13 @@ strings embedded in config files. Verifies:
   2. CatalogPlugin orchestrates a discover_all() with no discoverer errors.
   3. Any DiscoveredStore returned has a valid fingerprint + a recognized
      store_type.
-  4. An agent with the plugin can answer "what did you find?" using
-     discover_infrastructure.
+  4. An agent can execute the runtime-owned infrastructure discovery capability.
 
 Requirements:
   - httpx (pip install 'daita-agents[github]')
   - GITHUB_TOKEN
   - DAITA_TEST_GITHUB_REPOS (CSV of "owner/repo") or DAITA_TEST_GITHUB_ORG
     — at least one must be set so the discoverer has a scan target.
-  - OPENAI_API_KEY (for the live-LLM section)
 
 Run:
     GITHUB_TOKEN=ghp_... DAITA_TEST_GITHUB_REPOS=myorg/myrepo \\
@@ -42,7 +40,6 @@ from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.github import GitHubScanner as GitHubDiscoverer
 
 from tests.integration._harness import (
-    assert_tool_called,
     build_live_agent,
     timed,
 )
@@ -152,40 +149,14 @@ class TestAgentGitHubLive:
         plugin, _ = plugin_with_github
 
         agent = build_live_agent(name="GitHubCatalogAgent", tools=[plugin])
-        async with timed("agent.run github scan"):
-            result = await agent.run(
-                "Use the discover_infrastructure tool to scan the configured "
-                "GitHub targets for data-store connection strings. Then "
-                "summarize: how many stores were found and what unique store "
-                "types appeared. Be concise.",
-                detailed=True,
+        async with timed("agent capability github scan"):
+            result = await agent.execute_capability(
+                "catalog.infrastructure.discover",
+                {"concurrency": 5},
+                owner="catalog",
             )
 
-        assert_tool_called(result, "discover_infrastructure")
-
-        # Ground-truth check — the count in the answer must match the
-        # catalog's observed count. Empty results ("zero"/"0"/"no") are a
-        # legitimate answer for a clean repo.
-        text = (result.get("result") or "").lower()
+        evidence = result["evidence"][0]
+        assert evidence["kind"] == "catalog.infrastructure_inventory"
         expected_count = len(plugin.get_stores())
-        word_forms = {
-            0: "zero",
-            1: "one",
-            2: "two",
-            3: "three",
-            4: "four",
-            5: "five",
-            6: "six",
-            7: "seven",
-            8: "eight",
-            9: "nine",
-            10: "ten",
-        }
-        forms = {str(expected_count), word_forms.get(expected_count, "")}
-        # When zero, accept "no" as a synonym for the count.
-        if expected_count == 0:
-            forms.add("no ")
-        assert any(f and f in text for f in forms), (
-            f"Agent reported wrong count. Expected {expected_count}; "
-            f"answer: {text[:300]!r}"
-        )
+        assert evidence["payload"]["store_count"] == expected_count

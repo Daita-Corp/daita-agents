@@ -44,7 +44,6 @@ from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.aws import AWSDiscoverer
 
 from tests.integration._harness import (
-    assert_tool_called,
     build_live_agent,
     timed,
 )
@@ -215,41 +214,21 @@ class TestCatalogPluginAWS:
 @pytest.mark.requires_llm
 @pytest.mark.integration
 class TestAgentAWSLive:
-    async def test_agent_uses_discover_infrastructure(self, plugin_with_aws):
-        """Live LLM must reach for ``discover_infrastructure`` when asked to
-        enumerate the AWS account, and its answer must reflect the count the
-        catalog actually observed."""
+    async def test_agent_executes_infrastructure_discovery_capability(
+        self, plugin_with_aws
+    ):
+        """Infrastructure discovery is runtime-owned, not a model-visible tool."""
         plugin, _ = plugin_with_aws
 
         agent = build_live_agent(name="AWSCatalogAgent", tools=[plugin])
-        async with timed("agent.run aws enumerate"):
-            result = await agent.run(
-                "Use the discover_infrastructure tool to scan the configured "
-                "AWS account. Then report: the total number of data stores "
-                "found, and the unique store types (e.g. s3, dynamodb, rds). "
-                "Be concise.",
-                detailed=True,
+        async with timed("agent capability aws enumerate"):
+            result = await agent.execute_capability(
+                "catalog.infrastructure.discover",
+                {"concurrency": 5},
+                owner="catalog",
             )
 
-        assert_tool_called(result, "discover_infrastructure")
-
-        text = (result.get("result") or "").lower()
+        evidence = result["evidence"][0]
+        assert evidence["kind"] == "catalog.infrastructure_inventory"
         expected_count = len(plugin.get_stores())
-        word_forms = {
-            0: "zero",
-            1: "one",
-            2: "two",
-            3: "three",
-            4: "four",
-            5: "five",
-            6: "six",
-            7: "seven",
-            8: "eight",
-            9: "nine",
-            10: "ten",
-        }
-        # Accept either the digit or the English word form; LLMs switch.
-        forms = {str(expected_count), word_forms.get(expected_count, "")}
-        assert any(
-            f and f in text for f in forms
-        ), f"Agent reported wrong count. Expected {expected_count}; answer: {text[:300]!r}"
+        assert evidence["payload"]["store_count"] == expected_count

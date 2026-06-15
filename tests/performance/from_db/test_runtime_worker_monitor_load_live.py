@@ -362,7 +362,7 @@ async def _monitor_direct_executor_bypasses(store) -> int:
         types = {event.type for event in events}
         if (
             RuntimeEventType.EXECUTOR_STARTED in types
-            and RuntimeEventType.TASK_STARTED not in types
+            and RuntimeEventType.TASK_UPDATED not in types
         ):
             bypasses += 1
     return bypasses

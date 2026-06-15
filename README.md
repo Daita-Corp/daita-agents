@@ -2,58 +2,39 @@
 
 **Open-source Python framework for building production data agents.**
 
-Daita Agents is built for AI systems that operate on real data: databases,
-schemas, catalogs, pipelines, metrics, APIs, files, and memory. Its primary
-interface is `Agent.from_db()`, which returns a `DbAgent` backed by an
-operation-centric `DbRuntime`: catalog-aware planning, governed task execution,
-typed evidence, verification, audit state, and deterministic synthesis.
+Daita Agents is built around `Agent.from_db()`: the production interface for
+agents that answer questions from real structured data with planning,
+governance, typed evidence, verification, and auditability.
 
-The package also includes a lightweight generic `Agent` / `ChatRuntime` for
-non-DB assistants, local tool calling, plugin experiments, skill development,
-streaming, and shared runtime primitive testing. Production data-agent behavior
-belongs in `DbRuntime`; generic `Agent` is the supporting general capability
-runtime.
-
-```mermaid
-flowchart LR
-    Source["Database or data source"] --> DB["Database plugin<br/>connect + schema capabilities"]
-    DB --> Catalog["Catalog<br/>normalized schema snapshots<br/>relationship lookup"]
-    Catalog --> Runtime["DbRuntime<br/>operation contracts + evidence"]
-    Runtime --> Agent["DbAgent<br/>run + inspect + audit"]
-
-    Runtime --> Tasks["RuntimeKernel<br/>operations + tasks + leases"]
-    Tasks --> Exec["Executors<br/>declared capabilities"]
-    Exec --> Evidence["Typed evidence<br/>query results + schema + validation"]
-    Evidence --> Verify["Verification + synthesis"]
-    Verify --> Agent
-
-    Runtime -.-> Governance["Governance<br/>policies + approvals"]
-    Runtime -.-> Memory["Memory plugin<br/>business context"]
-    Runtime -.-> Lineage["Lineage / graph evidence"]
-```
+- `Agent.from_db()` is the primary entry point. It returns a
+  `DbAgent` backed by `DbRuntime`, with operation contracts, governed task
+  execution, typed evidence, verification, monitors, resume, and audit state.
+- Generic `Agent` exists as a secondary support surface for local tools, skills,
+  streaming, conversation history, and non-DB experiments.
+- Plugins and skills declare capabilities into a shared runtime registry.
+  Tools are only the model-visible projection of those capabilities.
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
 [![PyPI](https://img.shields.io/badge/pypi-daita--agents-orange)](https://pypi.org/project/daita-agents/)
 [![Version](https://img.shields.io/pypi/v/daita-agents.svg)](https://pypi.org/project/daita-agents/)
 
----
-
 ## Quickstart
 
 ```bash
-pip install daita-agents
+pip install "daita-agents[sqlite]"
 ```
 
-Point the runtime at a database and ask a data question:
+Ask a question over a SQLite or PostgreSQL source:
 
 ```python
 import asyncio
 from daita import Agent
 
+
 async def main():
     agent = await Agent.from_db(
-        "sqlite:///sales.db",
+        "sales.db",
         mode="analyst",
         read_only=True,
     )
@@ -61,10 +42,13 @@ async def main():
     answer = await agent.run("What were the top 5 products by revenue last quarter?")
     print(answer)
 
+    await agent.stop()
+
+
 asyncio.run(main())
 ```
 
-For inspection and audit detail:
+Inspect the operation instead of only reading the answer:
 
 ```python
 result = await agent.run_detailed("Which customers had the largest refunds?")
@@ -73,28 +57,65 @@ print(result.contract.required_capabilities)
 print(result.evidence)
 
 inspection = await agent.describe()
+print(inspection.plugin_ids)
 print(inspection.capability_ids)
 ```
 
-`Agent.from_db()` currently supports SQLite paths/URLs, PostgreSQL URLs, and
-converted extension-first database plugin instances. Additional database plugins
-are available as integrations and are being moved onto the same runtime path.
+## Architecture
 
----
+```mermaid
+flowchart LR
+    User["Data question"] --> Primary["Agent.from_db()<br/>primary public interface"]
+    Primary --> DBAgent["DbAgent"]
 
-## Runtime Model
+    DBAgent --> DbRuntime["DbRuntime<br/>planning + governance + evidence"]
+    DbRuntime --> Kernel["RuntimeKernel<br/>operations + tasks + approvals"]
+    Kernel --> Store["RuntimeStore<br/>operation, task, evidence, events"]
+    Kernel --> Registry["ExtensionRegistry"]
 
-### Primary: `Agent.from_db()`
+    Registry --> Plugins["Plugins<br/>connectors + domain services"]
+    Registry --> Skills["Skills<br/>instructions + declarations"]
+    Plugins --> Capabilities["Capabilities + executors<br/>evidence + policies + workers"]
+    Skills --> Capabilities
 
-Use `Agent.from_db()` for production data agents. It owns:
+    DbRuntime --> Catalog["Catalog plugin<br/>schemas + relationships + graph search"]
+    DbRuntime --> Synthesis["Verification + synthesis"]
 
-- schema discovery through database and catalog capabilities
-- catalog-owned structural truth for tables, columns, and relationships
-- governed operation contracts
-- persisted `Operation` and `Task` records
-- executor invocation through `RuntimeKernel`
-- typed evidence and audit events
-- DB policy, approval, resume, verification, and synthesis
+    Support["Generic Agent<br/>secondary support surface"] -.-> ChatRuntime["ChatRuntime<br/>model turns + tool views"]
+    ChatRuntime -.-> Kernel
+```
+
+The important boundary is that runtime-owned work goes through declared
+capabilities, persisted tasks, registered executors, and the shared governance
+boundary. `DbRuntime` owns database planning, SQL validation, approval state,
+resume, evidence, verification, and synthesis. The generic `Agent` should not
+grow a parallel DB planner or catalog graph owner.
+
+## Package Structure
+
+| Path                     | Responsibility                                                                                          |
+| ------------------------ | ------------------------------------------------------------------------------------------------------- |
+| `daita/db/`              | Public `from_db`, `DbAgent`, contracts, query planning, SQL analysis, synthesis, verification           |
+| `daita/db/runtime/`      | Operation-centric DB runtime mixins for tasks, governance, resume, monitors, cache, results             |
+| `daita/agents/`          | Secondary generic `Agent`, `BaseAgent`, conversation history, and chat facade                           |
+| `daita/agents/chat/`     | Runtime-native generic chat loop, tool execution, guardrails, retries, evidence                         |
+| `daita/runtime/`         | Domain-neutral primitives: operations, tasks, capabilities, evidence, policies, workers, stores, kernel |
+| `daita/plugins/`         | Extension-first connectors and domain services plus `ExtensionRegistry`                                 |
+| `daita/plugins/catalog/` | Catalog-owned discovery, normalization, profiling, persistence, relationship search, graph views        |
+| `daita/plugins/memory/`  | Semantic, keyword, graph, working-memory, contradiction, and storage helpers                            |
+| `daita/skills/`          | Skill declarations, activation, discovery, runtime effects, and skill-owned tool adapters               |
+| `daita/llm/`             | OpenAI, Anthropic, Gemini, Grok, Ollama, OpenAI-compatible, and mock providers                          |
+| `daita/embeddings/`      | OpenAI, Gemini, Voyage, sentence-transformers, and mock embedding providers                             |
+| `daita/evals/`           | Eval suites, assertions, judges, reporters, artifacts, datasets, baselines                              |
+| `daita/core/`            | Tools, exceptions, tracing, streaming, Focus DSL, assertions, graph helpers                             |
+| `daita/config/`          | Agent config, retry policies, retry strategies, settings                                                |
+| `tests/`                 | Unit, integration, performance, fixtures, mocks, and live-gated suites                                  |
+| `examples/`              | Basic examples and deployment-style project templates                                                   |
+
+## `Agent.from_db()`
+
+Use `Agent.from_db()` when an agent needs to answer questions from structured
+data with a durable operation trail.
 
 ```python
 agent = await Agent.from_db(
@@ -102,83 +123,202 @@ agent = await Agent.from_db(
     mode="governed",
     read_only=True,
     allowed_tables=["orders", "customers", "products"],
+    query_default_limit=50,
     query_max_rows=200,
+    query_timeout=30,
     lineage=True,
     memory=True,
 )
 ```
 
-Supported modes:
+Current source support on the new `DbRuntime` path:
 
-- `simple`: conservative read-only data questions
-- `analyst`: default read-only analytical work
-- `governed`: stricter limits and lineage defaults
-- `data_team`: broader data-team profile with quality and lineage support
+| Source                                                 | Status                                                                            |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------- |
+| SQLite file path, `:memory:`, or `sqlite://...`        | Supported                                                                         |
+| PostgreSQL URL, `postgresql://...` or `postgres://...` | Supported                                                                         |
+| Converted `BaseDatabasePlugin` instance                | Supported                                                                         |
+| Other database URL schemes                             | Direct plugin APIs exist, but URL routing into `from_db` is still being converted |
 
-### Supporting: `Agent`
+Built-in modes:
 
-Use generic `Agent` for lightweight non-DB assistants, local tools, model-visible
-tool views, streaming chat flows, and plugin/skill development.
+| Mode        | Default posture                                                      |
+| ----------- | -------------------------------------------------------------------- |
+| `simple`    | Conservative read-only questions with small row and character limits |
+| `analyst`   | Default read-only analytical profile                                 |
+| `governed`  | Stricter limits with lineage enabled by default                      |
+| `data_team` | Broader data-team profile with quality and lineage enabled           |
+
+`DbAgent` exposes:
+
+- `run(prompt)`: returns the synthesized answer string.
+- `run_detailed(prompt)`: returns a typed `DbOperationResult`.
+- `describe()`: returns a `DbRuntimeInspection` registry and runtime snapshot.
+- `operations` and `audit_log`: retained operation summaries.
+- `monitor(...)` and monitor management methods for durable DB observations.
+- `stop()` / `teardown()`: releases runtime resources.
+
+### DB Operation Flow
+
+1. `Agent.from_db()` resolves a source plugin, catalog plugin, optional memory,
+   lineage, and data-quality plugins.
+2. `DbRuntime.setup()` registers plugin declarations in `ExtensionRegistry`.
+3. A prompt becomes a `DbRequest`, `DbIntent`, and `DbOperationContract`.
+4. The runtime persists an operation and planned tasks through `RuntimeKernel`.
+5. Governance evaluates operation and task facts; approvals can block execution.
+6. Executors produce typed evidence such as schema, SQL validation, query
+   results, quality profiles, lineage, or synthesis payloads.
+7. Verification and synthesis produce a final `DbOperationResult` with audit
+   diagnostics.
+
+## Secondary Generic `Agent`
+
+Most users building data agents should start with `Agent.from_db()`. The generic
+agent is a secondary non-DB runtime surface for lightweight assistants, local
+tool calling, skill experiments, streaming events, and conversation history. It
+uses the same registry and kernel primitives, but its owner is `ChatRuntime`
+rather than `DbRuntime`.
 
 ```python
-import asyncio
 from daita import Agent, tool
+
 
 @tool
 def calculate_discount(price: float, pct: float) -> float:
     """Calculate a discounted price."""
     return round(price * (1 - pct / 100), 2)
 
-async def main():
-    agent = Agent(
-        name="Shopping Assistant",
-        llm_provider="openai",
-        tools=[calculate_discount],
-    )
 
-    answer = await agent.run("What is 15% off a $24 item?")
-    print(answer)
+agent = Agent(
+    name="shopping_assistant",
+    llm_provider="openai",
+    tools=[calculate_discount],
+)
+```
+
+```python
+result = await agent.run(
+    "Use the calculator and show the final price.",
+    detailed=True,
+)
+print(result["operation_id"])
+print(result["tool_calls"])
+```
+
+Streaming:
+
+```python
+from daita.core.streaming import EventType
+
+async for event in agent.stream("Explain transformer attention in one paragraph"):
+    if event.type == EventType.THINKING:
+        print(event.content, end="", flush=True)
+    elif event.type == EventType.COMPLETE:
+        print("\nDone")
+```
+
+Conversation state:
+
+```python
+from daita import Agent, ConversationHistory
+
+history = ConversationHistory(session_id="alice-session", workspace="support")
+agent = Agent(name="support_bot", llm_provider="openai")
+
+await agent.run("My name is Alice and I prefer concise answers.", history=history)
+answer = await agent.run("What is my preference?", history=history)
+```
+
+## Runtime Primitives
+
+Most framework behavior is expressed as declarations:
+
+| Primitive         | Purpose                                                                       |
+| ----------------- | ----------------------------------------------------------------------------- |
+| `Capability`      | Runtime-plannable behavior with access, risk, evidence, and executor metadata |
+| `Executor`        | Performs a capability for one persisted task                                  |
+| `EvidenceSchema`  | Declares the typed evidence shape produced by executors                       |
+| `Evidence`        | Runtime output accepted from executors, workers, or policies                  |
+| `Policy`          | Governance decision logic over runtime facts                                  |
+| `ContextProvider` | Renders context blocks for models, synthesizers, reviewers, or inspectors     |
+| `ToolView`        | Model-visible projection over a capability                                    |
+| `Worker`          | Specialist or background worker declaration                                   |
+| `Operation`       | Durable top-level unit of runtime work                                        |
+| `Task`            | Durable executable unit within an operation                                   |
+| `RuntimeKernel`   | Shared operation/task/governance/executor choke point                         |
+| `RuntimeStore`    | Operation, task, evidence, event, approval, and audit persistence             |
+
+## Plugins
+
+Plugins can expose direct Python APIs and declare runtime contracts. Extension
+plugins should declare stable manifests and contribute capabilities, executors,
+evidence schemas, policies, context providers, tool views, and workers through
+the registry.
+
+### Database And Search
+
+| Plugin        | Factory              | Extra             |
+| ------------- | -------------------- | ----------------- |
+| PostgreSQL    | `postgresql(...)`    | `[postgresql]`    |
+| SQLite        | `sqlite(...)`        | `[sqlite]`        |
+| MySQL         | `mysql(...)`         | `[mysql]`         |
+| MongoDB       | `mongodb(...)`       | `[mongodb]`       |
+| Snowflake     | `snowflake(...)`     | `[snowflake]`     |
+| BigQuery      | `bigquery(...)`      | `[bigquery]`      |
+| Elasticsearch | `elasticsearch(...)` | `[elasticsearch]` |
+| Chroma        | `chroma(...)`        | `[chromadb]`      |
+| Pinecone      | `pinecone(...)`      | `[pinecone]`      |
+| Qdrant        | `qdrant(...)`        | `[qdrant]`        |
+
+### Integrations
+
+| Plugin           | Factory                | Extra            |
+| ---------------- | ---------------------- | ---------------- |
+| REST APIs        | `rest(...)`            | core             |
+| S3               | `s3(...)`              | `[aws]`          |
+| Google Drive     | `google_drive(...)`    | `[google-drive]` |
+| Slack            | `slack(...)`           | `[slack]`        |
+| Email            | `email(...)`           | core             |
+| MCP              | `mcp` module           | `[mcp]`          |
+| Web search       | `websearch(...)`       | `[websearch]`    |
+| Exa search       | `exa_search(...)`      | `[exa]`          |
+| Redis data store | `redis(...)`           | `[redis]`        |
+| Redis messaging  | `redis_messaging(...)` | `[redis]`        |
+| Neo4j            | `neo4j(...)`           | `[neo4j]`        |
+
+### Domain Services
+
+| Plugin       | Factory             | Purpose                                                   |
+| ------------ | ------------------- | --------------------------------------------------------- |
+| Catalog      | `catalog(...)`      | Schema, infrastructure, relationship, and graph discovery |
+| Memory       | `memory(...)`       | Persistent semantic and working memory                    |
+| Lineage      | `lineage(...)`      | Data lineage and impact evidence                          |
+| Data quality | `data_quality(...)` | Profiling, freshness, anomaly, and report evidence        |
+| Transformer  | `transformer(...)`  | SQL transformation management and execution               |
+
+Direct plugin example:
+
+```python
+import asyncio
+from daita.plugins import sqlite
+
+
+async def main():
+    async with sqlite(path="./sales.db") as db:
+        rows = await db.query("SELECT product, revenue FROM sales LIMIT 5")
+        print(rows)
+
 
 asyncio.run(main())
 ```
 
-Generic `Agent` can project registered `ToolView`s and execute capabilities, but
-it should not grow a parallel DB planner, SQL validator, catalog graph owner, or
-DB governance path.
-
----
-
-## Features
-
-- **DB-native agents**: `Agent.from_db()` builds a `DbAgent` with operation
-  contracts, typed evidence, runtime inspection, and audit state.
-- **Extension-first plugins**: plugins declare `Capability`, `Executor`,
-  `EvidenceSchema`, `Policy`, `ContextProvider`, `ToolView`, and `Worker`
-  contracts through `ExtensionRegistry`.
-- **Catalog ownership**: catalog plugins own normalized schemas, infrastructure
-  discovery, relationship search, and graph traversal over data assets.
-- **Governance and approvals**: DB work flows through shared governance and
-  persisted task execution before executors run.
-- **Data quality**: `ItemAssertion` and `query_checked()` validate returned rows
-  with structured `DataQualityError` violations.
-- **Memory and lineage**: optional plugins add persistent business context,
-  contradiction checks, graph relationships, and lineage/impact evidence.
-- **Generic tool calling**: `@tool`, local tools, model-visible tool views,
-  streaming, conversation history, retries, and Focus DSL support the lightweight
-  chat runtime.
-- **Evals**: developer-preview eval suites inspect answers, tools, SQL shape,
-  data operations, budgets, stability, plugin behavior, and optional judges.
-
----
-
 ## Skills
 
-Skills are reusable operating patterns. A tool is a concrete executable action;
-a skill can include context, capability requirements, skill-owned capabilities,
-tool views, policies, evidence schemas, workers, planning hints, verification
-requirements, and synthesis preferences.
+Skills are reusable units of agent behavior. They can provide instructions,
+runtime discovery metadata, activation rules, runtime effects, and optional
+runtime declarations.
 
-Current stable API:
+Simple instruction skill:
 
 ```python
 from daita import Agent, Skill
@@ -186,46 +326,40 @@ from daita import Agent, Skill
 reporting = Skill(
     name="executive_reporting",
     description="Write concise executive summaries.",
-    instructions=(
-        "Use a crisp format: summary, key metrics, risks, and next actions."
-    ),
+    instructions="Use: summary, key metrics, risks, and next actions.",
 )
 
 agent = Agent(
-    name="Ops Analyst",
+    name="ops_analyst",
     llm_provider="openai",
     skills=[reporting],
 )
 ```
 
-For advanced skills, subclass `BaseSkill` and declare runtime contracts:
+Tool-backed skill:
 
 ```python
-from daita import BaseSkill
+from daita import Skill, tool
 
-class DataQualityInvestigationSkill(BaseSkill):
-    name = "data_quality_investigation"
-    description = "Investigate nulls, duplicates, drift, and schema anomalies."
 
-    def requires_capabilities(self):
-        return (
-            "catalog.schema.search",
-            "quality.profile",
-            "db.sql.execute_read",
-        )
+@tool
+def normalize_region(value: str) -> str:
+    """Normalize a sales region name."""
+    return value.strip().lower().replace(" ", "_")
 
-    def get_instructions(self, user_prompt: str = ""):
-        return (
-            "Separate confirmed evidence from hypotheses. Prefer small "
-            "diagnostic queries before broad scans."
-        )
+
+region_skill = Skill.with_tools(
+    name="region_cleanup",
+    tools=[normalize_region],
+    instructions="Normalize region names before comparing reports.",
+)
 ```
 
-`Skill` no longer accepts `tools=`. Tool-backed skill ergonomics and first-class
-`Agent.from_db(..., skills=[...])` integration are planned in
-[docs/skills_runtime_architecture_plan.md](docs/skills_runtime_architecture_plan.md).
+Advanced skills subclass `BaseSkill` when they need dynamic instructions,
+capability requirements, policies, workers, or custom runtime declarations.
 
----
+`Skill(...)` no longer accepts `tools=` directly. Use `Skill.with_tools(...)` or
+declare capabilities, executors, and tool views explicitly.
 
 ## Data Quality
 
@@ -234,7 +368,9 @@ matter:
 
 ```python
 import asyncio
-from daita import DataQualityError, ItemAssertion, postgresql
+from daita import DataQualityError, ItemAssertion
+from daita.plugins import postgresql
+
 
 async def main():
     async with postgresql(host="localhost", database="sales_db") as db:
@@ -250,10 +386,9 @@ async def main():
         except DataQualityError as exc:
             print(f"Data quality failure: {exc}")
 
+
 asyncio.run(main())
 ```
-
----
 
 ## Evals
 
@@ -287,119 +422,16 @@ import asyncio
 from daita.evals import EvalSuite
 from daita.evals.reporters import render_pretty
 
+
 async def main():
     report = await EvalSuite.from_file("evals/sales-agent.yaml").run()
     print(render_pretty(report))
 
-asyncio.run(main())
-```
-
-The CLI command is planned; use the Python API while evals are in developer
-preview.
-
----
-
-## Streaming And Conversation History
-
-Generic `Agent` supports streaming events:
-
-```python
-import asyncio
-from daita import Agent
-from daita.core.streaming import EventType
-
-async def main():
-    agent = Agent(name="Assistant", llm_provider="openai")
-
-    async for event in agent.stream("Explain transformer attention in one paragraph"):
-        if event.type == EventType.THINKING:
-            print(event.content, end="", flush=True)
-        elif event.type == EventType.COMPLETE:
-            print("\nDone")
 
 asyncio.run(main())
 ```
 
-Conversation state is available through `ConversationHistory`:
-
-```python
-from daita import Agent, ConversationHistory
-
-history = ConversationHistory(session_id="alice-session", workspace="support")
-agent = Agent(name="Support Bot", llm_provider="openai")
-
-await agent.run("My name is Alice and I prefer concise answers.", history=history)
-answer = await agent.run("What is my preference?", history=history)
-```
-
----
-
-## Runtime Primitives
-
-Most runtime behavior is expressed through extension declarations:
-
-| Primitive | Purpose |
-| --- | --- |
-| `Capability` | Runtime-plannable behavior with access, risk, evidence, and executor metadata |
-| `Executor` | Performs a capability for a persisted task |
-| `ToolView` | Model-visible projection over a capability |
-| `EvidenceSchema` | Typed evidence shape produced by executors |
-| `Policy` | Governance decision logic over operation/runtime facts |
-| `ContextProvider` | Audience-specific context blocks |
-| `Worker` | Specialist/background worker declaration |
-| `RuntimeKernel` | Operation/task/governance/executor choke point |
-| `RuntimeStore` | Operation, task, evidence, event, approval, and audit persistence |
-
-Runtime-owned DB work must pass through declared capabilities, persisted tasks,
-registered executors, and the shared governance boundary.
-
----
-
-## Plugins
-
-Plugins expose direct Python APIs and may also declare runtime capabilities,
-executors, evidence schemas, policies, context providers, workers, and
-model-visible tool views.
-
-### Database And Search
-
-| Plugin | Extra |
-| --- | --- |
-| PostgreSQL | `[postgresql]` |
-| SQLite | `[sqlite]` |
-| MySQL | `[mysql]` |
-| MongoDB | `[mongodb]` |
-| Snowflake | `[snowflake]` |
-| BigQuery | `[bigquery]` |
-| Elasticsearch | `[elasticsearch]` |
-| Chroma | `[chromadb]` |
-| Pinecone | `[pinecone]` |
-| Qdrant | `[qdrant]` |
-
-### Integrations
-
-| Plugin | Extra |
-| --- | --- |
-| S3 | `[aws]` |
-| Slack | `[slack]` |
-| Google Drive | `[google-drive]` |
-| MCP | `[mcp]` |
-| Web search | `[websearch]` |
-| Exa search | `[exa]` |
-| Neo4j | `[neo4j]` |
-| Redis | `[redis]` |
-
-### Domain Services
-
-| Plugin | Purpose |
-| --- | --- |
-| Catalog | Schema, infrastructure, relationship, and graph discovery |
-| Memory | Persistent semantic and working memory |
-| Lineage | Data lineage and impact analysis |
-| Data quality | Profiling and quality evidence |
-| Transformer | SQL transformation management and execution |
-
----
+The eval API is developer-preview.
 
 ## Installation
 
@@ -429,14 +461,26 @@ pip install "daita-agents[google]"
 pip install "daita-agents[llm-all]"
 ```
 
-Full bundles:
+Other useful extras include `[memory]`, `[voyage]`, `[sentence-transformers]`,
+`[data-quality]`, `[aws]`, `[azure]`, `[gcp]`, `[google-drive]`, `[slack]`,
+`[mcp]`, `[redis]`, `[neo4j]`, `[lineage]`, `[cloud]`, `[complete]`, and `[all]`.
 
-```bash
-pip install "daita-agents[complete]"
-pip install "daita-agents[all]"
+## LLM And Embeddings
+
+LLM providers are created lazily when the agent first needs a model. Built-in
+provider names are `openai`, `anthropic`, `grok`, `gemini`, `ollama`, and
+`mock`.
+
+```python
+from daita import create_llm_provider
+
+llm = create_llm_provider("openai", "gpt-5.4-mini", api_key="sk-...")
 ```
 
-Development:
+Embedding providers live under `daita.embeddings` and include OpenAI, Gemini,
+Voyage, sentence-transformers, and mock implementations.
+
+## Development
 
 ```bash
 pip install -e ".[dev]"
@@ -444,37 +488,44 @@ pre-commit install
 pytest tests/ -m "not requires_llm and not requires_db"
 ```
 
----
+Useful test targets:
 
-## Exception Hierarchy
+```bash
+pytest tests/unit/ -v
+pytest tests/unit/db/test_agent_from_db.py -v
+pytest tests/unit/core/test_skills.py -v
+pytest tests/ -m "not requires_llm and not requires_db"
+```
 
-All public exceptions are importable from `daita`:
+Development rules that matter most in this codebase:
 
-`DaitaError` -> `AgentError`, `LLMError`, `ConfigError`, `PluginError`,
+- Optional dependencies must be imported lazily inside `connect()` or a client
+  property body.
+- Packages needed by one integration belong in an optional extra, not core
+  dependencies.
+- `asyncio_mode = "auto"` is configured globally; do not add per-test
+  `@pytest.mark.asyncio`.
+- Production DB behavior belongs in `DbRuntime`; catalog behavior belongs in
+  catalog plugins; generic `Agent` should consume shared primitives rather than
+  reimplementing DB paths.
+
+## Exceptions
+
+Public exceptions are importable from `daita`:
+
+`DaitaError`, `AgentError`, `LLMError`, `ConfigError`, `PluginError`,
 `SkillError`, `TransientError`, `RetryableError`, `PermanentError`,
 `RateLimitError`, `AuthenticationError`, `ValidationError`, `FocusDSLError`,
-`DataQualityError`
+and `DataQualityError`.
 
----
+## More
 
-## Documentation
-
-See [examples/](examples/) for deployment examples and
-[docs/skills_runtime_architecture_plan.md](docs/skills_runtime_architecture_plan.md)
-for the proposed skills runtime architecture.
-
----
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md). New production data-agent behavior should
-land in `DbRuntime`; generic `Agent` should receive shared runtime primitives or
-lightweight projections of those primitives.
+- [examples/](examples/) contains basic examples and deployment templates.
+- [tests/README.md](tests/README.md) documents test organization.
+- [CONTRIBUTING.md](CONTRIBUTING.md) covers contribution workflow.
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0 - see [LICENSE](LICENSE).
 
----
-
-_Built by [Daita](https://daita-tech.io)_
+Built by [Daita](https://daita-tech.io).

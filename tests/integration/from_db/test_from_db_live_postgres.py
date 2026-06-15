@@ -138,9 +138,13 @@ async def test_from_db_live_postgres_query_uses_runtime_tasks_and_evidence(
     assert result.status is OperationStatus.SUCCEEDED
     assert result.intent.kind is DbIntentKind.DATA_QUERY
     assert result.answer == "The count is 3."
-    assert {"schema.asset_profile", "query.plan", "sql.validation", "query.result"} <= (
-        _evidence_kinds(result)
-    )
+    assert {
+        "schema.asset_profile",
+        "query.plan.proposal",
+        "query.plan.validation",
+        "sql.validation",
+        "query.result",
+    } <= _evidence_kinds(result)
     assert {"db.schema.inspect", "db.sql.validate", "db.sql.execute_read"} <= set(
         _task_capabilities(result)
     )
@@ -174,7 +178,8 @@ async def test_from_db_live_postgres_catalog_assisted_join_records_relationship_
         "catalog.source_registered",
         "schema.search_result",
         "schema.relationship_path",
-        "query.plan",
+        "query.plan.proposal",
+        "query.plan.validation",
         "sql.validation",
         "query.result",
     } <= _evidence_kinds(result)
@@ -232,7 +237,12 @@ async def test_from_db_live_postgres_resolves_non_descriptive_prompt_without_loo
     assert resolved.status is OperationStatus.SUCCEEDED
     assert resolved.intent.kind is DbIntentKind.DATA_QUERY
     assert resolved.answer == "Returned 3 rows."
-    assert {"query.plan", "sql.validation", "query.result"} <= _evidence_kinds(resolved)
+    assert {
+        "query.plan.proposal",
+        "query.plan.validation",
+        "sql.validation",
+        "query.result",
+    } <= _evidence_kinds(resolved)
     assert resolved.diagnostics["execution"]["task_count"] == 3
 
     assert bounded_fallback.status is OperationStatus.SUCCEEDED

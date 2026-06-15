@@ -1,3 +1,5 @@
+import pytest
+
 from daita.db import DbRuntime
 from daita.plugins import ExtensionRegistry, PluginKind
 from daita.plugins.catalog import CatalogPlugin
@@ -106,6 +108,24 @@ def test_catalog_capabilities_are_visible_in_extension_registry():
     } <= tool_view_names
 
 
+def test_catalog_tool_views_expose_strict_required_schemas():
+    views = {
+        view.name: view for view in CatalogPlugin(auto_persist=False).get_tool_views()
+    }
+
+    search = views["catalog_search_schema"].parameters
+    inspect = views["catalog_inspect_asset"].parameters
+    paths = views["catalog_find_relationship_paths"].parameters
+
+    assert search["required"] == ["store_id"]
+    assert search["additionalProperties"] is False
+    assert search["properties"]["limit"]["maximum"] == 50
+    assert inspect["required"] == ["store_id", "asset_ref"]
+    assert inspect["additionalProperties"] is False
+    assert paths["required"] == ["store_id", "from_assets", "to_assets"]
+    assert paths["additionalProperties"] is False
+
+
 async def test_catalog_register_and_search_executors_return_typed_evidence():
     catalog = CatalogPlugin(auto_persist=False)
     registry = ExtensionRegistry()
@@ -145,6 +165,26 @@ async def test_catalog_register_and_search_executors_return_typed_evidence():
     assert register_evidence[0].payload["store_id"] == "store:shop"
     assert search_evidence[0].kind == "schema.search_result"
     assert search_evidence[0].payload["tables"][0]["name"] == "customers"
+
+
+async def test_catalog_model_visible_executors_validate_required_args():
+    catalog = CatalogPlugin(auto_persist=False)
+    registry = ExtensionRegistry()
+    registry.register(catalog)
+    operation = Operation(id="op-validation", operation_type="schema.query")
+
+    with pytest.raises(Exception, match="store_id is required"):
+        await _executor(registry, "catalog.search_schema").execute(
+            Task(
+                id="task-search-missing-store",
+                operation_id=operation.id,
+                capability_id="catalog.schema.search",
+                executor_id="catalog.search_schema",
+                input={"query": "customers"},
+            ),
+            operation,
+            {},
+        )
 
 
 async def test_catalog_inspect_relationship_and_profile_executors_return_evidence():

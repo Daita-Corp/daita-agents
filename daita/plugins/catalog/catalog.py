@@ -64,6 +64,29 @@ MAX_COLUMN_VALUE_HINTS = 12
 _CATALOG_BACKEND_FACTORY: Optional[Callable[[], Any]] = None
 
 
+def _required_arg(args: Dict[str, Any], field: str) -> str:
+    value = args.get(field)
+    if value is None or str(value).strip() == "":
+        from ...core.exceptions import ValidationError
+
+        raise ValidationError(f"{field} is required", field=field)
+    return str(value)
+
+
+def _required_string_list_arg(args: Dict[str, Any], field: str) -> List[str]:
+    value = args.get(field)
+    if not isinstance(value, list) or not value:
+        from ...core.exceptions import ValidationError
+
+        raise ValidationError(f"{field} must be a non-empty list", field=field)
+    items = [str(item) for item in value if str(item).strip()]
+    if not items:
+        from ...core.exceptions import ValidationError
+
+        raise ValidationError(f"{field} must contain at least one value", field=field)
+    return items
+
+
 def register_catalog_backend_factory(factory: Optional[Callable[[], Any]]) -> None:
     """
     Register a factory that creates catalog backends.
@@ -287,7 +310,7 @@ class CatalogPlugin(DomainServicePlugin):
     async def _execute_search_schema(self, payload: Any) -> Dict[str, Any]:
         args = dict(payload or {})
         return self.catalog_search_schema(
-            str(args["store_id"]),
+            _required_arg(args, "store_id"),
             str(args.get("query") or ""),
             limit=int(args.get("limit") or 20),
         )
@@ -295,8 +318,8 @@ class CatalogPlugin(DomainServicePlugin):
     async def _execute_inspect_asset(self, payload: Any) -> Dict[str, Any]:
         args = dict(payload or {})
         return self.inspect_asset(
-            str(args["store_id"]),
-            str(args["asset_ref"]),
+            _required_arg(args, "store_id"),
+            _required_arg(args, "asset_ref"),
             field_filter=args.get("field_filter"),
             offset=int(args.get("offset") or 0),
             limit=int(args.get("limit") or 100),
@@ -309,9 +332,9 @@ class CatalogPlugin(DomainServicePlugin):
     async def _execute_find_relationship_paths(self, payload: Any) -> Dict[str, Any]:
         args = dict(payload or {})
         return self.find_relationship_paths(
-            str(args["store_id"]),
-            list(args.get("from_assets") or []),
-            list(args.get("to_assets") or []),
+            _required_arg(args, "store_id"),
+            _required_string_list_arg(args, "from_assets"),
+            _required_string_list_arg(args, "to_assets"),
             relationship_types=args.get("relationship_types"),
             max_hops=int(args.get("max_hops") or 4),
             max_paths=int(args.get("max_paths") or 5),

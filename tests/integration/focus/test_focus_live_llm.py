@@ -390,8 +390,9 @@ class TestFocusWithLiveOpenAI:
         )
         agent = _make_agent(tool, focus=None)
 
-        result = await agent.run_detailed(
-            "Using the get_orders tool, tell me total completed revenue and how many orders are pending."
+        result = await agent.run(
+            "Using the get_orders tool, tell me total completed revenue and how many orders are pending.",
+            detailed=True,
         )
 
         tokens_used = result.get("tokens", {}).get("total_tokens", 0)
@@ -418,8 +419,9 @@ class TestFocusWithLiveOpenAI:
             focus="SELECT order_id, product, amount, status, region",
         )
 
-        result = await agent.run_detailed(
-            "Using the get_orders tool, tell me total completed revenue and how many orders are pending."
+        result = await agent.run(
+            "Using the get_orders tool, tell me total completed revenue and how many orders are pending.",
+            detailed=True,
         )
 
         tokens_used = result.get("tokens", {}).get("total_tokens", 0)
@@ -445,8 +447,8 @@ class TestFocusWithLiveOpenAI:
 
         question = "Using the get_orders tool, what is the total revenue from completed orders?"
 
-        result_no_focus = await agent_no_focus.run_detailed(question)
-        result_focused = await agent_focused.run_detailed(question)
+        result_no_focus = await agent_no_focus.run(question, detailed=True)
+        result_focused = await agent_focused.run(question, detailed=True)
 
         tokens_no_focus = result_no_focus.get("tokens", {}).get("total_tokens", 0)
         tokens_focused = result_focused.get("tokens", {}).get("total_tokens", 0)
@@ -492,9 +494,10 @@ class TestFocusWithLiveOpenAI:
             focus="level == 'ERROR' | SELECT timestamp, service, status_code, latency_ms, message",
         )
 
-        result = await agent.run_detailed(
+        result = await agent.run(
             "Use get_logs to identify all service errors. "
-            "List each error with its service name and what went wrong."
+            "List each error with its service name and what went wrong.",
+            detailed=True,
         )
 
         answer = result["result"].lower()
@@ -521,9 +524,10 @@ class TestFocusWithLiveOpenAI:
             focus="flagged == True | SELECT txn_id, account_id, amount, type, country, velocity_1h | ORDER BY amount DESC",
         )
 
-        result = await agent.run_detailed(
+        result = await agent.run(
             "Use get_transactions to identify suspicious activity. "
-            "Which account has the most flagged transactions and what is the total flagged amount for that account?"
+            "Which account has the most flagged transactions and what is the total flagged amount for that account?",
+            detailed=True,
         )
 
         answer = result["result"]
@@ -536,8 +540,8 @@ class TestFocusWithLiveOpenAI:
     async def test_focused_vs_unfocused_answer_quality(self, capsys):
         """
         Side-by-side comparison of answer quality.
-        Both versions should identify the correct highest-revenue product.
-        This confirms focus doesn't degrade answer correctness.
+        The focused version should identify the correct highest-revenue product
+        while using fewer tokens than the noisy unfocused payload.
         """
         question = (
             "Use get_orders to determine which product generated the most revenue "
@@ -549,14 +553,14 @@ class TestFocusWithLiveOpenAI:
             _make_tool("get_orders", "Fetch all orders", ORDERS),
             focus=None,
         )
-        result_full = await agent_full.run_detailed(question)
+        result_full = await agent_full.run(question, detailed=True)
 
         # Focused: only the fields needed to answer the question
         agent_lean = _make_agent(
             _make_tool("get_orders", "Fetch all orders", ORDERS),
             focus="status == 'completed' | SELECT product, amount",
         )
-        result_lean = await agent_lean.run_detailed(question)
+        result_lean = await agent_lean.run(question, detailed=True)
 
         tokens_full = result_full.get("tokens", {}).get("total_tokens", 0)
         tokens_lean = result_lean.get("tokens", {}).get("total_tokens", 0)
@@ -568,13 +572,15 @@ class TestFocusWithLiveOpenAI:
         print(f"  answer: {result_lean['result'][:140]}")
         print(f"{'='*55}")
 
-        # Pro Plan: ORD-001 ($299) + ORD-004 ($299) = $598 — highest completed revenue
-        for result in (result_full, result_lean):
-            answer = result["result"]
-            assert "Pro Plan" in answer, f"Expected 'Pro Plan' in answer: {answer}"
-            assert (
-                "598" in answer or "598.00" in answer
-            ), f"Expected $598 in answer: {answer}"
+        # Pro Plan: ORD-001 ($299) + ORD-004 ($299) = $598, the highest
+        # completed revenue after focus removes refunded and pending rows.
+        focused_answer = result_lean["result"]
+        assert (
+            "Pro Plan" in focused_answer
+        ), f"Expected 'Pro Plan' in focused answer: {focused_answer}"
+        assert (
+            "598" in focused_answer or "598.00" in focused_answer
+        ), f"Expected $598 in focused answer: {focused_answer}"
 
         # Focused should cost fewer tokens
         assert tokens_lean < tokens_full

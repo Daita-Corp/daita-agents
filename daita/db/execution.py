@@ -303,10 +303,12 @@ class DbOperationExecutor:
             warnings.extend(strategy_warnings)
             diagnostics["planner_strategy"] = strategy_diagnostics.get("strategy")
             diagnostics["query_plan"] = strategy_diagnostics
+            repair_attempted = False
             if (
                 not validation.payload.get("valid")
                 and self.runtime.db_llm_service.available
             ):
+                repair_attempted = True
                 if planning_context is None:
                     planning_context = await self._build_planning_context(
                         request,
@@ -340,8 +342,38 @@ class DbOperationExecutor:
                         plan_evidence=plan_evidence,
                         planning_context=planning_context,
                     )
+            if (
+                repair_attempted
+                and not _accepted_sql(validation)
+                and planning_context is not None
+            ):
+                fallback = await self._try_deterministic_repair_fallback(
+                    request,
+                    intent,
+                    operation,
+                    schema,
+                    relationship_payload,
+                    tasks,
+                    evidence_store,
+                    planning_context=planning_context,
+                    prior_plan=plan_evidence,
+                    failure=validation,
+                    diagnostics=diagnostics,
+                )
+                if fallback is not None:
+                    (
+                        plan_evidence,
+                        validation,
+                        fallback_warnings,
+                        fallback_diagnostics,
+                    ) = fallback
+                    warnings.extend(fallback_warnings)
+                    diagnostics["query_plan"] = fallback_diagnostics
+                    diagnostics["planner_strategy"] = fallback_diagnostics.get(
+                        "strategy"
+                    )
 
-            sql = validation.payload.get("accepted_sql")
+            sql = _accepted_sql(validation)
             diagnostics["planned_sql"] = sql
             if sql:
                 try:
@@ -410,7 +442,7 @@ class DbOperationExecutor:
                                 plan_evidence=repaired,
                                 planning_context=planning_context,
                             )
-                            repaired_sql = validation.payload.get("accepted_sql")
+                            repaired_sql = _accepted_sql(validation)
                             if repaired_sql:
                                 sql_validation = await self._execute_sql_validation(
                                     contract,
@@ -440,6 +472,66 @@ class DbOperationExecutor:
                                     },
                                     warnings=tuple(warnings),
                                 )
+                            if planning_context is not None:
+                                fallback = (
+                                    await self._try_deterministic_repair_fallback(
+                                        request,
+                                        intent,
+                                        operation,
+                                        schema,
+                                        relationship_payload,
+                                        tasks,
+                                        evidence_store,
+                                        planning_context=planning_context,
+                                        prior_plan=repaired,
+                                        failure=validation,
+                                        diagnostics=diagnostics,
+                                    )
+                                )
+                                if fallback is not None:
+                                    (
+                                        _fallback_plan,
+                                        fallback_validation,
+                                        fallback_warnings,
+                                        fallback_diagnostics,
+                                    ) = fallback
+                                    warnings.extend(fallback_warnings)
+                                    fallback_sql = _accepted_sql(fallback_validation)
+                                    sql_validation = await self._execute_sql_validation(
+                                        contract,
+                                        operation,
+                                        tasks,
+                                        evidence_store,
+                                        fallback_sql,
+                                        plan_validation=fallback_validation,
+                                    )
+                                    await self._execute_validated_read(
+                                        contract,
+                                        operation,
+                                        tasks,
+                                        evidence_store,
+                                        sql_validation,
+                                    )
+                                    diagnostics["planned_sql"] = fallback_sql
+                                    diagnostics["query_plan"] = fallback_diagnostics
+                                    diagnostics["planner_strategy"] = (
+                                        fallback_diagnostics.get("strategy")
+                                    )
+                                    return DbExecutionOutcome(
+                                        evidence=evidence_store.list(),
+                                        tasks=tuple(tasks),
+                                        diagnostics={
+                                            **diagnostics,
+                                            "evidence_kinds": [
+                                                item.kind
+                                                for item in evidence_store.list()
+                                            ],
+                                            "evidence_refs": list(
+                                                evidence_store.refs()
+                                            ),
+                                        },
+                                        warnings=tuple(warnings),
+                                    )
                     raise
         elif intent.kind is DbIntentKind.QUALITY_CHECK:
             await self._execute_quality_steps(
@@ -1128,6 +1220,122 @@ class DbOperationExecutor:
             item for item in evidence if item.kind == QUERY_PLAN_PROPOSAL_EVIDENCE
         ]
         return proposals[-1] if proposals else None
+
+    async def _try_deterministic_repair_fallback(
+        self,
+        request: DbRequest,
+        intent: DbIntent,
+        operation: Operation,
+        schema: dict[str, Any],
+        relationship_payload: dict[str, Any] | None,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        planning_context: Evidence,
+        prior_plan: Evidence,
+        failure: Evidence,
+        diagnostics: dict[str, Any],
+    ) -> tuple[Evidence, Evidence, tuple[str, ...], dict[str, Any]] | None:
+        plan = self.query_planner.plan_read_query(
+            request,
+            intent,
+            operation,
+            schema,
+            relationship_payload=relationship_payload,
+            planning_context=planning_context.payload,
+        )
+        plan_evidence = replace(
+            plan.evidence,
+            metadata={
+                **plan.evidence.metadata,
+                "repair_fallback": True,
+                "fallback_after_failure_evidence_id": failure.id,
+                "prior_plan_evidence_id": prior_plan.id,
+            },
+        )
+        persisted = await self._persist_runtime_evidence(operation, plan_evidence)
+        evidence_store.add(persisted)
+        validation = await self._validate_query_plan(
+            operation,
+            tasks,
+            evidence_store,
+            plan_evidence=persisted,
+            planning_context=planning_context,
+            analysis_metadata={
+                "repair_fallback": True,
+                "fallback_after_failure_evidence_id": failure.id,
+                "prior_plan_evidence_id": prior_plan.id,
+            },
+            extra_dependencies=(
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind=failure.kind,
+                    evidence_id=failure.id,
+                    evidence_accepted=failure.accepted,
+                    operation_id=operation.id,
+                ),
+            ),
+        )
+        fallback_diagnostics = {
+            **plan.diagnostics,
+            "repair_fallback": True,
+            "fallback_after_failure_evidence_id": failure.id,
+            "prior_plan_evidence_id": prior_plan.id,
+        }
+        if _accepted_sql(validation):
+            diagnostics["repair_fallback_used"] = True
+            return persisted, validation, plan.warnings, fallback_diagnostics
+
+        await self._record_repair_exhaustion(
+            operation,
+            evidence_store,
+            failure=failure,
+            prior_plan=prior_plan,
+            fallback_plan=persisted,
+            fallback_validation=validation,
+            diagnostics=diagnostics,
+        )
+        return None
+
+    async def _record_repair_exhaustion(
+        self,
+        operation: Operation,
+        evidence_store: DbEvidenceStore,
+        *,
+        failure: Evidence,
+        prior_plan: Evidence,
+        fallback_plan: Evidence,
+        fallback_validation: Evidence,
+        diagnostics: dict[str, Any],
+    ) -> Evidence:
+        terminal_payload = {
+            "valid": False,
+            "failure": "repair_exhausted",
+            "repair_exhausted": True,
+            "accepted_sql_missing": not bool(
+                fallback_validation.payload.get("accepted_sql")
+            ),
+            "failure_evidence_id": failure.id,
+            "failure_evidence_kind": failure.kind,
+            "prior_plan_evidence_id": prior_plan.id,
+            "fallback_plan_evidence_id": fallback_plan.id,
+            "fallback_validation_evidence_id": fallback_validation.id,
+            "fallback_validation_payload": dict(fallback_validation.payload),
+        }
+        diagnostics.update(
+            {
+                "repair_exhausted": True,
+                "accepted_sql_missing": terminal_payload["accepted_sql_missing"],
+                "repair_terminal_failure_evidence_kind": QUERY_PLAN_VALIDATION_EVIDENCE,
+                "repair_terminal_failure": terminal_payload,
+            }
+        )
+        return await self._record_failure_evidence(
+            operation,
+            evidence_store,
+            QUERY_PLAN_VALIDATION_EVIDENCE,
+            terminal_payload,
+        )
 
     async def _persist_runtime_evidence(
         self,
@@ -2148,6 +2356,13 @@ def _deterministic_value_hint_search_needed(
     if request.constraints.get("sql") or request.constraints.get("query"):
         return False
     return DbQueryPlanner.needs_value_hint_context(request.prompt, schema)
+
+
+def _accepted_sql(validation: Evidence) -> str | None:
+    if not validation.payload.get("valid"):
+        return None
+    sql = validation.payload.get("accepted_sql")
+    return str(sql) if sql else None
 
 
 def _stable_hash(value: Any) -> str:

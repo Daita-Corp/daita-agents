@@ -3,9 +3,12 @@ import json
 from daita.agents.agent import Agent
 from daita.db import DbRuntime
 from daita.db.llm_service import DbLLMResponse
+from daita.db.query_plan import DbQueryPlan as StructuredDbQueryPlan
+from daita.db.query_planning import DbQueryPlan as DeterministicDbQueryPlan
+from daita.db.query_planning import DbQueryPlanner
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import OperationStatus
+from daita.runtime import Evidence, OperationStatus
 
 
 class FakeDbLLMService:
@@ -296,6 +299,118 @@ async def test_llm_validation_failure_creates_repair_with_fresh_tasks(tmp_path):
         and dep.evidence_id == failed_validations[0].id
     )
     assert failure_dependency.evidence_accepted is False
+
+
+async def test_invalid_repair_uses_deterministic_fallback_before_read(tmp_path):
+    bad_sql = "SELECT id, status FROM orders WHERE status = 'completed' LIMIT 10"
+    runtime, sqlite = await _runtime_with_llm(
+        tmp_path,
+        [
+            _status_plan(bad_sql, value="completed", confidence=0.82),
+            "not json",
+        ],
+    )
+    try:
+        result = await runtime.run("Show completed orders by status")
+        snapshot = await runtime.inspect_operation(result.operation_id)
+    finally:
+        await sqlite.disconnect()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert snapshot is not None
+    capability_sequence = [task.capability_id for task in snapshot.tasks]
+    assert capability_sequence.index(
+        "db.query.plan.validate"
+    ) < capability_sequence.index("db.query.repair")
+    assert "db.sql.validate" in capability_sequence
+    assert "db.sql.execute_read" in capability_sequence
+    fallback_proposal = next(
+        item
+        for item in snapshot.evidence
+        if item.kind == "query.plan.proposal"
+        and item.metadata.get("repair_fallback") is True
+    )
+    fallback_validation = next(
+        item
+        for item in snapshot.evidence
+        if item.kind == "query.plan.validation"
+        and item.payload.get("plan_evidence_id") == fallback_proposal.id
+    )
+    assert fallback_validation.payload["accepted_sql"]
+    query_result = next(item for item in result.evidence if item.kind == "query.result")
+    assert query_result.payload["rows"] == [
+        {"status": "complete"},
+        {"status": "complete"},
+    ]
+
+
+async def test_repair_exhaustion_records_terminal_diagnostics_without_sql_execution(
+    tmp_path,
+    monkeypatch,
+):
+    def invalid_plan(self, request, intent, operation, schema, **kwargs):
+        structured = StructuredDbQueryPlan.deterministic(
+            sql=None,
+            tables=(),
+            confidence=0.0,
+            strategy="forced_invalid_fallback",
+        )
+        return DeterministicDbQueryPlan(
+            sql=None,
+            evidence=Evidence(
+                kind="query.plan.proposal",
+                owner="db_runtime",
+                operation_id=operation.id,
+                payload={
+                    "sql": None,
+                    "structured_plan": structured.to_dict(),
+                    "strategy": "forced_invalid_fallback",
+                    "valid": False,
+                    "warnings": ["forced_invalid_fallback"],
+                    "plan_fingerprint": "forced-invalid",
+                    "sql_fingerprint": None,
+                },
+            ),
+            diagnostics={
+                "planner": "deterministic",
+                "strategy": "forced_invalid_fallback",
+                "sql": None,
+                "schema_table_count": len(schema.get("tables", []) or []),
+            },
+            warnings=("forced_invalid_fallback",),
+        )
+
+    monkeypatch.setattr(DbQueryPlanner, "plan_read_query", invalid_plan)
+    runtime, sqlite = await _runtime_with_llm(
+        tmp_path,
+        [
+            _plan(
+                "SELECT SUM(total) AS total FROM payments LIMIT 5",
+                tables=("payments",),
+                confidence=0.8,
+            ),
+            "not json",
+        ],
+    )
+    try:
+        result = await runtime.run("Show top customers by total revenue")
+        snapshot = await runtime.inspect_operation(result.operation_id)
+    finally:
+        await sqlite.disconnect()
+
+    assert result.status is OperationStatus.FAILED
+    assert snapshot is not None
+    assert not any(item.kind == "sql.validation" for item in snapshot.evidence)
+    assert not any(item.kind == "query.result" for item in snapshot.evidence)
+    terminal = next(
+        item
+        for item in snapshot.evidence
+        if item.kind == "query.plan.validation"
+        and item.payload.get("failure") == "repair_exhausted"
+    )
+    assert terminal.payload["repair_exhausted"] is True
+    assert result.diagnostics["execution"]["repair_exhausted"] is True
+    assert result.diagnostics["execution"]["accepted_sql_missing"] is True
 
 
 async def test_value_profile_validation_drives_repair_to_observed_literal(tmp_path):

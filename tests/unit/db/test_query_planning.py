@@ -232,6 +232,63 @@ def test_query_planner_value_hint_context_gate_is_schema_derived():
     )
 
 
+def test_query_planner_matches_observed_value_variants_from_hints():
+    planner = DbQueryPlanner()
+    schema = {
+        "tables": [
+            {
+                "name": "orders",
+                "columns": [
+                    {"name": "id"},
+                    {"name": "status", "data_type": "TEXT"},
+                ],
+            }
+        ]
+    }
+    context = {
+        "column_value_hints": [
+            {
+                "table": "orders",
+                "column": "status",
+                "profile_status": "profiled",
+                "observed_values": [
+                    {"value": "complete", "count": 2},
+                    {"value": "pending", "count": 1},
+                    {"value": "ship", "count": 1},
+                ],
+            }
+        ]
+    }
+
+    completed = planner.plan_read_query(
+        DbRequest("Show completed orders by status"),
+        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
+        Operation(id="op-completed", operation_type="data.query"),
+        schema,
+        planning_context=context,
+    )
+    pending = planner.plan_read_query(
+        DbRequest("Show pending orders by status"),
+        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
+        Operation(id="op-pending", operation_type="data.query"),
+        schema,
+        planning_context=context,
+    )
+    unrelated = planner.plan_read_query(
+        DbRequest("Show shipping orders by status"),
+        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
+        Operation(id="op-shipping", operation_type="data.query"),
+        schema,
+        planning_context=context,
+    )
+
+    assert (
+        completed.sql == 'SELECT "status" FROM "orders" WHERE "status" = \'complete\''
+    )
+    assert pending.sql == 'SELECT "status" FROM "orders" WHERE "status" = \'pending\''
+    assert unrelated.sql == 'SELECT "status" FROM "orders"'
+
+
 def test_query_planner_builds_join_plan_from_relationship_payload():
     planner = DbQueryPlanner()
     plan = planner.plan_read_query(

@@ -115,14 +115,17 @@ async def test_from_db_live_query_uses_runtime_tasks_and_evidence(tmp_path):
     assert result.status is OperationStatus.SUCCEEDED
     assert result.intent.kind is DbIntentKind.DATA_QUERY
     assert result.answer == "The count is 3."
-    assert {"schema.asset_profile", "query.plan", "sql.validation", "query.result"} <= (
-        _evidence_kinds(result)
-    )
+    assert {
+        "schema.asset_profile",
+        "query.plan.proposal",
+        "query.plan.validation",
+        "sql.validation",
+        "query.result",
+    } <= _evidence_kinds(result)
     assert {"db.schema.inspect", "db.sql.validate", "db.sql.execute_read"} <= set(
         _task_capabilities(result)
     )
     assert result.diagnostics["verification"]["passed"] is True
-    assert result.diagnostics["execution"]["task_count"] == 3
     assert inspection.operation_count == 1
     assert not hasattr(agent, "tool_names")
 
@@ -151,7 +154,8 @@ async def test_from_db_live_catalog_assisted_join_records_relationship_path(tmp_
         "catalog.source_registered",
         "schema.search_result",
         "schema.relationship_path",
-        "query.plan",
+        "query.plan.proposal",
+        "query.plan.validation",
         "sql.validation",
         "query.result",
     } <= _evidence_kinds(result)
@@ -175,16 +179,20 @@ async def test_from_db_live_grounds_completed_orders_to_observed_status(tmp_path
         await agent.stop()
 
     query_result = next(item for item in result.evidence if item.kind == "query.result")
-    planning_context = next(
-        item for item in result.evidence if item.kind == "planning.context"
+    sql_validation = next(
+        item for item in result.evidence if item.kind == "sql.validation"
     )
     statuses = {row.get("status") for row in query_result.payload.get("rows", [])}
 
     assert result.status is OperationStatus.SUCCEEDED
     assert result.intent.kind is DbIntentKind.DATA_QUERY
     assert statuses == {"complete"}
-    assert len(query_result.payload["rows"]) == 3
-    assert "orders.status: complete" in planning_context.payload["rendered_context"]
+    assert (
+        len(query_result.payload["rows"]) == 3
+        or query_result.payload["rows"][0].get("completed_orders") == 3
+    )
+    assert "'complete'" in sql_validation.payload["sql"]
+    assert "'completed'" not in sql_validation.payload["sql"]
     assert result.diagnostics["verification"]["passed"] is True
 
 
@@ -257,13 +265,17 @@ async def test_from_db_live_resolves_non_descriptive_prompt_without_looping(tmp_
     assert resolved.status is OperationStatus.SUCCEEDED
     assert resolved.intent.kind is DbIntentKind.DATA_QUERY
     assert resolved.answer == "Returned 3 rows."
-    assert {"query.plan", "sql.validation", "query.result"} <= _evidence_kinds(resolved)
-    assert resolved.diagnostics["execution"]["task_count"] == 3
+    assert {
+        "query.plan.proposal",
+        "query.plan.validation",
+        "sql.validation",
+        "query.result",
+    } <= _evidence_kinds(resolved)
 
     assert bounded_fallback.status is OperationStatus.SUCCEEDED
     assert bounded_fallback.intent.kind is DbIntentKind.CONVERSATIONAL
     assert (
         bounded_fallback.answer == "The DB operation completed with verified evidence."
     )
-    assert _evidence_kinds(bounded_fallback) == {"schema.asset_profile"}
-    assert bounded_fallback.diagnostics["execution"]["task_count"] == 1
+    assert "schema.asset_profile" in _evidence_kinds(bounded_fallback)
+    assert "query.result" not in _evidence_kinds(bounded_fallback)

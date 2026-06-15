@@ -15,6 +15,7 @@ from daita.runtime import (
     Operation,
     RiskLevel,
     Task,
+    ToolView,
 )
 
 from .manifest import PluginKind, PluginManifest
@@ -43,7 +44,7 @@ def lineage_capabilities() -> tuple[Capability, ...]:
             input_schema=common_schema,
             output_evidence=frozenset({"lineage.trace"}),
             executor="lineage.trace",
-            runtime_only=True,
+            model_visible=True,
             side_effecting=False,
         ),
         Capability(
@@ -57,7 +58,7 @@ def lineage_capabilities() -> tuple[Capability, ...]:
             input_schema=common_schema,
             output_evidence=frozenset({"lineage.impact"}),
             executor="lineage.impact.analyze",
-            runtime_only=True,
+            model_visible=True,
             side_effecting=False,
         ),
         Capability(
@@ -85,8 +86,106 @@ def lineage_capabilities() -> tuple[Capability, ...]:
             input_schema=common_schema,
             output_evidence=frozenset({"lineage.path"}),
             executor="lineage.path.find",
-            runtime_only=True,
+            model_visible=True,
             side_effecting=False,
+        ),
+    )
+
+
+def lineage_tool_views() -> tuple[ToolView, ...]:
+    """Return model-visible read-only lineage tool views."""
+    edge_types = {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Optional lineage edge types to include.",
+    }
+    return (
+        ToolView(
+            name="trace_lineage",
+            capability_id="lineage.trace",
+            description="Trace upstream, downstream, or both lineage for an entity.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "entity_id": {
+                        "type": "string",
+                        "description": "Lineage entity id to trace.",
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["upstream", "downstream", "both"],
+                        "description": "Traversal direction.",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "description": "Maximum lineage depth to traverse.",
+                    },
+                    "edge_types": edge_types,
+                },
+                "required": ["entity_id"],
+                "additionalProperties": False,
+            },
+        ),
+        ToolView(
+            name="find_lineage_paths",
+            capability_id="lineage.path.find",
+            description="Find read-only lineage paths between two entities.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "from_entity": {
+                        "type": "string",
+                        "description": "Starting lineage entity id.",
+                    },
+                    "to_entity": {
+                        "type": "string",
+                        "description": "Destination lineage entity id.",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "description": "Maximum path depth to search.",
+                    },
+                    "max_paths": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Maximum paths to return.",
+                    },
+                    "edge_types": edge_types,
+                },
+                "required": ["from_entity", "to_entity"],
+                "additionalProperties": False,
+            },
+        ),
+        ToolView(
+            name="analyze_impact",
+            capability_id="lineage.impact.analyze",
+            description="Analyze downstream impact for a proposed entity change.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "entity_id": {
+                        "type": "string",
+                        "description": "Lineage entity id that may change.",
+                    },
+                    "change_type": {
+                        "type": "string",
+                        "description": "Type of change to analyze.",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "description": "Maximum downstream depth to analyze.",
+                    },
+                },
+                "required": ["entity_id"],
+                "additionalProperties": False,
+            },
         ),
     )
 

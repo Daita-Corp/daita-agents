@@ -589,6 +589,7 @@ class ChatRuntime:
             specs.append(spec)
 
         registry_tool_names = {view.name for view in self.extension_registry.tool_views}
+        local_tool_catalog = getattr(self, "local_tool_catalog", None)
         for tool in resolved_local_tools:
             if not bool(getattr(tool, "model_visible", True)) or bool(
                 getattr(tool, "runtime_only", False)
@@ -597,6 +598,12 @@ class ChatRuntime:
             if (
                 getattr(tool, "source", None) == "plugin"
                 and tool.name in registry_tool_names
+            ):
+                continue
+            if (
+                tool.name in registry_tool_names
+                and local_tool_catalog is not None
+                and local_tool_catalog.get(tool.name) is tool
             ):
                 continue
             spec = self._register_local_tool(tool)
@@ -614,16 +621,23 @@ class ChatRuntime:
         if local_tool_catalog is None:
             return []
         if selected_tools is None:
-            return list(local_tool_catalog.tools)
+            return [self._with_focus(tool) for tool in local_tool_catalog.tools]
         resolved = []
+        seen: dict[str, Any] = {}
         for item in selected_tools:
             if isinstance(item, str):
                 tool = local_tool_catalog.get(item)
                 if tool is None:
                     raise ValueError(f"Tool '{item}' not found in registry")
-                resolved.append(tool)
             else:
-                resolved.append(item)
+                attached = local_tool_catalog.get(getattr(item, "name", ""))
+                tool = attached if attached is not None else item
+            name = str(getattr(tool, "name", ""))
+            existing = seen.get(name)
+            if existing is tool:
+                continue
+            seen[name] = tool
+            resolved.append(tool)
         return [self._with_focus(tool) for tool in resolved]
 
     @property

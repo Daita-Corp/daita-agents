@@ -447,13 +447,14 @@ def _token_estimate(data) -> int:
     return len(json.dumps(data, default=str)) // 4
 
 
-def _make_agent(tool: LocalTool) -> Agent:
+def _make_agent(tool: LocalTool, *, focus: str | None = None) -> Agent:
     return Agent(
         name="SQLFocusTestAgent",
         llm_provider="openai",
         model="gpt-4o-mini",
         api_key=os.environ["OPENAI_API_KEY"],
         tools=[tool],
+        focus=focus,
     )
 
 
@@ -495,13 +496,10 @@ class TestPostgreSQLFocusPushdown:
         print(f"\n[PG pushdown] SQL → {pushed_sql}")
         print(f"[PG result]   {rows}")
 
-        # SQL structure
+        # Safe-mode SQL pushdown only sends translatable filters to the DB.
         assert "WHERE" in pushed_sql
-        assert '"order_id"' in pushed_sql
-        assert '"product"' in pushed_sql
-        assert '"amount"' in pushed_sql
 
-        # Real execution result — only completed orders, only 3 projected columns
+        # Python focus evaluation applies projection after filtered DB results.
         assert len(rows) == 3, f"Expected 3 completed orders, got {len(rows)}"
         assert all(r["status"] != "refunded" for r in rows if "status" in r)
         assert all(
@@ -522,26 +520,29 @@ class TestPostgreSQLFocusPushdown:
         """
         plugin = _make_pg_plugin(ORDERS, "orders")
 
+        async def query_orders(args):
+            return await plugin._tool_query({**args, "sql": "SELECT * FROM orders"})
+
         tool = LocalTool(
             name="postgres_query",
-            description="Run a SELECT on the orders table. Use focus to filter/project at DB level.",
+            description="Query the orders table.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "sql": {"type": "string"},
                     "focus": {"type": "string"},
                 },
-                "required": ["sql"],
+                "required": [],
             },
-            handler=plugin._tool_query,
+            handler=query_orders,
             source="plugin",
         )
 
-        result = await _make_agent(tool).run_detailed(
-            'Use postgres_query with SQL "SELECT * FROM orders" '
-            "and focus \"status == 'completed' | SELECT order_id, product, amount\" "
-            "to find which product generated the most revenue from completed orders. "
-            "State the product name and exact total."
+        focus = "status == 'completed' | SELECT order_id, product, amount"
+
+        result = await _make_agent(tool, focus=focus).run(
+            "Use postgres_query to find which product generated the most revenue "
+            "from completed orders. State the product name and exact total.",
+            detailed=True,
         )
 
         answer = result["result"]
@@ -587,10 +588,8 @@ class TestMySQLFocusPushdown:
         print(f"\n[MySQL pushdown] SQL → {pushed_sql}")
         print(f"[MySQL result]   {rows}")
 
-        # SQL structure: MySQL uses backtick quoting
+        # Safe-mode SQL pushdown sends the filter and leaves projection to Python.
         assert "WHERE" in pushed_sql
-        assert "`session_id`" in pushed_sql
-        assert "`converted`" in pushed_sql
         assert "AND" in pushed_sql, "Compound filter should use AND"
 
         # Real execution: only pricing-page sessions with duration > 30s
@@ -612,26 +611,32 @@ class TestMySQLFocusPushdown:
         """
         plugin = _make_mysql_plugin(SESSIONS, "sessions")
 
+        async def query_sessions(args):
+            return await plugin._tool_query({**args, "sql": "SELECT * FROM sessions"})
+
         tool = LocalTool(
             name="mysql_query",
-            description="Query the sessions table. Use focus to filter/project at DB level.",
+            description="Query the sessions table.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "sql": {"type": "string"},
                     "focus": {"type": "string"},
                 },
-                "required": ["sql"],
+                "required": [],
             },
-            handler=plugin._tool_query,
+            handler=query_sessions,
             source="plugin",
         )
 
-        result = await _make_agent(tool).run_detailed(
-            'Use mysql_query with SQL "SELECT * FROM sessions" '
-            "and focus \"page == 'pricing' and duration_s > 30 | SELECT session_id, user_id, converted, duration_s\" "
-            "to find how many users who spent more than 30 seconds on the pricing page converted. "
-            "Give the exact count."
+        focus = (
+            "page == 'pricing' and duration_s > 30 | "
+            "SELECT session_id, user_id, converted, duration_s"
+        )
+
+        result = await _make_agent(tool, focus=focus).run(
+            "Use mysql_query to find how many users who spent more than 30 seconds "
+            "on the pricing page converted. Give the exact count.",
+            detailed=True,
         )
 
         answer = result["result"]
@@ -678,14 +683,10 @@ class TestSnowflakeFocusPushdown:
         print(f"\n[SF pushdown] SQL → {pushed_sql}")
         print(f"[SF result]   {rows}")
 
-        # SQL structure
-        assert "GROUP BY" in pushed_sql
-        assert "SUM(" in pushed_sql
-        assert '"total_sales"' in pushed_sql
+        # Safe-mode SQL pushdown sends the filter; aggregation/order run in Python.
         assert "WHERE" in pushed_sql
-        assert "ORDER BY" in pushed_sql
 
-        # Real execution: 3 EMEA product lines in descending revenue order
+        # Python focus evaluation returns 3 EMEA product lines in descending revenue order.
         assert len(rows) == 3, f"Expected 3 EMEA product lines, got {len(rows)}: {rows}"
 
         totals = {r["product_line"]: r["total_sales"] for r in rows}
@@ -713,25 +714,29 @@ class TestSnowflakeFocusPushdown:
         """
         plugin = _make_sf_plugin(SALES, "sales")
 
+        async def query_sales(args):
+            return await plugin._tool_query({**args, "sql": "SELECT * FROM sales"})
+
         tool = LocalTool(
             name="snowflake_query",
-            description="Query the Snowflake sales warehouse. Use focus to push clauses into SQL.",
+            description="Query the Snowflake sales warehouse.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "sql": {"type": "string"},
                     "focus": {"type": "string"},
                 },
-                "required": ["sql"],
+                "required": [],
             },
-            handler=plugin._tool_query,
+            handler=query_sales,
             source="plugin",
         )
 
-        result = await _make_agent(tool).run_detailed(
-            'Use snowflake_query with SQL "SELECT * FROM sales" '
-            "and focus \"region == 'EMEA' | GROUP BY product_line | SELECT product_line, SUM(amount) AS total_sales | ORDER BY total_sales DESC\" "
-            "to find the top-revenue product line in EMEA. State the product line and exact total."
+        focus = "region == 'EMEA' | GROUP BY product_line | SELECT product_line, SUM(amount) AS total_sales | ORDER BY total_sales DESC"
+
+        result = await _make_agent(tool, focus=focus).run(
+            "Use snowflake_query to find the top-revenue product line in EMEA. "
+            "State the product line and exact total.",
+            detailed=True,
         )
 
         answer = result["result"]

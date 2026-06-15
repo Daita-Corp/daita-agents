@@ -207,7 +207,7 @@ async def test_live_provider_whole_run_retries_after_replay_safe_tool_work(spec)
     )
 
     assert result["result"].strip()
-    assert result.get("retry_attempt") == 2
+    assert result["diagnostics"]["retry_attempt"] == 2
     assert llm.live_calls == 1
 
 

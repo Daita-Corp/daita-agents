@@ -52,6 +52,7 @@ from .lineage_extensions import (
     LineageExecutor,
     lineage_capabilities,
     lineage_evidence_schemas,
+    lineage_tool_views,
 )
 
 if TYPE_CHECKING:
@@ -212,6 +213,9 @@ class LineagePlugin(BasePlugin):
     def declare_evidence_schemas(self):
         return lineage_evidence_schemas()
 
+    def get_tool_views(self):
+        return lineage_tool_views()
+
     def _configure_runtime(self, agent_id: str) -> None:
         self._agent_id = agent_id
         if self._graph_backend is None:
@@ -254,6 +258,10 @@ class LineagePlugin(BasePlugin):
     async def _tool_trace_lineage(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for trace_lineage"""
         entity_id = args.get("entity_id")
+        if not entity_id:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError("entity_id is required", field="entity_id")
         direction = args.get("direction", "both")
         max_depth = args.get("max_depth", 5)
         edge_types = _parse_edge_types_arg(args.get("edge_types"))
@@ -447,7 +455,8 @@ class LineagePlugin(BasePlugin):
 
             raise ValidationError("from_entity and to_entity are required")
 
-        cutoff = int(args.get("cutoff") or 5)
+        cutoff = int(args.get("max_depth") or args.get("cutoff") or 5)
+        max_paths = int(args.get("max_paths") or 20)
         edge_types = _parse_edge_types_arg(args.get("edge_types"))
 
         if self._graph_backend is None:
@@ -474,10 +483,12 @@ class LineagePlugin(BasePlugin):
             edge_types=effective_edge_types,
             cutoff=cutoff,
         )
+        paths = paths[:max_paths]
         return {
             "from_entity": from_entity,
             "to_entity": to_entity,
-            "cutoff": cutoff,
+            "max_depth": cutoff,
+            "max_paths": max_paths,
             "paths": paths,
             "path_count": len(paths),
             "reachable": bool(paths),
@@ -614,6 +625,10 @@ class LineagePlugin(BasePlugin):
     async def _tool_analyze_impact(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for analyze_impact"""
         entity_id = args.get("entity_id")
+        if not entity_id:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError("entity_id is required", field="entity_id")
         change_type = args.get("change_type", "schema_change")
         max_depth = int(args.get("max_depth") or 5)
         edge_types = _parse_edge_types_arg(args.get("edge_types"))
