@@ -1021,17 +1021,18 @@ def _synthesis_dependencies(
         ):
             _append_dependency_for_kind(dependencies, accepted, kind)
     elif intent.kind is DbIntentKind.SCHEMA_QUERY:
-        _append_dependency_for_any(
-            dependencies,
-            accepted,
-            (
-                "planning.context",
-                "schema.asset_profile",
-                "catalog.source",
-                "schema.search_result",
-                "catalog.asset.profile",
-            ),
-        )
+        _append_database_schema_dependency(dependencies, accepted)
+        for kind in (
+            "planning.context",
+            "schema.search_result",
+            "schema.asset_profile",
+        ):
+            _append_dependency_for_kind(dependencies, accepted, kind)
+        _append_dependency_for_kind(dependencies, accepted, "verification.result")
+    elif intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY:
+        _append_database_schema_dependency(dependencies, accepted)
+        for kind in ("schema.relationship_path", "schema.search_result"):
+            _append_dependency_for_kind(dependencies, accepted, kind)
         _append_dependency_for_kind(dependencies, accepted, "verification.result")
     else:
         _append_dependency_for_kind(dependencies, accepted, "verification.result")
@@ -1084,6 +1085,43 @@ def _append_dependency_for_any(
         dependencies.append(_dependency_for_evidence(catalog))
 
 
+def _append_database_schema_dependency(
+    dependencies: list[TaskDependency],
+    evidence: tuple[Evidence, ...],
+) -> None:
+    item = next(
+        (
+            candidate
+            for candidate in reversed(evidence)
+            if candidate.kind == "schema.asset_profile"
+            and _schema_evidence_scope(candidate) == "database"
+        ),
+        None,
+    )
+    if item is None:
+        item = next(
+            (
+                candidate
+                for candidate in evidence
+                if candidate.kind == "schema.asset_profile"
+                and candidate.payload.get("tables")
+            ),
+            None,
+        )
+    if item is not None:
+        dependencies.append(_dependency_for_evidence(item))
+
+
+def _schema_evidence_scope(evidence: Evidence) -> str | None:
+    metadata_scope = evidence.metadata.get("scope")
+    if metadata_scope:
+        return str(metadata_scope)
+    payload_metadata = evidence.payload.get("metadata")
+    if isinstance(payload_metadata, dict) and payload_metadata.get("scope"):
+        return str(payload_metadata["scope"])
+    return None
+
+
 def _dependency_for_evidence(evidence: Evidence) -> TaskDependency:
     return TaskDependency(
         kind="evidence",
@@ -1134,7 +1172,6 @@ def _prompt_from_direct_input(input: dict[str, Any]) -> str:
         if value:
             return str(value)
     return ""
-
 
 
 def _task_dependencies_for_capability(

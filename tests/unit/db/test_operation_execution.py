@@ -1,4 +1,4 @@
-from daita.db import DbRequest, DbRuntime
+from daita.db import DbIntentKind, DbRequest, DbRuntime
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import OperationStatus
@@ -848,7 +848,7 @@ async def test_run_executes_catalog_assisted_join_query():
 
     try:
         result = await runtime.run(
-            "Join orders to customers using their relationship",
+            "Join orders to customers using their relationship and return records",
         )
     finally:
         await runtime.teardown()
@@ -864,3 +864,32 @@ async def test_run_executes_catalog_assisted_join_query():
     query_result = next(item for item in result.evidence if item.kind == "query.result")
     assert query_result.payload["rows"][0]["customers_email"] == "ada@example.com"
     assert query_result.payload["rows"][0]["orders_total"] == 42.5
+
+
+async def test_run_executes_relationship_query_without_sql_execution():
+    runtime, _ = await _runtime()
+
+    try:
+        result = await runtime.run(
+            "What relationships do I need to join customers to orders?",
+        )
+        snapshot = await runtime.inspect_operation(result.operation_id)
+    finally:
+        await runtime.teardown()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert result.intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY
+    assert {
+        "schema.asset_profile",
+        "schema.search_result",
+        "schema.relationship_path",
+    } <= {item.kind for item in result.evidence}
+    assert "query.result" not in {item.kind for item in result.evidence}
+    assert "sql.validation" not in {item.kind for item in result.evidence}
+    assert snapshot is not None
+    assert "db.sql.validate" not in {task.capability_id for task in snapshot.tasks}
+    assert "db.sql.execute_read" not in {task.capability_id for task in snapshot.tasks}
+    relationship = next(
+        item for item in result.evidence if item.kind == "schema.relationship_path"
+    )
+    assert relationship.payload["reachable"] is True

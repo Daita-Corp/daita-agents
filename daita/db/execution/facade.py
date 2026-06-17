@@ -97,6 +97,16 @@ class DbOperationExecutor(
                 evidence_store,
                 diagnostics["store_id"],
             )
+        elif intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY:
+            await self._execute_relationship_schema_steps(
+                request,
+                contract,
+                operation,
+                schema,
+                tasks,
+                evidence_store,
+                diagnostics["store_id"],
+            )
         elif intent.kind in {
             DbIntentKind.DATA_QUERY,
             DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
@@ -575,7 +585,7 @@ class DbOperationExecutor(
             {"store_id": store_id, "query": request.prompt, "limit": 10},
         )
         if table:
-            await self._execute_capability(
+            asset_evidence = await self._execute_capability(
                 "catalog.asset.inspect",
                 contract,
                 operation,
@@ -583,6 +593,54 @@ class DbOperationExecutor(
                 evidence_store,
                 {"store_id": store_id, "asset_ref": table, "limit": 100},
             )
+            for item in asset_evidence:
+                scoped = _with_schema_asset_scope(item, "asset")
+                if scoped is item:
+                    continue
+                evidence_store.discard(item.id)
+                evidence_store.add(scoped)
+
+    async def _execute_relationship_schema_steps(
+        self,
+        request: DbRequest,
+        contract: DbOperationContract,
+        operation: Operation,
+        schema: dict[str, Any],
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        store_id: str,
+    ) -> None:
+        await self._execute_capability(
+            "catalog.schema.search",
+            contract,
+            operation,
+            tasks,
+            evidence_store,
+            {"store_id": store_id, "query": request.prompt, "limit": 10},
+        )
+        from_assets, to_assets = _relationship_assets_for_metadata_prompt(
+            request.prompt,
+            schema,
+            self.query_planner.relationship_tables_for_prompt(request.prompt, schema),
+            self.query_planner.best_table_for_prompt(request.prompt, schema),
+        )
+        if not from_assets or not to_assets:
+            return
+        await self._execute_capability(
+            "catalog.relationship_paths.find",
+            contract,
+            operation,
+            tasks,
+            evidence_store,
+            {
+                "store_id": store_id,
+                "from_assets": from_assets,
+                "to_assets": to_assets,
+                "relationship_types": ["foreign_key", "references"],
+                "max_hops": 4,
+                "max_paths": 5,
+            },
+        )
 
     async def _execute_quality_steps(
         self,
@@ -699,3 +757,49 @@ class DbOperationExecutor(
             capability["id"].startswith("catalog.")
             for capability in contract.metadata.get("selected_capabilities", [])
         )
+
+
+def _relationship_assets_for_metadata_prompt(
+    prompt: str,
+    schema: dict[str, Any],
+    relationship_tables: tuple[str | None, str | None],
+    best_table: str | None,
+) -> tuple[list[str], list[str]]:
+    from_table, to_table = relationship_tables
+    if from_table and to_table:
+        return [from_table], [to_table]
+    source = from_table or to_table or best_table
+    if not source:
+        return [], []
+    related = _related_tables_for_schema_asset(schema, source)
+    if related:
+        return [source], related
+    all_tables = [
+        str(table.get("name"))
+        for table in schema.get("tables", []) or []
+        if table.get("name") and str(table.get("name")) != source
+    ]
+    return [source], all_tables[:5]
+
+
+def _related_tables_for_schema_asset(schema: dict[str, Any], asset: str) -> list[str]:
+    related: list[str] = []
+    for relationship in schema.get("foreign_keys", []) or []:
+        source = relationship.get("source_table") or relationship.get("source_asset")
+        target = relationship.get("target_table") or relationship.get("target_asset")
+        if source == asset and target:
+            related.append(str(target))
+        elif target == asset and source:
+            related.append(str(source))
+    return list(dict.fromkeys(related))
+
+
+def _with_schema_asset_scope(evidence: Evidence, scope: str) -> Evidence:
+    if evidence.kind != "schema.asset_profile":
+        return evidence
+    payload = dict(evidence.payload)
+    metadata = {**evidence.metadata, "scope": scope}
+    payload_metadata = dict(payload.get("metadata") or {})
+    payload_metadata.setdefault("scope", scope)
+    payload["metadata"] = payload_metadata
+    return replace(evidence, payload=payload, metadata=metadata)

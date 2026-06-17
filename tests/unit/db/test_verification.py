@@ -89,3 +89,31 @@ def test_verifier_allows_schema_evidence_without_query_result():
 
     assert result.passed is True
     assert result.diagnostics["schema_answer_uses_query_result"] is False
+
+
+def test_verifier_rejects_relationship_operation_with_query_result():
+    result = DbVerifier().verify(
+        DbOperationContract(
+            operation_type="schema.relationship_query",
+            required_evidence=("schema.relationship_path",),
+            access=AccessMode.METADATA_READ,
+        ),
+        DbIntent(
+            kind=DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
+            access=AccessMode.METADATA_READ,
+        ),
+        (
+            Evidence(
+                kind="schema.relationship_path",
+                payload={"reachable": True, "paths": []},
+            ),
+            Evidence(
+                kind="query.result",
+                payload={"rows": [{"id": 1}], "sql": "SELECT * FROM customers"},
+            ),
+        ),
+        (),
+    )
+
+    assert result.passed is False
+    assert "metadata_operation_includes_query_result" in result.warnings

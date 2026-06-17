@@ -74,6 +74,8 @@ class DbSynthesizer:
 
         if intent.kind is DbIntentKind.SCHEMA_QUERY:
             answer = _schema_answer(evidence)
+        elif intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY:
+            answer = _schema_relationship_answer(evidence)
         elif intent.kind in {
             DbIntentKind.DATA_QUERY,
             DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
@@ -99,10 +101,7 @@ class DbSynthesizer:
 
 
 def _schema_answer(evidence: tuple[Evidence, ...]) -> str:
-    schema = next(
-        (item.payload for item in evidence if item.kind == "schema.asset_profile"),
-        {},
-    )
+    schema = _database_schema_payload(evidence)
     tables = _tables_from_schema_payload(schema)
     parts = []
     for table in tables:
@@ -113,6 +112,57 @@ def _schema_answer(evidence: tuple[Evidence, ...]) -> str:
         ]
         parts.append(f"{table.get('name')}: {', '.join(columns)}")
     return f"Found {len(tables)} tables. " + "; ".join(parts)
+
+
+def _schema_relationship_answer(evidence: tuple[Evidence, ...]) -> str:
+    relationship = next(
+        (item.payload for item in evidence if item.kind == "schema.relationship_path"),
+        {},
+    )
+    if relationship.get("reachable") is False:
+        return "No relationship path was found between the requested tables."
+    paths = relationship.get("paths") or []
+    if not paths:
+        return "No relationship path evidence was produced."
+    parts = []
+    for path in paths[:3]:
+        assets = path.get("assets") or []
+        if assets:
+            parts.append(" -> ".join(str(asset) for asset in assets))
+    if parts:
+        return "Found relationship path: " + "; ".join(parts)
+    return "Found relationship path evidence for the requested tables."
+
+
+def _database_schema_payload(evidence: tuple[Evidence, ...]) -> dict[str, Any]:
+    scoped = next(
+        (
+            item.payload
+            for item in evidence
+            if item.kind == "schema.asset_profile" and _schema_scope(item) == "database"
+        ),
+        None,
+    )
+    if scoped is not None:
+        return scoped
+    return next(
+        (
+            item.payload
+            for item in evidence
+            if item.kind == "schema.asset_profile"
+            and _tables_from_schema_payload(item.payload)
+        ),
+        {},
+    )
+
+
+def _schema_scope(evidence: Evidence) -> str | None:
+    if evidence.metadata.get("scope"):
+        return str(evidence.metadata["scope"])
+    payload_metadata = evidence.payload.get("metadata")
+    if isinstance(payload_metadata, dict) and payload_metadata.get("scope"):
+        return str(payload_metadata["scope"])
+    return None
 
 
 def _data_answer(evidence: tuple[Evidence, ...]) -> str:
@@ -130,6 +180,11 @@ def _data_answer(evidence: tuple[Evidence, ...]) -> str:
 
 
 def _tables_from_schema_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    nested_schema = payload.get("schema")
+    if isinstance(nested_schema, dict):
+        nested_tables = _tables_from_schema_payload(nested_schema)
+        if nested_tables:
+            return nested_tables
     if payload.get("tables"):
         return [
             table

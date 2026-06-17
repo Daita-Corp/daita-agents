@@ -161,6 +161,36 @@ async def test_prompt_monitor_create_blocks_unsupported_action_and_audits_valida
     assert await runtime.store.list_tasks() == []
 
 
+async def test_create_monitor_prompt_requires_approval_then_resumes_to_create_monitor():
+    runtime = DbRuntime(runtime_id="db-monitor-create-approval-runtime")
+    agent = DbAgent(runtime=runtime)
+
+    result = await agent.run_detailed(
+        "Create a monitor for the users table. I want to be notified everytime "
+        "a new user gets added to the table"
+    )
+
+    assert result.status is OperationStatus.BLOCKED
+    assert result.contract.operation_type == "monitor.create"
+    assert result.warnings == ("db_monitor_approval_required",)
+    assert await agent.list_monitors() == ()
+
+    approvals = await runtime.store.list_approval_requests(result.operation_id)
+    assert len(approvals) == 1
+    assert approvals[0].status is ApprovalStatus.PENDING
+    assert approvals[0].proposed_action["operation_type"] == "monitor.create"
+
+    await runtime.approval_channel.approve(approvals[0].approval_id)
+    resumed = await runtime.resume_operation(result.operation_id)
+
+    assert resumed.operation.status is OperationStatus.SUCCEEDED
+    monitors = await agent.list_monitors()
+    assert len(monitors) == 1
+    assert monitors[0].id == "users_table"
+    evidence = await runtime.store.list_evidence(result.operation_id)
+    assert any(item.kind == "monitor.definition" and item.accepted for item in evidence)
+
+
 async def test_non_monitor_and_ambiguous_prompts_continue_to_db_runtime_run():
     runtime = RunSpyRuntime()
     agent = DbAgent(runtime=runtime)

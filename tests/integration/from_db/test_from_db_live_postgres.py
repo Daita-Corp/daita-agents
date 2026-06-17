@@ -166,7 +166,7 @@ async def test_from_db_live_postgres_catalog_assisted_join_records_relationship_
 
     try:
         result = await agent.run_detailed(
-            "Join orders to customers using their relationship"
+            "Join orders to customers using their relationship and return records"
         )
     finally:
         await agent.stop()

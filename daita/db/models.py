@@ -17,6 +17,7 @@ class DbIntentKind(str, Enum):
 
     CONVERSATIONAL = "conversational"
     SCHEMA_QUERY = "schema.query"
+    SCHEMA_RELATIONSHIP_QUERY = "schema.relationship_query"
     DATA_QUERY = "data.query"
     CATALOG_ASSISTED_DATA_QUERY = "data.query.catalog_assisted"
     METRIC_QUERY = "metric.query"

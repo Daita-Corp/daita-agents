@@ -234,7 +234,9 @@ async def test_catalog_relationship_evidence_reaches_llm_planning_context(tmp_pa
         tmp_path, [_join_plan(operation="query_planning")]
     )
     try:
-        result = await runtime.run("Join orders to customers using their relationship")
+        result = await runtime.run(
+            "Join orders to customers using their relationship and return records"
+        )
         snapshot = await runtime.inspect_operation(result.operation_id)
     finally:
         await sqlite.disconnect()

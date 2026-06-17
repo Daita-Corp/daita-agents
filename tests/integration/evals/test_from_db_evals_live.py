@@ -87,7 +87,7 @@ async def test_eval_live_from_db_sqlite_quality_suite(tmp_path):
             },
             {
                 "id": "sqlite-warm-relationship-join",
-                "prompt": "Join orders to customers using their relationship",
+                "prompt": "Join orders to customers using their relationship and return records",
                 "expectations": {
                     "answer": {"equals": "Returned 4 rows."},
                     "capabilities": {
@@ -290,7 +290,7 @@ async def test_eval_live_from_db_postgres_quality_suite(tmp_path):
             },
             {
                 "id": "postgres-warm-relationship-join",
-                "prompt": "Join orders to customers using their relationship",
+                "prompt": "Join orders to customers using their relationship and return records",
                 "expectations": {
                     "answer": {"equals": "Returned 4 rows."},
                     "capabilities": {

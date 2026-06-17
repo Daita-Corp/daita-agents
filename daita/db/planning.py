@@ -20,32 +20,87 @@ from .models import (
     DbRuntimeConfig,
 )
 
-_SCHEMA_WORDS = {
-    "schema",
-    "schemas",
-    "table",
-    "tables",
-    "column",
-    "columns",
-    "field",
-    "fields",
-    "foreign key",
-    "relationship",
-    "relationships",
-}
-_DATA_WORDS = {
-    "count",
-    "sum",
-    "average",
-    "avg",
-    "total",
-    "top",
-    "list",
-    "show",
-    "find",
-    "how many",
-    "revenue",
-}
+_SCHEMA_OBJECT_SIGNALS = (
+    ("schema", r"\bschemas?\b", 3),
+    ("database_structure", r"\bdatabase\s+(structure|schema|contain|contains)\b", 4),
+    ("available_data", r"\bavailable\s+(tables?|data|datasets?)\b", 3),
+    ("tables", r"\btables?\b", 2),
+    ("columns", r"\bcolumns?\b", 2),
+    ("fields", r"\bfields?\b", 2),
+    ("keys", r"\b(primary|foreign)\s+keys?\b", 2),
+    ("entities", r"\bentities\b", 2),
+    ("database_contains", r"\bwhat\s+(does|is)\s+this\s+database\s+contain", 4),
+    ("business_questions", r"\bbusiness\s+questions?\b", 3),
+    ("important_fields", r"\bimportant\s+fields?\b", 3),
+)
+_RELATIONSHIP_OBJECT_SIGNALS = (
+    ("relationships", r"\brelationships?\b", 4),
+    ("foreign_keys", r"\bforeign\s+keys?\b", 4),
+    ("join_path", r"\bjoin\s+paths?\b", 4),
+    ("join_relationship", r"\bjoin\b", 2),
+    ("connected", r"\bconnected\b", 3),
+    ("linked", r"\blink(?:ed|s)?\b", 3),
+    ("related_tables", r"\brelated\s+tables?\b", 3),
+    ("tables_connect", r"\bhow\s+tables?\s+connect\b", 4),
+    ("connect_to", r"\bconnect(?:ed|s)?\s+to\b", 3),
+)
+_DATA_ACCESS_SIGNALS = (
+    ("neutral_data_verb", r"\b(list|show|find)\b", 2),
+    ("count_rows", r"\b(count|how\s+many|number\s+of)\b", 4),
+    ("totals", r"\b(total|sum)\b", 3),
+    ("averages", r"\b(avg|average|mean)\b", 3),
+    ("top_n", r"\btop\s+\d+\b|\btop\b", 4),
+    (
+        "most_recent_records",
+        r"\b(most\s+recent|latest)\s+(records?|rows?|orders?|transactions?)\b",
+        4,
+    ),
+    (
+        "filter_records",
+        r"\b(where|filter|over|under|greater\s+than|less\s+than|threshold)\b",
+        3,
+    ),
+    (
+        "group_by",
+        r"\b(group\s+by|by\s+(month|week|day|period|account|customer|region|status))\b",
+        3,
+    ),
+    ("record_rows", r"\b(records?|rows?)\b", 3),
+    ("transactions", r"\btransactions?\b", 2),
+    (
+        "revenue_by_period",
+        r"\brevenue\s+by\b|\bmonthly\s+revenue\b|\brevenue\s+by\s+(month|period|account|customer)\b",
+        4,
+    ),
+    ("calculate_metric", r"\b(calculate|compute)\b", 3),
+    (
+        "analysis_request",
+        r"\b(multi-step|multiple\s+queries|deep\s+analysis|investigate|explain\s+why|why\s+did|root\s+cause|step\s+by\s+step\s+analysis)\b",
+        4,
+    ),
+)
+_DATA_RESOLUTION_SIGNALS = (
+    ("best_table", r"\b(best|right|appropriate|relevant)\s+tables?\b", 3),
+    ("best_column", r"\b(best|right|appropriate|relevant|safest)\s+columns?\b", 3),
+    (
+        "qualified_column",
+        r"\b(best|right|appropriate|relevant|safest)\s+\w+\s+columns?\b",
+        3,
+    ),
+    ("find_column", r"\bfind\s+the\s+columns?\b", 3),
+    ("which_column", r"\bwhich\s+columns?\b", 2),
+    ("which_table", r"\bwhich\s+tables?\b", 2),
+)
+_NEUTRAL_VERB_SIGNALS = (
+    ("summarize", r"\bsummarize\b"),
+    ("describe", r"\bdescribe\b"),
+    ("list", r"\blist\b"),
+    ("show", r"\bshow\b"),
+    ("find", r"\bfind\b"),
+    ("map", r"\bmap\b"),
+    ("identify", r"\bidentify\b"),
+    ("inspect", r"\binspect\b"),
+)
 _WRITE_WORDS = {
     "insert",
     "update",
@@ -60,7 +115,6 @@ _WRITE_WORDS = {
 _QUALITY_WORDS = {"quality", "profile", "null", "freshness", "anomaly"}
 _LINEAGE_WORDS = {"lineage", "upstream", "downstream", "impact"}
 _MEMORY_WORDS = {"remember", "note", "business rule", "semantic"}
-_JOIN_WORDS = {"join", "relationship", "relationships", "foreign key", "between"}
 _SCHEMA_ONLY_PHRASES = {
     "schema evidence only",
     "schema only",
@@ -78,14 +132,7 @@ _SCHEMA_SEARCH_PHRASES = {
     "which tables",
     "which table",
 }
-_CALCULATION_WORDS = {"calculate", "compute", "summarize", "aggregate"}
-_COLUMN_RESOLUTION_WORDS = {
-    "safest",
-    "best column",
-    "right column",
-    "relevant column",
-    "find the column",
-}
+_DATA_RESULT_WORDS = {"records", "rows", "values", "result", "results", "return"}
 
 
 @dataclass(frozen=True)
@@ -159,51 +206,64 @@ class DbIntentClassifier:
                 diagnostics={**diagnostics, "matched": "quality_keyword"},
             )
 
-        if _is_explicit_schema_only_prompt(prompt):
-            return DbIntent(
-                kind=DbIntentKind.SCHEMA_QUERY,
-                confidence=0.85,
-                access=AccessMode.METADATA_READ,
-                evidence_mode="schema",
-                diagnostics={**diagnostics, "matched": "schema_only_keyword"},
-            )
-
-        if _is_schema_assisted_data_prompt(prompt):
-            return DbIntent(
-                kind=DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-                confidence=0.75,
-                access=AccessMode.READ,
-                evidence_mode="query_and_relationships",
-                diagnostics={**diagnostics, "matched": "schema_assisted_data_keyword"},
-            )
-
-        if _contains_any(prompt, _JOIN_WORDS):
-            return DbIntent(
-                kind=DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-                confidence=0.7,
-                access=AccessMode.READ,
-                evidence_mode="query_and_relationships",
-                diagnostics={**diagnostics, "matched": "join_keyword"},
-            )
-
-        if _contains_any(prompt, _SCHEMA_WORDS) and not _contains_any(
-            prompt, _DATA_WORDS
-        ):
-            return DbIntent(
-                kind=DbIntentKind.SCHEMA_QUERY,
-                confidence=0.75,
-                access=AccessMode.METADATA_READ,
-                evidence_mode="schema",
-                diagnostics={**diagnostics, "matched": "schema_keyword"},
-            )
-
-        if _contains_any(prompt, _DATA_WORDS) or _looks_like_question(prompt):
+        if request.metadata.get("sql") or request.metadata.get("query"):
             return DbIntent(
                 kind=DbIntentKind.DATA_QUERY,
-                confidence=0.65,
+                confidence=0.9,
                 access=AccessMode.READ,
                 evidence_mode="query",
-                diagnostics={**diagnostics, "matched": "data_keyword"},
+                diagnostics={
+                    **diagnostics,
+                    "matched": "explicit_sql_metadata",
+                    "schema_score": 0,
+                    "relationship_score": 0,
+                    "data_score": 4,
+                    "dominant_object_type": "data",
+                    "neutral_verbs": _matched_signal_names(
+                        prompt, _NEUTRAL_VERB_SIGNALS
+                    ),
+                    "data_access_requested": True,
+                    "tie_break_reason": "explicit_sql_metadata",
+                },
+            )
+
+        signal = _intent_signal_scores(prompt)
+        diagnostics = {**diagnostics, **signal}
+        if _is_explicit_schema_only_prompt(prompt):
+            relationship_kind = (
+                DbIntentKind.SCHEMA_RELATIONSHIP_QUERY
+                if signal["relationship_score"] > signal["schema_score"]
+                else DbIntentKind.SCHEMA_QUERY
+            )
+            return DbIntent(
+                kind=relationship_kind,
+                confidence=0.9,
+                access=_access_for_intent(relationship_kind),
+                evidence_mode=_evidence_mode_for_intent(relationship_kind),
+                diagnostics={**diagnostics, "matched": "explicit_metadata_only"},
+            )
+
+        kind, confidence, reason = _kind_from_signal_scores(signal)
+        if kind is not None:
+            return DbIntent(
+                kind=kind,
+                confidence=confidence,
+                access=_access_for_intent(kind),
+                evidence_mode=_evidence_mode_for_intent(kind),
+                diagnostics={**diagnostics, "matched": reason},
+            )
+
+        if _looks_like_question(prompt):
+            return DbIntent(
+                kind=DbIntentKind.DATA_QUERY,
+                confidence=0.55,
+                access=AccessMode.READ,
+                evidence_mode="query",
+                diagnostics={
+                    **diagnostics,
+                    "matched": "question_fallback",
+                    "tie_break_reason": "question_without_metadata_signals_defaults_to_data",
+                },
             )
 
         return DbIntent(
@@ -438,6 +498,9 @@ def _kind_from_mode(mode: str) -> DbIntentKind | None:
             return kind
     aliases = {
         "schema": DbIntentKind.SCHEMA_QUERY,
+        "relationships": DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
+        "relationship": DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
+        "schema_relationship": DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
         "data": DbIntentKind.DATA_QUERY,
         "write": DbIntentKind.WRITE_PROPOSE,
         "write_execute": DbIntentKind.WRITE_EXECUTE,
@@ -454,6 +517,12 @@ def _operation_type_for_intent(kind: DbIntentKind) -> str:
 def _capability_requirements_for_intent(kind: DbIntentKind) -> tuple[str, ...]:
     if kind is DbIntentKind.SCHEMA_QUERY:
         return ("catalog.schema.search", "catalog.asset.inspect", "db.schema.inspect")
+    if kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY:
+        return (
+            "db.schema.inspect",
+            "catalog.schema.search",
+            "catalog.relationship_paths.find",
+        )
     if kind is DbIntentKind.DATA_QUERY:
         return ("db.sql.validate", "db.sql.execute_read")
     if kind is DbIntentKind.CATALOG_ASSISTED_DATA_QUERY:
@@ -477,7 +546,10 @@ def _capability_requirements_for_intent(kind: DbIntentKind) -> tuple[str, ...]:
 
 
 def _forbidden_for_intent(capability: Capability, intent: DbIntent) -> bool:
-    if intent.kind is DbIntentKind.SCHEMA_QUERY and capability.access in {
+    if intent.kind in {
+        DbIntentKind.SCHEMA_QUERY,
+        DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
+    } and capability.access in {
         AccessMode.READ,
         AccessMode.WRITE,
         AccessMode.ADMIN,
@@ -509,6 +581,7 @@ def _merge_skill_metadata(values: Iterable[dict]) -> dict[str, object]:
 def _access_for_intent(kind: DbIntentKind) -> AccessMode:
     if kind in {
         DbIntentKind.SCHEMA_QUERY,
+        DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
         DbIntentKind.LINEAGE_TRACE,
         DbIntentKind.WRITE_PROPOSE,
     }:
@@ -533,6 +606,7 @@ def _evidence_mode_for_intent(kind: DbIntentKind) -> str:
     return {
         DbIntentKind.CONVERSATIONAL: "none",
         DbIntentKind.SCHEMA_QUERY: "schema",
+        DbIntentKind.SCHEMA_RELATIONSHIP_QUERY: "schema_relationships",
         DbIntentKind.DATA_QUERY: "query",
         DbIntentKind.CATALOG_ASSISTED_DATA_QUERY: "query_and_relationships",
         DbIntentKind.METRIC_QUERY: "query",
@@ -591,15 +665,127 @@ def _is_explicit_schema_only_prompt(prompt: str) -> bool:
     return (
         _contains_any(prompt, _SCHEMA_ONLY_PHRASES)
         or _contains_any(prompt, _SCHEMA_SEARCH_PHRASES)
-    ) and _contains_any(prompt, _SCHEMA_WORDS)
-
-
-def _is_schema_assisted_data_prompt(prompt: str) -> bool:
-    return (
-        _contains_any(prompt, _CALCULATION_WORDS)
-        and _contains_any(prompt, _COLUMN_RESOLUTION_WORDS)
-        and _contains_any(prompt, _DATA_WORDS)
+    ) and (
+        _score_signal_patterns(prompt, _SCHEMA_OBJECT_SIGNALS)[0] > 0
+        or _score_signal_patterns(prompt, _RELATIONSHIP_OBJECT_SIGNALS)[0] > 0
     )
+
+
+def _intent_signal_scores(prompt: str) -> dict[str, object]:
+    schema_score, schema_matches = _score_signal_patterns(
+        prompt, _SCHEMA_OBJECT_SIGNALS
+    )
+    relationship_score, relationship_matches = _score_signal_patterns(
+        prompt, _RELATIONSHIP_OBJECT_SIGNALS
+    )
+    data_score, data_matches = _score_signal_patterns(prompt, _DATA_ACCESS_SIGNALS)
+    resolution_score, resolution_matches = _score_signal_patterns(
+        prompt, _DATA_RESOLUTION_SIGNALS
+    )
+    neutral_verbs = _matched_signal_names(prompt, _NEUTRAL_VERB_SIGNALS)
+    if "join_relationship" in relationship_matches and _has_data_result_object(prompt):
+        data_score += 3
+        data_matches.append("join_returns_data")
+    if (
+        data_matches
+        and set(data_matches) <= {"neutral_data_verb"}
+        and (schema_score > 0 or relationship_score > 0)
+    ):
+        data_score = 0
+        data_matches = []
+    dominant = "none"
+    ranked = sorted(
+        (
+            ("schema", schema_score),
+            ("relationship", relationship_score),
+            ("data", data_score),
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if ranked[0][1] > 0:
+        dominant = ranked[0][0]
+    return {
+        "schema_score": schema_score,
+        "relationship_score": relationship_score,
+        "data_score": data_score,
+        "resolution_score": resolution_score,
+        "dominant_object_type": dominant,
+        "neutral_verbs": neutral_verbs,
+        "schema_signals": schema_matches,
+        "relationship_signals": relationship_matches,
+        "data_signals": data_matches,
+        "resolution_signals": resolution_matches,
+        "data_access_requested": data_score > 0,
+        "tie_break_reason": "none",
+    }
+
+
+def _kind_from_signal_scores(
+    signal: dict[str, object],
+) -> tuple[DbIntentKind | None, float, str]:
+    schema_score = int(signal["schema_score"])
+    relationship_score = int(signal["relationship_score"])
+    data_score = int(signal["data_score"])
+    resolution_score = int(signal["resolution_score"])
+    weak_data_only = _weak_data_signal_only(signal)
+    metadata_score = max(schema_score, relationship_score)
+    if weak_data_only and metadata_score > 0:
+        data_score = 0
+    if data_score > 0 and (metadata_score > 0 or resolution_score > 0):
+        if relationship_score > 0 or resolution_score > 0:
+            signal["tie_break_reason"] = "data_access_with_catalog_resolution"
+            return (
+                DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
+                0.8,
+                "scored_catalog_assisted_data",
+            )
+        signal["tie_break_reason"] = "data_access_with_schema_terms"
+        return DbIntentKind.DATA_QUERY, 0.7, "scored_data"
+    if data_score > 0:
+        signal["tie_break_reason"] = "data_access_requested"
+        return DbIntentKind.DATA_QUERY, 0.75, "scored_data"
+    if relationship_score > 0:
+        signal["tie_break_reason"] = "relationship_object_without_row_access"
+        return (
+            DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
+            0.8,
+            "scored_schema_relationship",
+        )
+    if schema_score > 0:
+        signal["tie_break_reason"] = "schema_object_without_row_access"
+        return DbIntentKind.SCHEMA_QUERY, 0.8, "scored_schema"
+    return None, 0.5, "fallback"
+
+
+def _weak_data_signal_only(signal: dict[str, object]) -> bool:
+    data_signals = set(signal.get("data_signals") or [])
+    return bool(data_signals) and data_signals <= {"neutral_data_verb"}
+
+
+def _score_signal_patterns(
+    prompt: str,
+    patterns: tuple[tuple[str, str, int], ...],
+) -> tuple[int, list[str]]:
+    score = 0
+    matches: list[str] = []
+    for name, pattern, weight in patterns:
+        if re.search(pattern, prompt):
+            score += weight
+            matches.append(name)
+    return score, matches
+
+
+def _matched_signal_names(
+    prompt: str,
+    patterns: tuple[tuple[str, str], ...],
+) -> list[str]:
+    return [name for name, pattern in patterns if re.search(pattern, prompt)]
+
+
+def _has_data_result_object(prompt: str) -> bool:
+    words = set(re.findall(r"[a-z_]+", prompt))
+    return bool(words.intersection(_DATA_RESULT_WORDS))
 
 
 def _looks_like_question(prompt: str) -> bool:

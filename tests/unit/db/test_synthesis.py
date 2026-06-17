@@ -59,3 +59,69 @@ def test_synthesizer_refuses_to_answer_before_verification_passes():
             evidence=(),
             verification=_verification(passed=False),
         )
+
+
+def test_schema_synthesis_prefers_database_scoped_profile_over_asset_profile():
+    result = DbSynthesizer().synthesize(
+        request=DbRequest("Summarize the database schema."),
+        intent=DbIntent(
+            kind=DbIntentKind.SCHEMA_QUERY,
+            access=AccessMode.METADATA_READ,
+        ),
+        contract=DbOperationContract(
+            operation_type="schema.query",
+            required_evidence=("schema.asset_profile",),
+        ),
+        evidence=(
+            Evidence(
+                kind="schema.asset_profile",
+                payload={
+                    "asset": {"name": "customers"},
+                    "fields": [{"name": "email"}],
+                    "metadata": {"scope": "asset"},
+                },
+                metadata={"scope": "asset"},
+            ),
+            Evidence(
+                kind="schema.asset_profile",
+                payload={
+                    "tables": [
+                        {"name": "customers", "columns": [{"name": "id"}]},
+                        {"name": "orders", "columns": [{"name": "customer_id"}]},
+                    ],
+                    "metadata": {"scope": "database"},
+                },
+                metadata={"scope": "database"},
+            ),
+        ),
+        verification=_verification(),
+    )
+
+    assert "Found 2 tables" in result.answer
+    assert "orders: customer_id" in result.answer
+
+
+def test_relationship_synthesis_uses_relationship_path_evidence():
+    result = DbSynthesizer().synthesize(
+        request=DbRequest("What relationships do I need to join customers to orders?"),
+        intent=DbIntent(
+            kind=DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
+            access=AccessMode.METADATA_READ,
+        ),
+        contract=DbOperationContract(
+            operation_type="schema.relationship_query",
+            required_evidence=("schema.relationship_path",),
+        ),
+        evidence=(
+            Evidence(
+                kind="schema.relationship_path",
+                payload={
+                    "reachable": True,
+                    "paths": [{"assets": ["customers", "orders"]}],
+                },
+            ),
+        ),
+        verification=_verification(),
+    )
+
+    assert result.answer == "Found relationship path: customers -> orders"

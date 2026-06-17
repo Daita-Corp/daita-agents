@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from daita.runtime import Evidence, Operation, Task
@@ -64,12 +65,14 @@ class _ExecutionCatalogMixin:
     ) -> Evidence | None:
         cached = self.runtime.cached_schema_evidence(operation_id=operation.id)
         if cached is not None:
-            evidence_store.add(cached)
-            return cached
+            scoped = _with_schema_scope(cached, "database")
+            evidence_store.add(scoped)
+            return scoped
         persisted = self.runtime.persisted_schema_evidence(operation_id=operation.id)
         if persisted is not None:
-            evidence_store.add(persisted)
-            return persisted
+            scoped = _with_schema_scope(persisted, "database")
+            evidence_store.add(scoped)
+            return scoped
         capability = self._first_capability("db.schema.inspect")
         if capability is None:
             return None
@@ -92,8 +95,12 @@ class _ExecutionCatalogMixin:
             evidence_store.add(fallback)
             return fallback
         if evidence:
-            self.runtime.remember_schema_evidence(evidence[0])
-        return evidence[0] if evidence else None
+            scoped = _with_schema_scope(evidence[0], "database")
+            self.runtime.remember_schema_evidence(scoped)
+            evidence_store.discard(evidence[0].id)
+            evidence_store.add(scoped)
+            return scoped
+        return None
 
     async def _register_catalog_source_if_available(
         self,
@@ -159,6 +166,17 @@ def _schema_with_catalog_metadata(
         metadata.setdefault("profile_key", str(profile_key))
         copied["metadata"] = metadata
     return copied
+
+
+def _with_schema_scope(evidence: Evidence, scope: str) -> Evidence:
+    if evidence.kind != "schema.asset_profile":
+        return evidence
+    payload = dict(evidence.payload)
+    metadata = {**evidence.metadata, "scope": scope}
+    payload_metadata = dict(payload.get("metadata") or {})
+    payload_metadata.setdefault("scope", scope)
+    payload["metadata"] = payload_metadata
+    return replace(evidence, payload=payload, metadata=metadata)
 
 
 def _catalog_evidence_for_planning(

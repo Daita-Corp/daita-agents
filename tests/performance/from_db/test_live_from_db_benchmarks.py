@@ -181,7 +181,7 @@ async def test_live_from_db_relationship_query_latency_cost_and_output(
     try:
         result, elapsed_ms = await _timed_run(
             agent,
-            "Join orders to customers using their relationship",
+            "Join orders to customers using their relationship and return records",
         )
     finally:
         await agent.stop()
@@ -322,7 +322,7 @@ async def test_live_from_db_postgres_relationship_query_latency_cost_and_output(
     try:
         result, elapsed_ms = await _timed_run(
             agent,
-            "Join orders to customers using their relationship",
+            "Join orders to customers using their relationship and return records",
         )
     finally:
         await agent.stop()

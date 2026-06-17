@@ -7,9 +7,17 @@ import re
 from typing import Any, Literal
 
 from daita.plugins import ExtensionRegistry
-from daita.runtime import OperationStatus
+from daita.runtime import (
+    AccessMode,
+    ApprovalRequest,
+    Evidence,
+    OperationStatus,
+    RiskLevel,
+    RuntimeEvent,
+    RuntimeEventType,
+)
 
-from .models import DbOperationResult, DbRequest
+from .models import DbIntent, DbIntentKind, DbOperationContract, DbOperationResult, DbRequest
 from .monitors import DbMonitor
 
 DbMonitorCommandKind = Literal[
@@ -189,7 +197,10 @@ class DbCommandRouter:
                 monitor_id=monitor_id,
                 prompt=text,
                 confidence=0.88,
-                diagnostics={"route": "monitor.create"},
+                diagnostics={
+                    "route": "monitor.create",
+                    "approval_required": _requires_monitor_create_approval(lowered),
+                },
             )
         return None
 
@@ -269,6 +280,13 @@ class DbCommandRouter:
             return bool(
                 re.search(
                     r"\b(every|hourly|daily|weekly|if|when|alert|notify|schedule)\b",
+                    lowered,
+                )
+            )
+        if re.search(r"\b(create|add|set\s+up|setup)\b.*\bmonitors?\b", lowered):
+            return bool(
+                re.search(
+                    r"\b(every|hourly|daily|weekly|if|when|alert|notify|notified|watch|table|new|added|created|inserted|schedule)\b",
                     lowered,
                 )
             )
@@ -553,6 +571,13 @@ class DbMonitorCommandService:
                 warnings=("db_monitor_validation_failed", *validation.warnings),
                 diagnostics={"validation": validation.to_dict()},
             )
+        if command.diagnostics.get("approval_required") is True:
+            return await self._create_pending_approval(
+                command,
+                request,
+                monitor,
+                validation,
+            )
         committed = await self.runtime.create_monitor(monitor)
         inspection = await self.runtime.inspect_monitor(committed.id)
         operation_id = _inspection_operation_id(inspection)
@@ -573,6 +598,118 @@ class DbMonitorCommandService:
             },
             persist_operation=False,
         )
+
+    async def _create_pending_approval(
+        self,
+        command: DbMonitorCommand,
+        request: DbRequest,
+        monitor: DbMonitor,
+        validation: "DbMonitorValidation",
+    ) -> DbOperationResult:
+        command_payload = _command_payload(command)
+        operation = await self.runtime.kernel.create_operation(
+            operation_type="monitor.create",
+            request={
+                "kind": "monitor.create",
+                "prompt": request.prompt,
+                "command": command_payload,
+                "planned_monitor": monitor.to_dict(),
+            },
+            required_evidence=frozenset({"monitor.definition"}),
+            metadata={
+                "control_plane": "db.monitor",
+                "command_kind": "create",
+                "command_status": "approval_required",
+                "monitor_id": monitor.id,
+                "monitor_name": monitor.name,
+                "monitor": monitor.to_dict(),
+                "validation": validation.to_dict(),
+            },
+            evaluate_governance=False,
+        )
+        approval = ApprovalRequest(
+            approval_id=f"{operation.id}:runtime.approval_required:monitor.create",
+            operation_id=operation.id,
+            reason="Creating a monitor changes runtime monitor configuration.",
+            proposed_action={
+                "operation_type": "monitor.create",
+                "request": operation.request,
+                "monitor": monitor.to_dict(),
+                "approval": "monitor.create",
+            },
+            risk=RiskLevel.MEDIUM,
+            requested_by_policy_id="runtime.approval_required",
+            owner="db.monitor",
+            metadata={
+                "command": command_payload,
+                "validation": validation.to_dict(),
+            },
+        )
+        await self.runtime.store.save_approval_request(approval)
+        await self.runtime.store.append_event(
+            RuntimeEvent(
+                id=f"monitor-command-event-{operation.id}:approval-requested",
+                type=RuntimeEventType.APPROVAL_REQUESTED,
+                operation_id=operation.id,
+                runtime_id=self.runtime.runtime_id,
+                runtime_kind=self.runtime.runtime_kind,
+                approval_id=approval.approval_id,
+                policy_id=approval.requested_by_policy_id,
+                message=f"Approval {approval.approval_id} requested.",
+                payload={"approval": approval.to_dict()},
+            )
+        )
+        result = DbOperationResult(
+            operation_id=operation.id,
+            request=request,
+            intent=DbIntent(
+                kind=DbIntentKind.ADMIN,
+                confidence=command.confidence,
+                access=AccessMode.WRITE,
+                diagnostics={
+                    "command_kind": "create",
+                    **dict(command.diagnostics),
+                },
+            ),
+            contract=DbOperationContract(
+                operation_type="monitor.create",
+                required_evidence=("monitor.definition",),
+                access=AccessMode.WRITE,
+                policy_ids=("runtime.approval_required",),
+                metadata={
+                    "control_plane": "db.monitor",
+                    "approval_required": True,
+                    "command": command_payload,
+                    "planned_monitor": monitor.to_dict(),
+                    "validation": validation.to_dict(),
+                },
+            ),
+            status=OperationStatus.BLOCKED,
+            answer="This operation requires approval before creating the monitor.",
+            evidence=(
+                Evidence(
+                    id=f"monitor-command-evidence-{operation.id}:planned",
+                    kind="monitor.definition",
+                    owner="db.monitor",
+                    operation_id=operation.id,
+                    payload={
+                        "command": command_payload,
+                        "planned_monitor": monitor.to_dict(),
+                        "validation": validation.to_dict(),
+                    },
+                    accepted=False,
+                ),
+            ),
+            warnings=("db_monitor_approval_required", *validation.warnings),
+            diagnostics={
+                "monitor": monitor.to_dict(),
+                "validation": validation.to_dict(),
+                "approval_id": approval.approval_id,
+            },
+        )
+        for item in result.evidence:
+            await self.runtime.store.save_evidence(item)
+        return await self.runtime._record_operation_result(result, operation=operation)
 
     async def _list(
         self,
@@ -934,6 +1071,10 @@ def _has_recurring_or_scheduled_time(lowered: str) -> bool:
     )
 
 
+def _requires_monitor_create_approval(lowered: str) -> bool:
+    return bool(re.search(r"\b(create|add|set\s+up|setup)\b.*\bmonitors?\b", lowered))
+
+
 def _extract_monitor_id(prompt: str) -> str | None:
     lowered = prompt.lower()
     quoted = re.search(r"['\"]([^'\"]+)['\"]", prompt)
@@ -1004,6 +1145,12 @@ def _update_patch(prompt: str) -> dict[str, Any]:
 
 def _create_name_phrase(prompt: str) -> str:
     text = prompt.strip().rstrip(".")
+    create_for = re.match(
+        r"(?i)^(?:please\s+)?(?:create|add|set\s+up|setup)\s+(?:a\s+)?monitor\s+for\s+(.+)$",
+        text,
+    )
+    if create_for:
+        return _before_boundary(create_for.group(1))
     match = re.match(r"(?i)^(?:please\s+)?(?:monitor|watch)\s+(.+)$", text)
     if match:
         return _before_boundary(match.group(1))
@@ -1017,16 +1164,21 @@ def _create_name_phrase(prompt: str) -> str:
 
 def _before_boundary(text: str) -> str:
     return re.split(
-        r"(?i)\b(?:every|if|when|then|and alert|notify|at\s+\d|until)\b",
+        r"(?i)\b(?:every|if|when|then|and alert|notify|notified|i\s+want|at\s+\d|until)\b",
         text,
         maxsplit=1,
     )[0].strip(" ,;:") or text.strip(" ,;:")
 
 
 def _watch_from_prompt(prompt: str) -> str:
-    return _before_boundary(
-        re.sub(r"(?i)^(?:please\s+)?(?:monitor|watch)\s+", "", prompt.strip())
+    text = prompt.strip()
+    text = re.sub(
+        r"(?i)^(?:please\s+)?(?:create|add|set\s+up|setup)\s+(?:a\s+)?monitor\s+for\s+",
+        "",
+        text,
     )
+    text = re.sub(r"(?i)^(?:please\s+)?(?:monitor|watch)\s+", "", text)
+    return _before_boundary(text)
 
 
 def _schedule_from_prompt(prompt: str) -> dict[str, Any] | None:

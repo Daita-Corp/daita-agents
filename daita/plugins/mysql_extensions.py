@@ -39,7 +39,9 @@ def mysql_capabilities() -> tuple[Capability, ...]:
             owner="mysql",
             description="Inspect MySQL schema metadata.",
             domains=frozenset({"db"}),
-            operation_types=frozenset({"schema.query", "source.profile"}),
+            operation_types=frozenset(
+                {"schema.query", "schema.relationship_query", "source.profile"}
+            ),
             access=AccessMode.METADATA_READ,
             risk=RiskLevel.LOW,
             input_schema=common_schema,

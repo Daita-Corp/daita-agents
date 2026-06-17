@@ -56,6 +56,26 @@ def test_schema_search_with_metric_terms_stays_schema_only():
     assert "db.sql.execute_read" in blocked
 
 
+def test_broad_schema_summary_with_neutral_verb_stays_schema_only():
+    runtime = _runtime()
+    request = DbRequest(
+        "Summarize the database schema, then identify one useful business "
+        "question we could answer from the available tables."
+    )
+
+    intent = runtime.classify_request(request)
+    contract = runtime.build_contract(request, intent)
+
+    assert intent.kind is DbIntentKind.SCHEMA_QUERY
+    assert intent.diagnostics["schema_score"] > 0
+    assert intent.diagnostics["data_score"] == 0
+    assert "summarize" in intent.diagnostics["neutral_verbs"]
+    assert intent.diagnostics["data_access_requested"] is False
+    assert contract.access is AccessMode.METADATA_READ
+    assert "db.sql.execute_read" not in contract.required_capabilities
+    assert "query.result" not in contract.required_evidence
+
+
 def test_schema_evidence_only_prompt_forbids_row_query_capabilities():
     runtime = _runtime()
     request = DbRequest(
@@ -70,6 +90,30 @@ def test_schema_evidence_only_prompt_forbids_row_query_capabilities():
     assert contract.access is AccessMode.METADATA_READ
     assert "catalog.schema.search" in contract.required_capabilities
     assert "db.sql.execute_read" not in contract.required_capabilities
+    blocked = {item["id"] for item in contract.metadata["blocked_capabilities"]}
+    assert "db.sql.execute_read" in blocked
+
+
+def test_relationship_question_contract_uses_metadata_only_catalog_capabilities():
+    runtime = _runtime()
+    request = DbRequest("What relationships do I need to join customers to orders?")
+
+    intent = runtime.classify_request(request)
+    contract = runtime.build_contract(request, intent)
+
+    assert intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY
+    assert intent.evidence_mode == "schema_relationships"
+    assert contract.operation_type == "schema.relationship_query"
+    assert contract.access is AccessMode.METADATA_READ
+    assert {
+        "db.schema.inspect",
+        "catalog.schema.search",
+        "catalog.relationship_paths.find",
+    } <= set(contract.required_capabilities)
+    assert "db.sql.validate" not in contract.required_capabilities
+    assert "db.sql.execute_read" not in contract.required_capabilities
+    assert "schema.relationship_path" in contract.required_evidence
+    assert "query.result" not in contract.required_evidence
     blocked = {item["id"] for item in contract.metadata["blocked_capabilities"]}
     assert "db.sql.execute_read" in blocked
 
@@ -117,7 +161,9 @@ def test_schema_assisted_calculation_uses_catalog_assisted_data_contract():
 
 def test_catalog_assisted_data_contract_selects_catalog_and_query_capabilities():
     runtime = _runtime()
-    request = DbRequest("Join orders to customers using their relationship")
+    request = DbRequest(
+        "Join orders to customers using their relationship and return records"
+    )
 
     intent = runtime.classify_request(request)
     contract = runtime.build_contract(request, intent)

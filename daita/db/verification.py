@@ -61,10 +61,13 @@ class DbVerifier:
             DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
         }:
             warnings.extend(_verify_data_query(evidence, tasks, diagnostics))
-        elif intent.kind is DbIntentKind.SCHEMA_QUERY:
+        elif intent.kind in {
+            DbIntentKind.SCHEMA_QUERY,
+            DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
+        }:
             diagnostics["schema_answer_uses_query_result"] = "query.result" in kinds
             if "query.result" in kinds:
-                warnings.append("schema_answer_includes_unneeded_query_result")
+                warnings.append("metadata_operation_includes_query_result")
         elif intent.kind is DbIntentKind.MEMORY_UPDATE:
             warnings.extend(_verify_memory_update(evidence))
 
