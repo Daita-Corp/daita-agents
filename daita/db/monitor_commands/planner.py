@@ -10,6 +10,10 @@ from typing import Any
 
 from daita.plugins import ExtensionRegistry
 
+from ..monitor_plugin_planning import (
+    MonitorPluginPlanner,
+    MonitorPluginPlanningBlocked,
+)
 from ..monitors import DbMonitor
 from ..query_metadata import column_name, is_numeric_type, matching_tables
 from .prompt_parsing import (
@@ -26,6 +30,26 @@ from .prompt_parsing import (
     _watch_from_prompt,
 )
 from .types import DbMonitorCommand, DbMonitorValidation
+
+_MONITOR_DELIVERY_TEMPLATE = "New rows were observed for the monitored table."
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_SLACK_CHANNEL_RE = re.compile(r"#[A-Za-z0-9_-]+")
+_URL_RE = re.compile(r"https?://[^\s,;.]+")
+_HOSTED_IN_APP_DELIVERY_RE = re.compile(
+    r"\b(?:"
+    r"notify\s+me\s+in\s+(?:the\s+)?app|"
+    r"notify\s+me\s+via\s+(?:the\s+)?app|"
+    r"notify\s+me\s+inside\s+(?:the\s+)?app|"
+    r"notified\s+in\s+(?:the\s+)?app|"
+    r"notified\s+via\s+(?:the\s+)?app|"
+    r"alert\s+me\s+in\s+(?:the\s+)?app|"
+    r"alert\s+me\s+via\s+(?:the\s+)?app|"
+    r"send\s+me\s+(?:an?\s+)?app\s+notification|"
+    r"in[-\s]?app\s+notification|"
+    r"app\s+notification"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 class DbMonitorPlanner:
@@ -89,7 +113,11 @@ class DbMonitorPlanner:
             budgets=budgets,
             schema=schema,
         )
-        action_plan = _notification_action_plan(prompt, actions=actions)
+        action_plan = _notification_action_plan(
+            prompt,
+            actions=actions,
+            action_steps=action_steps,
+        )
         validation = self.validate(
             action_steps=action_steps,
             actions=actions,
@@ -194,6 +222,50 @@ class DbMonitorPlanner:
             trigger=trigger or {},
             action_plan=action_plan or {},
         )
+        delivery_errors: list[str] = []
+        delivery_diagnostics: dict[str, Any] = {}
+        if (action_plan or {}).get("kind") == "notification" and not any(
+            error.startswith("monitor.proposal_incomplete:delivery")
+            for error in plan_errors
+        ):
+            delivery_intent = (action_plan or {}).get("delivery_intent")
+            if isinstance(delivery_intent, dict):
+                try:
+                    capability = MonitorPluginPlanner(
+                        tuple(self.registry.capabilities)
+                        if self.registry is not None
+                        else ()
+                    ).select_delivery_capability(delivery_intent)
+                except MonitorPluginPlanningBlocked as exc:
+                    missing_label = _delivery_missing_capability_label(
+                        exc,
+                        delivery_intent,
+                    )
+                    if missing_label is not None:
+                        required.append(missing_label)
+                    if (
+                        exc.reason == "missing_capability"
+                        and missing_label is not None
+                        and missing_label not in capability_ids
+                    ):
+                        unsupported.append(
+                            f"delivery:{delivery_intent.get('delivery_kind')}"
+                        )
+                    delivery_errors.append(f"monitor.delivery_unsupported:{exc.reason}")
+                    delivery_diagnostics = {
+                        "accepted": False,
+                        "reason": exc.reason,
+                        "details": dict(exc.details or {}),
+                        "delivery_intent": dict(delivery_intent),
+                    }
+                else:
+                    required.append(capability.id)
+                    delivery_diagnostics = {
+                        "accepted": True,
+                        "capability_id": capability.id,
+                        "capability_owner": capability.owner,
+                        "delivery_kind": delivery_intent.get("delivery_kind"),
+                    }
         missing = tuple(
             capability_id
             for capability_id in dict.fromkeys(required)
@@ -203,6 +275,7 @@ class DbMonitorPlanner:
             (
                 *(f"missing_capability:{capability_id}" for capability_id in missing),
                 *plan_errors,
+                *delivery_errors,
             )
         )
         warnings = tuple((*budget_warnings, *policy_warnings))
@@ -221,6 +294,7 @@ class DbMonitorPlanner:
                     "execution": "deferred_to_runtime_capabilities",
                 },
                 "runtime_limits": dict(self.limits),
+                "delivery_validation": delivery_diagnostics,
             },
         )
 
@@ -413,34 +487,89 @@ def _notification_action_plan(
     prompt: str,
     *,
     actions: tuple[str, ...],
+    action_steps: tuple[dict[str, Any], ...],
 ) -> dict[str, Any]:
-    lowered = prompt.lower()
-    wants_notification = bool(
-        actions
-        or re.search(r"\b(notify|notified|alert|tell me|let me know)\b", lowered)
+    delivery_intent = _delivery_intent_from_prompt(
+        prompt,
+        actions=actions,
+        action_steps=action_steps,
     )
-    if not wants_notification:
+    if delivery_intent is None:
         return {"kind": "none", "steps": []}
-    delivery_kind = "local"
-    target: dict[str, Any] = {"type": "runtime_console"}
-    if "email" in lowered or re.search(r"\S+@\S+", prompt):
-        delivery_kind = "email"
-        target = {"type": "email"}
-    elif "slack" in lowered or re.search(r"#[A-Za-z0-9_-]+", prompt):
-        delivery_kind = "slack"
-        target = {"type": "slack"}
-    elif "webhook" in lowered:
-        delivery_kind = "webhook"
-        target = {"type": "webhook"}
     return {
         "kind": "notification",
-        "delivery_intent": {
-            "delivery_kind": delivery_kind,
-            "target": target,
-            "template": "New rows were observed for the monitored table.",
-            "include_observed_rows": True,
-        },
+        "delivery_intent": delivery_intent,
     }
+
+
+def _delivery_intent_from_prompt(
+    prompt: str,
+    *,
+    actions: tuple[str, ...],
+    action_steps: tuple[dict[str, Any], ...],
+) -> dict[str, Any] | None:
+    lowered = prompt.lower()
+    hints = {
+        str(step.get("delivery_hint") or "")
+        for step in action_steps
+        if step.get("kind") == "notify"
+    }
+    wants_notification = bool(
+        hints
+        or actions
+        or re.search(
+            r"\b(notify|notified|alert|tell me|let me know|email me|"
+            r"send me an email)\b",
+            lowered,
+        )
+    )
+    if not wants_notification:
+        return None
+    delivery_kind = "local"
+    target: dict[str, Any] = {"type": "runtime_console"}
+    if "in_app" in hints or _HOSTED_IN_APP_DELIVERY_RE.search(prompt):
+        delivery_kind = "in_app"
+        target = {"type": "requesting_user"}
+    elif "email" in hints or "email" in lowered or _EMAIL_RE.search(prompt):
+        delivery_kind = "email"
+        target = {"type": "email"}
+        email = _EMAIL_RE.search(prompt)
+        if email:
+            target["recipient"] = email.group(0)
+    elif "slack" in hints or "slack" in lowered or _SLACK_CHANNEL_RE.search(prompt):
+        delivery_kind = "slack"
+        target = {"type": "slack"}
+        channel = _SLACK_CHANNEL_RE.search(prompt)
+        if channel:
+            target["channel"] = channel.group(0)
+    elif "webhook" in hints or "webhook" in lowered or "callback" in lowered:
+        delivery_kind = "webhook"
+        target = {"type": "webhook"}
+        url = _URL_RE.search(prompt)
+        if url:
+            target["url"] = url.group(0)
+    return {
+        "delivery_kind": delivery_kind,
+        "target": target,
+        "payload_source": {"type": "monitor.report"},
+        "template": _MONITOR_DELIVERY_TEMPLATE,
+        "include_observed_rows": True,
+    }
+
+
+def _delivery_missing_capability_label(
+    exc: MonitorPluginPlanningBlocked,
+    delivery_intent: dict[str, Any],
+) -> str | None:
+    details = dict(exc.details or {})
+    capability_id = details.get("capability_id")
+    if isinstance(capability_id, str) and capability_id:
+        return capability_id
+    delivery_kind = str(delivery_intent.get("delivery_kind") or "")
+    if exc.reason == "missing_capability":
+        if delivery_kind in {"in_app", "local"}:
+            return f"monitor.delivery.{delivery_kind}"
+    return None
 
 
 def _proposal_validation_errors(

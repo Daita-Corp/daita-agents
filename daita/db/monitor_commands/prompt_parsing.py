@@ -10,6 +10,21 @@ _CRON_RE = re.compile(r"(?P<cron>(?:\S+\s+){4}\S+(?:\s+[A-Za-z_/-]+)?)")
 _EVERY_MINUTES_RE = re.compile(r"\bevery\s+(\d{1,3})\s+minutes?\b")
 _EVERY_HOURS_RE = re.compile(r"\bevery\s+(\d{1,2})\s+hours?\b")
 _TIME_RE = re.compile(r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b")
+_HOSTED_IN_APP_NOTIFICATION_RE = re.compile(
+    r"\b(?:"
+    r"notify\s+me\s+in\s+(?:the\s+)?app|"
+    r"notify\s+me\s+via\s+(?:the\s+)?app|"
+    r"notify\s+me\s+inside\s+(?:the\s+)?app|"
+    r"notified\s+in\s+(?:the\s+)?app|"
+    r"notified\s+via\s+(?:the\s+)?app|"
+    r"alert\s+me\s+in\s+(?:the\s+)?app|"
+    r"alert\s+me\s+via\s+(?:the\s+)?app|"
+    r"send\s+me\s+(?:an?\s+)?app\s+notification|"
+    r"in[-\s]?app\s+notification|"
+    r"app\s+notification"
+    r")\b",
+    re.IGNORECASE,
+)
 _WEEKDAY_INDEX = {
     "monday": 1,
     "tuesday": 2,
@@ -262,6 +277,10 @@ def _actions_from_prompt(prompt: str) -> tuple[str, ...]:
         notify = re.search(r"(?i)\bnotify\s+([^.;]+)", prompt)
         if notify:
             action_text = f"notify {notify.group(1)}"
+    if not action_text:
+        alert = re.search(r"(?i)\balert\s+([^.;]+)", prompt)
+        if alert:
+            action_text = f"alert {alert.group(1)}"
     if not action_text and "report" in prompt.lower():
         action_text = "generate the requested report"
     if not action_text:
@@ -270,24 +289,53 @@ def _actions_from_prompt(prompt: str) -> tuple[str, ...]:
     return tuple(part.strip(" .") for part in parts if part.strip(" ."))
 
 
+def _hosted_in_app_notification_requested(prompt: str) -> bool:
+    return bool(_HOSTED_IN_APP_NOTIFICATION_RE.search(prompt))
+
+
 def _action_steps_from_prompt(prompt: str) -> tuple[dict[str, Any], ...]:
     steps: list[dict[str, Any]] = []
     for action in _actions_from_prompt(prompt):
         lowered = action.lower()
-        if lowered.startswith("notify "):
-            target = action[len("notify ") :].strip()
+        if (
+            lowered.startswith("notify ")
+            or lowered.startswith("alert ")
+            or _hosted_in_app_notification_requested(action)
+        ):
+            if lowered.startswith("notify "):
+                target = action[len("notify ") :].strip()
+            elif lowered.startswith("alert "):
+                target = action[len("alert ") :].strip()
+            else:
+                target = "requesting_user"
             step: dict[str, Any] = {
                 "kind": "notify",
-                "target": target,
+                "target_hint": target,
                 "instruction": action,
             }
-            if target.startswith("#") or "slack" in lowered or "channel" in lowered:
-                step["required_capability"] = "slack.message.send"
+            if _hosted_in_app_notification_requested(action):
+                step["delivery_hint"] = "in_app"
+            elif target.startswith("#") or "slack" in lowered or "channel" in lowered:
+                step["delivery_hint"] = "slack"
             elif "email" in lowered or "@" in target:
-                step["required_capability"] = "email.message.send"
+                step["delivery_hint"] = "email"
+            elif "webhook" in lowered:
+                step["delivery_hint"] = "webhook"
             else:
-                step["required_capability"] = "notification.send"
+                step["delivery_hint"] = "local"
+            if action:
+                step["matched_text"] = action
             steps.append(step)
+        elif _hosted_in_app_notification_requested(action):
+            steps.append(
+                {
+                    "kind": "notify",
+                    "target_hint": "me in app",
+                    "delivery_hint": "in_app",
+                    "instruction": action,
+                    "matched_text": action,
+                }
+            )
         elif "report" in lowered:
             steps.append({"kind": "report_generate", "instruction": action})
         elif "approval" in lowered or "approve" in lowered:
@@ -300,6 +348,18 @@ def _action_steps_from_prompt(prompt: str) -> tuple[dict[str, Any], ...]:
             )
         else:
             steps.append({"kind": "instruction", "instruction": action})
+    if _hosted_in_app_notification_requested(prompt) and not any(
+        step.get("delivery_hint") == "in_app" for step in steps
+    ):
+        steps.append(
+            {
+                "kind": "notify",
+                "target_hint": "me in app",
+                "delivery_hint": "in_app",
+                "instruction": "Notify me in app",
+                "matched_text": "in-app notification",
+            }
+        )
     return tuple(steps)
 
 
@@ -324,7 +384,8 @@ def _policy_from_prompt(prompt: str) -> dict[str, Any]:
 def _target_resource_from_prompt(prompt: str) -> str:
     lowered = prompt.lower()
     for pattern in (
-        r"\bfor\s+(?:the\s+)?([a-z][a-z0-9_]*)\s+table\b",
+        r"\b(?:for|on|against)\s+(?:the\s+)?([a-z][a-z0-9_]*)\s+table\b",
+        r"\b(?:monitor|watch)\s+(?:the\s+)?([a-z][a-z0-9_]*)\s+table\b",
         r"\btable\s+([a-z][a-z0-9_]*)\b",
         r"\bfrom\s+(?:the\s+)?([a-z][a-z0-9_]*)\b",
     ):

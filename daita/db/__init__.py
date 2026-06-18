@@ -103,6 +103,7 @@ from .query_sql_validation import (
     validate_sql_against_schema,
 )
 from .runtime import DbRuntime
+from .runtime.extensions import HostedInAppMonitorDeliveryPlugin
 from .synthesis import (
     DbAnswerCitation,
     DbAnswerSynthesisPayload,
@@ -140,6 +141,7 @@ __all__ = [
     "DbOperationResult",
     "DbRequest",
     "DbRuntime",
+    "HostedInAppMonitorDeliveryPlugin",
     "DbRuntimeConfig",
     "DbRuntimeInspection",
     "DbCommandRouter",

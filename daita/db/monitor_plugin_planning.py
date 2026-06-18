@@ -158,6 +158,7 @@ class MonitorPluginPlanner:
             role="delivery",
             kind=intent.delivery_kind,
             target=intent.target,
+            payload_kind=_payload_kind_from_delivery_intent(intent),
             expected_evidence=(),
             input_payload=None,
         )
@@ -216,6 +217,24 @@ class MonitorPluginPlanner:
             source_evidence_refs=source_evidence_refs,
         )
 
+    def select_delivery_capability(
+        self,
+        delivery_intent: Mapping[str, Any],
+    ) -> Capability:
+        """Select and validate the monitor delivery capability for an intent."""
+        intent = _delivery_intent_from_mapping(delivery_intent)
+        capability = self._select_capability(
+            intent.raw,
+            role="delivery",
+            kind=intent.delivery_kind,
+            target=intent.target,
+            payload_kind=_payload_kind_from_delivery_intent(intent),
+            expected_evidence=(),
+            input_payload=None,
+        )
+        _validate_delivery_format(intent, capability)
+        return capability
+
     def _select_capability(
         self,
         intent: Mapping[str, Any],
@@ -223,6 +242,7 @@ class MonitorPluginPlanner:
         role: str,
         kind: str,
         target: Mapping[str, Any],
+        payload_kind: str | None = None,
         expected_evidence: tuple[str, ...],
         input_payload: Mapping[str, Any] | None,
     ) -> Capability:
@@ -265,6 +285,11 @@ class MonitorPluginPlanner:
                 )
             if input_payload is not None:
                 _validate_capability_input_schema(capability, input_payload)
+            _validate_delivery_payload_kind(
+                capability,
+                payload_kind=payload_kind,
+                role=role,
+            )
             return capability
 
         candidates = [
@@ -277,6 +302,28 @@ class MonitorPluginPlanner:
                 expected_evidence=expected_evidence,
             )
         ]
+        payload_supported_candidates = candidates
+        if role == "delivery" and payload_kind:
+            payload_supported_candidates = [
+                capability
+                for capability in candidates
+                if _capability_accepts_delivery_payload_kind(
+                    capability,
+                    payload_kind=payload_kind,
+                )
+            ]
+            if candidates and not payload_supported_candidates:
+                raise MonitorPluginPlanningBlocked(
+                    "unsupported_payload_kind",
+                    {
+                        "payload_kind": payload_kind,
+                        "matches": [
+                            {"id": capability.id, "owner": capability.owner}
+                            for capability in candidates
+                        ],
+                    },
+                )
+        candidates = payload_supported_candidates
         if input_payload is not None:
             candidates = [
                 capability
@@ -397,6 +444,17 @@ def _delivery_intent(
     *,
     report: Evidence,
 ) -> MonitorDeliveryIntent:
+    return _delivery_intent_from_mapping(
+        delivery_intent,
+        fallback_subject=str(report.payload.get("title") or ""),
+    )
+
+
+def _delivery_intent_from_mapping(
+    delivery_intent: Mapping[str, Any],
+    *,
+    fallback_subject: str = "",
+) -> MonitorDeliveryIntent:
     raw = dict(delivery_intent)
     target = raw.get("target")
     normalized = (
@@ -425,9 +483,16 @@ def _delivery_intent(
         subject=(
             str(raw.get("subject") or raw.get("title"))
             if raw.get("subject") or raw.get("title")
-            else str(report.payload.get("title") or "")
+            else fallback_subject
         ),
     )
+
+
+def _payload_kind_from_delivery_intent(intent: MonitorDeliveryIntent) -> str:
+    payload_source = intent.raw.get("payload_source")
+    if isinstance(payload_source, Mapping):
+        return str(payload_source.get("type") or payload_source.get("kind") or "")
+    return ""
 
 
 def _capability_supports_monitor_role(
@@ -484,6 +549,49 @@ def _capability_supports_monitor_role(
         ):
             return False
     return True
+
+
+def _validate_delivery_payload_kind(
+    capability: Capability,
+    *,
+    payload_kind: str | None,
+    role: str,
+) -> None:
+    if role != "delivery" or not payload_kind:
+        return
+    if not _capability_accepts_delivery_payload_kind(
+        capability,
+        payload_kind=payload_kind,
+    ):
+        raise MonitorPluginPlanningBlocked(
+            "unsupported_payload_kind",
+            {
+                "payload_kind": payload_kind,
+                "capability_id": capability.id,
+                "owner": capability.owner,
+                "accepted_payload_kinds": sorted(
+                    _accepted_delivery_payload_kinds(capability)
+                ),
+            },
+        )
+
+
+def _capability_accepts_delivery_payload_kind(
+    capability: Capability,
+    *,
+    payload_kind: str,
+) -> bool:
+    accepted = _accepted_delivery_payload_kinds(capability)
+    return not accepted or payload_kind in accepted
+
+
+def _accepted_delivery_payload_kinds(capability: Capability) -> set[str]:
+    return {
+        str(item)
+        for item in capability.metadata.get("accepted_payload_kinds")
+        or capability.metadata.get("accepted_evidence_kinds")
+        or ()
+    }
 
 
 def _capability_accepts_target_shape(

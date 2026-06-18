@@ -6,6 +6,7 @@ from daita.db import DbAgent, DbMonitor, DbRuntime
 from daita.db.monitor_commands import DbMonitorCommand, DbMonitorPlanner
 from daita.db.models import DbIntent, DbIntentKind, DbOperationContract
 from daita.db.models import DbOperationResult, DbRequest
+from daita.db.runtime.extensions import HostedInAppMonitorDeliveryPlugin
 from daita.runtime import (
     AccessMode,
     ApprovalRequest,
@@ -97,6 +98,163 @@ class SchemaInspectProbePlugin(RuntimeExtensionPlugin):
         )
 
 
+class HostedInAppDeliveryProbeExecutor:
+    id = "hosted_in_app_delivery_probe.deliver"
+    capability_ids = frozenset({"monitor.delivery.in_app"})
+
+    async def execute(self, task: Task, operation: Operation, context):
+        return [
+            Evidence(
+                kind="hosted.in_app.notification",
+                owner="hosted_in_app_delivery_probe",
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={"delivered": True},
+            )
+        ]
+
+
+class HostedInAppDeliveryProbePlugin(RuntimeExtensionPlugin):
+    manifest = PluginManifest(
+        id="hosted_in_app_delivery_probe",
+        display_name="Hosted In-App Delivery Probe",
+        version="1.0.0",
+        kind=PluginKind.RUNTIME_EXTENSION,
+        domains=frozenset({"monitor"}),
+    )
+
+    def __init__(self):
+        self.executor = HostedInAppDeliveryProbeExecutor()
+
+    def declare_capabilities(self):
+        return (
+            Capability(
+                id="monitor.delivery.in_app",
+                owner="hosted_in_app_delivery_probe",
+                description="Deliver hosted monitor notifications to the requesting user.",
+                domains=frozenset({"monitor", "notification"}),
+                operation_types=frozenset({"monitor.delivery"}),
+                access=AccessMode.NONE,
+                risk=RiskLevel.LOW,
+                input_schema={
+                    "type": "object",
+                    "required": ["delivery_kind", "target", "payload_source"],
+                    "properties": {
+                        "delivery_kind": {"type": "string"},
+                        "target": {"type": "object"},
+                        "payload_source": {"type": "object"},
+                        "format": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "idempotency_key": {"type": "string"},
+                    },
+                },
+                output_evidence=frozenset({"hosted.in_app.notification"}),
+                executor="hosted_in_app_delivery_probe.deliver",
+                runtime_only=True,
+                side_effecting=True,
+                replay_safe=True,
+                idempotent=True,
+                metadata={
+                    "monitor_roles": ["delivery"],
+                    "delivery_kind": "in_app",
+                    "accepted_payload_kinds": ["monitor.report"],
+                    "accepted_formats": ["markdown", "plain", "text"],
+                    "accepted_target_types": ["requesting_user"],
+                    "supports_idempotency_key": True,
+                },
+            ),
+        )
+
+    def get_executors(self):
+        return (self.executor,)
+
+
+class MonitorDeliveryProbeExecutor:
+    def __init__(self, *, plugin_id, capability_id, evidence_kind):
+        self.id = f"{plugin_id}.deliver"
+        self.capability_ids = frozenset({capability_id})
+        self.evidence_kind = evidence_kind
+        self.plugin_id = plugin_id
+
+    async def execute(self, task: Task, operation: Operation, context):
+        return [
+            Evidence(
+                kind=self.evidence_kind,
+                owner=self.plugin_id,
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={"delivered": True},
+            )
+        ]
+
+
+class MonitorDeliveryProbePlugin(RuntimeExtensionPlugin):
+    def __init__(
+        self,
+        *,
+        plugin_id,
+        capability_id,
+        delivery_kind,
+        target_type,
+        evidence_kind,
+        accepted_payload_kinds=("monitor.report",),
+    ):
+        self.manifest = PluginManifest(
+            id=plugin_id,
+            display_name=plugin_id,
+            version="1.0.0",
+            kind=PluginKind.RUNTIME_EXTENSION,
+            domains=frozenset({"monitor", delivery_kind}),
+        )
+        self.capability_id = capability_id
+        self.delivery_kind = delivery_kind
+        self.target_type = target_type
+        self.evidence_kind = evidence_kind
+        self.accepted_payload_kinds = tuple(accepted_payload_kinds)
+        self.executor = MonitorDeliveryProbeExecutor(
+            plugin_id=plugin_id,
+            capability_id=capability_id,
+            evidence_kind=evidence_kind,
+        )
+
+    def declare_capabilities(self):
+        return (
+            Capability(
+                id=self.capability_id,
+                owner=self.manifest.id,
+                description=f"Deliver monitor notifications through {self.delivery_kind}.",
+                domains=frozenset({"monitor", self.delivery_kind}),
+                operation_types=frozenset({"monitor.delivery"}),
+                access=AccessMode.NONE,
+                risk=RiskLevel.LOW,
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "delivery_kind": {"type": "string"},
+                        "target": {"type": "object"},
+                        "payload_source": {"type": "object"},
+                    },
+                },
+                output_evidence=frozenset({self.evidence_kind}),
+                executor=self.executor.id,
+                runtime_only=True,
+                side_effecting=True,
+                replay_safe=True,
+                idempotent=True,
+                metadata={
+                    "monitor_roles": ["delivery"],
+                    "delivery_kind": self.delivery_kind,
+                    "accepted_payload_kinds": list(self.accepted_payload_kinds),
+                    "accepted_formats": ["markdown", "plain", "text"],
+                    "accepted_target_types": [self.target_type],
+                },
+            ),
+        )
+
+    def get_executors(self):
+        return (self.executor,)
+
+
 def _schema_probe(*table_names):
     tables = []
     for table_name in table_names:
@@ -118,6 +276,29 @@ def _schema_probe(*table_names):
             }
         )
     return SchemaInspectProbePlugin(tables)
+
+
+def _schema_metadata(*table_names):
+    return {
+        "tables": [
+            {
+                "name": table_name,
+                "columns": [
+                    {
+                        "name": "id",
+                        "data_type": "uuid",
+                        "is_primary_key": True,
+                    },
+                    {
+                        "name": "created_at",
+                        "data_type": "timestamp",
+                        "is_primary_key": False,
+                    },
+                ],
+            }
+            for table_name in table_names
+        ],
+    }
 
 
 async def _create_helper_monitor(agent: DbAgent) -> None:
@@ -370,7 +551,9 @@ async def test_prompt_monitor_create_blocks_unsupported_action_and_audits_valida
 
     assert result.status is OperationStatus.BLOCKED
     assert result.warnings == ("db_monitor_validation_failed",)
-    assert "slack.message.send" in result.answer
+    assert result.answer == (
+        "Monitor was not created because its definition did not pass validation."
+    )
     assert await agent.list_monitors() == ()
 
     operations = await runtime.store.list_operations()
@@ -379,12 +562,389 @@ async def test_prompt_monitor_create_blocks_unsupported_action_and_audits_valida
     events = await runtime.store.list_events(operations[0].id)
     assert evidence[0].kind == "monitor.proposal"
     assert evidence[0].accepted is False
-    assert evidence[0].payload["validation"]["missing_capabilities"] == [
-        "slack.message.send"
-    ]
+    validation = evidence[0].payload["validation"]
+    assert validation["missing_capabilities"] == []
+    assert "monitor.delivery_unsupported:missing_capability" in validation["errors"]
+    assert validation["diagnostics"]["delivery_validation"]["details"] == {
+        "role": "delivery",
+        "kind": "slack",
+    }
     assert any(event.payload.get("status") == "blocked" for event in events)
     tasks = await runtime.store.list_tasks()
     assert [task.capability_id for task in tasks] == ["db.monitor.plan_create"]
+
+
+def test_monitor_prompt_notify_me_in_app_plans_hosted_delivery_intent():
+    runtime = DbRuntime(
+        runtime_id="db-monitor-in-app-planning-runtime",
+        plugins=(HostedInAppDeliveryProbePlugin(),),
+    )
+    planner = DbMonitorPlanner(registry=runtime.registry)
+
+    proposal, validation = planner.create_proposal(
+        DbMonitorCommand(
+            kind="create",
+            prompt=(
+                "Monitor operations table every 5 minutes when new rows are added. "
+                "Notify me in app."
+            ),
+        ),
+        schema=_schema_metadata("operations"),
+    )
+
+    delivery_intent = proposal["action_plan"]["delivery_intent"]
+    assert delivery_intent == {
+        "delivery_kind": "in_app",
+        "target": {"type": "requesting_user"},
+        "payload_source": {"type": "monitor.report"},
+        "template": "New rows were observed for the monitored table.",
+        "include_observed_rows": True,
+    }
+    assert validation.accepted is True
+
+
+@pytest.mark.parametrize(
+    "delivery_phrase",
+    [
+        "Notify me in app",
+        "Notify me in the app",
+        "Alert me in app",
+        "in-app notification",
+        "app notification",
+        "send me an app notification",
+        "notify me via the app",
+    ],
+)
+def test_monitor_prompt_in_app_phrase_variants_plan_hosted_delivery_intent(
+    delivery_phrase,
+):
+    runtime = DbRuntime(
+        runtime_id="db-monitor-in-app-phrase-runtime",
+        plugins=(HostedInAppDeliveryProbePlugin(),),
+    )
+    planner = DbMonitorPlanner(registry=runtime.registry)
+
+    proposal, validation = planner.create_proposal(
+        DbMonitorCommand(
+            kind="create",
+            prompt=(
+                "Monitor operations table every 5 minutes when new rows are added. "
+                f"{delivery_phrase}."
+            ),
+        ),
+        schema=_schema_metadata("operations"),
+    )
+
+    assert proposal["action_plan"]["delivery_intent"]["delivery_kind"] == "in_app"
+    assert validation.required_capabilities == ("monitor.delivery.in_app",)
+    assert validation.accepted is True
+
+
+def test_monitor_prompt_notify_me_in_app_requires_hosted_delivery_capability():
+    runtime = DbRuntime(runtime_id="db-monitor-in-app-validation-runtime")
+    planner = DbMonitorPlanner(registry=runtime.registry)
+
+    _proposal, validation = planner.create_proposal(
+        DbMonitorCommand(
+            kind="create",
+            prompt=(
+                "Monitor operations table every 5 minutes when new rows are added. "
+                "Notify me in app."
+            ),
+        ),
+        schema=_schema_metadata("operations"),
+    )
+
+    assert "monitor.delivery.in_app" in validation.required_capabilities
+    assert "notification.send" not in validation.required_capabilities
+    assert validation.missing_capabilities == ("monitor.delivery.in_app",)
+
+
+def test_monitor_prompt_notify_me_in_app_accepts_hosted_delivery_plugin():
+    runtime = DbRuntime(
+        runtime_id="db-monitor-hosted-in-app-plugin-runtime",
+        plugins=(
+            HostedInAppMonitorDeliveryPlugin(service=lambda payload: {"id": "n-1"}),
+        ),
+    )
+    planner = DbMonitorPlanner(registry=runtime.registry)
+
+    _proposal, validation = planner.create_proposal(
+        DbMonitorCommand(
+            kind="create",
+            prompt=(
+                "Monitor operations table every 5 minutes when new rows are added. "
+                "Notify me in app."
+            ),
+        ),
+        schema=_schema_metadata("operations"),
+    )
+
+    assert validation.accepted is True
+    assert validation.required_capabilities == ("monitor.delivery.in_app",)
+
+
+def test_monitor_prompt_generic_notify_validates_through_local_delivery():
+    runtime = DbRuntime(runtime_id="db-monitor-generic-notify-runtime")
+    planner = DbMonitorPlanner(registry=runtime.registry)
+
+    proposal, validation = planner.create_proposal(
+        DbMonitorCommand(
+            kind="create",
+            prompt=(
+                "Monitor operations table every 5 minutes when new rows are added. "
+                "Notify me."
+            ),
+        ),
+        schema=_schema_metadata("operations"),
+    )
+
+    assert proposal["action_plan"]["delivery_intent"] == {
+        "delivery_kind": "local",
+        "target": {"type": "runtime_console"},
+        "payload_source": {"type": "monitor.report"},
+        "template": "New rows were observed for the monitored table.",
+        "include_observed_rows": True,
+    }
+    assert validation.required_capabilities == ("monitor.delivery.local",)
+    assert validation.accepted is True
+
+
+@pytest.mark.parametrize(
+    (
+        "prompt",
+        "expected_delivery_kind",
+        "expected_capability",
+        "plugin_id",
+        "target_type",
+        "evidence_kind",
+    ),
+    [
+        (
+            "Monitor operations table every 5 minutes then notify ops@example.com.",
+            "email",
+            "email.message.send",
+            "email_delivery_probe",
+            "email",
+            "email.operation.result",
+        ),
+        (
+            "Monitor operations table every 5 minutes then notify #ops in Slack.",
+            "slack",
+            "slack.message.send",
+            "slack_delivery_probe",
+            "slack",
+            "slack.operation.result",
+        ),
+        (
+            "Monitor operations table every 5 minutes then notify webhook.",
+            "webhook",
+            "webhook.post",
+            "webhook_delivery_probe",
+            "webhook",
+            "webhook.operation.result",
+        ),
+    ],
+)
+def test_monitor_prompt_delivery_capabilities_are_selected_from_registry(
+    prompt,
+    expected_delivery_kind,
+    expected_capability,
+    plugin_id,
+    target_type,
+    evidence_kind,
+):
+    runtime = DbRuntime(
+        runtime_id=f"db-monitor-{expected_delivery_kind}-planning",
+        plugins=(
+            MonitorDeliveryProbePlugin(
+                plugin_id=plugin_id,
+                capability_id=expected_capability,
+                delivery_kind=expected_delivery_kind,
+                target_type=target_type,
+                evidence_kind=evidence_kind,
+            ),
+        ),
+    )
+    planner = DbMonitorPlanner(registry=runtime.registry)
+
+    proposal, validation = planner.create_proposal(
+        DbMonitorCommand(kind="create", prompt=prompt),
+        schema=_schema_metadata("operations"),
+    )
+
+    assert (
+        proposal["action_plan"]["delivery_intent"]["delivery_kind"]
+        == expected_delivery_kind
+    )
+    assert expected_capability in validation.required_capabilities
+    assert validation.accepted is True
+
+
+def test_monitor_delivery_validation_reports_unsupported_target_type():
+    runtime = DbRuntime(runtime_id="db-monitor-unsupported-target-runtime")
+    planner = DbMonitorPlanner(registry=runtime.registry)
+
+    validation = planner.validate(
+        action_steps=(),
+        actions=("notify pagerduty",),
+        source_scope=("operations",),
+        policy={},
+        budgets={},
+        observation_plan={
+            "kind": "planned_read",
+            "target_type": "table",
+            "target_name": "operations",
+            "sql": "select * from operations where created_at > ?",
+            "cursor": {"field": "created_at"},
+            "cursor_update": {"last_created_at": "max(rows.created_at)"},
+            "value_path": "rows",
+        },
+        schedule={"expression": "*/5 * * * *"},
+        trigger={"operator": "count_gt", "value": 0},
+        action_plan={
+            "kind": "notification",
+            "delivery_intent": {
+                "delivery_kind": "local",
+                "target": {"type": "pagerduty"},
+                "payload_source": {"type": "monitor.report"},
+            },
+        },
+    )
+
+    assert validation.accepted is False
+    assert (
+        "monitor.delivery_unsupported:unsupported_delivery_target" in validation.errors
+    )
+    assert validation.required_capabilities == ("monitor.delivery.local",)
+    assert validation.missing_capabilities == ()
+    assert (
+        validation.diagnostics["delivery_validation"]["reason"]
+        == "unsupported_delivery_target"
+    )
+
+
+def test_monitor_delivery_validation_reports_ambiguous_capability():
+    runtime = DbRuntime(
+        runtime_id="db-monitor-ambiguous-email-runtime",
+        plugins=(
+            MonitorDeliveryProbePlugin(
+                plugin_id="email_delivery_probe_a",
+                capability_id="email.message.send",
+                delivery_kind="email",
+                target_type="email",
+                evidence_kind="email.operation.result",
+            ),
+            MonitorDeliveryProbePlugin(
+                plugin_id="email_delivery_probe_b",
+                capability_id="email.message.send_alt",
+                delivery_kind="email",
+                target_type="email",
+                evidence_kind="email.operation.result",
+            ),
+        ),
+    )
+    planner = DbMonitorPlanner(registry=runtime.registry)
+
+    _proposal, validation = planner.create_proposal(
+        DbMonitorCommand(
+            kind="create",
+            prompt=(
+                "Monitor operations table every 5 minutes when new rows are added. "
+                "Email me."
+            ),
+        ),
+        schema=_schema_metadata("operations"),
+    )
+
+    assert validation.accepted is False
+    assert "monitor.delivery_unsupported:ambiguous_capability" in validation.errors
+    assert (
+        validation.diagnostics["delivery_validation"]["reason"]
+        == "ambiguous_capability"
+    )
+
+
+def test_monitor_delivery_validation_rejects_wrong_payload_kind():
+    runtime = DbRuntime(
+        runtime_id="db-monitor-payload-kind-runtime",
+        plugins=(
+            MonitorDeliveryProbePlugin(
+                plugin_id="email_delivery_probe",
+                capability_id="email.message.send",
+                delivery_kind="email",
+                target_type="email",
+                evidence_kind="email.operation.result",
+                accepted_payload_kinds=("analysis.synthesis",),
+            ),
+        ),
+    )
+    planner = DbMonitorPlanner(registry=runtime.registry)
+
+    _proposal, validation = planner.create_proposal(
+        DbMonitorCommand(
+            kind="create",
+            prompt=(
+                "Monitor operations table every 5 minutes when new rows are added. "
+                "Email me."
+            ),
+        ),
+        schema=_schema_metadata("operations"),
+    )
+
+    assert validation.accepted is False
+    assert "monitor.delivery_unsupported:unsupported_payload_kind" in validation.errors
+    assert validation.required_capabilities == ()
+    delivery_validation = validation.diagnostics["delivery_validation"]
+    assert delivery_validation["reason"] == "unsupported_payload_kind"
+    assert delivery_validation["details"]["payload_kind"] == "monitor.report"
+
+
+async def test_hosted_in_app_delivery_plugin_executes_registered_service():
+    calls = []
+
+    async def service(payload):
+        calls.append(payload)
+        return {"notification_id": "hosted-1"}
+
+    plugin = HostedInAppMonitorDeliveryPlugin(service=service)
+    runtime = DbRuntime(
+        runtime_id="db-monitor-hosted-in-app-executor-runtime",
+        plugins=(plugin,),
+    )
+    await runtime.setup()
+    capability = runtime.registry.get_capability(
+        "monitor.delivery.in_app",
+        owner="hosted_monitor_delivery",
+    )
+    operation = await runtime.kernel.create_operation(
+        request={"prompt": "deliver hosted monitor notification"},
+        operation_type="monitor.delivery",
+    )
+    task = await runtime.kernel.plan_task(
+        operation_id=operation.id,
+        capability_id=capability.id,
+        owner=capability.owner,
+        input={
+            "delivery_kind": "in_app",
+            "target": {"type": "requesting_user"},
+            "payload_source": {"type": "monitor.report"},
+            "idempotency_key": "idem-1",
+        },
+    )
+
+    evidence = await runtime.execute_task(task, operation)
+
+    assert calls == [
+        {
+            "delivery_kind": "in_app",
+            "target": {"type": "requesting_user"},
+            "payload_source": {"type": "monitor.report"},
+            "idempotency_key": "idem-1",
+        }
+    ]
+    assert evidence[0].kind == "hosted.in_app.notification"
+    assert evidence[0].payload["result"] == {"notification_id": "hosted-1"}
 
 
 async def test_create_monitor_prompt_requires_approval_then_resumes_to_create_monitor():
@@ -420,6 +980,28 @@ async def test_create_monitor_prompt_requires_approval_then_resumes_to_create_mo
     assert monitors[0].observation_plan["cursor"]["field"] == "created_at"
     evidence = await runtime.store.list_evidence(result.operation_id)
     assert any(item.kind == "monitor.definition" and item.accepted for item in evidence)
+
+
+async def test_create_monitor_prompt_extracts_on_table_target_before_approval():
+    schema_probe = _schema_probe("operations")
+    runtime = DbRuntime(
+        runtime_id="db-monitor-create-on-table-runtime",
+        plugins=(schema_probe, HostedInAppDeliveryProbePlugin()),
+    )
+    agent = DbAgent(runtime=runtime)
+
+    result = await agent.run_detailed(
+        "Create a monitor on the operations table. I want to track when new "
+        "operations appear in the table and be notified in app when they do. "
+        "Poll this once every 5 mins"
+    )
+
+    assert result.status is OperationStatus.BLOCKED
+    evidence = await runtime.store.list_evidence(result.operation_id)
+    proposal = next(item for item in evidence if item.kind == "monitor.proposal")
+    assert proposal.accepted is True
+    assert proposal.payload["target_name"] == "operations"
+    assert proposal.payload["source_scope"] == ["operations"]
 
 
 async def test_approval_resume_skips_plan_and_executes_only_pending_commit():
@@ -757,6 +1339,25 @@ async def test_prompt_monitor_create_blocks_when_schema_cannot_prove_cursor():
     assert (
         "monitor.proposal_incomplete:observation_sql"
         in proposal.payload["validation"]["errors"]
+    )
+
+
+async def test_resume_monitor_create_without_definition_fails_instead_of_succeeding():
+    runtime = DbRuntime(runtime_id="db-monitor-no-definition-resume-runtime")
+    agent = DbAgent(runtime=runtime)
+
+    result = await agent.run_detailed(
+        "Create a monitor for the users table. Notify me when a new user is inserted."
+    )
+
+    assert result.status is OperationStatus.BLOCKED
+    resumed = await runtime.resume_operation(result.operation_id)
+
+    assert resumed.operation.status is OperationStatus.FAILED
+    assert await agent.list_monitors() == ()
+    events = await runtime.store.list_events(result.operation_id)
+    assert any(
+        event.payload.get("reason") == "missing_monitor_definition" for event in events
     )
 
 

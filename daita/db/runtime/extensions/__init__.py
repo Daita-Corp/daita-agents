@@ -16,6 +16,10 @@ from .monitor_lifecycle import (
     DbMonitorLocalDeliveryExecutor,
     DbMonitorPlanLifecycleExecutor,
 )
+from .hosted_delivery import (
+    HostedInAppMonitorDeliveryExecutor,
+    HostedInAppMonitorDeliveryPlugin,
+)
 from .plugin import DbRuntimePlanningPlugin
 from .query import (
     DbPlanningContextExecutor,
@@ -38,4 +42,6 @@ __all__ = [
     "DbQueryPlanValidationExecutor",
     "DbQueryPrepareReadExecutor",
     "DbRuntimePlanningPlugin",
+    "HostedInAppMonitorDeliveryExecutor",
+    "HostedInAppMonitorDeliveryPlugin",
 ]

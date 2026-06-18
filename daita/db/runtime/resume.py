@@ -256,11 +256,24 @@ class DbRuntimeResumeMixin:
 
         if _monitor_create_context(completed.operation):
             definition = _latest_monitor_definition_from_snapshot(completed)
+            if definition is None:
+                await self.kernel.complete_operation(
+                    operation_id,
+                    status=OperationStatus.FAILED,
+                    message=(
+                        f"Operation {operation_id} failed because monitor creation "
+                        "did not produce a committed monitor definition."
+                    ),
+                    payload={"reason": "missing_monitor_definition"},
+                )
+                failed = await self.inspect_operation(operation_id)
+                if failed is None:
+                    raise KeyError(operation_id)
+                return failed
             payload = {}
-            if definition is not None:
-                monitor = definition.payload.get("monitor")
-                if isinstance(monitor, dict):
-                    payload["monitor_id"] = monitor.get("id")
+            monitor = definition.payload.get("monitor")
+            if isinstance(monitor, dict):
+                payload["monitor_id"] = monitor.get("id")
             await self.kernel.complete_operation(
                 operation_id,
                 message=f"Operation {operation_id} succeeded after monitor commit.",
