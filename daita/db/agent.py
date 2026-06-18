@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .monitor_commands import DbMonitorCommandService
+from .monitor_commands.service import DbMonitorCommandService
 from .models import DbOperationResult, DbRequest, DbRuntimeInspection
 from .monitors import DbMonitor, DbMonitorInspection
 from .runtime import DbRuntime

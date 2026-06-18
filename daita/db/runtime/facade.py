@@ -41,11 +41,11 @@ from ..models import (
 )
 from ..monitors import DbMonitorStore
 from ..planning import DbContractBuilder, DbIntentClassifier
-from ..runtime_extensions import DbRuntimePlanningPlugin
 from ..synthesis import DbSynthesizer
 from ..verification import DbVerifier
 from .analysis import DbRuntimeAnalysisMixin
 from .cache import DbRuntimeCacheMixin
+from .extensions import DbRuntimePlanningPlugin
 from .governance import (
     DbRuntimeGovernanceMixin,
     _safe_source_repr,
@@ -673,6 +673,7 @@ class DbRuntime(
             message=message,
             payload=dict(payload or {}),
         )
+
 
 def _skill_names_from_request(request: DbRequest) -> tuple[str, ...]:
     value = request.metadata.get("skills")

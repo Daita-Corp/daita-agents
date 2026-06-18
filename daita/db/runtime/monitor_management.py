@@ -39,7 +39,7 @@ from ..monitors import (
     InMemoryDbMonitorStore,
     SQLiteDbMonitorStore,
 )
-from ..monitor_scheduler import DbMonitorScheduler
+from ..monitor_scheduler.scheduler import DbMonitorScheduler
 from .types import DbRuntimeGovernanceBlocked
 
 
@@ -687,10 +687,10 @@ def _monitor_lifecycle_evidence_kind(action: str) -> str:
 def _validation_from_lifecycle_proposal(proposal: dict[str, Any]) -> Any:
     validation = proposal.get("validation")
     if isinstance(validation, dict):
-        from ..monitor_commands import DbMonitorValidation
+        from ..monitor_commands.types import DbMonitorValidation
 
         return DbMonitorValidation.from_dict(validation)
-    from ..monitor_commands import DbMonitorValidation
+    from ..monitor_commands.types import DbMonitorValidation
 
     return DbMonitorValidation(accepted=bool(proposal.get("accepted", True)))
 
