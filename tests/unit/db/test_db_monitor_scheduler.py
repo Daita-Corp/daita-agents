@@ -530,6 +530,19 @@ def _scheduled_report_action(delivery_intent=None):
     }
 
 
+def _notification_action(delivery_intent=None):
+    return {
+        "kind": "notification",
+        "title": "New order notification",
+        "delivery_intent": delivery_intent
+        or {
+            "delivery_kind": "local",
+            "target": {"type": "runtime_console"},
+            "format": "markdown",
+        },
+    }
+
+
 def _write_proposal_action(sql="update orders set status = 'ready' where id = 1"):
     return {
         "kind": "write_proposal",
@@ -543,6 +556,7 @@ async def _create_monitor(runtime, monitor_id, **kwargs):
     values = {
         "schedule": {"interval_seconds": 300},
         "trigger": {"force_trigger": False},
+        "observation_plan": _metric_observation(),
         "metadata": {"validation": _validation()},
     }
     values.update(kwargs)
@@ -748,7 +762,10 @@ async def test_scheduler_respects_pause_cooldown_and_backoff_gates():
         "backoff_monitor": "backoff",
     }
     assert all(run.status == "skipped" for run in runs)
-    assert await runtime.store.list_tasks() == []
+    assert [task.capability_id for task in await runtime.store.list_tasks()] == [
+        "db.monitor.plan_lifecycle",
+        "db.monitor.commit_lifecycle",
+    ]
 
 
 def _run_mutation(*, monitor, state, suffix):
@@ -840,6 +857,57 @@ async def test_due_monitor_observation_runs_through_db_runtime_execute_task():
     tasks = await runtime.store.list_tasks(runs[0].operation_id)
     assert [task.id for task in tasks] == [task.id for task, _, _ in calls]
     assert calls[1][0].input["sql_ref"] == "sql.validation"
+
+
+async def test_planned_read_observation_resolves_cursor_parameters_before_read():
+    plugin = MonitorReadProbePlugin(rows=[{"id": 42, "email": "new@example.test"}])
+    runtime = DbRuntime(
+        runtime_id="db-monitor-scheduler-cursor-params",
+        plugins=(plugin,),
+    )
+    await _create_monitor(
+        runtime,
+        "new_orders_monitor",
+        observation_plan={
+            "kind": "planned_read",
+            "sql": "select * from orders where id > ? order by id asc limit 100",
+            "parameters": ["monitor.state.cursor.last_id"],
+            "cursor": {"field": "id", "initialization": "zero"},
+            "cursor_update": {"last_id": "max(rows.id)"},
+            "value_path": "rows",
+            "source_scope": ["orders"],
+            "capability_owner": "monitor_read_probe",
+        },
+        trigger={
+            "type": "new_rows",
+            "path": "rows",
+            "operator": "count_gt",
+            "value": 0,
+        },
+    )
+    state = await runtime.monitor_store.load_monitor_state("new_orders_monitor")
+    assert state is not None
+    await runtime.monitor_store.save_monitor_state(
+        replace(state, cursor={"last_id": 17})
+    )
+    calls = []
+    original_execute_task = runtime.execute_task
+
+    async def spy_execute_task(task, operation, context=None):
+        calls.append((task, operation, context))
+        return await original_execute_task(task, operation, context=context)
+
+    runtime.execute_task = spy_execute_task
+
+    runs = await runtime.tick_monitors(now=NOW)
+
+    assert runs[0].status == "triggered"
+    read_task = next(
+        task for task, _, _ in calls if task.capability_id == "db.sql.execute_read"
+    )
+    assert read_task.input["params"] == [17]
+    updated = await runtime.monitor_store.load_monitor_state("new_orders_monitor")
+    assert updated.cursor["last_id"] == 42
 
 
 async def test_rest_source_observation_executes_through_runtime_and_cites_plugin_evidence():
@@ -1324,6 +1392,176 @@ async def test_slack_scheduled_report_delivery_executes_through_runtime_and_pers
     assert run.summary["delivery_result_evidence_id"] == delivery_result.id
     assert (
         run.summary["delivery_plugin_result_evidence_refs"][0]["id"] == plugin_result.id
+    )
+
+
+async def test_notification_action_uses_builtin_local_delivery_capability():
+    db_plugin = MonitorReadProbePlugin(rows=[{"pending_count": 12}])
+    runtime = DbRuntime(
+        runtime_id="db-monitor-delivery-local",
+        plugins=(db_plugin,),
+    )
+    await runtime.setup()
+    assert runtime.registry.get_capability(
+        "monitor.delivery.local",
+        owner="db_runtime",
+    )
+    calls = []
+    original_execute_task = runtime.execute_task
+
+    async def spy_execute_task(task, operation, context=None):
+        calls.append((task, operation, dict(context or {})))
+        return await original_execute_task(task, operation, context=context)
+
+    runtime.execute_task = spy_execute_task
+    await _create_monitor(
+        runtime,
+        "local_notification_monitor",
+        schedule={"interval_seconds": 0},
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+        action_plan=_notification_action(),
+    )
+
+    run = (await runtime.tick_monitors(now=NOW))[0]
+    snapshot = await runtime.inspect_operation(run.summary["triggered_operation_id"])
+    delivery_task = next(
+        task
+        for task in snapshot.tasks
+        if task.capability_id == "monitor.delivery.local"
+    )
+    delivery_result = next(
+        item for item in snapshot.evidence if item.kind == "monitor.delivery_result"
+    )
+    local_delivery = next(
+        item for item in snapshot.evidence if item.kind == "local.notification.delivery"
+    )
+    report = next(item for item in snapshot.evidence if item.kind == "monitor.report")
+    decision_ref = next(
+        ref
+        for ref in delivery_result.payload["source_evidence_refs"]
+        if ref["kind"] == "monitor.trigger_decision"
+    )
+
+    assert run.summary["action_kind"] == "notification"
+    assert run.summary["delivery_status"] == "succeeded"
+    assert run.summary["delivery_target"] == {"type": "runtime_console"}
+    assert run.summary["delivery_channel"] == "runtime_console"
+    assert [item[0].capability_id for item in calls].count(
+        "monitor.delivery.local"
+    ) == 1
+    assert delivery_task.metadata["monitor_id"] == "local_notification_monitor"
+    assert delivery_task.metadata["monitor_run_id"] == run.id
+    assert delivery_task.metadata["tick_operation_id"] == run.operation_id
+    assert delivery_task.metadata["monitor_delivery_target"] == {
+        "type": "runtime_console"
+    }
+    assert local_delivery.task_id == delivery_task.id
+    assert local_delivery.payload["status"] == "delivered"
+    assert local_delivery.payload["target_channel"] == "runtime_console"
+    assert local_delivery.payload["monitor_run_id"] == run.id
+    assert local_delivery.payload["tick_operation_id"] == run.operation_id
+    assert delivery_result.payload["capability_id"] == "monitor.delivery.local"
+    assert delivery_result.payload["capability_owner"] == "db_runtime"
+    assert delivery_result.payload["delivery_target"] == {"type": "runtime_console"}
+    assert delivery_result.payload["delivery_channel"] == "runtime_console"
+    assert delivery_result.metadata["monitor_delivery_channel"] == "runtime_console"
+    assert delivery_result.payload["action_plan_fingerprint"]
+    assert delivery_result.payload["report_fingerprint"]
+    assert delivery_result.payload["delivery_result_evidence_id"] == delivery_result.id
+    assert report.payload["action_kind"] == "notification"
+    assert decision_ref["id"] == run.trigger_decision_evidence_id
+
+
+async def test_local_delivery_replay_reuses_existing_result_without_reexecuting_task():
+    db_plugin = MonitorReadProbePlugin(rows=[{"pending_count": 12}])
+    runtime = DbRuntime(
+        runtime_id="db-monitor-delivery-local-replay",
+        plugins=(db_plugin,),
+    )
+    await _create_monitor(
+        runtime,
+        "local_replay_monitor",
+        schedule={"interval_seconds": 0},
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+        action_plan=_notification_action(),
+    )
+
+    run = (await runtime.tick_monitors(now=NOW))[0]
+    child_id = run.summary["triggered_operation_id"]
+    before = await runtime.inspect_operation(child_id)
+    existing_result = next(
+        item for item in before.evidence if item.kind == "monitor.delivery_result"
+    )
+    calls = []
+    original_execute_task = runtime.execute_task
+
+    async def spy_execute_task(task, operation, context=None):
+        calls.append(task.capability_id)
+        return await original_execute_task(task, operation, context=context)
+
+    runtime.execute_task = spy_execute_task
+    replayed = await runtime.execute_monitor_delivery(
+        child_id,
+        monitor_id="local_replay_monitor",
+        monitor_name="Local Replay Monitor",
+        monitor_run_id=run.id,
+        tick_operation_id=run.operation_id,
+        report_evidence_id=run.summary["report_evidence_id"],
+    )
+    after = await runtime.inspect_operation(child_id)
+
+    assert replayed["delivery_result_evidence_id"] == existing_result.id
+    assert calls == []
+    assert [
+        item.kind
+        for item in after.evidence
+        if item.kind == "local.notification.delivery"
+    ] == ["local.notification.delivery"]
+
+
+async def test_local_delivery_unsupported_target_blocks_before_task_execution():
+    db_plugin = MonitorReadProbePlugin(rows=[{"pending_count": 12}])
+    runtime = DbRuntime(
+        runtime_id="db-monitor-delivery-local-unsupported",
+        plugins=(db_plugin,),
+    )
+    await _create_monitor(
+        runtime,
+        "unsupported_local_delivery_monitor",
+        schedule={"interval_seconds": 0},
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+        action_plan=_notification_action(
+            {
+                "delivery_kind": "local",
+                "target": {"type": "pagerduty"},
+                "format": "markdown",
+            }
+        ),
+    )
+
+    run = (await runtime.tick_monitors(now=NOW))[0]
+    snapshot = await runtime.inspect_operation(run.summary["triggered_operation_id"])
+    delivery_plan = next(
+        item for item in snapshot.evidence if item.kind == "monitor.delivery_plan"
+    )
+    delivery_result = next(
+        item for item in snapshot.evidence if item.kind == "monitor.delivery_result"
+    )
+
+    assert run.summary["delivery_status"] == "blocked"
+    assert delivery_plan.accepted is False
+    assert delivery_plan.payload["block_reason"] == "unsupported_delivery_target"
+    assert delivery_result.payload["block_reason"] == "unsupported_delivery_target"
+    assert delivery_result.payload["delivery_target"] == {"type": "pagerduty"}
+    assert delivery_result.payload["delivery_channel"] == "pagerduty"
+    assert not any(
+        task.capability_id == "monitor.delivery.local" for task in snapshot.tasks
+    )
+    assert not any(
+        item.kind == "local.notification.delivery" for item in snapshot.evidence
     )
 
 

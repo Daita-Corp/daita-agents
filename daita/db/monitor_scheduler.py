@@ -198,7 +198,7 @@ class DbMonitorObservationRunner:
             validation_task, read_task = self.runtime.plan_validated_read_tasks(
                 operation,
                 sql=sql,
-                params=list(plan.get("parameters") or plan.get("params") or ()),
+                params=_observation_params(plan, state),
                 owner=owner,
                 reason="monitor_observation_read",
                 sequence=1,
@@ -322,6 +322,11 @@ class DbMonitorObservationRunner:
             )
 
         value = _observed_value(plan, query_result.payload, now=now)
+        cursor_updates = {
+            "last_observation_at": _iso(now),
+            "last_observation_fingerprint": validation_facts.sql_fingerprint,
+            **_cursor_updates_from_plan(plan, query_result.payload),
+        }
         evidence_ids = tuple(
             item.id for item in (*validation_evidence, *read_evidence) if item.id
         )
@@ -352,10 +357,7 @@ class DbMonitorObservationRunner:
                 "summary": summary,
                 "observed_value": _compact_observed_value(value),
                 "cursor_before": state.cursor,
-                "cursor_updates": {
-                    "last_observation_at": _iso(now),
-                    "last_observation_fingerprint": validation_facts.sql_fingerprint,
-                },
+                "cursor_updates": cursor_updates,
                 "task_ids": list(task_ids),
                 "evidence_ids": list(evidence_ids),
             },
@@ -516,6 +518,8 @@ class DbMonitorDeliveryRunner:
                     **run.summary,
                     "delivery_status": delivery_status,
                     "delivery_kind": result.get("delivery_kind"),
+                    "delivery_target": dict(result.get("delivery_target") or {}),
+                    "delivery_channel": result.get("delivery_channel"),
                     "delivery_operation_id": result.get("delivery_operation_id"),
                     "delivery_result_evidence_id": result.get(
                         "delivery_result_evidence_id"
@@ -1359,6 +1363,66 @@ def _query_row_count(payload: Mapping[str, Any]) -> int | None:
     return len(rows) if isinstance(rows, list) else None
 
 
+def _observation_params(
+    plan: Mapping[str, Any],
+    state: DbMonitorState,
+) -> list[Any]:
+    return [
+        _resolve_observation_param(value, state)
+        for value in list(plan.get("parameters") or plan.get("params") or ())
+    ]
+
+
+def _resolve_observation_param(value: Any, state: DbMonitorState) -> Any:
+    if not isinstance(value, str):
+        return value
+    if value.startswith("monitor.state.cursor."):
+        current: Any = state.cursor
+        for part in value.removeprefix("monitor.state.cursor.").split("."):
+            if isinstance(current, Mapping):
+                current = current.get(part)
+            else:
+                return None
+        return current
+    if value.startswith("cursor."):
+        current = state.cursor
+        for part in value.removeprefix("cursor.").split("."):
+            if isinstance(current, Mapping):
+                current = current.get(part)
+            else:
+                return None
+        return current
+    return value
+
+
+def _cursor_updates_from_plan(
+    plan: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return updates
+    cursor_update = plan.get("cursor_update")
+    if not isinstance(cursor_update, Mapping):
+        return updates
+    for cursor_key, rule in cursor_update.items():
+        if not isinstance(cursor_key, str) or not isinstance(rule, str):
+            continue
+        match = re.fullmatch(r"max\(rows\.([A-Za-z_][A-Za-z0-9_]*)\)", rule)
+        if not match:
+            continue
+        field = match.group(1)
+        values = [
+            row.get(field)
+            for row in rows
+            if isinstance(row, Mapping) and row.get(field) is not None
+        ]
+        if values:
+            updates[cursor_key] = max(values)
+    return updates
+
+
 def _compact_observed_value(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -1535,8 +1599,13 @@ def _trigger_decision(
         return bool(trigger["force_trigger"]), summarize_monitor_value(value), "forced"
     if value is None:
         return False, None, "observation_unavailable"
+    trigger_value = (
+        {"rows": value}
+        if trigger.get("path") == "rows" and isinstance(value, list)
+        else value
+    )
     try:
-        matched = monitor_trigger_matches(value, trigger)
+        matched = monitor_trigger_matches(trigger_value, trigger)
     except TypeError:
         return False, summarize_monitor_value(value), "trigger_type_mismatch"
     return (

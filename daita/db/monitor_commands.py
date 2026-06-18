@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+import hashlib
+import json
 import re
 from typing import Any, Literal
 
@@ -10,15 +13,24 @@ from daita.plugins import ExtensionRegistry
 from daita.runtime import (
     AccessMode,
     ApprovalRequest,
+    ApprovalStatus,
     Evidence,
     OperationStatus,
     RiskLevel,
     RuntimeEvent,
     RuntimeEventType,
+    TaskDependency,
 )
 
-from .models import DbIntent, DbIntentKind, DbOperationContract, DbOperationResult, DbRequest
+from .models import (
+    DbIntent,
+    DbIntentKind,
+    DbOperationContract,
+    DbOperationResult,
+    DbRequest,
+)
 from .monitors import DbMonitor
+from .query_metadata import column_name, is_numeric_type, matching_tables
 
 DbMonitorCommandKind = Literal[
     "create",
@@ -316,42 +328,102 @@ class DbMonitorPlanner:
     ) -> DbMonitor:
         if command.kind != "create":
             raise ValueError("DbMonitorPlanner can only create monitor specs")
+        proposal, validation = self.create_proposal(
+            command,
+            source_scope=source_scope,
+            owner=owner,
+        )
+        if not validation.accepted:
+            raise ValueError(
+                "monitor proposal is incomplete or unsupported: "
+                + ", ".join(validation.errors)
+            )
+        return _monitor_from_proposal(proposal, validation=validation)
+
+    def create_proposal(
+        self,
+        command: DbMonitorCommand,
+        *,
+        source_scope: tuple[str, ...] = (),
+        owner: dict[str, Any] | None = None,
+        schema: dict[str, Any] | None = None,
+        schema_evidence_id: str | None = None,
+    ) -> tuple[dict[str, Any], DbMonitorValidation]:
+        """Plan a prompt-created monitor as an executable proposal."""
+        if command.kind != "create":
+            raise ValueError("DbMonitorPlanner can only create monitor proposals")
         prompt = command.prompt
         name = _title_from_phrase(_create_name_phrase(prompt))
-        schedule = _schedule_from_prompt(prompt)
-        trigger = _trigger_from_prompt(prompt, schedule=schedule)
+        target = _target_resource_from_prompt(prompt)
+        schedule = _schedule_from_prompt(prompt) or {"interval_seconds": 300}
+        trigger = _executable_trigger_from_prompt(prompt)
         actions = _actions_from_prompt(prompt)
-        watch = _watch_from_prompt(prompt)
         budgets = _budgets_from_prompt(prompt)
         policy = _policy_from_prompt(prompt)
         action_steps = _action_steps_from_prompt(prompt)
+        monitor_id = command.monitor_id or _monitor_id_from_phrase(name)
+        effective_scope = tuple(source_scope or ((target,) if target else ()))
+        observation_plan, initial_cursor = _planned_read_observation_plan(
+            target,
+            budgets=budgets,
+            schema=schema,
+        )
+        action_plan = _notification_action_plan(prompt, actions=actions)
         validation = self.validate(
             action_steps=action_steps,
             actions=actions,
-            source_scope=source_scope,
+            source_scope=effective_scope,
             policy=policy,
             budgets=budgets,
-        )
-        return DbMonitor(
-            id=command.monitor_id or _monitor_id_from_phrase(name),
-            name=name,
-            description=watch,
-            status="active",
-            source_scope=source_scope,
+            observation_plan=observation_plan,
             schedule=schedule,
+            stream=None,
             trigger=trigger,
-            observation_plan={"watch": [watch] if watch else []},
-            action_plan={"steps": [dict(step) for step in action_steps]},
-            policy=policy,
-            budgets=budgets,
-            owner=dict(owner or {}),
-            metadata={
+            action_plan=action_plan,
+        )
+        proposal: dict[str, Any] = {
+            "kind": "monitor.proposal",
+            "monitor_id": monitor_id,
+            "name": name,
+            "description": _watch_from_prompt(prompt),
+            "status": "active",
+            "target_type": "table",
+            "target_name": target,
+            "source_scope": list(effective_scope),
+            "schedule": schedule,
+            "stream": None,
+            "trigger": trigger,
+            "observation_plan": observation_plan,
+            "action_plan": action_plan,
+            "initial_state": {
+                "cursor": initial_cursor,
+            },
+            "policy": policy,
+            "budgets": {
+                "max_rows_per_tick": observation_plan.get("max_rows", 100),
+                **budgets,
+            },
+            "owner": dict(owner or {}),
+            "runtime_limits": dict(self.limits),
+            "governance": {
+                "approval_required": command.diagnostics.get("approval_required")
+                is True,
+                "risk": "medium",
+                "side_effect_summary": (
+                    "Creates runtime monitor configuration; observation is read-only."
+                ),
+            },
+            "metadata": {
                 "created_from_prompt": True,
                 "prompt": prompt,
                 "command": command.diagnostics,
                 "validation": validation.to_dict(),
+                "schema_evidence_id": schema_evidence_id,
             },
-        )
+        }
+        proposal["proposal_fingerprint"] = _stable_monitor_payload_hash(proposal)
+        proposal["metadata"]["proposal_fingerprint"] = proposal["proposal_fingerprint"]
+        return proposal, validation
 
     def validate(
         self,
@@ -361,6 +433,11 @@ class DbMonitorPlanner:
         source_scope: tuple[str, ...],
         policy: dict[str, Any],
         budgets: dict[str, Any],
+        observation_plan: dict[str, Any] | None = None,
+        schedule: dict[str, Any] | None = None,
+        stream: dict[str, Any] | None = None,
+        trigger: dict[str, Any] | None = None,
+        action_plan: dict[str, Any] | None = None,
     ) -> DbMonitorValidation:
         capability_ids = (
             {capability.id for capability in self.registry.capabilities}
@@ -389,13 +466,23 @@ class DbMonitorPlanner:
         policy_warnings = []
         if policy.get("access") not in {None, "read"}:
             policy_warnings.append("monitor_policy_access_requires_runtime_review")
+        plan_errors = _proposal_validation_errors(
+            observation_plan=observation_plan or {},
+            schedule=schedule,
+            stream=stream,
+            trigger=trigger or {},
+            action_plan=action_plan or {},
+        )
         missing = tuple(
             capability_id
             for capability_id in dict.fromkeys(required)
             if capability_id not in capability_ids
         )
         errors = tuple(
-            f"missing_capability:{capability_id}" for capability_id in missing
+            (
+                *(f"missing_capability:{capability_id}" for capability_id in missing),
+                *plan_errors,
+            )
         )
         warnings = tuple((*budget_warnings, *policy_warnings))
         return DbMonitorValidation(
@@ -545,56 +632,187 @@ class DbMonitorCommandService:
         command: DbMonitorCommand,
         request: DbRequest,
     ) -> DbOperationResult:
-        planner = DbMonitorPlanner(
-            registry=self.runtime.registry,
-            limits=self.runtime.config.limits.to_dict(),
+        if not self.runtime.is_setup:
+            await self.runtime.setup()
+        monitor_id = command.monitor_id or _monitor_id_from_phrase(
+            _title_from_phrase(_create_name_phrase(request.prompt))
         )
-        monitor = planner.create_monitor(
-            command,
-            source_scope=request.source_scope,
-            owner=_owner_from_request(request),
+        monitor_name = _title_from_phrase(_create_name_phrase(request.prompt))
+
+        operation = await self.runtime.kernel.create_operation(
+            operation_type="monitor.create",
+            request={
+                "kind": "monitor.create",
+                "prompt": request.prompt,
+                "user_id": request.user_id,
+                "session_id": request.session_id,
+                "source_scope": list(request.source_scope),
+                "command": _command_payload(command),
+            },
+            required_evidence=frozenset({"monitor.proposal", "monitor.definition"}),
+            metadata={
+                "control_plane": "db.monitor",
+                "command_kind": "create",
+                "monitor_id": monitor_id,
+                "monitor_name": monitor_name,
+                "resume_context": {
+                    "request": {
+                        "prompt": request.prompt,
+                        "user_id": request.user_id,
+                        "session_id": request.session_id,
+                        "source_scope": list(request.source_scope),
+                    },
+                    "intent": {
+                        "kind": DbIntentKind.ADMIN.value,
+                        "confidence": command.confidence,
+                        "access": AccessMode.WRITE.value,
+                    },
+                    "contract": {
+                        "operation_type": "monitor.create",
+                        "required_evidence": [
+                            "monitor.proposal",
+                            "monitor.definition",
+                        ],
+                        "access": AccessMode.WRITE.value,
+                    },
+                },
+            },
+            evaluate_governance=False,
         )
-        validation = DbMonitorValidation.from_dict(monitor.metadata["validation"])
+        plan_task = await self.runtime.kernel.plan_task(
+            operation_id=operation.id,
+            capability_id="db.monitor.plan_create",
+            owner="db_runtime",
+            input={
+                "command": _command_payload(command),
+                "prompt": request.prompt,
+                "source_scope": list(request.source_scope),
+                "owner": _owner_from_request(request),
+            },
+            metadata={
+                "reason": "monitor_create_planning",
+                "sequence": 1,
+                "idempotency_key": _stable_monitor_payload_hash(
+                    {
+                        "prompt": request.prompt,
+                        "command": _command_payload(command),
+                        "source_scope": list(request.source_scope),
+                    }
+                ),
+            },
+        )
+        plan_evidence = await self.runtime.execute_task(plan_task, operation)
+        proposal_evidence = next(
+            (item for item in plan_evidence if item.kind == "monitor.proposal"),
+            None,
+        )
+        if proposal_evidence is None:
+            raise RuntimeError("monitor planning did not produce proposal evidence")
+        proposal = dict(proposal_evidence.payload)
+        validation = DbMonitorValidation.from_dict(
+            dict(proposal.get("validation") or {})
+        )
+        operation = replace(
+            operation,
+            metadata={
+                **operation.metadata,
+                "monitor_id": proposal["monitor_id"],
+                "monitor_name": proposal["name"],
+                "proposal_fingerprint": proposal["proposal_fingerprint"],
+            },
+        )
+        await self.runtime.store.save_operation(operation)
         if not validation.accepted:
+            await self.runtime.kernel.block_operation(
+                operation.id,
+                message="Monitor proposal is incomplete or unsupported.",
+                payload={"validation": validation.to_dict()},
+            )
             return await self.runtime.record_monitor_command_result(
                 request=request,
                 kind=command.kind,
                 command=_command_payload(command),
                 status=OperationStatus.BLOCKED,
                 answer=_monitor_validation_answer(validation),
-                evidence_kind="monitor.command.validation",
+                operation_id=operation.id,
+                evidence=tuple(plan_evidence),
                 payload={
                     "command": _command_payload(command),
-                    "planned_monitor": monitor.to_dict(),
+                    "proposal": proposal,
                     "validation": validation.to_dict(),
                 },
                 warnings=("db_monitor_validation_failed", *validation.warnings),
                 diagnostics={"validation": validation.to_dict()},
+                persist_operation=False,
             )
+        commit_task = await self.runtime.kernel.plan_task(
+            operation_id=operation.id,
+            capability_id="db.monitor.commit_create",
+            owner="db_runtime",
+            input={
+                "proposal_evidence_id": proposal_evidence.id,
+                "proposal_fingerprint": proposal["proposal_fingerprint"],
+            },
+            metadata={
+                "reason": "monitor_create_commit",
+                "sequence": 2,
+                "idempotency_key": proposal["proposal_fingerprint"],
+            },
+            dependencies=(
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind="monitor.proposal",
+                    evidence_id=proposal_evidence.id,
+                    evidence_owner="db_runtime",
+                    producer_task_id=plan_task.id,
+                    producer_capability_id=plan_task.capability_id,
+                    producer_executor_id=plan_task.executor_id,
+                    evidence_payload={
+                        "proposal_fingerprint": proposal["proposal_fingerprint"],
+                    },
+                    evidence_accepted=True,
+                    operation_id=operation.id,
+                ),
+            ),
+        )
         if command.diagnostics.get("approval_required") is True:
             return await self._create_pending_approval(
                 command,
                 request,
-                monitor,
+                proposal,
+                proposal_evidence,
+                commit_task.id,
                 validation,
             )
-        committed = await self.runtime.create_monitor(monitor)
+        commit_evidence = await self.runtime.execute_task(commit_task, operation)
+        definition = next(
+            (item for item in commit_evidence if item.kind == "monitor.definition"),
+            None,
+        )
+        if definition is None:
+            raise RuntimeError("monitor commit did not produce definition evidence")
+        committed = DbMonitor.from_dict(definition.payload["monitor"])
         inspection = await self.runtime.inspect_monitor(committed.id)
-        operation_id = _inspection_operation_id(inspection)
-        evidence = await _operation_evidence(self.runtime, operation_id)
+        await self.runtime.kernel.complete_operation(
+            operation.id,
+            status=OperationStatus.SUCCEEDED,
+            message=f"Monitor {committed.id} created from proposal.",
+            payload={"monitor_id": committed.id},
+        )
         return await self.runtime.record_monitor_command_result(
             request=request,
             kind=command.kind,
             command=_command_payload(command),
             status=OperationStatus.SUCCEEDED,
             answer=_create_monitor_answer(committed),
-            operation_id=operation_id,
-            evidence=tuple(evidence),
+            operation_id=operation.id,
+            evidence=(*plan_evidence, *commit_evidence),
             warnings=validation.warnings,
             diagnostics={
                 "monitor": committed.to_dict(),
                 "inspection": None if inspection is None else inspection.to_dict(),
                 "validation": validation.to_dict(),
+                "proposal_evidence_id": proposal_evidence.id,
             },
             persist_operation=False,
         )
@@ -603,30 +821,19 @@ class DbMonitorCommandService:
         self,
         command: DbMonitorCommand,
         request: DbRequest,
-        monitor: DbMonitor,
+        proposal: dict[str, Any],
+        proposal_evidence: Evidence,
+        commit_task_id: str,
         validation: "DbMonitorValidation",
     ) -> DbOperationResult:
-        command_payload = _command_payload(command)
-        operation = await self.runtime.kernel.create_operation(
-            operation_type="monitor.create",
-            request={
-                "kind": "monitor.create",
-                "prompt": request.prompt,
-                "command": command_payload,
-                "planned_monitor": monitor.to_dict(),
-            },
-            required_evidence=frozenset({"monitor.definition"}),
-            metadata={
-                "control_plane": "db.monitor",
-                "command_kind": "create",
-                "command_status": "approval_required",
-                "monitor_id": monitor.id,
-                "monitor_name": monitor.name,
-                "monitor": monitor.to_dict(),
-                "validation": validation.to_dict(),
-            },
-            evaluate_governance=False,
+        operation = await self.runtime.store.load_operation(
+            proposal_evidence.operation_id
         )
+        if operation is None:
+            raise RuntimeError(
+                f"monitor create operation {proposal_evidence.operation_id} missing"
+            )
+        command_payload = _command_payload(command)
         approval = ApprovalRequest(
             approval_id=f"{operation.id}:runtime.approval_required:monitor.create",
             operation_id=operation.id,
@@ -634,18 +841,46 @@ class DbMonitorCommandService:
             proposed_action={
                 "operation_type": "monitor.create",
                 "request": operation.request,
-                "monitor": monitor.to_dict(),
+                "monitor": {
+                    "id": proposal["monitor_id"],
+                    "name": proposal["name"],
+                    "trigger": proposal["trigger"],
+                    "action_plan": proposal["action_plan"],
+                },
                 "approval": "monitor.create",
+                "proposal_evidence_id": proposal_evidence.id,
+                "proposal_fingerprint": proposal["proposal_fingerprint"],
             },
             risk=RiskLevel.MEDIUM,
             requested_by_policy_id="runtime.approval_required",
             owner="db.monitor",
             metadata={
                 "command": command_payload,
+                "commit_task_id": commit_task_id,
+                "proposal_evidence_id": proposal_evidence.id,
+                "proposal_fingerprint": proposal["proposal_fingerprint"],
                 "validation": validation.to_dict(),
             },
         )
         await self.runtime.store.save_approval_request(approval)
+        commit_task = await self.runtime.store.load_task(commit_task_id)
+        if commit_task is not None:
+            from dataclasses import replace
+
+            await self.runtime.store.save_task(
+                replace(
+                    commit_task,
+                    dependencies=(
+                        *commit_task.dependencies,
+                        TaskDependency(
+                            kind="approval",
+                            approval_id=approval.approval_id,
+                            approval_status=ApprovalStatus.APPROVED,
+                            operation_id=operation.id,
+                        ),
+                    ),
+                )
+            )
         await self.runtime.store.append_event(
             RuntimeEvent(
                 id=f"monitor-command-event-{operation.id}:approval-requested",
@@ -658,6 +893,14 @@ class DbMonitorCommandService:
                 message=f"Approval {approval.approval_id} requested.",
                 payload={"approval": approval.to_dict()},
             )
+        )
+        await self.runtime.kernel.block_operation(
+            operation.id,
+            message="Monitor create operation is waiting for approval.",
+            payload={
+                "approval_id": approval.approval_id,
+                "proposal_evidence_id": proposal_evidence.id,
+            },
         )
         result = DbOperationResult(
             operation_id=operation.id,
@@ -680,31 +923,20 @@ class DbMonitorCommandService:
                     "control_plane": "db.monitor",
                     "approval_required": True,
                     "command": command_payload,
-                    "planned_monitor": monitor.to_dict(),
+                    "proposal": proposal,
+                    "proposal_evidence_id": proposal_evidence.id,
                     "validation": validation.to_dict(),
                 },
             ),
             status=OperationStatus.BLOCKED,
             answer="This operation requires approval before creating the monitor.",
-            evidence=(
-                Evidence(
-                    id=f"monitor-command-evidence-{operation.id}:planned",
-                    kind="monitor.definition",
-                    owner="db.monitor",
-                    operation_id=operation.id,
-                    payload={
-                        "command": command_payload,
-                        "planned_monitor": monitor.to_dict(),
-                        "validation": validation.to_dict(),
-                    },
-                    accepted=False,
-                ),
-            ),
+            evidence=(proposal_evidence,),
             warnings=("db_monitor_approval_required", *validation.warnings),
             diagnostics={
-                "monitor": monitor.to_dict(),
+                "proposal": proposal,
                 "validation": validation.to_dict(),
                 "approval_id": approval.approval_id,
+                "proposal_evidence_id": proposal_evidence.id,
             },
         )
         for item in result.evidence:
@@ -1312,6 +1544,322 @@ def _policy_from_prompt(prompt: str) -> dict[str, Any]:
     if "read-only" in lowered or "readonly" in lowered:
         policy["access"] = "read"
     return policy
+
+
+def _target_resource_from_prompt(prompt: str) -> str:
+    lowered = prompt.lower()
+    for pattern in (
+        r"\bfor\s+(?:the\s+)?([a-z][a-z0-9_]*)\s+table\b",
+        r"\btable\s+([a-z][a-z0-9_]*)\b",
+        r"\bfrom\s+(?:the\s+)?([a-z][a-z0-9_]*)\b",
+    ):
+        match = re.search(pattern, lowered)
+        if match:
+            return match.group(1)
+    phrase = _watch_from_prompt(prompt)
+    phrase = re.sub(r"(?i)\btable\b", "", phrase).strip()
+    return _monitor_id_from_phrase(phrase)
+
+
+def _planned_read_observation_plan(
+    target: str,
+    *,
+    budgets: dict[str, Any],
+    schema: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not _valid_sql_identifier(target):
+        return (
+            {
+                "kind": "planned_read",
+                "target": target,
+                "planning_status": "blocked",
+                "block_reason": "invalid_target_identifier",
+            },
+            {},
+        )
+    cursor = _cursor_strategy_from_schema(target, schema)
+    if cursor is None:
+        return (
+            {
+                "kind": "planned_read",
+                "target_type": "table",
+                "target_name": target,
+                "planning_status": "blocked",
+                "block_reason": "missing_reliable_cursor",
+                "schema_available": bool(schema),
+            },
+            {},
+        )
+    max_rows = int(budgets.get("max_rows_per_tick") or 100)
+    max_rows = max(1, min(max_rows, 1000))
+    field = cursor["field"]
+    cursor_key = cursor["cursor_key"]
+    return (
+        {
+            "kind": "planned_read",
+            "target_type": "table",
+            "target_name": target,
+            "sql": (
+                f"select * from {target} "
+                f"where {field} > ? order by {field} asc limit "
+                f"{max_rows}"
+            ),
+            "parameters": [f"monitor.state.cursor.{cursor_key}"],
+            "cursor": {
+                "field": field,
+                "initialization": cursor["initialization"],
+                "strategy": cursor["strategy"],
+                "source": cursor["source"],
+            },
+            "cursor_update": {
+                cursor_key: f"max(rows.{field})",
+            },
+            "max_rows": max_rows,
+            "value_path": "rows",
+            "validation_owner": "db_runtime",
+            "capability_id": "db.sql.execute_read",
+        },
+        {
+            cursor_key: cursor["initial_value"],
+            "initialized_from": "monitor_create",
+        },
+    )
+
+
+def _cursor_strategy_from_schema(
+    target: str,
+    schema: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not schema:
+        return None
+    matches = matching_tables(schema, target)
+    if len(matches) != 1:
+        return None
+    table = matches[0]
+    columns = [
+        column for column in table.get("columns") or [] if isinstance(column, dict)
+    ]
+    timestamp = _timestamp_cursor_column(columns)
+    if timestamp is not None:
+        field = column_name(timestamp)
+        return {
+            "field": field,
+            "cursor_key": f"last_{field}",
+            "initialization": "monitor_created_at",
+            "initial_value": _now_iso(),
+            "strategy": "insert_timestamp",
+            "source": "schema_column",
+        }
+    primary_key = _auto_increment_primary_key(columns)
+    if primary_key is not None:
+        field = column_name(primary_key)
+        return {
+            "field": field,
+            "cursor_key": f"last_{field}",
+            "initialization": "zero",
+            "initial_value": 0,
+            "strategy": "auto_increment_primary_key",
+            "source": "schema_primary_key",
+        }
+    return None
+
+
+def _timestamp_cursor_column(columns: list[dict[str, Any]]) -> dict[str, Any] | None:
+    preferred_names = (
+        "created_at",
+        "inserted_at",
+        "created_on",
+        "inserted_on",
+        "created_ts",
+        "inserted_ts",
+    )
+    by_name = {column_name(column).lower(): column for column in columns}
+    for name in preferred_names:
+        column = by_name.get(name)
+        if column is not None and _looks_timestamp_type(column.get("data_type")):
+            return column
+    for column in columns:
+        name = column_name(column).lower()
+        if ("created" in name or "inserted" in name) and _looks_timestamp_type(
+            column.get("data_type")
+        ):
+            return column
+    return None
+
+
+def _auto_increment_primary_key(columns: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for column in columns:
+        if not column.get("is_primary_key"):
+            continue
+        if not is_numeric_type(str(column.get("data_type") or "")):
+            continue
+        if _looks_auto_incrementing(column):
+            return column
+    return None
+
+
+def _looks_timestamp_type(type_name: Any) -> bool:
+    lowered = str(type_name or "").lower()
+    return any(token in lowered for token in ("timestamp", "datetime", "date"))
+
+
+def _looks_auto_incrementing(column: dict[str, Any]) -> bool:
+    data_type = str(column.get("data_type") or "").lower()
+    default = str(
+        column.get("default_value")
+        or column.get("column_default")
+        or column.get("default")
+        or ""
+    ).lower()
+    extra = str(
+        column.get("extra") or column.get("generation_expression") or ""
+    ).lower()
+    identity = str(column.get("identity") or column.get("is_identity") or "").lower()
+    return any(
+        token in f"{data_type} {default} {extra} {identity}"
+        for token in (
+            "serial",
+            "identity",
+            "nextval",
+            "auto_increment",
+            "autoincrement",
+        )
+    )
+
+
+def _executable_trigger_from_prompt(prompt: str) -> dict[str, Any]:
+    lowered = prompt.lower()
+    if re.search(r"\b(new|inserted|added|created)\b", lowered):
+        return {
+            "type": "new_rows",
+            "path": "rows",
+            "operator": "count_gt",
+            "value": 0,
+        }
+    return {
+        "type": "rows_present",
+        "path": "rows",
+        "operator": "count_gt",
+        "value": 0,
+        "expression": _trigger_from_prompt(prompt, schedule=None).get("expression"),
+    }
+
+
+def _notification_action_plan(
+    prompt: str,
+    *,
+    actions: tuple[str, ...],
+) -> dict[str, Any]:
+    lowered = prompt.lower()
+    wants_notification = bool(
+        actions
+        or re.search(r"\b(notify|notified|alert|tell me|let me know)\b", lowered)
+    )
+    if not wants_notification:
+        return {"kind": "none", "steps": []}
+    delivery_kind = "local"
+    target: dict[str, Any] = {"type": "runtime_console"}
+    if "email" in lowered or re.search(r"\S+@\S+", prompt):
+        delivery_kind = "email"
+        target = {"type": "email"}
+    elif "slack" in lowered or re.search(r"#[A-Za-z0-9_-]+", prompt):
+        delivery_kind = "slack"
+        target = {"type": "slack"}
+    elif "webhook" in lowered:
+        delivery_kind = "webhook"
+        target = {"type": "webhook"}
+    return {
+        "kind": "notification",
+        "delivery_intent": {
+            "delivery_kind": delivery_kind,
+            "target": target,
+            "template": "New rows were observed for the monitored table.",
+            "include_observed_rows": True,
+        },
+    }
+
+
+def _proposal_validation_errors(
+    *,
+    observation_plan: dict[str, Any],
+    schedule: dict[str, Any] | None,
+    stream: dict[str, Any] | None,
+    trigger: dict[str, Any],
+    action_plan: dict[str, Any],
+) -> tuple[str, ...]:
+    errors: list[str] = []
+    kind = observation_plan.get("kind")
+    if kind not in {"planned_read", "metric_sql", "freshness_sql", "plugin_source"}:
+        errors.append("monitor.proposal_incomplete:observation_plan")
+    if kind in {"planned_read", "metric_sql", "freshness_sql"}:
+        sql = observation_plan.get("sql")
+        target = observation_plan.get("target_name") or observation_plan.get("target")
+        if not isinstance(sql, str) or not sql.strip():
+            errors.append("monitor.proposal_incomplete:observation_sql")
+        if not isinstance(target, str) or not _valid_sql_identifier(target):
+            errors.append("monitor.proposal_incomplete:source")
+        if not observation_plan.get("cursor") or not observation_plan.get(
+            "cursor_update"
+        ):
+            errors.append("monitor.proposal_incomplete:cursor")
+        if not observation_plan.get("value_path"):
+            errors.append("monitor.proposal_incomplete:value_path")
+    if schedule is None and stream is None:
+        errors.append("monitor.proposal_incomplete:schedule_or_stream")
+    if not trigger.get("operator") and not any(
+        key in trigger for key in ("gt", "gte", "lt", "lte", "equals", "truthy")
+    ):
+        errors.append("monitor.proposal_incomplete:trigger")
+    if action_plan.get("kind") == "notification":
+        delivery = action_plan.get("delivery_intent")
+        if not isinstance(delivery, dict) or not delivery.get("delivery_kind"):
+            errors.append("monitor.proposal_incomplete:delivery")
+    return tuple(dict.fromkeys(errors))
+
+
+def _monitor_from_proposal(
+    proposal: dict[str, Any],
+    *,
+    validation: DbMonitorValidation | None = None,
+) -> DbMonitor:
+    metadata = dict(proposal.get("metadata") or {})
+    if validation is not None:
+        metadata["validation"] = validation.to_dict()
+    metadata["proposal_fingerprint"] = proposal.get("proposal_fingerprint")
+    return DbMonitor(
+        id=str(proposal["monitor_id"]),
+        name=str(proposal["name"]),
+        description=str(proposal.get("description") or ""),
+        status=str(proposal.get("status") or "active"),  # type: ignore[arg-type]
+        source_scope=tuple(str(item) for item in proposal.get("source_scope") or ()),
+        schedule=proposal.get("schedule"),
+        stream=proposal.get("stream"),
+        trigger=dict(proposal.get("trigger") or {}),
+        observation_plan=dict(proposal.get("observation_plan") or {}),
+        action_plan=dict(proposal.get("action_plan") or {}),
+        policy=dict(proposal.get("policy") or {}),
+        budgets=dict(proposal.get("budgets") or {}),
+        owner=dict(proposal.get("owner") or {}),
+        metadata=metadata,
+    )
+
+
+def _valid_sql_identifier(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", value or ""))
+
+
+def _stable_monitor_payload_hash(payload: dict[str, Any]) -> str:
+    cleaned = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"proposal_fingerprint"}
+    }
+    encoded = json.dumps(cleaned, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _title_from_phrase(phrase: str) -> str:

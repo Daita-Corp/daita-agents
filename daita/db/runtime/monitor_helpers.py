@@ -18,7 +18,6 @@ from ..analysis import (
 )
 
 
-
 def _normalize_monitor_action_plan(
     action_plan: dict[str, Any],
     *,
@@ -52,6 +51,43 @@ def _normalize_monitor_action_plan(
         "propose_write",
     }:
         kind = "write_proposal"
+    if kind in {"notify", "notification", "deliver", "delivery"}:
+        kind = "notification"
+
+    if kind == "notification":
+        delivery_intent = dict(
+            raw.get("delivery_intent")
+            or raw.get("delivery")
+            or raw.get("notification")
+            or {}
+        )
+        if not delivery_intent:
+            return _invalid_monitor_action(
+                raw,
+                kind=kind,
+                reason="missing_delivery_intent",
+            )
+        if not delivery_intent.get("delivery_kind") and delivery_intent.get("mode"):
+            delivery_intent["delivery_kind"] = delivery_intent.get("mode")
+        if not delivery_intent.get("delivery_kind"):
+            return _invalid_monitor_action(
+                raw,
+                kind=kind,
+                reason="missing_delivery_kind",
+            )
+        return {
+            "valid": True,
+            "kind": "notification",
+            "title": raw.get("title") or raw.get("goal") or "Monitor notification",
+            "template": raw.get("template") or delivery_intent.get("template"),
+            "output": dict(
+                raw.get("output") or {"kind": "notification", "format": "markdown"}
+            ),
+            "delivery_status": "deferred",
+            "delivery_phase": 3,
+            "delivery_intent": delivery_intent,
+            "original_action_plan": raw,
+        }
 
     if kind == "investigation":
         analysis_steps = [

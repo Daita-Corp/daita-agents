@@ -343,6 +343,21 @@ def monitor_trigger_matches(value: Any, trigger: Mapping[str, Any]) -> bool:
         if trigger.get("path")
         else value
     )
+    operator = trigger.get("operator")
+    if operator == "count_gt":
+        try:
+            threshold = int(trigger.get("value", 0))
+        except (TypeError, ValueError):
+            return False
+        if not (_candidate_count(candidate) > threshold):
+            return False
+    elif operator == "count_gte":
+        try:
+            threshold = int(trigger.get("value", 0))
+        except (TypeError, ValueError):
+            return False
+        if not (_candidate_count(candidate) >= threshold):
+            return False
     if "equals" in trigger and candidate != trigger["equals"]:
         return False
     if "not_equals" in trigger and candidate == trigger["not_equals"]:
@@ -358,6 +373,18 @@ def monitor_trigger_matches(value: Any, trigger: Mapping[str, Any]) -> bool:
     if "lte" in trigger and not (candidate <= trigger["lte"]):
         return False
     return True
+
+
+def _candidate_count(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, Mapping):
+        if isinstance(value.get("count"), int):
+            return int(value["count"])
+        return len(value)
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    return 1
 
 
 def _extract_path(value: Any, path: str) -> Any:

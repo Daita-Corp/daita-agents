@@ -138,6 +138,17 @@ class DbRuntimeMonitorActionsMixin:
             )
 
         kind = str(normalized.get("kind") or "")
+        if kind == "notification":
+            return await self._execute_monitor_notification_action(
+                operation,
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+                action_plan=normalized,
+                action_plan_fingerprint=fingerprint,
+                tick_evidence_refs=tick_evidence_refs,
+                plan_evidence=plan_evidence,
+            )
         if kind == "investigation":
             return await self._execute_monitor_investigation_action(
                 operation,
@@ -183,6 +194,46 @@ class DbRuntimeMonitorActionsMixin:
             tick_evidence_refs=tick_evidence_refs,
             plan_evidence=plan_evidence,
             reason="unsupported_action_kind",
+        )
+
+    async def _execute_monitor_notification_action(
+        self,
+        operation: Operation,
+        *,
+        monitor_id: str,
+        monitor_run_id: str,
+        tick_operation_id: str,
+        action_plan: dict[str, Any],
+        action_plan_fingerprint: str,
+        tick_evidence_refs: tuple[dict[str, Any], ...],
+        plan_evidence: Evidence,
+    ) -> dict[str, Any]:
+        report = await self._persist_monitor_report_evidence(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_plan=action_plan,
+            action_plan_fingerprint=action_plan_fingerprint,
+            tick_evidence_refs=tick_evidence_refs,
+            produced_evidence=(),
+        )
+        await self.kernel.complete_operation(
+            operation.id,
+            status=OperationStatus.SUCCEEDED,
+            message=f"Monitor notification action {operation.id} succeeded.",
+        )
+        return await self._persist_monitor_action_result(
+            operation,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+            action_kind="notification",
+            action_plan_fingerprint=action_plan_fingerprint,
+            tick_evidence_refs=tick_evidence_refs,
+            plan_evidence=plan_evidence,
+            status="succeeded",
+            extra_produced_evidence=(report,),
         )
 
     async def _prepare_monitor_action_operation(
@@ -1177,12 +1228,13 @@ class DbRuntimeMonitorActionsMixin:
             "monitor_id": monitor_id,
             "monitor_run_id": monitor_run_id,
             "tick_operation_id": tick_operation_id,
-            "action_kind": "scheduled_report",
+            "action_kind": action_plan.get("kind") or "scheduled_report",
             "action_plan_fingerprint": action_plan_fingerprint,
             "title": action_plan.get("title"),
             "format": dict(action_plan.get("output") or {}).get("format"),
+            "template": action_plan.get("template"),
             "delivery_status": "deferred",
-            "delivery_phase": 6,
+            "delivery_phase": action_plan.get("delivery_phase") or 6,
             "delivery_intent": dict(action_plan.get("delivery_intent") or {}),
             "cited_tick_evidence_refs": [dict(item) for item in tick_evidence_refs],
             "produced_evidence_refs": [
@@ -1200,7 +1252,7 @@ class DbRuntimeMonitorActionsMixin:
                 "monitor_id": monitor_id,
                 "monitor_run_id": monitor_run_id,
                 "tick_operation_id": tick_operation_id,
-                "monitor_action_kind": "scheduled_report",
+                "monitor_action_kind": action_plan.get("kind") or "scheduled_report",
                 "monitor_action_fingerprint": action_plan_fingerprint,
                 "payload_fingerprint": _payload_fingerprint(payload),
             },

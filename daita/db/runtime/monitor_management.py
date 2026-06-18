@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
+import json
 from typing import Any
 from uuid import uuid4
 
@@ -17,6 +19,7 @@ from daita.runtime import (
     RuntimeEventType,
     RuntimeStore,
     SQLiteRuntimeStore,
+    TaskDependency,
 )
 
 from ..models import (
@@ -35,11 +38,9 @@ from ..monitors import (
     DbMonitorStore,
     InMemoryDbMonitorStore,
     SQLiteDbMonitorStore,
-    monitor_with_updates,
 )
 from ..monitor_scheduler import DbMonitorScheduler
-
-
+from .types import DbRuntimeGovernanceBlocked
 
 
 class DbRuntimeMonitorManagementMixin:
@@ -57,6 +58,7 @@ class DbRuntimeMonitorManagementMixin:
 
     async def create_monitor(self, monitor: DbMonitor) -> DbMonitor:
         """Persist a DB monitor definition and audit the create operation."""
+        _raise_if_non_executable_active_monitor(monitor)
         operation, evidence, events = self._monitor_management_artifacts(
             "create",
             monitor=monitor,
@@ -99,42 +101,15 @@ class DbRuntimeMonitorManagementMixin:
         monitor_id: str,
         patch: dict[str, Any],
     ) -> DbMonitor:
-        """Patch a durable monitor definition and audit the update."""
-        monitor = await self.monitor_store.load_monitor(monitor_id)
-        if monitor is None:
-            raise ValueError(f"monitor {monitor_id!r} does not exist")
-        updated = monitor_with_updates(monitor, patch)
-        operation, evidence, events = self._monitor_management_artifacts(
-            "update",
-            monitor=updated,
-            evidence_kind="monitor.state_update",
-            payload={
+        """Patch a durable monitor definition through runtime lifecycle tasks."""
+        result = await self.execute_monitor_lifecycle_operation(
+            {
+                "operation_type": "monitor.update",
                 "monitor_id": monitor_id,
-                "before": monitor.to_dict(),
-                "after": updated.to_dict(),
                 "patch": dict(patch),
-            },
+            }
         )
-        state = await self.monitor_store.load_monitor_state(monitor_id)
-        state = state or DbMonitorState(monitor_id=monitor_id)
-        await self.monitor_store.commit_monitor_mutation(
-            DbMonitorMutation(
-                action="update",
-                operation=operation,
-                evidence=evidence,
-                events=events,
-                monitor_before=monitor,
-                monitor_after=updated,
-                state_after=DbMonitorState.from_dict(
-                    {
-                        **state.to_dict(),
-                        "last_operation_id": operation.id,
-                        "last_management_operation_id": operation.id,
-                    }
-                ),
-            )
-        )
-        return updated
+        return _monitor_from_lifecycle_result(result)
 
     async def pause_monitor(
         self,
@@ -142,103 +117,281 @@ class DbRuntimeMonitorManagementMixin:
         *,
         paused_until: str | None = None,
     ) -> DbMonitor:
-        """Mark a monitor paused and persist its pause state."""
-        monitor = await self.monitor_store.load_monitor(monitor_id)
-        if monitor is None:
-            raise ValueError(f"monitor {monitor_id!r} does not exist")
-        updated = monitor_with_updates(monitor, {"status": "paused"})
-        operation, evidence, events = self._monitor_management_artifacts(
-            "pause",
-            monitor=updated,
-            evidence_kind="monitor.state_update",
-            payload={
+        """Pause a monitor through runtime lifecycle tasks."""
+        result = await self.execute_monitor_lifecycle_operation(
+            {
+                "operation_type": "monitor.pause",
                 "monitor_id": monitor_id,
-                "before": monitor.to_dict(),
-                "after": updated.to_dict(),
+                "paused_until": paused_until,
+            }
+        )
+        return _monitor_from_lifecycle_result(result)
+
+    async def resume_monitor(self, monitor_id: str) -> DbMonitor:
+        """Resume a monitor through runtime lifecycle tasks."""
+        result = await self.execute_monitor_lifecycle_operation(
+            {
+                "operation_type": "monitor.resume",
+                "monitor_id": monitor_id,
+            }
+        )
+        return _monitor_from_lifecycle_result(result)
+
+    async def delete_monitor(self, monitor_id: str) -> DbMonitor:
+        """Delete a monitor through runtime lifecycle tasks."""
+        result = await self.execute_monitor_lifecycle_operation(
+            {
+                "operation_type": "monitor.delete",
+                "monitor_id": monitor_id,
+            }
+        )
+        return _monitor_from_lifecycle_result(result)
+
+    async def execute_monitor_lifecycle_operation(
+        self,
+        request: dict[str, Any],
+        *,
+        context: dict[str, Any] | None = None,
+        operation_id: str | None = None,
+        source: str = "runtime",
+    ) -> DbOperationResult:
+        """Run update/delete/pause/resume through proposal and commit tasks."""
+
+        if not self._is_setup:
+            await self.setup()
+        operation_type = str(request.get("operation_type") or "monitor.update")
+        action = _monitor_lifecycle_action(operation_type)
+        monitor_id = str(request.get("monitor_id") or "")
+        if not monitor_id:
+            raise ValueError("monitor lifecycle operation requires monitor_id")
+        patch = dict(request.get("patch") or {})
+        paused_until = request.get("paused_until")
+        required_evidence = frozenset(
+            {
+                "monitor.proposal",
+                _monitor_lifecycle_evidence_kind(action),
+            }
+        )
+        operation = await self.kernel.create_operation(
+            operation_id=operation_id,
+            operation_type=operation_type,
+            request={
+                "kind": operation_type,
+                "monitor_id": monitor_id,
+                "patch": patch,
+                "paused_until": paused_until,
+                "source": source,
+                **dict(context or {}),
+            },
+            required_evidence=required_evidence,
+            metadata={
+                "runtime_id": self.runtime_id,
+                "runtime_kind": self.runtime_kind,
+                "control_plane": "db.monitor",
+                "monitor_id": monitor_id,
+                "command_kind": action,
+                "access": AccessMode.WRITE.value,
+                "resume_context": {
+                    "request": {
+                        "operation_type": operation_type,
+                        "monitor_id": monitor_id,
+                        "patch": patch,
+                        "paused_until": paused_until,
+                    },
+                    "contract": {
+                        "operation_type": operation_type,
+                        "required_evidence": sorted(required_evidence),
+                        "access": AccessMode.WRITE.value,
+                    },
+                },
+            },
+            evaluate_governance=False,
+        )
+        plan_task = await self.kernel.plan_task(
+            operation_id=operation.id,
+            capability_id="db.monitor.plan_lifecycle",
+            owner="db_runtime",
+            input={
+                "action": action,
+                "monitor_id": monitor_id,
+                "patch": patch,
                 "paused_until": paused_until,
             },
-        )
-        state = await self.monitor_store.load_monitor_state(monitor_id)
-        state = state or DbMonitorState(monitor_id=monitor_id)
-        await self.monitor_store.commit_monitor_mutation(
-            DbMonitorMutation(
-                action="pause",
-                operation=operation,
-                evidence=evidence,
-                events=events,
-                monitor_before=monitor,
-                monitor_after=updated,
-                state_after=DbMonitorState.from_dict(
+            metadata={
+                "reason": f"monitor_{action}_planning",
+                "sequence": 1,
+                "idempotency_key": _stable_monitor_lifecycle_hash(
                     {
-                        **state.to_dict(),
-                        "last_operation_id": operation.id,
-                        "last_management_operation_id": operation.id,
+                        "operation_type": operation_type,
+                        "monitor_id": monitor_id,
+                        "patch": patch,
                         "paused_until": paused_until,
                     }
                 ),
-            )
-        )
-        return updated
-
-    async def resume_monitor(self, monitor_id: str) -> DbMonitor:
-        """Resume a paused monitor."""
-        monitor = await self.monitor_store.load_monitor(monitor_id)
-        if monitor is None:
-            raise ValueError(f"monitor {monitor_id!r} does not exist")
-        updated = monitor_with_updates(monitor, {"status": "active"})
-        operation, evidence, events = self._monitor_management_artifacts(
-            "resume",
-            monitor=updated,
-            evidence_kind="monitor.state_update",
-            payload={
-                "monitor_id": monitor_id,
-                "before": monitor.to_dict(),
-                "after": updated.to_dict(),
             },
         )
-        state = await self.monitor_store.load_monitor_state(monitor_id)
-        state = state or DbMonitorState(monitor_id=monitor_id)
-        await self.monitor_store.commit_monitor_mutation(
-            DbMonitorMutation(
-                action="resume",
-                operation=operation,
-                evidence=evidence,
-                events=events,
-                monitor_before=monitor,
-                monitor_after=updated,
-                state_after=DbMonitorState.from_dict(
-                    {
-                        **state.to_dict(),
-                        "last_operation_id": operation.id,
-                        "last_management_operation_id": operation.id,
-                        "paused_until": None,
-                    }
-                ),
-            )
+        plan_evidence = await self.execute_task(plan_task, operation)
+        proposal_evidence = next(
+            (item for item in plan_evidence if item.kind == "monitor.proposal"),
+            None,
         )
-        return updated
+        if proposal_evidence is None:
+            raise RuntimeError("monitor lifecycle planning did not produce proposal evidence")
+        proposal = dict(proposal_evidence.payload)
+        validation = _validation_from_lifecycle_proposal(proposal)
+        if not validation.accepted:
+            await self.kernel.block_operation(
+                operation.id,
+                message="Monitor lifecycle proposal is incomplete or unsupported.",
+                payload={"validation": validation.to_dict()},
+            )
+            return await self._record_monitor_lifecycle_result(
+                request=request,
+                operation=operation,
+                action=action,
+                status=OperationStatus.BLOCKED,
+                answer=_monitor_lifecycle_validation_answer(action, validation),
+                evidence=tuple(plan_evidence),
+                warnings=("db_monitor_validation_failed", *validation.warnings),
+                diagnostics={
+                    "proposal": proposal,
+                    "validation": validation.to_dict(),
+                },
+            )
 
-    async def delete_monitor(self, monitor_id: str) -> DbMonitor:
-        """Delete a monitor control-plane record and audit the removal."""
-        monitor = await self.monitor_store.load_monitor(monitor_id)
-        if monitor is None:
-            raise ValueError(f"monitor {monitor_id!r} does not exist")
-        operation, evidence, events = self._monitor_management_artifacts(
-            "delete",
-            monitor=monitor,
-            evidence_kind="monitor.definition",
-            payload={"deleted_monitor": monitor.to_dict()},
+        commit_task = await self.kernel.plan_task(
+            operation_id=operation.id,
+            capability_id="db.monitor.commit_lifecycle",
+            owner="db_runtime",
+            input={
+                "proposal_evidence_id": proposal_evidence.id,
+                "proposal_fingerprint": proposal["proposal_fingerprint"],
+            },
+            metadata={
+                "reason": f"monitor_{action}_commit",
+                "sequence": 2,
+                "idempotency_key": proposal["proposal_fingerprint"],
+            },
+            dependencies=(
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind="monitor.proposal",
+                    evidence_id=proposal_evidence.id,
+                    evidence_owner="db_runtime",
+                    producer_task_id=plan_task.id,
+                    producer_capability_id=plan_task.capability_id,
+                    producer_executor_id=plan_task.executor_id,
+                    evidence_payload={
+                        "proposal_fingerprint": proposal["proposal_fingerprint"],
+                    },
+                    evidence_accepted=True,
+                    operation_id=operation.id,
+                ),
+            ),
         )
-        await self.monitor_store.commit_monitor_mutation(
-            DbMonitorMutation(
-                action="delete",
-                operation=operation,
+        try:
+            commit_evidence = await self.execute_task(commit_task, operation)
+        except DbRuntimeGovernanceBlocked as exc:
+            snapshot = await self.inspect_operation(operation.id)
+            evidence = tuple(plan_evidence)
+            if snapshot is not None:
+                evidence = tuple(snapshot.evidence)
+            return await self._record_monitor_lifecycle_result(
+                request=request,
+                operation=exc.operation,
+                action=action,
+                status=OperationStatus.BLOCKED,
+                answer="This operation requires approval before changing the monitor.",
                 evidence=evidence,
-                events=events,
-                monitor_before=monitor,
+                warnings=("db_runtime_approval_required",),
+                diagnostics={
+                    "proposal": proposal,
+                    "validation": validation.to_dict(),
+                    "governance": exc.governance.to_dict(),
+                },
             )
+
+        lifecycle_evidence = next(
+            (
+                item
+                for item in commit_evidence
+                if item.kind == _monitor_lifecycle_evidence_kind(action)
+            ),
+            None,
         )
-        return monitor
+        if lifecycle_evidence is None:
+            raise RuntimeError("monitor lifecycle commit did not produce commit evidence")
+        monitor_payload = (
+            lifecycle_evidence.payload.get("monitor")
+            or lifecycle_evidence.payload.get("after")
+            or lifecycle_evidence.payload.get("before")
+        )
+        monitor = (
+            DbMonitor.from_dict(monitor_payload)
+            if isinstance(monitor_payload, dict)
+            else None
+        )
+        await self.kernel.complete_operation(
+            operation.id,
+            status=OperationStatus.SUCCEEDED,
+            message=f"Monitor {monitor_id} {action} committed.",
+            payload={"monitor_id": monitor_id, "action": action},
+        )
+        return await self._record_monitor_lifecycle_result(
+            request=request,
+            operation=operation,
+            action=action,
+            status=OperationStatus.SUCCEEDED,
+            answer=_monitor_lifecycle_answer(action, monitor_id),
+            evidence=(*plan_evidence, *commit_evidence),
+            diagnostics={
+                "proposal": proposal,
+                "validation": validation.to_dict(),
+                "monitor": None if monitor is None else monitor.to_dict(),
+            },
+        )
+
+    async def _record_monitor_lifecycle_result(
+        self,
+        *,
+        request: dict[str, Any],
+        operation: Operation,
+        action: str,
+        status: OperationStatus,
+        answer: str,
+        evidence: tuple[Evidence, ...],
+        warnings: tuple[str, ...] = (),
+        diagnostics: dict[str, Any] | None = None,
+    ) -> DbOperationResult:
+        result = DbOperationResult(
+            operation_id=operation.id,
+            request=DbRequest(
+                prompt=str(request.get("prompt") or request.get("operation_type") or ""),
+                metadata={key: value for key, value in request.items() if key != "prompt"},
+            ),
+            intent=DbIntent(
+                kind=DbIntentKind.ADMIN,
+                confidence=1.0,
+                access=AccessMode.WRITE,
+                diagnostics={"command_kind": action},
+            ),
+            contract=DbOperationContract(
+                operation_type=operation.operation_type,
+                required_evidence=tuple(item.kind for item in evidence),
+                access=AccessMode.WRITE,
+                metadata={
+                    "control_plane": "db.monitor",
+                    "monitor_id": operation.metadata.get("monitor_id"),
+                    "action": action,
+                },
+            ),
+            status=status,
+            answer=answer,
+            evidence=evidence,
+            warnings=warnings,
+            diagnostics=diagnostics or {},
+        )
+        return await self._record_operation_result(result, operation=operation)
 
     async def list_monitor_approvals(
         self,
@@ -485,6 +638,103 @@ class DbRuntimeMonitorManagementMixin:
         )
         return operation, (evidence,), (created_event, completed_event)
 
+
+def _raise_if_non_executable_active_monitor(monitor: DbMonitor) -> None:
+    if monitor.status != "active":
+        return
+    reason = _non_executable_observation_plan_reason(monitor.observation_plan)
+    if reason is not None:
+        raise ValueError(
+            "active monitors require an executable observation_plan; " f"{reason}"
+        )
+
+
+def _monitor_from_lifecycle_result(result: DbOperationResult) -> DbMonitor:
+    if result.status is OperationStatus.BLOCKED:
+        if "db_monitor_validation_failed" in result.warnings:
+            validation = result.diagnostics.get("validation")
+            if isinstance(validation, dict) and validation.get("errors"):
+                message = ", ".join(str(item) for item in validation["errors"])
+                message = message.replace("monitor.lifecycle:", "")
+                raise ValueError(message)
+            raise ValueError(result.answer or "Monitor lifecycle proposal is invalid.")
+        raise PermissionError(result.answer or "Monitor lifecycle operation is blocked.")
+    monitor = result.diagnostics.get("monitor")
+    if not isinstance(monitor, dict):
+        raise RuntimeError("monitor lifecycle operation did not return a monitor")
+    return DbMonitor.from_dict(monitor)
+
+
+def _monitor_lifecycle_action(operation_type: str) -> str:
+    normalized = operation_type.removeprefix("monitor.").lower()
+    if normalized in {"update", "pause", "resume", "delete", "disable"}:
+        return normalized
+    raise ValueError(f"unsupported monitor lifecycle operation: {operation_type!r}")
+
+
+def _monitor_lifecycle_evidence_kind(action: str) -> str:
+    if action == "delete":
+        return "monitor.deleted"
+    if action == "disable":
+        return "monitor.disabled"
+    if action == "pause":
+        return "monitor.paused"
+    if action == "resume":
+        return "monitor.resumed"
+    return "monitor.state_update"
+
+
+def _validation_from_lifecycle_proposal(proposal: dict[str, Any]) -> Any:
+    validation = proposal.get("validation")
+    if isinstance(validation, dict):
+        from ..monitor_commands import DbMonitorValidation
+
+        return DbMonitorValidation.from_dict(validation)
+    from ..monitor_commands import DbMonitorValidation
+
+    return DbMonitorValidation(accepted=bool(proposal.get("accepted", True)))
+
+
+def _monitor_lifecycle_validation_answer(action: str, validation: Any) -> str:
+    errors = ", ".join(str(item) for item in validation.errors)
+    return (
+        f"Monitor {action} proposal is incomplete or unsupported"
+        + (f": {errors}" if errors else ".")
+    )
+
+
+def _monitor_lifecycle_answer(action: str, monitor_id: str) -> str:
+    verb = {
+        "update": "Updated",
+        "pause": "Paused",
+        "resume": "Resumed",
+        "delete": "Deleted",
+        "disable": "Disabled",
+    }.get(action, "Updated")
+    return f"{verb} monitor {monitor_id}."
+
+
+def _stable_monitor_lifecycle_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _non_executable_observation_plan_reason(plan: dict[str, Any]) -> str | None:
+    kind = (plan or {}).get("kind")
+    if kind not in {"planned_read", "metric_sql", "freshness_sql", "plugin_source"}:
+        return "missing executable kind"
+    if kind in {"planned_read", "metric_sql", "freshness_sql"}:
+        if not isinstance(plan.get("sql"), str) or not plan["sql"].strip():
+            return "missing observation SQL"
+        if not plan.get("value_path"):
+            return "missing value_path"
+    if kind == "planned_read":
+        if not plan.get("cursor") or not plan.get("cursor_update"):
+            return "missing cursor strategy"
+    if kind == "plugin_source":
+        if not plan.get("capability_id") and not plan.get("source_kind"):
+            return "missing plugin source capability"
+    return None
 
 
 def _default_monitor_store(store: RuntimeStore) -> DbMonitorStore:

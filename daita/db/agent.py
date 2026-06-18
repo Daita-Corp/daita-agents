@@ -54,6 +54,7 @@ class DbAgent:
         name: str,
         schedule: str | dict[str, Any] | None = None,
         watch: str | tuple[str, ...] = "",
+        observation_plan: dict[str, Any] | None = None,
         trigger: str | dict[str, Any] | None = None,
         then: str | tuple[str, ...] | list[str] = (),
         monitor_id: str | None = None,
@@ -65,7 +66,12 @@ class DbAgent:
         owner: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> DbMonitor:
-        """Create a durable DB monitor from typed Phase 1 fields."""
+        """Create a durable DB monitor from typed executable fields."""
+        if observation_plan is None:
+            raise ValueError(
+                "DbAgent.monitor() requires an executable observation_plan. "
+                "Use run_detailed() for prompt-planned monitors."
+            )
         monitor = DbMonitor(
             id=monitor_id or _monitor_id_from_name(name),
             name=name,
@@ -75,7 +81,7 @@ class DbAgent:
             schedule=_schedule_dict(schedule),
             stream=stream,
             trigger=_trigger_dict(trigger, schedule=schedule),
-            observation_plan=_observation_plan(watch),
+            observation_plan=dict(observation_plan),
             action_plan=_action_plan(then),
             policy=dict(policy or {}),
             budgets=dict(budgets or {}),
@@ -213,14 +219,6 @@ def _trigger_dict(
     if schedule is not None:
         return {"type": "schedule", "expression": "always on schedule"}
     return {"type": "manual", "expression": "manual tick"}
-
-
-def _observation_plan(watch: str | tuple[str, ...]) -> dict[str, Any]:
-    if isinstance(watch, str):
-        watches = [watch] if watch else []
-    else:
-        watches = list(watch)
-    return {"watch": watches}
 
 
 def _action_plan(then: str | tuple[str, ...] | list[str]) -> dict[str, Any]:

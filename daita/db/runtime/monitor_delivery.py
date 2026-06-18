@@ -131,7 +131,7 @@ class DbRuntimeMonitorDeliveryMixin:
                 tick_operation_id=tick_operation_id,
             )
         except MonitorPluginPlanningBlocked as exc:
-            await self._persist_monitor_delivery_plan(
+            blocked_plan_evidence = await self._persist_monitor_delivery_plan(
                 operation,
                 monitor_id=monitor_id,
                 monitor_run_id=monitor_run_id,
@@ -160,6 +160,7 @@ class DbRuntimeMonitorDeliveryMixin:
                 status="blocked",
                 idempotency_key="",
                 block_reason=exc.reason,
+                plan_evidence=blocked_plan_evidence,
             )
 
         capability = plan.capability
@@ -470,12 +471,30 @@ class DbRuntimeMonitorDeliveryMixin:
                 return dict(existing.payload)
         evidence_id = f"monitor-delivery-result-{uuid4()}"
         plugin_refs = [evidence_ref(item) for item in plugin_result_evidence if item.id]
+        delivery_intent = (
+            dict(plan_evidence.payload.get("delivery_intent") or {})
+            if plan_evidence is not None
+            else {}
+        )
+        delivery_target = delivery_intent.get("target")
+        delivery_target = delivery_target if isinstance(delivery_target, dict) else {}
+        delivery_channel = (
+            delivery_target.get("channel")
+            or delivery_target.get("type")
+            or delivery_target.get("recipient")
+            or delivery_target.get("address")
+            or delivery_target.get("url")
+            or delivery_target.get("endpoint")
+            or delivery_target.get("path")
+        )
         payload = {
             "monitor_id": monitor_id,
             "monitor_run_id": monitor_run_id,
             "tick_operation_id": tick_operation_id,
             "delivery_operation_id": operation.id,
             "delivery_kind": delivery_kind,
+            "delivery_target": dict(delivery_target),
+            "delivery_channel": delivery_channel,
             "capability_id": capability.id if capability is not None else None,
             "capability_owner": capability.owner if capability is not None else None,
             "action_plan_fingerprint": action_plan_fingerprint,
@@ -506,6 +525,7 @@ class DbRuntimeMonitorDeliveryMixin:
                 "monitor_run_id": monitor_run_id,
                 "tick_operation_id": tick_operation_id,
                 "monitor_delivery_kind": delivery_kind,
+                "monitor_delivery_channel": delivery_channel,
                 "monitor_report_fingerprint": report_fingerprint,
                 "payload_fingerprint": _payload_fingerprint(payload),
             },
@@ -821,6 +841,8 @@ class DbRuntimeMonitorDeliveryMixin:
             **run.summary,
             "delivery_status": result_payload.get("status"),
             "delivery_kind": result_payload.get("delivery_kind"),
+            "delivery_target": dict(result_payload.get("delivery_target") or {}),
+            "delivery_channel": result_payload.get("delivery_channel"),
             "delivery_operation_id": result_payload.get("delivery_operation_id"),
             "delivery_result_evidence_id": result_payload.get(
                 "delivery_result_evidence_id"
@@ -878,4 +900,3 @@ class DbRuntimeMonitorDeliveryMixin:
                 run_after=updated_run,
             )
         )
-

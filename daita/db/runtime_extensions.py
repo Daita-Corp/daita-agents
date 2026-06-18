@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from typing import Any, Mapping
+from uuid import uuid4
 
 from daita.plugins import PluginContext, PluginKind, PluginManifest
 from daita.plugins.base import RuntimeExtensionPlugin
@@ -28,6 +29,19 @@ from .analysis import (
     validate_analysis_plan_payload,
 )
 from .llm_planner import DbLLMPlannerExecutor, DbLLMRepairExecutor
+from .monitor_commands import (
+    DbMonitorCommand,
+    DbMonitorPlanner,
+    DbMonitorValidation,
+    _monitor_from_proposal,
+    _target_resource_from_prompt,
+)
+from .monitors import (
+    DbMonitor,
+    DbMonitorMutation,
+    DbMonitorState,
+    monitor_with_updates,
+)
 from .plan_validation import DbQueryPlanValidator
 from .planning_context import DbPlanningContextBuilder
 from .query_plan import DbQueryPlan
@@ -215,6 +229,137 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 replay_safe=True,
                 idempotent=True,
             ),
+            Capability(
+                id="db.monitor.plan_create",
+                owner="db_runtime",
+                description="Plan an executable DB monitor proposal from a monitor create prompt.",
+                domains=frozenset({"db", "monitor"}),
+                operation_types=frozenset({"monitor.create"}),
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.LOW,
+                input_schema=common_schema,
+                output_evidence=frozenset({"monitor.proposal"}),
+                executor="db_runtime.monitor.plan_create",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
+                id="db.monitor.commit_create",
+                owner="db_runtime",
+                description="Commit an approved executable DB monitor proposal.",
+                domains=frozenset({"db", "monitor"}),
+                operation_types=frozenset({"monitor.create"}),
+                access=AccessMode.WRITE,
+                risk=RiskLevel.MEDIUM,
+                input_schema=common_schema,
+                output_evidence=frozenset({"monitor.definition"}),
+                executor="db_runtime.monitor.commit_create",
+                runtime_only=True,
+                side_effecting=True,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
+                id="db.monitor.plan_lifecycle",
+                owner="db_runtime",
+                description="Plan an auditable DB monitor lifecycle proposal.",
+                domains=frozenset({"db", "monitor"}),
+                operation_types=frozenset(
+                    {
+                        "monitor.update",
+                        "monitor.pause",
+                        "monitor.resume",
+                        "monitor.delete",
+                        "monitor.disable",
+                    }
+                ),
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.LOW,
+                input_schema=common_schema,
+                output_evidence=frozenset({"monitor.proposal"}),
+                executor="db_runtime.monitor.plan_lifecycle",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
+                id="db.monitor.commit_lifecycle",
+                owner="db_runtime",
+                description="Commit an approved DB monitor lifecycle proposal.",
+                domains=frozenset({"db", "monitor"}),
+                operation_types=frozenset(
+                    {
+                        "monitor.update",
+                        "monitor.pause",
+                        "monitor.resume",
+                        "monitor.delete",
+                        "monitor.disable",
+                    }
+                ),
+                access=AccessMode.WRITE,
+                risk=RiskLevel.MEDIUM,
+                input_schema=common_schema,
+                output_evidence=frozenset(
+                    {
+                        "monitor.state_update",
+                        "monitor.definition",
+                        "monitor.deleted",
+                        "monitor.disabled",
+                    }
+                ),
+                executor="db_runtime.monitor.commit_lifecycle",
+                runtime_only=True,
+                side_effecting=True,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
+                id="monitor.delivery.local",
+                owner="db_runtime",
+                description="Record a local monitor notification delivery for CLI/runtime use.",
+                domains=frozenset({"monitor", "local"}),
+                operation_types=frozenset({"monitor.delivery"}),
+                access=AccessMode.NONE,
+                risk=RiskLevel.LOW,
+                input_schema={
+                    "type": "object",
+                    "required": ["delivery_kind", "target", "payload_source"],
+                    "properties": {
+                        "delivery_kind": {"type": "string"},
+                        "target": {"type": "object"},
+                        "format": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "idempotency_key": {"type": "string"},
+                        "payload_source": {"type": "object"},
+                    },
+                },
+                output_evidence=frozenset({"local.notification.delivery"}),
+                executor="db_runtime.monitor.delivery.local",
+                runtime_only=True,
+                side_effecting=True,
+                replay_safe=True,
+                idempotent=True,
+                metadata={
+                    "monitor_roles": ["delivery"],
+                    "delivery_kind": "local",
+                    "accepted_payload_kinds": [
+                        "monitor.report",
+                        "monitor.action_result",
+                        "analysis.synthesis",
+                    ],
+                    "accepted_formats": ["markdown", "plain", "text"],
+                    "accepted_target_types": [
+                        "runtime_console",
+                        "terminal",
+                        "stdout",
+                        "callback",
+                    ],
+                    "supports_idempotency_key": True,
+                },
+            ),
         ]
         if self.llm_capable:
             capabilities.extend(
@@ -264,6 +409,11 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
             DbAnalysisCheckpointExecutor(self),
             DbAnalysisSummarizeExecutor(self),
             DbAnalysisReplanExecutor(self),
+            DbMonitorPlanCreateExecutor(self),
+            DbMonitorCommitCreateExecutor(self),
+            DbMonitorPlanLifecycleExecutor(self),
+            DbMonitorCommitLifecycleExecutor(self),
+            DbMonitorLocalDeliveryExecutor(self),
         ]
         if self.llm_capable:
             executors.append(DbLLMPlannerExecutor(runtime=self))
@@ -344,6 +494,54 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 json_schema=object_schema,
                 description="Auditable multi-step analysis replan or repair revision.",
+            ),
+            EvidenceSchema(
+                kind="monitor.proposal",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Executable monitor proposal produced by DB monitor planning.",
+            ),
+            EvidenceSchema(
+                kind="monitor.definition",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor definition committed from a proposal.",
+            ),
+            EvidenceSchema(
+                kind="monitor.action_plan",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Normalized monitor action plan selected for a triggered run.",
+            ),
+            EvidenceSchema(
+                kind="monitor.report",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Durable monitor notification or report payload descriptor.",
+            ),
+            EvidenceSchema(
+                kind="monitor.action_result",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Monitor action execution result linked to a trigger run.",
+            ),
+            EvidenceSchema(
+                kind="monitor.delivery_plan",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Resolved notification delivery capability plan.",
+            ),
+            EvidenceSchema(
+                kind="monitor.delivery_result",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Durable notification delivery status for a monitor run.",
+            ),
+            EvidenceSchema(
+                kind="local.notification.delivery",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Local runtime notification delivery result.",
             ),
         )
 
@@ -565,6 +763,434 @@ class DbQueryPlanValidationExecutor:
         ]
 
 
+@dataclass(frozen=True)
+class DbMonitorPlanCreateExecutor:
+    """Executor that persists accepted or blocked monitor proposal evidence."""
+
+    plugin: DbRuntimePlanningPlugin
+    id: str = "db_runtime.monitor.plan_create"
+    owner: str = "db_runtime"
+    capability_ids: frozenset[str] = frozenset({"db.monitor.plan_create"})
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        runtime = self.plugin.runtime
+        command = DbMonitorCommand(
+            **dict(task.input.get("command") or operation.request.get("command") or {})
+        )
+        target = _target_resource_from_prompt(command.prompt)
+        schema_evidence = await _inspect_monitor_target_schema(
+            runtime,
+            operation,
+            target=target,
+        )
+        proposal, validation = DbMonitorPlanner(
+            registry=runtime.registry,
+            limits=runtime.config.limits.to_dict(),
+        ).create_proposal(
+            command,
+            source_scope=tuple(
+                str(item) for item in task.input.get("source_scope") or ()
+            ),
+            owner=dict(task.input.get("owner") or {}),
+            schema=(schema_evidence.payload if schema_evidence is not None else None),
+            schema_evidence_id=(
+                schema_evidence.id if schema_evidence is not None else None
+            ),
+        )
+        fingerprint = str(
+            proposal.get("proposal_fingerprint") or stable_fingerprint(proposal)
+        )
+        proposal.setdefault("proposal_fingerprint", fingerprint)
+        proposal.setdefault("kind", "monitor.proposal")
+        proposal["validation"] = validation.to_dict()
+        return [
+            Evidence(
+                kind="monitor.proposal",
+                owner="db_runtime",
+                operation_id=operation.id,
+                task_id=task.id,
+                accepted=validation.accepted,
+                payload=proposal,
+                metadata={
+                    "payload_fingerprint": fingerprint,
+                    "monitor_id": proposal.get("monitor_id"),
+                    "validation_accepted": validation.accepted,
+                },
+            )
+        ]
+
+
+@dataclass(frozen=True)
+class DbMonitorCommitCreateExecutor:
+    """Executor that idempotently commits a monitor proposal."""
+
+    plugin: DbRuntimePlanningPlugin
+    id: str = "db_runtime.monitor.commit_create"
+    owner: str = "db_runtime"
+    capability_ids: frozenset[str] = frozenset({"db.monitor.commit_create"})
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        runtime = self.plugin.runtime
+        proposal_evidence = await _load_evidence(
+            runtime,
+            operation.id,
+            task.input.get("proposal_evidence_id"),
+        )
+        if proposal_evidence is None:
+            raise RuntimeError("monitor proposal evidence is required")
+        if not proposal_evidence.accepted:
+            raise RuntimeError("monitor proposal evidence was not accepted")
+        proposal = dict(proposal_evidence.payload)
+        expected_fingerprint = task.input.get("proposal_fingerprint")
+        actual_fingerprint = proposal.get("proposal_fingerprint") or stable_fingerprint(
+            proposal
+        )
+        if expected_fingerprint and expected_fingerprint != actual_fingerprint:
+            raise RuntimeError("monitor proposal fingerprint mismatch")
+
+        validation = DbMonitorValidation.from_dict(
+            dict(
+                proposal.get("validation")
+                or proposal.get("metadata", {}).get("validation")
+                or {}
+            )
+        )
+        monitor = _monitor_from_proposal(proposal, validation=validation)
+        existing = await runtime.inspect_monitor(monitor.id)
+        committed_existing = existing is not None
+        if existing is None:
+            initial_state = dict(proposal.get("initial_state") or {})
+            await runtime.monitor_store.commit_monitor_mutation(
+                DbMonitorMutation(
+                    action="create",
+                    operation=operation,
+                    monitor_after=monitor,
+                    state_after=DbMonitorState(
+                        monitor_id=monitor.id,
+                        cursor=dict(initial_state.get("cursor") or {}),
+                        last_operation_id=operation.id,
+                        last_management_operation_id=operation.id,
+                    ),
+                )
+            )
+        return [
+            Evidence(
+                kind="monitor.definition",
+                owner="db_runtime",
+                operation_id=operation.id,
+                task_id=task.id,
+                accepted=True,
+                payload={
+                    "monitor": monitor.to_dict(),
+                    "proposal_evidence_id": proposal_evidence.id,
+                    "proposal_fingerprint": actual_fingerprint,
+                    "idempotent_existing": committed_existing,
+                },
+                metadata={
+                    "payload_fingerprint": actual_fingerprint,
+                    "proposal_evidence_id": proposal_evidence.id,
+                    "monitor_id": monitor.id,
+                    "idempotent_existing": committed_existing,
+                },
+            )
+        ]
+
+
+@dataclass(frozen=True)
+class DbMonitorPlanLifecycleExecutor:
+    """Executor that persists accepted or blocked monitor lifecycle proposals."""
+
+    plugin: DbRuntimePlanningPlugin
+    id: str = "db_runtime.monitor.plan_lifecycle"
+    owner: str = "db_runtime"
+    capability_ids: frozenset[str] = frozenset({"db.monitor.plan_lifecycle"})
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        runtime = self.plugin.runtime
+        action = _monitor_lifecycle_action(
+            str(task.input.get("action") or operation.operation_type)
+        )
+        monitor_id = str(
+            task.input.get("monitor_id") or operation.metadata.get("monitor_id") or ""
+        )
+        if not monitor_id:
+            raise RuntimeError("monitor lifecycle proposal requires monitor_id")
+
+        monitor = await runtime.monitor_store.load_monitor(monitor_id)
+        errors: list[str] = []
+        before = monitor.to_dict() if monitor is not None else None
+        after = None
+        patch = dict(task.input.get("patch") or {})
+        paused_until = task.input.get("paused_until")
+        if monitor is None:
+            errors.append("monitor.lifecycle:monitor_not_found")
+        else:
+            try:
+                updated = _monitor_after_lifecycle_action(
+                    monitor,
+                    action=action,
+                    patch=patch,
+                    paused_until=paused_until,
+                )
+                after = None if updated is None else updated.to_dict()
+                reason = (
+                    None
+                    if updated is None
+                    else _non_executable_active_monitor_reason(
+                        updated.observation_plan,
+                    )
+                )
+                if updated is not None and updated.status == "active" and reason:
+                    errors.append(f"monitor.lifecycle:{reason}")
+            except ValueError as exc:
+                errors.append(f"monitor.lifecycle:{str(exc)}")
+
+        validation = DbMonitorValidation(
+            accepted=not errors,
+            errors=tuple(errors),
+            diagnostics={
+                "action": action,
+                "operation_type": operation.operation_type,
+            },
+        )
+        proposal = {
+            "kind": "monitor.proposal",
+            "operation_type": operation.operation_type,
+            "action": action,
+            "monitor_id": monitor_id,
+            "before": before,
+            "after": after,
+            "patch": patch,
+            "paused_until": paused_until,
+            "validation": validation.to_dict(),
+        }
+        fingerprint = stable_fingerprint(proposal)
+        proposal["proposal_fingerprint"] = fingerprint
+        return [
+            Evidence(
+                kind="monitor.proposal",
+                owner="db_runtime",
+                operation_id=operation.id,
+                task_id=task.id,
+                accepted=validation.accepted,
+                payload=proposal,
+                metadata={
+                    "payload_fingerprint": fingerprint,
+                    "monitor_id": monitor_id,
+                    "action": action,
+                    "validation_accepted": validation.accepted,
+                },
+            )
+        ]
+
+
+@dataclass(frozen=True)
+class DbMonitorCommitLifecycleExecutor:
+    """Executor that idempotently commits a monitor lifecycle proposal."""
+
+    plugin: DbRuntimePlanningPlugin
+    id: str = "db_runtime.monitor.commit_lifecycle"
+    owner: str = "db_runtime"
+    capability_ids: frozenset[str] = frozenset({"db.monitor.commit_lifecycle"})
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        runtime = self.plugin.runtime
+        proposal_evidence = await _load_evidence(
+            runtime,
+            operation.id,
+            task.input.get("proposal_evidence_id"),
+        )
+        if proposal_evidence is None:
+            raise RuntimeError("monitor lifecycle proposal evidence is required")
+        if not proposal_evidence.accepted:
+            raise RuntimeError("monitor lifecycle proposal evidence was not accepted")
+        proposal = dict(proposal_evidence.payload)
+        expected_fingerprint = task.input.get("proposal_fingerprint")
+        actual_fingerprint = proposal.get("proposal_fingerprint") or stable_fingerprint(
+            proposal
+        )
+        if expected_fingerprint and expected_fingerprint != actual_fingerprint:
+            raise RuntimeError("monitor lifecycle proposal fingerprint mismatch")
+
+        action = _monitor_lifecycle_action(str(proposal.get("action") or "update"))
+        monitor_id = str(proposal.get("monitor_id") or "")
+        before_payload = proposal.get("before")
+        after_payload = proposal.get("after")
+        before = (
+            DbMonitor.from_dict(before_payload)
+            if isinstance(before_payload, Mapping)
+            else None
+        )
+        after = (
+            DbMonitor.from_dict(after_payload)
+            if isinstance(after_payload, Mapping)
+            else None
+        )
+        state = await runtime.monitor_store.load_monitor_state(monitor_id)
+        state = state or DbMonitorState(monitor_id=monitor_id)
+        existing = await runtime.monitor_store.load_monitor(monitor_id)
+        idempotent_existing = _monitor_lifecycle_already_committed(
+            existing,
+            after=after,
+            action=action,
+        )
+        if not idempotent_existing:
+            await runtime.monitor_store.commit_monitor_mutation(
+                DbMonitorMutation(
+                    action=_monitor_lifecycle_mutation_action(action),
+                    operation=operation,
+                    monitor_before=before,
+                    monitor_after=after,
+                    state_after=(
+                        None
+                        if action == "delete"
+                        else DbMonitorState.from_dict(
+                            {
+                                **state.to_dict(),
+                                "last_operation_id": operation.id,
+                                "last_management_operation_id": operation.id,
+                                "paused_until": (
+                                    proposal.get("paused_until")
+                                    if action == "pause"
+                                    else None
+                                    if action == "resume"
+                                    else state.paused_until
+                                ),
+                            }
+                        )
+                    ),
+                )
+            )
+
+        evidence_kind = _monitor_lifecycle_commit_evidence_kind(action)
+        payload = {
+            "monitor_id": monitor_id,
+            "action": action,
+            "before": before_payload,
+            "after": after_payload,
+            "patch": dict(proposal.get("patch") or {}),
+            "proposal_evidence_id": proposal_evidence.id,
+            "proposal_fingerprint": actual_fingerprint,
+            "idempotent_existing": idempotent_existing,
+        }
+        if action == "delete":
+            payload["monitor"] = before_payload
+        elif after_payload is not None:
+            payload["monitor"] = after_payload
+        return [
+            Evidence(
+                kind=evidence_kind,
+                owner="db_runtime",
+                operation_id=operation.id,
+                task_id=task.id,
+                accepted=True,
+                payload=payload,
+                metadata={
+                    "payload_fingerprint": actual_fingerprint,
+                    "proposal_evidence_id": proposal_evidence.id,
+                    "monitor_id": monitor_id,
+                    "action": action,
+                    "idempotent_existing": idempotent_existing,
+                },
+            )
+        ]
+
+
+@dataclass(frozen=True)
+class DbMonitorLocalDeliveryExecutor:
+    """Executor that records local monitor notification delivery evidence."""
+
+    plugin: DbRuntimePlanningPlugin
+    id: str = "db_runtime.monitor.delivery.local"
+    owner: str = "db_runtime"
+    capability_ids: frozenset[str] = frozenset({"monitor.delivery.local"})
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        runtime = self.plugin.runtime
+        payload_source = dict(task.input.get("payload_source") or {})
+        report = await _load_evidence(
+            runtime,
+            operation.id,
+            payload_source.get("report_evidence_id"),
+        )
+        if report is None:
+            raise RuntimeError("monitor report evidence is required for local delivery")
+        delivery_kind = str(task.input.get("delivery_kind") or "")
+        if delivery_kind != "local":
+            raise RuntimeError("local delivery executor only supports local delivery")
+        target = dict(task.input.get("target") or {})
+        target_type = str(target.get("type") or target.get("channel") or "")
+        if target_type not in {"runtime_console", "terminal", "stdout", "callback"}:
+            raise RuntimeError("unsupported_local_delivery_target")
+        payload = {
+            "monitor_id": task.metadata.get("monitor_id"),
+            "monitor_run_id": task.metadata.get("monitor_run_id"),
+            "tick_operation_id": task.metadata.get("tick_operation_id"),
+            "delivery_operation_id": operation.id,
+            "delivery_kind": delivery_kind,
+            "target": target,
+            "target_channel": target.get("channel") or target_type,
+            "format": task.input.get("format"),
+            "subject": task.input.get("subject"),
+            "status": "delivered",
+            "idempotency_key": (
+                task.input.get("idempotency_key")
+                or task.metadata.get("idempotency_key")
+            ),
+            "report_evidence_id": report.id,
+            "report_fingerprint": payload_source.get("report_fingerprint"),
+            "action_plan_fingerprint": payload_source.get("action_plan_fingerprint"),
+            "source_evidence_refs": list(
+                payload_source.get("source_evidence_refs") or ()
+            ),
+        }
+        return [
+            Evidence(
+                kind="local.notification.delivery",
+                owner="db_runtime",
+                operation_id=operation.id,
+                task_id=task.id,
+                accepted=True,
+                payload=payload,
+                metadata={
+                    "monitor_id": payload["monitor_id"],
+                    "monitor_run_id": payload["monitor_run_id"],
+                    "tick_operation_id": payload["tick_operation_id"],
+                    "monitor_delivery_kind": delivery_kind,
+                    "monitor_report_fingerprint": payload["report_fingerprint"],
+                    "monitor_action_fingerprint": payload["action_plan_fingerprint"],
+                    "idempotency_key": payload["idempotency_key"],
+                    "payload_fingerprint": stable_fingerprint(payload),
+                },
+            )
+        ]
+
+
 async def _load_evidence(
     runtime: Any,
     operation_id: str,
@@ -576,6 +1202,150 @@ async def _load_evidence(
         if evidence.id == evidence_id:
             return evidence
     return None
+
+
+def _monitor_lifecycle_action(value: str) -> str:
+    normalized = value.removeprefix("monitor.").replace("_", ".").lower()
+    if normalized in {"update", "pause", "resume", "delete", "disable"}:
+        return normalized
+    if normalized == "disabled":
+        return "disable"
+    raise ValueError(f"unsupported monitor lifecycle action: {value!r}")
+
+
+def _monitor_after_lifecycle_action(
+    monitor: DbMonitor,
+    *,
+    action: str,
+    patch: dict[str, Any],
+    paused_until: Any = None,
+) -> DbMonitor | None:
+    if action == "delete":
+        return None
+    if action == "update":
+        return monitor_with_updates(monitor, patch)
+    if action == "pause":
+        return monitor_with_updates(monitor, {"status": "paused", **patch})
+    if action == "resume":
+        return monitor_with_updates(monitor, {"status": "active", **patch})
+    if action == "disable":
+        return monitor_with_updates(monitor, {"status": "disabled", **patch})
+    raise ValueError(f"unsupported monitor lifecycle action: {action!r}")
+
+
+def _monitor_lifecycle_commit_evidence_kind(action: str) -> str:
+    if action == "delete":
+        return "monitor.deleted"
+    if action == "disable":
+        return "monitor.disabled"
+    if action == "pause":
+        return "monitor.paused"
+    if action == "resume":
+        return "monitor.resumed"
+    return "monitor.state_update"
+
+
+def _monitor_lifecycle_mutation_action(action: str) -> str:
+    if action == "disable":
+        return "update"
+    return action
+
+
+def _monitor_lifecycle_already_committed(
+    existing: DbMonitor | None,
+    *,
+    after: DbMonitor | None,
+    action: str,
+) -> bool:
+    if action == "delete":
+        return existing is None
+    return existing == after
+
+
+def _non_executable_active_monitor_reason(plan: dict[str, Any]) -> str | None:
+    kind = (plan or {}).get("kind")
+    if kind not in {"planned_read", "metric_sql", "freshness_sql", "plugin_source"}:
+        return "missing_executable_kind"
+    if kind in {"planned_read", "metric_sql", "freshness_sql"}:
+        if not isinstance(plan.get("sql"), str) or not plan["sql"].strip():
+            return "missing_observation_sql"
+        if not plan.get("value_path"):
+            return "missing_value_path"
+    if kind == "planned_read":
+        if not plan.get("cursor") or not plan.get("cursor_update"):
+            return "missing_cursor_strategy"
+    if kind == "plugin_source":
+        if not plan.get("capability_id") and not plan.get("source_kind"):
+            return "missing_plugin_source_capability"
+    return None
+
+
+async def _inspect_monitor_target_schema(
+    runtime: Any,
+    operation: Operation,
+    *,
+    target: str,
+) -> Evidence | None:
+    cached = runtime.cached_schema_evidence(operation_id=operation.id)
+    if cached is not None:
+        return await _persist_monitor_schema_evidence(runtime, operation, cached)
+    persisted = runtime.persisted_schema_evidence(operation_id=operation.id)
+    if persisted is not None:
+        return await _persist_monitor_schema_evidence(runtime, operation, persisted)
+    capability = _first_capability(runtime, "db.schema.inspect")
+    if capability is None:
+        return None
+    schema_task = await runtime.kernel.plan_task(
+        operation_id=operation.id,
+        capability_id=capability.id,
+        owner=capability.owner,
+        input={"tables": [target] if target else []},
+        metadata={
+            "reason": "monitor_create_schema_context",
+            "sequence": 0,
+            "target_table": target,
+        },
+    )
+    evidence = await runtime.execute_task(schema_task, operation)
+    schema_evidence = next(
+        (item for item in evidence if item.kind == "schema.asset_profile"),
+        None,
+    )
+    if schema_evidence is not None:
+        runtime.remember_schema_evidence(schema_evidence)
+    return schema_evidence
+
+
+async def _persist_monitor_schema_evidence(
+    runtime: Any,
+    operation: Operation,
+    evidence: Evidence,
+) -> Evidence:
+    persisted = Evidence(
+        id=evidence.id or f"monitor-schema-{uuid4()}",
+        kind=evidence.kind,
+        owner=evidence.owner,
+        operation_id=operation.id,
+        accepted=evidence.accepted,
+        payload=dict(evidence.payload),
+        metadata={
+            **dict(evidence.metadata),
+            "monitor_planning_schema_context": True,
+        },
+    )
+    await runtime.store.save_evidence(persisted)
+    return persisted
+
+
+def _first_capability(runtime: Any, capability_id: str) -> Any | None:
+    matches = [
+        capability
+        for capability in runtime.registry.capabilities
+        if capability.id == capability_id
+    ]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda item: item.owner)[0]
 
 
 def _compact_prepare_context(

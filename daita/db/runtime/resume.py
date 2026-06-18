@@ -23,7 +23,6 @@ from ..models import (
     DbOperationResult,
     DbRequest,
 )
-from ..monitors import DbMonitor
 from .types import DbRuntimeGovernanceBlocked, DbRuntimeTaskNotRunnable
 
 
@@ -130,13 +129,6 @@ class DbRuntimeResumeMixin:
 
         if self._has_pending_approvals(snapshot):
             await self.kernel.block_operation(operation_id)
-            resumed = await self.inspect_operation(operation_id)
-            if resumed is None:
-                raise KeyError(operation_id)
-            return resumed
-
-        if _monitor_command_create_context(snapshot.operation):
-            await self._finalize_resumed_monitor_create_command(snapshot)
             resumed = await self.inspect_operation(operation_id)
             if resumed is None:
                 raise KeyError(operation_id)
@@ -262,6 +254,37 @@ class DbRuntimeResumeMixin:
                 return finalized
             return resumed_analysis
 
+        if _monitor_create_context(completed.operation):
+            definition = _latest_monitor_definition_from_snapshot(completed)
+            payload = {}
+            if definition is not None:
+                monitor = definition.payload.get("monitor")
+                if isinstance(monitor, dict):
+                    payload["monitor_id"] = monitor.get("id")
+            await self.kernel.complete_operation(
+                operation_id,
+                message=f"Operation {operation_id} succeeded after monitor commit.",
+                payload=payload,
+            )
+            resumed = await self.inspect_operation(operation_id)
+            if resumed is None:
+                raise KeyError(operation_id)
+            return resumed
+
+        if _monitor_lifecycle_context(completed.operation):
+            await self.kernel.complete_operation(
+                operation_id,
+                message=f"Operation {operation_id} succeeded after monitor lifecycle commit.",
+                payload={
+                    "monitor_id": completed.operation.metadata.get("monitor_id"),
+                    "action": completed.operation.metadata.get("command_kind"),
+                },
+            )
+            resumed = await self.inspect_operation(operation_id)
+            if resumed is None:
+                raise KeyError(operation_id)
+            return resumed
+
         if _operation_has_run_context(completed.operation):
             await self._complete_resumed_run_operation(completed)
         elif (
@@ -337,42 +360,6 @@ class DbRuntimeResumeMixin:
             operation=snapshot.operation,
         )
 
-    async def _finalize_resumed_monitor_create_command(
-        self,
-        snapshot: OperationSnapshot,
-    ) -> None:
-        context = _monitor_command_create_context(snapshot.operation)
-        if not context:
-            return
-        monitor = DbMonitor.from_dict(context["monitor"])
-        existing = await self.inspect_monitor(monitor.id)
-        if existing is None:
-            await self.create_monitor(monitor)
-        evidence = Evidence(
-            id=f"{snapshot.operation.id}:monitor-definition",
-            kind="monitor.definition",
-            owner="db.monitor",
-            operation_id=snapshot.operation.id,
-            payload={"monitor": monitor.to_dict()},
-            accepted=True,
-            metadata={
-                "control_plane": "db.monitor",
-                "command_kind": "create",
-                "monitor_id": monitor.id,
-            },
-        )
-        await self.store.save_evidence(evidence)
-        await self.kernel.complete_operation(
-            snapshot.operation.id,
-            status=OperationStatus.SUCCEEDED,
-            message=f"Monitor {monitor.id} created after approval.",
-            payload={
-                "monitor_id": monitor.id,
-                "monitor_name": monitor.name,
-                "command_kind": "create",
-            },
-        )
-
 
 def _tasks_in_resume_order(tasks: tuple[Task, ...]) -> tuple[Task, ...]:
     return tuple(
@@ -388,6 +375,38 @@ def _tasks_in_resume_order(tasks: tuple[Task, ...]) -> tuple[Task, ...]:
 
 def _operation_has_run_context(operation: Operation) -> bool:
     return isinstance(operation.metadata.get("resume_context"), dict)
+
+
+def _monitor_create_context(operation: Operation) -> bool:
+    return (
+        operation.operation_type == "monitor.create"
+        and operation.metadata.get("control_plane") == "db.monitor"
+    )
+
+
+def _monitor_lifecycle_context(operation: Operation) -> bool:
+    return (
+        operation.operation_type
+        in {
+            "monitor.update",
+            "monitor.pause",
+            "monitor.resume",
+            "monitor.delete",
+            "monitor.disable",
+        }
+        and operation.metadata.get("control_plane") == "db.monitor"
+    )
+
+
+def _latest_monitor_definition_from_snapshot(
+    snapshot: OperationSnapshot,
+) -> Evidence | None:
+    definitions = [
+        evidence
+        for evidence in snapshot.evidence
+        if evidence.kind == "monitor.definition" and evidence.accepted
+    ]
+    return definitions[-1] if definitions else None
 
 
 def _snapshot_has_incomplete_analysis(snapshot: OperationSnapshot) -> bool:
@@ -441,19 +460,6 @@ def _monitor_action_context(operation: Operation) -> dict[str, Any]:
 def _monitor_delivery_context(operation: Operation) -> dict[str, Any]:
     context = operation.metadata.get("monitor_delivery_context")
     return context if isinstance(context, dict) else {}
-
-
-def _monitor_command_create_context(operation: Operation) -> dict[str, Any]:
-    if operation.metadata.get("control_plane") != "db.monitor":
-        return {}
-    if operation.metadata.get("command_kind") != "create":
-        return {}
-    if operation.metadata.get("command_status") != "approval_required":
-        return {}
-    monitor = operation.request.get("planned_monitor") or operation.metadata.get("monitor")
-    if not isinstance(monitor, dict):
-        return {}
-    return {"monitor": monitor}
 
 
 def _resume_context(operation: Operation) -> dict[str, Any]:

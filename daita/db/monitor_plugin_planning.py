@@ -201,9 +201,11 @@ class MonitorPluginPlanner:
                 "tick_operation_id": tick_operation_id,
                 "monitor_role": "delivery",
                 "monitor_delivery_kind": intent.delivery_kind,
+                "monitor_delivery_target": intent.target,
                 "monitor_report_evidence_id": report.id,
                 "monitor_report_fingerprint": report_fingerprint,
                 "monitor_action_fingerprint": action_fingerprint,
+                "source_evidence_refs": [dict(item) for item in source_evidence_refs],
             },
             intent_payload={
                 "delivery_kind": intent.delivery_kind,
@@ -317,6 +319,9 @@ def monitor_delivery_source_refs(
     operation_evidence: tuple[Evidence, ...],
 ) -> tuple[dict[str, Any], ...]:
     refs: list[dict[str, Any]] = [evidence_ref(report)]
+    for ref in report.payload.get("cited_tick_evidence_refs") or ():
+        if isinstance(ref, Mapping):
+            refs.append(dict(ref))
     for item in operation_evidence:
         if item.id == report.id:
             continue
@@ -500,6 +505,29 @@ def _validate_delivery_format(
     intent: MonitorDeliveryIntent,
     capability: Capability,
 ) -> None:
+    accepted_target_types = {
+        str(item)
+        for item in capability.metadata.get("accepted_target_types")
+        or capability.metadata.get("accepted_channels")
+        or ()
+    }
+    if accepted_target_types:
+        target_type = str(
+            intent.target.get("type")
+            or intent.target.get("channel")
+            or intent.target.get("mode")
+            or ""
+        )
+        if target_type not in accepted_target_types:
+            raise MonitorPluginPlanningBlocked(
+                "unsupported_delivery_target",
+                {
+                    "target_type": target_type,
+                    "accepted_target_types": sorted(accepted_target_types),
+                    "capability_id": capability.id,
+                    "owner": capability.owner,
+                },
+            )
     if not intent.format:
         return
     accepted = {
