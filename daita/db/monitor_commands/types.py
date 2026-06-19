@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from daita.runtime import Evidence
+
 from ..monitors import DbMonitor
 
 DbMonitorCommandKind = Literal[
@@ -101,6 +103,10 @@ class DbMonitorResolution:
     matches: tuple[DbMonitor, ...] = ()
     warnings: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
+    definition_evidence: Evidence | None = None
+    proposal_evidence: Evidence | None = None
+    operation_id: str | None = None
+    resolution_source: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "matches", tuple(self.matches))
@@ -109,7 +115,11 @@ class DbMonitorResolution:
 
     @property
     def accepted(self) -> bool:
-        return self.monitor is not None and not self.errors
+        return (
+            self.monitor is not None
+            or self.definition_evidence is not None
+            or self.proposal_evidence is not None
+        ) and not self.errors
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -118,4 +128,14 @@ class DbMonitorResolution:
             "matches": [monitor.id for monitor in self.matches],
             "warnings": list(self.warnings),
             "errors": list(self.errors),
+            "definition_evidence_id": (
+                None
+                if self.definition_evidence is None
+                else self.definition_evidence.id
+            ),
+            "proposal_evidence_id": (
+                None if self.proposal_evidence is None else self.proposal_evidence.id
+            ),
+            "operation_id": self.operation_id,
+            "resolution_source": self.resolution_source,
         }

@@ -427,6 +427,15 @@ async def _approval_required_create(runtime: DbRuntime):
     return agent, result, approvals[0], plan_task, commit_task, proposal
 
 
+def _assert_monitor_sql_answer(answer: str, *, table: str) -> None:
+    assert f"select * from {table}" in answer
+    assert "created_at" in answer
+    assert "cursor" in answer
+    assert "runtime_result" not in answer
+    assert "Evidence(" not in answer
+    assert "payload" not in answer
+
+
 async def test_prompt_managed_monitor_crud_uses_typed_apis_and_audits_runtime():
     schema_probe = _schema_probe("pending_orders")
     runtime = SpyDbRuntime(plugins=(schema_probe,))
@@ -1317,6 +1326,260 @@ async def test_monitor_create_metadata_is_ready_for_worker_handoff():
     assert proposal.metadata["payload_fingerprint"]
     assert proposal.metadata["validation_accepted"] is True
     assert proposal.payload["proposal_fingerprint"]
+
+
+async def test_monitor_detail_followup_resolves_via_last_monitor_id():
+    runtime = DbRuntime(runtime_id="db-monitor-detail-last-monitor-id")
+    agent = DbAgent(runtime=runtime)
+    await agent.create_monitor(
+        DbMonitor(
+            id="orders_backlog",
+            name="Orders Backlog",
+            schedule={"expression": "*/5 * * * *"},
+            observation_plan={
+                "kind": "planned_read",
+                "sql": "select * from orders where created_at > ?",
+                "cursor": {"field": "created_at"},
+                "cursor_update": {"last_created_at": "max(rows.created_at)"},
+                "value_path": "rows",
+            },
+        )
+    )
+
+    result = await agent.run_detailed(
+        "what is that monitor SQL?",
+        metadata={"last_monitor_id": "orders_backlog"},
+    )
+
+    assert result.status is OperationStatus.SUCCEEDED
+    _assert_monitor_sql_answer(result.answer, table="orders")
+    assert "every 5 minutes" in result.answer
+    assert result.diagnostics["resolution"]["resolution_source"] == (
+        "request.metadata.last_monitor_id"
+    )
+
+
+async def test_monitor_detail_followup_resolves_definition_from_last_operation():
+    runtime = DbRuntime(
+        runtime_id="db-monitor-detail-definition-operation",
+        plugins=(_schema_probe("users"),),
+    )
+    agent = DbAgent(runtime=runtime)
+    created = await agent.run_detailed(
+        "Monitor users every 5 minutes when new rows are added."
+    )
+
+    result = await agent.run_detailed(
+        "what query will it run?",
+        metadata={"last_runtime_operation_id": created.operation_id},
+    )
+
+    assert created.status is OperationStatus.SUCCEEDED
+    assert result.status is OperationStatus.SUCCEEDED
+    _assert_monitor_sql_answer(result.answer, table="users")
+    assert result.diagnostics["resolution"]["definition_evidence_id"]
+    assert result.diagnostics["resolution"]["resolution_source"] == (
+        "request.metadata.last_runtime_operation_id.monitor.definition"
+    )
+
+
+async def test_blocked_monitor_detail_followup_resolves_proposal_from_operation():
+    runtime = DbRuntime(
+        runtime_id="db-monitor-detail-proposal-operation",
+        plugins=(_schema_probe("users"),),
+    )
+    agent, created, _approval, _plan_task, _commit_task, proposal = (
+        await _approval_required_create(runtime)
+    )
+
+    result = await agent.run_detailed(
+        "what query will it run?",
+        metadata={"last_runtime_operation_id": created.operation_id},
+    )
+
+    assert created.status is OperationStatus.BLOCKED
+    assert result.status is OperationStatus.SUCCEEDED
+    assert (
+        proposal.payload["monitor_id"]
+        in result.diagnostics["resolution"]["monitor_ref"]
+    )
+    _assert_monitor_sql_answer(result.answer, table="users")
+    assert result.diagnostics["resolution"]["proposal_evidence_id"] == proposal.id
+
+
+async def test_monitor_detail_followup_resolves_operation_from_last_approval_id():
+    runtime = DbRuntime(
+        runtime_id="db-monitor-detail-approval",
+        plugins=(_schema_probe("users"),),
+    )
+    agent, _created, approval, _plan_task, _commit_task, _proposal = (
+        await _approval_required_create(runtime)
+    )
+
+    result = await agent.run_detailed(
+        "show me the SQL for that monitor",
+        metadata={"last_approval_id": approval.approval_id},
+    )
+
+    assert result.status is OperationStatus.SUCCEEDED
+    _assert_monitor_sql_answer(result.answer, table="users")
+    assert result.diagnostics["resolution"]["resolution_source"] == (
+        "request.metadata.last_approval_id.monitor.proposal"
+    )
+
+
+async def test_monitor_detail_followup_resolves_latest_same_session_operation():
+    runtime = DbRuntime(
+        runtime_id="db-monitor-detail-session",
+        plugins=(_schema_probe("operations"),),
+    )
+    agent = DbAgent(runtime=runtime)
+    created = await agent.run_detailed(
+        "Monitor operations every 5 minutes when new rows are added.",
+        session_id="session-1",
+    )
+
+    result = await agent.run_detailed(
+        "what query will it run?",
+        session_id="session-1",
+    )
+
+    assert created.status is OperationStatus.SUCCEEDED
+    assert result.status is OperationStatus.SUCCEEDED
+    _assert_monitor_sql_answer(result.answer, table="operations")
+    assert result.diagnostics["resolution"]["resolution_source"] == (
+        "request.session_id.monitor.definition"
+    )
+
+
+async def test_same_session_fallback_skips_unusable_detail_operations():
+    runtime = DbRuntime(
+        runtime_id="db-monitor-detail-session-skip-command",
+        plugins=(_schema_probe("users"),),
+    )
+    agent = DbAgent(runtime=runtime)
+    created = await agent.run_detailed(
+        "Create a monitor for the users table. I want to be notified everytime "
+        "a new user gets added to the table",
+        session_id="session-1",
+    )
+
+    first = await agent.run_detailed(
+        "what is that monitor SQL?",
+        session_id="session-1",
+    )
+    second = await agent.run_detailed(
+        "what query will it run?",
+        session_id="session-1",
+    )
+
+    assert created.status is OperationStatus.BLOCKED
+    assert first.status is OperationStatus.SUCCEEDED
+    assert second.status is OperationStatus.SUCCEEDED
+    _assert_monitor_sql_answer(second.answer, table="users")
+    assert second.diagnostics["resolution"]["operation_id"] == created.operation_id
+    assert second.diagnostics["resolution"]["resolution_source"] == (
+        "request.session_id.monitor.proposal"
+    )
+
+
+async def test_global_active_monitor_list_remains_global_with_context_metadata():
+    runtime = DbRuntime(runtime_id="db-monitor-global-list-context")
+    agent = DbAgent(runtime=runtime)
+    await agent.create_monitor(
+        DbMonitor(
+            id="orders",
+            name="Orders",
+            observation_plan={
+                "kind": "metric_sql",
+                "sql": "select count(*) as value from orders",
+                "value_path": "rows.0.value",
+            },
+        )
+    )
+    await agent.create_monitor(
+        DbMonitor(
+            id="users",
+            name="Users",
+            observation_plan={
+                "kind": "metric_sql",
+                "sql": "select count(*) as value from users",
+                "value_path": "rows.0.value",
+            },
+        )
+    )
+
+    result = await agent.run_detailed(
+        "what monitors are active?",
+        metadata={"last_monitor_id": "orders"},
+    )
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert "- orders: Orders [active]" in result.answer
+    assert "- users: Users [active]" in result.answer
+
+
+async def test_monitor_detail_followup_without_context_does_not_guess():
+    runtime = DbRuntime(runtime_id="db-monitor-detail-no-context")
+    agent = DbAgent(runtime=runtime)
+
+    result = await agent.run_detailed("what is that monitor SQL?")
+
+    assert result.status is OperationStatus.FAILED
+    assert result.answer == "Please specify which monitor to manage."
+    assert result.warnings == ("db_monitor_reference_required",)
+
+
+async def test_monitor_detail_answer_does_not_leak_raw_runtime_or_evidence():
+    runtime = DbRuntime(
+        runtime_id="db-monitor-detail-no-raw-leak",
+        plugins=(_schema_probe("users"),),
+    )
+    agent, created, _approval, _plan_task, _commit_task, _proposal = (
+        await _approval_required_create(runtime)
+    )
+
+    result = await agent.run_detailed(
+        "what query will it run?",
+        metadata={"last_runtime_operation_id": created.operation_id},
+    )
+
+    assert result.status is OperationStatus.SUCCEEDED
+    for forbidden in (
+        "runtime_result",
+        "Evidence(",
+        "observation_plan",
+        "action_plan",
+        "validation",
+        "payload",
+    ):
+        assert forbidden not in result.answer
+
+
+async def test_monitor_command_operation_persists_request_context():
+    runtime = DbRuntime(runtime_id="db-monitor-command-request-context")
+    agent = DbAgent(runtime=runtime)
+
+    result = await agent.run_detailed(
+        "list monitors",
+        user_id="user-1",
+        session_id="conversation-1",
+        source_scope=("orders",),
+        metadata={"last_monitor_id": "orders_backlog"},
+    )
+    operation = await runtime.store.load_operation(result.operation_id)
+
+    assert operation is not None
+    assert operation.request["user_id"] == "user-1"
+    assert operation.request["session_id"] == "conversation-1"
+    assert operation.request["source_scope"] == ["orders"]
+    assert operation.request["metadata"] == {"last_monitor_id": "orders_backlog"}
+    assert operation.metadata["user_id"] == "user-1"
+    assert operation.metadata["session_id"] == "conversation-1"
+    assert operation.metadata["source_scope"] == ["orders"]
+    assert operation.metadata["request_metadata"] == {
+        "last_monitor_id": "orders_backlog"
+    }
 
 
 async def test_prompt_monitor_create_blocks_when_schema_cannot_prove_cursor():

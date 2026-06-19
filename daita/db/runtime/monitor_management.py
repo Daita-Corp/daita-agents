@@ -236,7 +236,9 @@ class DbRuntimeMonitorManagementMixin:
             None,
         )
         if proposal_evidence is None:
-            raise RuntimeError("monitor lifecycle planning did not produce proposal evidence")
+            raise RuntimeError(
+                "monitor lifecycle planning did not produce proposal evidence"
+            )
         proposal = dict(proposal_evidence.payload)
         validation = _validation_from_lifecycle_proposal(proposal)
         if not validation.accepted:
@@ -320,7 +322,9 @@ class DbRuntimeMonitorManagementMixin:
             None,
         )
         if lifecycle_evidence is None:
-            raise RuntimeError("monitor lifecycle commit did not produce commit evidence")
+            raise RuntimeError(
+                "monitor lifecycle commit did not produce commit evidence"
+            )
         monitor_payload = (
             lifecycle_evidence.payload.get("monitor")
             or lifecycle_evidence.payload.get("after")
@@ -366,8 +370,12 @@ class DbRuntimeMonitorManagementMixin:
         result = DbOperationResult(
             operation_id=operation.id,
             request=DbRequest(
-                prompt=str(request.get("prompt") or request.get("operation_type") or ""),
-                metadata={key: value for key, value in request.items() if key != "prompt"},
+                prompt=str(
+                    request.get("prompt") or request.get("operation_type") or ""
+                ),
+                metadata={
+                    key: value for key, value in request.items() if key != "prompt"
+                },
             ),
             intent=DbIntent(
                 kind=DbIntentKind.ADMIN,
@@ -489,6 +497,10 @@ class DbRuntimeMonitorManagementMixin:
                 request={
                     "kind": f"monitor.{kind}",
                     "prompt": request.prompt,
+                    "user_id": request.user_id,
+                    "session_id": request.session_id,
+                    "source_scope": list(request.source_scope),
+                    "metadata": request.metadata,
                     "command": command_payload,
                 },
                 required_evidence=(
@@ -502,6 +514,10 @@ class DbRuntimeMonitorManagementMixin:
                     "control_plane": "db.monitor",
                     "monitor_id": command_payload.get("monitor_id"),
                     "command_kind": kind,
+                    "user_id": request.user_id,
+                    "session_id": request.session_id,
+                    "source_scope": list(request.source_scope),
+                    "request_metadata": request.metadata,
                 },
             )
             if evidence_kind is not None:
@@ -658,7 +674,9 @@ def _monitor_from_lifecycle_result(result: DbOperationResult) -> DbMonitor:
                 message = message.replace("monitor.lifecycle:", "")
                 raise ValueError(message)
             raise ValueError(result.answer or "Monitor lifecycle proposal is invalid.")
-        raise PermissionError(result.answer or "Monitor lifecycle operation is blocked.")
+        raise PermissionError(
+            result.answer or "Monitor lifecycle operation is blocked."
+        )
     monitor = result.diagnostics.get("monitor")
     if not isinstance(monitor, dict):
         raise RuntimeError("monitor lifecycle operation did not return a monitor")
@@ -697,9 +715,8 @@ def _validation_from_lifecycle_proposal(proposal: dict[str, Any]) -> Any:
 
 def _monitor_lifecycle_validation_answer(action: str, validation: Any) -> str:
     errors = ", ".join(str(item) for item in validation.errors)
-    return (
-        f"Monitor {action} proposal is incomplete or unsupported"
-        + (f": {errors}" if errors else ".")
+    return f"Monitor {action} proposal is incomplete or unsupported" + (
+        f": {errors}" if errors else "."
     )
 
 

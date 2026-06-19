@@ -30,6 +30,7 @@ from .answers import (
     _create_monitor_answer,
     _inspect_monitor_answer,
     _list_monitors_answer,
+    _monitor_detail_answer,
     _monitor_validation_answer,
     _resolution_failure_answer,
 )
@@ -53,7 +54,15 @@ class DbMonitorCommandService:
         self.resolver = DbMonitorResolver()
 
     async def run(self, request: DbRequest) -> DbOperationResult | None:
-        command = self.router.route(request.prompt)
+        has_monitor_context = _request_has_monitor_context(request)
+        if not has_monitor_context and request.session_id:
+            has_monitor_context = await self._has_session_monitor_context(
+                request.session_id
+            )
+        command = self.router.route(
+            request.prompt,
+            has_monitor_context=has_monitor_context,
+        )
         if command is None:
             return None
         try:
@@ -116,6 +125,7 @@ class DbMonitorCommandService:
                 "user_id": request.user_id,
                 "session_id": request.session_id,
                 "source_scope": list(request.source_scope),
+                "metadata": request.metadata,
                 "command": _command_payload(command),
             },
             required_evidence=frozenset({"monitor.proposal", "monitor.definition"}),
@@ -124,12 +134,17 @@ class DbMonitorCommandService:
                 "command_kind": "create",
                 "monitor_id": monitor_id,
                 "monitor_name": monitor_name,
+                "user_id": request.user_id,
+                "session_id": request.session_id,
+                "source_scope": list(request.source_scope),
+                "request_metadata": request.metadata,
                 "resume_context": {
                     "request": {
                         "prompt": request.prompt,
                         "user_id": request.user_id,
                         "session_id": request.session_id,
                         "source_scope": list(request.source_scope),
+                        "metadata": request.metadata,
                     },
                     "intent": {
                         "kind": DbIntentKind.ADMIN.value,
@@ -438,9 +453,31 @@ class DbMonitorCommandService:
         command: DbMonitorCommand,
         request: DbRequest,
     ) -> DbOperationResult:
-        resolution = await self._resolve(command)
+        resolution = await self._resolve(command, request)
         if not resolution.accepted:
             return await self._resolution_failure(command, request, resolution)
+        if command.patch.get("detail"):
+            monitor_id = (
+                resolution.monitor.id if resolution.monitor is not None else None
+            )
+            return await self.runtime.record_monitor_command_result(
+                request=request,
+                kind=command.kind,
+                command=_command_payload(command, monitor_id=monitor_id),
+                status=OperationStatus.SUCCEEDED,
+                answer=_monitor_detail_answer(resolution, command=command),
+                evidence_kind="monitor.inspection",
+                payload={
+                    "command": _command_payload(command, monitor_id=monitor_id),
+                    "resolution": resolution.to_dict(),
+                    "detail": command.patch.get("detail"),
+                },
+                warnings=resolution.warnings,
+                diagnostics={
+                    "resolution": resolution.to_dict(),
+                    "detail": command.patch.get("detail"),
+                },
+            )
         assert resolution.monitor is not None
         inspection = await self.runtime.inspect_monitor(resolution.monitor.id)
         if inspection is None:
@@ -482,7 +519,7 @@ class DbMonitorCommandService:
         command: DbMonitorCommand,
         request: DbRequest,
     ) -> DbOperationResult:
-        resolution = await self._resolve(command)
+        resolution = await self._resolve(command, request)
         if not resolution.accepted:
             return await self._resolution_failure(command, request, resolution)
         assert resolution.monitor is not None
@@ -514,7 +551,7 @@ class DbMonitorCommandService:
         command: DbMonitorCommand,
         request: DbRequest,
     ) -> DbOperationResult:
-        resolution = await self._resolve(command)
+        resolution = await self._resolve(command, request)
         if not resolution.accepted:
             return await self._resolution_failure(command, request, resolution)
         assert resolution.monitor is not None
@@ -547,7 +584,7 @@ class DbMonitorCommandService:
         command: DbMonitorCommand,
         request: DbRequest,
     ) -> DbOperationResult:
-        resolution = await self._resolve(command)
+        resolution = await self._resolve(command, request)
         if not resolution.accepted:
             return await self._resolution_failure(command, request, resolution)
         assert resolution.monitor is not None
@@ -577,7 +614,7 @@ class DbMonitorCommandService:
         command: DbMonitorCommand,
         request: DbRequest,
     ) -> DbOperationResult:
-        resolution = await self._resolve(command)
+        resolution = await self._resolve(command, request)
         if not resolution.accepted:
             return await self._resolution_failure(command, request, resolution)
         assert resolution.monitor is not None
@@ -609,7 +646,7 @@ class DbMonitorCommandService:
         command: DbMonitorCommand,
         request: DbRequest,
     ) -> DbOperationResult:
-        resolution = await self._resolve(command)
+        resolution = await self._resolve(command, request)
         if not resolution.accepted:
             return await self._resolution_failure(command, request, resolution)
         assert resolution.monitor is not None
@@ -716,9 +753,205 @@ class DbMonitorCommandService:
             },
         )
 
-    async def _resolve(self, command: DbMonitorCommand) -> DbMonitorResolution:
+    async def _resolve(
+        self,
+        command: DbMonitorCommand,
+        request: DbRequest,
+    ) -> DbMonitorResolution:
         monitors = await self.runtime.list_monitors()
-        return self.resolver.resolve(command, monitors)
+        resolution = self.resolver.resolve(command, monitors)
+        if command.monitor_id:
+            return resolution
+        if resolution.accepted or not _allows_contextual_resolution(command):
+            return resolution
+        contextual = await self._resolve_from_request_context(
+            command,
+            request,
+            monitors,
+        )
+        if contextual is not None:
+            return contextual
+        return resolution
+
+    async def _resolve_from_request_context(
+        self,
+        command: DbMonitorCommand,
+        request: DbRequest,
+        monitors: tuple[DbMonitor, ...],
+    ) -> DbMonitorResolution | None:
+        last_monitor_id = request.metadata.get("last_monitor_id")
+        if last_monitor_id:
+            resolution = self.resolver.resolve(
+                replace(command, monitor_id=str(last_monitor_id)),
+                monitors,
+            )
+            if resolution.accepted:
+                return replace(
+                    resolution,
+                    resolution_source="request.metadata.last_monitor_id",
+                )
+
+        operation_id = request.metadata.get("last_runtime_operation_id")
+        if operation_id:
+            resolution = await self._resolve_from_operation(
+                str(operation_id),
+                monitors,
+                source="request.metadata.last_runtime_operation_id",
+            )
+            if resolution is not None:
+                return resolution
+
+        approval_id = request.metadata.get("last_approval_id")
+        if approval_id:
+            approval_operation_id = await self._monitor_operation_from_approval(
+                str(approval_id)
+            )
+            if approval_operation_id:
+                resolution = await self._resolve_from_operation(
+                    approval_operation_id,
+                    monitors,
+                    source="request.metadata.last_approval_id",
+                )
+                if resolution is not None:
+                    return resolution
+
+        if request.session_id:
+            resolution = await self._resolve_from_latest_session_operation(
+                request.session_id,
+                monitors,
+            )
+            if resolution is not None:
+                return resolution
+        return None
+
+    async def _resolve_from_latest_session_operation(
+        self,
+        session_id: str,
+        monitors: tuple[DbMonitor, ...],
+    ) -> DbMonitorResolution | None:
+        for operation in await self._session_monitor_operations(session_id):
+            resolution = await self._resolve_from_operation(
+                operation.id,
+                monitors,
+                source="request.session_id",
+            )
+            if resolution is not None:
+                return resolution
+        return None
+
+    async def _has_session_monitor_context(self, session_id: str) -> bool:
+        operations = await self._session_monitor_operations(session_id)
+        return bool(operations)
+
+    async def _session_monitor_operations(
+        self,
+        session_id: str,
+    ) -> tuple[Any, ...]:
+        operations = await self.runtime.store.list_operations()
+        matches = []
+        for operation in reversed(operations):
+            if not operation.operation_type.startswith("monitor."):
+                continue
+            if operation.metadata.get("control_plane") != "db.monitor":
+                continue
+            operation_session_id = operation.metadata.get(
+                "session_id",
+                operation.request.get("session_id"),
+            )
+            if operation_session_id == session_id:
+                matches.append(operation)
+        return tuple(matches)
+
+    async def _resolve_from_operation(
+        self,
+        operation_id: str,
+        monitors: tuple[DbMonitor, ...],
+        *,
+        source: str,
+    ) -> DbMonitorResolution | None:
+        definition = await self._latest_monitor_definition(operation_id)
+        if definition is not None:
+            monitor = _monitor_from_definition_evidence(definition)
+            matches: tuple[DbMonitor, ...] = ()
+            if monitor is not None:
+                committed = self.resolver.resolve(
+                    DbMonitorCommand(kind="inspect", monitor_id=monitor.id),
+                    monitors,
+                )
+                monitor = committed.monitor or monitor
+                matches = (monitor,)
+            return DbMonitorResolution(
+                monitor=monitor,
+                monitor_ref=None if monitor is None else monitor.id,
+                matches=matches,
+                definition_evidence=definition,
+                operation_id=operation_id,
+                resolution_source=f"{source}.monitor.definition",
+            )
+
+        proposal = await self._latest_monitor_proposal(operation_id)
+        if proposal is not None:
+            monitor_id = proposal.payload.get("monitor_id")
+            monitor = None
+            matches: tuple[DbMonitor, ...] = ()
+            if monitor_id:
+                committed = self.resolver.resolve(
+                    DbMonitorCommand(kind="inspect", monitor_id=str(monitor_id)),
+                    monitors,
+                )
+                if committed.monitor is not None:
+                    monitor = committed.monitor
+                    matches = committed.matches
+            return DbMonitorResolution(
+                monitor=monitor,
+                monitor_ref=None if monitor_id is None else str(monitor_id),
+                matches=matches,
+                proposal_evidence=proposal,
+                operation_id=operation_id,
+                resolution_source=f"{source}.monitor.proposal",
+            )
+
+        operation = await self.runtime.store.load_operation(operation_id)
+        monitor_id = None if operation is None else operation.metadata.get("monitor_id")
+        if monitor_id:
+            resolution = self.resolver.resolve(
+                DbMonitorCommand(kind="inspect", monitor_id=str(monitor_id)),
+                monitors,
+            )
+            if resolution.accepted:
+                return replace(
+                    resolution,
+                    operation_id=operation_id,
+                    resolution_source=f"{source}.operation.monitor_id",
+                )
+        return None
+
+    async def _latest_monitor_definition(self, operation_id: str) -> Evidence | None:
+        evidence = await self.runtime.store.list_evidence(operation_id)
+        for item in reversed(evidence):
+            if item.kind == "monitor.definition" and item.accepted:
+                return item
+        return None
+
+    async def _latest_monitor_proposal(self, operation_id: str) -> Evidence | None:
+        evidence = await self.runtime.store.list_evidence(operation_id)
+        for item in reversed(evidence):
+            if (
+                item.kind == "monitor.proposal"
+                and item.accepted
+                and isinstance(item.payload.get("observation_plan"), dict)
+            ):
+                return item
+        return None
+
+    async def _monitor_operation_from_approval(
+        self,
+        approval_id: str,
+    ) -> str | None:
+        for approval in await self.runtime.store.list_approval_requests():
+            if approval.approval_id == approval_id:
+                return approval.operation_id
+        return None
 
     async def _resolution_failure(
         self,
@@ -751,6 +984,28 @@ def _owner_from_request(request: DbRequest) -> dict[str, Any]:
     if request.session_id is not None:
         owner["session_id"] = request.session_id
     return owner
+
+
+def _request_has_monitor_context(request: DbRequest) -> bool:
+    return any(
+        request.metadata.get(key)
+        for key in (
+            "last_monitor_id",
+            "last_runtime_operation_id",
+            "last_approval_id",
+        )
+    )
+
+
+def _allows_contextual_resolution(command: DbMonitorCommand) -> bool:
+    return command.kind == "inspect" and bool(command.patch.get("detail"))
+
+
+def _monitor_from_definition_evidence(evidence: Evidence) -> DbMonitor | None:
+    monitor = evidence.payload.get("monitor")
+    if not isinstance(monitor, dict):
+        return None
+    return DbMonitor.from_dict(monitor)
 
 
 def _command_payload(
