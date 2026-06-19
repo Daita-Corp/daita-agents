@@ -135,6 +135,18 @@ def _schema_relationship_answer(evidence: tuple[Evidence, ...]) -> str:
 
 
 def _database_schema_payload(evidence: tuple[Evidence, ...]) -> dict[str, Any]:
+    asset_scoped = [
+        item.payload
+        for item in evidence
+        if item.kind == "schema.asset_profile"
+        and _schema_scope(item) == "asset"
+        and _tables_from_schema_payload(item.payload)
+    ]
+    if asset_scoped:
+        tables = []
+        for payload in asset_scoped:
+            tables.extend(_tables_from_schema_payload(payload))
+        return {"tables": tables}
     scoped = next(
         (
             item.payload
@@ -162,6 +174,10 @@ def _schema_scope(evidence: Evidence) -> str | None:
     payload_metadata = evidence.payload.get("metadata")
     if isinstance(payload_metadata, dict) and payload_metadata.get("scope"):
         return str(payload_metadata["scope"])
+    if isinstance(evidence.payload.get("asset"), dict):
+        return "asset"
+    if isinstance(evidence.payload.get("table"), dict):
+        return "asset"
     return None
 
 

@@ -191,6 +191,8 @@ def _best_table_for_prompt(prompt: str, schema: dict[str, Any]) -> str | None:
                 score += 1
         ranked.append((score, table))
     ranked.sort(key=lambda item: (-item[0], item[1]))
+    if ranked[0][0] <= 0:
+        return None
     return ranked[0][1]
 
 

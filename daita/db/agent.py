@@ -5,20 +5,31 @@ User-facing facade for the new database runtime.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import Any
+
+from daita.agents.conversation import ConversationHistory
 
 from .monitor_commands.service import DbMonitorCommandService
 from .models import DbOperationResult, DbRequest, DbRuntimeInspection
 from .monitors import DbMonitor, DbMonitorInspection
 from .runtime import DbRuntime
+from .session_context import DbSessionContextBuilder
 
 
 class DbAgent:
     """Facade returned by the future `Agent.from_db()` implementation."""
 
-    def __init__(self, *, runtime: DbRuntime, name: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        runtime: DbRuntime,
+        name: str | None = None,
+        default_history: ConversationHistory | None = None,
+    ) -> None:
         self.runtime = runtime
         self.name = name
+        self._default_history = default_history
         self._monitor_commands = DbMonitorCommandService(runtime)
 
     @property
@@ -31,18 +42,41 @@ class DbAgent:
         """Redacted operation audit summaries retained by the runtime."""
         return self.runtime.audit_log
 
-    async def run(self, prompt: str, **kwargs) -> str:
+    async def run(
+        self,
+        prompt: str,
+        *,
+        history: ConversationHistory | None = None,
+        **kwargs,
+    ) -> str:
         """Run a DB request and return the synthesized answer string."""
-        result = await self.run_detailed(prompt, **kwargs)
+        result = await self.run_detailed(prompt, history=history, **kwargs)
         return result.answer or ""
 
-    async def run_detailed(self, prompt: str, **kwargs) -> DbOperationResult:
+    async def run_detailed(
+        self,
+        prompt: str,
+        *,
+        history: ConversationHistory | None = None,
+        **kwargs,
+    ) -> DbOperationResult:
         """Run a DB request and return the typed operation result."""
+        active_history = self._resolve_history(history, kwargs)
+        if active_history is not None:
+            active_history._set_workspace(self._history_workspace())
         request = _request_from_kwargs(prompt, kwargs)
+        if active_history is not None and request.session_id is None:
+            request = replace(request, session_id=active_history.session_id)
+        request = await self._with_session_context(request, active_history)
         monitor_result = await self._monitor_commands.run(request)
-        if monitor_result is not None:
-            return monitor_result
-        return await self.runtime.run(request)
+        result = (
+            monitor_result
+            if monitor_result is not None
+            else await self.runtime.run(request)
+        )
+        if active_history is not None:
+            await active_history.add_turn(prompt, result.answer or "")
+        return result
 
     async def describe(self) -> DbRuntimeInspection:
         """Return runtime diagnostics for inspection."""
@@ -166,10 +200,42 @@ class DbAgent:
         """Alias for framework code that manages runtimes directly."""
         await self.stop()
 
-    async def stream(self, prompt: str, **kwargs):
+    async def stream(
+        self,
+        prompt: str,
+        *,
+        history: ConversationHistory | None = None,
+        **kwargs,
+    ):
         """Streaming will be implemented once DB synthesis exists."""
-        result = await self.run_detailed(prompt, **kwargs)
+        result = await self.run_detailed(prompt, history=history, **kwargs)
         yield result
+
+    def _resolve_history(
+        self,
+        explicit_history: ConversationHistory | None,
+        kwargs: dict[str, Any],
+    ) -> ConversationHistory | None:
+        if explicit_history is not None:
+            return explicit_history
+        if "session_id" in kwargs and kwargs.get("session_id") is not None:
+            return None
+        return self._default_history
+
+    def _history_workspace(self) -> str:
+        return self.name or self.runtime.runtime_id
+
+    async def _with_session_context(
+        self,
+        request: DbRequest,
+        history: ConversationHistory | None,
+    ) -> DbRequest:
+        messages = history.messages if history is not None else ()
+        context = await DbSessionContextBuilder(self.runtime).build(
+            request,
+            conversation_messages=messages,
+        )
+        return replace(request, session_context=context.to_request_dict())
 
 
 def _request_from_kwargs(prompt: str, kwargs: dict[str, Any]) -> DbRequest:

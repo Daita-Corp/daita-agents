@@ -1022,12 +1022,9 @@ def _synthesis_dependencies(
             _append_dependency_for_kind(dependencies, accepted, kind)
     elif intent.kind is DbIntentKind.SCHEMA_QUERY:
         _append_database_schema_dependency(dependencies, accepted)
-        for kind in (
-            "planning.context",
-            "schema.search_result",
-            "schema.asset_profile",
-        ):
+        for kind in ("planning.context", "schema.search_result"):
             _append_dependency_for_kind(dependencies, accepted, kind)
+        _append_schema_asset_dependencies(dependencies, accepted)
         _append_dependency_for_kind(dependencies, accepted, "verification.result")
     elif intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY:
         _append_database_schema_dependency(dependencies, accepted)
@@ -1110,6 +1107,23 @@ def _append_database_schema_dependency(
         )
     if item is not None:
         dependencies.append(_dependency_for_evidence(item))
+
+
+def _append_schema_asset_dependencies(
+    dependencies: list[TaskDependency],
+    evidence: tuple[Evidence, ...],
+) -> None:
+    scoped = [
+        item
+        for item in evidence
+        if item.kind == "schema.asset_profile"
+        and _schema_evidence_scope(item) == "asset"
+        and item.id
+    ]
+    for item in scoped:
+        dependencies.append(_dependency_for_evidence(item))
+    if not scoped:
+        _append_dependency_for_kind(dependencies, evidence, "schema.asset_profile")
 
 
 def _schema_evidence_scope(evidence: Evidence) -> str | None:

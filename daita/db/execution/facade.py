@@ -12,6 +12,7 @@ from ..capabilities import SCHEMA_RELATIONSHIP_PATH_EVIDENCE
 from ..evidence import DbEvidenceStore
 from ..models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
 from ..query_planning import DbQueryPlanner
+from ..session_context import db_session_context_from_request
 from .catalog import (
     _ExecutionCatalogMixin,
     _catalog_column_value_search_exists,
@@ -575,7 +576,7 @@ class DbOperationExecutor(
         evidence_store: DbEvidenceStore,
         store_id: str,
     ) -> None:
-        table = self.query_planner.best_table_for_prompt(request.prompt, schema)
+        tables = _schema_tables_for_request(request, schema, self.query_planner)
         await self._execute_capability(
             "catalog.schema.search",
             contract,
@@ -584,7 +585,7 @@ class DbOperationExecutor(
             evidence_store,
             {"store_id": store_id, "query": request.prompt, "limit": 10},
         )
-        if table:
+        for table in tables:
             asset_evidence = await self._execute_capability(
                 "catalog.asset.inspect",
                 contract,
@@ -780,6 +781,67 @@ def _relationship_assets_for_metadata_prompt(
         if table.get("name") and str(table.get("name")) != source
     ]
     return [source], all_tables[:5]
+
+
+def _schema_tables_for_request(
+    request: DbRequest,
+    schema: dict[str, Any],
+    query_planner: DbQueryPlanner,
+) -> tuple[str, ...]:
+    schema_tables = _schema_table_names(schema)
+    if not schema_tables:
+        return ()
+    if request.source_scope:
+        scoped_tables = []
+        for table in request.source_scope:
+            if table in schema_tables:
+                scoped_tables.append(table)
+                continue
+            short_name = table.split(".")[-1]
+            if short_name in schema_tables:
+                scoped_tables.append(short_name)
+        return tuple(dict.fromkeys(scoped_tables))
+    explicit_table = query_planner.best_table_for_prompt(request.prompt, schema)
+    if explicit_table:
+        return (explicit_table,)
+    return _session_tables_for_request(request, schema_tables)
+
+
+def _session_tables_for_request(
+    request: DbRequest,
+    schema_tables: set[str],
+) -> tuple[str, ...]:
+    session_context = db_session_context_from_request(request)
+    if session_context is None:
+        return ()
+    referent_sources = (
+        session_context.diagnostics.get("referent_sources", {}).get("tables", {})
+        if isinstance(session_context.diagnostics.get("referent_sources"), dict)
+        else {}
+    )
+    structured_referents = tuple(
+        table
+        for table in session_context.referents.tables
+        if referent_sources.get(table) != "conversation_history"
+    )
+    candidate_referents = structured_referents or session_context.referents.tables
+    tables = []
+    for table in candidate_referents:
+        if table in schema_tables:
+            tables.append(table)
+            continue
+        short_name = table.split(".")[-1]
+        if short_name in schema_tables:
+            tables.append(short_name)
+    return tuple(dict.fromkeys(tables))
+
+
+def _schema_table_names(schema: dict[str, Any]) -> set[str]:
+    return {
+        str(table.get("name"))
+        for table in schema.get("tables", []) or []
+        if table.get("name")
+    }
 
 
 def _related_tables_for_schema_asset(schema: dict[str, Any], asset: str) -> list[str]:

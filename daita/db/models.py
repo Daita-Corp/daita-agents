@@ -106,6 +106,7 @@ class DbRequest:
     requested_capabilities: tuple[str, ...] = ()
     constraints: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    session_context: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.prompt:
@@ -118,6 +119,12 @@ class DbRequest:
         )
         object.__setattr__(self, "constraints", _json_dict(self.constraints))
         object.__setattr__(self, "metadata", _json_dict(self.metadata))
+        if self.session_context is not None:
+            object.__setattr__(
+                self,
+                "session_context",
+                _json_dict(self.session_context),
+            )
 
 
 @dataclass(frozen=True)

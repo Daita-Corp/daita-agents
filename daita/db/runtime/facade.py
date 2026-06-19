@@ -41,6 +41,7 @@ from ..models import (
 )
 from ..monitors import DbMonitorStore
 from ..planning import DbContractBuilder, DbIntentClassifier
+from ..session_context import db_session_context_from_request
 from ..synthesis import DbSynthesizer
 from ..verification import DbVerifier
 from .analysis import DbRuntimeAnalysisMixin
@@ -354,6 +355,9 @@ class DbRuntime(
             "contract": contract.metadata,
             "skills": skill_resolution.to_metadata(),
         }
+        session_context = db_session_context_from_request(db_request)
+        if session_context is not None:
+            base_diagnostics["session_context"] = session_context.to_diagnostic_dict()
         if contract.metadata.get("missing_capabilities"):
             return await self._record_operation_result(
                 DbOperationResult(

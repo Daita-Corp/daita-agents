@@ -10,6 +10,7 @@ from typing import Any
 from daita.runtime import Evidence, Operation
 
 from .models import DbIntent, DbRequest, DbRuntimeConfig
+from .session_context import db_session_context_from_request
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class DbPlanningContext:
     policy_summary: dict[str, Any] = field(default_factory=dict)
     limit_summary: dict[str, Any] = field(default_factory=dict)
     redaction_policy: dict[str, Any] = field(default_factory=dict)
+    session_context: dict[str, Any] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
     rendered_context: str = ""
     schema_fingerprint: str | None = None
@@ -64,6 +66,7 @@ class DbPlanningContext:
             "policy_summary": self.policy_summary,
             "limit_summary": self.limit_summary,
             "redaction_policy": self.redaction_policy,
+            "session_context": self.session_context,
             "diagnostics": self.diagnostics,
             "rendered_context": self.rendered_context,
             "schema_fingerprint": self.schema_fingerprint,
@@ -147,6 +150,9 @@ class DbPlanningContextBuilder:
             "capability_summary_count": len(capability_summaries),
             "column_value_hint_count": len(column_value_hints),
         }
+        session_context = _compact_session_context(request)
+        if session_context:
+            included_sections.append("session_context")
         context = DbPlanningContext(
             operation_id=operation.id,
             prompt=request.prompt,
@@ -204,6 +210,7 @@ class DbPlanningContextBuilder:
                     options.get("include_sample_values", False)
                 ),
             },
+            session_context=session_context,
             diagnostics=diagnostics,
             schema_fingerprint=schema_fingerprint,
         )
@@ -297,7 +304,67 @@ def _render_context_summary(context: DbPlanningContext) -> str:
                     f"- {hint.get('table')}.{hint.get('column')}: "
                     + ", ".join(values[:25])
                 )
+    referents = context.session_context.get("referents")
+    if isinstance(referents, dict):
+        tables = referents.get("tables") or []
+        if tables:
+            lines.append("Session table referents:")
+            for table in tables[:20]:
+                lines.append(f"- {table}")
+        monitors = referents.get("monitors") or []
+        if monitors:
+            lines.append("Session monitor referents:")
+            for monitor in monitors[:10]:
+                lines.append(f"- {monitor}")
     return "\n".join(lines)
+
+
+def _compact_session_context(request: DbRequest) -> dict[str, Any]:
+    session_context = db_session_context_from_request(request)
+    if session_context is not None:
+        context = session_context.to_request_dict()
+    else:
+        context = getattr(request, "session_context", None)
+    if context is None:
+        return {}
+    if not isinstance(context, dict):
+        return {}
+    referents = context.get("referents")
+    recent_operations = context.get("recent_operations")
+    durable_ids = context.get("durable_ids")
+    diagnostics = context.get("diagnostics")
+    compact: dict[str, Any] = {}
+    if isinstance(referents, dict):
+        compact["referents"] = {
+            key: list(referents.get(key) or [])[:20]
+            for key in (
+                "tables",
+                "columns",
+                "schemas",
+                "metrics",
+                "monitors",
+                "approvals",
+                "operations",
+            )
+        }
+    if isinstance(recent_operations, list):
+        compact["recent_operations"] = recent_operations[:8]
+    if isinstance(durable_ids, dict):
+        compact["durable_ids"] = dict(durable_ids)
+    if isinstance(diagnostics, dict):
+        compact["diagnostics"] = {
+            "sources": list(diagnostics.get("sources") or []),
+            "referent_sources": dict(diagnostics.get("referent_sources") or {}),
+            "bounded": dict(diagnostics.get("bounded") or {}),
+        }
+        for key in (
+            "conversation_message_count",
+            "recent_operation_count",
+            "evidence_operation_count",
+        ):
+            if key in diagnostics:
+                compact["diagnostics"][key] = diagnostics[key]
+    return compact
 
 
 def _column_value_hints(

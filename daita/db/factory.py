@@ -9,6 +9,7 @@ from dataclasses import asdict, is_dataclass, replace
 from typing import Any
 from urllib.parse import urlparse
 
+from daita.agents.conversation import ConversationHistory
 from daita.core.exceptions import AgentError
 from daita.plugins.base_db import BaseDatabasePlugin
 from daita.plugins.catalog import CatalogPlugin
@@ -89,6 +90,7 @@ async def from_db(
     budget: Any | None = None,
     schema_prompt_policy: Any | None = None,
     tool_result_policy: Any | None = None,
+    stateful: bool = False,
     plugins: tuple[Any, ...] | list[Any] = (),
     skills: tuple[Any, ...] | list[Any] = (),
     read_only: bool | None = None,
@@ -152,7 +154,8 @@ async def from_db(
         temperature=temperature,
         include_sample_values=include_sample_values,
         redact_pii_columns=redact_pii_columns,
-        history=history,
+        history=history if not isinstance(history, ConversationHistory) else None,
+        stateful=stateful,
         cache_ttl=cache_ttl,
         toolkit=toolkit,
         calibrate_memory=calibrate_memory,
@@ -220,7 +223,10 @@ async def from_db(
             retry_hint=getattr(exc, "retry_hint", "retryable"),
             context={"source_type": type(source_plugin).__name__},
         ) from exc
-    return DbAgent(runtime=runtime, name=name)
+    default_history = history if isinstance(history, ConversationHistory) else None
+    if default_history is None and stateful:
+        default_history = ConversationHistory(workspace=name)
+    return DbAgent(runtime=runtime, name=name, default_history=default_history)
 
 
 def _resolve_runtime_source(

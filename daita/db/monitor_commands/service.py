@@ -25,6 +25,7 @@ from ..models import (
     DbRequest,
 )
 from ..monitors import DbMonitor
+from ..session_context import db_session_context_from_request
 from .answers import (
     _approval_action_answer,
     _create_monitor_answer,
@@ -822,6 +823,18 @@ class DbMonitorCommandService:
             )
             if resolution is not None:
                 return resolution
+        session_context = db_session_context_from_request(request)
+        if session_context is not None:
+            for monitor_id in session_context.referents.monitors:
+                resolution = self.resolver.resolve(
+                    replace(command, monitor_id=str(monitor_id)),
+                    monitors,
+                )
+                if resolution.accepted:
+                    return replace(
+                        resolution,
+                        resolution_source="db_session_context.referents.monitors",
+                    )
         return None
 
     async def _resolve_from_latest_session_operation(
@@ -987,12 +1000,22 @@ def _owner_from_request(request: DbRequest) -> dict[str, Any]:
 
 
 def _request_has_monitor_context(request: DbRequest) -> bool:
-    return any(
+    if any(
         request.metadata.get(key)
         for key in (
             "last_monitor_id",
             "last_runtime_operation_id",
             "last_approval_id",
+        )
+    ):
+        return True
+    session_context = db_session_context_from_request(request)
+    return bool(
+        session_context
+        and (
+            session_context.referents.monitors
+            or session_context.durable_ids.get("last_monitor_id")
+            or session_context.durable_ids.get("monitor_id")
         )
     )
 

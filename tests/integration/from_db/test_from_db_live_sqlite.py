@@ -20,7 +20,9 @@ import pytest
 from dotenv import load_dotenv
 
 from daita.agents.agent import Agent
+from daita.agents.conversation import ConversationHistory
 from daita.db import DbIntentKind
+from daita.db.session_context import db_session_context_from_request
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.memory.local_backend import LocalMemoryBackend
 from daita.plugins.memory.memory_plugin import MemoryPlugin
@@ -279,3 +281,96 @@ async def test_from_db_live_resolves_non_descriptive_prompt_without_looping(tmp_
     )
     assert "schema.asset_profile" in _evidence_kinds(bounded_fallback)
     assert "query.result" not in _evidence_kinds(bounded_fallback)
+
+
+async def test_from_db_live_stateful_and_stateless_session_context(tmp_path):
+    db_path = tmp_path / "sales.sqlite"
+    await _seed_sales_db(db_path)
+    live_openai = _require_live_openai()
+    stateful_agent = await Agent.from_db(
+        str(db_path),
+        name="LiveFromDbStateful",
+        stateful=True,
+        cache_ttl=0,
+        **live_openai,
+    )
+    stateless_agent = await Agent.from_db(
+        str(db_path),
+        name="LiveFromDbStateless",
+        cache_ttl=0,
+        **live_openai,
+    )
+    explicit_history_agent = await Agent.from_db(
+        str(db_path),
+        name="LiveFromDbExplicitHistory",
+        cache_ttl=0,
+        **live_openai,
+    )
+    explicit_history = ConversationHistory(
+        session_id="live-explicit-history",
+        workspace="LiveFromDbExplicitHistory",
+    )
+
+    try:
+        stateful_first = await stateful_agent.run_detailed(
+            "What columns are in customers?",
+            mode="schema.query",
+        )
+        stateful_second = await stateful_agent.run_detailed(
+            "Please detail them.",
+            mode="schema.query",
+        )
+        stateless_first = await stateless_agent.run_detailed(
+            "What columns are in customers?",
+            mode="schema.query",
+        )
+        stateless_second = await stateless_agent.run_detailed(
+            "Please detail them.",
+            mode="schema.query",
+        )
+        explicit_override = await explicit_history_agent.run_detailed(
+            "How many customers are there?",
+            history=explicit_history,
+            session_id="live-explicit-session",
+        )
+    finally:
+        await stateful_agent.stop()
+        await stateless_agent.stop()
+        await explicit_history_agent.stop()
+
+    assert stateful_first.status is OperationStatus.SUCCEEDED
+    assert stateful_second.status is OperationStatus.SUCCEEDED
+    assert stateful_first.request.session_id == stateful_second.request.session_id
+    assert stateful_agent._default_history is not None
+    assert stateful_agent._default_history.turn_count == 2
+    assert "customers" in (stateful_second.answer or "")
+    assert "orders" not in (stateful_second.answer or "")
+    stateful_context = db_session_context_from_request(stateful_second.request)
+    assert stateful_context is not None
+    assert "customers" in stateful_context.referents.tables
+    assert (
+        "runtime.evidence"
+        in stateful_context.diagnostics["referent_sources"]["tables"].values()
+    )
+    assert "conversation_messages" not in (
+        stateful_second.request.session_context or {}
+    )
+
+    assert stateless_first.status is OperationStatus.SUCCEEDED
+    assert stateless_second.status is OperationStatus.SUCCEEDED
+    assert stateless_first.request.session_id is None
+    assert stateless_second.request.session_id is None
+    assert stateless_agent._default_history is None
+    stateless_context = db_session_context_from_request(stateless_second.request)
+    assert stateless_context is not None
+    assert stateless_context.referents.tables == ()
+    assert "customers" in (stateless_second.answer or "")
+    assert "orders" in (stateless_second.answer or "")
+
+    assert explicit_override.status is OperationStatus.SUCCEEDED
+    assert explicit_override.request.session_id == "live-explicit-session"
+    assert explicit_history.turn_count == 1
+    assert explicit_history.messages[-2:] == [
+        {"role": "user", "content": "How many customers are there?"},
+        {"role": "assistant", "content": explicit_override.answer or ""},
+    ]
