@@ -5,14 +5,17 @@ Evidence-driven final answer synthesis for DB runtime operations.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from difflib import get_close_matches
 import json
 import re
-from typing import Any
+from typing import Any, Literal
 
 from daita.runtime import Evidence, Operation, Task
 
 from .context import DbContextRenderer
 from .models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
+from .query_planning import DbQueryPlanner
+from .session_context import db_session_context_from_request
 from .verification import DbVerificationResult
 
 _ALLOWED_SUFFICIENCY = frozenset(
@@ -32,6 +35,23 @@ _SENSITIVE_FIELD_RE = re.compile(
 )
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 _PHONE_RE = re.compile(r"\+?\d[\d\-\s().]{7,}\d")
+_DATABASE_WIDE_SCHEMA_RE = re.compile(
+    r"\b("
+    r"what\s+tables\s+(?:exist|are\s+(?:there|available))|"
+    r"list\s+(?:all\s+)?tables|"
+    r"all\s+tables|"
+    r"database\s+schema|"
+    r"schema\s+summary|"
+    r"summarize\s+(?:the\s+)?(?:database\s+)?schema|"
+    r"available\s+(?:tables|data|schema)"
+    r")\b",
+    re.IGNORECASE,
+)
+_TABLE_NAME_PROMPT_RE = re.compile(
+    r"\b(?:about|for|from|in|named|called)\s+(?:the\s+)?([A-Za-z_][\w.]*)(?:\s+table)?\b|"
+    r"\b([A-Za-z_][\w.]*)\s+table\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +68,30 @@ class DbSynthesisResult:
             "answer": self.answer,
             "evidence_refs": list(self.evidence_refs),
             "warnings": list(self.warnings),
+            "diagnostics": self.diagnostics,
+        }
+
+
+@dataclass(frozen=True)
+class SchemaAnswerScope:
+    """Prompt-aware schema evidence selected for the final answer."""
+
+    mode: Literal["asset", "database", "ambiguous", "none"]
+    requested_assets: tuple[str, ...]
+    selected_tables: tuple[dict[str, Any], ...]
+    evidence_refs: tuple[str, ...]
+    diagnostics: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "requested_assets": list(self.requested_assets),
+            "selected_table_names": [
+                str(table.get("name"))
+                for table in self.selected_tables
+                if table.get("name")
+            ],
+            "evidence_refs": list(self.evidence_refs),
             "diagnostics": self.diagnostics,
         }
 
@@ -73,36 +117,60 @@ class DbSynthesizer:
             )
 
         if intent.kind is DbIntentKind.SCHEMA_QUERY:
-            answer = _schema_answer(evidence)
+            scope = _schema_answer_scope(request, contract, evidence)
+            answer = _schema_answer(scope)
         elif intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY:
+            scope = None
             answer = _schema_relationship_answer(evidence)
         elif intent.kind in {
             DbIntentKind.DATA_QUERY,
             DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
         }:
+            scope = None
             answer = _data_answer(evidence)
         else:
+            scope = None
             answer = "The DB operation completed with verified evidence."
 
+        diagnostics = {
+            "synthesis": "deterministic",
+            "operation_type": contract.operation_type,
+            "context": self.context_renderer.render_evidence_summary(evidence),
+            "prompt": request.prompt,
+            "skill_synthesis_metadata": contract.metadata.get(
+                "skill_synthesis_metadata", {}
+            ),
+        }
+        if scope is not None:
+            diagnostics["schema_answer_scope"] = scope.to_dict()
         return DbSynthesisResult(
             answer=answer,
             evidence_refs=verification.evidence_refs,
             warnings=(),
-            diagnostics={
-                "synthesis": "deterministic",
-                "operation_type": contract.operation_type,
-                "context": self.context_renderer.render_evidence_summary(evidence),
-                "prompt": request.prompt,
-                "skill_synthesis_metadata": contract.metadata.get(
-                    "skill_synthesis_metadata", {}
-                ),
-            },
+            diagnostics=diagnostics,
         )
 
 
-def _schema_answer(evidence: tuple[Evidence, ...]) -> str:
-    schema = _database_schema_payload(evidence)
-    tables = _tables_from_schema_payload(schema)
+def _schema_answer(scope: SchemaAnswerScope) -> str:
+    if scope.mode == "none":
+        return "No schema evidence was produced."
+    if scope.mode == "ambiguous":
+        requested = (
+            f" named {scope.requested_assets[0]}"
+            if len(scope.requested_assets) == 1
+            else ""
+        )
+        matches = tuple(scope.diagnostics.get("closest_matches") or ())
+        if matches:
+            return (
+                f"I could not find an exact table{requested}. "
+                f"Closest matches: {', '.join(str(item) for item in matches)}."
+            )
+        return (
+            f"I could not find an exact table{requested}. "
+            "Please clarify which table you want."
+        )
+    tables = list(scope.selected_tables)
     parts = []
     for table in tables:
         columns = [
@@ -111,7 +179,105 @@ def _schema_answer(evidence: tuple[Evidence, ...]) -> str:
             if column.get("name") or column.get("column_name")
         ]
         parts.append(f"{table.get('name')}: {', '.join(columns)}")
+    if scope.mode == "asset":
+        prefix = f"Found {len(tables)} matching tables. " if len(tables) != 1 else ""
+        return prefix + "; ".join(parts)
     return f"Found {len(tables)} tables. " + "; ".join(parts)
+
+
+def _schema_answer_scope(
+    request: DbRequest,
+    contract: DbOperationContract,
+    evidence: tuple[Evidence, ...],
+) -> SchemaAnswerScope:
+    accepted = tuple(item for item in evidence if item.accepted)
+    inventory = _schema_table_inventory(accepted)
+    table_names = tuple(inventory["table_names"])
+    if not table_names:
+        return SchemaAnswerScope(
+            mode="none",
+            requested_assets=(),
+            selected_tables=(),
+            evidence_refs=(),
+            diagnostics={"reason": "no_schema_tables"},
+        )
+
+    source_requested = _requested_assets_from_source_scope(request, table_names)
+    hinted_requested = _requested_assets_from_scope_hint(contract, table_names)
+    session_requested = _requested_assets_from_session(request, table_names)
+    prompt_requested = _requested_assets_from_prompt(request.prompt, inventory)
+    for reason, assets in (
+        ("request.source_scope", source_requested),
+        ("schema_answer_scope_hint", hinted_requested),
+        ("structured_session_referents", session_requested),
+        ("best_table_for_prompt", prompt_requested),
+    ):
+        selected = _tables_for_names(assets, inventory)
+        if selected:
+            return SchemaAnswerScope(
+                mode="asset",
+                requested_assets=tuple(assets),
+                selected_tables=tuple(table for table, _ in selected),
+                evidence_refs=tuple(
+                    dict.fromkeys(ref for _, refs in selected for ref in refs if ref)
+                ),
+                diagnostics={
+                    "reason": reason,
+                    "database_wide_prompt": _is_database_wide_schema_prompt(
+                        request.prompt
+                    ),
+                },
+            )
+
+    if _is_database_wide_schema_prompt(request.prompt):
+        tables, evidence_refs = _database_tables(inventory)
+        return SchemaAnswerScope(
+            mode="database",
+            requested_assets=(),
+            selected_tables=tuple(tables),
+            evidence_refs=evidence_refs,
+            diagnostics={"reason": "database_wide_prompt"},
+        )
+
+    requested_names = _prompt_table_like_names(request.prompt)
+    closest = _closest_table_matches(requested_names, table_names)
+    search_matches = _search_result_table_names(accepted)
+    if requested_names and not _exact_name_match(requested_names, table_names):
+        return SchemaAnswerScope(
+            mode="ambiguous",
+            requested_assets=tuple(requested_names),
+            selected_tables=(),
+            evidence_refs=tuple(
+                item.id
+                for item in accepted
+                if item.id and item.kind == "schema.search_result"
+            ),
+            diagnostics={
+                "reason": "missing_or_ambiguous_table",
+                "closest_matches": tuple(closest or search_matches[:5]),
+            },
+        )
+
+    asset_tables = _asset_tables(inventory)
+    if asset_tables:
+        return SchemaAnswerScope(
+            mode="asset",
+            requested_assets=tuple(table.get("name") for table, _ in asset_tables),
+            selected_tables=tuple(table for table, _ in asset_tables),
+            evidence_refs=tuple(
+                dict.fromkeys(ref for _, refs in asset_tables for ref in refs if ref)
+            ),
+            diagnostics={"reason": "asset_profile_evidence"},
+        )
+
+    tables, evidence_refs = _database_tables(inventory)
+    return SchemaAnswerScope(
+        mode="database",
+        requested_assets=(),
+        selected_tables=tuple(tables),
+        evidence_refs=evidence_refs,
+        diagnostics={"reason": "database_schema_fallback"},
+    )
 
 
 def _schema_relationship_answer(evidence: tuple[Evidence, ...]) -> str:
@@ -134,38 +300,271 @@ def _schema_relationship_answer(evidence: tuple[Evidence, ...]) -> str:
     return "Found relationship path evidence for the requested tables."
 
 
-def _database_schema_payload(evidence: tuple[Evidence, ...]) -> dict[str, Any]:
-    asset_scoped = [
-        item.payload
-        for item in evidence
-        if item.kind == "schema.asset_profile"
-        and _schema_scope(item) == "asset"
-        and _tables_from_schema_payload(item.payload)
-    ]
-    if asset_scoped:
-        tables = []
-        for payload in asset_scoped:
-            tables.extend(_tables_from_schema_payload(payload))
-        return {"tables": tables}
-    scoped = next(
-        (
-            item.payload
-            for item in evidence
-            if item.kind == "schema.asset_profile" and _schema_scope(item) == "database"
-        ),
-        None,
+def _schema_table_inventory(evidence: tuple[Evidence, ...]) -> dict[str, Any]:
+    tables_by_name: dict[str, list[tuple[dict[str, Any], tuple[str, ...], str]]] = {}
+    table_names: list[str] = []
+    database_tables: list[tuple[dict[str, Any], tuple[str, ...], str]] = []
+    asset_tables: list[tuple[dict[str, Any], tuple[str, ...], str]] = []
+    search_tables: list[tuple[dict[str, Any], tuple[str, ...], str]] = []
+    for item in evidence:
+        if item.kind not in {"schema.asset_profile", "schema.search_result"}:
+            continue
+        scope = _schema_scope(item)
+        source = (
+            "search"
+            if item.kind == "schema.search_result"
+            else ("asset" if scope == "asset" else "database")
+        )
+        for table in _tables_from_schema_payload(item.payload):
+            name = _table_name(table)
+            if not name:
+                continue
+            normalized = _normalize_table_name(name)
+            copied = dict(table)
+            copied["name"] = name
+            entry = (copied, (item.id,) if item.id else (), source)
+            tables_by_name.setdefault(normalized, []).append(entry)
+            table_names.append(name)
+            if source == "asset":
+                asset_tables.append(entry)
+            elif source == "search":
+                search_tables.append(entry)
+            else:
+                database_tables.append(entry)
+    return {
+        "tables_by_name": tables_by_name,
+        "table_names": tuple(dict.fromkeys(table_names)),
+        "database_tables": database_tables,
+        "asset_tables": asset_tables,
+        "search_tables": search_tables,
+    }
+
+
+def _requested_assets_from_source_scope(
+    request: DbRequest, table_names: tuple[str, ...]
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            resolved
+            for item in request.source_scope
+            for resolved in (_resolve_table_name(str(item), table_names),)
+            if resolved
+        )
     )
-    if scoped is not None:
-        return scoped
-    return next(
-        (
-            item.payload
-            for item in evidence
-            if item.kind == "schema.asset_profile"
-            and _tables_from_schema_payload(item.payload)
-        ),
-        {},
+
+
+def _requested_assets_from_scope_hint(
+    contract: DbOperationContract, table_names: tuple[str, ...]
+) -> tuple[str, ...]:
+    hint = contract.metadata.get("schema_answer_scope")
+    if not isinstance(hint, dict):
+        return ()
+    names = hint.get("requested_assets") or hint.get("selected_tables") or ()
+    if isinstance(names, str):
+        names = (names,)
+    return tuple(
+        dict.fromkeys(
+            resolved
+            for item in names
+            for resolved in (_resolve_table_name(str(item), table_names),)
+            if resolved
+        )
     )
+
+
+def _requested_assets_from_session(
+    request: DbRequest, table_names: tuple[str, ...]
+) -> tuple[str, ...]:
+    session_context = db_session_context_from_request(request)
+    if session_context is None:
+        return ()
+    referent_sources = (
+        session_context.diagnostics.get("referent_sources", {}).get("tables", {})
+        if isinstance(session_context.diagnostics.get("referent_sources"), dict)
+        else {}
+    )
+    structured_referents = tuple(
+        table
+        for table in session_context.referents.tables
+        if referent_sources.get(table) != "conversation_history"
+    )
+    candidate_referents = structured_referents or session_context.referents.tables
+    return tuple(
+        dict.fromkeys(
+            resolved
+            for item in candidate_referents
+            for resolved in (_resolve_table_name(str(item), table_names),)
+            if resolved
+        )
+    )
+
+
+def _requested_assets_from_prompt(
+    prompt: str, inventory: dict[str, Any]
+) -> tuple[str, ...]:
+    table_names = tuple(inventory["table_names"])
+    explicit = tuple(
+        dict.fromkeys(
+            resolved
+            for item in _prompt_table_like_names(prompt)
+            for resolved in (_resolve_table_name(item, table_names),)
+            if resolved
+        )
+    )
+    if explicit:
+        return explicit
+    schema = {"tables": [entry[0] for entry in _all_table_entries(inventory)]}
+    planned = DbQueryPlanner.best_table_for_prompt(prompt, schema)
+    resolved = _resolve_table_name(planned or "", table_names)
+    if not resolved:
+        return ()
+    return (resolved,)
+
+
+def _tables_for_names(
+    names: tuple[str, ...], inventory: dict[str, Any]
+) -> list[tuple[dict[str, Any], tuple[str, ...]]]:
+    selected: list[tuple[dict[str, Any], tuple[str, ...]]] = []
+    for name in names:
+        entries = inventory["tables_by_name"].get(_normalize_table_name(name)) or []
+        if not entries:
+            continue
+        table, refs, _ = _preferred_table_entry(entries)
+        selected.append((table, refs))
+    return selected
+
+
+def _preferred_table_entry(
+    entries: list[tuple[dict[str, Any], tuple[str, ...], str]],
+) -> tuple[dict[str, Any], tuple[str, ...], str]:
+    order = {"asset": 0, "search": 1, "database": 2}
+    return sorted(entries, key=lambda item: order.get(item[2], 99))[0]
+
+
+def _database_tables(
+    inventory: dict[str, Any],
+) -> tuple[list[dict[str, Any]], tuple[str, ...]]:
+    entries = inventory["database_tables"] or _all_table_entries(inventory)
+    tables: list[dict[str, Any]] = []
+    refs: list[str] = []
+    seen: set[str] = set()
+    for table, entry_refs, _ in entries:
+        normalized = _normalize_table_name(_table_name(table))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        tables.append(table)
+        refs.extend(entry_refs)
+    return tables, tuple(dict.fromkeys(refs))
+
+
+def _asset_tables(
+    inventory: dict[str, Any],
+) -> list[tuple[dict[str, Any], tuple[str, ...]]]:
+    selected = []
+    seen: set[str] = set()
+    for table, refs, _ in inventory["asset_tables"]:
+        normalized = _normalize_table_name(_table_name(table))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        selected.append((table, refs))
+    return selected
+
+
+def _all_table_entries(
+    inventory: dict[str, Any],
+) -> list[tuple[dict[str, Any], tuple[str, ...], str]]:
+    entries: list[tuple[dict[str, Any], tuple[str, ...], str]] = []
+    seen: set[tuple[str, str]] = set()
+    for source in ("asset_tables", "search_tables", "database_tables"):
+        for table, refs, kind in inventory[source]:
+            key = (_normalize_table_name(_table_name(table)), kind)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append((table, refs, kind))
+    return entries
+
+
+def _search_result_table_names(evidence: tuple[Evidence, ...]) -> tuple[str, ...]:
+    names: list[str] = []
+    for item in evidence:
+        if item.kind != "schema.search_result":
+            continue
+        names.extend(
+            name
+            for table in _tables_from_schema_payload(item.payload)
+            for name in (_table_name(table),)
+            if name
+        )
+    return tuple(dict.fromkeys(names))
+
+
+def _is_database_wide_schema_prompt(prompt: str) -> bool:
+    lowered = prompt.lower()
+    if _DATABASE_WIDE_SCHEMA_RE.search(lowered):
+        return True
+    return "schema" in lowered and not _prompt_table_like_names(prompt)
+
+
+def _prompt_table_like_names(prompt: str) -> tuple[str, ...]:
+    names: list[str] = []
+    for match in _TABLE_NAME_PROMPT_RE.finditer(prompt):
+        name = match.group(1) or match.group(2)
+        if not name:
+            continue
+        lowered = name.lower()
+        if lowered in {"the", "a", "an", "this", "that", "what", "which"}:
+            continue
+        names.append(name)
+    return tuple(dict.fromkeys(names))
+
+
+def _closest_table_matches(
+    requested_names: tuple[str, ...], table_names: tuple[str, ...]
+) -> tuple[str, ...]:
+    if not requested_names:
+        return ()
+    display_by_normalized = {
+        _normalize_table_name(name): name for name in table_names if name
+    }
+    matches: list[str] = []
+    for requested in requested_names:
+        normalized = _normalize_table_name(requested)
+        for match in get_close_matches(
+            normalized, tuple(display_by_normalized), n=3, cutoff=0.55
+        ):
+            matches.append(display_by_normalized[match])
+    return tuple(dict.fromkeys(matches))
+
+
+def _exact_name_match(
+    requested_names: tuple[str, ...], table_names: tuple[str, ...]
+) -> bool:
+    normalized = {_normalize_table_name(name) for name in table_names}
+    return any(_normalize_table_name(name) in normalized for name in requested_names)
+
+
+def _resolve_table_name(raw: str, table_names: tuple[str, ...]) -> str | None:
+    if not raw:
+        return None
+    normalized_raw = _normalize_table_name(raw)
+    short_raw = _normalize_table_name(raw.split(".")[-1])
+    for table_name in table_names:
+        normalized = _normalize_table_name(table_name)
+        short = _normalize_table_name(table_name.split(".")[-1])
+        if normalized_raw in {normalized, short} or short_raw in {normalized, short}:
+            return table_name
+    return None
+
+
+def _normalize_table_name(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
+
+
+def _table_name(table: dict[str, Any]) -> str:
+    return str(table.get("name") or table.get("table_name") or "").strip()
 
 
 def _schema_scope(evidence: Evidence) -> str | None:
@@ -421,7 +820,12 @@ def build_synthesis_context(
         (item for item in accepted if item.kind == "query.result"), None
     )
     rows, row_metadata = _bounded_rows(query_result, row_budget=row_budget)
-    semantics = _catalog_semantics(accepted)
+    schema_scope = (
+        _schema_answer_scope(request, contract, accepted)
+        if intent.kind is DbIntentKind.SCHEMA_QUERY
+        else None
+    )
+    semantics = _catalog_semantics(accepted, schema_scope=schema_scope)
     payload = {
         "prompt": request.prompt,
         "intent_kind": intent.kind.value,
@@ -440,6 +844,8 @@ def build_synthesis_context(
         "semantics": semantics,
         "verification": _verification_summary(accepted),
     }
+    if schema_scope is not None:
+        payload["schema_answer_scope"] = schema_scope.to_dict()
     required_caveats = _required_caveats(payload, row_metadata)
     payload["required_caveats"] = list(required_caveats)
     rendered = json.dumps(payload, sort_keys=True, default=str)
@@ -474,6 +880,8 @@ def build_synthesis_context(
             "field_char_budget": _DEFAULT_FIELD_CHAR_BUDGET,
         },
     }
+    if schema_scope is not None:
+        metadata["schema_answer_scope"] = schema_scope.to_dict()
     payload["truncation"] = truncation
     payload["redaction"] = metadata["redaction"]
     return DbSynthesisContext(payload=payload, metadata=metadata)
@@ -641,6 +1049,10 @@ def _synthesis_messages(context_payload: dict[str, Any]) -> list[dict[str, str]]
             "content": (
                 "You synthesize final database answers inside a governed runtime. "
                 "Use only the provided accepted evidence. Return strict JSON only. "
+                "The sufficiency field must be exactly one string from: "
+                "answered, partial, needs_clarification, insufficient_evidence. "
+                "If verification.result evidence is present, cite it. If "
+                "query.result evidence is present, cite it. "
                 "Never request SQL execution, tool calls, connector access, or any "
                 "new database work."
             ),
@@ -664,7 +1076,10 @@ def _synthesis_messages(context_payload: dict[str, Any]) -> list[dict[str, str]]
                         "limitations": ["string"],
                         "warnings": ["string"],
                         "follow_up_questions": ["string"],
-                        "sufficiency": sorted(_ALLOWED_SUFFICIENCY),
+                        "sufficiency": (
+                            "one of: answered, partial, needs_clarification, "
+                            "insufficient_evidence"
+                        ),
                         "confidence": "number from 0 to 1",
                         "truncation": {
                             "rows_truncated": "boolean",
@@ -794,7 +1209,11 @@ def _first_type_for_column(rows: list[dict[str, Any]], column: str) -> str:
     return "null"
 
 
-def _catalog_semantics(evidence: tuple[Evidence, ...]) -> dict[str, Any]:
+def _catalog_semantics(
+    evidence: tuple[Evidence, ...],
+    *,
+    schema_scope: SchemaAnswerScope | None = None,
+) -> dict[str, Any]:
     planning = next(
         (item for item in evidence if item.kind == "planning.context"), None
     )
@@ -813,7 +1232,12 @@ def _catalog_semantics(evidence: tuple[Evidence, ...]) -> dict[str, Any]:
         payload.get("schema") if isinstance(payload.get("schema"), dict) else payload
     )
     tables = []
-    for table in _tables_from_schema_payload(schema):
+    source_tables = (
+        list(schema_scope.selected_tables)
+        if schema_scope is not None
+        else _tables_from_schema_payload(schema)
+    )
+    for table in source_tables:
         tables.append(
             {
                 "name": table.get("name"),
@@ -828,11 +1252,37 @@ def _catalog_semantics(evidence: tuple[Evidence, ...]) -> dict[str, Any]:
                 "metadata": dict(table.get("metadata") or {}),
             }
         )
+    relationships = list(schema.get("foreign_keys", []) or [])[:50]
+    if schema_scope is not None and schema_scope.mode == "asset":
+        selected_names = {
+            str(table.get("name"))
+            for table in schema_scope.selected_tables
+            if table.get("name")
+        }
+        relationships = [
+            relationship
+            for relationship in relationships
+            if _relationship_mentions_table(relationship, selected_names)
+        ]
     return {
         "evidence_id": planning.id if planning is not None else None,
         "tables": tables,
-        "relationships": list(schema.get("foreign_keys", []) or [])[:50],
+        "relationships": relationships,
     }
+
+
+def _relationship_mentions_table(relationship: Any, selected_names: set[str]) -> bool:
+    if not isinstance(relationship, dict):
+        return False
+    values = {
+        relationship.get("source_table"),
+        relationship.get("target_table"),
+        relationship.get("source_asset"),
+        relationship.get("target_asset"),
+        relationship.get("from_table"),
+        relationship.get("to_table"),
+    }
+    return bool(selected_names & {str(value) for value in values if value})
 
 
 def _planning_summary(evidence: tuple[Evidence, ...]) -> dict[str, Any]:

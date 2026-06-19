@@ -66,13 +66,15 @@ class _ExecutionCatalogMixin:
         cached = self.runtime.cached_schema_evidence(operation_id=operation.id)
         if cached is not None:
             scoped = _with_schema_scope(cached, "database")
-            evidence_store.add(scoped)
-            return scoped
+            persisted = await self._persist_runtime_evidence(operation, scoped)
+            evidence_store.add(persisted)
+            return persisted
         persisted = self.runtime.persisted_schema_evidence(operation_id=operation.id)
         if persisted is not None:
             scoped = _with_schema_scope(persisted, "database")
-            evidence_store.add(scoped)
-            return scoped
+            persisted_scoped = await self._persist_runtime_evidence(operation, scoped)
+            evidence_store.add(persisted_scoped)
+            return persisted_scoped
         capability = self._first_capability("db.schema.inspect")
         if capability is None:
             return None
@@ -92,8 +94,11 @@ class _ExecutionCatalogMixin:
             )
             if fallback is None:
                 raise
-            evidence_store.add(fallback)
-            return fallback
+            persisted_fallback = await self._persist_runtime_evidence(
+                operation, _with_schema_scope(fallback, "database")
+            )
+            evidence_store.add(persisted_fallback)
+            return persisted_fallback
         if evidence:
             scoped = _with_schema_scope(evidence[0], "database")
             self.runtime.remember_schema_evidence(scoped)

@@ -69,6 +69,21 @@ async def test_run_executes_schema_query_with_typed_evidence():
     }
     assert result.diagnostics["verification"]["passed"] is True
     assert "customers: id, email, status" in result.answer
+    assert "orders:" not in result.answer
+
+
+async def test_run_executes_database_wide_schema_query_when_prompt_is_broad():
+    runtime, _ = await _runtime()
+
+    try:
+        result = await runtime.run(DbRequest("What tables exist?", mode="schema.query"))
+    finally:
+        await runtime.teardown()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert "Found 2 tables" in result.answer
+    assert "customers: id, email, status" in result.answer
+    assert "orders: id, customer_id, total" in result.answer
 
 
 async def test_run_executes_simple_count_query_with_validation_and_result_evidence():

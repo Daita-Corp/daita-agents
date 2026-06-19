@@ -2,7 +2,7 @@ import json
 from uuid import uuid4
 
 from daita.agents.agent import Agent
-from daita.db import DbRuntime
+from daita.db import DbRequest, DbRuntime
 from daita.db.llm_service import DbLLMResponse
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
@@ -41,6 +41,10 @@ async def _runtime(tmp_path, llm_service=None, **sqlite_options):
     db_path = tmp_path / f"llm_synthesis_{uuid4().hex}.sqlite"
     sqlite = SQLitePlugin(path=str(db_path), **sqlite_options)
     await sqlite.execute_script("""
+        CREATE TABLE customers (
+            id INTEGER PRIMARY KEY,
+            email TEXT
+        );
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             customer_email TEXT,
@@ -95,6 +99,31 @@ def _valid_response(answer):
                 "follow_up_questions": [],
                 "sufficiency": "partial" if caveats else "answered",
                 "confidence": 0.91,
+                "truncation": context["truncation"],
+                "grounding": {"all_claims_from_evidence": True},
+            }
+        )
+
+    return responder
+
+
+def _valid_schema_response(answer):
+    def responder(messages):
+        context = _context_from_messages(messages)
+        caveats = context.get("required_caveats") or []
+        return json.dumps(
+            {
+                "answer": answer,
+                "reasoning_summary": "Used accepted schema evidence.",
+                "cited_evidence_refs": _citations(
+                    context, "schema.asset_profile", "verification.result"
+                ),
+                "assumptions": [],
+                "limitations": caveats,
+                "warnings": caveats,
+                "follow_up_questions": [],
+                "sufficiency": "partial" if caveats else "answered",
+                "confidence": 0.88,
                 "truncation": context["truncation"],
                 "grounding": {"all_claims_from_evidence": True},
             }
@@ -232,6 +261,38 @@ async def test_llm_context_uses_accepted_dependency_evidence_only(tmp_path):
     assert "rejected-noise" not in evidence_ids
     assert "other-operation-noise" not in evidence_ids
     assert {item["operation_id"] for item in context["evidence"]} != {"other-operation"}
+
+
+async def test_llm_schema_context_scopes_single_table_prompts(tmp_path):
+    llm = FakeSynthesisLLMService(_valid_schema_response("Orders schema."))
+    runtime, sqlite = await _runtime(tmp_path, llm)
+    try:
+        result = await runtime.run(
+            DbRequest("Tell me about the orders table.", mode="schema.query")
+        )
+    finally:
+        await sqlite.disconnect()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    context = _context_from_messages(llm.calls[-1])
+    assert context["schema_answer_scope"]["mode"] == "asset"
+    assert context["schema_answer_scope"]["selected_table_names"] == ["orders"]
+    assert [table["name"] for table in context["semantics"]["tables"]] == ["orders"]
+
+
+async def test_llm_schema_context_keeps_database_wide_prompts_broad(tmp_path):
+    llm = FakeSynthesisLLMService(_valid_schema_response("Database schema."))
+    runtime, sqlite = await _runtime(tmp_path, llm)
+    try:
+        result = await runtime.run(DbRequest("What tables exist?", mode="schema.query"))
+    finally:
+        await sqlite.disconnect()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    context = _context_from_messages(llm.calls[-1])
+    assert context["schema_answer_scope"]["mode"] == "database"
+    table_names = {table["name"] for table in context["semantics"]["tables"]}
+    assert {"customers", "orders"} <= table_names
 
 
 async def test_no_llm_uses_deterministic_fallback_through_synthesis_evidence(tmp_path):

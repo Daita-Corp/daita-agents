@@ -995,6 +995,38 @@ async def test_agent_from_db_reuses_schema_profile_when_cache_ttl_allows(tmp_pat
         item for item in second.evidence if item.kind == "schema.asset_profile"
     )
     assert cached_schema.metadata["schema_cache"] == "hit"
+    assert cached_schema.id
+
+
+async def test_agent_from_db_cache_hit_schema_evidence_supports_database_wide_followup(
+    tmp_path,
+):
+    db_path = tmp_path / "phase13_schema_cache_database_followup.sqlite"
+    await _seed_sqlite(db_path)
+    source = SQLitePlugin(path=str(db_path))
+    agent = await Agent.from_db(source, cache_ttl=3600)
+
+    try:
+        first = await agent.run_detailed("Tell me about the customers table.")
+        second = await agent.run_detailed("What tables exist?", mode="schema.query")
+    finally:
+        await agent.stop()
+
+    assert first.status is OperationStatus.SUCCEEDED
+    assert second.status is OperationStatus.SUCCEEDED
+    assert "customers: id, name" in first.answer
+    assert "orders:" not in first.answer
+    assert "Found 2 tables" in second.answer
+    assert "customers: id, name" in second.answer
+    assert "orders: id, customer_id, total" in second.answer
+    cached_schema = next(
+        item
+        for item in second.evidence
+        if item.kind == "schema.asset_profile"
+        and item.metadata.get("schema_cache") == "hit"
+    )
+    assert cached_schema.id
+    assert cached_schema.metadata.get("payload_fingerprint")
 
 
 async def test_agent_from_db_cache_ttl_zero_reprofiles_schema(tmp_path):

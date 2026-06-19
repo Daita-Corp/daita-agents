@@ -61,7 +61,7 @@ def test_synthesizer_refuses_to_answer_before_verification_passes():
         )
 
 
-def test_schema_synthesis_prefers_database_scoped_profile_over_asset_profile():
+def test_schema_synthesis_uses_database_scope_for_database_wide_prompts():
     result = DbSynthesizer().synthesize(
         request=DbRequest("Summarize the database schema."),
         intent=DbIntent(
@@ -98,7 +98,94 @@ def test_schema_synthesis_prefers_database_scoped_profile_over_asset_profile():
     )
 
     assert "Found 2 tables" in result.answer
+    assert "customers: id" in result.answer
     assert "orders: customer_id" in result.answer
+    assert result.diagnostics["schema_answer_scope"]["mode"] == "database"
+
+
+def test_schema_synthesis_uses_exact_asset_scope_for_table_prompts():
+    result = DbSynthesizer().synthesize(
+        request=DbRequest("Tell me about the customers table."),
+        intent=DbIntent(
+            kind=DbIntentKind.SCHEMA_QUERY,
+            access=AccessMode.METADATA_READ,
+        ),
+        contract=DbOperationContract(
+            operation_type="schema.query",
+            required_evidence=("schema.asset_profile",),
+        ),
+        evidence=(
+            Evidence(
+                kind="schema.asset_profile",
+                id="db-schema",
+                payload={
+                    "tables": [
+                        {"name": "customers", "columns": [{"name": "id"}]},
+                        {"name": "orders", "columns": [{"name": "customer_id"}]},
+                    ],
+                    "metadata": {"scope": "database"},
+                },
+                metadata={"scope": "database"},
+            ),
+            Evidence(
+                kind="schema.asset_profile",
+                id="customers-profile",
+                payload={
+                    "asset": {"name": "customers"},
+                    "fields": [{"name": "email"}],
+                    "metadata": {"scope": "asset"},
+                },
+                metadata={"scope": "asset"},
+            ),
+        ),
+        verification=_verification(),
+    )
+
+    assert "customers: email" in result.answer
+    assert "orders" not in result.answer
+    assert result.diagnostics["schema_answer_scope"]["mode"] == "asset"
+    assert result.diagnostics["schema_answer_scope"]["selected_table_names"] == [
+        "customers"
+    ]
+
+
+def test_schema_synthesis_missing_table_returns_closest_matches_not_full_schema():
+    result = DbSynthesizer().synthesize(
+        request=DbRequest("Tell me about the custmers table."),
+        intent=DbIntent(
+            kind=DbIntentKind.SCHEMA_QUERY,
+            access=AccessMode.METADATA_READ,
+        ),
+        contract=DbOperationContract(operation_type="schema.query"),
+        evidence=(
+            Evidence(
+                kind="schema.asset_profile",
+                id="db-schema",
+                payload={
+                    "tables": [
+                        {"name": "customers", "columns": [{"name": "id"}]},
+                        {"name": "orders", "columns": [{"name": "customer_id"}]},
+                    ],
+                    "metadata": {"scope": "database"},
+                },
+                metadata={"scope": "database"},
+            ),
+            Evidence(
+                kind="schema.search_result",
+                id="search",
+                payload={
+                    "tables": [
+                        {"name": "customers", "fields": [{"name": "email"}]},
+                    ]
+                },
+            ),
+        ),
+        verification=_verification(),
+    )
+
+    assert "Closest matches: customers" in result.answer
+    assert "orders: customer_id" not in result.answer
+    assert result.diagnostics["schema_answer_scope"]["mode"] == "ambiguous"
 
 
 def test_relationship_synthesis_uses_relationship_path_evidence():
