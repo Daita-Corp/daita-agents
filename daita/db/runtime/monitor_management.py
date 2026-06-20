@@ -207,6 +207,10 @@ class DbRuntimeMonitorManagementMixin:
             },
             evaluate_governance=False,
         )
+        operation = await self._persist_trace_correlation(
+            operation,
+            intent_kind=DbIntentKind.ADMIN.value,
+        )
         plan_task = await self.kernel.plan_task(
             operation_id=operation.id,
             capability_id="db.monitor.plan_lifecycle",
@@ -520,6 +524,10 @@ class DbRuntimeMonitorManagementMixin:
                     "request_metadata": request.metadata,
                 },
             )
+            operation = await self._persist_trace_correlation(
+                operation=operation,
+                intent_kind=DbIntentKind.ADMIN.value,
+            )
             if evidence_kind is not None:
                 persisted_evidence = (
                     Evidence(
@@ -531,12 +539,15 @@ class DbRuntimeMonitorManagementMixin:
                         accepted=status is OperationStatus.SUCCEEDED,
                     ),
                 )
+            trace_id, span_id = self._current_trace_ids()
             created_event = RuntimeEvent(
                 id=f"monitor-command-event-{uuid4()}",
                 type=RuntimeEventType.OPERATION_CREATED,
                 operation_id=operation_id,
                 runtime_id=self.runtime_id,
                 runtime_kind=self.runtime_kind,
+                trace_id=trace_id,
+                span_id=span_id,
                 message=f"Monitor command operation {operation_id} created.",
                 payload={"operation_type": operation.operation_type},
             )
@@ -547,6 +558,8 @@ class DbRuntimeMonitorManagementMixin:
                 runtime_id=self.runtime_id,
                 runtime_kind=self.runtime_kind,
                 evidence_id=(persisted_evidence[0].id if persisted_evidence else None),
+                trace_id=trace_id,
+                span_id=span_id,
                 message=f"Monitor command {kind} finished with {status.value}.",
                 payload={
                     "status": status.value,
@@ -602,6 +615,7 @@ class DbRuntimeMonitorManagementMixin:
         payload: dict[str, Any],
     ) -> tuple[Operation, tuple[Evidence, ...], tuple[RuntimeEvent, ...]]:
         operation_id = f"monitor-{action}-{uuid4()}"
+        trace = self._current_trace_metadata()
         operation = Operation(
             id=operation_id,
             operation_type=f"monitor.{action}",
@@ -619,7 +633,13 @@ class DbRuntimeMonitorManagementMixin:
                 "monitor_name": monitor.name,
                 "monitor_status": monitor.status,
                 "control_plane": "db.monitor",
+                "command_kind": action,
+                **({"trace": trace} if trace else {}),
             },
+        )
+        self._record_active_span_correlation(
+            operation,
+            intent_kind=DbIntentKind.ADMIN.value,
         )
         evidence = Evidence(
             id=f"monitor-evidence-{uuid4()}",
@@ -628,12 +648,15 @@ class DbRuntimeMonitorManagementMixin:
             operation_id=operation_id,
             payload=payload,
         )
+        trace_id, span_id = self._current_trace_ids()
         created_event = RuntimeEvent(
             id=f"monitor-event-{uuid4()}",
             type=RuntimeEventType.OPERATION_CREATED,
             operation_id=operation_id,
             runtime_id=self.runtime_id,
             runtime_kind=self.runtime_kind,
+            trace_id=trace_id,
+            span_id=span_id,
             message=f"Monitor operation {operation_id} created.",
             payload={"operation_type": operation.operation_type},
         )
@@ -644,6 +667,8 @@ class DbRuntimeMonitorManagementMixin:
             runtime_id=self.runtime_id,
             runtime_kind=self.runtime_kind,
             evidence_id=evidence.id,
+            trace_id=trace_id,
+            span_id=span_id,
             message=f"Monitor {monitor.id} {action} committed.",
             payload={
                 "status": OperationStatus.SUCCEEDED.value,

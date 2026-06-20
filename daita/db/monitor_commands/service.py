@@ -12,7 +12,6 @@ from daita.runtime import (
     Evidence,
     OperationStatus,
     RiskLevel,
-    RuntimeEvent,
     RuntimeEventType,
     TaskDependency,
 )
@@ -164,6 +163,10 @@ class DbMonitorCommandService:
             },
             evaluate_governance=False,
         )
+        operation = await self.runtime._persist_trace_correlation(
+            operation,
+            intent_kind=DbIntentKind.ADMIN.value,
+        )
         plan_task = await self.runtime.kernel.plan_task(
             operation_id=operation.id,
             capability_id="db.monitor.plan_create",
@@ -207,6 +210,10 @@ class DbMonitorCommandService:
             },
         )
         await self.runtime.store.save_operation(operation)
+        operation = await self.runtime._persist_trace_correlation(
+            operation,
+            intent_kind=DbIntentKind.ADMIN.value,
+        )
         if not validation.accepted:
             await self.runtime.kernel.block_operation(
                 operation.id,
@@ -366,18 +373,13 @@ class DbMonitorCommandService:
                     ),
                 )
             )
-        await self.runtime.store.append_event(
-            RuntimeEvent(
-                id=f"monitor-command-event-{operation.id}:approval-requested",
-                type=RuntimeEventType.APPROVAL_REQUESTED,
-                operation_id=operation.id,
-                runtime_id=self.runtime.runtime_id,
-                runtime_kind=self.runtime.runtime_kind,
-                approval_id=approval.approval_id,
-                policy_id=approval.requested_by_policy_id,
-                message=f"Approval {approval.approval_id} requested.",
-                payload={"approval": approval.to_dict()},
-            )
+        await self.runtime.kernel.append_event(
+            RuntimeEventType.APPROVAL_REQUESTED,
+            operation_id=operation.id,
+            approval_id=approval.approval_id,
+            policy_id=approval.requested_by_policy_id,
+            message=f"Approval {approval.approval_id} requested.",
+            payload={"approval": approval.to_dict()},
         )
         await self.runtime.kernel.block_operation(
             operation.id,

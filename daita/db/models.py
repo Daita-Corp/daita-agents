@@ -197,6 +197,170 @@ class DbOperationResult:
         object.__setattr__(self, "warnings", _tuple_strings(self.warnings))
         object.__setattr__(self, "diagnostics", _json_dict(self.diagnostics))
 
+    @property
+    def telemetry(self) -> dict[str, Any]:
+        """Normalized DB operation telemetry for framework and hosted consumers."""
+        return db_operation_telemetry(self)
+
+
+def db_operation_telemetry(result: DbOperationResult) -> dict[str, Any]:
+    """Return normalized model/token/cost telemetry for a DB operation result."""
+    diagnostics = _telemetry_source_diagnostics(result)
+    if _is_deterministic_telemetry(diagnostics):
+        return _deterministic_telemetry(diagnostics)
+    if diagnostics:
+        return normalize_db_telemetry_diagnostics(diagnostics)
+    return _unknown_telemetry()
+
+
+def _telemetry_source_diagnostics(result: DbOperationResult) -> dict[str, Any]:
+    answer = _latest_synthesis_diagnostics(result.evidence, kind="answer.synthesis")
+    if answer:
+        return answer
+    analysis = _latest_synthesis_diagnostics(
+        result.evidence,
+        kind="analysis.synthesis",
+        require_final=True,
+    )
+    if analysis:
+        return analysis
+    synthesis = result.diagnostics.get("synthesis")
+    if isinstance(synthesis, dict):
+        diagnostics = synthesis.get("diagnostics")
+        if isinstance(diagnostics, dict) and diagnostics:
+            return dict(diagnostics)
+    analysis = result.diagnostics.get("analysis")
+    if isinstance(analysis, dict):
+        if not bool(analysis.get("partial")):
+            diagnostics = analysis.get("diagnostics")
+            if isinstance(diagnostics, dict) and diagnostics:
+                return dict(diagnostics)
+            synthesis = analysis.get("synthesis")
+            if isinstance(synthesis, dict) and not bool(synthesis.get("partial")):
+                diagnostics = synthesis.get("diagnostics")
+                if isinstance(diagnostics, dict) and diagnostics:
+                    return dict(diagnostics)
+    return {}
+
+
+def _latest_synthesis_diagnostics(
+    evidence: tuple[Evidence, ...],
+    *,
+    kind: str,
+    require_final: bool = False,
+) -> dict[str, Any]:
+    for item in reversed(evidence):
+        if item.kind != kind or not item.accepted:
+            continue
+        payload = item.payload if isinstance(item.payload, dict) else {}
+        if require_final and bool(payload.get("partial")):
+            continue
+        diagnostics = payload.get("diagnostics")
+        if isinstance(diagnostics, dict) and diagnostics:
+            return dict(diagnostics)
+    return {}
+
+
+def _is_deterministic_telemetry(diagnostics: Mapping[str, Any]) -> bool:
+    mode = str(diagnostics.get("mode") or "")
+    return (
+        mode in {"deterministic", "deterministic_fallback"}
+        or diagnostics.get("provider") == "daita.db"
+        or diagnostics.get("model") == "deterministic"
+    )
+
+
+def _deterministic_telemetry(diagnostics: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "provider": "daita.db",
+        "model": "deterministic",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "llm_calls": 0,
+        "estimated_cost_usd": 0.0,
+        "latency_ms": db_optional_float(diagnostics.get("latency_ms")),
+        "mode": "deterministic",
+    }
+
+
+def _unknown_telemetry() -> dict[str, Any]:
+    return {
+        "provider": "unknown",
+        "model": "unknown",
+        "input_tokens": "unknown",
+        "output_tokens": "unknown",
+        "total_tokens": "unknown",
+        "llm_calls": "unknown",
+        "estimated_cost_usd": "unknown",
+        "latency_ms": None,
+        "mode": "unknown",
+    }
+
+
+def normalize_db_telemetry_diagnostics(
+    diagnostics: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize one synthesis diagnostics payload into DB telemetry fields."""
+    tokens = (
+        diagnostics.get("tokens") if isinstance(diagnostics.get("tokens"), dict) else {}
+    )
+    input_tokens = db_optional_int(
+        diagnostics.get("input_tokens")
+        if diagnostics.get("input_tokens") is not None
+        else tokens.get("input_tokens", tokens.get("prompt_tokens"))
+    )
+    output_tokens = db_optional_int(
+        diagnostics.get("output_tokens")
+        if diagnostics.get("output_tokens") is not None
+        else tokens.get("output_tokens", tokens.get("completion_tokens"))
+    )
+    total_tokens = db_optional_int(
+        diagnostics.get("total_tokens")
+        if diagnostics.get("total_tokens") is not None
+        else tokens.get("total_tokens")
+    )
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    mode = str(diagnostics.get("mode") or "unknown")
+    llm_calls = db_optional_int(diagnostics.get("llm_calls"))
+    if llm_calls is None and mode == "llm":
+        llm_calls = 1
+    cost = diagnostics.get("estimated_cost_usd")
+    if cost is None:
+        cost = diagnostics.get("estimated_cost")
+    return {
+        "provider": str(diagnostics.get("provider") or "unknown"),
+        "model": str(diagnostics.get("model") or "unknown"),
+        "input_tokens": input_tokens if input_tokens is not None else "unknown",
+        "output_tokens": output_tokens if output_tokens is not None else "unknown",
+        "total_tokens": total_tokens if total_tokens is not None else "unknown",
+        "llm_calls": llm_calls if llm_calls is not None else "unknown",
+        "estimated_cost_usd": (
+            db_optional_float(cost) if cost is not None else "unknown"
+        ),
+        "latency_ms": db_optional_float(diagnostics.get("latency_ms")),
+        "mode": mode,
+    }
+
+
+def db_optional_int(value: Any) -> int | None:
+    if value is None or value == "unknown":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def db_optional_float(value: Any) -> float | None:
+    if value is None or value == "unknown":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 
 @dataclass(frozen=True)
 class DbRuntimeInspection:

@@ -239,6 +239,14 @@ def _map_metadata_to_attributes(
     # Agent name
     if metadata.get("agent_name"):
         attrs["daita.agent.name"] = str(metadata["agent_name"])
+    if metadata.get("user_id"):
+        attrs["daita.user.id"] = str(metadata["user_id"])
+    if metadata.get("session_id"):
+        attrs["daita.session.id"] = str(metadata["session_id"])
+    if metadata.get("mode"):
+        attrs["daita.mode"] = str(metadata["mode"])
+    if metadata.get("stateful_history") is not None:
+        attrs["daita.stateful_history"] = bool(metadata["stateful_history"])
 
     # OTel GenAI semconv
     if metadata.get("model"):
@@ -282,11 +290,21 @@ def _map_metadata_to_attributes(
         ("policy_id", "daita.policy.id"),
         ("approval_id", "daita.approval.id"),
         ("evidence_id", "daita.evidence.id"),
+        ("operation_type", "daita.operation.type"),
+        ("intent_kind", "daita.intent.kind"),
+        ("command_kind", "daita.command.kind"),
+        ("control_plane", "daita.control_plane"),
+        ("monitor_id", "daita.monitor.id"),
+        ("monitor_name", "daita.monitor.name"),
+        ("lease_owner", "daita.lease.owner"),
+        ("attempt_count", "daita.task.attempt_count"),
         ("span_id", "daita.span.id"),
         ("trace_id", "daita.trace.id"),
     ):
-        value = metadata.get(metadata_key) or runtime_context.get(metadata_key)
-        if value:
+        value = metadata.get(metadata_key)
+        if value is None:
+            value = runtime_context.get(metadata_key)
+        if value is not None and value != "":
             attrs[attribute_key] = str(value)
 
     # Deployment / environment
@@ -624,6 +642,26 @@ class TraceManager:
             logger.error(
                 f"Failed to record runtime correlation for span {span_id}: {e}"
             )
+
+    def current_trace_metadata(
+        self,
+        *,
+        span_name: str | None = None,
+        provider: str = "otel",
+    ) -> dict[str, str]:
+        """Return bounded trace correlation metadata for durable runtime state."""
+        trace_id = self.trace_context.current_trace_id
+        span_id = self.trace_context.current_span_id
+        if not trace_id or not span_id:
+            return {}
+        metadata = {
+            "trace_id": trace_id,
+            "root_span_id": span_id,
+            "provider": provider,
+        }
+        if span_name:
+            metadata["span_name"] = span_name
+        return metadata
 
     @asynccontextmanager
     async def span(
@@ -1183,6 +1221,13 @@ def _readable_span_to_dict(span) -> Dict[str, Any]:
             ("runtime_id", "daita.runtime.id"),
             ("runtime_kind", "daita.runtime.kind"),
             ("operation_id", "daita.operation.id"),
+            ("execution_id", "daita.execution.id"),
+            ("operation_type", "daita.operation.type"),
+            ("intent_kind", "daita.intent.kind"),
+            ("command_kind", "daita.command.kind"),
+            ("control_plane", "daita.control_plane"),
+            ("monitor_id", "daita.monitor.id"),
+            ("monitor_name", "daita.monitor.name"),
             ("task_id", "daita.task.id"),
             ("capability_id", "daita.capability.id"),
             ("executor_id", "daita.executor.id"),

@@ -9,6 +9,7 @@ from dataclasses import replace
 from typing import Any
 
 from daita.agents.conversation import ConversationHistory
+from daita.core.tracing import TraceType, get_trace_manager
 
 from .monitor_commands.service import DbMonitorCommandService
 from .models import DbOperationResult, DbRequest, DbRuntimeInspection
@@ -68,15 +69,29 @@ class DbAgent:
         if active_history is not None and request.session_id is None:
             request = replace(request, session_id=active_history.session_id)
         request = await self._with_session_context(request, active_history)
-        monitor_result = await self._monitor_commands.run(request)
-        result = (
-            monitor_result
-            if monitor_result is not None
-            else await self.runtime.run(request)
-        )
-        if active_history is not None:
-            await active_history.add_turn(prompt, result.answer or "")
-        return result
+        trace_manager = get_trace_manager()
+        async with trace_manager.span(
+            "from_db_operation",
+            TraceType.AGENT_EXECUTION,
+            agent_id=self.name,
+            runtime_id=self.runtime.runtime_id,
+            runtime_kind=self.runtime.runtime_kind,
+            agent_name=self.name,
+            prompt=request.prompt,
+            user_id=request.user_id,
+            session_id=request.session_id,
+            mode=request.mode,
+            stateful_history=active_history is not None,
+        ):
+            monitor_result = await self._monitor_commands.run(request)
+            result = (
+                monitor_result
+                if monitor_result is not None
+                else await self.runtime.run(request)
+            )
+            if active_history is not None:
+                await active_history.add_turn(prompt, result.answer or "")
+            return result
 
     async def describe(self) -> DbRuntimeInspection:
         """Return runtime diagnostics for inspection."""

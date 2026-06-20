@@ -759,165 +759,187 @@ class RuntimeKernel:
             message=f"Task {task.id} started.",
         )
         await self.store.commit_task_started(task, started_event)
-        trace_id, span_id = _current_trace_ids()
-        executor_started_event = self._event(
-            RuntimeEventType.EXECUTOR_STARTED,
-            operation=operation,
-            task=task,
-            capability=capability,
-            message=f"Executor {task.executor_id} started.",
-            payload={
-                "executor_id": task.executor_id,
-                "attempt_count": lease.attempt_count,
-            },
-            trace_id=trace_id,
-            span_id=span_id,
-        )
-        await self.store.append_event(executor_started_event)
         executor = self.extension_registry.get_executor(task.executor_id)
-        try:
-            evidence = tuple(
-                await executor.execute(task, operation, dict(context or {}))
-            )
-        except Exception as exc:
-            failed_task = replace(
-                task,
-                status=TaskStatus.FAILED,
-                metadata=_metadata_without_active_lease(task.metadata),
-            )
-            event = self._event(
-                RuntimeEventType.ERROR,
+        from daita.core.tracing import TraceType, get_trace_manager
+
+        async with get_trace_manager().span(
+            "runtime_executor",
+            TraceType.TOOL_EXECUTION,
+            runtime_id=self.runtime_id,
+            runtime_kind=self.runtime_kind,
+            operation_id=operation.id,
+            execution_id=operation.id,
+            operation_type=operation.operation_type,
+            task_id=task.id,
+            capability_id=capability.id,
+            executor_id=task.executor_id,
+            plugin_id=capability.owner,
+            lease_owner=lease.lease_owner,
+            attempt_count=lease.attempt_count,
+        ):
+            trace_id, span_id = _current_trace_ids()
+            executor_started_event = self._event(
+                RuntimeEventType.EXECUTOR_STARTED,
                 operation=operation,
                 task=task,
                 capability=capability,
-                message=f"Task {task.id} failed.",
-                payload={"error": {"type": type(exc).__name__, "message": str(exc)}},
-                trace_id=trace_id,
-                span_id=span_id,
-            )
-            committed = await self.store.commit_task_failed(
-                failed_task,
-                event,
-                lease_id=lease.lease_id,
-            )
-            executor_failed_event = self._event(
-                RuntimeEventType.EXECUTOR_FAILED,
-                operation=operation,
-                task=failed_task,
-                capability=capability,
-                message=f"Executor {task.executor_id} failed.",
+                message=f"Executor {task.executor_id} started.",
                 payload={
                     "executor_id": task.executor_id,
-                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                    "attempt_count": lease.attempt_count,
                 },
                 trace_id=trace_id,
                 span_id=span_id,
             )
-            result = TaskExecutionResult(
-                operation,
-                failed_task,
-                capability,
-                events=(started_event, executor_started_event, event),
-                governance=governance,
-                error=exc,
-            )
-            if not committed:
-                raise RuntimeKernelLeaseLost(
-                    f"Task {task.id} lease was lost before failure commit.",
+            await self.store.append_event(executor_started_event)
+            try:
+                evidence = tuple(
+                    await executor.execute(task, operation, dict(context or {}))
+                )
+            except Exception as exc:
+                failed_task = replace(
+                    task,
+                    status=TaskStatus.FAILED,
+                    metadata=_metadata_without_active_lease(task.metadata),
+                )
+                event = self._event(
+                    RuntimeEventType.ERROR,
+                    operation=operation,
+                    task=task,
+                    capability=capability,
+                    message=f"Task {task.id} failed.",
+                    payload={
+                        "error": {"type": type(exc).__name__, "message": str(exc)}
+                    },
+                    trace_id=trace_id,
+                    span_id=span_id,
+                )
+                committed = await self.store.commit_task_failed(
+                    failed_task,
+                    event,
+                    lease_id=lease.lease_id,
+                )
+                executor_failed_event = self._event(
+                    RuntimeEventType.EXECUTOR_FAILED,
+                    operation=operation,
+                    task=failed_task,
+                    capability=capability,
+                    message=f"Executor {task.executor_id} failed.",
+                    payload={
+                        "executor_id": task.executor_id,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                    trace_id=trace_id,
+                    span_id=span_id,
+                )
+                result = TaskExecutionResult(
+                    operation,
+                    failed_task,
+                    capability,
+                    events=(started_event, executor_started_event, event),
+                    governance=governance,
+                    error=exc,
+                )
+                if not committed:
+                    raise RuntimeKernelLeaseLost(
+                        f"Task {task.id} lease was lost before failure commit.",
+                        result=result,
+                    ) from exc
+                await self.store.append_event(executor_failed_event)
+                result = replace(
+                    result,
+                    events=(*result.events, executor_failed_event),
+                )
+                raise RuntimeKernelExecutorFailed(
+                    f"Executor {task.executor_id} failed for task {task.id}.",
                     result=result,
                 ) from exc
-            await self.store.append_event(executor_failed_event)
-            result = replace(
-                result,
-                events=(*result.events, executor_failed_event),
+            accepted_evidence = tuple(
+                self._accepted_task_evidence(item, operation=operation, task=task)
+                for item in evidence
             )
-            raise RuntimeKernelExecutorFailed(
-                f"Executor {task.executor_id} failed for task {task.id}.",
-                result=result,
-            ) from exc
-        accepted_evidence = tuple(
-            self._accepted_task_evidence(item, operation=operation, task=task)
-            for item in evidence
-        )
-        succeeded_task = replace(
-            task,
-            status=TaskStatus.SUCCEEDED,
-            metadata={
-                **_metadata_without_active_lease(task.metadata),
-                "output_evidence_refs": [
-                    item.id for item in accepted_evidence if item.id is not None
-                ],
-            },
-        )
-        event = self._event(
-            RuntimeEventType.TASK_UPDATED,
-            operation=operation,
-            task=task,
-            capability=capability,
-            message=f"Task {task.id} succeeded.",
-            payload={
-                "evidence_ids": [
-                    item.id for item in accepted_evidence if item.id is not None
-                ]
-            },
-            trace_id=trace_id,
-            span_id=span_id,
-        )
-        committed = await self.store.commit_task_succeeded(
-            succeeded_task,
-            accepted_evidence,
-            event,
-            lease_id=lease.lease_id,
-        )
-        result = TaskExecutionResult(
-            operation,
-            succeeded_task,
-            capability,
-            evidence=accepted_evidence,
-            events=(started_event, executor_started_event, event),
-            governance=governance,
-        )
-        if not committed:
-            raise RuntimeKernelLeaseLost(
-                f"Task {task.id} lease was lost before success commit.",
-                result=result,
+            succeeded_task = replace(
+                task,
+                status=TaskStatus.SUCCEEDED,
+                metadata={
+                    **_metadata_without_active_lease(task.metadata),
+                    "output_evidence_refs": [
+                        item.id for item in accepted_evidence if item.id is not None
+                    ],
+                },
             )
-        evidence_events = tuple(
-            self._event(
-                RuntimeEventType.EVIDENCE_ACCEPTED,
+            event = self._event(
+                RuntimeEventType.TASK_UPDATED,
                 operation=operation,
-                task=succeeded_task,
+                task=task,
                 capability=capability,
-                message=f"Evidence {item.id} accepted.",
-                payload=_evidence_event_payload(item),
-                evidence_id=item.id,
+                message=f"Task {task.id} succeeded.",
+                payload={
+                    "evidence_ids": [
+                        item.id for item in accepted_evidence if item.id is not None
+                    ]
+                },
                 trace_id=trace_id,
                 span_id=span_id,
             )
-            for item in accepted_evidence
-        )
-        executor_completed_event = self._event(
-            RuntimeEventType.EXECUTOR_COMPLETED,
-            operation=operation,
-            task=succeeded_task,
-            capability=capability,
-            message=f"Executor {task.executor_id} completed.",
-            payload={
-                "executor_id": task.executor_id,
-                "evidence_ids": [
-                    item.id for item in accepted_evidence if item.id is not None
-                ],
-            },
-            trace_id=trace_id,
-            span_id=span_id,
-        )
-        for emitted in (*evidence_events, executor_completed_event):
-            await self.store.append_event(emitted)
-        result = replace(
-            result,
-            events=(*result.events, *evidence_events, executor_completed_event),
-        )
-        return result
+            committed = await self.store.commit_task_succeeded(
+                succeeded_task,
+                accepted_evidence,
+                event,
+                lease_id=lease.lease_id,
+            )
+            result = TaskExecutionResult(
+                operation,
+                succeeded_task,
+                capability,
+                evidence=accepted_evidence,
+                events=(started_event, executor_started_event, event),
+                governance=governance,
+            )
+            if not committed:
+                raise RuntimeKernelLeaseLost(
+                    f"Task {task.id} lease was lost before success commit.",
+                    result=result,
+                )
+            evidence_events = tuple(
+                self._event(
+                    RuntimeEventType.EVIDENCE_ACCEPTED,
+                    operation=operation,
+                    task=succeeded_task,
+                    capability=capability,
+                    message=f"Evidence {item.id} accepted.",
+                    payload=_evidence_event_payload(item),
+                    evidence_id=item.id,
+                    trace_id=trace_id,
+                    span_id=span_id,
+                )
+                for item in accepted_evidence
+            )
+            executor_completed_event = self._event(
+                RuntimeEventType.EXECUTOR_COMPLETED,
+                operation=operation,
+                task=succeeded_task,
+                capability=capability,
+                message=f"Executor {task.executor_id} completed.",
+                payload={
+                    "executor_id": task.executor_id,
+                    "evidence_ids": [
+                        item.id for item in accepted_evidence if item.id is not None
+                    ],
+                },
+                trace_id=trace_id,
+                span_id=span_id,
+            )
+            for emitted in (*evidence_events, executor_completed_event):
+                await self.store.append_event(emitted)
+            result = replace(
+                result,
+                events=(*result.events, *evidence_events, executor_completed_event),
+            )
+            return result
 
     async def execute_capability(
         self,

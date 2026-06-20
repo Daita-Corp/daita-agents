@@ -347,6 +347,10 @@ class DbRuntime(
             evaluate_governance=False,
         )
         operation_id = operation.id
+        operation = await self._persist_trace_correlation(
+            operation,
+            intent_kind=intent.kind.value,
+        )
         await self._record_skill_resolution(operation_id, skill_resolution, contract)
 
         base_diagnostics = {

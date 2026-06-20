@@ -13,7 +13,13 @@ from typing import Any, Literal
 from daita.runtime import Evidence, Operation, Task
 
 from .context import DbContextRenderer
-from .models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
+from .models import (
+    DbIntent,
+    DbIntentKind,
+    DbOperationContract,
+    DbRequest,
+    db_optional_int,
+)
 from .query_planning import DbQueryPlanner
 from .session_context import db_session_context_from_request
 from .verification import DbVerificationResult
@@ -932,12 +938,14 @@ def deterministic_synthesis_payload(
         grounding={"all_claims_from_evidence": True},
         diagnostics={
             "mode": "deterministic_fallback",
-            "model": None,
-            "provider": None,
+            "model": "deterministic",
+            "provider": "daita.db",
             "latency_ms": None,
-            "input_tokens": None,
-            "output_tokens": None,
-            "estimated_cost": None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost": 0.0,
+            "llm_calls": 0,
             "fallback_reason": fallback_reason,
             "evidence_refs": [citation.id for citation in citations],
             "context": context_metadata,
@@ -1452,23 +1460,35 @@ def _diagnostics_from_llm(diagnostics: dict[str, Any]) -> dict[str, Any]:
     tokens = (
         diagnostics.get("tokens") if isinstance(diagnostics.get("tokens"), dict) else {}
     )
+    input_tokens = db_optional_int(
+        diagnostics.get("input_tokens")
+        if diagnostics.get("input_tokens") is not None
+        else tokens.get("input_tokens", tokens.get("prompt_tokens"))
+    )
+    output_tokens = db_optional_int(
+        diagnostics.get("output_tokens")
+        if diagnostics.get("output_tokens") is not None
+        else tokens.get("output_tokens", tokens.get("completion_tokens"))
+    )
+    total_tokens = db_optional_int(
+        diagnostics.get("total_tokens")
+        if diagnostics.get("total_tokens") is not None
+        else tokens.get("total_tokens")
+    )
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    estimated_cost = diagnostics.get("estimated_cost")
+    if estimated_cost is None:
+        estimated_cost = diagnostics.get("estimated_cost_usd")
     return {
         "model": diagnostics.get("model"),
         "provider": diagnostics.get("provider"),
         "latency_ms": diagnostics.get("latency_ms"),
-        "input_tokens": (
-            diagnostics.get("input_tokens")
-            or tokens.get("input_tokens")
-            or tokens.get("prompt_tokens")
-        ),
-        "output_tokens": (
-            diagnostics.get("output_tokens")
-            or tokens.get("output_tokens")
-            or tokens.get("completion_tokens")
-        ),
-        "estimated_cost": (
-            diagnostics.get("estimated_cost") or diagnostics.get("estimated_cost_usd")
-        ),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "estimated_cost": estimated_cost,
+        "llm_calls": diagnostics.get("llm_calls") or 1,
     }
 
 
