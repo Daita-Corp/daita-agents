@@ -16,6 +16,7 @@ CATALOG_ASSET_INSPECT_CAPABILITY = "catalog.asset.inspect"
 CATALOG_RELATIONSHIP_PATHS_FIND_CAPABILITY = "catalog.relationship_paths.find"
 
 MEMORY_SEMANTIC_WRITE_CAPABILITY = "memory.semantic.write"
+MEMORY_SEMANTIC_RECALL_CAPABILITY = "memory.semantic.recall"
 
 QUALITY_PROFILE_CAPABILITY = "quality.profile"
 QUALITY_ANOMALY_DETECT_CAPABILITY = "quality.anomaly.detect"

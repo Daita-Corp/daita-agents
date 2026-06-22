@@ -8,12 +8,17 @@ from typing import Any
 from daita.runtime import Evidence, Operation, Task, TaskDependency
 
 from ..capabilities import (
+    MEMORY_SEMANTIC_RECALL_CAPABILITY,
     PLANNING_CONTEXT_EVIDENCE,
     QUERY_PLAN_PROPOSAL_EVIDENCE,
     QUERY_PLAN_VALIDATION_EVIDENCE,
     SQL_VALIDATION_EVIDENCE,
 )
 from ..evidence import DbEvidenceStore
+from ..memory import (
+    db_memory_options_from_runtime_metadata,
+    db_memory_planning_recall_decision,
+)
 from ..models import DbIntent, DbOperationContract, DbRequest
 from ..query_planning import DbQueryPlanner
 from ..query_sql_validation import sql_fingerprint
@@ -39,6 +44,16 @@ class _ExecutionPlanningMixin:
                 schema_evidence,
             )
             evidence_store.add(schema_evidence)
+        intent = self.runtime._db_intent_from_operation(operation)
+        memory_evidence, memory_diagnostics = await self._recall_db_memory_for_planning(
+            request,
+            intent,
+            operation,
+            tasks,
+            evidence_store,
+            schema=schema_evidence.payload if schema_evidence is not None else {},
+            analysis_metadata=analysis_metadata,
+        )
         capability = self.runtime.registry.get_capability(
             "db.planning.context.build", owner="db_runtime"
         )
@@ -56,14 +71,96 @@ class _ExecutionPlanningMixin:
                 "relationship_evidence_ids": [
                     item.id for item in relationship_evidence if item.id is not None
                 ],
+                "memory_recall_evidence_ids": [
+                    item.id for item in memory_evidence if item.id is not None
+                ],
+                "memory_recall_diagnostics": memory_diagnostics,
             },
             reason="planning_context",
             metadata=analysis_metadata,
-            dependencies=extra_dependencies,
+            dependencies=(
+                *(
+                    TaskDependency(
+                        kind="evidence",
+                        evidence_kind=item.kind,
+                        evidence_id=item.id,
+                        evidence_accepted=item.accepted,
+                        operation_id=operation.id,
+                    )
+                    for item in memory_evidence
+                    if item.id is not None
+                ),
+                *extra_dependencies,
+            ),
         )
         if not evidence:
             raise RuntimeError("planning.context evidence was not produced")
         return evidence[0]
+
+    async def _recall_db_memory_for_planning(
+        self,
+        request: DbRequest,
+        intent: DbIntent,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        schema: dict[str, Any],
+        analysis_metadata: dict[str, Any] | None = None,
+    ) -> tuple[tuple[Evidence, ...], dict[str, Any]]:
+        options = db_memory_options_from_runtime_metadata(self.runtime.config.metadata)
+        decision = db_memory_planning_recall_decision(
+            prompt=request.prompt,
+            intent_kind=intent.kind.value,
+            schema=schema,
+            memory_config=options,
+        )
+        diagnostics = {
+            "registered": _memory_capability_available(self.runtime),
+            "queried": False,
+            "decision": decision,
+        }
+        if not decision.get("recall"):
+            return (), diagnostics
+        try:
+            capability = self.runtime.registry.get_capability(
+                MEMORY_SEMANTIC_RECALL_CAPABILITY,
+                owner="memory",
+            )
+        except KeyError:
+            diagnostics["decision"] = {
+                "recall": False,
+                "reason": "memory_not_registered",
+            }
+            return (), diagnostics
+        try:
+            evidence = await self._execute_direct_capability(
+                capability,
+                operation,
+                tasks,
+                evidence_store,
+                {
+                    "query": str(decision.get("query") or request.prompt),
+                    "category": "db_semantics",
+                    "limit": int(options.get("limit") or 3) * 3,
+                    "score_threshold": _float_option(
+                        options,
+                        "score_threshold",
+                        0.45,
+                    ),
+                },
+                reason="planning_memory_recall",
+                metadata={**dict(analysis_metadata or {}), "memory_recall": "planning"},
+            )
+        except Exception as exc:
+            diagnostics["error"] = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            return (), diagnostics
+        diagnostics["queried"] = True
+        diagnostics["evidence_count"] = len(evidence)
+        return evidence, diagnostics
 
     async def _plan_query(
         self,
@@ -406,3 +503,21 @@ def _accepted_sql(validation: Evidence) -> str | None:
         return None
     sql = validation.payload.get("accepted_sql")
     return str(sql) if sql else None
+
+
+def _memory_capability_available(runtime: Any) -> bool:
+    try:
+        runtime.registry.get_capability(
+            MEMORY_SEMANTIC_RECALL_CAPABILITY,
+            owner="memory",
+        )
+        return True
+    except KeyError:
+        return False
+
+
+def _float_option(options: dict[str, Any], key: str, default: float) -> float:
+    value = options.get(key)
+    if value is None:
+        return default
+    return float(value)

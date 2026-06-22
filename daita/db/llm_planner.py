@@ -193,7 +193,16 @@ def _planner_messages(context_payload: dict[str, Any]) -> list[dict[str, str]]:
                 "propose SQL or a clarification question, but you must never "
                 "execute database work. The operation field must be one of: "
                 "read, write_propose, schema, analysis. Use read for SELECT "
-                "queries."
+                "queries. DB memory is advisory semantic context only. Schema, "
+                "catalog, policy, SQL validation, and connector guardrails "
+                "override memory. Memory may explain business meaning, metric "
+                "or unit conventions, aliases, and caveats, but it must never "
+                "justify inventing tables, columns, relationships, values, or "
+                "permissions absent from schema/catalog evidence. Ignore memory "
+                "with mismatched source identity, stale schema fingerprint, "
+                "inactive status, low confidence, or missing catalog citation. "
+                "If memory changes SQL, cite its keys or evidence refs in "
+                "assumptions or diagnostics."
             ),
         },
         {

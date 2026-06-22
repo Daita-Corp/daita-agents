@@ -80,8 +80,8 @@ class Agent(ChatAgentFacadeMixin, BaseAgent):
                 db_schema: DB schema name override (e.g. "public" for PostgreSQL).
                 lineage: True to auto-create LineagePlugin, or pass an instance.
                     Seeds FK relationships into a persistent graph.
-                memory: True to auto-create MemoryPlugin, or pass an instance.
-                    Enables conversational business context annotations.
+                memory: Optional DB memory configuration mapping or DbMemoryConfig.
+                    Pass False to disable planning-time memory recall.
                 skills: Skill instances registered before DbRuntime setup.
                 cache_ttl: Schema cache TTL in seconds. None disables caching.
                 Additional kwargs forwarded to Agent.__init__.
@@ -90,7 +90,7 @@ class Agent(ChatAgentFacadeMixin, BaseAgent):
             agent = await Agent.from_db(
                 "postgresql://localhost/mydb",
                 lineage=True,
-                memory=True,
+                memory={"enabled": True},
                 cache_ttl=3600,
             )
             result = await agent.run("What are our top customers?")

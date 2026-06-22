@@ -1,10 +1,20 @@
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-from daita.db import DbRequest, DbRuntime
+from daita.db import (
+    DbEvidenceStore,
+    DbOperationExecutor,
+    DbRequest,
+    DbRuntime,
+    DbRuntimeConfig,
+)
+from daita.db.llm_planner import _planner_messages
 from daita.db.memory import (
     DBMemoryRecord,
     calibrate_db_memory,
+    db_memory_planning_recall_decision,
+    db_memory_refs_from_recall_evidence,
     has_db_memory_marker,
     normalize_db_memory_record,
     recall_db_memory_records,
@@ -12,9 +22,11 @@ from daita.db.memory import (
     write_db_memory_records,
 )
 from daita.embeddings.mock import MockEmbeddingProvider
+from daita.plugins.catalog import CatalogPlugin
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
 from daita.plugins.memory.local_backend import LocalMemoryBackend
 from daita.plugins.memory.memory_plugin import MemoryPlugin
+from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import (
     AccessMode,
     Capability,
@@ -40,6 +52,23 @@ def _memory(tmp_path: Path) -> MemoryPlugin:
         embedder=MockEmbeddingProvider(dim=8),
     )
     return plugin
+
+
+def _runtime_with_memory_source(*plugins) -> DbRuntime:
+    return DbRuntime(
+        config=DbRuntimeConfig(
+            plugins=tuple(plugins),
+            metadata={
+                "from_db_options": {
+                    "memory": {
+                        "enabled": True,
+                        "workspace_scope": "source",
+                        "source_identity": "test:memory-runtime-source",
+                    }
+                }
+            },
+        )
+    )
 
 
 class SchemaInspectExecutor:
@@ -143,18 +172,27 @@ async def test_memory_teardown_flushes_runtime_state():
 
 
 def test_db_runtime_can_require_memory_write_when_service_registered(tmp_path):
-    runtime = DbRuntime(plugins=(_memory(tmp_path),))
+    runtime = _runtime_with_memory_source(_memory(tmp_path))
 
     contract = runtime.build_contract(
         DbRequest("Remember that revenue excludes tax", mode="memory.update")
     )
 
-    assert contract.required_capabilities == ("memory.semantic.write",)
-    assert contract.required_evidence == ("memory.semantic.write",)
+    assert contract.required_capabilities == (
+        "db.memory.plan_update",
+        "db.memory.commit_update",
+    )
+    assert set(contract.required_evidence) == {
+        "db.memory.proposal",
+        "db.memory.definition",
+        "memory.semantic.write",
+    }
     assert contract.metadata["missing_capabilities"] == []
-    selected = contract.metadata["selected_capabilities"][0]
-    assert selected["owner"] == "memory"
-    assert selected["executor"] == "memory.semantic.write"
+    selected = contract.metadata["selected_capabilities"]
+    assert selected[0]["owner"] == "db_runtime"
+    assert selected[0]["executor"] == "db_runtime.memory.plan_update"
+    assert selected[1]["owner"] == "db_runtime"
+    assert selected[1]["executor"] == "db_runtime.memory.commit_update"
 
 
 async def test_memory_executors_return_typed_evidence(tmp_path):
@@ -191,6 +229,184 @@ async def test_memory_executors_return_typed_evidence(tmp_path):
     assert context[0].kind == "memory.context"
     assert context[0].payload["rendered"] is True
     assert "Relevant Memory" in context[0].payload["content"]
+
+
+async def test_planning_time_db_memory_recall_adds_bounded_context(tmp_path):
+    db_path = tmp_path / "planning_memory.sqlite"
+    sqlite = SQLitePlugin(path=str(db_path))
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            total REAL NOT NULL
+        );
+        INSERT INTO orders (total) VALUES (10.0), (20.0);
+        """)
+    source_identity = "sqlite:from_db:memory-test-source"
+    memory = MemoryPlugin()
+    backend = MagicMock()
+    backend.recall = AsyncMock(
+        return_value=[
+            {
+                "chunk_id": "mem-1",
+                "content": (
+                    "DB memory record:\n"
+                    '{"kind":"metric_definition","key":"metric:revenue",'
+                    '"text":"Revenue excludes refunded orders.",'
+                    '"metadata":{"source_identity":"sqlite:from_db:memory-test-source",'
+                    '"workspace_scope":"source","active":true,"confidence":0.9},'
+                    '"importance":0.8,"category":"db_semantics"}'
+                ),
+                "metadata": {
+                    "db_memory": {
+                        "kind": "metric_definition",
+                        "key": "metric:revenue",
+                        "text": "Revenue excludes refunded orders.",
+                        "metadata": {
+                            "source_identity": source_identity,
+                            "workspace_scope": "source",
+                            "active": True,
+                            "confidence": 0.9,
+                        },
+                        "importance": 0.8,
+                        "category": "db_semantics",
+                    }
+                },
+                "score": 0.91,
+            }
+        ]
+    )
+    backend.list_by_category = AsyncMock(return_value=[])
+    memory.backend = backend
+    runtime = DbRuntime(
+        source=sqlite,
+        config=DbRuntimeConfig(
+            plugins=(CatalogPlugin(auto_persist=False), sqlite, memory),
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "from_db:memory-test-source",
+                    "memory": {
+                        "enabled": True,
+                        "recall": "auto",
+                        "learning": "safe",
+                        "limit": 3,
+                        "char_budget": 120,
+                        "score_threshold": 0.0,
+                        "workspace_scope": "source",
+                        "source_identity": source_identity,
+                    },
+                }
+            },
+        ),
+    )
+
+    try:
+        await runtime.setup()
+        request = DbRequest("How should revenue be calculated?")
+        intent = runtime.classify_request(request)
+        contract = runtime.build_contract(request, intent)
+        operation = await runtime.kernel.create_operation(
+            operation_type=contract.operation_type,
+            request={
+                "prompt": request.prompt,
+                "user_id": request.user_id,
+                "session_id": request.session_id,
+                "source_scope": list(request.source_scope),
+                "mode": request.mode,
+                "requested_capabilities": list(request.requested_capabilities),
+                "constraints": request.constraints,
+                "metadata": request.metadata,
+            },
+            required_evidence=frozenset(contract.required_evidence),
+            metadata={
+                "intent_kind": intent.kind.value,
+                "access": contract.access.value,
+                "resume_context": {
+                    "request": {
+                        "prompt": request.prompt,
+                        "user_id": request.user_id,
+                        "session_id": request.session_id,
+                        "source_scope": list(request.source_scope),
+                        "mode": request.mode,
+                        "requested_capabilities": list(request.requested_capabilities),
+                        "constraints": request.constraints,
+                        "metadata": request.metadata,
+                    },
+                    "intent": {
+                        "kind": intent.kind.value,
+                        "confidence": intent.confidence,
+                        "access": intent.access.value,
+                        "evidence_mode": intent.evidence_mode,
+                        "requested_outputs": list(intent.requested_outputs),
+                        "constraints": intent.constraints,
+                        "diagnostics": intent.diagnostics,
+                    },
+                    "contract": {
+                        "operation_type": contract.operation_type,
+                        "required_capabilities": list(contract.required_capabilities),
+                        "required_evidence": list(contract.required_evidence),
+                        "access": contract.access.value,
+                        "limits": contract.limits.to_dict(),
+                        "policy_ids": list(contract.policy_ids),
+                        "metadata": contract.metadata,
+                    },
+                },
+            },
+        )
+        schema_evidence = (
+            await runtime.execute_capability(
+                "db.schema.inspect",
+                owner="sqlite",
+                operation_type="source.profile",
+                input={},
+            )
+        )[0]
+        evidence_store = DbEvidenceStore()
+        tasks = []
+        context = await DbOperationExecutor(runtime)._build_planning_context(
+            request,
+            operation,
+            tasks,
+            evidence_store,
+            schema_evidence=replace(schema_evidence, id=None),
+            catalog_evidence=(),
+            relationship_evidence=(),
+        )
+    finally:
+        await runtime.teardown()
+
+    recall = next(
+        item for item in evidence_store.list() if item.kind == "memory.semantic.recall"
+    )
+    assert [task.capability_id for task in tasks][-2:] == [
+        "memory.semantic.recall",
+        "db.planning.context.build",
+    ]
+    assert recall.owner == "memory"
+    assert backend.recall.await_args.kwargs["category"] == "db_semantics"
+    assert context.payload["db_memory_refs"] == [
+        {
+            "chunk_id": "mem-1",
+            "kind": "metric_definition",
+            "key": "metric:revenue",
+            "text": "Revenue excludes refunded orders.",
+            "confidence": 0.9,
+            "importance": 0.8,
+            "source_identity": source_identity,
+            "evidence_refs": [],
+            "schema_fingerprint": None,
+        }
+    ]
+    assert context.payload["db_memory_evidence_refs"] == [recall.id]
+    assert "Database memory:" in context.payload["rendered_context"]
+    assert "DB memory record:" not in context.payload["rendered_context"]
+
+
+def test_llm_planner_includes_db_memory_advisory_contract():
+    system_message = _planner_messages({"rendered_context": "Database memory:\n- x"})[
+        0
+    ]["content"]
+    assert "DB memory is advisory semantic context only" in system_message
+    assert "Schema, catalog, policy, SQL validation" in system_message
 
 
 async def test_memory_fact_query_executor_uses_memory_owned_fact_store(tmp_path):
@@ -249,7 +465,7 @@ async def test_db_runtime_renders_memory_context_through_context_provider(tmp_pa
 
 
 async def test_db_runtime_executes_memory_update_with_typed_evidence(tmp_path):
-    runtime = DbRuntime(plugins=(_memory(tmp_path),))
+    runtime = _runtime_with_memory_source(_memory(tmp_path))
 
     result = await runtime.run(
         DbRequest(
@@ -276,7 +492,7 @@ async def test_db_runtime_memory_update_stores_db_semantic_record():
     )
     memory = MemoryPlugin()
     memory.backend = backend
-    runtime = DbRuntime(plugins=(memory,))
+    runtime = _runtime_with_memory_source(memory)
 
     result = await runtime.run(
         DbRequest(
@@ -508,6 +724,183 @@ async def test_db_memory_helpers_recall_relevant_business_rules():
     assert backend.recall.call_args.kwargs["category"] == "db_semantics"
 
 
+def test_db_memory_planning_refs_omit_cross_source_irrelevant_and_stale_records():
+    def result(chunk_id, text, metadata, *, score=0.9, kind="metric_definition"):
+        return {
+            "chunk_id": chunk_id,
+            "content": "DB memory record:\n{}",
+            "metadata": {
+                "db_memory": {
+                    "kind": kind,
+                    "key": f"metric:{chunk_id}",
+                    "text": text,
+                    "metadata": metadata,
+                    "importance": 0.7,
+                    "category": "db_semantics",
+                }
+            },
+            "score": score,
+        }
+
+    source_identity = "sqlite:from_db:source-a"
+    evidence = Evidence(
+        id="evidence-memory",
+        kind="memory.semantic.recall",
+        owner="memory",
+        payload={
+            "results": [
+                result(
+                    "revenue",
+                    "Revenue excludes refunded orders.",
+                    {
+                        "source_identity": source_identity,
+                        "workspace_scope": "source",
+                        "active": True,
+                        "confidence": 0.9,
+                    },
+                ),
+                result(
+                    "other-source",
+                    "Revenue includes tax in the other warehouse.",
+                    {
+                        "source_identity": "sqlite:from_db:source-b",
+                        "workspace_scope": "source",
+                        "active": True,
+                        "confidence": 0.9,
+                    },
+                ),
+                result(
+                    "inventory",
+                    "Inventory turns are counted weekly.",
+                    {
+                        "source_identity": source_identity,
+                        "workspace_scope": "source",
+                        "active": True,
+                        "confidence": 0.9,
+                    },
+                ),
+                result(
+                    "stale",
+                    "Revenue includes archived orders.",
+                    {
+                        "source_identity": source_identity,
+                        "workspace_scope": "source",
+                        "stale": True,
+                        "active": True,
+                        "confidence": 0.9,
+                    },
+                ),
+                result(
+                    "inactive",
+                    "Revenue excludes wholesale orders.",
+                    {
+                        "source_identity": source_identity,
+                        "workspace_scope": "source",
+                        "active": False,
+                        "confidence": 0.9,
+                    },
+                ),
+                result(
+                    "low-confidence",
+                    "Revenue excludes shipping.",
+                    {
+                        "source_identity": source_identity,
+                        "workspace_scope": "source",
+                        "active": True,
+                        "confidence": 0.2,
+                    },
+                ),
+            ]
+        },
+    )
+
+    refs, evidence_refs, diagnostics = db_memory_refs_from_recall_evidence(
+        (evidence,),
+        prompt="How should revenue be calculated?",
+        schema={"tables": [{"name": "orders", "columns": [{"name": "total"}]}]},
+        source_identity=source_identity,
+        schema_fingerprint="schema-a",
+        limit=3,
+        char_budget=800,
+        score_threshold=0.45,
+    )
+
+    assert [ref["key"] for ref in refs] == ["metric:revenue"]
+    assert evidence_refs == ("evidence-memory",)
+    assert diagnostics["candidate_count"] == 6
+    assert diagnostics["included_count"] == 1
+    assert diagnostics["omitted_reasons"]["cross_source"] == 1
+    assert diagnostics["omitted_reasons"]["irrelevant"] == 1
+    assert diagnostics["omitted_reasons"]["stale"] == 1
+    assert diagnostics["omitted_reasons"]["inactive"] == 1
+    assert diagnostics["omitted_reasons"]["low_confidence"] == 1
+
+
+def test_db_memory_planning_recall_skips_pii_row_lookup():
+    decision = db_memory_planning_recall_decision(
+        prompt="Look up the customer email for customer_id 123",
+        intent_kind="data.query",
+        schema={"tables": [{"name": "customers", "columns": [{"name": "email"}]}]},
+        memory_config={
+            "enabled": True,
+            "recall": "auto",
+            "limit": 3,
+            "char_budget": 800,
+        },
+    )
+
+    assert decision == {"recall": False, "reason": "row_level_or_pii_prompt"}
+
+
+def test_db_memory_planning_context_remains_bounded():
+    source_identity = "sqlite:from_db:source-a"
+    evidence = Evidence(
+        id="evidence-memory",
+        kind="memory.semantic.recall",
+        owner="memory",
+        payload={
+            "results": [
+                {
+                    "chunk_id": f"mem-{index}",
+                    "metadata": {
+                        "db_memory": {
+                            "kind": "metric_definition",
+                            "key": f"metric:revenue:{index}",
+                            "text": f"Revenue rule {index} excludes refunds.",
+                            "metadata": {
+                                "source_identity": source_identity,
+                                "workspace_scope": "source",
+                                "active": True,
+                                "confidence": 0.9,
+                            },
+                            "importance": 0.7,
+                            "category": "db_semantics",
+                        }
+                    },
+                    "score": 0.9,
+                }
+                for index in range(6)
+            ]
+        },
+    )
+
+    refs, _evidence_refs, diagnostics = db_memory_refs_from_recall_evidence(
+        (evidence,),
+        prompt="How should revenue be calculated?",
+        schema={"tables": []},
+        source_identity=source_identity,
+        schema_fingerprint=None,
+        limit=2,
+        char_budget=95,
+        score_threshold=0.0,
+    )
+
+    rendered = "\n".join(f"- {ref['kind']} {ref['key']}: {ref['text']}" for ref in refs)
+    assert len(refs) <= 2
+    assert len(rendered) <= 95
+    assert diagnostics["omitted_reasons"]["budget"] >= 1
+
+
 async def test_db_memory_helpers_marker_lookup_uses_exact_category_listing():
     backend = MagicMock()
     backend.list_by_category = AsyncMock(
@@ -601,7 +994,7 @@ async def test_db_runtime_memory_update_replaces_existing_record_by_key():
     )
     memory = MemoryPlugin()
     memory.backend = backend
-    runtime = DbRuntime(plugins=(memory,))
+    runtime = _runtime_with_memory_source(memory)
 
     result = await runtime.run(
         DbRequest(
@@ -621,9 +1014,8 @@ async def test_db_runtime_memory_update_replaces_existing_record_by_key():
     )
     assert evidence.payload["status"] == "updated"
     assert evidence.payload["updated"] == 1
-    backend.list_by_category.assert_awaited_once_with(
-        category="db_semantics", limit=1000
-    )
+    assert backend.list_by_category.await_count == 2
+    backend.list_by_category.assert_awaited_with(category="db_semantics", limit=1000)
     backend.delete_chunks.assert_awaited_once_with(["old-1"])
 
 
@@ -644,7 +1036,7 @@ async def test_db_runtime_memory_update_appends_when_backend_cannot_delete_exist
     )
     memory = MemoryPlugin()
     memory.backend = backend
-    runtime = DbRuntime(plugins=(memory,))
+    runtime = _runtime_with_memory_source(memory)
 
     result = await runtime.run(
         DbRequest(
@@ -676,7 +1068,7 @@ async def test_db_runtime_memory_update_rejects_pii_values():
     )
     memory = MemoryPlugin()
     memory.backend = backend
-    runtime = DbRuntime(plugins=(memory,))
+    runtime = _runtime_with_memory_source(memory)
 
     result = await runtime.run(
         DbRequest(
@@ -691,12 +1083,15 @@ async def test_db_runtime_memory_update_rejects_pii_values():
     )
 
     assert result.status is OperationStatus.FAILED
-    evidence = next(
-        item for item in result.evidence if item.kind == "memory.semantic.write"
+    proposal = next(
+        item for item in result.evidence if item.kind == "db.memory.proposal"
     )
-    assert evidence.payload["success"] is False
-    assert "PII values" in evidence.payload["error"]
-    assert "memory_write_not_successful" in result.warnings
+    assert proposal.accepted is False
+    assert (
+        "pii_or_row_level_memory_rejected" in proposal.payload["validation"]["reasons"]
+    )
+    assert "memory_proposal_not_accepted" in result.warnings
+    assert not any(item.kind == "memory.semantic.write" for item in result.evidence)
     backend.remember.assert_not_awaited()
 
 
@@ -708,7 +1103,7 @@ async def test_db_runtime_memory_update_rejects_sensitive_metadata_keys():
     )
     memory = MemoryPlugin()
     memory.backend = backend
-    runtime = DbRuntime(plugins=(memory,))
+    runtime = _runtime_with_memory_source(memory)
 
     result = await runtime.run(
         DbRequest(
@@ -724,12 +1119,15 @@ async def test_db_runtime_memory_update_rejects_sensitive_metadata_keys():
     )
 
     assert result.status is OperationStatus.FAILED
-    evidence = next(
-        item for item in result.evidence if item.kind == "memory.semantic.write"
+    proposal = next(
+        item for item in result.evidence if item.kind == "db.memory.proposal"
     )
-    assert evidence.payload["success"] is False
-    assert "sensitive field" in evidence.payload["error"]
-    assert "memory_write_not_successful" in result.warnings
+    assert proposal.accepted is False
+    assert (
+        "pii_or_row_level_memory_rejected" in proposal.payload["validation"]["reasons"]
+    )
+    assert "memory_proposal_not_accepted" in result.warnings
+    assert not any(item.kind == "memory.semantic.write" for item in result.evidence)
     backend.remember.assert_not_awaited()
 
 
@@ -741,7 +1139,7 @@ async def test_db_runtime_memory_update_allows_schema_level_pii_column_mentions(
     )
     memory = MemoryPlugin()
     memory.backend = backend
-    runtime = DbRuntime(plugins=(memory,))
+    runtime = _runtime_with_memory_source(memory)
 
     result = await runtime.run(
         DbRequest(
@@ -776,7 +1174,7 @@ async def test_db_runtime_memory_update_rejects_unsupported_kind():
     )
     memory = MemoryPlugin()
     memory.backend = backend
-    runtime = DbRuntime(plugins=(memory,))
+    runtime = _runtime_with_memory_source(memory)
 
     result = await runtime.run(
         DbRequest(
@@ -787,10 +1185,14 @@ async def test_db_runtime_memory_update_rejects_unsupported_kind():
     )
 
     assert result.status is OperationStatus.FAILED
-    evidence = next(
-        item for item in result.evidence if item.kind == "memory.semantic.write"
+    proposal = next(
+        item for item in result.evidence if item.kind == "db.memory.proposal"
     )
-    assert evidence.payload["success"] is False
-    assert "Unsupported DB memory kind" in evidence.payload["error"]
-    assert "memory_write_not_successful" in result.warnings
+    assert proposal.accepted is False
+    assert (
+        "unsupported_or_ambiguous_memory_kind"
+        in proposal.payload["validation"]["reasons"]
+    )
+    assert "memory_proposal_not_accepted" in result.warnings
+    assert not any(item.kind == "memory.semantic.write" for item in result.evidence)
     backend.remember.assert_not_awaited()

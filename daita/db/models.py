@@ -118,6 +118,51 @@ class DbRuntimeOptions:
 
 
 @dataclass(frozen=True)
+class DbMemoryConfig:
+    """Construction-time DB memory behavior for `Agent.from_db()`."""
+
+    enabled: bool = True
+    recall: Literal["auto", "off"] = "auto"
+    learning: Literal["safe", "off"] = "safe"
+    limit: int = 3
+    char_budget: int = 800
+    score_threshold: float = 0.45
+    workspace_scope: Literal["source"] = "source"
+    source_identity: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "recall", str(self.recall or "auto"))
+        object.__setattr__(self, "learning", str(self.learning or "safe"))
+        object.__setattr__(
+            self, "workspace_scope", str(self.workspace_scope or "source")
+        )
+        if self.recall not in {"auto", "off"}:
+            raise ValueError("memory.recall must be 'auto' or 'off'")
+        if self.learning not in {"safe", "off"}:
+            raise ValueError("memory.learning must be 'safe' or 'off'")
+        if self.workspace_scope != "source":
+            raise ValueError("memory.workspace_scope must be 'source'")
+        if self.limit < 0:
+            raise ValueError("memory.limit must be non-negative")
+        if self.char_budget < 0:
+            raise ValueError("memory.char_budget must be non-negative")
+        if not 0 <= self.score_threshold <= 1:
+            raise ValueError("memory.score_threshold must be between 0 and 1")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "recall": self.recall,
+            "learning": self.learning,
+            "limit": self.limit,
+            "char_budget": self.char_budget,
+            "score_threshold": self.score_threshold,
+            "workspace_scope": self.workspace_scope,
+            "source_identity": self.source_identity,
+        }
+
+
+@dataclass(frozen=True)
 class DbRequest:
     """Normalized user request for the DB runtime."""
 

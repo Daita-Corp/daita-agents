@@ -26,6 +26,7 @@ from .models import (
     DbRuntimeConfig,
     DbRuntimeInspection,
     DbRuntimeOptions,
+    DbMemoryConfig,
 )
 from .monitor_commands import (
     DbCommandRouter,
@@ -146,6 +147,7 @@ __all__ = [
     "DbRuntimeConfig",
     "DbRuntimeInspection",
     "DbRuntimeOptions",
+    "DbMemoryConfig",
     "DbCommandRouter",
     "DbMonitorCommand",
     "DbMonitorCommandService",

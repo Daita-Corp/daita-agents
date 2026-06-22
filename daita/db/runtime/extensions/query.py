@@ -58,6 +58,15 @@ class DbPlanningContextExecutor:
             ]
             if item is not None
         )
+        memory_recall_evidence = tuple(
+            item
+            for item in [
+                await _load_evidence(runtime, operation.id, evidence_id)
+                for evidence_id in task.input.get("memory_recall_evidence_ids", ())
+            ]
+            if item is not None
+        )
+        memory_recall_diagnostics = task.input.get("memory_recall_diagnostics")
         planning_context = builder.build(
             request=base_request,
             intent=runtime._db_intent_from_operation(operation),
@@ -65,6 +74,12 @@ class DbPlanningContextExecutor:
             schema_evidence=schema_evidence,
             catalog_evidence=catalog_evidence,
             relationship_evidence=relationship_evidence,
+            memory_recall_evidence=memory_recall_evidence,
+            memory_recall_diagnostics=(
+                memory_recall_diagnostics
+                if isinstance(memory_recall_diagnostics, dict)
+                else None
+            ),
             capability_summaries=_planner_capability_summaries(runtime),
             source=runtime.source,
         )

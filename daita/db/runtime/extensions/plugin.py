@@ -6,7 +6,7 @@ from typing import Any
 
 from daita.plugins import PluginContext, PluginKind, PluginManifest
 from daita.plugins.base import RuntimeExtensionPlugin
-from daita.runtime import AccessMode, Capability, EvidenceSchema, RiskLevel
+from daita.runtime import AccessMode, Capability, EvidenceSchema, RiskLevel, Worker
 
 from ...llm_planner import DbLLMPlannerExecutor, DbLLMRepairExecutor
 from ...synthesis import DbAnswerSynthesisExecutor
@@ -20,6 +20,14 @@ from .analysis import (
 from .monitor_create import (
     DbMonitorCommitCreateExecutor,
     DbMonitorPlanCreateExecutor,
+)
+from .memory_update import (
+    DbMemoryCommitUpdateExecutor,
+    DbMemoryPlanUpdateExecutor,
+)
+from .memory_learning import (
+    DbMemoryLearningEnqueueExecutor,
+    DbMemoryLearningRunExecutor,
 )
 from .monitor_lifecycle import (
     DbMonitorCommitLifecycleExecutor,
@@ -344,6 +352,85 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                     "supports_idempotency_key": True,
                 },
             ),
+            Capability(
+                id="db.memory.plan_update",
+                owner="db_runtime",
+                description="Plan and validate an explicit DB memory update proposal.",
+                domains=frozenset({"db", "memory"}),
+                operation_types=frozenset({"memory.update"}),
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.LOW,
+                input_schema=common_schema,
+                output_evidence=frozenset({"db.memory.proposal"}),
+                executor="db_runtime.memory.plan_update",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
+                id="db.memory.commit_update",
+                owner="db_runtime",
+                description="Commit an accepted explicit DB memory proposal.",
+                domains=frozenset({"db", "memory"}),
+                operation_types=frozenset({"memory.update"}),
+                access=AccessMode.WRITE,
+                risk=RiskLevel.MEDIUM,
+                input_schema=common_schema,
+                output_evidence=frozenset(
+                    {"db.memory.definition", "memory.semantic.write"}
+                ),
+                executor="db_runtime.memory.commit_update",
+                runtime_only=True,
+                side_effecting=True,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
+                id="db.memory.learning.enqueue",
+                owner="db_runtime",
+                description="Plan a worker-owned DB memory learning task.",
+                domains=frozenset({"db", "memory"}),
+                operation_types=frozenset({"db.memory.learning"}),
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.LOW,
+                input_schema=common_schema,
+                output_evidence=frozenset({"db.memory.learning.enqueue"}),
+                executor="db_runtime.memory.learning.enqueue",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
+                id="db.memory.learning.run",
+                owner="db_runtime",
+                description="Extract and promote deterministic DB memory candidates.",
+                domains=frozenset({"db", "memory"}),
+                operation_types=frozenset({"db.memory.learning"}),
+                access=AccessMode.WRITE,
+                risk=RiskLevel.MEDIUM,
+                input_schema=common_schema,
+                output_evidence=frozenset(
+                    {
+                        "db.memory.candidate",
+                        "db.memory.promotion",
+                        "db.memory.rejection",
+                        "memory.semantic.write",
+                    }
+                ),
+                executor="db_runtime.memory.learning.run",
+                runtime_only=True,
+                side_effecting=True,
+                replay_safe=True,
+                idempotent=True,
+                retry_safe=True,
+                metadata={
+                    "queue": "memory_learning",
+                    "worker_id": "db.memory.learner",
+                    "worker_owner": "db_runtime",
+                },
+            ),
         ]
         if self.llm_capable:
             capabilities.extend(
@@ -395,6 +482,10 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
             DbAnalysisReplanExecutor(self),
             DbMonitorPlanCreateExecutor(self),
             DbMonitorCommitCreateExecutor(self),
+            DbMemoryPlanUpdateExecutor(self),
+            DbMemoryCommitUpdateExecutor(self),
+            DbMemoryLearningEnqueueExecutor(self),
+            DbMemoryLearningRunExecutor(self),
             DbMonitorPlanLifecycleExecutor(self),
             DbMonitorCommitLifecycleExecutor(self),
             DbMonitorLocalDeliveryExecutor(self),
@@ -492,6 +583,42 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 description="Accepted DB monitor definition committed from a proposal.",
             ),
             EvidenceSchema(
+                kind="db.memory.proposal",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Validated explicit DB memory proposal.",
+            ),
+            EvidenceSchema(
+                kind="db.memory.definition",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Explicit DB memory definition committed from a proposal.",
+            ),
+            EvidenceSchema(
+                kind="db.memory.learning.enqueue",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Worker-owned DB memory learning handoff.",
+            ),
+            EvidenceSchema(
+                kind="db.memory.candidate",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Deterministic DB memory candidate from accepted evidence.",
+            ),
+            EvidenceSchema(
+                kind="db.memory.promotion",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="DB memory candidate promoted through memory semantic write.",
+            ),
+            EvidenceSchema(
+                kind="db.memory.rejection",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="DB memory candidate rejected by automatic gates.",
+            ),
+            EvidenceSchema(
                 kind="monitor.action_plan",
                 owner="db_runtime",
                 json_schema=object_schema,
@@ -526,5 +653,25 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 json_schema=object_schema,
                 description="Local runtime notification delivery result.",
+            ),
+        )
+
+    def get_workers(self) -> tuple[Worker, ...]:
+        return (
+            Worker(
+                id="db.memory.learner",
+                owner="db_runtime",
+                role="db_memory_learning",
+                capability_ids=frozenset({"db.memory.learning.run"}),
+                input_schema={"type": "object"},
+                output_evidence=frozenset(
+                    {
+                        "db.memory.candidate",
+                        "db.memory.promotion",
+                        "db.memory.rejection",
+                    }
+                ),
+                max_concurrency=1,
+                metadata={"queue": "memory_learning"},
             ),
         )

@@ -27,6 +27,10 @@ class DbEvidenceStore:
         for item in evidence:
             self.add(item)
 
+    def add_diagnostic(self, evidence: Evidence) -> None:
+        """Store one evidence item that must remain visible even if rejected."""
+        self._items.append(evidence)
+
     def discard(self, evidence_id: str | None) -> None:
         """Remove one evidence item from the accepted operation view."""
         if not evidence_id:

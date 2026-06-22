@@ -184,6 +184,11 @@ async def test_live_monitor_metric_observation_records_runtime_tasks(
         "db.sql.validate",
         "db.sql.execute_read",
     ]
+    assert all(
+        "focus" not in task.input
+        for task in tick_snapshot.tasks
+        if task.capability_id == "db.sql.execute_read"
+    )
     assert {
         "sql.validation",
         "query.result",
@@ -308,6 +313,11 @@ async def test_live_monitor_scheduled_report_reads_live_db_uses_llm_and_delivers
     assert report.payload["delivery_intent"]["target"]["channel"] == "#ops"
     assert task_capabilities.count("db.sql.validate") >= 2
     assert task_capabilities.count("db.sql.execute_read") >= 2
+    assert all(
+        "focus" not in task.input
+        for task in action_snapshot.tasks
+        if task.capability_id == "db.sql.execute_read"
+    )
     assert "slack.summary.send" in task_capabilities
     assert delivery_plugin.executor.calls == 1
     assert delivery_result.accepted is True

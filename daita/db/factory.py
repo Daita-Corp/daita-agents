@@ -6,7 +6,8 @@ from __future__ import annotations
 
 from contextlib import suppress
 from dataclasses import asdict, is_dataclass, replace
-from typing import Any
+import re
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from daita.agents.conversation import ConversationHistory
@@ -21,8 +22,10 @@ from daita.runtime import RuntimeStore, SQLiteRuntimeStore, current_host_runtime
 from .agent import DbAgent
 from .memory import calibrate_db_memory
 from .llm_service import db_llm_service_from_config
-from .models import DbLimits, DbRuntimeConfig, DbRuntimeOptions
+from .models import DbLimits, DbMemoryConfig, DbRuntimeConfig, DbRuntimeOptions
 from .runtime import DbRuntime
+
+_DbMemoryOption = DbMemoryConfig | dict[str, Any] | Literal[False] | None
 
 _MODE_DEFAULTS: dict[str, dict[str, Any]] = {
     "simple": {
@@ -32,7 +35,7 @@ _MODE_DEFAULTS: dict[str, dict[str, Any]] = {
         "query_max_chars": 25000,
         "quality": False,
         "lineage": False,
-        "memory": False,
+        "memory": None,
     },
     "analyst": {
         "read_only": True,
@@ -41,7 +44,7 @@ _MODE_DEFAULTS: dict[str, dict[str, Any]] = {
         "query_max_chars": 50000,
         "quality": False,
         "lineage": False,
-        "memory": False,
+        "memory": None,
     },
     "governed": {
         "read_only": True,
@@ -51,7 +54,7 @@ _MODE_DEFAULTS: dict[str, dict[str, Any]] = {
         "query_timeout": 30,
         "quality": False,
         "lineage": True,
-        "memory": False,
+        "memory": None,
     },
     "data_team": {
         "read_only": True,
@@ -61,7 +64,7 @@ _MODE_DEFAULTS: dict[str, dict[str, Any]] = {
         "query_timeout": 60,
         "quality": True,
         "lineage": True,
-        "memory": False,
+        "memory": None,
     },
 }
 
@@ -74,7 +77,7 @@ async def from_db(
     config: DbRuntimeConfig | None = None,
     catalog: CatalogPlugin | None | bool = None,
     lineage: Any | bool | None = None,
-    memory: Any | bool | None = None,
+    memory: _DbMemoryOption = None,
     quality: Any | bool | None = None,
     model: str | None = None,
     api_key: str | None = None,
@@ -145,6 +148,11 @@ async def from_db(
     )
     _ensure_converted_plugin(source_plugin)
     profile_key = catalog_profile_key(source, db_schema=db_schema)
+    source_identity = _source_identity(source_plugin, profile_key)
+    memory_config = _resolve_memory_config(
+        resolved_options["memory"],
+        source_identity=source_identity,
+    )
     host_context = current_host_runtime_context()
     runtime_metadata = _runtime_metadata(
         db_config,
@@ -168,6 +176,7 @@ async def from_db(
         catalog_profile_key=profile_key,
         catalog_store_id=f"from_db:{profile_key}",
         catalog_keys=[f"from_db:{profile_key}"],
+        memory=memory_config.to_dict(),
     )
     if host_context is not None:
         runtime_metadata["host_runtime"] = {
@@ -180,6 +189,7 @@ async def from_db(
         source_plugin,
         lineage=resolved_options["lineage"],
         memory=resolved_options["memory"],
+        memory_config=memory_config,
         quality=resolved_options["quality"],
     )
     host_plugins = tuple(host_context.runtime_extensions) if host_context else ()
@@ -308,7 +318,7 @@ def _resolve_factory_options(
     query_max_chars: int | None,
     query_timeout: float | None,
     lineage: Any | bool | None,
-    memory: Any | bool | None,
+    memory: _DbMemoryOption,
     quality: Any | bool | None,
 ) -> tuple[str, dict[str, Any]]:
     mode_name = (mode or config.profile or "analyst").lower()
@@ -371,13 +381,14 @@ def _resolve_service_plugins(
     source_plugin: BaseDatabasePlugin,
     *,
     lineage: Any | bool | None,
-    memory: Any | bool | None,
+    memory: _DbMemoryOption,
+    memory_config: DbMemoryConfig,
     quality: Any | bool | None,
 ) -> tuple[Any, ...]:
     resolved: list[Any] = []
     quality_plugin = _resolve_quality_plugin(quality, source_plugin)
     lineage_plugin = _resolve_lineage_plugin(lineage)
-    memory_plugin = _resolve_memory_plugin(memory)
+    memory_plugin = _resolve_memory_plugin(memory, memory_config)
     for plugin in (quality_plugin, lineage_plugin, memory_plugin):
         if plugin is not None:
             resolved.append(plugin)
@@ -417,19 +428,108 @@ def _resolve_lineage_plugin(lineage: Any | bool | None) -> Any | None:
 
 
 def _resolve_memory_plugin(
-    memory: Any | bool | None,
+    memory: _DbMemoryOption,
+    memory_config: DbMemoryConfig,
 ) -> Any | None:
-    if memory in (None, False):
+    if not memory_config.enabled:
         return None
-    if memory is True:
-        from daita.plugins.memory import MemoryPlugin
 
-        plugin = MemoryPlugin()
-    else:
-        plugin = memory
-        if getattr(plugin, "manifest", None) is None:
-            raise ValueError("memory must be True, False, None, or a converted plugin")
+    _ensure_supported_memory_option(memory)
+    from daita.plugins.memory import MemoryPlugin
+
+    plugin = MemoryPlugin(
+        workspace=_memory_workspace(memory_config),
+        scope="project",
+        auto_curate="manual",
+        **_memory_plugin_kwargs(memory),
+    )
+    backend = _memory_backend(memory)
+    if backend is not None:
+        plugin.backend = backend
     return plugin
+
+
+def _resolve_memory_config(
+    memory: _DbMemoryOption,
+    *,
+    source_identity: str,
+) -> DbMemoryConfig:
+    if memory is False:
+        return DbMemoryConfig(
+            enabled=False,
+            recall="off",
+            learning="off",
+            source_identity=source_identity,
+        )
+    if isinstance(memory, DbMemoryConfig):
+        config = replace(
+            memory, source_identity=memory.source_identity or source_identity
+        )
+        if not config.enabled:
+            return replace(config, recall="off", learning="off")
+        return config
+    if isinstance(memory, dict):
+        values = dict(memory)
+        if values.get("enabled") is False:
+            values.setdefault("recall", "off")
+            values.setdefault("learning", "off")
+        for key in (
+            "backend",
+            "embedding_provider",
+            "embedding_model",
+            "embedder",
+            "max_chunks",
+            "default_ttl_days",
+        ):
+            values.pop(key, None)
+        values["source_identity"] = values.get("source_identity") or source_identity
+        return DbMemoryConfig(**values)
+    _ensure_supported_memory_option(memory)
+    return DbMemoryConfig(source_identity=source_identity)
+
+
+def _ensure_supported_memory_option(memory: Any) -> None:
+    if memory is None or memory is False:
+        return
+    if isinstance(memory, (DbMemoryConfig, dict)):
+        return
+    raise ValueError(
+        "memory must be False, a DbMemoryConfig, a config mapping, or None"
+    )
+
+
+def _memory_plugin_kwargs(memory: _DbMemoryOption) -> dict[str, Any]:
+    if not isinstance(memory, dict):
+        return {}
+    kwargs = {}
+    for key in (
+        "embedding_provider",
+        "embedding_model",
+        "embedder",
+        "max_chunks",
+        "default_ttl_days",
+    ):
+        if key in memory:
+            kwargs[key] = memory[key]
+    return kwargs
+
+
+def _memory_backend(memory: _DbMemoryOption) -> Any | None:
+    if not isinstance(memory, dict):
+        return None
+    return memory.get("backend")
+
+
+def _memory_workspace(memory_config: DbMemoryConfig) -> str:
+    source_identity = memory_config.source_identity or "unknown-source"
+    return re.sub(r"[^a-zA-Z0-9_.:-]+", "_", source_identity).strip("_") or "source"
+
+
+def _source_identity(source_plugin: BaseDatabasePlugin, profile_key: str) -> str:
+    source_kind = getattr(getattr(source_plugin, "manifest", None), "id", None)
+    return (
+        f"{source_kind or type(source_plugin).__name__.lower()}:from_db:{profile_key}"
+    )
 
 
 def _ensure_host_extensions_are_unique(

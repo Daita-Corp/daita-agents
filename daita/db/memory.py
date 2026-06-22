@@ -5,6 +5,7 @@ DB-specific memory semantics for the operation-centric runtime.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import decimal
 from inspect import isawaitable
 import json
@@ -38,6 +39,7 @@ DB_SEMANTIC_MEMORY_KINDS = (
     "schema_interpretation",
     "value_alias",
 )
+DB_PLANNING_MEMORY_KINDS = frozenset(DB_SEMANTIC_MEMORY_KINDS)
 
 PII_COLUMN_PATTERNS = (
     "password",
@@ -200,6 +202,12 @@ async def write_db_memory_records(
     return [await write_db_memory_record(plugin, record) for record in records]
 
 
+async def db_memory_record_chunk_ids_by_key(plugin: Any, raw: Any) -> list[str]:
+    """Return existing stored chunk IDs for a normalized DB memory key."""
+    record = normalize_db_memory_record(raw)
+    return await _find_record_chunk_ids_by_key(plugin, record)
+
+
 async def recall_db_memory_records(
     plugin: Any,
     query: str,
@@ -222,6 +230,166 @@ async def recall_db_memory_records(
             result for result in results if _record_kind_from_result(result) in allowed
         ]
     return _dedupe_recall_results(results)[:limit]
+
+
+def db_memory_planning_recall_decision(
+    *,
+    prompt: str,
+    intent_kind: str,
+    schema: dict[str, Any],
+    memory_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Return whether planning should recall DB semantic memory."""
+    if not bool(memory_config.get("enabled", False)):
+        return {"recall": False, "reason": "memory_disabled"}
+    if memory_config.get("recall") == "off":
+        return {"recall": False, "reason": "recall_disabled"}
+    if int(memory_config.get("limit") or 0) <= 0:
+        return {"recall": False, "reason": "limit_zero"}
+    if int(memory_config.get("char_budget") or 0) <= 0:
+        return {"recall": False, "reason": "char_budget_zero"}
+    if intent_kind not in {
+        "data.query",
+        "data.query.catalog_assisted",
+        "metric.query",
+        "report.generate",
+        "quality.check",
+        "anomaly.investigate",
+    }:
+        return {"recall": False, "reason": "intent_not_semantic_query"}
+    if _looks_row_level(prompt):
+        return {"recall": False, "reason": "row_level_or_pii_prompt"}
+
+    text = str(prompt or "").lower()
+    semantic_matches = _matched_terms(text, FALLBACK_SEMANTIC_RECALL_TERMS)
+    if semantic_matches:
+        return {
+            "recall": True,
+            "reason": "semantic_prompt",
+            "matched_terms": semantic_matches,
+            "query": db_memory_planning_recall_query(prompt, schema, intent_kind),
+        }
+    if _looks_direct_query(text) and _prompt_matches_schema(prompt, schema):
+        return {"recall": False, "reason": "direct_schema_matched_query"}
+    return {
+        "recall": True,
+        "reason": "semantic_fallback",
+        "matched_terms": [],
+        "query": db_memory_planning_recall_query(prompt, schema, intent_kind),
+    }
+
+
+def db_memory_planning_recall_query(
+    prompt: str,
+    schema: dict[str, Any],
+    intent_kind: str,
+) -> str:
+    """Build the bounded text used for planning-time memory recall."""
+    schema_terms: list[str] = []
+    for table in schema.get("tables", []) or []:
+        table_name = str(table.get("name") or "").strip()
+        if table_name:
+            schema_terms.append(table_name)
+        for column in table.get("columns", []) or []:
+            column_name = str(column.get("name") or "").strip()
+            if column_name:
+                schema_terms.append(f"{table_name}.{column_name}")
+        if len(schema_terms) >= 40:
+            break
+    compact_terms = " ".join(schema_terms[:40])
+    return f"{prompt}\nIntent: {intent_kind}\nSchema terms: {compact_terms}".strip()
+
+
+def db_memory_refs_from_recall_evidence(
+    recall_evidence: tuple[Any, ...],
+    *,
+    prompt: str,
+    schema: dict[str, Any],
+    source_identity: str | None,
+    schema_fingerprint: str | None,
+    limit: int = 3,
+    char_budget: int = 800,
+    score_threshold: float = 0.45,
+) -> tuple[tuple[dict[str, Any], ...], tuple[str, ...], dict[str, Any]]:
+    """Project semantic recall evidence into compact, planner-safe DB refs."""
+    diagnostics: dict[str, Any] = {
+        "registered": bool(recall_evidence),
+        "queried": bool(recall_evidence),
+        "candidate_count": 0,
+        "included_count": 0,
+        "omitted_reasons": {},
+    }
+    candidates: list[tuple[dict[str, Any], Any]] = []
+    for evidence in recall_evidence:
+        payload = getattr(evidence, "payload", {}) or {}
+        for result in payload.get("results", []) or []:
+            if isinstance(result, dict):
+                candidates.append((result, evidence))
+    diagnostics["candidate_count"] = len(candidates)
+
+    refs: list[dict[str, Any]] = []
+    evidence_refs: list[str] = []
+    used_chars = 0
+    for result, evidence in candidates:
+        if len(refs) >= max(0, int(limit)):
+            _bump_omitted(diagnostics, "limit")
+            continue
+        record = _db_memory_record_from_recall_result(result)
+        reason = _planner_memory_omit_reason(
+            record,
+            result,
+            prompt=prompt,
+            schema=schema,
+            source_identity=source_identity,
+            schema_fingerprint=schema_fingerprint,
+            score_threshold=score_threshold,
+        )
+        if reason:
+            _bump_omitted(diagnostics, reason)
+            continue
+        text = str(record.get("text") or "").strip()
+        key = str(record.get("key") or "").strip()
+        kind = str(record.get("kind") or "").strip()
+        line = f"- {kind} {key}: {text}"
+        if used_chars + len(line) > max(0, int(char_budget)):
+            _bump_omitted(diagnostics, "budget")
+            continue
+        metadata = (
+            record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        )
+        ref_evidence = _memory_evidence_ref_ids(metadata)
+        if getattr(evidence, "id", None):
+            evidence_refs.append(evidence.id)
+        evidence_refs.extend(ref_evidence)
+        refs.append(
+            {
+                "chunk_id": result.get("chunk_id"),
+                "kind": kind,
+                "key": key,
+                "text": text,
+                "confidence": _confidence_value(
+                    metadata.get("confidence"), default=1.0
+                ),
+                "importance": float(record.get("importance") or 0.0),
+                "source_identity": metadata.get("source_identity"),
+                "evidence_refs": ref_evidence,
+                "schema_fingerprint": metadata.get("source_schema_fingerprint")
+                or metadata.get("schema_fingerprint"),
+            }
+        )
+        used_chars += len(line)
+    diagnostics["included_count"] = len(refs)
+    diagnostics["char_budget"] = int(char_budget)
+    diagnostics["used_chars"] = used_chars
+    return tuple(refs), tuple(dict.fromkeys(evidence_refs)), diagnostics
+
+
+def db_memory_record_refs_known_schema(
+    metadata: dict[str, Any],
+    schema: dict[str, Any],
+) -> bool:
+    """Return whether DB memory metadata references known schema objects."""
+    return _record_refs_known_schema(metadata, schema)
 
 
 async def calibrate_db_memory(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
@@ -324,6 +492,7 @@ async def _write_db_memory_record_runtime(
     runtime: Any, record: DBMemoryRecord
 ) -> dict[str, Any]:
     """Write one DB memory record through the runtime capability boundary."""
+    record = _record_with_runtime_source_identity(runtime, record)
     evidence = await runtime.execute_capability(
         "memory.semantic.write",
         owner="memory",
@@ -336,6 +505,72 @@ async def _write_db_memory_record_runtime(
     if not evidence:
         return {"success": False, "error": "memory write produced no evidence"}
     return dict(evidence[0].payload)
+
+
+def _record_with_runtime_source_identity(
+    runtime: Any,
+    record: DBMemoryRecord,
+) -> DBMemoryRecord:
+    memory_options = db_memory_options_from_runtime_metadata(
+        getattr(runtime.config, "metadata", {})
+    )
+    source_identity = memory_options.get("source_identity")
+    metadata = dict(record.metadata)
+    if source_identity:
+        metadata.setdefault("source_identity", source_identity)
+    metadata.setdefault("workspace_scope", "source")
+    metadata.setdefault("active", True)
+    metadata.setdefault("creation_path", "runtime_calibration")
+    return DBMemoryRecord(
+        kind=record.kind,
+        key=record.key,
+        text=record.text,
+        metadata=metadata,
+        importance=record.importance,
+    )
+
+
+def db_memory_payload_with_runtime_source(
+    payload: dict[str, Any],
+    runtime_metadata: dict[str, Any],
+    *,
+    creation_path: str = "explicit_intent",
+) -> dict[str, Any]:
+    """Attach runtime source-scope metadata to a DB memory payload."""
+    from_db_options = _from_db_options(runtime_metadata)
+    memory_options = db_memory_options_from_runtime_metadata(runtime_metadata)
+    source_identity = memory_options.get("source_identity")
+    metadata = dict(payload.get("metadata") or {})
+    if source_identity:
+        metadata.setdefault("source_identity", source_identity)
+    metadata.setdefault("workspace_scope", "source")
+    metadata.setdefault("active", True)
+    metadata.setdefault("confidence", 1.0)
+    metadata.setdefault("creation_path", creation_path)
+    catalog_store_id = (
+        from_db_options.get("catalog_store_id")
+        if isinstance(from_db_options, dict)
+        else None
+    )
+    if catalog_store_id:
+        metadata.setdefault("catalog_store_id", catalog_store_id)
+    return {**payload, "metadata": metadata}
+
+
+def db_memory_options_from_runtime_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized DB memory options from runtime metadata."""
+    return db_memory_options_from_from_db_options(_from_db_options(metadata))
+
+
+def db_memory_options_from_from_db_options(options: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized DB memory options from `from_db_options`."""
+    memory = options.get("memory")
+    return memory if isinstance(memory, dict) else {}
+
+
+def _from_db_options(metadata: dict[str, Any]) -> dict[str, Any]:
+    options = metadata.get("from_db_options")
+    return options if isinstance(options, dict) else {}
 
 
 async def has_db_memory_marker(plugin: Any, key: str) -> bool:
@@ -908,6 +1143,226 @@ def _record_key_from_result(result: dict[str, Any]) -> str | None:
     return None
 
 
+def _db_memory_record_from_recall_result(result: dict[str, Any]) -> dict[str, Any]:
+    metadata = result.get("metadata") or {}
+    db_memory = metadata.get("db_memory") if isinstance(metadata, dict) else None
+    if isinstance(db_memory, dict):
+        return dict(db_memory)
+
+    content = str(result.get("content", ""))
+    try:
+        marker = "DB memory record:\n"
+        if content.startswith(marker):
+            payload = json.loads(content[len(marker) :])
+            if isinstance(payload, dict):
+                return payload
+    except Exception:
+        return {}
+    return {}
+
+
+def _planner_memory_omit_reason(
+    record: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    prompt: str,
+    schema: dict[str, Any],
+    source_identity: str | None,
+    schema_fingerprint: str | None,
+    score_threshold: float,
+) -> str | None:
+    kind = str(record.get("kind") or "")
+    key = str(record.get("key") or "")
+    text = str(record.get("text") or "")
+    metadata = (
+        record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    )
+    if kind not in DB_PLANNING_MEMORY_KINDS:
+        return "unsupported_kind"
+    if not key or not text:
+        return "malformed"
+    if not _score_is_high_enough(result, score_threshold):
+        return "low_score"
+    record_source = metadata.get("source_identity")
+    if source_identity and record_source != source_identity:
+        return "cross_source" if record_source else "missing_source_identity"
+    if metadata.get("active") is False:
+        return "inactive"
+    if bool(metadata.get("stale")) or _is_memory_expired(metadata):
+        return "stale"
+    record_schema = metadata.get("source_schema_fingerprint") or metadata.get(
+        "schema_fingerprint"
+    )
+    if record_schema and schema_fingerprint and record_schema != schema_fingerprint:
+        return "stale_schema"
+    if _confidence_value(metadata.get("confidence"), default=1.0) < 0.5:
+        return "low_confidence"
+    if kind == "value_alias" and not _value_alias_has_catalog_citation(metadata):
+        return "missing_catalog_citation"
+    if db_memory_pii_error(key=key, text=text, metadata=metadata):
+        return "unsafe"
+    if not _record_refs_known_schema(metadata, schema):
+        return "schema_scope_mismatch"
+    if not _memory_relevant_to_prompt(prompt, record):
+        return "irrelevant"
+    return None
+
+
+def _score_is_high_enough(result: dict[str, Any], threshold: float) -> bool:
+    score = result.get("relevance_score", result.get("score"))
+    if score is None:
+        return True
+    try:
+        return float(score) >= float(threshold)
+    except (TypeError, ValueError):
+        return True
+
+
+def _confidence_value(value: Any, *, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "high":
+            return 0.9
+        if lowered == "medium":
+            return 0.7
+        if lowered == "low":
+            return 0.4
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_memory_expired(metadata: dict[str, Any]) -> bool:
+    expires_at = metadata.get("expires_at")
+    if not expires_at:
+        return False
+    try:
+        parsed = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed <= datetime.now(timezone.utc)
+
+
+def _value_alias_has_catalog_citation(metadata: dict[str, Any]) -> bool:
+    return bool(
+        metadata.get("catalog_profile_ref")
+        or metadata.get("catalog_evidence_id")
+        or metadata.get("catalog_refs")
+    )
+
+
+def _record_refs_known_schema(metadata: dict[str, Any], schema: dict[str, Any]) -> bool:
+    tables = {
+        str(table.get("name") or "").lower(): {
+            str(column.get("name") or "").lower()
+            for column in table.get("columns", []) or []
+            if column.get("name")
+        }
+        for table in schema.get("tables", []) or []
+        if table.get("name")
+    }
+    table = str(metadata.get("table") or "").lower()
+    column = str(metadata.get("column") or "").lower()
+    if table and table not in tables:
+        return False
+    if table and column and column not in tables.get(table, set()):
+        return False
+    return True
+
+
+def _memory_relevant_to_prompt(prompt: str, record: dict[str, Any]) -> bool:
+    prompt_tokens = set(_meaningful_tokens(prompt))
+    if not prompt_tokens:
+        return True
+    metadata = (
+        record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    )
+    record_text = " ".join(
+        str(value)
+        for value in (
+            record.get("kind"),
+            record.get("key"),
+            record.get("text"),
+            metadata.get("metric"),
+            metadata.get("table"),
+            metadata.get("column"),
+            metadata.get("alias"),
+        )
+        if value
+    )
+    record_tokens = set(_meaningful_tokens(record_text))
+    return bool(prompt_tokens & record_tokens)
+
+
+def _prompt_matches_schema(prompt: str, schema: dict[str, Any]) -> bool:
+    prompt_tokens = set(_meaningful_tokens(prompt))
+    if not prompt_tokens:
+        return False
+    for table in schema.get("tables", []) or []:
+        names = [table.get("name")]
+        names.extend(column.get("name") for column in table.get("columns", []) or [])
+        if prompt_tokens & set(
+            _meaningful_tokens(" ".join(str(n) for n in names if n))
+        ):
+            return True
+    return False
+
+
+def _meaningful_tokens(text: Any) -> list[str]:
+    stop = {
+        "about",
+        "after",
+        "before",
+        "calculate",
+        "computed",
+        "does",
+        "from",
+        "have",
+        "many",
+        "show",
+        "that",
+        "their",
+        "there",
+        "this",
+        "what",
+        "when",
+        "where",
+        "which",
+        "with",
+    }
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_]{2,}", str(text or "").lower())
+    expanded: list[str] = []
+    for token in tokens:
+        expanded.extend(part for part in token.split("_") if len(part) > 2)
+        expanded.append(token)
+    return [token for token in expanded if token not in stop]
+
+
+def _memory_evidence_ref_ids(metadata: dict[str, Any]) -> list[str]:
+    refs: list[str] = []
+    raw = metadata.get("evidence_refs")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and item.get("id"):
+                refs.append(str(item["id"]))
+            elif isinstance(item, str):
+                refs.append(item)
+    for key in ("catalog_evidence_id", "proposal_evidence_id"):
+        if metadata.get(key):
+            refs.append(str(metadata[key]))
+    return list(dict.fromkeys(refs))
+
+
+def _bump_omitted(diagnostics: dict[str, Any], reason: str) -> None:
+    omitted = diagnostics.setdefault("omitted_reasons", {})
+    omitted[reason] = int(omitted.get(reason) or 0) + 1
+
+
 def _dedupe_recall_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen = set()
     deduped = []
@@ -1064,9 +1519,7 @@ def _find_sensitive_metadata_key(
 ) -> str | None:
     for key, value in metadata.items():
         key_text = str(key).lower()
-        if key_text in SENSITIVE_METADATA_KEYS or any(
-            pattern in key_text for pattern in SENSITIVE_METADATA_KEYS
-        ):
+        if _metadata_key_is_sensitive(key_text):
             return f"{prefix}{key}" if prefix else str(key)
         if isinstance(value, dict):
             nested = _find_sensitive_metadata_key(
@@ -1075,6 +1528,19 @@ def _find_sensitive_metadata_key(
             if nested:
                 return nested
     return None
+
+
+def _metadata_key_is_sensitive(key_text: str) -> bool:
+    if key_text in SENSITIVE_METADATA_KEYS:
+        return True
+    tokens = {token for token in re.split(r"[^a-z0-9]+", key_text) if token}
+    if tokens & SENSITIVE_METADATA_KEYS:
+        return True
+    for pattern in SENSITIVE_METADATA_KEYS:
+        pattern_tokens = {token for token in re.split(r"[^a-z0-9]+", pattern) if token}
+        if pattern_tokens and pattern_tokens <= tokens:
+            return True
+    return False
 
 
 def _default_key(kind: str, text: str) -> str:

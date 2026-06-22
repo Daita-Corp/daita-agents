@@ -122,6 +122,16 @@ def _verify_data_query(
 
 
 def _verify_memory_update(evidence: tuple[Evidence, ...]) -> tuple[str, ...]:
+    proposal = next(
+        (item for item in evidence if item.kind == "db.memory.proposal"), None
+    )
+    if proposal is not None and not proposal.accepted:
+        reasons = (
+            proposal.payload.get("validation", {}).get("reasons", [])
+            if isinstance(proposal.payload.get("validation"), dict)
+            else []
+        )
+        return tuple(["memory_proposal_not_accepted", *[str(item) for item in reasons]])
     memory_write = next(
         (item for item in evidence if item.kind == "memory.semantic.write"), None
     )

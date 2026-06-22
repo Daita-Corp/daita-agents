@@ -373,7 +373,6 @@ class DbRuntimeMonitorActionReportsMixin:
             ),
             reason="monitor_report_read",
             sequence=sequence,
-            focus=step.get("metric") or step.get("purpose") or step.get("id"),
             metadata={
                 "monitor_id": monitor_id,
                 "monitor_run_id": monitor_run_id,

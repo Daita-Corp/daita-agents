@@ -51,6 +51,7 @@ from .governance import (
     DbRuntimeGovernanceMixin,
     _safe_source_repr,
 )
+from .memory_learning import DbRuntimeMemoryLearningMixin
 from .monitors import DbRuntimeMonitorsMixin, _default_monitor_store
 from .resume import (
     DbRuntimeResumeMixin,
@@ -77,6 +78,7 @@ class DbRuntime(
     DbRuntimeCacheMixin,
     DbRuntimeGovernanceMixin,
     DbRuntimeMonitorsMixin,
+    DbRuntimeMemoryLearningMixin,
     DbRuntimeResultsMixin,
     DbRuntimeResumeMixin,
     DbRuntimeTasksMixin,
@@ -633,11 +635,16 @@ class DbRuntime(
 
     async def _stored_operation_count(self) -> int:
         operations = await self.store.list_operations()
-        return len(operations)
+        return len(
+            [operation for operation in operations if _inspection_counts(operation)]
+        )
 
     async def _last_stored_operation_id(self) -> str | None:
         operations = await self.store.list_operations()
-        return operations[-1].id if operations else None
+        counted = [
+            operation for operation in operations if _inspection_counts(operation)
+        ]
+        return counted[-1].id if counted else None
 
     def _runtime_event(
         self,
@@ -684,6 +691,10 @@ class DbRuntime(
             message=message,
             payload=dict(payload or {}),
         )
+
+
+def _inspection_counts(operation: Operation) -> bool:
+    return operation.operation_type != "db.memory.learning"
 
 
 def _skill_names_from_request(request: DbRequest) -> tuple[str, ...]:

@@ -57,7 +57,8 @@ class FailingRuntimeDbPlugin(BaseDatabasePlugin):
 
 async def _seed_sqlite(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL
@@ -69,36 +70,33 @@ async def _seed_sqlite(path):
         );
         INSERT INTO customers (name) VALUES ('Ada'), ('Linus');
         INSERT INTO orders (customer_id, total) VALUES (1, 10.0), (2, 20.0);
-        """)
+        """
+    )
     await plugin.disconnect()
 
 
 async def _seed_sqlite_with_cents(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             total_cents INTEGER NOT NULL
         );
         INSERT INTO orders (total_cents) VALUES (1234);
-        """)
+        """
+    )
     await plugin.disconnect()
 
 
-def _memory_plugin(tmp_path):
-    plugin = MemoryPlugin(
-        workspace="agent-from-db-memory",
-        embedder=MockEmbeddingProvider(dim=8),
-    )
-    plugin.backend = LocalMemoryBackend(
+def _memory_backend(tmp_path):
+    return LocalMemoryBackend(
         workspace="agent-from-db-memory",
         agent_id="agent-from-db-memory-test",
         scope="project",
         base_dir=tmp_path,
         embedder=MockEmbeddingProvider(dim=8),
     )
-    plugin.environment = "local"
-    return plugin
 
 
 def _write_catalog_snapshot(profile_key, schema, *, last_seen=None):
@@ -704,7 +702,7 @@ async def test_agent_from_db_registers_db_adjacent_extension_plugins(tmp_path):
         str(db_path),
         name="phase-13-services",
         lineage=LineagePlugin(),
-        memory=_memory_plugin(tmp_path),
+        memory={"backend": _memory_backend(tmp_path)},
         quality=True,
     )
 
@@ -762,11 +760,17 @@ async def test_agent_from_db_lineage_true_registers_runtime_plugin(tmp_path):
     assert not hasattr(agent, "_db_lineage")
 
 
-async def test_agent_from_db_memory_true_registers_initialized_memory_plugin(tmp_path):
-    db_path = tmp_path / "phase13_memory_true.sqlite"
+async def test_agent_from_db_memory_config_registers_initialized_memory_plugin(
+    tmp_path,
+):
+    db_path = tmp_path / "phase13_memory_config.sqlite"
     await _seed_sqlite(db_path)
 
-    agent = await Agent.from_db(str(db_path), name="memory-true-test", memory=True)
+    agent = await Agent.from_db(
+        str(db_path),
+        name="memory-config-test",
+        memory={"enabled": True},
+    )
 
     try:
         inspection = await agent.describe()
@@ -776,17 +780,21 @@ async def test_agent_from_db_memory_true_registers_initialized_memory_plugin(tmp
 
     assert isinstance(memory, MemoryPlugin)
     assert memory.backend is not None
-    assert memory._agent_id == "memory-true-test"
+    assert memory._agent_id == "memory-config-test"
     assert "memory" in inspection.plugin_ids
     assert "memory:memory.semantic.write" in inspection.capability_ids
     assert "memory:memory.context" in inspection.context_provider_ids
 
 
-async def test_agent_from_db_memory_true_uses_runtime_setup_not_initialize(tmp_path):
+async def test_agent_from_db_memory_config_uses_runtime_setup_not_initialize(tmp_path):
     db_path = tmp_path / "phase13_memory_setup.sqlite"
     await _seed_sqlite(db_path)
 
-    agent = await Agent.from_db(str(db_path), name="memory-setup-test", memory=True)
+    agent = await Agent.from_db(
+        str(db_path),
+        name="memory-setup-test",
+        memory={"enabled": True},
+    )
 
     try:
         memory = agent.runtime.registry.get_plugin("memory")
@@ -799,19 +807,122 @@ async def test_agent_from_db_memory_true_uses_runtime_setup_not_initialize(tmp_p
     assert not hasattr(MemoryPlugin, "initialize")
 
 
-async def test_agent_from_db_memory_none_is_not_registered_by_default(tmp_path):
-    db_path = tmp_path / "phase13_memory_none.sqlite"
+async def test_agent_from_db_default_initializes_source_scoped_memory(tmp_path):
+    db_path = tmp_path / "phase1_memory_default.sqlite"
     await _seed_sqlite(db_path)
 
     agent = await Agent.from_db(str(db_path))
 
     try:
         inspection = await agent.describe()
+        memory = agent.runtime.registry.get_plugin("memory")
     finally:
         await agent.stop()
 
+    memory_config = inspection.metadata["from_db_options"]["memory"]
+    assert memory_config["enabled"] is True
+    assert memory_config["recall"] == "auto"
+    assert memory_config["learning"] == "safe"
+    assert memory_config["limit"] == 3
+    assert memory_config["char_budget"] == 800
+    assert memory_config["workspace_scope"] == "source"
+    assert memory_config["source_identity"].startswith("sqlite:from_db:")
+    assert isinstance(memory, MemoryPlugin)
+    assert memory.workspace == memory_config["source_identity"]
+    assert "memory" in inspection.plugin_ids
+    assert "memory:memory.semantic.write" in inspection.capability_ids
+
+
+async def test_agent_from_db_memory_false_opts_out(tmp_path):
+    db_path = tmp_path / "phase1_memory_opt_out.sqlite"
+    await _seed_sqlite(db_path)
+
+    agent = await Agent.from_db(str(db_path), memory=False)
+
+    try:
+        inspection = await agent.describe()
+    finally:
+        await agent.stop()
+
+    memory_config = inspection.metadata["from_db_options"]["memory"]
+    assert memory_config["enabled"] is False
+    assert memory_config["recall"] == "off"
+    assert memory_config["learning"] == "off"
     assert "memory" not in inspection.plugin_ids
     assert "memory:memory.semantic.write" not in inspection.capability_ids
+
+
+async def test_agent_from_db_rejects_legacy_memory_true(tmp_path):
+    db_path = tmp_path / "phase1_memory_true_rejected.sqlite"
+    await _seed_sqlite(db_path)
+
+    with pytest.raises(
+        ValueError,
+        match="memory must be False, a DbMemoryConfig, a config mapping, or None",
+    ):
+        await Agent.from_db(str(db_path), memory=True)
+
+
+async def test_agent_from_db_rejects_memory_plugin_argument(tmp_path):
+    db_path = tmp_path / "phase1_memory_plugin_rejected.sqlite"
+    await _seed_sqlite(db_path)
+
+    with pytest.raises(
+        ValueError,
+        match="memory must be False, a DbMemoryConfig, a config mapping, or None",
+    ):
+        await Agent.from_db(str(db_path), memory=MemoryPlugin())
+
+
+async def test_agent_from_db_memory_config_can_provide_backend(tmp_path):
+    db_path = tmp_path / "phase1_memory_backend.sqlite"
+    await _seed_sqlite(db_path)
+    backend = MagicMock()
+
+    agent = await Agent.from_db(str(db_path), memory={"backend": backend})
+
+    try:
+        memory = agent.runtime.registry.get_plugin("memory")
+    finally:
+        await agent.stop()
+
+    assert memory.backend is backend
+
+
+async def test_agent_from_db_memory_update_works_without_extra_enablement(tmp_path):
+    db_path = tmp_path / "phase1_memory_update_default.sqlite"
+    await _seed_sqlite(db_path)
+
+    agent = await Agent.from_db(str(db_path))
+    try:
+        memory = agent.runtime.registry.get_plugin("memory")
+        backend = MagicMock()
+        backend.list_by_category = AsyncMock(return_value=[])
+        backend.remember = AsyncMock(
+            return_value={"status": "success", "chunk_id": "mem-1"}
+        )
+        memory.backend = backend
+        result = await agent.run_detailed(
+            "Remember the revenue definition",
+            mode="memory.update",
+            metadata={
+                "kind": "metric_definition",
+                "key": "metric:revenue",
+                "text": "Revenue excludes refunded orders.",
+            },
+        )
+    finally:
+        await agent.stop()
+
+    memory_config = agent.runtime.config.metadata["from_db_options"]["memory"]
+    assert result.status is OperationStatus.SUCCEEDED
+    evidence = next(
+        item for item in result.evidence if item.kind == "memory.semantic.write"
+    )
+    stored = backend.remember.await_args.kwargs["extra_metadata"]["db_memory"]
+    assert evidence.payload["success"] is True
+    assert stored["metadata"]["source_identity"] == memory_config["source_identity"]
+    assert stored["metadata"]["workspace_scope"] == "source"
 
 
 async def test_agent_from_db_calibrate_memory_stores_structured_unit_conventions(
@@ -819,15 +930,13 @@ async def test_agent_from_db_calibrate_memory_stores_structured_unit_conventions
 ):
     db_path = tmp_path / "phase13_memory_calibration.sqlite"
     await _seed_sqlite_with_cents(db_path)
-    memory = MemoryPlugin()
     backend = MagicMock()
     backend.list_by_category = AsyncMock(return_value=[])
     backend.remember = AsyncMock(return_value={"status": "success"})
-    memory.backend = backend
 
     agent = await Agent.from_db(
         str(db_path),
-        memory=memory,
+        memory={"backend": backend},
         calibrate_memory=True,
     )
 
@@ -854,7 +963,6 @@ async def test_agent_from_db_calibrate_memory_skips_when_exact_marker_exists(
     source = SQLitePlugin(path=str(db_path))
     original_schema_inspect = source._execute_schema_inspect
     source._execute_schema_inspect = AsyncMock(side_effect=original_schema_inspect)
-    memory = MemoryPlugin()
     backend = MagicMock()
     backend.list_by_category = AsyncMock(
         return_value=[
@@ -866,11 +974,10 @@ async def test_agent_from_db_calibrate_memory_skips_when_exact_marker_exists(
         ]
     )
     backend.remember = AsyncMock()
-    memory.backend = backend
 
     agent = await Agent.from_db(
         source,
-        memory=memory,
+        memory={"backend": backend},
         calibrate_memory=True,
     )
 
@@ -887,13 +994,11 @@ async def test_agent_from_db_calibrate_memory_skips_when_exact_marker_exists(
 async def test_agent_from_db_does_not_register_generic_memory_tools(tmp_path):
     db_path = tmp_path / "phase13_no_generic_memory_tools.sqlite"
     await _seed_sqlite(db_path)
-    memory = MemoryPlugin()
     backend = MagicMock()
     backend.list_by_category = AsyncMock(return_value=[])
     backend.remember = AsyncMock(return_value={"status": "success"})
-    memory.backend = backend
 
-    agent = await Agent.from_db(str(db_path), memory=memory)
+    agent = await Agent.from_db(str(db_path), memory={"backend": backend})
 
     try:
         inspection = await agent.describe()
@@ -906,26 +1011,21 @@ async def test_agent_from_db_does_not_register_generic_memory_tools(tmp_path):
     assert "memory:memory.semantic.write" in inspection.capability_ids
 
 
-async def test_agent_from_db_memory_update_never_calls_generic_memory_tools(tmp_path):
+async def test_agent_from_db_memory_update_uses_runtime_capability_not_generic_tools(
+    tmp_path,
+):
     db_path = tmp_path / "phase13_generic_memory_guardrail.sqlite"
     await _seed_sqlite(db_path)
-    memory = MemoryPlugin()
     backend = MagicMock()
     backend.list_by_category = AsyncMock(return_value=[])
     backend.remember = AsyncMock(
         return_value={"status": "success", "chunk_id": "mem-1"}
     )
-    memory.backend = backend
-    memory.get_tools = MagicMock(
-        side_effect=AssertionError("generic memory tools should not be registered")
-    )
-    memory.remember = AsyncMock(
-        side_effect=AssertionError("generic memory write should not run")
-    )
 
-    agent = await Agent.from_db(str(db_path), memory=memory)
+    agent = await Agent.from_db(str(db_path), memory={"backend": backend})
 
     try:
+        inspection = await agent.describe()
         result = await agent.run_detailed(
             "Please remember that revenue excludes refunds and update_memory if needed."
         )
@@ -934,8 +1034,8 @@ async def test_agent_from_db_memory_update_never_calls_generic_memory_tools(tmp_
 
     assert result.status is OperationStatus.SUCCEEDED
     assert result.intent.kind.value == "memory.update"
-    memory.get_tools.assert_not_called()
-    memory.remember.assert_not_awaited()
+    assert "remember" not in inspection.tool_view_names
+    assert "update_memory" not in inspection.tool_view_names
     backend.remember.assert_awaited_once()
     evidence = next(
         item for item in result.evidence if item.kind == "memory.semantic.write"
@@ -981,7 +1081,7 @@ async def test_agent_from_db_simple_mode_applies_connector_limits_without_servic
     assert inspection.profile == "simple"
     assert "data_quality" not in inspection.plugin_ids
     assert "lineage" not in inspection.plugin_ids
-    assert "memory" not in inspection.plugin_ids
+    assert "memory" in inspection.plugin_ids
     assert sqlite_plugin.query_max_rows == 100
     assert sqlite_plugin.query_max_chars == 25000
 
@@ -1004,12 +1104,16 @@ async def test_agent_from_db_mode_quality_override_wins_on_new_path(tmp_path):
     assert sqlite_plugin.query_timeout == 60
 
 
-async def test_agent_from_db_data_team_can_register_custom_memory_plugin(tmp_path):
-    db_path = tmp_path / "phase13_custom_memory.sqlite"
+async def test_agent_from_db_data_team_can_configure_memory_backend(tmp_path):
+    db_path = tmp_path / "phase13_custom_memory_backend.sqlite"
     await _seed_sqlite(db_path)
-    memory = _memory_plugin(tmp_path)
+    backend = _memory_backend(tmp_path)
 
-    agent = await Agent.from_db(str(db_path), mode="data_team", memory=memory)
+    agent = await Agent.from_db(
+        str(db_path),
+        mode="data_team",
+        memory={"backend": backend},
+    )
 
     try:
         inspection = await agent.describe()
@@ -1017,7 +1121,8 @@ async def test_agent_from_db_data_team_can_register_custom_memory_plugin(tmp_pat
     finally:
         await agent.stop()
 
-    assert registered is memory
+    assert isinstance(registered, MemoryPlugin)
+    assert registered.backend is backend
     assert "memory" in inspection.plugin_ids
     assert "memory:memory.semantic.write" in inspection.capability_ids
     assert "memory:memory.context" in inspection.context_provider_ids

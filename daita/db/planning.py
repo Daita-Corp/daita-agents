@@ -114,7 +114,14 @@ _WRITE_WORDS = {
 }
 _QUALITY_WORDS = {"quality", "profile", "null", "freshness", "anomaly"}
 _LINEAGE_WORDS = {"lineage", "upstream", "downstream", "impact"}
-_MEMORY_WORDS = {"remember", "note", "business rule", "semantic"}
+_MEMORY_WORDS = {
+    "remember",
+    "note",
+    "business rule",
+    "semantic",
+    "forget",
+    "memory",
+}
 _SCHEMA_ONLY_PHRASES = {
     "schema evidence only",
     "schema only",
@@ -537,7 +544,7 @@ def _capability_requirements_for_intent(kind: DbIntentKind) -> tuple[str, ...]:
     if kind is DbIntentKind.LINEAGE_TRACE:
         return ("lineage.trace",)
     if kind is DbIntentKind.MEMORY_UPDATE:
-        return ("memory.semantic.write",)
+        return ("db.memory.plan_update", "db.memory.commit_update")
     if kind is DbIntentKind.WRITE_PROPOSE:
         return ("db.sql.validate",)
     if kind is DbIntentKind.WRITE_EXECUTE:

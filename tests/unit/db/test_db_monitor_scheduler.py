@@ -906,6 +906,7 @@ async def test_planned_read_observation_resolves_cursor_parameters_before_read()
         task for task, _, _ in calls if task.capability_id == "db.sql.execute_read"
     )
     assert read_task.input["params"] == [17]
+    assert "focus" not in read_task.input
     updated = await runtime.monitor_store.load_monitor_state("new_orders_monitor")
     assert updated.cursor["last_id"] == 42
 
@@ -1308,6 +1309,11 @@ async def test_scheduled_report_action_uses_validated_reads_and_blocks_vague_del
     assert run.summary["action_status"] == "succeeded"
     assert task_capabilities.count("db.sql.validate") == 2
     assert task_capabilities.count("db.sql.execute_read") == 2
+    assert all(
+        "focus" not in task.input
+        for task in snapshot.tasks
+        if task.capability_id == "db.sql.execute_read"
+    )
     assert not any("delivery" in task.capability_id for task in snapshot.tasks)
     assert not any("slack" in task.capability_id for task in snapshot.tasks)
     assert any(item.kind == "analysis.synthesis" for item in snapshot.evidence)

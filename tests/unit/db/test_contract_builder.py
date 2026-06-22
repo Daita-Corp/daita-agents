@@ -240,7 +240,11 @@ def test_lineage_and_memory_contracts_report_missing_declared_services():
     assert lineage.metadata["missing_capabilities"] == ["lineage.trace"]
     assert memory.operation_type == "memory.update"
     assert memory.access is AccessMode.WRITE
-    assert memory.metadata["missing_capabilities"] == ["memory.semantic.write"]
+    assert memory.required_capabilities == (
+        "db.memory.plan_update",
+        "db.memory.commit_update",
+    )
+    assert memory.metadata["missing_capabilities"] == []
 
 
 def test_conversational_contract_requires_no_capabilities_or_evidence():

@@ -9,6 +9,10 @@ from typing import Any
 
 from daita.runtime import Evidence, Operation
 
+from .memory import (
+    db_memory_options_from_from_db_options,
+    db_memory_refs_from_recall_evidence,
+)
 from .models import DbIntent, DbRequest, DbRuntimeConfig
 from .session_context import db_session_context_from_request
 
@@ -28,6 +32,9 @@ class DbPlanningContext:
     relationship_evidence_refs: tuple[str, ...] = ()
     column_value_evidence_refs: tuple[str, ...] = ()
     column_value_hints: tuple[dict[str, Any], ...] = ()
+    db_memory_refs: tuple[dict[str, Any], ...] = ()
+    db_memory_evidence_refs: tuple[str, ...] = ()
+    db_memory_diagnostics: dict[str, Any] = field(default_factory=dict)
     source_evidence_refs: tuple[dict[str, Any], ...] = ()
     source_fingerprints: dict[str, str] = field(default_factory=dict)
     capability_summaries: tuple[dict[str, Any], ...] = ()
@@ -56,6 +63,9 @@ class DbPlanningContext:
             "relationship_evidence_refs": list(self.relationship_evidence_refs),
             "column_value_evidence_refs": list(self.column_value_evidence_refs),
             "column_value_hints": [dict(item) for item in self.column_value_hints],
+            "db_memory_refs": [dict(item) for item in self.db_memory_refs],
+            "db_memory_evidence_refs": list(self.db_memory_evidence_refs),
+            "db_memory_diagnostics": dict(self.db_memory_diagnostics),
             "source_evidence_refs": [dict(item) for item in self.source_evidence_refs],
             "source_fingerprints": dict(self.source_fingerprints),
             "capability_summaries": [dict(item) for item in self.capability_summaries],
@@ -88,6 +98,8 @@ class DbPlanningContextBuilder:
         schema_evidence: Evidence | None,
         catalog_evidence: tuple[Evidence, ...] = (),
         relationship_evidence: tuple[Evidence, ...] = (),
+        memory_recall_evidence: tuple[Evidence, ...] = (),
+        memory_recall_diagnostics: dict[str, Any] | None = None,
         capability_summaries: tuple[dict[str, Any], ...] = (),
         source: Any = None,
     ) -> DbPlanningContext:
@@ -141,6 +153,29 @@ class DbPlanningContextBuilder:
         )
         if column_value_hints:
             included_sections.append("column_value_hints")
+        memory_options = db_memory_options_from_from_db_options(options)
+        db_memory_refs, db_memory_evidence_refs, db_memory_diagnostics = (
+            db_memory_refs_from_recall_evidence(
+                tuple(item for item in memory_recall_evidence if item.accepted),
+                prompt=request.prompt,
+                schema=schema,
+                source_identity=memory_options.get("source_identity"),
+                schema_fingerprint=schema_fingerprint,
+                limit=int(memory_options.get("limit") or 3),
+                char_budget=int(memory_options.get("char_budget") or 800),
+                score_threshold=_float_option(
+                    memory_options,
+                    "score_threshold",
+                    0.45,
+                ),
+            )
+        )
+        db_memory_diagnostics = {
+            **db_memory_diagnostics,
+            **dict(memory_recall_diagnostics or {}),
+        }
+        if db_memory_refs:
+            included_sections.append("db_memory")
         diagnostics = {
             "schema_table_count": len(schema.get("tables", []) or []),
             "context_budget": options.get("planner_context_budget"),
@@ -149,6 +184,7 @@ class DbPlanningContextBuilder:
             "source_evidence_count": len(source_evidence),
             "capability_summary_count": len(capability_summaries),
             "column_value_hint_count": len(column_value_hints),
+            "db_memory_ref_count": len(db_memory_refs),
         }
         session_context = _compact_session_context(request)
         if session_context:
@@ -165,6 +201,9 @@ class DbPlanningContextBuilder:
             relationship_evidence_refs=_evidence_refs(relationship_evidence),
             column_value_evidence_refs=_evidence_refs(column_value_evidence),
             column_value_hints=column_value_hints,
+            db_memory_refs=db_memory_refs,
+            db_memory_evidence_refs=db_memory_evidence_refs,
+            db_memory_diagnostics=db_memory_diagnostics,
             source_evidence_refs=source_refs,
             source_fingerprints=source_fingerprints,
             capability_summaries=tuple(capability_summaries),
@@ -174,6 +213,7 @@ class DbPlanningContextBuilder:
                 "rendered_context_chars": 0,
                 "capability_summary_count": len(capability_summaries),
                 "source_evidence_count": len(source_evidence),
+                "db_memory_chars": int(db_memory_diagnostics.get("used_chars") or 0),
             },
             context_selection_diagnostics={
                 "mode": "runtime_bounded",
@@ -286,6 +326,14 @@ def _render_context_summary(context: DbPlanningContext) -> str:
                 "- "
                 f"{item.get('source_table')}.{item.get('source_column')} -> "
                 f"{item.get('target_table')}.{item.get('target_column')}"
+            )
+    if context.db_memory_refs:
+        lines.append("Database memory:")
+        for ref in context.db_memory_refs:
+            lines.append(
+                "- "
+                f"{ref.get('kind')} {ref.get('key')}: "
+                f"{str(ref.get('text') or '').strip()}"
             )
     if context.column_value_hints:
         lines.append("Known filter values:")
@@ -508,3 +556,10 @@ def _fingerprint(value: Any) -> str:
 def _from_db_options(metadata: dict[str, Any]) -> dict[str, Any]:
     options = metadata.get("from_db_options")
     return options if isinstance(options, dict) else {}
+
+
+def _float_option(options: dict[str, Any], key: str, default: float) -> float:
+    value = options.get(key)
+    if value is None:
+        return default
+    return float(value)

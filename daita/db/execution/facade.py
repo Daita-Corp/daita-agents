@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 from typing import Any
-from uuid import uuid4
 
-from daita.runtime import Evidence, Operation, Task
+from daita.runtime import Evidence, Operation, Task, TaskDependency
 
 from ..capabilities import SCHEMA_RELATIONSHIP_PATH_EVIDENCE
 from ..evidence import DbEvidenceStore
+from ..analysis import stable_fingerprint
 from ..models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
 from ..query_planning import DbQueryPlanner
 from ..session_context import db_session_context_from_request
@@ -550,6 +550,7 @@ class DbOperationExecutor(
                 request,
                 contract,
                 operation,
+                schema,
                 tasks,
                 evidence_store,
             )
@@ -703,45 +704,58 @@ class DbOperationExecutor(
         request: DbRequest,
         contract: DbOperationContract,
         operation: Operation,
+        schema: dict[str, Any],
         tasks: list[Task],
         evidence_store: DbEvidenceStore,
     ) -> None:
-        selected = _selected_capability(contract, "memory.semantic.write")
-        if selected is None:
-            return
-        capability = self.runtime.registry.get_capability(
-            selected["id"], owner=selected["owner"]
-        )
-        task_input = {
-            "db_memory_payload": {
-                **request.constraints,
-                **request.metadata,
-            },
-            "db_memory_prompt": request.prompt,
+        request_payload = {
+            "prompt": request.prompt,
+            "mode": request.mode,
+            "metadata": dict(request.metadata),
+            "constraints": dict(request.constraints),
+            "source_scope": list(request.source_scope),
+            "requested_capabilities": list(request.requested_capabilities),
         }
-        planned = await self.runtime._planned_task_for_capability(
-            operation.id, capability
-        )
-        task = (
-            Task(
-                id=f"db-task-{uuid4()}",
-                operation_id=operation.id,
-                capability_id=capability.id,
-                executor_id=capability.executor,
-                input=task_input,
-                required_evidence=capability.output_evidence,
-                metadata={"owner": capability.owner, "reason": "db_memory_semantics"},
-            )
-            if planned is None
-            else replace(planned, input=task_input)
-        )
-        tasks.append(task)
-        evidence = await self.runtime.execute_task(
-            task,
+        proposal_evidence = await self._execute_capability(
+            "db.memory.plan_update",
+            contract,
             operation,
-            context={"capability_owner": capability.owner},
+            tasks,
+            evidence_store,
+            {
+                "request": request_payload,
+                "schema": schema,
+                "schema_fingerprint": stable_fingerprint(schema) if schema else None,
+            },
         )
-        evidence_store.add_many(evidence)
+        proposal = next(
+            (item for item in proposal_evidence if item.kind == "db.memory.proposal"),
+            None,
+        )
+        if proposal is None:
+            return
+        if not proposal.accepted:
+            evidence_store.add_diagnostic(proposal)
+            return
+        await self._execute_capability(
+            "db.memory.commit_update",
+            contract,
+            operation,
+            tasks,
+            evidence_store,
+            {
+                "proposal_evidence_id": proposal.id,
+                "proposal_fingerprint": proposal.payload.get("proposal_fingerprint"),
+                "source_identity": proposal.payload.get("source_identity"),
+            },
+            dependencies=(
+                TaskDependency(
+                    kind="evidence",
+                    producer_task_id=str(proposal.task_id),
+                    evidence_kind=proposal.kind,
+                ),
+            ),
+        )
 
     def _value_grounding_available(self) -> bool:
         required = {

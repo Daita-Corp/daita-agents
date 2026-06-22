@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
-from daita.runtime import Evidence, Operation, OperationStatus
+from daita.runtime import Evidence, Operation, OperationStatus, RuntimeEventType
 
 from ..models import DbOperationResult
 
@@ -76,6 +76,21 @@ class DbRuntimeResultsMixin:
                     message=message,
                     payload=payload,
                 )
+            enqueue_learning = getattr(
+                self,
+                "_enqueue_memory_learning_after_result",
+                None,
+            )
+            if enqueue_learning is not None:
+                try:
+                    await enqueue_learning(result, operation=operation)
+                except Exception:
+                    await self.kernel.append_event(
+                        RuntimeEventType.DIAGNOSTIC,
+                        operation_id=result.operation_id,
+                        message="DB memory learning enqueue was skipped after error.",
+                        payload={"reason": "memory_learning_enqueue_failed"},
+                    )
         return result
 
     async def _persist_trace_correlation(

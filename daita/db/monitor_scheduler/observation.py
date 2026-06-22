@@ -143,7 +143,6 @@ class DbMonitorObservationRunner:
                 owner=owner,
                 reason="monitor_observation_read",
                 sequence=1,
-                focus=plan.get("metric") or plan.get("purpose") or monitor.name,
                 metadata={
                     "monitor_id": monitor.id,
                     "monitor_run_id": run_id,
