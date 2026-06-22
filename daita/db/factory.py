@@ -16,11 +16,12 @@ from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.persistence import catalog_profile_key
 from daita.plugins.postgresql import PostgreSQLPlugin
 from daita.plugins.sqlite import SQLitePlugin
+from daita.runtime import RuntimeStore, SQLiteRuntimeStore, current_host_runtime_context
 
 from .agent import DbAgent
 from .memory import calibrate_db_memory
 from .llm_service import db_llm_service_from_config
-from .models import DbLimits, DbRuntimeConfig
+from .models import DbLimits, DbRuntimeConfig, DbRuntimeOptions
 from .runtime import DbRuntime
 
 _MODE_DEFAULTS: dict[str, dict[str, Any]] = {
@@ -91,6 +92,7 @@ async def from_db(
     schema_prompt_policy: Any | None = None,
     tool_result_policy: Any | None = None,
     stateful: bool = False,
+    runtime: DbRuntimeOptions | None = None,
     plugins: tuple[Any, ...] | list[Any] = (),
     skills: tuple[Any, ...] | list[Any] = (),
     read_only: bool | None = None,
@@ -143,6 +145,7 @@ async def from_db(
     )
     _ensure_converted_plugin(source_plugin)
     profile_key = catalog_profile_key(source, db_schema=db_schema)
+    host_context = current_host_runtime_context()
     runtime_metadata = _runtime_metadata(
         db_config,
         mode=mode_name,
@@ -166,6 +169,12 @@ async def from_db(
         catalog_store_id=f"from_db:{profile_key}",
         catalog_keys=[f"from_db:{profile_key}"],
     )
+    if host_context is not None:
+        runtime_metadata["host_runtime"] = {
+            "surface": host_context.surface,
+            "delivery_defaults": list(host_context.delivery_defaults),
+            "metadata": dict(host_context.metadata),
+        }
     catalog_plugin = CatalogPlugin(auto_persist=False) if catalog is None else catalog
     service_plugins = _resolve_service_plugins(
         source_plugin,
@@ -173,14 +182,19 @@ async def from_db(
         memory=resolved_options["memory"],
         quality=resolved_options["quality"],
     )
+    host_plugins = tuple(host_context.runtime_extensions) if host_context else ()
+    host_services = dict(host_context.services) if host_context else {}
+    runtime_store = _resolve_runtime_store(runtime)
+    developer_plugins = (*tuple(db_config.plugins), *tuple(plugins))
+    _ensure_host_extensions_are_unique(host_plugins, developer_plugins)
     runtime_plugins = tuple(
         plugin
         for plugin in (
             *((catalog_plugin,) if catalog_plugin is not False else ()),
             source_plugin,
             *service_plugins,
-            *db_config.plugins,
-            *tuple(plugins),
+            *host_plugins,
+            *developer_plugins,
             *tuple(skills),
         )
         if plugin is not None
@@ -202,7 +216,9 @@ async def from_db(
     runtime = DbRuntime(
         source=source,
         config=runtime_config,
+        store=runtime_store,
         db_llm_service=db_llm_service if db_llm_service.available else None,
+        host_services=host_services,
     )
     try:
         await runtime.setup(agent_id=name)
@@ -268,6 +284,18 @@ def _resolve_runtime_source(
 
 def _plugin_options(options: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in options.items() if value is not None}
+
+
+def _resolve_runtime_store(options: DbRuntimeOptions | None) -> RuntimeStore | None:
+    if options is None:
+        return None
+    if not isinstance(options, DbRuntimeOptions):
+        raise TypeError("runtime must be a DbRuntimeOptions instance")
+    if options.store is None:
+        return None
+    if options.store == "sqlite":
+        return SQLiteRuntimeStore(options.store_path)
+    return options.store
 
 
 def _resolve_factory_options(
@@ -402,6 +430,40 @@ def _resolve_memory_plugin(
         if getattr(plugin, "manifest", None) is None:
             raise ValueError("memory must be True, False, None, or a converted plugin")
     return plugin
+
+
+def _ensure_host_extensions_are_unique(
+    host_plugins: tuple[Any, ...],
+    developer_plugins: tuple[Any, ...],
+) -> None:
+    host_ids = tuple(
+        plugin_id
+        for plugin in host_plugins
+        if (plugin_id := _plugin_manifest_id(plugin)) is not None
+    )
+    duplicate_host_ids = {
+        plugin_id for plugin_id in host_ids if host_ids.count(plugin_id) > 1
+    }
+    developer_ids = {
+        plugin_id
+        for plugin in developer_plugins
+        if (plugin_id := _plugin_manifest_id(plugin)) is not None
+    }
+    duplicates = tuple(
+        plugin_id
+        for plugin_id in dict.fromkeys((*duplicate_host_ids, *host_ids))
+        if plugin_id in duplicate_host_ids or plugin_id in developer_ids
+    )
+    if duplicates:
+        raise ValueError(
+            "duplicate hosted runtime extension id(s): " + ", ".join(duplicates)
+        )
+
+
+def _plugin_manifest_id(plugin: Any) -> str | None:
+    manifest = getattr(plugin, "manifest", None)
+    plugin_id = getattr(manifest, "id", None)
+    return plugin_id if isinstance(plugin_id, str) and plugin_id else None
 
 
 def _calibration_source_key(

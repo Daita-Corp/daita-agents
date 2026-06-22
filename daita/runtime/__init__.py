@@ -33,6 +33,11 @@ from .primitives import (
     Worker,
 )
 from .governance import PolicyEvaluator, evaluate_policies
+from .hosting import (
+    HostRuntimeContext,
+    current_host_runtime_context,
+    host_runtime_context,
+)
 from .approvals import InMemoryApprovalChannel
 from .events import RuntimeStreamEvent
 from .executors import EvidenceWrappingExecutor
@@ -79,6 +84,7 @@ __all__ = [
     "Executor",
     "GovernanceAuditRecord",
     "GovernanceResult",
+    "HostRuntimeContext",
     "Operation",
     "OperationStatus",
     "OperationSnapshot",
@@ -123,7 +129,9 @@ __all__ = [
     "WorkerRunResult",
     "WorkerRuntime",
     "WorkerRuntimeOptions",
+    "current_host_runtime_context",
     "evaluate_policies",
+    "host_runtime_context",
     "local_tool_plugin_for",
     "register_local_tool",
 ]

@@ -9,8 +9,9 @@ from uuid import uuid4
 from daita.runtime import Evidence, Operation, Task
 
 from ...analysis import stable_fingerprint
+from ...models import DbRequest
+from ...monitor_commands.extractor import DeterministicMonitorIntentExtractor
 from ...monitor_commands.planner import DbMonitorPlanner, _monitor_from_proposal
-from ...monitor_commands.prompt_parsing import _target_resource_from_prompt
 from ...monitor_commands.types import DbMonitorCommand, DbMonitorValidation
 from ...monitors import DbMonitorMutation, DbMonitorState
 
@@ -34,7 +35,13 @@ class DbMonitorPlanCreateExecutor:
         command = DbMonitorCommand(
             **dict(task.input.get("command") or operation.request.get("command") or {})
         )
-        target = _target_resource_from_prompt(command.prompt)
+        source_scope = tuple(str(item) for item in task.input.get("source_scope") or ())
+        preliminary_intent = DeterministicMonitorIntentExtractor().extract(
+            command,
+            DbRequest(prompt=command.prompt, source_scope=source_scope),
+            host_defaults={"delivery_default": _hosted_delivery_default(runtime)},
+        )
+        target = preliminary_intent.target.name or ""
         schema_evidence = await _inspect_monitor_target_schema(
             runtime,
             operation,
@@ -43,11 +50,10 @@ class DbMonitorPlanCreateExecutor:
         proposal, validation = DbMonitorPlanner(
             registry=runtime.registry,
             limits=runtime.config.limits.to_dict(),
+            delivery_default=_hosted_delivery_default(runtime),
         ).create_proposal(
             command,
-            source_scope=tuple(
-                str(item) for item in task.input.get("source_scope") or ()
-            ),
+            source_scope=source_scope,
             owner=dict(task.input.get("owner") or {}),
             schema=(schema_evidence.payload if schema_evidence is not None else None),
             schema_evidence_id=(
@@ -75,6 +81,17 @@ class DbMonitorPlanCreateExecutor:
                 },
             )
         ]
+
+
+def _hosted_delivery_default(runtime: Any) -> str | None:
+    host_runtime = runtime.config.metadata.get("host_runtime")
+    if not isinstance(host_runtime, dict):
+        return None
+    delivery_defaults = host_runtime.get("delivery_defaults")
+    if not isinstance(delivery_defaults, list) or not delivery_defaults:
+        return None
+    default = delivery_defaults[0]
+    return default if isinstance(default, str) and default else None
 
 
 @dataclass(frozen=True)

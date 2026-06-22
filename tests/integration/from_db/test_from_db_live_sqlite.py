@@ -21,13 +21,13 @@ from dotenv import load_dotenv
 
 from daita.agents.agent import Agent
 from daita.agents.conversation import ConversationHistory
-from daita.db import DbIntentKind
+from daita.db import DbIntentKind, DbRuntimeOptions
 from daita.db.session_context import db_session_context_from_request
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.memory.local_backend import LocalMemoryBackend
 from daita.plugins.memory.memory_plugin import MemoryPlugin
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import OperationStatus
+from daita.runtime import OperationStatus, SQLiteRuntimeStore
 
 load_dotenv(Path.cwd() / ".env")
 
@@ -130,6 +130,52 @@ async def test_from_db_live_query_uses_runtime_tasks_and_evidence(tmp_path):
     assert result.diagnostics["verification"]["passed"] is True
     assert inspection.operation_count == 1
     assert not hasattr(agent, "tool_names")
+
+
+async def test_from_db_live_sqlite_runtime_store_reopens_llm_operation_state(tmp_path):
+    db_path = tmp_path / "sales.sqlite"
+    runtime_path = tmp_path / "runtime.sqlite"
+    await _seed_sales_db(db_path)
+    live_openai = _require_live_openai()
+    first = await Agent.from_db(
+        str(db_path),
+        name="LiveFromDbRuntimePersistence",
+        cache_ttl=0,
+        runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
+        **live_openai,
+    )
+
+    try:
+        assert isinstance(first.runtime.store, SQLiteRuntimeStore)
+        assert first.runtime.db_llm_service.available is True
+        result = await first.run_detailed("How many customers are there?")
+    finally:
+        await first.stop()
+
+    second = await Agent.from_db(
+        str(db_path),
+        name="LiveFromDbRuntimePersistenceReopened",
+        cache_ttl=0,
+        runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
+        **live_openai,
+    )
+    try:
+        reopened = await second.runtime.inspect_operation(result.operation_id)
+    finally:
+        await second.stop()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert result.telemetry["mode"] == "llm"
+    assert result.telemetry["provider"] == "openai"
+    assert result.telemetry["model"] == live_openai["model"]
+    assert "db.answer.synthesize" in _task_capabilities(result)
+    assert "answer.synthesis" in _evidence_kinds(result)
+    assert runtime_path.exists()
+    assert reopened is not None
+    assert reopened.operation.id == result.operation_id
+    assert reopened.operation.status is OperationStatus.SUCCEEDED
+    assert "db.answer.synthesize" in {task.capability_id for task in reopened.tasks}
+    assert "answer.synthesis" in {evidence.kind for evidence in reopened.evidence}
 
 
 async def test_from_db_live_catalog_assisted_join_records_relationship_path(tmp_path):

@@ -25,6 +25,15 @@ _HOSTED_IN_APP_NOTIFICATION_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_LOCAL_NOTIFICATION_RE = re.compile(
+    r"\b(?:"
+    r"notify\s+me\s+(?:locally|in\s+(?:the\s+)?console|via\s+(?:the\s+)?console)|"
+    r"alert\s+me\s+(?:locally|in\s+(?:the\s+)?console|via\s+(?:the\s+)?console)|"
+    r"runtime\s+console|"
+    r"local\s+notification"
+    r")\b",
+    re.IGNORECASE,
+)
 _WEEKDAY_INDEX = {
     "monday": 1,
     "tuesday": 2,
@@ -165,44 +174,6 @@ def _update_patch(prompt: str) -> dict[str, Any]:
     return patch
 
 
-def _create_name_phrase(prompt: str) -> str:
-    text = prompt.strip().rstrip(".")
-    create_for = re.match(
-        r"(?i)^(?:please\s+)?(?:create|add|set\s+up|setup)\s+(?:a\s+)?monitor\s+for\s+(.+)$",
-        text,
-    )
-    if create_for:
-        return _before_boundary(create_for.group(1))
-    match = re.match(r"(?i)^(?:please\s+)?(?:monitor|watch)\s+(.+)$", text)
-    if match:
-        return _before_boundary(match.group(1))
-    report = re.search(
-        r"(?i)(?:give me|generate|send|prepare)\s+(?:a\s+)?(.+?)\s+report\b", text
-    )
-    if report:
-        return f"{report.group(1)} report"
-    return _before_boundary(text)
-
-
-def _before_boundary(text: str) -> str:
-    return re.split(
-        r"(?i)\b(?:every|if|when|then|and alert|notify|notified|i\s+want|at\s+\d|until)\b",
-        text,
-        maxsplit=1,
-    )[0].strip(" ,;:") or text.strip(" ,;:")
-
-
-def _watch_from_prompt(prompt: str) -> str:
-    text = prompt.strip()
-    text = re.sub(
-        r"(?i)^(?:please\s+)?(?:create|add|set\s+up|setup)\s+(?:a\s+)?monitor\s+for\s+",
-        "",
-        text,
-    )
-    text = re.sub(r"(?i)^(?:please\s+)?(?:monitor|watch)\s+", "", text)
-    return _before_boundary(text)
-
-
 def _schedule_from_prompt(prompt: str) -> dict[str, Any] | None:
     lowered = prompt.lower()
     cron = _CRON_RE.search(prompt)
@@ -321,7 +292,7 @@ def _action_steps_from_prompt(prompt: str) -> tuple[dict[str, Any], ...]:
                 step["delivery_hint"] = "email"
             elif "webhook" in lowered:
                 step["delivery_hint"] = "webhook"
-            else:
+            elif _LOCAL_NOTIFICATION_RE.search(action):
                 step["delivery_hint"] = "local"
             if action:
                 step["matched_text"] = action
@@ -392,16 +363,7 @@ def _target_resource_from_prompt(prompt: str) -> str:
         match = re.search(pattern, lowered)
         if match:
             return match.group(1)
-    phrase = _watch_from_prompt(prompt)
-    phrase = re.sub(r"(?i)\btable\b", "", phrase).strip()
-    return _monitor_id_from_phrase(phrase)
-
-
-def _title_from_phrase(phrase: str) -> str:
-    words = [word for word in re.split(r"\s+", phrase.strip()) if word]
-    if not words:
-        return "DB Monitor"
-    return " ".join(word[:1].upper() + word[1:] for word in words)
+    return ""
 
 
 def _monitor_id_from_phrase(phrase: str) -> str:

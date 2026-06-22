@@ -145,6 +145,16 @@ def _resolution_monitor_context(resolution: DbMonitorResolution) -> dict[str, An
 def _schedule_text(schedule: Any) -> str:
     if not isinstance(schedule, dict):
         return ""
+    interval_seconds = schedule.get("interval_seconds") or schedule.get("every_seconds")
+    if isinstance(interval_seconds, (int, float)) and interval_seconds > 0:
+        if interval_seconds % 3600 == 0:
+            hours = int(interval_seconds // 3600)
+            return "hourly" if hours == 1 else f"every {hours} hours"
+        if interval_seconds % 60 == 0:
+            minutes = int(interval_seconds // 60)
+            return "every minute" if minutes == 1 else f"every {minutes} minutes"
+        seconds = int(interval_seconds)
+        return "every second" if seconds == 1 else f"every {seconds} seconds"
     expression = str(schedule.get("expression") or "").strip()
     if not expression:
         return ""

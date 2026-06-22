@@ -35,11 +35,6 @@ from .answers import (
     _resolution_failure_answer,
 )
 from .planner import _stable_monitor_payload_hash
-from .prompt_parsing import (
-    _create_name_phrase,
-    _monitor_id_from_phrase,
-    _title_from_phrase,
-)
 from .resolver import DbMonitorResolver
 from .router import DbCommandRouter
 from .types import DbMonitorCommand, DbMonitorResolution, DbMonitorValidation
@@ -112,10 +107,6 @@ class DbMonitorCommandService:
     ) -> DbOperationResult:
         if not self.runtime.is_setup:
             await self.runtime.setup()
-        monitor_id = command.monitor_id or _monitor_id_from_phrase(
-            _title_from_phrase(_create_name_phrase(request.prompt))
-        )
-        monitor_name = _title_from_phrase(_create_name_phrase(request.prompt))
 
         operation = await self.runtime.kernel.create_operation(
             operation_type="monitor.create",
@@ -132,8 +123,6 @@ class DbMonitorCommandService:
             metadata={
                 "control_plane": "db.monitor",
                 "command_kind": "create",
-                "monitor_id": monitor_id,
-                "monitor_name": monitor_name,
                 "user_id": request.user_id,
                 "session_id": request.session_id,
                 "source_scope": list(request.source_scope),

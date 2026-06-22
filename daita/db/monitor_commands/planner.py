@@ -14,42 +14,13 @@ from ..monitor_plugin_planning import (
     MonitorPluginPlanner,
     MonitorPluginPlanningBlocked,
 )
+from ..models import DbRequest
 from ..monitors import DbMonitor
 from ..query_metadata import column_name, is_numeric_type, matching_tables
-from .prompt_parsing import (
-    _action_steps_from_prompt,
-    _actions_from_prompt,
-    _budgets_from_prompt,
-    _create_name_phrase,
-    _monitor_id_from_phrase,
-    _policy_from_prompt,
-    _schedule_from_prompt,
-    _target_resource_from_prompt,
-    _title_from_phrase,
-    _trigger_from_prompt,
-    _watch_from_prompt,
-)
+from .extractor import DeterministicMonitorIntentExtractor
+from .intent import MonitorConditionIntent, MonitorCreateIntent
+from .naming import monitor_display_name, monitor_id as monitor_id_from_intent
 from .types import DbMonitorCommand, DbMonitorValidation
-
-_MONITOR_DELIVERY_TEMPLATE = "New rows were observed for the monitored table."
-_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-_SLACK_CHANNEL_RE = re.compile(r"#[A-Za-z0-9_-]+")
-_URL_RE = re.compile(r"https?://[^\s,;.]+")
-_HOSTED_IN_APP_DELIVERY_RE = re.compile(
-    r"\b(?:"
-    r"notify\s+me\s+in\s+(?:the\s+)?app|"
-    r"notify\s+me\s+via\s+(?:the\s+)?app|"
-    r"notify\s+me\s+inside\s+(?:the\s+)?app|"
-    r"notified\s+in\s+(?:the\s+)?app|"
-    r"notified\s+via\s+(?:the\s+)?app|"
-    r"alert\s+me\s+in\s+(?:the\s+)?app|"
-    r"alert\s+me\s+via\s+(?:the\s+)?app|"
-    r"send\s+me\s+(?:an?\s+)?app\s+notification|"
-    r"in[-\s]?app\s+notification|"
-    r"app\s+notification"
-    r")\b",
-    re.IGNORECASE,
-)
 
 
 class DbMonitorPlanner:
@@ -60,9 +31,11 @@ class DbMonitorPlanner:
         *,
         registry: ExtensionRegistry | None = None,
         limits: dict[str, Any] | None = None,
+        delivery_default: str | None = None,
     ) -> None:
         self.registry = registry
         self.limits = dict(limits or {})
+        self.delivery_default = delivery_default
 
     def create_monitor(
         self,
@@ -93,31 +66,41 @@ class DbMonitorPlanner:
         owner: dict[str, Any] | None = None,
         schema: dict[str, Any] | None = None,
         schema_evidence_id: str | None = None,
+        intent: MonitorCreateIntent | None = None,
     ) -> tuple[dict[str, Any], DbMonitorValidation]:
         """Plan a prompt-created monitor as an executable proposal."""
         if command.kind != "create":
             raise ValueError("DbMonitorPlanner can only create monitor proposals")
         prompt = command.prompt
-        name = _title_from_phrase(_create_name_phrase(prompt))
-        target = _target_resource_from_prompt(prompt)
-        schedule = _schedule_from_prompt(prompt) or {"interval_seconds": 300}
-        trigger = _executable_trigger_from_prompt(prompt)
-        actions = _actions_from_prompt(prompt)
-        budgets = _budgets_from_prompt(prompt)
-        policy = _policy_from_prompt(prompt)
-        action_steps = _action_steps_from_prompt(prompt)
-        monitor_id = command.monitor_id or _monitor_id_from_phrase(name)
-        effective_scope = tuple(source_scope or ((target,) if target else ()))
+        if intent is None:
+            intent = DeterministicMonitorIntentExtractor().extract(
+                command,
+                DbRequest(prompt=prompt, source_scope=source_scope),
+                schema=schema,
+                host_defaults={"delivery_default": self.delivery_default},
+            )
+        target = intent.target.name or ""
+        schedule = (
+            intent.schedule.to_schedule_dict()
+            if intent.schedule is not None
+            else {"interval_seconds": 300}
+        )
+        trigger = _trigger_from_condition(intent.condition)
+        actions = intent.action.actions
+        budgets = intent.budget.to_dict()
+        policy = intent.policy.to_dict()
+        action_steps = intent.action.steps
+        name = monitor_display_name(intent)
+        monitor_id = monitor_id_from_intent(intent, explicit_id=command.monitor_id)
+        effective_scope = tuple(intent.target.source_scope or source_scope or ())
+        if not effective_scope and target:
+            effective_scope = (target,)
         observation_plan, initial_cursor = _planned_read_observation_plan(
             target,
             budgets=budgets,
             schema=schema,
         )
-        action_plan = _notification_action_plan(
-            prompt,
-            actions=actions,
-            action_steps=action_steps,
-        )
+        action_plan = _notification_action_plan(intent)
         validation = self.validate(
             action_steps=action_steps,
             actions=actions,
@@ -134,9 +117,9 @@ class DbMonitorPlanner:
             "kind": "monitor.proposal",
             "monitor_id": monitor_id,
             "name": name,
-            "description": _watch_from_prompt(prompt),
+            "description": intent.display.description or prompt,
             "status": "active",
-            "target_type": "table",
+            "target_type": intent.target.target_type,
             "target_name": target,
             "source_scope": list(effective_scope),
             "schedule": schedule,
@@ -166,6 +149,8 @@ class DbMonitorPlanner:
                 "created_from_prompt": True,
                 "prompt": prompt,
                 "command": command.diagnostics,
+                "intent": intent.to_dict(),
+                "extraction": intent.diagnostics,
                 "validation": validation.to_dict(),
                 "schema_evidence_id": schema_evidence_id,
             },
@@ -465,95 +450,27 @@ def _looks_auto_incrementing(column: dict[str, Any]) -> bool:
     )
 
 
-def _executable_trigger_from_prompt(prompt: str) -> dict[str, Any]:
-    lowered = prompt.lower()
-    if re.search(r"\b(new|inserted|added|created)\b", lowered):
-        return {
-            "type": "new_rows",
-            "path": "rows",
-            "operator": "count_gt",
-            "value": 0,
-        }
-    return {
-        "type": "rows_present",
-        "path": "rows",
-        "operator": "count_gt",
-        "value": 0,
-        "expression": _trigger_from_prompt(prompt, schedule=None).get("expression"),
+def _trigger_from_condition(condition: MonitorConditionIntent) -> dict[str, Any]:
+    trigger: dict[str, Any] = {
+        "type": condition.kind,
     }
+    if condition.path is not None:
+        trigger["path"] = condition.path
+    if condition.operator is not None:
+        trigger["operator"] = condition.operator
+    if condition.value is not None:
+        trigger["value"] = condition.value
+    if condition.expression is not None:
+        trigger["expression"] = condition.expression
+    return trigger
 
 
-def _notification_action_plan(
-    prompt: str,
-    *,
-    actions: tuple[str, ...],
-    action_steps: tuple[dict[str, Any], ...],
-) -> dict[str, Any]:
-    delivery_intent = _delivery_intent_from_prompt(
-        prompt,
-        actions=actions,
-        action_steps=action_steps,
-    )
-    if delivery_intent is None:
+def _notification_action_plan(intent: MonitorCreateIntent) -> dict[str, Any]:
+    if intent.delivery is None:
         return {"kind": "none", "steps": []}
     return {
         "kind": "notification",
-        "delivery_intent": delivery_intent,
-    }
-
-
-def _delivery_intent_from_prompt(
-    prompt: str,
-    *,
-    actions: tuple[str, ...],
-    action_steps: tuple[dict[str, Any], ...],
-) -> dict[str, Any] | None:
-    lowered = prompt.lower()
-    hints = {
-        str(step.get("delivery_hint") or "")
-        for step in action_steps
-        if step.get("kind") == "notify"
-    }
-    wants_notification = bool(
-        hints
-        or actions
-        or re.search(
-            r"\b(notify|notified|alert|tell me|let me know|email me|"
-            r"send me an email)\b",
-            lowered,
-        )
-    )
-    if not wants_notification:
-        return None
-    delivery_kind = "local"
-    target: dict[str, Any] = {"type": "runtime_console"}
-    if "in_app" in hints or _HOSTED_IN_APP_DELIVERY_RE.search(prompt):
-        delivery_kind = "in_app"
-        target = {"type": "requesting_user"}
-    elif "email" in hints or "email" in lowered or _EMAIL_RE.search(prompt):
-        delivery_kind = "email"
-        target = {"type": "email"}
-        email = _EMAIL_RE.search(prompt)
-        if email:
-            target["recipient"] = email.group(0)
-    elif "slack" in hints or "slack" in lowered or _SLACK_CHANNEL_RE.search(prompt):
-        delivery_kind = "slack"
-        target = {"type": "slack"}
-        channel = _SLACK_CHANNEL_RE.search(prompt)
-        if channel:
-            target["channel"] = channel.group(0)
-    elif "webhook" in hints or "webhook" in lowered or "callback" in lowered:
-        delivery_kind = "webhook"
-        target = {"type": "webhook"}
-        url = _URL_RE.search(prompt)
-        if url:
-            target["url"] = url.group(0)
-    return {
-        "delivery_kind": delivery_kind,
-        "target": target,
-        "payload_source": {"type": "monitor.report"},
-        "template": _MONITOR_DELIVERY_TEMPLATE,
-        "include_observed_rows": True,
+        "delivery_intent": intent.delivery.to_action_plan_intent(),
     }
 
 

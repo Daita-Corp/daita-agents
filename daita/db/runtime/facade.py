@@ -102,6 +102,7 @@ class DbRuntime(
         approval_channel: InMemoryApprovalChannel | None = None,
         runtime_id: str | None = None,
         db_llm_service: DbLLMService | None = None,
+        host_services: dict[str, Any] | None = None,
     ) -> None:
         self.source = source
         self.config = config or DbRuntimeConfig()
@@ -116,6 +117,7 @@ class DbRuntime(
         self.db_llm_service = db_llm_service or db_llm_service_from_metadata(
             self.config.metadata
         )
+        self.host_services = dict(host_services or {})
         self._setup_context: PluginContext | None = None
         self._is_setup = False
         self._schema_profile_cache: dict[str, Any] | None = None
@@ -163,6 +165,7 @@ class DbRuntime(
             return
         services = ServiceRegistry(
             {
+                **self.host_services,
                 "db_runtime": self,
                 "extension_registry": self.registry,
                 "runtime_store": self.store,

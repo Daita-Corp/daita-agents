@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 from daita.agents.agent import Agent
 from daita.db.config.policies import SchemaPromptPolicy, ToolResultPolicy
-from daita.db import DbAgent, DbRequest, DbRuntime
+from daita.db import DbAgent, DbRequest, DbRuntime, DbRuntimeOptions
+from daita.db.runtime.extensions import HostedInAppMonitorDeliveryPlugin
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.catalog.persistence import catalog_profile_key
 from daita.plugins import PluginKind, PluginManifest
@@ -17,7 +18,13 @@ from daita.plugins.memory.local_backend import LocalMemoryBackend
 from daita.plugins.memory.memory_plugin import MemoryPlugin
 from daita.plugins.postgresql import PostgreSQLPlugin
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import OperationStatus
+from daita.runtime import (
+    HostRuntimeContext,
+    InMemoryRuntimeStore,
+    OperationStatus,
+    SQLiteRuntimeStore,
+    host_runtime_context,
+)
 from daita.skills import Skill, SkillRuntimeEffects
 
 import pytest
@@ -128,6 +135,85 @@ async def test_agent_from_db_returns_db_agent_backed_by_db_runtime(tmp_path):
         await agent.stop()
 
 
+async def test_agent_from_db_defaults_to_in_memory_runtime_store(tmp_path):
+    db_path = tmp_path / "default_runtime_store.sqlite"
+    runtime_path = tmp_path / "runtime.sqlite"
+    await _seed_sqlite(db_path)
+
+    agent = await Agent.from_db(str(db_path))
+
+    try:
+        assert isinstance(agent.runtime.store, InMemoryRuntimeStore)
+        assert not runtime_path.exists()
+    finally:
+        await agent.stop()
+
+
+async def test_agent_from_db_runtime_options_sqlite_store(tmp_path):
+    db_path = tmp_path / "runtime_options_source.sqlite"
+    runtime_path = tmp_path / "runtime_options.sqlite"
+    await _seed_sqlite(db_path)
+
+    agent = await Agent.from_db(
+        str(db_path),
+        runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
+    )
+
+    try:
+        assert isinstance(agent.runtime.store, SQLiteRuntimeStore)
+        assert agent.runtime.store.path == runtime_path
+        assert runtime_path.exists()
+    finally:
+        await agent.stop()
+
+
+async def test_agent_from_db_runtime_options_existing_store_instance(tmp_path):
+    db_path = tmp_path / "existing_store_source.sqlite"
+    runtime_path = tmp_path / "existing_runtime_store.sqlite"
+    runtime_store = SQLiteRuntimeStore(runtime_path)
+    await _seed_sqlite(db_path)
+
+    agent = await Agent.from_db(
+        str(db_path),
+        runtime=DbRuntimeOptions(store=runtime_store),
+    )
+
+    try:
+        assert agent.runtime.store is runtime_store
+    finally:
+        await agent.stop()
+
+
+async def test_agent_from_db_reopens_persisted_runtime_operation_state(tmp_path):
+    db_path = tmp_path / "reopen_source.sqlite"
+    runtime_path = tmp_path / "reopen_runtime.sqlite"
+    await _seed_sqlite(db_path)
+
+    first = await Agent.from_db(
+        str(db_path),
+        runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
+    )
+    try:
+        result = await first.run_detailed("How many customers are there?")
+    finally:
+        await first.stop()
+
+    second = await Agent.from_db(
+        str(db_path),
+        runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
+    )
+    try:
+        snapshot = await second.runtime.inspect_operation(result.operation_id)
+    finally:
+        await second.stop()
+
+    assert snapshot is not None
+    assert snapshot.operation.id == result.operation_id
+    assert snapshot.operation.status is OperationStatus.SUCCEEDED
+    assert snapshot.tasks
+    assert snapshot.evidence
+
+
 async def test_agent_from_db_registers_skills_before_runtime_setup(tmp_path):
     db_path = tmp_path / "skills.sqlite"
     await _seed_sqlite(db_path)
@@ -157,6 +243,52 @@ async def test_agent_from_db_registers_skills_before_runtime_setup(tmp_path):
 
     assert "skill_finance" in inspection.plugin_ids
     assert "catalog.schema.search" in contract.required_capabilities
+
+
+async def test_agent_from_db_consumes_host_runtime_extensions_before_setup(tmp_path):
+    db_path = tmp_path / "hosted.sqlite"
+    await _seed_sqlite(db_path)
+    calls = []
+
+    async def hosted_notification_service(payload):
+        calls.append(payload)
+        return {"notification_id": "hosted-1"}
+
+    host_context = HostRuntimeContext(
+        surface="web_app",
+        delivery_defaults=("in_app",),
+        services={
+            "hosted_in_app_notification_service": hosted_notification_service,
+        },
+        runtime_extensions=(HostedInAppMonitorDeliveryPlugin(),),
+    )
+
+    with host_runtime_context(host_context):
+        agent = await Agent.from_db(str(db_path), name="hosted-runtime-test")
+
+    try:
+        inspection = await agent.describe()
+        evidence = await agent.runtime.execute_capability(
+            "monitor.delivery.in_app",
+            owner="hosted_monitor_delivery",
+            operation_type="monitor.delivery",
+            input={
+                "delivery_kind": "in_app",
+                "target": {"type": "requesting_user"},
+                "payload_source": {"type": "monitor.report"},
+            },
+        )
+    finally:
+        await agent.stop()
+
+    assert "hosted_monitor_delivery" in inspection.plugin_ids
+    assert "hosted_monitor_delivery:monitor.delivery.in_app" in (
+        inspection.capability_ids
+    )
+    assert calls[0]["delivery_kind"] == "in_app"
+    assert calls[0]["target"] == {"type": "requesting_user"}
+    assert calls[0]["payload_source"] == {"type": "monitor.report"}
+    assert evidence[0].payload["result"] == {"notification_id": "hosted-1"}
 
 
 async def test_agent_from_db_skill_effects_apply_during_run_before_contract_building(

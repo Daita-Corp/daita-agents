@@ -211,6 +211,26 @@ async def test_db_runtime_exposes_runtime_store_to_plugins():
     assert plugin.setup_context.services.require("runtime_store") is store
 
 
+async def test_db_runtime_merges_host_services_before_plugin_setup():
+    plugin = CapturingRuntimePlugin()
+    hosted_service = object()
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(plugins=(plugin,)),
+        host_services={
+            "hosted_in_app_notification_service": hosted_service,
+            "db_runtime": "host-value",
+        },
+    )
+
+    await runtime.setup(agent_id="agent-1")
+
+    assert (
+        plugin.setup_context.services.require("hosted_in_app_notification_service")
+        is hosted_service
+    )
+    assert plugin.setup_context.services.require("db_runtime") is runtime
+
+
 async def test_db_runtime_setup_and_teardown_are_idempotent():
     plugin = CapturingRuntimePlugin()
     runtime = DbRuntime(config=DbRuntimeConfig(plugins=(plugin,)))

@@ -6,11 +6,9 @@ import re
 
 from .prompt_parsing import (
     _approval_action_from_prompt,
-    _create_name_phrase,
     _extract_monitor_id,
     _has_recurring_or_scheduled_time,
     _looks_like_monitor_update,
-    _monitor_id_from_phrase,
     _requires_monitor_create_approval,
     _state_patch,
     _update_patch,
@@ -40,10 +38,8 @@ class DbCommandRouter:
         if command is not None:
             return command
         if self._looks_like_monitor_create(lowered):
-            monitor_id = _monitor_id_from_phrase(_create_name_phrase(text))
             return DbMonitorCommand(
                 kind="create",
-                monitor_id=monitor_id,
                 prompt=text,
                 confidence=0.88,
                 diagnostics={

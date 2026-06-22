@@ -3,7 +3,17 @@ from dataclasses import replace
 import pytest
 
 from daita.db import DbAgent, DbMonitor, DbRuntime
-from daita.db.monitor_commands import DbMonitorCommand, DbMonitorPlanner
+from daita.db.monitor_commands import (
+    DbCommandRouter,
+    DbMonitorCommand,
+    DbMonitorPlanner,
+    DeterministicMonitorIntentExtractor,
+    MonitorConditionIntent,
+    MonitorCreateIntent,
+    MonitorDisplayIntent,
+    MonitorTargetIntent,
+    monitor_display_name,
+)
 from daita.db.models import DbIntent, DbIntentKind, DbOperationContract
 from daita.db.models import DbOperationResult, DbRequest
 from daita.db.runtime.extensions import HostedInAppMonitorDeliveryPlugin
@@ -14,12 +24,14 @@ from daita.runtime import (
     Capability,
     Evidence,
     EvidenceSchema,
+    HostRuntimeContext,
     Operation,
     OperationStatus,
     RiskLevel,
     Task,
     TaskDependency,
     TaskStatus,
+    host_runtime_context,
 )
 from daita.plugins import RuntimeExtensionPlugin, PluginKind, PluginManifest
 
@@ -436,6 +448,181 @@ def _assert_monitor_sql_answer(answer: str, *, table: str) -> None:
     assert "payload" not in answer
 
 
+def test_monitor_create_router_does_not_generate_raw_prompt_id():
+    command = DbCommandRouter().route(
+        "I want you to create a monitor for the operations table. "
+        "Notify me in app when a new record shows up in the table. "
+        "Poll every 5 mins."
+    )
+
+    assert command is not None
+    assert command.kind == "create"
+    assert command.monitor_id is None
+
+
+def test_monitor_create_intent_extracts_conversational_preamble_and_compact_name():
+    original_prompt = (
+        "I want you to create a monitor for the operations table. "
+        "Notify me in app when a new record shows up in the table. "
+        "Poll every 5 mins."
+    )
+    command = DbMonitorCommand(
+        kind="create",
+        prompt=original_prompt,
+        confidence=0.88,
+        diagnostics={"approval_required": True},
+    )
+    intent = DeterministicMonitorIntentExtractor().extract(
+        command,
+        DbRequest(prompt=original_prompt),
+        schema=_schema_metadata("operations"),
+    )
+
+    assert intent.target.name == "operations"
+    assert intent.condition.kind == "new_rows"
+    assert intent.schedule is not None
+    assert intent.schedule.interval_seconds == 300
+    assert intent.delivery is not None
+    assert intent.delivery.delivery_kind == "in_app"
+    assert monitor_display_name(intent) == "Operations New Rows"
+
+    proposal, validation = DbMonitorPlanner().create_proposal(
+        command,
+        schema=_schema_metadata("operations"),
+    )
+
+    assert proposal["name"] == "Operations New Rows"
+    assert proposal["monitor_id"] == "operations_new_rows"
+    assert proposal["target_name"] == "operations"
+    assert proposal["schedule"]["interval_seconds"] == 300
+    assert proposal["action_plan"]["delivery_intent"]["delivery_kind"] == "in_app"
+    assert proposal["metadata"]["prompt"] == original_prompt
+    assert proposal["metadata"]["intent"]["target"]["name"] == "operations"
+    assert validation.accepted is False
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Create a monitor for operations when new rows are added. Notify me.",
+        "Watch operations for new rows every 5 minutes. Notify me.",
+    ],
+)
+def test_monitor_create_intent_extracts_direct_create_and_watch_prompts(prompt):
+    command = DbMonitorCommand(kind="create", prompt=prompt, confidence=0.88)
+
+    intent = DeterministicMonitorIntentExtractor().extract(
+        command,
+        DbRequest(prompt=prompt),
+        schema=_schema_metadata("operations"),
+    )
+
+    assert intent.target.name == "operations"
+    assert intent.condition.kind == "new_rows"
+    assert monitor_display_name(intent) == "Operations New Rows"
+
+
+def test_monitor_create_intent_preserves_explicit_quoted_name():
+    prompt = (
+        'Create a monitor named "High Value Orders" for orders when total '
+        "exceeds 1000. Notify me."
+    )
+    command = DbMonitorCommand(kind="create", prompt=prompt, confidence=0.88)
+
+    proposal, _validation = DbMonitorPlanner().create_proposal(
+        command,
+        schema=_schema_metadata("orders"),
+    )
+
+    assert proposal["name"] == "High Value Orders"
+    assert proposal["monitor_id"] == "high_value_orders"
+    assert proposal["target_name"] == "orders"
+
+
+def test_monitor_create_intent_uses_hosted_default_delivery():
+    prompt = "Create a monitor for operations when new rows are added. Notify me."
+    command = DbMonitorCommand(kind="create", prompt=prompt, confidence=0.88)
+
+    with host_runtime_context(
+        HostRuntimeContext(surface="web_app", delivery_defaults=("in_app",))
+    ):
+        intent = DeterministicMonitorIntentExtractor().extract(
+            command,
+            DbRequest(prompt=prompt),
+            schema=_schema_metadata("operations"),
+        )
+
+    assert intent.delivery is not None
+    assert intent.delivery.delivery_kind == "in_app"
+    assert intent.delivery.target == {"type": "requesting_user"}
+    assert intent.delivery.explicit is False
+
+
+def test_monitor_create_intent_uses_local_delivery_without_host():
+    prompt = "Create a monitor for operations when new rows are added. Notify me."
+    command = DbMonitorCommand(kind="create", prompt=prompt, confidence=0.88)
+
+    intent = DeterministicMonitorIntentExtractor().extract(
+        command,
+        DbRequest(prompt=prompt),
+        schema=_schema_metadata("operations"),
+    )
+
+    assert intent.delivery is not None
+    assert intent.delivery.delivery_kind == "local"
+    assert intent.delivery.target == {"type": "runtime_console"}
+
+
+def test_monitor_display_name_caps_length_and_never_returns_full_prompt():
+    original_prompt = (
+        "I want you to create a monitor for an extremely verbose operations "
+        "table with lots of conversational words."
+    )
+    intent = MonitorCreateIntent(
+        target=MonitorTargetIntent(
+            target_type="table",
+            name=(
+                "extremely_verbose_operations_table_name_that_should_not_take_over_"
+                "dashboard_cards"
+            ),
+            confidence=0.9,
+        ),
+        condition=MonitorConditionIntent(kind="new_rows"),
+        schedule=None,
+        delivery=None,
+        display=MonitorDisplayIntent(description=original_prompt),
+        confidence=0.9,
+    )
+
+    name = monitor_display_name(intent)
+
+    assert len(name) <= 64
+    assert name != original_prompt
+
+
+def test_monitor_create_intent_blocks_ambiguous_target_without_prompt_slug():
+    prompt = "Create a monitor when new rows are added. Notify me."
+    command = DbMonitorCommand(kind="create", prompt=prompt, confidence=0.88)
+
+    intent = DeterministicMonitorIntentExtractor().extract(
+        command,
+        DbRequest(prompt=prompt),
+        schema=_schema_metadata("operations"),
+    )
+    proposal, validation = DbMonitorPlanner().create_proposal(
+        command,
+        schema=_schema_metadata("operations"),
+    )
+
+    assert intent.target.name is None
+    assert proposal["target_name"] == ""
+    assert proposal["name"] == "DB Monitor"
+    assert proposal["monitor_id"] == "new_rows_every_300_seconds"
+    assert "create_when_new_rows_added_notify_me" not in proposal["monitor_id"]
+    assert validation.accepted is False
+    assert "monitor.proposal_incomplete:source" in validation.errors
+
+
 async def test_prompt_managed_monitor_crud_uses_typed_apis_and_audits_runtime():
     schema_probe = _schema_probe("pending_orders")
     runtime = SpyDbRuntime(plugins=(schema_probe,))
@@ -447,32 +634,36 @@ async def test_prompt_managed_monitor_crud_uses_typed_apis_and_audits_runtime():
     )
     assert created.status is OperationStatus.SUCCEEDED
     assert created.contract.operation_type == "monitor.create"
-    assert created.diagnostics["monitor"]["id"] == "pending_orders"
+    assert created.diagnostics["monitor"]["id"] == "pending_orders_threshold"
 
     listed = await agent.run("List active monitors.")
-    assert "pending_orders" in listed
-    inspected = await agent.run("Inspect monitor pending_orders.")
-    assert "pending_orders" in inspected
+    assert "pending_orders_threshold" in listed
+    inspected = await agent.run("Inspect monitor pending_orders_threshold.")
+    assert "pending_orders_threshold" in inspected
     updated = await agent.run(
-        "Make pending_orders monitor less noisy; require two bad checks."
+        "Make pending_orders_threshold monitor less noisy; require two bad checks."
     )
     assert "Updated monitor" in updated
-    paused = await agent.run("Please pause the pending_orders monitor until Monday.")
+    paused = await agent.run(
+        "Please pause the pending_orders_threshold monitor until Monday."
+    )
     assert "Paused monitor" in paused
-    resumed = await agent.run("Resume pending_orders monitor.")
+    resumed = await agent.run("Resume pending_orders_threshold monitor.")
     assert "Resumed monitor" in resumed
-    explained = await agent.run("Why did pending_orders monitor trigger today?")
+    explained = await agent.run(
+        "Why did pending_orders_threshold monitor trigger today?"
+    )
     assert "no recorded runs" in explained
-    deleted = await agent.run("Delete pending_orders monitor.")
+    deleted = await agent.run("Delete pending_orders_threshold monitor.")
     assert "Deleted monitor" in deleted
 
-    assert ("create_monitor", "pending_orders") not in runtime.calls
+    assert ("create_monitor", "pending_orders_threshold") not in runtime.calls
     assert ("list_monitors", "active") in runtime.calls
-    assert ("inspect_monitor", "pending_orders") in runtime.calls
-    assert ("update_monitor", "pending_orders") in runtime.calls
-    assert ("pause_monitor", "pending_orders") in runtime.calls
-    assert ("resume_monitor", "pending_orders") in runtime.calls
-    assert ("delete_monitor", "pending_orders") in runtime.calls
+    assert ("inspect_monitor", "pending_orders_threshold") in runtime.calls
+    assert ("update_monitor", "pending_orders_threshold") in runtime.calls
+    assert ("pause_monitor", "pending_orders_threshold") in runtime.calls
+    assert ("resume_monitor", "pending_orders_threshold") in runtime.calls
+    assert ("delete_monitor", "pending_orders_threshold") in runtime.calls
 
     operations = await runtime.store.list_operations()
     assert [operation.operation_type for operation in operations] == [
@@ -714,6 +905,115 @@ def test_monitor_prompt_generic_notify_validates_through_local_delivery():
         "payload_source": {"type": "monitor.report"},
         "template": "New rows were observed for the monitored table.",
         "include_observed_rows": True,
+    }
+    assert validation.required_capabilities == ("monitor.delivery.local",)
+    assert validation.accepted is True
+
+
+def test_monitor_prompt_generic_notify_uses_hosted_delivery_default():
+    runtime = DbRuntime(
+        runtime_id="db-monitor-hosted-generic-notify-runtime",
+        plugins=(HostedInAppDeliveryProbePlugin(),),
+    )
+    planner = DbMonitorPlanner(registry=runtime.registry)
+
+    with host_runtime_context(
+        HostRuntimeContext(surface="web_app", delivery_defaults=("in_app",))
+    ):
+        proposal, validation = planner.create_proposal(
+            DbMonitorCommand(
+                kind="create",
+                prompt=(
+                    "Monitor operations table every 5 minutes when new rows are "
+                    "added. Notify me."
+                ),
+            ),
+            schema=_schema_metadata("operations"),
+        )
+
+    assert proposal["action_plan"]["delivery_intent"] == {
+        "delivery_kind": "in_app",
+        "target": {"type": "requesting_user"},
+        "payload_source": {"type": "monitor.report"},
+        "template": "New rows were observed for the monitored table.",
+        "include_observed_rows": True,
+    }
+    assert validation.required_capabilities == ("monitor.delivery.in_app",)
+    assert validation.accepted is True
+
+
+def test_monitor_prompt_generic_notify_uses_runtime_delivery_default_without_context():
+    runtime = DbRuntime(
+        runtime_id="db-monitor-runtime-default-notify-runtime",
+        plugins=(HostedInAppDeliveryProbePlugin(),),
+    )
+    planner = DbMonitorPlanner(registry=runtime.registry, delivery_default="in_app")
+
+    proposal, validation = planner.create_proposal(
+        DbMonitorCommand(
+            kind="create",
+            prompt=(
+                "Monitor operations table every 5 minutes when new rows are added. "
+                "Notify me."
+            ),
+        ),
+        schema=_schema_metadata("operations"),
+    )
+
+    assert proposal["action_plan"]["delivery_intent"]["delivery_kind"] == "in_app"
+    assert proposal["action_plan"]["delivery_intent"]["target"] == {
+        "type": "requesting_user"
+    }
+    assert validation.required_capabilities == ("monitor.delivery.in_app",)
+    assert validation.accepted is True
+
+
+def test_monitor_prompt_hosted_generic_notify_requires_in_app_capability():
+    runtime = DbRuntime(runtime_id="db-monitor-hosted-missing-in-app-runtime")
+    planner = DbMonitorPlanner(registry=runtime.registry)
+
+    with host_runtime_context(
+        HostRuntimeContext(surface="web_app", delivery_defaults=("in_app",))
+    ):
+        _proposal, validation = planner.create_proposal(
+            DbMonitorCommand(
+                kind="create",
+                prompt=(
+                    "Monitor operations table every 5 minutes when new rows are "
+                    "added. Notify me."
+                ),
+            ),
+            schema=_schema_metadata("operations"),
+        )
+
+    assert validation.accepted is False
+    assert validation.required_capabilities == ("monitor.delivery.in_app",)
+    assert validation.missing_capabilities == ("monitor.delivery.in_app",)
+    assert "missing_capability:monitor.delivery.in_app" in validation.errors
+    assert "monitor.delivery_unsupported:missing_capability" in validation.errors
+
+
+def test_monitor_prompt_explicit_local_delivery_overrides_hosted_default():
+    runtime = DbRuntime(runtime_id="db-monitor-hosted-local-override-runtime")
+    planner = DbMonitorPlanner(registry=runtime.registry)
+
+    with host_runtime_context(
+        HostRuntimeContext(surface="web_app", delivery_defaults=("in_app",))
+    ):
+        proposal, validation = planner.create_proposal(
+            DbMonitorCommand(
+                kind="create",
+                prompt=(
+                    "Monitor operations table every 5 minutes when new rows are "
+                    "added. Notify me in the console."
+                ),
+            ),
+            schema=_schema_metadata("operations"),
+        )
+
+    assert proposal["action_plan"]["delivery_intent"]["delivery_kind"] == "local"
+    assert proposal["action_plan"]["delivery_intent"]["target"] == {
+        "type": "runtime_console"
     }
     assert validation.required_capabilities == ("monitor.delivery.local",)
     assert validation.accepted is True
@@ -985,7 +1285,8 @@ async def test_create_monitor_prompt_requires_approval_then_resumes_to_create_mo
     assert resumed.operation.status is OperationStatus.SUCCEEDED
     monitors = await agent.list_monitors()
     assert len(monitors) == 1
-    assert monitors[0].id == "users_table"
+    assert monitors[0].id == "users_new_rows"
+    assert monitors[0].name == "Users New Rows"
     assert monitors[0].observation_plan["cursor"]["field"] == "created_at"
     evidence = await runtime.store.list_evidence(result.operation_id)
     assert any(item.kind == "monitor.definition" and item.accepted for item in evidence)

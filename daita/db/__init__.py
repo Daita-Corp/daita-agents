@@ -25,6 +25,7 @@ from .models import (
     DbRequest,
     DbRuntimeConfig,
     DbRuntimeInspection,
+    DbRuntimeOptions,
 )
 from .monitor_commands import (
     DbCommandRouter,
@@ -144,6 +145,7 @@ __all__ = [
     "HostedInAppMonitorDeliveryPlugin",
     "DbRuntimeConfig",
     "DbRuntimeInspection",
+    "DbRuntimeOptions",
     "DbCommandRouter",
     "DbMonitorCommand",
     "DbMonitorCommandService",

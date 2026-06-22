@@ -6,10 +6,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from os import PathLike
 import json
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
-from daita.runtime import AccessMode, Evidence, OperationStatus
+from daita.runtime import AccessMode, Evidence, OperationStatus, RuntimeStore
 
 
 class DbIntentKind(str, Enum):
@@ -92,6 +93,28 @@ class DbRuntimeConfig:
         object.__setattr__(self, "plugins", tuple(self.plugins))
         object.__setattr__(self, "policies", tuple(self.policies))
         object.__setattr__(self, "metadata", _json_dict(self.metadata))
+
+
+@dataclass(frozen=True)
+class DbRuntimeOptions:
+    """Construction-time runtime options for `Agent.from_db()`."""
+
+    store: RuntimeStore | Literal["sqlite"] | None = None
+    store_path: str | PathLike[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.store is None:
+            if self.store_path is not None:
+                raise ValueError("store_path requires store='sqlite'")
+            return
+        if self.store == "sqlite":
+            if self.store_path is None:
+                raise ValueError("store_path is required when store='sqlite'")
+            return
+        if self.store_path is not None:
+            raise ValueError("store_path is only supported when store='sqlite'")
+        if not isinstance(self.store, RuntimeStore):
+            raise TypeError("store must be 'sqlite' or a RuntimeStore instance")
 
 
 @dataclass(frozen=True)
