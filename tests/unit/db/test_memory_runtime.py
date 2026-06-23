@@ -17,6 +17,7 @@ from daita.db.memory import (
     DBMemoryRecord,
     calibrate_db_memory,
     db_memory_planning_recall_decision,
+    db_memory_planning_recall_query,
     db_memory_refs_from_recall_evidence,
     has_db_memory_marker,
     normalize_db_memory_record,
@@ -109,6 +110,49 @@ def _board_revenue_schema():
                 "target_column": "id",
             }
         ],
+    }
+
+
+def _mock_db_memory_backend(results: list[dict]) -> MagicMock:
+    backend = MagicMock()
+    backend.embedding_available = False
+    backend.structured_index = True
+    backend.recall_db_records = AsyncMock(return_value=results)
+    backend.recall = AsyncMock(return_value=[])
+    backend.list_by_category = AsyncMock(return_value=[])
+    return backend
+
+
+def _db_memory_recall_result(
+    *,
+    key: str,
+    text: str,
+    source_identity: str,
+    table: str | None = None,
+    score: float = 0.91,
+) -> dict:
+    metadata = {
+        "source_identity": source_identity,
+        "workspace_scope": "source",
+        "active": True,
+        "confidence": 0.9,
+    }
+    if table:
+        metadata["table"] = table
+    return {
+        "chunk_id": f"mem-{key}",
+        "content": text,
+        "metadata": {
+            "db_memory": {
+                "kind": "schema_interpretation",
+                "key": key,
+                "text": text,
+                "metadata": metadata,
+                "importance": 0.8,
+                "category": "db_semantics",
+            }
+        },
+        "score": score,
     }
 
 
@@ -246,6 +290,35 @@ async def test_memory_registers_domain_service_capabilities_and_context_provider
     assert "memory.semantic.write" in inspection.executor_ids
     assert "memory:memory.context" in inspection.evidence_schema_kinds
     assert "memory:memory.context" in inspection.context_provider_ids
+    recall = runtime.registry.get_capability(
+        "memory.semantic.recall",
+        owner="memory",
+    )
+    assert {
+        "schema.query",
+        "schema.relationship_query",
+    } <= recall.operation_types
+    planning_context = runtime.registry.get_capability(
+        "db.planning.context.build",
+        owner="db_runtime",
+    )
+    assert {
+        "schema.query",
+        "schema.relationship_query",
+    } <= planning_context.operation_types
+    answer_synthesis = runtime.registry.get_capability(
+        "db.answer.synthesize",
+        owner="db_runtime",
+    )
+    assert {
+        "schema.query",
+        "schema.relationship_query",
+    } <= answer_synthesis.operation_types
+    schema_contract = runtime.build_contract(
+        DbRequest("What is the operations table?", mode="schema.query")
+    )
+    assert "memory.semantic.recall" not in schema_contract.required_capabilities
+    assert "memory.semantic.recall" not in schema_contract.required_evidence
 
 
 async def test_memory_teardown_flushes_runtime_state():
@@ -500,6 +573,419 @@ def test_llm_planner_includes_db_memory_advisory_contract():
     assert "DB memory is semantic business context" in system_message
     assert "must satisfy the memory contract" in system_message
     assert "Schema, catalog, policy, SQL validation" in system_message
+
+
+@pytest.mark.parametrize(
+    ("intent_kind", "prompt"),
+    [
+        ("schema.query", "What does the operations table mean?"),
+        (
+            "schema.relationship_query",
+            "How are customers related to orders in business terms?",
+        ),
+    ],
+)
+def test_db_memory_planning_recall_allows_metadata_intents(intent_kind, prompt):
+    decision = db_memory_planning_recall_decision(
+        prompt=prompt,
+        intent_kind=intent_kind,
+        schema={
+            "tables": [
+                {"name": "operations", "columns": [{"name": "id"}]},
+                {"name": "orders", "columns": [{"name": "customer_id"}]},
+            ]
+        },
+        memory_config={
+            "enabled": True,
+            "recall": "auto",
+            "limit": 3,
+            "char_budget": 800,
+        },
+    )
+
+    assert decision["recall"] is True
+    assert decision["query"]
+
+
+@pytest.mark.parametrize(
+    "intent_kind",
+    [
+        "write.propose",
+        "memory.update",
+        "write.execute",
+        "admin",
+        "conversational",
+        "lineage.trace",
+    ],
+)
+def test_db_memory_planning_recall_excludes_non_allowlisted_metadata_intents(
+    intent_kind,
+):
+    decision = db_memory_planning_recall_decision(
+        prompt="What does operations mean?",
+        intent_kind=intent_kind,
+        schema={"tables": [{"name": "operations", "columns": [{"name": "id"}]}]},
+        memory_config={
+            "enabled": True,
+            "recall": "auto",
+            "limit": 3,
+            "char_budget": 800,
+        },
+    )
+
+    assert decision == {"recall": False, "reason": "intent_not_semantic_query"}
+
+
+@pytest.mark.parametrize(
+    ("memory_config", "reason"),
+    [
+        (
+            {"enabled": False, "recall": "auto", "limit": 3, "char_budget": 800},
+            "memory_disabled",
+        ),
+        (
+            {"enabled": True, "recall": "off", "limit": 3, "char_budget": 800},
+            "recall_disabled",
+        ),
+        (
+            {"enabled": True, "recall": "auto", "limit": 0, "char_budget": 800},
+            "limit_zero",
+        ),
+        (
+            {"enabled": True, "recall": "auto", "limit": 3, "char_budget": 0},
+            "char_budget_zero",
+        ),
+    ],
+)
+def test_db_memory_planning_recall_metadata_intents_keep_global_guards(
+    memory_config,
+    reason,
+):
+    decision = db_memory_planning_recall_decision(
+        prompt="What does operations mean?",
+        intent_kind="schema.query",
+        schema={"tables": [{"name": "operations", "columns": [{"name": "id"}]}]},
+        memory_config=memory_config,
+    )
+
+    assert decision == {"recall": False, "reason": reason}
+
+
+async def test_schema_execution_with_memory_produces_planning_context(tmp_path):
+    db_path = tmp_path / "metadata_memory.sqlite"
+    sqlite = SQLitePlugin(path=str(db_path))
+    await sqlite.execute_script("""
+        CREATE TABLE operations (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO operations (id, status) VALUES (1, 'complete');
+        """)
+    source_identity = "sqlite:from_db:metadata-memory"
+    memory = MemoryPlugin()
+    memory.backend = _mock_db_memory_backend(
+        [
+            _db_memory_recall_result(
+                key="table:operations",
+                text="operations are agent runs",
+                source_identity=source_identity,
+                table="operations",
+            )
+        ]
+    )
+    runtime = DbRuntime(
+        source=sqlite,
+        config=DbRuntimeConfig(
+            plugins=(CatalogPlugin(auto_persist=False), sqlite, memory),
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "from_db:metadata-memory",
+                    "memory": {
+                        "enabled": True,
+                        "recall": "auto",
+                        "limit": 3,
+                        "char_budget": 800,
+                        "score_threshold": 0.0,
+                        "source_identity": source_identity,
+                    },
+                }
+            },
+        ),
+    )
+
+    try:
+        await runtime.setup()
+        result = await runtime.run(
+            DbRequest(
+                "Can you tell me what the operations table is?",
+                mode="schema.query",
+            )
+        )
+    finally:
+        await runtime.teardown()
+
+    evidence_kinds = {item.kind for item in result.evidence}
+    assert {
+        "schema.search_result",
+        "schema.asset_profile",
+        "memory.semantic.recall",
+        "planning.context",
+        "verification.result",
+        "answer.synthesis",
+    } <= evidence_kinds
+    assert "query.result" not in evidence_kinds
+    planning_context = next(
+        item for item in result.evidence if item.kind == "planning.context"
+    )
+    assert planning_context.payload["db_memory_refs"][0]["text"] == (
+        "operations are agent runs"
+    )
+    assert "Database memory:" in planning_context.payload["rendered_context"]
+    assert "operations: id, status" in result.answer
+    assert "Semantic memory note: operations are agent runs" in result.answer
+
+
+async def test_relationship_schema_execution_can_include_planning_context(tmp_path):
+    db_path = tmp_path / "relationship_metadata_memory.sqlite"
+    sqlite = SQLitePlugin(path=str(db_path))
+    await sqlite.execute_script("""
+        CREATE TABLE customers (
+            id INTEGER PRIMARY KEY
+        );
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            customer_id INTEGER REFERENCES customers(id)
+        );
+        """)
+    source_identity = "sqlite:from_db:relationship-memory"
+    memory = MemoryPlugin()
+    memory.backend = _mock_db_memory_backend(
+        [
+            _db_memory_recall_result(
+                key="relationship:customers_orders",
+                text="orders represent purchases made by customers",
+                source_identity=source_identity,
+                table="orders",
+            )
+        ]
+    )
+    runtime = DbRuntime(
+        source=sqlite,
+        config=DbRuntimeConfig(
+            plugins=(CatalogPlugin(auto_persist=False), sqlite, memory),
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "from_db:relationship-memory",
+                    "memory": {
+                        "enabled": True,
+                        "recall": "auto",
+                        "limit": 3,
+                        "char_budget": 800,
+                        "score_threshold": 0.0,
+                        "source_identity": source_identity,
+                    },
+                }
+            },
+        ),
+    )
+
+    try:
+        await runtime.setup()
+        result = await runtime.run(
+            DbRequest(
+                "How are customers related to orders?",
+                mode="schema.relationship_query",
+            )
+        )
+    finally:
+        await runtime.teardown()
+
+    planning_context = next(
+        item for item in result.evidence if item.kind == "planning.context"
+    )
+    assert planning_context.payload["db_memory_refs"][0]["text"] == (
+        "orders represent purchases made by customers"
+    )
+    assert planning_context.payload["relationship_evidence_refs"]
+    assert any(item.kind == "schema.relationship_path" for item in result.evidence)
+    assert "Semantic memory note:" in result.answer
+
+
+async def test_schema_execution_memory_disabled_does_not_recall(tmp_path):
+    db_path = tmp_path / "metadata_memory_disabled.sqlite"
+    sqlite = SQLitePlugin(path=str(db_path))
+    await sqlite.execute_script("""
+        CREATE TABLE operations (
+            id INTEGER PRIMARY KEY
+        );
+        """)
+    memory = MemoryPlugin()
+    memory.backend = _mock_db_memory_backend(
+        [
+            _db_memory_recall_result(
+                key="table:operations",
+                text="operations are agent runs",
+                source_identity="sqlite:from_db:disabled",
+                table="operations",
+            )
+        ]
+    )
+    runtime = DbRuntime(
+        source=sqlite,
+        config=DbRuntimeConfig(
+            plugins=(CatalogPlugin(auto_persist=False), sqlite, memory),
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "from_db:disabled",
+                    "memory": {
+                        "enabled": False,
+                        "recall": "auto",
+                        "limit": 3,
+                        "char_budget": 800,
+                        "source_identity": "sqlite:from_db:disabled",
+                    },
+                }
+            },
+        ),
+    )
+
+    try:
+        await runtime.setup()
+        result = await runtime.run(
+            DbRequest("What is the operations table?", mode="schema.query")
+        )
+    finally:
+        await runtime.teardown()
+
+    assert not [
+        item for item in result.evidence if item.kind == "memory.semantic.recall"
+    ]
+    planning_context = next(
+        item for item in result.evidence if item.kind == "planning.context"
+    )
+    assert planning_context.payload["db_memory_refs"] == []
+    assert planning_context.payload["db_memory_diagnostics"]["decision"] == {
+        "recall": False,
+        "reason": "memory_disabled",
+    }
+    memory.backend.recall_db_records.assert_not_awaited()
+
+
+async def test_schema_execution_filters_unrelated_or_cross_source_memory(tmp_path):
+    db_path = tmp_path / "metadata_memory_filtered.sqlite"
+    sqlite = SQLitePlugin(path=str(db_path))
+    await sqlite.execute_script("""
+        CREATE TABLE operations (
+            id INTEGER PRIMARY KEY
+        );
+        CREATE TABLE inventory (
+            id INTEGER PRIMARY KEY
+        );
+        """)
+    source_identity = "sqlite:from_db:source-a"
+    memory = MemoryPlugin()
+    memory.backend = _mock_db_memory_backend(
+        [
+            _db_memory_recall_result(
+                key="table:operations",
+                text="operations mean something else in another source",
+                source_identity="sqlite:from_db:source-b",
+                table="operations",
+            ),
+            _db_memory_recall_result(
+                key="inventory-note",
+                text="inventory tracks stock counts",
+                source_identity=source_identity,
+                table="inventory",
+            ),
+        ]
+    )
+    runtime = DbRuntime(
+        source=sqlite,
+        config=DbRuntimeConfig(
+            plugins=(CatalogPlugin(auto_persist=False), sqlite, memory),
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "from_db:source-a",
+                    "memory": {
+                        "enabled": True,
+                        "recall": "auto",
+                        "limit": 3,
+                        "char_budget": 800,
+                        "score_threshold": 0.0,
+                        "source_identity": source_identity,
+                    },
+                }
+            },
+        ),
+    )
+
+    try:
+        await runtime.setup()
+        result = await runtime.run(
+            DbRequest("What is the operations table?", mode="schema.query")
+        )
+    finally:
+        await runtime.teardown()
+
+    planning_context = next(
+        item for item in result.evidence if item.kind == "planning.context"
+    )
+    assert any(item.kind == "memory.semantic.recall" for item in result.evidence)
+    assert planning_context.payload["db_memory_refs"] == []
+    assert planning_context.payload["db_memory_diagnostics"]["omitted_reasons"] == {
+        "cross_source": 1,
+        "irrelevant": 1,
+    }
+    assert "Semantic memory note:" not in result.answer
+
+
+async def test_simple_data_query_fast_path_still_avoids_planning_context_with_memory(
+    tmp_path,
+):
+    db_path = tmp_path / "simple_data_query_memory.sqlite"
+    sqlite = SQLitePlugin(path=str(db_path))
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY
+        );
+        INSERT INTO orders (id) VALUES (1), (2);
+        """)
+    memory = MemoryPlugin()
+    memory.backend = _mock_db_memory_backend([])
+    runtime = DbRuntime(
+        source=sqlite,
+        config=DbRuntimeConfig(
+            plugins=(CatalogPlugin(auto_persist=False), sqlite, memory),
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "from_db:simple-fast-path",
+                    "memory": {
+                        "enabled": True,
+                        "recall": "auto",
+                        "limit": 3,
+                        "char_budget": 800,
+                        "source_identity": "sqlite:from_db:simple-fast-path",
+                    },
+                }
+            },
+        ),
+    )
+
+    try:
+        await runtime.setup()
+        result = await runtime.run("How many orders are there?")
+        snapshot = await runtime.inspect_operation(result.operation_id)
+    finally:
+        await runtime.teardown()
+
+    assert snapshot is not None
+    assert result.answer == "The count is 2."
+    assert not [item for item in snapshot.evidence if item.kind == "planning.context"]
+    assert not [
+        item for item in snapshot.evidence if item.kind == "memory.semantic.recall"
+    ]
+    memory.backend.recall_db_records.assert_not_awaited()
 
 
 async def test_memory_fact_query_executor_uses_memory_owned_fact_store(tmp_path):
@@ -1717,6 +2203,134 @@ def test_db_memory_planning_recall_skips_pii_row_lookup():
     )
 
     assert decision == {"recall": False, "reason": "row_level_or_pii_prompt"}
+
+
+def test_db_memory_planning_recall_query_uses_prompt_matched_table_only():
+    schema = {
+        "tables": [
+            {"name": "agents", "columns": [{"name": "agent_id"}]},
+            {"name": "api_keys", "columns": [{"name": "api_key_id"}]},
+            {"name": "operations", "columns": [{"name": "operation_id"}]},
+        ]
+    }
+
+    query = db_memory_planning_recall_query(
+        "Can you tell me what the operations table is?",
+        schema,
+        "schema.query",
+    )
+
+    assert "Matched schema terms: operations" in query
+    assert "operations table" in query
+    assert "agents" not in query
+    assert "agents.agent_id" not in query
+    assert "api_keys.api_key_id" not in query
+
+
+def test_db_memory_planning_recall_query_includes_explicit_column_refs():
+    schema = {
+        "tables": [
+            {"name": "orders", "columns": [{"name": "total"}, {"name": "status"}]},
+            {"name": "refunds", "columns": [{"name": "amount"}]},
+        ]
+    }
+
+    query = db_memory_planning_recall_query(
+        "What does orders total mean?",
+        schema,
+        "metric.query",
+    )
+
+    assert "orders" in query
+    assert "orders.total" in query
+    assert "orders.status" not in query
+    assert "refunds.amount" not in query
+
+
+def test_db_memory_planning_recall_query_includes_relationship_tables():
+    schema = {
+        "tables": [
+            {"name": "operations", "columns": [{"name": "deployment_id"}]},
+            {"name": "deployments", "columns": [{"name": "deployment_id"}]},
+        ]
+    }
+
+    query = db_memory_planning_recall_query(
+        "How do operations relate to deployments?",
+        schema,
+        "schema.relationship_query",
+    )
+
+    assert "operations" in query
+    assert "deployments" in query
+    assert "relationship" in query
+
+
+def test_db_memory_planning_recall_query_respects_matched_schema_terms_and_bounds():
+    schema = {
+        "tables": [{"name": f"table_{index}", "columns": []} for index in range(80)]
+    }
+    terms = [f"selected_{index}" for index in range(60)]
+
+    query = db_memory_planning_recall_query(
+        "Explain selected tables",
+        schema,
+        "schema.query",
+        matched_schema_terms=terms,
+    )
+
+    assert "selected_0" in query
+    assert "selected_23" in query
+    assert "selected_24" not in query
+    assert "table_0" not in query
+    assert len(query) < 900
+
+
+def test_db_memory_planning_recall_guards_disabled_zero_and_disallowed_intents():
+    base_config = {
+        "enabled": True,
+        "recall": "auto",
+        "limit": 3,
+        "char_budget": 800,
+    }
+    schema = {"tables": [{"name": "operations", "columns": []}]}
+
+    disabled = db_memory_planning_recall_decision(
+        prompt="What is operations?",
+        intent_kind="schema.query",
+        schema=schema,
+        memory_config={**base_config, "enabled": False},
+    )
+    recall_off = db_memory_planning_recall_decision(
+        prompt="What is operations?",
+        intent_kind="schema.query",
+        schema=schema,
+        memory_config={**base_config, "recall": "off"},
+    )
+    limit_zero = db_memory_planning_recall_decision(
+        prompt="What is operations?",
+        intent_kind="schema.query",
+        schema=schema,
+        memory_config={**base_config, "limit": 0},
+    )
+    char_budget_zero = db_memory_planning_recall_decision(
+        prompt="What is operations?",
+        intent_kind="schema.query",
+        schema=schema,
+        memory_config={**base_config, "char_budget": 0},
+    )
+    disallowed = db_memory_planning_recall_decision(
+        prompt="Remember operations are agent runs.",
+        intent_kind="memory.update",
+        schema=schema,
+        memory_config=base_config,
+    )
+
+    assert disabled["reason"] == "memory_disabled"
+    assert recall_off["reason"] == "recall_disabled"
+    assert limit_zero["reason"] == "limit_zero"
+    assert char_budget_zero["reason"] == "char_budget_zero"
+    assert disallowed["reason"] == "intent_not_semantic_query"
 
 
 def test_db_memory_planning_context_remains_bounded():

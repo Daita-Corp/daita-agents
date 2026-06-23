@@ -52,6 +52,8 @@ class _ExecutionPlanningMixin:
             tasks,
             evidence_store,
             schema=schema_evidence.payload if schema_evidence is not None else {},
+            catalog_evidence=catalog_evidence,
+            relationship_evidence=relationship_evidence,
             analysis_metadata=analysis_metadata,
         )
         capability = self.runtime.registry.get_capability(
@@ -106,14 +108,20 @@ class _ExecutionPlanningMixin:
         evidence_store: DbEvidenceStore,
         *,
         schema: dict[str, Any],
+        catalog_evidence: tuple[Evidence, ...] = (),
+        relationship_evidence: tuple[Evidence, ...] = (),
         analysis_metadata: dict[str, Any] | None = None,
     ) -> tuple[tuple[Evidence, ...], dict[str, Any]]:
         options = db_memory_options_from_runtime_metadata(self.runtime.config.metadata)
+        matched_schema_terms = _matched_schema_terms_from_evidence(
+            (*catalog_evidence, *relationship_evidence)
+        )
         decision = db_memory_planning_recall_decision(
             prompt=request.prompt,
             intent_kind=intent.kind.value,
             schema=schema,
             memory_config=options,
+            matched_schema_terms=matched_schema_terms or None,
         )
         diagnostics = {
             "registered": _memory_capability_available(self.runtime),
@@ -516,6 +524,47 @@ def _memory_capability_available(runtime: Any) -> bool:
         return True
     except KeyError:
         return False
+
+
+def _matched_schema_terms_from_evidence(
+    evidence: tuple[Evidence, ...],
+) -> tuple[str, ...]:
+    terms: list[str] = []
+    for item in evidence:
+        if not item.accepted:
+            continue
+        payload = item.payload if isinstance(item.payload, dict) else {}
+        if item.kind == "schema.search_result":
+            for table in payload.get("tables", []) or []:
+                if not isinstance(table, dict):
+                    continue
+                table_name = str(table.get("name") or "").strip()
+                if table_name and (
+                    table.get("matched_columns") or table.get("match_reasons")
+                ):
+                    terms.append(table_name)
+                for column in table.get("matched_columns", []) or []:
+                    if isinstance(column, dict) and column.get("name") and table_name:
+                        terms.append(f"{table_name}.{column['name']}")
+        elif item.kind == "schema.asset_profile":
+            for table in payload.get("tables", []) or []:
+                if isinstance(table, dict) and table.get("name"):
+                    terms.append(str(table["name"]))
+            asset_ref = payload.get("asset_ref") or payload.get("name")
+            if asset_ref:
+                terms.append(str(asset_ref))
+        elif item.kind == "schema.relationship_path":
+            for key in ("from_tables", "to_tables", "from_assets", "to_assets"):
+                for value in payload.get(key, []) or []:
+                    if value:
+                        terms.append(str(value))
+            for path in payload.get("paths", []) or []:
+                if not isinstance(path, dict):
+                    continue
+                for key in ("from_asset", "to_asset", "source", "target"):
+                    if path.get(key):
+                        terms.append(str(path[key]))
+    return tuple(dict.fromkeys(term for term in terms if term.strip()))
 
 
 def _float_option(options: dict[str, Any], key: str, default: float) -> float:

@@ -10,6 +10,7 @@ from daita.runtime import Evidence, Operation, Task, TaskDependency
 from ..capabilities import SCHEMA_RELATIONSHIP_PATH_EVIDENCE
 from ..evidence import DbEvidenceStore
 from ..analysis import stable_fingerprint, structural_schema_fingerprint
+from ..memory import DB_MEMORY_METADATA_RECALL_INTENTS
 from ..models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
 from ..query_planning import DbQueryPlanner
 from ..session_context import db_session_context_from_request
@@ -98,6 +99,14 @@ class DbOperationExecutor(
                 evidence_store,
                 diagnostics["store_id"],
             )
+            await self._build_metadata_planning_context_if_allowed(
+                request,
+                intent,
+                operation,
+                schema_evidence,
+                tasks,
+                evidence_store,
+            )
         elif intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY:
             await self._execute_relationship_schema_steps(
                 request,
@@ -107,6 +116,14 @@ class DbOperationExecutor(
                 tasks,
                 evidence_store,
                 diagnostics["store_id"],
+            )
+            await self._build_metadata_planning_context_if_allowed(
+                request,
+                intent,
+                operation,
+                schema_evidence,
+                tasks,
+                evidence_store,
             )
         elif intent.kind in {
             DbIntentKind.DATA_QUERY,
@@ -771,6 +788,38 @@ class DbOperationExecutor(
         return any(
             capability["id"].startswith("catalog.")
             for capability in contract.metadata.get("selected_capabilities", [])
+        )
+
+    async def _build_metadata_planning_context_if_allowed(
+        self,
+        request: DbRequest,
+        intent: DbIntent,
+        operation: Operation,
+        schema_evidence: Evidence | None,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+    ) -> Evidence | None:
+        if intent.kind.value not in DB_MEMORY_METADATA_RECALL_INTENTS:
+            return None
+        existing = next(
+            (item for item in evidence_store.list() if item.kind == "planning.context"),
+            None,
+        )
+        if existing is not None:
+            return existing
+        return await self._build_planning_context(
+            request,
+            operation,
+            tasks,
+            evidence_store,
+            schema_evidence=schema_evidence,
+            catalog_evidence=_catalog_evidence_for_planning(evidence_store),
+            relationship_evidence=tuple(
+                item
+                for item in evidence_store.list()
+                if item.kind == SCHEMA_RELATIONSHIP_PATH_EVIDENCE
+            ),
+            analysis_metadata={"metadata_context_enrichment": intent.kind.value},
         )
 
 

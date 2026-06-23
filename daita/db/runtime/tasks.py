@@ -1028,7 +1028,11 @@ def _synthesis_dependencies(
         _append_dependency_for_kind(dependencies, accepted, "verification.result")
     elif intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY:
         _append_database_schema_dependency(dependencies, accepted)
-        for kind in ("schema.relationship_path", "schema.search_result"):
+        for kind in (
+            "planning.context",
+            "schema.relationship_path",
+            "schema.search_result",
+        ):
             _append_dependency_for_kind(dependencies, accepted, kind)
         _append_dependency_for_kind(dependencies, accepted, "verification.result")
     else:

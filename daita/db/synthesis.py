@@ -4,7 +4,7 @@ Evidence-driven final answer synthesis for DB runtime operations.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import get_close_matches
 import json
 import re
@@ -124,10 +124,16 @@ class DbSynthesizer:
 
         if intent.kind is DbIntentKind.SCHEMA_QUERY:
             scope = _schema_answer_scope(request, contract, evidence)
-            answer = _schema_answer(scope)
+            answer = _append_db_memory_annotation(
+                _schema_answer(scope),
+                evidence,
+            )
         elif intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY:
             scope = None
-            answer = _schema_relationship_answer(evidence)
+            answer = _append_db_memory_annotation(
+                _schema_relationship_answer(evidence),
+                evidence,
+            )
         elif intent.kind in {
             DbIntentKind.DATA_QUERY,
             DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
@@ -304,6 +310,59 @@ def _schema_relationship_answer(evidence: tuple[Evidence, ...]) -> str:
     if parts:
         return "Found relationship path: " + "; ".join(parts)
     return "Found relationship path evidence for the requested tables."
+
+
+def _append_db_memory_annotation(answer: str, evidence: tuple[Evidence, ...]) -> str:
+    if "Semantic memory note:" in answer:
+        return answer
+    refs = _db_memory_refs_from_planning_context(evidence)
+    if not refs:
+        return answer
+    notes = []
+    for ref in refs[:2]:
+        text = str(ref.get("text") or "").strip()
+        if not text:
+            continue
+        notes.append(text)
+    if not notes:
+        return answer
+    return answer.rstrip() + " Semantic memory note: " + " ".join(notes)
+
+
+def _apply_schema_db_memory_annotation(
+    payload: DbAnswerSynthesisPayload,
+    *,
+    intent: DbIntent,
+    evidence: tuple[Evidence, ...],
+) -> DbAnswerSynthesisPayload:
+    if intent.kind not in {
+        DbIntentKind.SCHEMA_QUERY,
+        DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
+    }:
+        return payload
+    answer = _append_db_memory_annotation(payload.answer, evidence)
+    if answer == payload.answer:
+        return payload
+    return replace(payload, answer=answer)
+
+
+def _db_memory_refs_from_planning_context(
+    evidence: tuple[Evidence, ...],
+) -> tuple[dict[str, Any], ...]:
+    planning = next(
+        (
+            item
+            for item in reversed(evidence)
+            if item.accepted and item.kind == "planning.context"
+        ),
+        None,
+    )
+    if planning is None:
+        return ()
+    refs = planning.payload.get("db_memory_refs")
+    if not isinstance(refs, list):
+        return ()
+    return tuple(item for item in refs if isinstance(item, dict))
 
 
 def _schema_table_inventory(evidence: tuple[Evidence, ...]) -> dict[str, Any]:
@@ -768,6 +827,11 @@ class DbAnswerSynthesisExecutor:
                 context_metadata=synthesis_context.metadata,
                 fallback_reason=fallback_reason or "llm_synthesis_invalid",
             )
+        payload = _apply_schema_db_memory_annotation(
+            payload,
+            intent=intent,
+            evidence=dependency_evidence,
+        )
 
         return [
             Evidence(

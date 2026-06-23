@@ -39,7 +39,14 @@ def memory_capabilities() -> tuple[Capability, ...]:
             owner="memory",
             description="Recall semantically relevant durable memory.",
             domains=frozenset({"db", "agent"}),
-            operation_types=frozenset({"data.query", "memory.recall"}),
+            operation_types=frozenset(
+                {
+                    "data.query",
+                    "memory.recall",
+                    "schema.query",
+                    "schema.relationship_query",
+                }
+            ),
             access=AccessMode.METADATA_READ,
             risk=RiskLevel.LOW,
             input_schema=common_schema,

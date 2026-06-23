@@ -11,7 +11,7 @@ from inspect import getattr_static, isawaitable
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Iterable
 
 from daita.db.query_catalog import has_likely_catalog_match
 from daita.db.memory_contracts import (
@@ -45,6 +45,22 @@ DB_SEMANTIC_MEMORY_KINDS = (
     "value_alias",
 )
 DB_PLANNING_MEMORY_KINDS = frozenset(DB_SEMANTIC_MEMORY_KINDS)
+DB_MEMORY_SEMANTIC_QUERY_INTENTS = frozenset(
+    {
+        "data.query",
+        "data.query.catalog_assisted",
+        "metric.query",
+        "report.generate",
+        "quality.check",
+        "anomaly.investigate",
+    }
+)
+DB_MEMORY_METADATA_RECALL_INTENTS = frozenset(
+    {
+        "schema.query",
+        "schema.relationship_query",
+    }
+)
 
 PII_COLUMN_PATTERNS = (
     "password",
@@ -244,6 +260,7 @@ def db_memory_planning_recall_decision(
     intent_kind: str,
     schema: dict[str, Any],
     memory_config: dict[str, Any],
+    matched_schema_terms: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Return whether planning should recall DB semantic memory."""
     if not bool(memory_config.get("enabled", False)):
@@ -254,14 +271,9 @@ def db_memory_planning_recall_decision(
         return {"recall": False, "reason": "limit_zero"}
     if int(memory_config.get("char_budget") or 0) <= 0:
         return {"recall": False, "reason": "char_budget_zero"}
-    if intent_kind not in {
-        "data.query",
-        "data.query.catalog_assisted",
-        "metric.query",
-        "report.generate",
-        "quality.check",
-        "anomaly.investigate",
-    }:
+    if intent_kind not in (
+        DB_MEMORY_SEMANTIC_QUERY_INTENTS | DB_MEMORY_METADATA_RECALL_INTENTS
+    ):
         return {"recall": False, "reason": "intent_not_semantic_query"}
     if _looks_row_level(prompt):
         return {"recall": False, "reason": "row_level_or_pii_prompt"}
@@ -273,7 +285,12 @@ def db_memory_planning_recall_decision(
             "recall": True,
             "reason": "semantic_prompt",
             "matched_terms": semantic_matches,
-            "query": db_memory_planning_recall_query(prompt, schema, intent_kind),
+            "query": db_memory_planning_recall_query(
+                prompt,
+                schema,
+                intent_kind,
+                matched_schema_terms=matched_schema_terms,
+            ),
         }
     if _looks_direct_query(text) and _prompt_matches_schema(prompt, schema):
         return {"recall": False, "reason": "direct_schema_matched_query"}
@@ -281,7 +298,12 @@ def db_memory_planning_recall_decision(
         "recall": True,
         "reason": "semantic_fallback",
         "matched_terms": [],
-        "query": db_memory_planning_recall_query(prompt, schema, intent_kind),
+        "query": db_memory_planning_recall_query(
+            prompt,
+            schema,
+            intent_kind,
+            matched_schema_terms=matched_schema_terms,
+        ),
     }
 
 
@@ -289,21 +311,133 @@ def db_memory_planning_recall_query(
     prompt: str,
     schema: dict[str, Any],
     intent_kind: str,
+    *,
+    matched_schema_terms: Iterable[str] | None = None,
 ) -> str:
     """Build the bounded text used for planning-time memory recall."""
-    schema_terms: list[str] = []
+    schema_terms = _bounded_recall_terms(
+        (
+            matched_schema_terms
+            if matched_schema_terms is not None
+            else _matched_schema_terms_for_recall(prompt, schema)
+        ),
+        limit=24,
+    )
+    recall_terms = _bounded_recall_terms(
+        _recall_terms_for_prompt(prompt, schema_terms, intent_kind),
+        limit=32,
+    )
+    lines = [str(prompt or "").strip(), f"Intent: {intent_kind}"]
+    if schema_terms:
+        lines.append(f"Matched schema terms: {' '.join(schema_terms)}")
+    if recall_terms:
+        lines.append(f"Recall terms: {' '.join(recall_terms)}")
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _matched_schema_terms_for_recall(
+    prompt: str,
+    schema: dict[str, Any],
+) -> tuple[str, ...]:
+    """Return schema terms that are actually mentioned by the prompt."""
+    prompt_terms = set(_meaningful_tokens(prompt))
+    if not prompt_terms:
+        return ()
+    matches: list[str] = []
+    column_tables: dict[str, list[str]] = {}
     for table in schema.get("tables", []) or []:
         table_name = str(table.get("name") or "").strip()
-        if table_name:
-            schema_terms.append(table_name)
+        if not table_name:
+            continue
+        if _identifier_matches_terms(table_name, prompt_terms):
+            matches.append(table_name)
         for column in table.get("columns", []) or []:
             column_name = str(column.get("name") or "").strip()
             if column_name:
-                schema_terms.append(f"{table_name}.{column_name}")
-        if len(schema_terms) >= 40:
+                column_tables.setdefault(_identifier_key(column_name), []).append(
+                    table_name
+                )
+
+    for table in schema.get("tables", []) or []:
+        table_name = str(table.get("name") or "").strip()
+        if not table_name:
+            continue
+        table_matched = table_name in matches
+        for column in table.get("columns", []) or []:
+            column_name = str(column.get("name") or "").strip()
+            if not column_name or not _identifier_matches_terms(
+                column_name, prompt_terms
+            ):
+                continue
+            owners = column_tables.get(_identifier_key(column_name), [])
+            if table_matched or len(set(owners)) == 1:
+                matches.append(f"{table_name}.{column_name}")
+            else:
+                matches.append(column_name)
+    return tuple(_bounded_recall_terms(matches, limit=24))
+
+
+def _recall_terms_for_prompt(
+    prompt: str,
+    schema_terms: Iterable[str],
+    intent_kind: str,
+) -> tuple[str, ...]:
+    terms: list[str] = []
+    prompt_terms = set(_meaningful_tokens(prompt))
+    for term in schema_terms:
+        cleaned = str(term or "").strip()
+        if not cleaned:
+            continue
+        terms.append(cleaned)
+        if "." not in cleaned and "table" in prompt_terms:
+            terms.append(f"{cleaned} table")
+    if intent_kind == "schema.relationship_query":
+        terms.append("relationship")
+    return tuple(terms)
+
+
+def _bounded_recall_terms(
+    terms: Iterable[str],
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    bounded: list[str] = []
+    seen: set[str] = set()
+    for raw in terms:
+        term = re.sub(r"\s+", " ", str(raw or "").strip())
+        if not term:
+            continue
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        bounded.append(term)
+        if len(bounded) >= max(0, int(limit)):
             break
-    compact_terms = " ".join(schema_terms[:40])
-    return f"{prompt}\nIntent: {intent_kind}\nSchema terms: {compact_terms}".strip()
+    return tuple(bounded)
+
+
+def _identifier_matches_terms(identifier: str, prompt_terms: set[str]) -> bool:
+    identifier_terms = set(_meaningful_tokens(identifier))
+    if identifier_terms & prompt_terms:
+        return True
+    return bool(_singular_terms(identifier_terms) & _singular_terms(prompt_terms))
+
+
+def _identifier_key(identifier: str) -> str:
+    return " ".join(_meaningful_tokens(identifier))
+
+
+def _singular_terms(terms: Iterable[str]) -> set[str]:
+    singular: set[str] = set()
+    for term in terms:
+        text = str(term)
+        singular.add(text)
+        if len(text) > 3 and text.endswith("ies"):
+            singular.add(f"{text[:-3]}y")
+        elif len(text) > 3 and text.endswith("s"):
+            singular.add(text[:-1])
+    return singular
 
 
 def db_memory_refs_from_recall_evidence(

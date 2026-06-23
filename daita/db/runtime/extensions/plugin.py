@@ -68,7 +68,14 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 description="Build evidence-backed context for DB planning.",
                 domains=frozenset({"db"}),
-                operation_types=frozenset({"data.query", "query.plan"}),
+                operation_types=frozenset(
+                    {
+                        "data.query",
+                        "query.plan",
+                        "schema.query",
+                        "schema.relationship_query",
+                    }
+                ),
                 access=AccessMode.METADATA_READ,
                 risk=RiskLevel.LOW,
                 input_schema=common_schema,
@@ -119,7 +126,12 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 description="Synthesize a final DB answer from accepted evidence.",
                 domains=frozenset({"db"}),
                 operation_types=frozenset(
-                    {"data.query", "schema.query", "data.query.catalog_assisted"}
+                    {
+                        "data.query",
+                        "schema.query",
+                        "schema.relationship_query",
+                        "data.query.catalog_assisted",
+                    }
                 ),
                 access=AccessMode.NONE,
                 risk=RiskLevel.LOW,

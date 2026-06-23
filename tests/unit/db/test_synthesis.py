@@ -1,6 +1,8 @@
 import pytest
 
 from daita.db import (
+    DbAnswerCitation,
+    DbAnswerSynthesisPayload,
     DbIntent,
     DbIntentKind,
     DbOperationContract,
@@ -8,6 +10,7 @@ from daita.db import (
     DbSynthesizer,
     DbVerificationResult,
 )
+from daita.db.synthesis import _apply_schema_db_memory_annotation
 from daita.runtime import AccessMode, Evidence
 
 
@@ -101,6 +104,84 @@ def test_schema_synthesis_uses_database_scope_for_database_wide_prompts():
     assert "customers: id" in result.answer
     assert "orders: customer_id" in result.answer
     assert result.diagnostics["schema_answer_scope"]["mode"] == "database"
+
+
+def test_llm_schema_synthesis_appends_db_memory_annotation():
+    payload = DbAnswerSynthesisPayload(
+        answer="The operations table stores execution metadata.",
+        reasoning_summary="Used accepted schema evidence.",
+        cited_evidence_refs=(
+            DbAnswerCitation(
+                id="schema-1",
+                kind="schema.asset_profile",
+                purpose="schema",
+            ),
+        ),
+        assumptions=(),
+        limitations=(),
+        warnings=(),
+        follow_up_questions=(),
+        sufficiency="answered",
+        confidence=0.88,
+        truncation={
+            "rows_truncated": False,
+            "fields_truncated": False,
+            "context_chars_truncated": False,
+        },
+        grounding={"all_claims_from_evidence": True},
+        diagnostics={"mode": "llm"},
+    )
+
+    annotated = _apply_schema_db_memory_annotation(
+        payload,
+        intent=DbIntent(
+            kind=DbIntentKind.SCHEMA_QUERY,
+            access=AccessMode.METADATA_READ,
+        ),
+        evidence=(
+            Evidence(
+                kind="planning.context",
+                accepted=True,
+                payload={
+                    "db_memory_refs": [
+                        {
+                            "key": "business_rule:operations",
+                            "text": "operations are agent runs",
+                        }
+                    ]
+                },
+            ),
+        ),
+    )
+
+    assert annotated.answer == (
+        "The operations table stores execution metadata. "
+        "Semantic memory note: operations are agent runs"
+    )
+    assert (
+        _apply_schema_db_memory_annotation(
+            annotated,
+            intent=DbIntent(
+                kind=DbIntentKind.SCHEMA_QUERY,
+                access=AccessMode.METADATA_READ,
+            ),
+            evidence=(
+                Evidence(
+                    kind="planning.context",
+                    accepted=True,
+                    payload={
+                        "db_memory_refs": [
+                            {
+                                "key": "business_rule:operations",
+                                "text": "operations are agent runs",
+                            }
+                        ]
+                    },
+                ),
+            ),
+        ).answer
+        == annotated.answer
+    )
 
 
 def test_schema_synthesis_uses_exact_asset_scope_for_table_prompts():
