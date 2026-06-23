@@ -127,6 +127,10 @@ class DbMemoryConfig:
     limit: int = 3
     char_budget: int = 800
     score_threshold: float = 0.45
+    backend: str = "local"
+    retrieval_mode: Literal["structured", "hybrid", "embedding"] = "structured"
+    embedding_available: bool = False
+    structured_index: str = "sqlite_fts5"
     workspace_scope: Literal["source"] = "source"
     source_identity: str | None = None
 
@@ -134,12 +138,19 @@ class DbMemoryConfig:
         object.__setattr__(self, "recall", str(self.recall or "auto"))
         object.__setattr__(self, "learning", str(self.learning or "safe"))
         object.__setattr__(
+            self, "retrieval_mode", str(self.retrieval_mode or "structured")
+        )
+        object.__setattr__(
             self, "workspace_scope", str(self.workspace_scope or "source")
         )
         if self.recall not in {"auto", "off"}:
             raise ValueError("memory.recall must be 'auto' or 'off'")
         if self.learning not in {"safe", "off"}:
             raise ValueError("memory.learning must be 'safe' or 'off'")
+        if self.retrieval_mode not in {"structured", "hybrid", "embedding"}:
+            raise ValueError(
+                "memory.retrieval_mode must be 'structured', 'hybrid', or 'embedding'"
+            )
         if self.workspace_scope != "source":
             raise ValueError("memory.workspace_scope must be 'source'")
         if self.limit < 0:
@@ -157,6 +168,10 @@ class DbMemoryConfig:
             "limit": self.limit,
             "char_budget": self.char_budget,
             "score_threshold": self.score_threshold,
+            "backend": self.backend,
+            "retrieval_mode": self.retrieval_mode,
+            "embedding_available": self.embedding_available,
+            "structured_index": self.structured_index,
             "workspace_scope": self.workspace_scope,
             "source_identity": self.source_identity,
         }

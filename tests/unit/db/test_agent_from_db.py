@@ -57,8 +57,7 @@ class FailingRuntimeDbPlugin(BaseDatabasePlugin):
 
 async def _seed_sqlite(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script(
-        """
+    await plugin.execute_script("""
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL
@@ -70,22 +69,19 @@ async def _seed_sqlite(path):
         );
         INSERT INTO customers (name) VALUES ('Ada'), ('Linus');
         INSERT INTO orders (customer_id, total) VALUES (1, 10.0), (2, 20.0);
-        """
-    )
+        """)
     await plugin.disconnect()
 
 
 async def _seed_sqlite_with_cents(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script(
-        """
+    await plugin.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             total_cents INTEGER NOT NULL
         );
         INSERT INTO orders (total_cents) VALUES (1234);
-        """
-    )
+        """)
     await plugin.disconnect()
 
 
@@ -825,12 +821,73 @@ async def test_agent_from_db_default_initializes_source_scoped_memory(tmp_path):
     assert memory_config["learning"] == "safe"
     assert memory_config["limit"] == 3
     assert memory_config["char_budget"] == 800
+    assert memory_config["backend"] == "local"
+    assert memory_config["retrieval_mode"] == "structured"
+    assert memory_config["embedding_available"] is False
+    assert memory_config["structured_index"] == "sqlite_fts5"
     assert memory_config["workspace_scope"] == "source"
     assert memory_config["source_identity"].startswith("sqlite:from_db:")
     assert isinstance(memory, MemoryPlugin)
     assert memory.workspace == memory_config["source_identity"]
+    assert memory._embedder is None
     assert "memory" in inspection.plugin_ids
     assert "memory:memory.semantic.write" in inspection.capability_ids
+
+
+async def test_agent_from_db_default_structured_db_memory_needs_no_embedder(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    db_path = tmp_path / "phase31_structured_memory.sqlite"
+    await _seed_sqlite(db_path)
+
+    agent = await Agent.from_db(str(db_path))
+
+    try:
+        memory = agent.runtime.registry.get_plugin("memory")
+        written = await agent.runtime.execute_capability(
+            "memory.semantic.write",
+            owner="memory",
+            operation_type="memory.update",
+            input={
+                "db_memory_payload": {
+                    "kind": "metric_definition",
+                    "key": "metric:revenue",
+                    "text": "Revenue excludes refunded orders.",
+                    "importance": 0.9,
+                    "metadata": {
+                        "active": True,
+                        "workspace_scope": "source",
+                        "confidence": 0.95,
+                    },
+                },
+                "db_memory_prompt": "Revenue excludes refunded orders.",
+            },
+        )
+        recalled = await agent.runtime.execute_capability(
+            "memory.semantic.recall",
+            owner="memory",
+            operation_type="memory.recall",
+            input={
+                "query": "How should revenue be calculated?",
+                "category": "db_semantics",
+                "limit": 3,
+                "score_threshold": 0.0,
+            },
+        )
+    finally:
+        await agent.stop()
+
+    assert memory._embedder is None
+    assert getattr(memory.backend, "embedding_available") is False
+    assert written[0].payload["success"] is True
+    assert written[0].payload["stored"]["structured"] is True
+    assert recalled[0].payload["diagnostics"]["retrieval_mode"] == "structured"
+    assert recalled[0].payload["diagnostics"]["embedding_available"] is False
+    assert recalled[0].payload["diagnostics"]["structured_candidate_count"] == 1
+    result = recalled[0].payload["results"][0]
+    assert result["metadata"]["db_memory"]["key"] == "metric:revenue"
+    assert result["score_breakdown"]["key_overlap"] > 0
 
 
 async def test_agent_from_db_memory_false_opts_out(tmp_path):
@@ -850,6 +907,17 @@ async def test_agent_from_db_memory_false_opts_out(tmp_path):
     assert memory_config["learning"] == "off"
     assert "memory" not in inspection.plugin_ids
     assert "memory:memory.semantic.write" not in inspection.capability_ids
+
+
+async def test_agent_from_db_embedding_modes_require_explicit_embedder(tmp_path):
+    db_path = tmp_path / "phase31_embedding_modes.sqlite"
+    await _seed_sqlite(db_path)
+
+    with pytest.raises(ValueError, match="requires an explicit embedding"):
+        await Agent.from_db(str(db_path), memory={"retrieval_mode": "hybrid"})
+
+    with pytest.raises(ValueError, match="requires an explicit embedding"):
+        await Agent.from_db(str(db_path), memory={"retrieval_mode": "embedding"})
 
 
 async def test_agent_from_db_rejects_legacy_memory_true(tmp_path):

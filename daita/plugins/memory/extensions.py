@@ -138,7 +138,9 @@ class MemoryExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        payload = await self.handler(task.input)
+        handler_input = dict(task.input)
+        handler_input["_runtime_task_metadata"] = dict(task.metadata)
+        payload = await self.handler(handler_input)
         return [
             Evidence(
                 kind=self.evidence_kind,

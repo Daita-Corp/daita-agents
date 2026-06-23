@@ -1,12 +1,19 @@
 import json
+from unittest.mock import AsyncMock, MagicMock
 
 from daita.agents.agent import Agent
-from daita.db import DbRuntime
+from daita.db import DbRuntime, DbRuntimeConfig
 from daita.db.llm_service import DbLLMResponse
+from daita.db.memory import DBMemoryRecord
+from daita.db.memory_contracts import (
+    DB_MEMORY_SEMANTIC_CONTRACT_KEY,
+    extract_db_memory_semantic_contract,
+)
 from daita.db.query_plan import DbQueryPlan as StructuredDbQueryPlan
 from daita.db.query_planning import DbQueryPlan as DeterministicDbQueryPlan
 from daita.db.query_planning import DbQueryPlanner
 from daita.plugins.catalog import CatalogPlugin
+from daita.plugins.memory.memory_plugin import MemoryPlugin
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import Evidence, OperationStatus
 
@@ -34,6 +41,55 @@ class FakeDbLLMService:
                 "latency_ms": 1.5,
             },
         )
+
+
+def _board_revenue_contract_metadata(source_identity: str) -> dict:
+    return {
+        "source_identity": source_identity,
+        "workspace_scope": "source",
+        "active": True,
+        "confidence": 0.95,
+        "semantic_contract_status": "validated",
+        "subject": {
+            "type": "metric",
+            "key": "metric:board_revenue",
+            "aliases": ["board revenue"],
+        },
+        "requirements": {
+            "refs": [
+                {"kind": "column", "ref": "orders.total", "role": "measure"},
+                {"kind": "column", "ref": "refunds.amount", "role": "adjustment"},
+                {"kind": "column", "ref": "orders.status", "role": "filter"},
+            ],
+            "relationships": [
+                {"from": "refunds.order_id", "to": "orders.id", "role": "join"}
+            ],
+            "filters": [
+                {
+                    "ref": "orders.status",
+                    "operator": "semantic_equals",
+                    "value": "complete",
+                    "value_source": "literal_or_catalog_value",
+                }
+            ],
+            "aggregations": [
+                {"function": "sum", "ref": "orders.total", "role": "base_measure"},
+                {
+                    "function": "sum",
+                    "ref": "refunds.amount",
+                    "role": "subtractive_adjustment",
+                },
+            ],
+            "result_shape": {"grain": "single_aggregate"},
+        },
+        "schema_refs": [
+            "orders.total",
+            "refunds.amount",
+            "orders.status",
+            "refunds.order_id",
+            "orders.id",
+        ],
+    }
 
 
 async def _runtime_with_llm(tmp_path, responses):
@@ -65,6 +121,104 @@ async def _runtime_with_llm(tmp_path, responses):
     return runtime, sqlite
 
 
+async def _runtime_with_board_revenue_memory(tmp_path, responses):
+    db_path = tmp_path / "llm_board_revenue.sqlite"
+    sqlite = SQLitePlugin(path=str(db_path))
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            total REAL NOT NULL,
+            status TEXT NOT NULL
+        );
+        CREATE TABLE refunds (
+            id INTEGER PRIMARY KEY,
+            order_id INTEGER REFERENCES orders(id),
+            amount REAL NOT NULL
+        );
+        INSERT INTO orders (id, total, status)
+        VALUES
+            (1, 10.0, 'complete'),
+            (2, 30.0, 'complete'),
+            (3, 20.0, 'pending');
+        INSERT INTO refunds (order_id, amount) VALUES (1, 5.0);
+        """)
+    source_identity = "sqlite:from_db:board-revenue"
+    schema = {
+        "database_type": "sqlite",
+        "tables": [
+            {
+                "name": "orders",
+                "columns": [
+                    {"name": "id", "data_type": "INTEGER"},
+                    {"name": "total", "data_type": "REAL"},
+                    {"name": "status", "data_type": "TEXT"},
+                ],
+            },
+            {
+                "name": "refunds",
+                "columns": [
+                    {"name": "id", "data_type": "INTEGER"},
+                    {"name": "order_id", "data_type": "INTEGER"},
+                    {"name": "amount", "data_type": "REAL"},
+                ],
+            },
+        ],
+    }
+    record = DBMemoryRecord(
+        kind="metric_definition",
+        key="metric:board_revenue",
+        text="Board revenue is complete order total minus refunds.",
+        metadata=_board_revenue_contract_metadata(source_identity),
+    )
+    contract = extract_db_memory_semantic_contract(
+        record,
+        schema=schema,
+        source_identity=source_identity,
+    )
+    record_payload = {
+        **record.to_dict(),
+        "metadata": {
+            **record.metadata,
+            DB_MEMORY_SEMANTIC_CONTRACT_KEY: contract,
+        },
+    }
+    memory = MemoryPlugin()
+    backend = MagicMock()
+    backend.recall_db_records = AsyncMock(
+        return_value=[
+            {
+                "chunk_id": "mem-board-revenue",
+                "metadata": {"db_memory": record_payload},
+                "score": 0.99,
+            }
+        ]
+    )
+    backend.recall = AsyncMock(return_value=[])
+    backend.list_by_category = AsyncMock(return_value=[])
+    memory.backend = backend
+    runtime = DbRuntime(
+        plugins=(CatalogPlugin(auto_persist=False), sqlite, memory),
+        db_llm_service=FakeDbLLMService(responses),
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "memory": {
+                        "enabled": True,
+                        "recall": "auto",
+                        "limit": 3,
+                        "char_budget": 1200,
+                        "score_threshold": 0.0,
+                        "workspace_scope": "source",
+                        "source_identity": source_identity,
+                    },
+                }
+            }
+        ),
+    )
+    await runtime.setup()
+    return runtime, sqlite
+
+
 def _plan(sql, *, tables=("orders", "customers"), confidence=0.92, operation="read"):
     return json.dumps(
         {
@@ -90,6 +244,51 @@ def _plan(sql, *, tables=("orders", "customers"), confidence=0.92, operation="re
             "order_by": ["total desc"],
             "limit": 5,
             "assumptions": [],
+            "clarification_question": None,
+            "confidence": confidence,
+            "planner": "llm",
+        }
+    )
+
+
+def _board_revenue_plan(sql, *, confidence=0.9):
+    return json.dumps(
+        {
+            "operation": "read",
+            "selected_sql": sql,
+            "candidates": [
+                {
+                    "sql": sql,
+                    "purpose": "calculate board revenue",
+                    "confidence": confidence,
+                    "tables": ["orders", "refunds"],
+                }
+            ],
+            "selected_tables": ["orders", "refunds"],
+            "joins": [
+                {
+                    "left_table": "refunds",
+                    "left_column": "order_id",
+                    "right_table": "orders",
+                    "right_column": "id",
+                    "relationship": "refunds.order_id -> orders.id",
+                }
+            ],
+            "filters": [
+                {
+                    "column": "orders.status",
+                    "operator": "=",
+                    "value": "complete",
+                }
+            ],
+            "aggregations": [
+                {"function": "sum", "column": "orders.total"},
+                {"function": "sum", "column": "refunds.amount"},
+            ],
+            "group_by": [],
+            "order_by": [],
+            "limit": None,
+            "assumptions": ["metric:board_revenue"],
             "clarification_question": None,
             "confidence": confidence,
             "planner": "llm",
@@ -455,6 +654,56 @@ async def test_value_profile_validation_drives_repair_to_observed_literal(tmp_pa
         {"id": 1, "status": "complete"},
         {"id": 2, "status": "complete"},
     ]
+
+
+async def test_db_memory_contract_validation_drives_existing_repair(tmp_path):
+    bad_sql = "SELECT total FROM orders LIMIT 10"
+    good_sql = (
+        "SELECT SUM(o.total) - COALESCE(SUM(r.amount), 0) AS board_revenue "
+        "FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+        "WHERE o.status = 'complete'"
+    )
+    runtime, sqlite = await _runtime_with_board_revenue_memory(
+        tmp_path,
+        [
+            _board_revenue_plan(bad_sql, confidence=0.84),
+            _board_revenue_plan(good_sql, confidence=0.93),
+        ],
+    )
+    try:
+        result = await runtime.run("Calculate board revenue")
+        snapshot = await runtime.inspect_operation(result.operation_id)
+    finally:
+        await sqlite.disconnect()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert result.diagnostics["execution"]["planned_sql"] == good_sql
+    assert snapshot is not None
+    planning_context = next(
+        item for item in snapshot.evidence if item.kind == "planning.context"
+    )
+    assert planning_context.payload["db_memory_semantics"][0]["enforceable"] is True
+    failed_validation = next(
+        item
+        for item in snapshot.evidence
+        if item.kind == "query.plan.validation" and not item.accepted
+    )
+    assert any(
+        error.startswith(
+            "missing_db_memory_required_ref:metric:board_revenue:refunds.amount"
+        )
+        for error in failed_validation.payload["errors"]
+    )
+    assert any(
+        error.startswith(
+            "missing_db_memory_required_filter:"
+            "metric:board_revenue:orders.status=complete"
+        )
+        for error in failed_validation.payload["errors"]
+    )
+    assert any(item.kind == "query.plan.repair" for item in snapshot.evidence)
+    query_result = next(item for item in result.evidence if item.kind == "query.result")
+    assert query_result.payload["rows"] == [{"board_revenue": 35.0}]
 
 
 async def test_predicate_profile_fills_missing_value_hint_before_repair(tmp_path):

@@ -10,8 +10,9 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation, Task
 
-from ...analysis import stable_fingerprint
+from ...analysis import stable_fingerprint, structural_schema_fingerprint
 from ...memory import (
+    DB_MEMORY_SEMANTIC_CONTRACT_KEY,
     DBMemoryRecord,
     db_memory_pii_error,
     db_memory_record_chunk_ids_by_key,
@@ -19,6 +20,7 @@ from ...memory import (
     normalize_db_memory_record,
     unit_records_from_schema,
 )
+from ...memory_contracts import extract_db_memory_semantic_contract
 from ..memory_learning import _learner_task_id_from_operation
 
 _LEARNING_SOURCE_EVIDENCE_KINDS = frozenset(
@@ -245,30 +247,49 @@ class _Candidate:
     source_operation_id: str
     source_identity: str | None
     schema_fingerprint: str | None
+    schema: dict[str, Any]
     evidence_refs: tuple[str, ...]
     learned_at: str
 
     def record(self) -> DBMemoryRecord:
+        metadata = {
+            **self.metadata,
+            "confidence": self.confidence,
+            "evidence_refs": list(self.evidence_refs),
+            "source_operation_id": self.source_operation_id,
+            "source_identity": self.source_identity,
+            "workspace_scope": "source",
+            "source_schema_fingerprint": self.schema_fingerprint,
+            "created_by": "db_memory_learner:v1",
+            "creation_path": "automatic_worker",
+            "promotion_policy": "auto_high_confidence",
+            "active": True,
+            "last_verified_at": self.learned_at,
+            "verification_count": 1,
+            "negative_feedback_count": 0,
+        }
+        draft = DBMemoryRecord(
+            kind=self.kind,
+            key=self.key,
+            text=self.text,
+            metadata=metadata,
+            importance=self.importance,
+        )
+        contract = extract_db_memory_semantic_contract(
+            draft,
+            schema=self.schema,
+            source_identity=self.source_identity,
+            schema_fingerprint=self.schema_fingerprint,
+            evidence_refs=self.evidence_refs,
+        )
+        if contract is not None:
+            metadata.setdefault(DB_MEMORY_SEMANTIC_CONTRACT_KEY, contract)
+            metadata.setdefault("semantic_contract_status", "validated")
         return DBMemoryRecord(
             kind=self.kind,
             key=self.key,
             text=self.text,
-            metadata={
-                **self.metadata,
-                "confidence": self.confidence,
-                "evidence_refs": list(self.evidence_refs),
-                "source_operation_id": self.source_operation_id,
-                "source_identity": self.source_identity,
-                "workspace_scope": "source",
-                "source_schema_fingerprint": self.schema_fingerprint,
-                "created_by": "db_memory_learner:v1",
-                "creation_path": "automatic_worker",
-                "promotion_policy": "auto_high_confidence",
-                "active": True,
-                "last_verified_at": self.learned_at,
-                "verification_count": 1,
-                "negative_feedback_count": 0,
-            },
+            metadata=metadata,
             importance=self.importance,
         )
 
@@ -428,6 +449,7 @@ def _unit_candidates(
                 source_operation_id=source_operation_id,
                 source_identity=source_identity,
                 schema_fingerprint=schema_fingerprint,
+                schema=schema,
                 evidence_refs=evidence_refs,
                 learned_at=learned_at,
             )
@@ -487,6 +509,7 @@ def _value_alias_candidates(
                     fallback=fallback_source_identity,
                 ),
                 schema_fingerprint=schema_fingerprint,
+                schema={},
                 evidence_refs=(evidence_item.id,) if evidence_item.id else (),
                 learned_at=learned_at,
             )
@@ -687,7 +710,7 @@ def _schema_fingerprint(evidence: tuple[Evidence, ...]) -> str | None:
             if value:
                 return str(value)
     schema = _schema_from_evidence(evidence)
-    return stable_fingerprint(schema) if schema else None
+    return structural_schema_fingerprint(schema)
 
 
 def _column_value_hints_from_evidence(

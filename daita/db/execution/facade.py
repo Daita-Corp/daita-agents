@@ -9,7 +9,7 @@ from daita.runtime import Evidence, Operation, Task, TaskDependency
 
 from ..capabilities import SCHEMA_RELATIONSHIP_PATH_EVIDENCE
 from ..evidence import DbEvidenceStore
-from ..analysis import stable_fingerprint
+from ..analysis import stable_fingerprint, structural_schema_fingerprint
 from ..models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
 from ..query_planning import DbQueryPlanner
 from ..session_context import db_session_context_from_request
@@ -725,7 +725,7 @@ class DbOperationExecutor(
             {
                 "request": request_payload,
                 "schema": schema,
-                "schema_fingerprint": stable_fingerprint(schema) if schema else None,
+                "schema_fingerprint": structural_schema_fingerprint(schema),
             },
         )
         proposal = next(

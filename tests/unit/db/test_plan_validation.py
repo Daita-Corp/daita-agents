@@ -73,6 +73,8 @@ def _order_refund_planning_context():
             "name": "orders",
             "columns": [
                 {"name": "id", "data_type": "INTEGER"},
+                {"name": "total", "data_type": "REAL"},
+                {"name": "status", "data_type": "TEXT"},
                 {"name": "customer_id", "data_type": "INTEGER"},
             ],
         },
@@ -81,8 +83,76 @@ def _order_refund_planning_context():
             "columns": [
                 {"name": "id", "data_type": "INTEGER"},
                 {"name": "order_id", "data_type": "INTEGER"},
+                {"name": "amount", "data_type": "REAL"},
             ],
         },
+    ]
+    return context
+
+
+def _board_revenue_context():
+    context = _order_refund_planning_context()
+    context["prompt"] = "Calculate board revenue"
+    context["db_memory_semantics"] = [
+        {
+            "key": "metric:board_revenue",
+            "memory_key": "metric:board_revenue",
+            "kind": "metric_definition",
+            "contract_kind": "metric_definition",
+            "subject_aliases": ["board revenue"],
+            "required_refs": ["orders.total", "refunds.amount", "orders.status"],
+            "required_relationships": ["refunds.order_id -> orders.id"],
+            "required_filters": [
+                {
+                    "ref": "orders.status",
+                    "operator": "semantic_equals",
+                    "value": "complete",
+                }
+            ],
+            "required_aggregations": [
+                {"function": "sum", "ref": "orders.total"},
+                {"function": "sum", "ref": "refunds.amount"},
+            ],
+            "result_shape": {"grain": "single_aggregate"},
+            "evidence_refs": ["evidence-memory"],
+            "confidence": 0.95,
+            "enforcement_mode": "required_when_recalled",
+            "enforceable": True,
+        }
+    ]
+    return context
+
+
+def _unit_convention_context():
+    context = _planning_context()
+    context["prompt"] = "Show total revenue in dollars"
+    context["schema"]["tables"] = [
+        {
+            "name": "orders",
+            "columns": [
+                {"name": "id", "data_type": "INTEGER"},
+                {"name": "total_cents", "data_type": "INTEGER"},
+            ],
+        }
+    ]
+    context["db_memory_semantics"] = [
+        {
+            "key": "orders.total_cents",
+            "memory_key": "unit_convention:orders.total_cents",
+            "kind": "unit_convention",
+            "contract_kind": "unit_convention",
+            "subject_aliases": ["total cents"],
+            "required_refs": ["orders.total_cents"],
+            "unit_conversion": {
+                "stored_unit": "cents",
+                "display_unit": "dollars",
+                "operator": "divide",
+                "factor": 100,
+            },
+            "confidence": 0.9,
+            "enforcement_mode": "required_when_recalled",
+            "enforceable": True,
+        }
     ]
     return context
 
@@ -303,6 +373,161 @@ def test_plan_mapping_accepts_llm_join_key_aliases():
 
     assert plan.joins[0].left_column == "id"
     assert plan.joins[0].right_column == "order_id"
+    assert validation.valid is True
+    assert validation.accepted_sql == sql
+
+
+def test_validator_rejects_board_revenue_missing_ref_filter_aggregation_and_shape():
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql="SELECT total FROM orders LIMIT 10",
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, _board_revenue_context())
+
+    assert validation.valid is False
+    assert (
+        "missing_db_memory_required_ref:metric:board_revenue:refunds.amount"
+        in validation.errors
+    )
+    assert (
+        "missing_db_memory_required_filter:metric:board_revenue:orders.status=complete"
+        in validation.errors
+    )
+    assert (
+        "missing_db_memory_required_aggregation:metric:board_revenue:sum:orders.total"
+        in validation.errors
+    )
+    assert (
+        "missing_db_memory_required_result_shape:metric:board_revenue:single_aggregate"
+        in validation.errors
+    )
+
+
+def test_validator_rejects_board_revenue_missing_required_join():
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql=(
+            "SELECT SUM(o.total) - SUM(r.amount) AS board_revenue "
+            "FROM orders o, refunds r WHERE o.status = 'complete'"
+        ),
+        selected_tables=("orders", "refunds"),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, _board_revenue_context())
+
+    assert validation.valid is False
+    assert (
+        "missing_db_memory_required_join:"
+        "metric:board_revenue:refunds.order_id -> orders.id"
+    ) in validation.errors
+
+
+def test_validator_accepts_contract_compliant_board_revenue_sql():
+    sql = (
+        "SELECT SUM(o.total) - COALESCE(SUM(r.amount), 0) AS board_revenue "
+        "FROM orders o LEFT JOIN refunds r ON r.order_id = o.id "
+        "WHERE o.status = 'complete'"
+    )
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql=sql,
+        selected_tables=("orders", "refunds"),
+        confidence=0.95,
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, _board_revenue_context())
+
+    assert validation.valid is True
+    assert validation.accepted_sql == sql
+
+
+def test_validator_allows_incomplete_declared_join_when_sql_join_is_valid():
+    sql = (
+        "SELECT SUM(o.total) - COALESCE(SUM(r.amount), 0) AS board_revenue "
+        "FROM orders AS o LEFT JOIN refunds AS r ON r.order_id = o.id "
+        "WHERE o.status = 'complete'"
+    )
+    plan = DbQueryPlan.from_mapping(
+        {
+            "operation": "read",
+            "selected_sql": sql,
+            "selected_tables": ["orders", "refunds"],
+            "joins": [
+                {
+                    "left_table": "orders",
+                    "right_table": "refunds",
+                    "on": "r.order_id = o.id",
+                }
+            ],
+            "confidence": 0.95,
+        }
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, _board_revenue_context())
+
+    assert validation.valid is True
+    assert validation.accepted_sql == sql
+    assert "join_left_column_not_declared:orders" in validation.warnings
+    assert "join_right_column_not_declared:refunds" in validation.warnings
+
+
+def test_validator_enforces_unit_convention_when_selected_expression_uses_column():
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql="SELECT SUM(total_cents) AS revenue FROM orders",
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, _unit_convention_context())
+
+    assert validation.valid is False
+    assert (
+        "missing_db_memory_required_unit_conversion:"
+        "unit_convention:orders.total_cents:orders.total_cents:divide:100"
+    ) in validation.errors
+
+
+def test_validator_accepts_unit_convention_conversion():
+    sql = "SELECT SUM(total_cents) / 100 AS revenue_dollars FROM orders"
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql=sql,
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, _unit_convention_context())
+
+    assert validation.valid is True
+    assert validation.accepted_sql == sql
+
+
+def test_validator_does_not_enforce_unit_convention_for_same_column_on_other_table():
+    context = _unit_convention_context()
+    context["schema"]["tables"].append(
+        {
+            "name": "invoices",
+            "columns": [
+                {"name": "id", "data_type": "INTEGER"},
+                {"name": "total_cents", "data_type": "INTEGER"},
+            ],
+        }
+    )
+    sql = "SELECT SUM(total_cents) AS invoice_total FROM invoices"
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql=sql,
+        selected_tables=("invoices",),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, context)
+
     assert validation.valid is True
     assert validation.accepted_sql == sql
 

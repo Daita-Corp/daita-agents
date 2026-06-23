@@ -148,6 +148,8 @@ class _ExecutionPlanningMixin:
                         "score_threshold",
                         0.45,
                     ),
+                    "retrieval_mode": options.get("retrieval_mode", "structured"),
+                    "source_identity": options.get("source_identity"),
                 },
                 reason="planning_memory_recall",
                 metadata={**dict(analysis_metadata or {}), "memory_recall": "planning"},

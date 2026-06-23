@@ -7,13 +7,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import decimal
-from inspect import isawaitable
+from inspect import getattr_static, isawaitable
 import json
 import logging
 import re
 from typing import Any
 
 from daita.db.query_catalog import has_likely_catalog_match
+from daita.db.memory_contracts import (
+    DB_MEMORY_SEMANTIC_CONTRACT_KEY,
+    extract_db_memory_semantic_contract,
+    normalize_db_memory_semantic_contract as _normalize_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +228,7 @@ async def recall_db_memory_records(
         limit=max(limit * 3, limit),
         score_threshold=score_threshold,
         category=DB_SEMANTIC_CATEGORY,
+        kinds=kinds,
     )
     if kinds:
         allowed = set(kinds)
@@ -361,22 +367,35 @@ def db_memory_refs_from_recall_evidence(
         if getattr(evidence, "id", None):
             evidence_refs.append(evidence.id)
         evidence_refs.extend(ref_evidence)
-        refs.append(
-            {
-                "chunk_id": result.get("chunk_id"),
-                "kind": kind,
-                "key": key,
-                "text": text,
-                "confidence": _confidence_value(
-                    metadata.get("confidence"), default=1.0
-                ),
-                "importance": float(record.get("importance") or 0.0),
-                "source_identity": metadata.get("source_identity"),
-                "evidence_refs": ref_evidence,
-                "schema_fingerprint": metadata.get("source_schema_fingerprint")
-                or metadata.get("schema_fingerprint"),
-            }
-        )
+        ref = {
+            "chunk_id": result.get("chunk_id"),
+            "kind": kind,
+            "key": key,
+            "text": text,
+            "confidence": _confidence_value(metadata.get("confidence"), default=1.0),
+            "importance": float(record.get("importance") or 0.0),
+            "source_identity": metadata.get("source_identity"),
+            "evidence_refs": ref_evidence,
+            "schema_fingerprint": metadata.get("source_schema_fingerprint")
+            or metadata.get("schema_fingerprint"),
+        }
+        if metadata.get("active") is False:
+            ref["active"] = False
+        if metadata.get("stale") is True:
+            ref["stale"] = True
+        if metadata.get("creation_path"):
+            ref["creation_path"] = metadata.get("creation_path")
+        if metadata.get("semantic_contract_status"):
+            ref["semantic_contract_status"] = metadata.get("semantic_contract_status")
+        try:
+            contract = _normalize_contract(
+                metadata.get(DB_MEMORY_SEMANTIC_CONTRACT_KEY)
+            )
+        except Exception:
+            contract = None
+        if contract is not None:
+            ref[DB_MEMORY_SEMANTIC_CONTRACT_KEY] = contract
+        refs.append(ref)
         used_chars += len(line)
     diagnostics["included_count"] = len(refs)
     diagnostics["char_budget"] = int(char_budget)
@@ -606,22 +625,34 @@ def unit_records_from_schema(schema: dict[str, Any]) -> tuple[DBMemoryRecord, ..
         confidence = "high" if unit in {"cents", "percent", "basis_points"} else "low"
         table_name = column["table"]
         column_name = column["column"]
+        metadata = {
+            "table": table_name,
+            "column": column_name,
+            "unit": unit,
+            "confidence": confidence,
+            "reason": reason,
+        }
+        draft = DBMemoryRecord(
+            kind="unit_convention",
+            key=f"unit_convention:{table_name}.{column_name}",
+            text=(
+                f"{table_name}.{column_name} is stored as {unit} "
+                f"(confidence: {confidence}). Reason: {reason}"
+            ),
+            metadata=metadata,
+            importance=0.75 if confidence == "high" else 0.65,
+        )
+        contract = extract_db_memory_semantic_contract(draft, schema=schema)
+        if contract is not None:
+            metadata[DB_MEMORY_SEMANTIC_CONTRACT_KEY] = contract
+            metadata["semantic_contract_status"] = "validated"
         records.append(
             DBMemoryRecord(
-                kind="unit_convention",
-                key=f"unit_convention:{table_name}.{column_name}",
-                text=(
-                    f"{table_name}.{column_name} is stored as {unit} "
-                    f"(confidence: {confidence}). Reason: {reason}"
-                ),
-                metadata={
-                    "table": table_name,
-                    "column": column_name,
-                    "unit": unit,
-                    "confidence": confidence,
-                    "reason": reason,
-                },
-                importance=0.75 if confidence == "high" else 0.65,
+                kind=draft.kind,
+                key=draft.key,
+                text=draft.text,
+                metadata=metadata,
+                importance=draft.importance,
             )
         )
     return tuple(records)
@@ -854,18 +885,25 @@ def _identifier_matches(text: str) -> list[str]:
 
 
 def db_memory_record_from_payload(
-    payload: dict[str, Any], prompt: str
+    payload: dict[str, Any],
+    prompt: str,
+    *,
+    task_metadata: dict[str, Any] | None = None,
 ) -> DBMemoryRecord:
     """Build a DB memory record from runtime request metadata and constraints."""
     metadata = payload.get("metadata") or {}
     if not isinstance(metadata, dict):
         raise ValueError("metadata must be an object")
+    metadata = _direct_write_contract_metadata(
+        dict(metadata),
+        task_metadata=task_metadata or {},
+    )
 
     kind = str(payload.get("kind") or "business_rule").strip()
     text = str(payload.get("text") or payload.get("content") or prompt).strip()
     key = str(payload.get("key") or _default_key(kind, text)).strip()
     importance = float(payload.get("importance", 0.7))
-    return normalize_db_memory_record(
+    record = normalize_db_memory_record(
         {
             "kind": kind,
             "key": key,
@@ -874,6 +912,7 @@ def db_memory_record_from_payload(
             "importance": importance,
         }
     )
+    return record
 
 
 def normalize_db_memory_record(raw: Any) -> DBMemoryRecord:
@@ -902,13 +941,45 @@ def normalize_db_memory_record(raw: Any) -> DBMemoryRecord:
         raise ValueError("DB memory record requires text")
     if record.kind == "value_alias":
         _validate_value_alias_memory(record)
+    metadata = _json_safe(record.metadata)
+    if DB_MEMORY_SEMANTIC_CONTRACT_KEY in metadata:
+        try:
+            metadata[DB_MEMORY_SEMANTIC_CONTRACT_KEY] = _normalize_contract(
+                metadata.get(DB_MEMORY_SEMANTIC_CONTRACT_KEY)
+            )
+        except Exception as exc:
+            metadata.pop(DB_MEMORY_SEMANTIC_CONTRACT_KEY, None)
+            metadata["semantic_contract_diagnostics"] = {
+                "valid": False,
+                "reason": str(exc),
+            }
     return DBMemoryRecord(
         kind=record.kind,
         key=record.key,
         text=record.text,
-        metadata=_json_safe(record.metadata),
+        metadata=metadata,
         importance=max(0.0, min(1.0, record.importance)),
     )
+
+
+def _direct_write_contract_metadata(
+    metadata: dict[str, Any],
+    *,
+    task_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    if DB_MEMORY_SEMANTIC_CONTRACT_KEY not in metadata:
+        return metadata
+    if metadata.get("semantic_contract_status") == "validated" and task_metadata.get(
+        "reason"
+    ) in {"db_memory_commit_update", "db_memory_learning_promotion"}:
+        return metadata
+    metadata.pop(DB_MEMORY_SEMANTIC_CONTRACT_KEY, None)
+    metadata.pop("semantic_contract_status", None)
+    metadata["semantic_contract_diagnostics"] = {
+        "created": False,
+        "reason": "direct_write_unvalidated",
+    }
+    return metadata
 
 
 def _validate_value_alias_memory(record: DBMemoryRecord) -> None:
@@ -981,6 +1052,20 @@ def _find_forbidden_value_alias_key(value: Any, prefix: str = "") -> str | None:
 
 
 async def _upsert_record(plugin: Any, record: DBMemoryRecord) -> dict[str, Any] | None:
+    structured_upsert = _backend_method(plugin, "upsert_db_record")
+    if structured_upsert is not None:
+        result = structured_upsert(record.to_dict())
+        if isawaitable(result):
+            result = await result
+        if isinstance(result, dict):
+            return {
+                "status": result.get("status", "created"),
+                "updated": 1 if result.get("status") == "updated" else 0,
+                "stored": result,
+                "structured": True,
+            }
+        return {"status": "created", "updated": 0, "stored": result, "structured": True}
+
     existing_chunk_ids = await _find_record_chunk_ids_by_key(plugin, record)
     if existing_chunk_ids:
         deleted = await _delete_record_chunks(plugin, existing_chunk_ids)
@@ -1035,6 +1120,23 @@ async def _remember_record(
 async def _find_record_chunk_ids_by_key(
     plugin: Any, record: DBMemoryRecord
 ) -> list[str]:
+    structured_list = _backend_method(plugin, "list_db_records")
+    if structured_list is not None:
+        result = structured_list(
+            category=record.category,
+            key=record.key,
+            source_identity=record.metadata.get("source_identity"),
+            limit=1000,
+        )
+        if isawaitable(result):
+            result = await result
+        if isinstance(result, list):
+            return [
+                str(item.get("chunk_id") or item.get("record_id"))
+                for item in result
+                if item.get("chunk_id") or item.get("record_id")
+            ]
+
     results = await _list_records_by_category(plugin, record.category, limit=1000)
     if results is None:
         return []
@@ -1052,6 +1154,13 @@ async def _find_record_chunk_ids_by_key(
 async def _list_records_by_category(
     plugin: Any, category: str, *, limit: int
 ) -> list[dict[str, Any]] | None:
+    structured_list = _backend_method(plugin, "list_db_records")
+    if structured_list is not None:
+        result = structured_list(category=category, limit=limit)
+        if isawaitable(result):
+            result = await result
+        return result if isinstance(result, list) else None
+
     backend = getattr(plugin, "backend", None)
     if backend is not None and hasattr(backend, "list_by_category"):
         result = backend.list_by_category(category=category, limit=limit)
@@ -1068,7 +1177,21 @@ async def _recall_records(
     limit: int,
     score_threshold: float,
     category: str,
+    kinds: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> list[dict[str, Any]]:
+    structured_recall = _backend_method(plugin, "recall_db_records")
+    if structured_recall is not None and category == DB_SEMANTIC_CATEGORY:
+        result = structured_recall(
+            query,
+            limit=limit,
+            score_threshold=score_threshold,
+            category=category,
+            kinds=kinds,
+        )
+        if isawaitable(result):
+            result = await result
+        return result if isinstance(result, list) else []
+
     backend = getattr(plugin, "backend", None)
     if backend is not None and hasattr(backend, "recall"):
         return await backend.recall(
@@ -1105,6 +1228,18 @@ async def _delete_record_chunks(plugin: Any, chunk_ids: list[str]) -> bool:
     if isawaitable(result):
         await result
     return True
+
+
+def _backend_method(plugin: Any, name: str) -> Any | None:
+    backend = getattr(plugin, "backend", None)
+    if backend is None:
+        return None
+    try:
+        getattr_static(backend, name)
+    except AttributeError:
+        return None
+    method = getattr(backend, name, None)
+    return method if callable(method) else None
 
 
 def _record_kind_from_result(result: dict[str, Any]) -> str | None:
@@ -1257,6 +1392,11 @@ def _value_alias_has_catalog_citation(metadata: dict[str, Any]) -> bool:
 
 
 def _record_refs_known_schema(metadata: dict[str, Any], schema: dict[str, Any]) -> bool:
+    schema_refs = metadata.get("schema_refs")
+    if isinstance(schema_refs, list) and schema_refs:
+        return _schema_refs_known_schema(
+            _schema_refs_from_metadata(schema_refs), schema
+        )
     tables = {
         str(table.get("name") or "").lower(): {
             str(column.get("name") or "").lower()
@@ -1272,6 +1412,56 @@ def _record_refs_known_schema(metadata: dict[str, Any], schema: dict[str, Any]) 
         return False
     if table and column and column not in tables.get(table, set()):
         return False
+    return True
+
+
+def _schema_refs_from_metadata(value: Any) -> tuple[dict[str, str], ...]:
+    refs: list[dict[str, str]] = []
+    if not isinstance(value, (list, tuple, set)):
+        return ()
+    for item in value:
+        if isinstance(item, dict):
+            table = str(item.get("table") or "").strip()
+            column = str(item.get("column") or "").strip()
+        else:
+            parts = [
+                part.strip('"`[] ')
+                for part in str(item or "").split(".")
+                if part.strip()
+            ]
+            if len(parts) >= 2:
+                table, column = parts[-2], parts[-1]
+            else:
+                table, column = "", ""
+        if table and column:
+            refs.append({"table": table, "column": column})
+        elif table:
+            refs.append({"table": table})
+    return tuple(refs)
+
+
+def _schema_refs_known_schema(
+    refs: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    schema: dict[str, Any],
+) -> bool:
+    tables = {
+        str(table.get("name") or "").lower(): {
+            str(column.get("name") or "").lower()
+            for column in table.get("columns", []) or []
+            if column.get("name")
+        }
+        for table in schema.get("tables", []) or []
+        if table.get("name")
+    }
+    if not tables:
+        return True
+    for ref in refs:
+        table = str(ref.get("table") or "").lower()
+        column = str(ref.get("column") or "").lower()
+        if table and table not in tables:
+            return False
+        if table and column and column not in tables.get(table, set()):
+            return False
     return True
 
 

@@ -59,6 +59,94 @@ async def _maybe_await(result: Any) -> Any:
     return result
 
 
+def _merge_recall_results(
+    structured_results: list[dict[str, Any]],
+    embedding_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for result in (*structured_results, *embedding_results):
+        key = str(result.get("chunk_id") or result.get("record_id") or id(result))
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = dict(result)
+            continue
+        existing_score = float(
+            existing.get("relevance_score", existing.get("score", 0))
+        )
+        score = float(result.get("relevance_score", result.get("score", 0)))
+        if score > existing_score:
+            merged[key] = dict(result)
+    results = list(merged.values())
+    results.sort(
+        key=lambda item: float(item.get("relevance_score", item.get("score", 0))),
+        reverse=True,
+    )
+    return results
+
+
+def _declared_method(obj: Any, name: str) -> Any | None:
+    if obj is None:
+        return None
+    try:
+        inspect.getattr_static(obj, name)
+    except AttributeError:
+        return None
+    method = getattr(obj, name, None)
+    return method if callable(method) else None
+
+
+def _backend_name(backend: Any, environment: str | None) -> str:
+    if backend is None:
+        return environment or "unconfigured"
+    name = type(backend).__name__.lower()
+    if "supabase" in name:
+        return "supabase"
+    if "local" in name:
+        return "local"
+    return name or (environment or "custom")
+
+
+def _declared_attr(obj: Any, name: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    try:
+        inspect.getattr_static(obj, name)
+    except AttributeError:
+        return default
+    return getattr(obj, name, default)
+
+
+def _db_semantic_result_allowed(
+    result: dict[str, Any],
+    *,
+    source_identity: str | None,
+) -> bool:
+    metadata = result.get("metadata") or {}
+    record = metadata.get("db_memory")
+    if not isinstance(record, dict):
+        return False
+    record_metadata = (
+        record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    )
+    record_source = record.get("source_identity") or record_metadata.get(
+        "source_identity"
+    )
+    if source_identity and record_source != source_identity:
+        return False
+    if record.get("category", metadata.get("category")) != "db_semantics":
+        return False
+    if (
+        record.get("workspace_scope", record_metadata.get("workspace_scope", "source"))
+        != "source"
+    ):
+        return False
+    if record.get("active", record_metadata.get("active", True)) is False:
+        return False
+    if record.get("stale", record_metadata.get("stale", False)) is True:
+        return False
+    return True
+
+
 class MemoryPlugin(DomainServicePlugin):
     """
     Production-ready memory plugin for DAITA agents.
@@ -116,6 +204,8 @@ class MemoryPlugin(DomainServicePlugin):
         tier: str = "basic",
         memory_tools: Optional[List[str]] = None,
         dedup_threshold: float = 0.95,
+        db_memory_mode: bool = False,
+        db_memory_retrieval_mode: str = "structured",
     ):
         """
         Args:
@@ -180,6 +270,11 @@ class MemoryPlugin(DomainServicePlugin):
                 consider a new memory a duplicate of an existing one
                 (default: 0.95). Dedup is also scoped by category — a
                 memory is only deduped against others in the same category.
+            db_memory_mode: Enable the structured DB semantic memory lane used
+                by Agent.from_db(). Generic MemoryPlugin behavior is unchanged
+                when this is False.
+            db_memory_retrieval_mode: DB semantic recall mode: "structured",
+                "hybrid", or "embedding".
         """
         self.workspace = workspace
         self.scope = scope
@@ -206,6 +301,8 @@ class MemoryPlugin(DomainServicePlugin):
         self.tier = tier
         self.memory_tools = memory_tools
         self.dedup_threshold = dedup_threshold
+        self.db_memory_mode = bool(db_memory_mode)
+        self.db_memory_retrieval_mode = str(db_memory_retrieval_mode or "structured")
 
         self._agent_id = None
         self.backend = None
@@ -219,6 +316,12 @@ class MemoryPlugin(DomainServicePlugin):
         self._memory_graph = None
         self._pending_contradiction_checks: list = []
         self._background_tasks: list = []
+
+    @property
+    def embedding_available(self) -> bool:
+        if self._embedder is not None:
+            return True
+        return bool(getattr(self.backend, "embedding_available", False))
 
     async def setup(self, context):
         """Set up the memory backend for an extension-runtime host."""
@@ -295,8 +398,14 @@ class MemoryPlugin(DomainServicePlugin):
         else:
             workspace = agent_id
 
-        # Build embedding provider (factory or pre-constructed)
-        if self._embedder is None:
+        structured_db_only = (
+            self.db_memory_mode and self.db_memory_retrieval_mode == "structured"
+        )
+
+        # Build embedding provider (factory or pre-constructed).
+        # The from_db structured DB lane intentionally avoids constructing the
+        # generic vector lane unless hybrid/embedding recall is explicit.
+        if self._embedder is None and not structured_db_only:
             from ...embeddings import create_embedding_provider
 
             self._embedder = create_embedding_provider(
@@ -336,6 +445,7 @@ class MemoryPlugin(DomainServicePlugin):
                 agent_id=agent_id,
                 scope=self.scope,
                 embedder=self._embedder,
+                retrieval_mode=self.db_memory_retrieval_mode,
             )
             self.environment = "cloud"
             print(
@@ -350,6 +460,7 @@ class MemoryPlugin(DomainServicePlugin):
                 scope=self.scope,
                 embedder=self._embedder,
                 max_chunks=self.max_chunks,
+                default_source_identity=workspace if self.db_memory_mode else None,
             )
             self.environment = "local"
 
@@ -410,14 +521,19 @@ class MemoryPlugin(DomainServicePlugin):
                     "Enable fact_extraction for richer entity graphs."
                 )
 
-        # Contradiction checker for high-importance fact validation
-        from .contradiction import ContradictionChecker
+        # Contradiction checking belongs to the generic vector lane. The
+        # structured DB lane validates DB records before storage and should not
+        # construct an LLM solely to support unused generic memory behavior.
+        if getattr(self.backend, "embedding_available", True):
+            from .contradiction import ContradictionChecker
 
-        self._checker = ContradictionChecker(
-            llm=self._ensure_curation_llm(),
-            recall_fn=self.backend.recall,
-            importance_threshold=0.7,
-        )
+            self._checker = ContradictionChecker(
+                llm=self._ensure_curation_llm(),
+                recall_fn=self.backend.recall,
+                importance_threshold=0.7,
+            )
+        else:
+            self._checker = None
 
     def _build_memory_graph(self, agent_id: str, workspace: str):
         """Build the optional memory graph without coupling to a backend."""
@@ -451,6 +567,10 @@ class MemoryPlugin(DomainServicePlugin):
         from .memory_tools import handle_recall
 
         args = dict(payload or {})
+        category = args.get("category")
+        if category == "db_semantics":
+            return await self._execute_db_semantic_recall(args)
+
         results = await handle_recall(
             self,
             query=str(args.get("query") or ""),
@@ -463,6 +583,95 @@ class MemoryPlugin(DomainServicePlugin):
             before=args.get("before"),
         )
         return {"query": str(args.get("query") or ""), "results": results}
+
+    async def _execute_db_semantic_recall(self, args: dict[str, Any]) -> Dict[str, Any]:
+        query = str(args.get("query") or "")
+        requested_mode = args.get("retrieval_mode") or self.db_memory_retrieval_mode
+        retrieval_mode = str(requested_mode or "structured")
+        if retrieval_mode not in {"structured", "hybrid", "embedding"}:
+            return {
+                "query": query,
+                "results": [],
+                "diagnostics": {
+                    "retrieval_mode": retrieval_mode,
+                    "embedding_available": self.embedding_available,
+                    "structured_candidate_count": 0,
+                    "embedding_candidate_count": 0,
+                    "fallback": "invalid_retrieval_mode",
+                },
+            }
+
+        limit = int(args.get("limit") or 5)
+        score_threshold = float(args.get("score_threshold", 0.45))
+        source_identity = args.get("source_identity") or (
+            self.workspace if self.db_memory_mode else None
+        )
+        diagnostics = {
+            "backend": _backend_name(self.backend, self.environment),
+            "retrieval_mode": retrieval_mode,
+            "embedding_available": self.embedding_available,
+            "structured_index": _declared_attr(self.backend, "structured_index", None),
+            "structured_candidate_count": 0,
+            "embedding_candidate_count": 0,
+            "fallback": None,
+        }
+
+        structured_results = []
+        if retrieval_mode in {"structured", "hybrid"}:
+            recall_db_records = _declared_method(self.backend, "recall_db_records")
+            if recall_db_records is not None:
+                structured_results = await recall_db_records(
+                    query,
+                    limit=limit,
+                    score_threshold=score_threshold,
+                    source_identity=source_identity,
+                    category="db_semantics",
+                    kinds=args.get("kinds"),
+                )
+            elif retrieval_mode == "structured":
+                diagnostics["fallback"] = "structured_backend_unavailable"
+            diagnostics["structured_candidate_count"] = len(structured_results)
+
+        embedding_results = []
+        if retrieval_mode in {"hybrid", "embedding"}:
+            if not self.embedding_available:
+                diagnostics["fallback"] = "embedding_unavailable"
+                if retrieval_mode == "embedding":
+                    return {
+                        "query": query,
+                        "results": [],
+                        "diagnostics": diagnostics,
+                    }
+            else:
+                try:
+                    embedding_results = await self.backend.recall(
+                        query=query,
+                        limit=limit,
+                        score_threshold=score_threshold,
+                        category="db_semantics",
+                        reranker=self._reranker,
+                    )
+                    embedding_results = [
+                        result
+                        for result in embedding_results
+                        if _db_semantic_result_allowed(
+                            result, source_identity=source_identity
+                        )
+                    ]
+                except Exception as exc:
+                    diagnostics["fallback"] = f"embedding_recall_failed:{exc}"
+                    embedding_results = []
+            diagnostics["embedding_candidate_count"] = len(embedding_results)
+
+        if retrieval_mode == "embedding":
+            results = embedding_results
+        else:
+            results = _merge_recall_results(structured_results, embedding_results)
+        return {
+            "query": query,
+            "results": results[:limit],
+            "diagnostics": diagnostics,
+        }
 
     async def _execute_semantic_write(self, payload: Any) -> Dict[str, Any]:
         from .memory_tools import handle_remember
@@ -478,6 +687,7 @@ class MemoryPlugin(DomainServicePlugin):
                 record = db_memory_record_from_payload(
                     dict(args.get("db_memory_payload") or {}),
                     str(args.get("db_memory_prompt") or ""),
+                    task_metadata=dict(args.get("_runtime_task_metadata") or {}),
                 )
             except Exception as exc:
                 return {"success": False, "error": str(exc)}

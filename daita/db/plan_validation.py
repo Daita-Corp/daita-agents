@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 from .planning_context import planner_eligible_column_value_hint
@@ -28,6 +29,12 @@ class DbQueryPlanValidator:
         )
         table_columns = _table_columns(schema)
         value_profiles = _value_profiles(planning_context)
+        db_memory_validation = {
+            "checked": bool(planning_context.get("db_memory_semantics")),
+            "memory_keys": [],
+            "passed": True,
+            "errors": [],
+        }
         sql = plan.selected_sql
 
         if plan.confidence < 0 or plan.confidence > 1:
@@ -44,18 +51,20 @@ class DbQueryPlanValidator:
         if missing_tables:
             errors.append(f"unknown_selected_tables:{','.join(missing_tables)}")
         for join in plan.joins:
-            _validate_column(
+            _validate_join_column(
                 table_columns,
                 join.left_table,
                 join.left_column,
                 errors,
+                warnings,
                 label="join_left",
             )
-            _validate_column(
+            _validate_join_column(
                 table_columns,
                 join.right_table,
                 join.right_column,
                 errors,
+                warnings,
                 label="join_right",
             )
         for filter_spec in plan.filters:
@@ -131,6 +140,20 @@ class DbQueryPlanValidator:
                         ),
                         errors,
                     )
+                memory_errors = _validate_db_memory_semantics(
+                    plan,
+                    analysis,
+                    planning_context,
+                )
+                if memory_errors:
+                    errors.extend(memory_errors)
+                    db_memory_validation["passed"] = False
+                    db_memory_validation["errors"] = memory_errors
+                db_memory_validation["memory_keys"] = [
+                    str(item.get("key") or item.get("memory_key") or "")
+                    for item in planning_context.get("db_memory_semantics", []) or []
+                    if isinstance(item, dict) and item.get("enforceable")
+                ]
 
         fingerprint = _fingerprint(plan.to_dict())
         return DbQueryPlanValidation(
@@ -143,6 +166,7 @@ class DbQueryPlanValidator:
             metadata={
                 "validator": "deterministic",
                 "schema_fingerprint": planning_context.get("schema_fingerprint"),
+                "db_memory_contract_validation": db_memory_validation,
             },
         )
 
@@ -175,6 +199,24 @@ def _validate_column(
         return
     if column.lower() not in table_columns[table_key]:
         errors.append(f"{label}_unknown_column:{table}.{column}")
+
+
+def _validate_join_column(
+    table_columns: dict[str, set[str]],
+    table: str,
+    column: str,
+    errors: list[str],
+    warnings: list[str],
+    *,
+    label: str,
+) -> None:
+    if not column:
+        table_label = table or "unknown"
+        warnings.append(f"{label}_column_not_declared:{table_label}")
+        if table and table.lower() not in table_columns:
+            errors.append(f"{label}_unknown_table:{table}")
+        return
+    _validate_column(table_columns, table, column, errors, label=label)
 
 
 def _validate_filter_literal(
@@ -380,6 +422,245 @@ def _split_column_ref(value: str) -> tuple[str | None, str]:
 def _looks_aggregated(sql: str) -> bool:
     lowered = sql.lower()
     return any(token in lowered for token in ("count(", "sum(", "avg(", "min(", "max("))
+
+
+def _validate_db_memory_semantics(
+    plan: DbQueryPlan,
+    analysis: Any,
+    planning_context: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    semantics = [
+        item
+        for item in planning_context.get("db_memory_semantics", []) or []
+        if isinstance(item, dict) and item.get("enforceable")
+    ]
+    if not semantics:
+        return errors
+    sql = plan.selected_sql or ""
+    sql_refs = _sql_column_refs(analysis, planning_context.get("schema") or {})
+    for contract in semantics:
+        kind = str(contract.get("contract_kind") or contract.get("kind") or "")
+        if kind == "metric_definition":
+            _validate_metric_contract(contract, plan, analysis, sql, sql_refs, errors)
+        elif kind == "unit_convention":
+            _validate_unit_contract(contract, analysis, sql, errors)
+    return errors
+
+
+def _validate_metric_contract(
+    contract: dict[str, Any],
+    plan: DbQueryPlan,
+    analysis: Any,
+    sql: str,
+    sql_refs: set[str],
+    errors: list[str],
+) -> None:
+    memory_key = _memory_key(contract)
+    for ref in contract.get("required_refs", []) or []:
+        if not _sql_references_ref(str(ref), sql_refs):
+            errors.append(f"missing_db_memory_required_ref:{memory_key}:{ref}")
+    for relationship in contract.get("required_relationships", []) or []:
+        if not _sql_contains_relationship(str(relationship), analysis, sql):
+            errors.append(
+                f"missing_db_memory_required_join:{memory_key}:{relationship}"
+            )
+    for filter_spec in contract.get("required_filters", []) or []:
+        if not isinstance(filter_spec, dict):
+            continue
+        if not _sql_contains_contract_filter(filter_spec, analysis):
+            errors.append(
+                "missing_db_memory_required_filter:"
+                f"{memory_key}:{filter_spec.get('ref')}={filter_spec.get('value')}"
+            )
+    for aggregation in contract.get("required_aggregations", []) or []:
+        if not isinstance(aggregation, dict):
+            continue
+        function = str(aggregation.get("function") or "").lower()
+        ref = str(aggregation.get("ref") or "")
+        if function and ref and not _sql_contains_aggregation(function, ref, analysis):
+            errors.append(
+                f"missing_db_memory_required_aggregation:"
+                f"{memory_key}:{function}:{ref}"
+            )
+    result_shape = contract.get("result_shape") or {}
+    if result_shape.get("grain") == "single_aggregate":
+        if plan.group_by or re.search(r"\bgroup\s+by\b", sql, re.IGNORECASE):
+            errors.append(
+                f"missing_db_memory_required_result_shape:"
+                f"{memory_key}:single_aggregate"
+            )
+        elif not _looks_aggregated(sql):
+            errors.append(
+                f"missing_db_memory_required_result_shape:"
+                f"{memory_key}:single_aggregate"
+            )
+
+
+def _validate_unit_contract(
+    contract: dict[str, Any],
+    analysis: Any,
+    sql: str,
+    errors: list[str],
+) -> None:
+    conversion = contract.get("unit_conversion") or {}
+    if conversion.get("operator") not in {"divide", "multiply"}:
+        return
+    required_refs = [str(ref) for ref in contract.get("required_refs", []) or [] if ref]
+    if not required_refs:
+        return
+    memory_key = _memory_key(contract)
+    factor = str(conversion.get("factor") or "")
+    for ref in required_refs:
+        item = _select_item_for_ref(ref, analysis)
+        if item is None:
+            continue
+        expression = str(getattr(item, "expression_sql", "") or "")
+        if conversion["operator"] == "divide":
+            if re.search(rf"/\s*{re.escape(factor)}(?:\.0+)?\b", expression):
+                continue
+        if conversion["operator"] == "multiply":
+            if re.search(rf"\*\s*{re.escape(factor)}(?:\.0+)?\b", expression):
+                continue
+        if not _prompted_raw_unit_alias(item, conversion):
+            errors.append(
+                f"missing_db_memory_required_unit_conversion:"
+                f"{memory_key}:{ref}:{conversion['operator']}:{factor}"
+            )
+
+
+def _sql_column_refs(analysis: Any, schema: dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    table_columns = _table_columns(schema)
+    sql_tables = [
+        table.short_key for table in getattr(analysis, "tables", ()) if not table.is_cte
+    ]
+    for column in getattr(analysis, "columns", ()) or ():
+        name = str(getattr(column, "name", "") or "").lower()
+        table = _short_table_key(getattr(column, "table", "") or None)
+        if table:
+            refs.add(f"{table}.{name}")
+            continue
+        matching_tables = [
+            table_name
+            for table_name, columns in table_columns.items()
+            if name in columns and (not sql_tables or table_name in sql_tables)
+        ]
+        for table_name in matching_tables:
+            refs.add(f"{table_name}.{name}")
+        refs.add(name)
+    return refs
+
+
+def _sql_references_ref(ref: str, sql_refs: set[str]) -> bool:
+    table, column = _split_column_ref(ref)
+    if table and column:
+        return f"{_short_table_key(table)}.{column.lower()}" in sql_refs
+    return column.lower() in sql_refs
+
+
+def _sql_contains_contract_filter(filter_spec: dict[str, Any], analysis: Any) -> bool:
+    ref = str(filter_spec.get("ref") or "")
+    table, column = _split_column_ref(ref)
+    expected_operator = _normalize_operator(
+        "="
+        if str(filter_spec.get("operator") or "").lower() == "semantic_equals"
+        else filter_spec.get("operator")
+    )
+    expected_value = str(filter_spec.get("value") or "").lower()
+    for predicate in getattr(analysis, "literal_predicates", ()) or ():
+        predicate_column = getattr(predicate, "column", None)
+        predicate_table = str(getattr(predicate_column, "table", "") or "") or None
+        predicate_column_name = str(getattr(predicate_column, "name", "") or "")
+        if column.lower() != predicate_column_name.lower():
+            continue
+        if table and _short_table_key(table) != _short_table_key(predicate_table):
+            continue
+        if _normalize_operator(getattr(predicate, "operator", "")) != expected_operator:
+            continue
+        values = {str(value).lower() for value in getattr(predicate, "values", ())}
+        if expected_value in values:
+            return True
+    return False
+
+
+def _sql_contains_relationship(relationship: str, analysis: Any, sql: str) -> bool:
+    if "->" not in relationship:
+        return False
+    left, right = [part.strip() for part in relationship.split("->", maxsplit=1)]
+    left_variants = _ref_sql_variants(left, analysis)
+    right_variants = _ref_sql_variants(right, analysis)
+    normalized = _normalized_sql_text(sql)
+    for left_variant in left_variants:
+        for right_variant in right_variants:
+            left_pattern = re.escape(left_variant).replace(r"\.", r"\s*\.\s*")
+            right_pattern = re.escape(right_variant).replace(r"\.", r"\s*\.\s*")
+            if re.search(rf"{left_pattern}\s*=\s*{right_pattern}", normalized):
+                return True
+            if re.search(rf"{right_pattern}\s*=\s*{left_pattern}", normalized):
+                return True
+    return False
+
+
+def _sql_contains_aggregation(function: str, ref: str, analysis: Any) -> bool:
+    for item in getattr(analysis, "select_items", ()) or ():
+        expression = str(getattr(item, "expression_sql", "") or "").lower()
+        if f"{function.lower()}(" not in expression:
+            continue
+        if any(
+            variant in _normalized_sql_text(expression)
+            for variant in _ref_sql_variants(ref, analysis)
+        ):
+            return True
+    return False
+
+
+def _select_item_for_ref(ref: str, analysis: Any) -> Any | None:
+    for item in getattr(analysis, "select_items", ()) or ():
+        expression = _normalized_sql_text(getattr(item, "expression_sql", "") or "")
+        if any(variant in expression for variant in _ref_sql_variants(ref, analysis)):
+            return item
+    return None
+
+
+def _prompted_raw_unit_alias(item: Any, conversion: dict[str, Any]) -> bool:
+    alias = str(getattr(item, "alias", "") or "").lower()
+    stored_unit = str(conversion.get("stored_unit") or "").lower()
+    return bool(stored_unit and stored_unit in alias)
+
+
+def _ref_sql_variants(ref: str, analysis: Any) -> set[str]:
+    table, column = _split_column_ref(ref)
+    column_key = column.lower()
+    table_key = _short_table_key(table)
+    sql_tables = [
+        table_ref
+        for table_ref in getattr(analysis, "tables", ()) or ()
+        if not getattr(table_ref, "is_cte", False)
+    ]
+    if not table_key:
+        return {column_key}
+    variants = {f"{table_key}.{column_key}"}
+    matching_tables = [
+        table_ref
+        for table_ref in sql_tables
+        if getattr(table_ref, "short_key", "") == table_key
+    ]
+    if matching_tables or not sql_tables:
+        variants.add(column_key)
+    for table_ref in matching_tables:
+        alias = str(getattr(table_ref, "alias", "") or "").lower()
+        if alias:
+            variants.add(f"{alias}.{column_key}")
+    return variants
+
+
+def _normalized_sql_text(sql: str) -> str:
+    return re.sub(r'["`\[\]]', "", str(sql or "").lower())
+
+
+def _memory_key(contract: dict[str, Any]) -> str:
+    return str(contract.get("memory_key") or contract.get("key") or "db_memory")
 
 
 def _fingerprint(value: Any) -> str:

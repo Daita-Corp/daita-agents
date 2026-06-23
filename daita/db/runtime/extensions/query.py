@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation, Task
 
-from ...analysis import stable_fingerprint
+from ...analysis import stable_fingerprint, structural_schema_fingerprint
 from ...plan_validation import DbQueryPlanValidator
 from ...planning_context import DbPlanningContextBuilder
 from ...query_plan import DbQueryPlan
@@ -81,7 +81,7 @@ class DbPlanningContextExecutor:
                 else None
             ),
             capability_summaries=_planner_capability_summaries(runtime),
-            source=runtime.source,
+            source=_runtime_source_plugin(runtime),
         )
         return [builder.evidence_for(planning_context)]
 
@@ -266,9 +266,9 @@ def _compact_prepare_context(
     schema_evidence: Evidence | None,
     schema: dict[str, Any],
 ) -> dict[str, Any]:
+    source = _runtime_source_plugin(runtime)
     dialect = (
-        str(schema.get("database_type") or getattr(runtime.source, "sql_dialect", ""))
-        or None
+        str(schema.get("database_type") or getattr(source, "sql_dialect", "")) or None
     )
     return {
         "operation_id": operation.id,
@@ -304,7 +304,7 @@ def _compact_prepare_context(
         "column_value_evidence_refs": [],
         "column_value_hints": [],
         "included_sections": ["schema"],
-        "schema_fingerprint": stable_fingerprint(schema),
+        "schema_fingerprint": structural_schema_fingerprint(schema),
         "diagnostics": {"mode": "prepare_read_compact"},
     }
 
@@ -331,6 +331,13 @@ def _planner_capability_summaries(runtime: Any) -> tuple[dict[str, Any], ...]:
             }
         )
     return tuple(sorted(summaries, key=lambda item: (item["owner"], item["id"])))
+
+
+def _runtime_source_plugin(runtime: Any) -> Any:
+    for plugin in getattr(getattr(runtime, "config", None), "plugins", ()) or ():
+        if getattr(plugin, "sql_dialect", None) and hasattr(plugin, "query"):
+            return plugin
+    return getattr(runtime, "source", None)
 
 
 def _predicted_evidence_id(

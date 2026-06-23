@@ -441,6 +441,8 @@ def _resolve_memory_plugin(
         workspace=_memory_workspace(memory_config),
         scope="project",
         auto_curate="manual",
+        db_memory_mode=True,
+        db_memory_retrieval_mode=memory_config.retrieval_mode,
         **_memory_plugin_kwargs(memory),
     )
     backend = _memory_backend(memory)
@@ -467,9 +469,12 @@ def _resolve_memory_config(
         )
         if not config.enabled:
             return replace(config, recall="off", learning="off")
+        _validate_embedding_mode_config(config, memory)
         return config
     if isinstance(memory, dict):
         values = dict(memory)
+        embedding_available = _memory_embedding_explicit(memory)
+        backend = values.get("backend")
         if values.get("enabled") is False:
             values.setdefault("recall", "off")
             values.setdefault("learning", "off")
@@ -482,8 +487,20 @@ def _resolve_memory_config(
             "default_ttl_days",
         ):
             values.pop(key, None)
+        if backend is not None:
+            values.setdefault("backend", _memory_backend_name(backend))
+            values.setdefault(
+                "structured_index",
+                str(getattr(backend, "structured_index", "custom") or "custom"),
+            )
+            embedding_available = bool(
+                getattr(backend, "embedding_available", embedding_available)
+            )
+        values["embedding_available"] = embedding_available
         values["source_identity"] = values.get("source_identity") or source_identity
-        return DbMemoryConfig(**values)
+        config = DbMemoryConfig(**values)
+        _validate_embedding_mode_config(config, memory)
+        return config
     _ensure_supported_memory_option(memory)
     return DbMemoryConfig(source_identity=source_identity)
 
@@ -512,6 +529,39 @@ def _memory_plugin_kwargs(memory: _DbMemoryOption) -> dict[str, Any]:
         if key in memory:
             kwargs[key] = memory[key]
     return kwargs
+
+
+def _memory_embedding_explicit(memory: _DbMemoryOption) -> bool:
+    if not isinstance(memory, dict):
+        return False
+    return any(
+        memory.get(key) is not None
+        for key in ("embedding_provider", "embedding_model", "embedder")
+    )
+
+
+def _memory_backend_name(backend: Any) -> str:
+    name = type(backend).__name__.lower()
+    if "supabase" in name:
+        return "supabase"
+    if "local" in name:
+        return "local"
+    return name or "custom"
+
+
+def _validate_embedding_mode_config(
+    memory_config: DbMemoryConfig,
+    memory: _DbMemoryOption,
+) -> None:
+    if not memory_config.enabled:
+        return
+    if memory_config.retrieval_mode == "structured":
+        return
+    if not _memory_embedding_explicit(memory):
+        raise ValueError(
+            "memory.retrieval_mode='hybrid' or 'embedding' requires an explicit "
+            "embedding_provider, embedding_model, or embedder"
+        )
 
 
 def _memory_backend(memory: _DbMemoryOption) -> Any | None:

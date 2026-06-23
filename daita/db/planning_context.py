@@ -9,10 +9,12 @@ from typing import Any
 
 from daita.runtime import Evidence, Operation
 
+from .analysis import structural_schema_fingerprint
 from .memory import (
     db_memory_options_from_from_db_options,
     db_memory_refs_from_recall_evidence,
 )
+from .memory_contracts import project_db_memory_semantic_contracts
 from .models import DbIntent, DbRequest, DbRuntimeConfig
 from .session_context import db_session_context_from_request
 
@@ -33,8 +35,10 @@ class DbPlanningContext:
     column_value_evidence_refs: tuple[str, ...] = ()
     column_value_hints: tuple[dict[str, Any], ...] = ()
     db_memory_refs: tuple[dict[str, Any], ...] = ()
+    db_memory_semantics: tuple[dict[str, Any], ...] = ()
     db_memory_evidence_refs: tuple[str, ...] = ()
     db_memory_diagnostics: dict[str, Any] = field(default_factory=dict)
+    db_memory_contract_diagnostics: dict[str, Any] = field(default_factory=dict)
     source_evidence_refs: tuple[dict[str, Any], ...] = ()
     source_fingerprints: dict[str, str] = field(default_factory=dict)
     capability_summaries: tuple[dict[str, Any], ...] = ()
@@ -64,8 +68,10 @@ class DbPlanningContext:
             "column_value_evidence_refs": list(self.column_value_evidence_refs),
             "column_value_hints": [dict(item) for item in self.column_value_hints],
             "db_memory_refs": [dict(item) for item in self.db_memory_refs],
+            "db_memory_semantics": [dict(item) for item in self.db_memory_semantics],
             "db_memory_evidence_refs": list(self.db_memory_evidence_refs),
             "db_memory_diagnostics": dict(self.db_memory_diagnostics),
+            "db_memory_contract_diagnostics": dict(self.db_memory_contract_diagnostics),
             "source_evidence_refs": [dict(item) for item in self.source_evidence_refs],
             "source_fingerprints": dict(self.source_fingerprints),
             "capability_summaries": [dict(item) for item in self.capability_summaries],
@@ -104,7 +110,7 @@ class DbPlanningContextBuilder:
         source: Any = None,
     ) -> DbPlanningContext:
         schema = dict(schema_evidence.payload) if schema_evidence is not None else {}
-        schema_fingerprint = _fingerprint(schema)
+        schema_fingerprint = structural_schema_fingerprint(schema)
         dialect = (
             str(
                 schema.get("database_type")
@@ -174,8 +180,25 @@ class DbPlanningContextBuilder:
             **db_memory_diagnostics,
             **dict(memory_recall_diagnostics or {}),
         }
+        policy_summary = {
+            "read_only": getattr(source, "read_only", None),
+            "allowed_tables": sorted(getattr(source, "allowed_tables", set()) or []),
+            "blocked_tables": sorted(getattr(source, "blocked_tables", set()) or []),
+            "blocked_columns": sorted(getattr(source, "blocked_columns", set()) or []),
+        }
+        db_memory_semantics, db_memory_contract_diagnostics = (
+            project_db_memory_semantic_contracts(
+                db_memory_refs,
+                prompt=request.prompt,
+                schema=schema,
+                policy_summary=policy_summary,
+                source_identity=memory_options.get("source_identity"),
+            )
+        )
         if db_memory_refs:
             included_sections.append("db_memory")
+        if db_memory_semantics:
+            included_sections.append("db_memory_semantics")
         diagnostics = {
             "schema_table_count": len(schema.get("tables", []) or []),
             "context_budget": options.get("planner_context_budget"),
@@ -185,6 +208,7 @@ class DbPlanningContextBuilder:
             "capability_summary_count": len(capability_summaries),
             "column_value_hint_count": len(column_value_hints),
             "db_memory_ref_count": len(db_memory_refs),
+            "db_memory_contract_count": len(db_memory_semantics),
         }
         session_context = _compact_session_context(request)
         if session_context:
@@ -202,8 +226,10 @@ class DbPlanningContextBuilder:
             column_value_evidence_refs=_evidence_refs(column_value_evidence),
             column_value_hints=column_value_hints,
             db_memory_refs=db_memory_refs,
+            db_memory_semantics=db_memory_semantics,
             db_memory_evidence_refs=db_memory_evidence_refs,
             db_memory_diagnostics=db_memory_diagnostics,
+            db_memory_contract_diagnostics=db_memory_contract_diagnostics,
             source_evidence_refs=source_refs,
             source_fingerprints=source_fingerprints,
             capability_summaries=tuple(capability_summaries),
@@ -225,18 +251,7 @@ class DbPlanningContextBuilder:
                     }
                 ),
             },
-            policy_summary={
-                "read_only": getattr(source, "read_only", None),
-                "allowed_tables": sorted(
-                    getattr(source, "allowed_tables", set()) or []
-                ),
-                "blocked_tables": sorted(
-                    getattr(source, "blocked_tables", set()) or []
-                ),
-                "blocked_columns": sorted(
-                    getattr(source, "blocked_columns", set()) or []
-                ),
-            },
+            policy_summary=policy_summary,
             limit_summary={
                 "max_rows": self.config.limits.max_rows,
                 "timeout_seconds": self.config.limits.timeout_seconds,

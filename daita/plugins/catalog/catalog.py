@@ -1766,7 +1766,7 @@ def _candidate_value_mapping(
                 confidence = 1.0
                 reason = "exact_match"
             elif _lexical_value_match(token, observed_text):
-                confidence = 0.78
+                confidence = 0.82
                 reason = "lexical_stem_match"
             if confidence and (best is None or confidence > best[0]):
                 best = (confidence, token, observed, reason)

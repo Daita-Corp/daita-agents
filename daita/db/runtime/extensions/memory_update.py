@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation, Task
 
-from ...analysis import stable_fingerprint
+from ...analysis import stable_fingerprint, structural_schema_fingerprint
 from ...memory import (
     db_memory_options_from_runtime_metadata,
     db_memory_record_chunk_ids_by_key,
@@ -41,7 +41,7 @@ class DbMemoryPlanUpdateExecutor:
         source_identity = str(memory_options.get("source_identity") or "").strip()
         schema_fingerprint = task.input.get("schema_fingerprint")
         if not schema_fingerprint and schema:
-            schema_fingerprint = stable_fingerprint(schema)
+            schema_fingerprint = structural_schema_fingerprint(schema)
 
         proposal, validation = DbMemoryCommandService().plan_update(
             request,

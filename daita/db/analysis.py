@@ -409,6 +409,70 @@ def stable_fingerprint(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def structural_schema_fingerprint(schema: Mapping[str, Any] | None) -> str | None:
+    """Fingerprint catalog-owned schema structure without incidental metadata."""
+    if not schema:
+        return None
+    return stable_fingerprint(_structural_schema_payload(schema))
+
+
+def _structural_schema_payload(schema: Mapping[str, Any]) -> dict[str, Any]:
+    tables = []
+    for table in schema.get("tables", []) or []:
+        if not isinstance(table, Mapping):
+            continue
+        table_name = str(table.get("name") or "").strip()
+        if not table_name:
+            continue
+        columns = []
+        for column in table.get("columns", []) or []:
+            if not isinstance(column, Mapping):
+                continue
+            column_name = str(column.get("name") or "").strip()
+            if not column_name:
+                continue
+            columns.append(
+                {
+                    "name": column_name,
+                    "data_type": column.get("data_type"),
+                    "is_primary_key": bool(column.get("is_primary_key")),
+                }
+            )
+        tables.append(
+            {
+                "name": table_name,
+                "columns": sorted(columns, key=lambda item: item["name"]),
+            }
+        )
+
+    foreign_keys = []
+    for foreign_key in schema.get("foreign_keys", []) or []:
+        if not isinstance(foreign_key, Mapping):
+            continue
+        foreign_keys.append(
+            {
+                "source_table": foreign_key.get("source_table"),
+                "source_column": foreign_key.get("source_column"),
+                "target_table": foreign_key.get("target_table"),
+                "target_column": foreign_key.get("target_column"),
+            }
+        )
+
+    return {
+        "database_type": schema.get("database_type"),
+        "tables": sorted(tables, key=lambda item: item["name"]),
+        "foreign_keys": sorted(
+            foreign_keys,
+            key=lambda item: (
+                str(item.get("source_table") or ""),
+                str(item.get("source_column") or ""),
+                str(item.get("target_table") or ""),
+                str(item.get("target_column") or ""),
+            ),
+        ),
+    }
+
+
 def analysis_metadata(
     *,
     analysis_id: str,
