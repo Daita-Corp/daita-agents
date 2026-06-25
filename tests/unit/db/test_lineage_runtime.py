@@ -142,6 +142,34 @@ async def test_lineage_executors_return_typed_evidence_without_graph_backend():
     assert impact[0].payload["total_affected_count"] == 1
 
 
+async def test_lineage_trace_falls_back_when_graph_dependency_missing():
+    class MissingGraphDependencyBackend:
+        async def subgraph(self, **_kwargs):
+            raise ModuleNotFoundError("No module named 'networkx'")
+
+    lineage = LineagePlugin(
+        backend=MissingGraphDependencyBackend(),
+        risk_thresholds={"HIGH": 3, "MEDIUM": 1},
+    )
+    lineage._flows.append(
+        {
+            "flow_id": "flow:test",
+            "source_id": "table:raw_orders",
+            "target_id": "table:orders",
+            "flow_type": "transforms",
+            "transformation": "Load cleaned orders",
+            "metadata": {},
+            "registered_at": "2026-06-25T00:00:00+00:00",
+        }
+    )
+
+    result = await lineage.trace_lineage("table:orders", direction="upstream")
+
+    assert lineage._graph_backend is None
+    assert result["upstream_count"] == 1
+    assert result["lineage"]["upstream"][0]["entity_id"] == "table:raw_orders"
+
+
 async def test_db_runtime_executes_lineage_trace_with_typed_evidence():
     runtime, _, _ = await _runtime()
 

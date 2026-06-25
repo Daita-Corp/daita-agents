@@ -315,48 +315,55 @@ class LineagePlugin(BasePlugin):
             Lineage graph with sources and destinations
         """
         if self._graph_backend:
-            from daita.core.graph.algorithms import (
-                LINEAGE_EDGE_TYPES,
-                traverse,
-            )
+            try:
+                from daita.core.graph.algorithms import (
+                    LINEAGE_EDGE_TYPES,
+                    traverse,
+                )
 
-            effective_edge_types = edge_types or LINEAGE_EDGE_TYPES
-            graph = await self._graph_backend.subgraph(
-                root=entity_id,
-                direction=direction,
-                edge_types=effective_edge_types,
-                max_depth=max_depth,
-            )
-            result = traverse(
-                graph,
-                entity_id,
-                direction=direction,
-                max_depth=max_depth,
-                edge_types=effective_edge_types,
-            )
-            if direction == "both":
-                upstream = result.get("upstream", [])
-                downstream = result.get("downstream", [])
-            elif direction == "upstream":
-                upstream = result
-                downstream = []
-            else:
-                upstream = []
-                downstream = result
-            upstream = _json_safe(upstream)
-            downstream = _json_safe(downstream)
-            upstream = [_lineage_entity_payload(item) for item in upstream]
-            downstream = [_lineage_entity_payload(item) for item in downstream]
-            lineage = {
-                "entity_id": entity_id,
-                "upstream": upstream,
-                "downstream": downstream,
-            }
-            return {
-                "lineage": lineage,
-                "upstream_count": len(upstream),
-                "downstream_count": len(downstream),
-            }
+                effective_edge_types = edge_types or LINEAGE_EDGE_TYPES
+                graph = await self._graph_backend.subgraph(
+                    root=entity_id,
+                    direction=direction,
+                    edge_types=effective_edge_types,
+                    max_depth=max_depth,
+                )
+                result = traverse(
+                    graph,
+                    entity_id,
+                    direction=direction,
+                    max_depth=max_depth,
+                    edge_types=effective_edge_types,
+                )
+                if direction == "both":
+                    upstream = result.get("upstream", [])
+                    downstream = result.get("downstream", [])
+                elif direction == "upstream":
+                    upstream = result
+                    downstream = []
+                else:
+                    upstream = []
+                    downstream = result
+                upstream = _json_safe(upstream)
+                downstream = _json_safe(downstream)
+                upstream = [_lineage_entity_payload(item) for item in upstream]
+                downstream = [_lineage_entity_payload(item) for item in downstream]
+                lineage = {
+                    "entity_id": entity_id,
+                    "upstream": upstream,
+                    "downstream": downstream,
+                }
+                return {
+                    "lineage": lineage,
+                    "upstream_count": len(upstream),
+                    "downstream_count": len(downstream),
+                }
+            except ImportError as exc:
+                logger.debug(
+                    "LineagePlugin: graph traversal unavailable; using in-memory flows: %s",
+                    exc,
+                )
+                self._graph_backend = None
 
         # In-memory fallback (no backend initialized)
         lineage = {"entity_id": entity_id, "upstream": [], "downstream": []}
@@ -665,37 +672,46 @@ class LineagePlugin(BasePlugin):
             Impact analysis with affected entities
         """
         if self._graph_backend:
-            from daita.core.graph.algorithms import (
-                LINEAGE_EDGE_TYPES,
-                impact_analysis,
-            )
+            try:
+                from daita.core.graph.algorithms import (
+                    LINEAGE_EDGE_TYPES,
+                    impact_analysis,
+                )
 
-            effective_edge_types = edge_types or LINEAGE_EDGE_TYPES
-            graph = await self._graph_backend.subgraph(
-                root=entity_id,
-                direction="downstream",
-                edge_types=effective_edge_types,
-                max_depth=max_depth,
-            )
-            result = impact_analysis(graph, entity_id, edge_types=effective_edge_types)
+                effective_edge_types = edge_types or LINEAGE_EDGE_TYPES
+                graph = await self._graph_backend.subgraph(
+                    root=entity_id,
+                    direction="downstream",
+                    edge_types=effective_edge_types,
+                    max_depth=max_depth,
+                )
+                result = impact_analysis(
+                    graph, entity_id, edge_types=effective_edge_types
+                )
 
-            # Nodes with path_length == 1 are directly connected
-            directly_affected = sum(
-                1 for n in result["affected_nodes"] if n["path_length"] == 1
-            )
+                # Nodes with path_length == 1 are directly connected
+                directly_affected = sum(
+                    1 for n in result["affected_nodes"] if n["path_length"] == 1
+                )
 
-            return {
-                "entity_id": entity_id,
-                "change_type": change_type,
-                "max_depth": max_depth,
-                "directly_affected_count": directly_affected,
-                "total_affected_count": result["affected_count"],
-                "affected_entities": _json_safe(result["affected_nodes"]),
-                "risk_level": result["risk_level"],
-                "recommendation": self._get_impact_recommendation(
-                    result["risk_level"], change_type
-                ),
-            }
+                return {
+                    "entity_id": entity_id,
+                    "change_type": change_type,
+                    "max_depth": max_depth,
+                    "directly_affected_count": directly_affected,
+                    "total_affected_count": result["affected_count"],
+                    "affected_entities": _json_safe(result["affected_nodes"]),
+                    "risk_level": result["risk_level"],
+                    "recommendation": self._get_impact_recommendation(
+                        result["risk_level"], change_type
+                    ),
+                }
+            except ImportError as exc:
+                logger.debug(
+                    "LineagePlugin: graph impact analysis unavailable; using in-memory flows: %s",
+                    exc,
+                )
+                self._graph_backend = None
 
         # In-memory fallback — no graph backend available
         downstream_result = await self.trace_lineage(
