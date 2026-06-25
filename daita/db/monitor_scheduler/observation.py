@@ -16,6 +16,7 @@ from ..sql_evidence import (
     effective_source_scope,
     sql_validation_facts_from_evidence,
 )
+from .params import resolve_observation_params, resolve_monitor_state_ref
 from .state import _iso, _parse_iso
 from .types import (
     DbMonitorObservationBlocked,
@@ -135,11 +136,13 @@ class DbMonitorObservationRunner:
             )
 
         owner = _observation_capability_owner(plan)
+        params, param_specs = resolve_observation_params(plan, state)
         try:
             validation_task, read_task = self.runtime.plan_validated_read_tasks(
                 operation,
                 sql=sql,
-                params=_observation_params(plan, state),
+                params=params,
+                param_specs=param_specs,
                 owner=owner,
                 reason="monitor_observation_read",
                 sequence=1,
@@ -326,7 +329,11 @@ def _observation_sql(plan: Mapping[str, Any]) -> str:
 
 def _observation_capability_owner(plan: Mapping[str, Any]) -> str | None:
     owner = (
-        plan.get("capability_owner") or plan.get("source_owner") or plan.get("owner")
+        plan.get("execution_owner")
+        or plan.get("validation_owner")
+        or plan.get("capability_owner")
+        or plan.get("source_owner")
+        or plan.get("owner")
     )
     return str(owner) if owner else None
 
@@ -412,31 +419,13 @@ def _observation_params(
     plan: Mapping[str, Any],
     state: DbMonitorState,
 ) -> list[Any]:
-    return [
-        _resolve_observation_param(value, state)
-        for value in list(plan.get("parameters") or plan.get("params") or ())
-    ]
+    params, _param_specs = resolve_observation_params(plan, state)
+    return params
 
 
 def _resolve_observation_param(value: Any, state: DbMonitorState) -> Any:
-    if not isinstance(value, str):
-        return value
-    if value.startswith("monitor.state.cursor."):
-        current: Any = state.cursor
-        for part in value.removeprefix("monitor.state.cursor.").split("."):
-            if isinstance(current, Mapping):
-                current = current.get(part)
-            else:
-                return None
-        return current
-    if value.startswith("cursor."):
-        current = state.cursor
-        for part in value.removeprefix("cursor.").split("."):
-            if isinstance(current, Mapping):
-                current = current.get(part)
-            else:
-                return None
-        return current
+    if isinstance(value, str):
+        return resolve_monitor_state_ref(value, state)
     return value
 
 

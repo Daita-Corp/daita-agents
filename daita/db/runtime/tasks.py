@@ -558,11 +558,21 @@ class DbRuntimeTasksMixin:
             {
                 "sql_ref": "sql.validation",
                 "params": list(input.get("params") or []),
+                **(
+                    {"param_specs": list(input.get("param_specs") or [])}
+                    if input.get("param_specs")
+                    else {}
+                ),
             }
             if capability.id == "db.sql.execute_read"
             else {
                 "sql_ref": "sql.validation",
                 "params": list(input.get("params") or []),
+                **(
+                    {"param_specs": list(input.get("param_specs") or [])}
+                    if input.get("param_specs")
+                    else {}
+                ),
             }
         )
         execute_task = self._task_for_capability(
@@ -581,6 +591,7 @@ class DbRuntimeTasksMixin:
         *,
         sql: str,
         params: tuple[Any, ...] | list[Any] = (),
+        param_specs: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
         owner: str | None = None,
         reason: str = "validated_read",
         sequence: int = 1,
@@ -610,6 +621,8 @@ class DbRuntimeTasksMixin:
             "sql_ref": "sql.validation",
             "params": list(params),
         }
+        if param_specs:
+            execute_input["param_specs"] = list(param_specs)
         if focus is not None:
             execute_input["focus"] = focus
         read_task = self._task_for_capability(

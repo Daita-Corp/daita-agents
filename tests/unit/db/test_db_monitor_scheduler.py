@@ -85,6 +85,8 @@ class MonitorValidateProbeExecutor:
         )
         is_read = lowered.startswith("select ") or lowered.startswith("with ")
         tables = ["orders"]
+        if "runtime_operations" in lowered:
+            tables = ["runtime_operations"]
         if "customers" in lowered:
             tables = ["customers"]
         return [
@@ -871,12 +873,20 @@ async def test_planned_read_observation_resolves_cursor_parameters_before_read()
         observation_plan={
             "kind": "planned_read",
             "sql": "select * from orders where id > ? order by id asc limit 100",
-            "parameters": ["monitor.state.cursor.last_id"],
+            "parameters": [
+                {
+                    "ref": "monitor.state.cursor.last_id",
+                    "source": "monitor_state",
+                    "path": ["cursor", "last_id"],
+                }
+            ],
             "cursor": {"field": "id", "initialization": "zero"},
             "cursor_update": {"last_id": "max(rows.id)"},
             "value_path": "rows",
             "source_scope": ["orders"],
-            "capability_owner": "monitor_read_probe",
+            "validation_owner": "monitor_read_probe",
+            "execution_owner": "monitor_read_probe",
+            "sql_dialect": "sqlite",
         },
         trigger={
             "type": "new_rows",
@@ -906,9 +916,89 @@ async def test_planned_read_observation_resolves_cursor_parameters_before_read()
         task for task, _, _ in calls if task.capability_id == "db.sql.execute_read"
     )
     assert read_task.input["params"] == [17]
+    assert read_task.input["param_specs"] == [
+        {
+            "ref": "monitor.state.cursor.last_id",
+            "source": "monitor_state",
+            "path": ["cursor", "last_id"],
+        }
+    ]
     assert "focus" not in read_task.input
     updated = await runtime.monitor_store.load_monitor_state("new_orders_monitor")
     assert updated.cursor["last_id"] == 42
+
+
+async def test_planned_read_observation_preserves_typed_param_specs_before_read():
+    plugin = MonitorReadProbePlugin(
+        rows=[{"id": 1, "created_at": "2026-06-24T18:30:00+00:00"}]
+    )
+    runtime = DbRuntime(
+        runtime_id="db-monitor-scheduler-typed-cursor-params",
+        plugins=(plugin,),
+    )
+    typed_param = {
+        "ref": "monitor.state.cursor.last_created_at",
+        "source": "monitor_state",
+        "path": ["cursor", "last_created_at"],
+        "table": "runtime_operations",
+        "column": "created_at",
+        "db_type": "timestamp with time zone",
+        "native_type": "datetime",
+        "dialect": "postgresql",
+        "nullable": False,
+    }
+    await _create_monitor(
+        runtime,
+        "runtime_operations_new_rows",
+        observation_plan={
+            "kind": "planned_read",
+            "sql": (
+                "select * from runtime_operations "
+                "where created_at > $1 order by created_at asc limit 100"
+            ),
+            "parameters": [typed_param],
+            "cursor": {"field": "created_at", "initialization": "monitor_created_at"},
+            "cursor_update": {"last_created_at": "max(rows.created_at)"},
+            "value_path": "rows",
+            "source_scope": ["runtime_operations"],
+            "validation_owner": "monitor_read_probe",
+            "execution_owner": "monitor_read_probe",
+            "sql_dialect": "postgresql",
+        },
+        trigger={
+            "type": "new_rows",
+            "path": "rows",
+            "operator": "count_gt",
+            "value": 0,
+        },
+    )
+    state = await runtime.monitor_store.load_monitor_state(
+        "runtime_operations_new_rows"
+    )
+    assert state is not None
+    await runtime.monitor_store.save_monitor_state(
+        replace(
+            state,
+            cursor={"last_created_at": "2026-06-24T18:22:26.382861+00:00"},
+        )
+    )
+    calls = []
+    original_execute_task = runtime.execute_task
+
+    async def spy_execute_task(task, operation, context=None):
+        calls.append((task, operation, context))
+        return await original_execute_task(task, operation, context=context)
+
+    runtime.execute_task = spy_execute_task
+
+    runs = await runtime.tick_monitors(now=NOW)
+
+    assert runs[0].status == "triggered"
+    read_task = next(
+        task for task, _, _ in calls if task.capability_id == "db.sql.execute_read"
+    )
+    assert read_task.input["params"] == ["2026-06-24T18:22:26.382861+00:00"]
+    assert read_task.input["param_specs"] == [typed_param]
 
 
 async def test_rest_source_observation_executes_through_runtime_and_cites_plugin_evidence():

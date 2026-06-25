@@ -1,7 +1,14 @@
+from datetime import date, datetime, time, timezone
+from decimal import Decimal
+from uuid import UUID
+
+import pytest
+
 from daita.db import DbRequest, DbRuntime
 from daita.db.runtime import DbRuntimeGovernanceBlocked
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.postgresql import PostgreSQLPlugin
+from daita.plugins.sql_params import SQLParameterCoercionError, coerce_sql_params
 
 
 def _postgres() -> PostgreSQLPlugin:
@@ -168,6 +175,110 @@ async def test_postgresql_sql_executors_return_typed_evidence_without_live_db():
     assert plan[0].payload["plan"] == [{"QUERY PLAN": "Seq Scan on orders"}]
     assert write[0].kind == "write.execution"
     assert write[0].payload["affected_rows"] == 3
+
+
+def test_postgresql_typed_parameter_coercion_covers_json_restored_values():
+    params = coerce_sql_params(
+        [
+            "2026-06-24T18:22:26.382861+00:00",
+            "2026-06-24",
+            "18:22:26",
+            "6f78f12b-6b6d-42f6-b5bf-f0d25e7cb5ba",
+            "12.34",
+            '{"ok": true}',
+            {"nested": ["value"]},
+            "42",
+            "3.5",
+            "true",
+            123,
+        ],
+        [
+            {"ref": "monitor.state.cursor.last_created_at", "db_type": "timestamptz"},
+            {"db_type": "date"},
+            {"db_type": "time"},
+            {"db_type": "uuid"},
+            {"db_type": "numeric"},
+            {"db_type": "jsonb"},
+            {"db_type": "jsonb"},
+            {"db_type": "integer"},
+            {"db_type": "double precision"},
+            {"db_type": "boolean"},
+            {"db_type": "text"},
+        ],
+        dialect="postgresql",
+    )
+
+    assert params == [
+        datetime(2026, 6, 24, 18, 22, 26, 382861, tzinfo=timezone.utc),
+        date(2026, 6, 24),
+        time(18, 22, 26),
+        UUID("6f78f12b-6b6d-42f6-b5bf-f0d25e7cb5ba"),
+        Decimal("12.34"),
+        '{"ok": true}',
+        '{"nested":["value"]}',
+        42,
+        3.5,
+        True,
+        "123",
+    ]
+
+
+def test_postgresql_invalid_typed_parameter_error_is_actionable():
+    with pytest.raises(SQLParameterCoercionError) as exc_info:
+        coerce_sql_params(
+            ["not-a-date"],
+            [
+                {
+                    "ref": "monitor.state.cursor.last_created_at",
+                    "db_type": "timestamptz",
+                }
+            ],
+            dialect="postgresql",
+        )
+
+    message = str(exc_info.value)
+    assert "monitor.state.cursor.last_created_at" in message
+    assert "timestamptz" in message
+    assert "raw type str" in message
+
+
+async def test_postgresql_executor_coerces_monitor_param_before_driver_call():
+    postgres = _postgres()
+    captured = {}
+
+    async def fake_query(sql, params=None):
+        captured["query"] = (sql, params)
+        return [{"id": 1}]
+
+    postgres.query = fake_query
+    postgres.connect = _noop_connect
+
+    await postgres._execute_sql_read(
+        {
+            "sql": (
+                "select * from runtime_operations "
+                "where created_at > $1 order by created_at asc limit 100"
+            ),
+            "params": ["2026-06-24T18:22:26.382861+00:00"],
+            "param_specs": [
+                {
+                    "ref": "monitor.state.cursor.last_created_at",
+                    "source": "monitor_state",
+                    "path": ["cursor", "last_created_at"],
+                    "table": "runtime_operations",
+                    "column": "created_at",
+                    "db_type": "timestamp with time zone",
+                    "native_type": "datetime",
+                    "dialect": "postgresql",
+                    "nullable": False,
+                }
+            ],
+        }
+    )
+
+    bound = captured["query"][1][0]
+    assert isinstance(bound, datetime)
+    assert bound.tzinfo is not None
 
 
 async def test_postgresql_column_value_profile_uses_bounded_aggregate_sql():

@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from daita.db import DbAgent, DbMonitor, DbRuntime
+from daita.db import DbAgent, DbMonitor, DbMonitorState, DbRuntime
 from daita.db.monitor_commands import (
     DbCommandRouter,
     DbMonitorCommand,
@@ -499,6 +499,95 @@ def test_monitor_create_intent_extracts_conversational_preamble_and_compact_name
     assert proposal["metadata"]["prompt"] == original_prompt
     assert proposal["metadata"]["intent"]["target"]["name"] == "operations"
     assert validation.accepted is False
+
+
+def test_monitor_create_postgres_planned_read_uses_selected_dialect_contract():
+    command = DbMonitorCommand(
+        kind="create",
+        prompt=(
+            "Create a monitor on the runtime_operations table. Notify me in app "
+            "when a new record comes through. Poll every 5 mins."
+        ),
+        confidence=0.88,
+    )
+    schema = {**_schema_metadata("runtime_operations"), "database_type": "postgresql"}
+
+    proposal, _validation = DbMonitorPlanner().create_proposal(
+        command,
+        schema=schema,
+    )
+
+    plan = proposal["observation_plan"]
+    assert plan["kind"] == "planned_read"
+    assert plan["sql_dialect"] == "postgresql"
+    assert plan["validation_owner"] == "postgresql"
+    assert plan["execution_owner"] == "postgresql"
+    assert plan["sql"] == (
+        "select * from runtime_operations "
+        "where created_at > $1 order by created_at asc limit 100"
+    )
+    assert "?" not in plan["sql"]
+    assert plan["parameters"] == [
+        {
+            "ref": "monitor.state.cursor.last_created_at",
+            "source": "monitor_state",
+            "path": ["cursor", "last_created_at"],
+            "table": "runtime_operations",
+            "column": "created_at",
+            "db_type": "timestamp",
+            "native_type": "datetime",
+            "dialect": "postgresql",
+        }
+    ]
+    assert plan["cursor"]["column_type"] == {
+        "table": "runtime_operations",
+        "column": "created_at",
+        "db_type": "timestamp",
+        "native_type": "datetime",
+        "dialect": "postgresql",
+    }
+
+
+def test_monitor_create_validation_rejects_placeholder_style_for_selected_dialect():
+    planner = DbMonitorPlanner()
+
+    validation = planner.validate(
+        action_steps=(),
+        actions=(),
+        source_scope=("runtime_operations",),
+        policy={},
+        budgets={},
+        observation_plan={
+            "kind": "planned_read",
+            "target_type": "table",
+            "target_name": "runtime_operations",
+            "sql_dialect": "postgresql",
+            "validation_owner": "postgresql",
+            "execution_owner": "postgresql",
+            "sql": (
+                "select * from runtime_operations where created_at > ? "
+                "order by created_at asc limit 100"
+            ),
+            "parameters": [
+                {
+                    "ref": "monitor.state.cursor.last_created_at",
+                    "source": "monitor_state",
+                    "path": ["cursor", "last_created_at"],
+                    "table": "runtime_operations",
+                    "column": "created_at",
+                }
+            ],
+            "cursor": {"field": "created_at"},
+            "cursor_update": {"last_created_at": "max(rows.created_at)"},
+            "value_path": "rows",
+        },
+        schedule={"interval_seconds": 300},
+        trigger={"operator": "count_gt", "value": 0},
+        action_plan={"kind": "none", "steps": []},
+    )
+
+    assert validation.accepted is False
+    assert "monitor.proposal_invalid:sql_placeholder_dialect" in validation.errors
 
 
 @pytest.mark.parametrize(
@@ -1289,7 +1378,20 @@ async def test_create_monitor_prompt_requires_approval_then_resumes_to_create_mo
     assert monitors[0].name == "Users New Rows"
     assert monitors[0].observation_plan["cursor"]["field"] == "created_at"
     evidence = await runtime.store.list_evidence(result.operation_id)
-    assert any(item.kind == "monitor.definition" and item.accepted for item in evidence)
+    proposal = next(item for item in evidence if item.kind == "monitor.proposal")
+    definition = next(item for item in evidence if item.kind == "monitor.definition")
+    assert proposal.payload["initial_state"]["cursor"]["last_created_at"]
+    assert definition.accepted is True
+    assert definition.payload["monitor_state"]["monitor_id"] == "users_new_rows"
+    assert definition.payload["monitor_state"]["cursor"] == (
+        proposal.payload["initial_state"]["cursor"]
+    )
+    assert definition.payload["monitor_state"]["last_operation_id"] == (
+        result.operation_id
+    )
+    assert definition.payload["monitor_state"]["last_management_operation_id"] == (
+        result.operation_id
+    )
 
 
 async def test_create_monitor_prompt_extracts_on_table_target_before_approval():
@@ -1522,6 +1624,18 @@ async def test_monitor_commit_replay_is_idempotent_and_preserves_initial_cursor(
     assert inspection is not None
     assert inspection.state is not None
     assert inspection.state.cursor == proposal.payload["initial_state"]["cursor"]
+    advanced_state = DbMonitorState.from_dict(
+        {
+            **inspection.state.to_dict(),
+            "cursor": {
+                **inspection.state.cursor,
+                "last_created_at": "2099-01-01T00:00:00+00:00",
+                "advanced_by": "tick",
+            },
+            "last_tick_operation_id": "tick-op-1",
+        }
+    )
+    await runtime.monitor_store.save_monitor_state(advanced_state)
 
     replay_task = await runtime.kernel.plan_task(
         operation_id=result.operation_id,
@@ -1560,6 +1674,7 @@ async def test_monitor_commit_replay_is_idempotent_and_preserves_initial_cursor(
         item for item in replay_evidence if item.kind == "monitor.definition"
     )
     assert definition.payload["idempotent_existing"] is True
+    assert definition.payload["monitor_state"] == advanced_state.to_dict()
 
 
 async def test_monitor_create_metadata_is_ready_for_worker_handoff():

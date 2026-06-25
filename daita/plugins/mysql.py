@@ -18,6 +18,7 @@ from .mysql_extensions import (
     mysql_evidence_schemas,
     mysql_tool_views,
 )
+from .sql_params import coerce_sql_params, param_specs_from_payload
 
 if TYPE_CHECKING:
     from ..core.tools import LocalTool
@@ -203,22 +204,40 @@ class MySQLPlugin(BaseDatabasePlugin):
 
     async def _execute_sql_read(self, payload: Any) -> Dict[str, Any]:
         args = dict(payload or {})
+        params = coerce_sql_params(
+            list(args.get("params") or []),
+            param_specs_from_payload(args),
+            dialect="mysql",
+            json_binding="text",
+        )
         return await self._run_guarded_tool_query(
             str(args.get("sql") or ""),
-            list(args.get("params") or []),
+            params,
             args.get("focus"),
         )
 
     async def _execute_sql_write(self, payload: Any) -> Dict[str, Any]:
         args = dict(payload or {})
         sql = self._prepare_tool_execute_sql(str(args.get("sql") or ""))
-        affected_rows = await self.execute(sql, list(args.get("params") or []))
+        params = coerce_sql_params(
+            list(args.get("params") or []),
+            param_specs_from_payload(args),
+            dialect="mysql",
+            json_binding="text",
+        )
+        affected_rows = await self.execute(sql, params)
         return {"sql": sql, "affected_rows": affected_rows}
 
     async def _execute_sql_explain(self, payload: Any) -> Dict[str, Any]:
         args = dict(payload or {})
         sql = self._prepare_tool_query_sql(str(args.get("sql") or ""))
-        rows = await self.query(f"EXPLAIN {sql}", list(args.get("params") or []))
+        params = coerce_sql_params(
+            list(args.get("params") or []),
+            param_specs_from_payload(args),
+            dialect="mysql",
+            json_binding="text",
+        )
+        rows = await self.query(f"EXPLAIN {sql}", params)
         return {"sql": sql, "plan": rows}
 
     async def connect(self):

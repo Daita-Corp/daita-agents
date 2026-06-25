@@ -152,6 +152,9 @@ class DbMonitorCommitCreateExecutor:
                     ),
                 )
             )
+        committed_state = await runtime.monitor_store.load_monitor_state(monitor.id)
+        if committed_state is None:
+            committed_state = DbMonitorState(monitor_id=monitor.id)
         return [
             Evidence(
                 kind="monitor.definition",
@@ -161,6 +164,7 @@ class DbMonitorCommitCreateExecutor:
                 accepted=True,
                 payload={
                     "monitor": monitor.to_dict(),
+                    "monitor_state": committed_state.to_dict(),
                     "proposal_evidence_id": proposal_evidence.id,
                     "proposal_fingerprint": actual_fingerprint,
                     "idempotent_existing": committed_existing,

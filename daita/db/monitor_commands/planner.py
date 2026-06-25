@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 import hashlib
 import json
 import re
@@ -17,6 +19,7 @@ from ..monitor_plugin_planning import (
 from ..models import DbRequest
 from ..monitors import DbMonitor
 from ..query_metadata import column_name, is_numeric_type, matching_tables
+from ...core.db_type_metadata import column_type_metadata
 from .extractor import DeterministicMonitorIntentExtractor
 from .intent import MonitorConditionIntent, MonitorCreateIntent
 from .naming import monitor_display_name, monitor_id as monitor_id_from_intent
@@ -99,6 +102,7 @@ class DbMonitorPlanner:
             target,
             budgets=budgets,
             schema=schema,
+            registry=self.registry,
         )
         action_plan = _notification_action_plan(intent)
         validation = self.validate(
@@ -289,6 +293,7 @@ def _planned_read_observation_plan(
     *,
     budgets: dict[str, Any],
     schema: dict[str, Any] | None,
+    registry: ExtensionRegistry | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if not _valid_sql_identifier(target):
         return (
@@ -317,6 +322,14 @@ def _planned_read_observation_plan(
     max_rows = max(1, min(max_rows, 1000))
     field = cursor["field"]
     cursor_key = cursor["cursor_key"]
+    sql_contract = _planned_read_sql_contract(schema, registry)
+    placeholder = _sql_placeholder(sql_contract["sql_dialect"], 1)
+    parameter = _cursor_observation_parameter(
+        cursor,
+        target=target,
+        cursor_key=cursor_key,
+        dialect=sql_contract["sql_dialect"],
+    )
     return (
         {
             "kind": "planned_read",
@@ -324,29 +337,208 @@ def _planned_read_observation_plan(
             "target_name": target,
             "sql": (
                 f"select * from {target} "
-                f"where {field} > ? order by {field} asc limit "
+                f"where {field} > {placeholder} order by {field} asc limit "
                 f"{max_rows}"
             ),
-            "parameters": [f"monitor.state.cursor.{cursor_key}"],
+            "parameters": [parameter],
             "cursor": {
                 "field": field,
                 "initialization": cursor["initialization"],
                 "strategy": cursor["strategy"],
                 "source": cursor["source"],
+                **(
+                    {"column_type": cursor["column_type"]}
+                    if cursor.get("column_type")
+                    else {}
+                ),
             },
             "cursor_update": {
                 cursor_key: f"max(rows.{field})",
             },
             "max_rows": max_rows,
             "value_path": "rows",
-            "validation_owner": "db_runtime",
             "capability_id": "db.sql.execute_read",
+            **sql_contract,
         },
         {
             cursor_key: cursor["initial_value"],
             "initialized_from": "monitor_create",
         },
     )
+
+
+def _cursor_observation_parameter(
+    cursor: dict[str, Any],
+    *,
+    target: str,
+    cursor_key: str,
+    dialect: str,
+) -> dict[str, Any]:
+    ref = f"monitor.state.cursor.{cursor_key}"
+    base = {
+        "ref": ref,
+        "source": "monitor_state",
+        "path": ["cursor", cursor_key],
+        "table": target,
+        "column": str(cursor["field"]),
+    }
+    column_type = cursor.get("column_type")
+    if not isinstance(column_type, dict):
+        return base
+    db_type = column_type.get("db_type")
+    native_type = column_type.get("native_type")
+    param_dialect = column_type.get("dialect") or dialect
+    return {
+        **base,
+        "table": str(column_type.get("table") or target),
+        "column": str(column_type.get("column") or cursor["field"]),
+        **({"db_type": str(db_type)} if db_type else {}),
+        **({"native_type": str(native_type)} if native_type else {}),
+        **({"dialect": str(param_dialect)} if param_dialect else {}),
+        **(
+            {"nullable": column_type["nullable"]}
+            if column_type.get("nullable") is not None
+            else {}
+        ),
+    }
+
+
+def _planned_read_sql_contract(
+    schema: dict[str, Any] | None,
+    registry: ExtensionRegistry | None,
+) -> dict[str, str]:
+    schema_spec = _sql_dialect_spec(
+        (schema or {}).get("sql_dialect") or (schema or {}).get("database_type")
+    )
+    read_owners = _capability_owners(registry, "db.sql.execute_read")
+    validate_owners = _capability_owners(registry, "db.sql.validate")
+    compatible_owners = read_owners & validate_owners
+    known_owner = (
+        schema_spec.dialect.value
+        if schema_spec is not None and schema_spec.dialect is not _SqlDialect.STANDARD
+        else None
+    )
+    if known_owner and (not compatible_owners or known_owner in compatible_owners):
+        owner = known_owner
+    elif len(compatible_owners) == 1:
+        owner = next(iter(compatible_owners))
+    elif len(read_owners) == 1:
+        owner = next(iter(read_owners))
+    else:
+        owner = "db_runtime"
+    dialect_spec = (
+        schema_spec
+        or _sql_dialect_spec(owner)
+        or _SQL_DIALECT_SPECS[_SqlDialect.STANDARD]
+    )
+    return {
+        "validation_owner": owner,
+        "execution_owner": owner,
+        "sql_dialect": dialect_spec.dialect.value,
+    }
+
+
+def _capability_owners(
+    registry: ExtensionRegistry | None,
+    capability_id: str,
+) -> set[str]:
+    if registry is None:
+        return set()
+    return {
+        str(capability.owner)
+        for capability in registry.capabilities
+        if capability.id == capability_id
+    }
+
+
+class _SqlDialect(str, Enum):
+    POSTGRESQL = "postgresql"
+    MYSQL = "mysql"
+    SQLITE = "sqlite"
+    STANDARD = "standard"
+
+
+class _PlaceholderStyle(Enum):
+    NUMBERED_DOLLAR = "numbered_dollar"
+    PERCENT_S = "percent_s"
+    QUESTION_MARK = "question_mark"
+
+
+@dataclass(frozen=True)
+class _SqlDialectSpec:
+    dialect: _SqlDialect
+    aliases: frozenset[str]
+    placeholder_style: _PlaceholderStyle
+
+    def placeholder(self, position: int) -> str:
+        if self.placeholder_style is _PlaceholderStyle.NUMBERED_DOLLAR:
+            return f"${position}"
+        if self.placeholder_style is _PlaceholderStyle.PERCENT_S:
+            return "%s"
+        return "?"
+
+    def placeholder_errors(self, sql: str, parameter_count: int) -> tuple[str, ...]:
+        if self.placeholder_style is _PlaceholderStyle.NUMBERED_DOLLAR:
+            if "?" in sql or "%s" in sql:
+                return ("monitor.proposal_invalid:sql_placeholder_dialect",)
+            found = {int(item) for item in re.findall(r"\$(\d+)", sql)}
+            expected = set(range(1, parameter_count + 1))
+            if expected <= found:
+                return ()
+            return ("monitor.proposal_invalid:sql_placeholder_count",)
+        if self.placeholder_style is _PlaceholderStyle.PERCENT_S:
+            if "?" in sql or re.search(r"\$\d+", sql):
+                return ("monitor.proposal_invalid:sql_placeholder_dialect",)
+            if sql.count("%s") >= parameter_count:
+                return ()
+            return ("monitor.proposal_invalid:sql_placeholder_count",)
+        if "%s" in sql or re.search(r"\$\d+", sql):
+            return ("monitor.proposal_invalid:sql_placeholder_dialect",)
+        if sql.count("?") >= parameter_count:
+            return ()
+        return ("monitor.proposal_invalid:sql_placeholder_count",)
+
+
+_SQL_DIALECT_SPECS = {
+    _SqlDialect.POSTGRESQL: _SqlDialectSpec(
+        dialect=_SqlDialect.POSTGRESQL,
+        aliases=frozenset({"postgresql", "postgres", "asyncpg"}),
+        placeholder_style=_PlaceholderStyle.NUMBERED_DOLLAR,
+    ),
+    _SqlDialect.MYSQL: _SqlDialectSpec(
+        dialect=_SqlDialect.MYSQL,
+        aliases=frozenset({"mysql", "aiomysql"}),
+        placeholder_style=_PlaceholderStyle.PERCENT_S,
+    ),
+    _SqlDialect.SQLITE: _SqlDialectSpec(
+        dialect=_SqlDialect.SQLITE,
+        aliases=frozenset({"sqlite", "aiosqlite"}),
+        placeholder_style=_PlaceholderStyle.QUESTION_MARK,
+    ),
+    _SqlDialect.STANDARD: _SqlDialectSpec(
+        dialect=_SqlDialect.STANDARD,
+        aliases=frozenset({"standard"}),
+        placeholder_style=_PlaceholderStyle.QUESTION_MARK,
+    ),
+}
+
+_SQL_DIALECT_ALIASES = {
+    alias: dialect
+    for dialect, spec in _SQL_DIALECT_SPECS.items()
+    for alias in spec.aliases
+}
+
+
+def _sql_dialect_spec(value: Any) -> _SqlDialectSpec | None:
+    dialect = _SQL_DIALECT_ALIASES.get(str(value or "").strip().lower())
+    if dialect is None:
+        return None
+    return _SQL_DIALECT_SPECS[dialect]
+
+
+def _sql_placeholder(dialect: str, position: int) -> str:
+    spec = _sql_dialect_spec(dialect) or _SQL_DIALECT_SPECS[_SqlDialect.STANDARD]
+    return spec.placeholder(position)
 
 
 def _cursor_strategy_from_schema(
@@ -372,6 +564,7 @@ def _cursor_strategy_from_schema(
             "initial_value": _now_iso(),
             "strategy": "insert_timestamp",
             "source": "schema_column",
+            "column_type": column_type_metadata(table, timestamp, schema),
         }
     primary_key = _auto_increment_primary_key(columns)
     if primary_key is not None:
@@ -383,6 +576,7 @@ def _cursor_strategy_from_schema(
             "initial_value": 0,
             "strategy": "auto_increment_primary_key",
             "source": "schema_primary_key",
+            "column_type": column_type_metadata(table, primary_key, schema),
         }
     return None
 
@@ -514,6 +708,7 @@ def _proposal_validation_errors(
             errors.append("monitor.proposal_incomplete:cursor")
         if not observation_plan.get("value_path"):
             errors.append("monitor.proposal_incomplete:value_path")
+        errors.extend(_placeholder_validation_errors(observation_plan))
     if schedule is None and stream is None:
         errors.append("monitor.proposal_incomplete:schedule_or_stream")
     if not trigger.get("operator") and not any(
@@ -525,6 +720,29 @@ def _proposal_validation_errors(
         if not isinstance(delivery, dict) or not delivery.get("delivery_kind"):
             errors.append("monitor.proposal_incomplete:delivery")
     return tuple(dict.fromkeys(errors))
+
+
+def _placeholder_validation_errors(
+    observation_plan: dict[str, Any],
+) -> tuple[str, ...]:
+    sql = observation_plan.get("sql")
+    if not isinstance(sql, str) or not sql.strip():
+        return ()
+    spec = _sql_dialect_spec(observation_plan.get("sql_dialect"))
+    if spec is None or spec.dialect is _SqlDialect.STANDARD:
+        return ()
+    validation_owner = observation_plan.get("validation_owner")
+    execution_owner = observation_plan.get("execution_owner")
+    errors: list[str] = []
+    if validation_owner and execution_owner and validation_owner != execution_owner:
+        errors.append("monitor.proposal_invalid:sql_owner_mismatch")
+    errors.extend(
+        spec.placeholder_errors(
+            sql,
+            len(list(observation_plan.get("parameters") or ())),
+        )
+    )
+    return tuple(errors)
 
 
 def _monitor_from_proposal(
