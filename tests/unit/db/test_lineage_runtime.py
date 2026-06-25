@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock
+
 from daita.db import DbRequest, DbRuntime
 from daita.plugins.base import PluginContext
 from daita.plugins.catalog import CatalogPlugin
@@ -84,12 +86,12 @@ def test_db_runtime_can_require_lineage_evidence_when_service_registered():
     assert selected["executor"] == "lineage.trace"
 
 
-async def test_lineage_setup_uses_plugin_context_and_auto_selects_backend(mocker):
+async def test_lineage_setup_uses_plugin_context_and_auto_selects_backend(monkeypatch):
     lineage = LineagePlugin()
-    mock_backend = mocker.MagicMock()
-    mocker.patch(
+    mock_backend = MagicMock()
+    monkeypatch.setattr(
         "daita.core.graph.backend.auto_select_backend",
-        return_value=mock_backend,
+        lambda graph_type: mock_backend,
     )
 
     await lineage.setup(
