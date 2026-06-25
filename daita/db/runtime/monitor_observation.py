@@ -15,8 +15,6 @@ from ..monitor_plugin_planning import (
 from .types import DbRuntimeGovernanceBlocked
 
 
-
-
 class DbRuntimeMonitorObservationMixin:
     async def execute_monitor_source_observation(
         self,

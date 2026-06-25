@@ -627,6 +627,7 @@ def _governance_policy_block_reason(governance: GovernanceResult) -> str | None:
         return "governance_approval_required"
     return None
 
+
 def _evidence_trace_summary(evidence: Evidence) -> dict[str, Any]:
     return {
         "id": evidence.id,
@@ -1247,4 +1248,3 @@ def _safe_source_repr(source: Any) -> str:
         user = credentials.split(":", 1)[0]
         netloc = f"{user}:***@{host}"
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
-

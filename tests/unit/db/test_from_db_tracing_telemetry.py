@@ -19,15 +19,13 @@ from daita.runtime import AccessMode, Evidence, OperationStatus
 
 async def _seed_sqlite(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script(
-        """
+    await plugin.execute_script("""
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL
         );
         INSERT INTO customers (name) VALUES ('Ada'), ('Linus');
-        """
-    )
+        """)
     await plugin.disconnect()
 
 
