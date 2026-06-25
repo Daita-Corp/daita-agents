@@ -68,6 +68,20 @@ class AgentEvent:
     # ERROR events
     error: Optional[str] = None
 
+    # Runtime correlation
+    runtime_id: Optional[str] = None
+    runtime_kind: Optional[str] = None
+    operation_id: Optional[str] = None
+    task_id: Optional[str] = None
+    capability_id: Optional[str] = None
+    executor_id: Optional[str] = None
+    plugin_id: Optional[str] = None
+    policy_id: Optional[str] = None
+    approval_id: Optional[str] = None
+    evidence_id: Optional[str] = None
+    trace_id: Optional[str] = None
+    span_id: Optional[str] = None
+
     # WATCH_TRIGGERED / WATCH_RESOLVED events
     watch_name: Optional[str] = None
     watch_event: Optional[Any] = None
@@ -103,6 +117,30 @@ class AgentEvent:
             data["cost"] = self.cost
         if self.error is not None:
             data["error"] = self.error
+        if self.runtime_id is not None:
+            data["runtime_id"] = self.runtime_id
+        if self.runtime_kind is not None:
+            data["runtime_kind"] = self.runtime_kind
+        if self.operation_id is not None:
+            data["operation_id"] = self.operation_id
+        if self.task_id is not None:
+            data["task_id"] = self.task_id
+        if self.capability_id is not None:
+            data["capability_id"] = self.capability_id
+        if self.executor_id is not None:
+            data["executor_id"] = self.executor_id
+        if self.plugin_id is not None:
+            data["plugin_id"] = self.plugin_id
+        if self.policy_id is not None:
+            data["policy_id"] = self.policy_id
+        if self.approval_id is not None:
+            data["approval_id"] = self.approval_id
+        if self.evidence_id is not None:
+            data["evidence_id"] = self.evidence_id
+        if self.trace_id is not None:
+            data["trace_id"] = self.trace_id
+        if self.span_id is not None:
+            data["span_id"] = self.span_id
 
         return data
 

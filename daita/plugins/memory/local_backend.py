@@ -47,11 +47,12 @@ class LocalMemoryBackend:
     def __init__(
         self,
         workspace: str,
-        embedder: "BaseEmbeddingProvider",
+        embedder: Optional["BaseEmbeddingProvider"] = None,
         agent_id: Optional[str] = None,
         scope: str = "project",
         base_dir: Optional[Path] = None,
         max_chunks: int = 2000,
+        default_source_identity: Optional[str] = None,
     ):
         self.workspace = workspace
         self.agent_id = agent_id
@@ -70,15 +71,137 @@ class LocalMemoryBackend:
         self.logs_dir = self.workspace_dir / "logs"
         self.memory_file = self.workspace_dir / "MEMORY.md"
         self.vector_db = self.workspace_dir / "vectors.db"
+        self.db_memory_db = self.workspace_dir / "db_semantics.db"
 
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
         from .storage import FileStorage
-        from .search import SQLiteVectorSearch
+        from .db_semantic_store import DBSemanticMemoryStore
 
         self.max_chunks = max_chunks
         self.storage = FileStorage(self.workspace_dir, agent_id=agent_id)
-        self.search = SQLiteVectorSearch(self.vector_db, embedder)
+        self.search = None
+        if embedder is not None:
+            from .search import SQLiteVectorSearch
+
+            self.search = SQLiteVectorSearch(self.vector_db, embedder)
+        self.db_semantic_store = DBSemanticMemoryStore(
+            self.db_memory_db,
+            default_source_identity=default_source_identity,
+        )
+        self._migrate_legacy_db_memory_chunks()
+
+    @property
+    def embedding_available(self) -> bool:
+        return self.search is not None
+
+    @property
+    def structured_index(self) -> str:
+        return "sqlite_fts5"
+
+    async def upsert_db_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        return await self.db_semantic_store.upsert_db_record(record)
+
+    async def delete_db_records_by_key(
+        self,
+        key: str,
+        *,
+        source_identity: Optional[str] = None,
+        category: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return await self.db_semantic_store.delete_db_records_by_key(
+            key,
+            source_identity=source_identity,
+            category=category,
+        )
+
+    async def list_db_records(
+        self,
+        *,
+        category: Optional[str] = None,
+        key: Optional[str] = None,
+        source_identity: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        return await self.db_semantic_store.list_db_records(
+            category=category,
+            key=key,
+            source_identity=source_identity,
+            limit=limit,
+        )
+
+    async def recall_db_records(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        score_threshold: float = 0.45,
+        source_identity: Optional[str] = None,
+        kinds: Optional[List[str]] = None,
+        category: str = "db_semantics",
+    ) -> List[Dict[str, Any]]:
+        return await self.db_semantic_store.recall_db_records(
+            query,
+            limit=limit,
+            score_threshold=score_threshold,
+            source_identity=source_identity,
+            kinds=kinds,
+            category=category,
+        )
+
+    def _migrate_legacy_db_memory_chunks(self) -> None:
+        """Move legacy metadata.db_memory chunks into the structured DB store."""
+        if not self.vector_db.exists():
+            return
+        conn = sqlite3.connect(str(self.vector_db))
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT chunk_id, metadata
+                FROM chunks
+                WHERE json_extract(metadata, '$.db_memory') IS NOT NULL
+                  AND json_extract(metadata, '$.category') IN (?, ?)
+                """,
+                ("db_semantics", "db_cache_marker"),
+            )
+            rows = cursor.fetchall()
+        except sqlite3.OperationalError:
+            conn.close()
+            return
+
+        migrated_chunk_ids: list[str] = []
+        for chunk_id, metadata_json in rows:
+            metadata = parse_metadata_json(metadata_json)
+            db_memory = metadata.get("db_memory")
+            if not isinstance(db_memory, dict):
+                continue
+            try:
+                normalized = self.db_semantic_store.upsert_db_record_sync(db_memory)
+            except Exception:
+                continue
+            if normalized.get("structured"):
+                migrated_chunk_ids.append(str(chunk_id))
+
+        if migrated_chunk_ids:
+            placeholders = ",".join("?" * len(migrated_chunk_ids))
+            cursor.execute(
+                f"DELETE FROM embeddings WHERE chunk_id IN ({placeholders})",
+                migrated_chunk_ids,
+            )
+            cursor.execute(
+                f"DELETE FROM chunks WHERE chunk_id IN ({placeholders})",
+                migrated_chunk_ids,
+            )
+            conn.commit()
+        conn.close()
+
+    def _require_vector_search(self) -> None:
+        if self.search is None:
+            raise RuntimeError(
+                "Generic memory recall requires an embedding provider. "
+                "Structured DB semantic memory is available for category='db_semantics'."
+            )
 
     async def remember(
         self,
@@ -103,6 +226,7 @@ class LocalMemoryBackend:
         await self.storage.append_to_daily_log(content, category)
 
         # Store directly in vector DB for immediate recall
+        self._require_vector_search()
         if metadata is None:
             metadata = MemoryMetadata(
                 content=content,
@@ -247,6 +371,7 @@ class LocalMemoryBackend:
         since: Optional[str] = None,
         before: Optional[str] = None,
     ) -> List[Dict]:
+        self._require_vector_search()
         results = await self.search.search(
             query, limit, score_threshold, category=category, since=since, before=before
         )
@@ -281,6 +406,7 @@ class LocalMemoryBackend:
         from .text_utils import extract_keywords
 
         keywords = extract_keywords(query)
+        self._require_vector_search()
 
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
@@ -347,6 +473,7 @@ class LocalMemoryBackend:
         from .query_router import QueryRouter
         import numpy as np
 
+        self._require_vector_search()
         route = QueryRouter.classify(query)
         # Use the caller's threshold if stricter, otherwise let the route loosen it
         effective_threshold = min(score_threshold, route.score_threshold)
@@ -464,6 +591,18 @@ class LocalMemoryBackend:
         self, category: str, min_importance: float = 0.0, limit: int = 100
     ) -> List[Dict[str, Any]]:
         """Direct category dump — no embedding call, no semantic ranking."""
+        if category in {"db_semantics", "db_cache_marker"}:
+            results = await self.list_db_records(category=category, limit=limit)
+            return [
+                result
+                for result in results
+                if result.get("metadata", {})
+                .get("db_memory", {})
+                .get("importance", 0.0)
+                >= min_importance
+            ]
+
+        self._require_vector_search()
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
         cursor.execute(
@@ -504,6 +643,7 @@ class LocalMemoryBackend:
         """
         if not items:
             return {"status": "success", "stored": 0, "skipped": 0, "items": []}
+        self._require_vector_search()
 
         prepared = []
         for i, item in enumerate(items):
@@ -562,6 +702,7 @@ class LocalMemoryBackend:
         """
         where_clauses = []
         params = []
+        self._require_vector_search()
         if entity is not None:
             where_clauses.append(
                 "LOWER(json_extract(f.value, '$.entity')) LIKE LOWER(?)"

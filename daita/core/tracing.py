@@ -29,11 +29,9 @@ import dataclasses
 import json
 import logging
 import os
-import time
 import threading
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -44,6 +42,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace import SpanKind
 from opentelemetry.trace.status import Status, StatusCode
 
+from .decision_tracing import DecisionEvent
 from .otel_exporter import BoundedInMemorySpanExporter, DaitaSpanExporter
 
 if TYPE_CHECKING:
@@ -55,7 +54,7 @@ DEFAULT_TRACE_PAYLOAD_MAX_CHARS = 12000
 
 
 # ---------------------------------------------------------------------------
-# Public enums / dataclasses (API unchanged)
+# Public enums / dataclasses
 # ---------------------------------------------------------------------------
 
 
@@ -64,7 +63,6 @@ class TraceType(str, Enum):
 
     AGENT_EXECUTION = "agent_execution"
     LLM_CALL = "llm_call"
-    WORKFLOW_COMMUNICATION = "workflow_communication"
     AGENT_LIFECYCLE = "agent_lifecycle"
     DECISION_TRACE = "decision_trace"
     TOOL_EXECUTION = "tool_execution"
@@ -241,6 +239,14 @@ def _map_metadata_to_attributes(
     # Agent name
     if metadata.get("agent_name"):
         attrs["daita.agent.name"] = str(metadata["agent_name"])
+    if metadata.get("user_id"):
+        attrs["daita.user.id"] = str(metadata["user_id"])
+    if metadata.get("session_id"):
+        attrs["daita.session.id"] = str(metadata["session_id"])
+    if metadata.get("mode"):
+        attrs["daita.mode"] = str(metadata["mode"])
+    if metadata.get("stateful_history") is not None:
+        attrs["daita.stateful_history"] = bool(metadata["stateful_history"])
 
     # OTel GenAI semconv
     if metadata.get("model"):
@@ -268,15 +274,38 @@ def _map_metadata_to_attributes(
     if metadata.get("tool_name"):
         attrs["daita.tool.name"] = str(metadata["tool_name"])
 
-    # Workflow attributes
-    if metadata.get("workflow_name"):
-        attrs["daita.workflow.name"] = str(metadata["workflow_name"])
-    if metadata.get("from_agent"):
-        attrs["daita.comm.from_agent"] = str(metadata["from_agent"])
-    if metadata.get("to_agent"):
-        attrs["daita.comm.to_agent"] = str(metadata["to_agent"])
-    if metadata.get("channel"):
-        attrs["daita.comm.channel"] = str(metadata["channel"])
+    runtime_id = metadata.get("runtime_id") or runtime_context.get("runtime_id")
+    if runtime_id:
+        attrs["daita.runtime.id"] = str(runtime_id)
+
+    runtime_kind = metadata.get("runtime_kind") or runtime_context.get("runtime_kind")
+    if runtime_kind:
+        attrs["daita.runtime.kind"] = str(runtime_kind)
+
+    for metadata_key, attribute_key in (
+        ("task_id", "daita.task.id"),
+        ("capability_id", "daita.capability.id"),
+        ("executor_id", "daita.executor.id"),
+        ("plugin_id", "daita.plugin.id"),
+        ("policy_id", "daita.policy.id"),
+        ("approval_id", "daita.approval.id"),
+        ("evidence_id", "daita.evidence.id"),
+        ("operation_type", "daita.operation.type"),
+        ("intent_kind", "daita.intent.kind"),
+        ("command_kind", "daita.command.kind"),
+        ("control_plane", "daita.control_plane"),
+        ("monitor_id", "daita.monitor.id"),
+        ("monitor_name", "daita.monitor.name"),
+        ("lease_owner", "daita.lease.owner"),
+        ("attempt_count", "daita.task.attempt_count"),
+        ("span_id", "daita.span.id"),
+        ("trace_id", "daita.trace.id"),
+    ):
+        value = metadata.get(metadata_key)
+        if value is None:
+            value = runtime_context.get(metadata_key)
+        if value is not None and value != "":
+            attrs[attribute_key] = str(value)
 
     # Deployment / environment
     deployment_id = metadata.get("deployment_id") or runtime_context.get(
@@ -312,7 +341,11 @@ def _map_metadata_to_attributes(
         attrs["daita.operation.id"] = str(operation_id)
         attrs["daita.execution.id"] = str(operation_id)
 
-    runtime = runtime_context.get("runtime") or os.getenv("DAITA_RUNTIME")
+    runtime = (
+        metadata.get("runtime")
+        or runtime_context.get("runtime")
+        or os.getenv("DAITA_RUNTIME")
+    )
     if runtime:
         attrs["daita.runtime"] = str(runtime)
 
@@ -591,6 +624,45 @@ class TraceManager:
         except Exception as e:
             logger.error(f"Failed to record LLM call for span {span_id}: {e}")
 
+    def record_runtime_correlation(self, span_id: str, **metadata: Any) -> None:
+        """Stamp runtime correlation attributes onto a live span."""
+        try:
+            with self._otel_spans_lock:
+                span = self._otel_spans.get(span_id)
+            if not span:
+                logger.debug(
+                    f"Cannot record runtime correlation for unknown span: {span_id}"
+                )
+                return
+            attrs = _map_metadata_to_attributes("", None, metadata)
+            for key, value in attrs.items():
+                if key != "daita.trace.type":
+                    span.set_attribute(key, value)
+        except Exception as e:
+            logger.error(
+                f"Failed to record runtime correlation for span {span_id}: {e}"
+            )
+
+    def current_trace_metadata(
+        self,
+        *,
+        span_name: str | None = None,
+        provider: str = "otel",
+    ) -> dict[str, str]:
+        """Return bounded trace correlation metadata for durable runtime state."""
+        trace_id = self.trace_context.current_trace_id
+        span_id = self.trace_context.current_span_id
+        if not trace_id or not span_id:
+            return {}
+        metadata = {
+            "trace_id": trace_id,
+            "root_span_id": span_id,
+            "provider": provider,
+        }
+        if span_name:
+            metadata["span_name"] = span_name
+        return metadata
+
     @asynccontextmanager
     async def span(
         self,
@@ -724,62 +796,6 @@ class TraceManager:
             logger.error(f"Error getting agent metrics: {e}")
             return {"total_operations": 0, "success_rate": 0}
 
-    def get_workflow_communications(
-        self, workflow_name: Optional[str] = None, limit: int = 20
-    ) -> List[Dict[str, Any]]:
-        """Get workflow communication traces (agent-to-agent messages)."""
-        try:
-            spans = [
-                s
-                for s in self._memory_exporter.get_finished_spans()
-                if (s.attributes or {}).get("daita.trace.type")
-                == TraceType.WORKFLOW_COMMUNICATION.value
-                and (
-                    workflow_name is None
-                    or (s.attributes or {}).get("daita.workflow.name") == workflow_name
-                )
-            ]
-            result = []
-            for s in reversed(spans[-limit:]):
-                d = _readable_span_to_dict(s)
-                attrs = s.attributes or {}
-                d["from_agent"] = attrs.get("daita.comm.from_agent", "unknown")
-                d["to_agent"] = attrs.get("daita.comm.to_agent", "unknown")
-                d["channel"] = attrs.get("daita.comm.channel", "unknown")
-                d["success"] = s.status and s.status.status_code == StatusCode.OK
-                result.append(d)
-            return result
-        except Exception as e:
-            logger.error(f"Error getting workflow communications: {e}")
-            return []
-
-    def get_workflow_metrics(self, workflow_name: str) -> Dict[str, Any]:
-        """Get metrics for a specific workflow."""
-        try:
-            spans = [
-                s
-                for s in self._memory_exporter.get_finished_spans()
-                if (s.attributes or {}).get("daita.trace.type")
-                == TraceType.WORKFLOW_COMMUNICATION.value
-                and (s.attributes or {}).get("daita.workflow.name") == workflow_name
-            ]
-            if not spans:
-                return {"total_messages": 0, "success_rate": 0}
-            total = len(spans)
-            successful = sum(
-                1 for s in spans if s.status and s.status.status_code == StatusCode.OK
-            )
-            return {
-                "workflow_name": workflow_name,
-                "total_messages": total,
-                "successful_messages": successful,
-                "failed_messages": total - successful,
-                "success_rate": successful / total,
-            }
-        except Exception as e:
-            logger.error(f"Error getting workflow metrics: {e}")
-            return {"total_messages": 0, "success_rate": 0}
-
     # ------------------------------------------------------------------
     # Decision stream callbacks (in-process, not OTel-related)
     # ------------------------------------------------------------------
@@ -866,8 +882,19 @@ class TraceManager:
         *,
         organization_id: Optional[Any] = None,
         api_key_id: Optional[Any] = None,
+        runtime_id: Optional[Any] = None,
+        runtime_kind: Optional[Any] = None,
         operation_id: Optional[Any] = None,
         execution_id: Optional[Any] = None,
+        task_id: Optional[Any] = None,
+        capability_id: Optional[Any] = None,
+        executor_id: Optional[Any] = None,
+        plugin_id: Optional[Any] = None,
+        policy_id: Optional[Any] = None,
+        approval_id: Optional[Any] = None,
+        evidence_id: Optional[Any] = None,
+        trace_id: Optional[Any] = None,
+        span_id: Optional[Any] = None,
         deployment_id: Optional[Any] = None,
         runtime: Optional[str] = None,
         environment: Optional[str] = None,
@@ -877,8 +904,19 @@ class TraceManager:
         updates = {
             "organization_id": organization_id,
             "api_key_id": api_key_id,
+            "runtime_id": runtime_id,
+            "runtime_kind": runtime_kind,
             "operation_id": operation_id,
             "execution_id": execution_id,
+            "task_id": task_id,
+            "capability_id": capability_id,
+            "executor_id": executor_id,
+            "plugin_id": plugin_id,
+            "policy_id": policy_id,
+            "approval_id": approval_id,
+            "evidence_id": evidence_id,
+            "trace_id": trace_id,
+            "span_id": span_id,
             "deployment_id": deployment_id,
             "runtime": runtime,
             "environment": environment,
@@ -920,8 +958,19 @@ def configure_tracing(
     dashboard_url: Optional[str] = None,
     organization_id: Optional[Any] = None,
     api_key_id: Optional[Any] = None,
+    runtime_id: Optional[Any] = None,
+    runtime_kind: Optional[Any] = None,
     operation_id: Optional[Any] = None,
     execution_id: Optional[Any] = None,
+    task_id: Optional[Any] = None,
+    capability_id: Optional[Any] = None,
+    executor_id: Optional[Any] = None,
+    plugin_id: Optional[Any] = None,
+    policy_id: Optional[Any] = None,
+    approval_id: Optional[Any] = None,
+    evidence_id: Optional[Any] = None,
+    trace_id: Optional[Any] = None,
+    span_id: Optional[Any] = None,
     deployment_id: Optional[Any] = None,
     runtime: Optional[str] = None,
     environment: Optional[str] = None,
@@ -939,6 +988,8 @@ def configure_tracing(
         dashboard_url: Explicit backend URL for the built-in Daita span exporter.
         organization_id: Organization ID stamped on subsequent spans.
         api_key_id: API key ID included in hosted span ingest payloads.
+        runtime_id: Runtime ID stamped on subsequent spans.
+        runtime_kind: Runtime kind stamped on subsequent spans.
         operation_id: Hosted operation ID stamped on subsequent spans.
         execution_id: Alias for operation_id when callers use execution terminology.
         deployment_id: Deployment ID stamped on subsequent spans.
@@ -970,8 +1021,19 @@ def configure_tracing(
         for value in (
             organization_id,
             api_key_id,
+            runtime_id,
+            runtime_kind,
             operation_id,
             execution_id,
+            task_id,
+            capability_id,
+            executor_id,
+            plugin_id,
+            policy_id,
+            approval_id,
+            evidence_id,
+            trace_id,
+            span_id,
             deployment_id,
             runtime,
             environment,
@@ -980,8 +1042,19 @@ def configure_tracing(
         tm.configure_runtime_context(
             organization_id=organization_id,
             api_key_id=api_key_id,
+            runtime_id=runtime_id,
+            runtime_kind=runtime_kind,
             operation_id=operation_id,
             execution_id=execution_id,
+            task_id=task_id,
+            capability_id=capability_id,
+            executor_id=executor_id,
+            plugin_id=plugin_id,
+            policy_id=policy_id,
+            approval_id=approval_id,
+            evidence_id=evidence_id,
+            trace_id=trace_id,
+            span_id=span_id,
             deployment_id=deployment_id,
             runtime=runtime,
             environment=environment,
@@ -998,8 +1071,19 @@ def set_trace_context(
     *,
     organization_id: Optional[Any] = None,
     api_key_id: Optional[Any] = None,
+    runtime_id: Optional[Any] = None,
+    runtime_kind: Optional[Any] = None,
     operation_id: Optional[Any] = None,
     execution_id: Optional[Any] = None,
+    task_id: Optional[Any] = None,
+    capability_id: Optional[Any] = None,
+    executor_id: Optional[Any] = None,
+    plugin_id: Optional[Any] = None,
+    policy_id: Optional[Any] = None,
+    approval_id: Optional[Any] = None,
+    evidence_id: Optional[Any] = None,
+    trace_id: Optional[Any] = None,
+    span_id: Optional[Any] = None,
     deployment_id: Optional[Any] = None,
     runtime: Optional[str] = None,
     environment: Optional[str] = None,
@@ -1008,8 +1092,19 @@ def set_trace_context(
     get_trace_manager().configure_runtime_context(
         organization_id=organization_id,
         api_key_id=api_key_id,
+        runtime_id=runtime_id,
+        runtime_kind=runtime_kind,
         operation_id=operation_id,
         execution_id=execution_id,
+        task_id=task_id,
+        capability_id=capability_id,
+        executor_id=executor_id,
+        plugin_id=plugin_id,
+        policy_id=policy_id,
+        approval_id=approval_id,
+        evidence_id=evidence_id,
+        trace_id=trace_id,
+        span_id=span_id,
         deployment_id=deployment_id,
         runtime=runtime,
         environment=environment,
@@ -1120,11 +1215,29 @@ def _readable_span_to_dict(span) -> Dict[str, Any]:
         span.status.description if span.status else None
     )
 
-    trace_type_str = attrs.get("daita.trace.type", "agent_execution")
-    try:
-        trace_type = TraceType(trace_type_str)
-    except ValueError:
-        trace_type = TraceType.AGENT_EXECUTION
+    correlation_metadata = {
+        public_key: attrs.get(attribute_key)
+        for public_key, attribute_key in (
+            ("runtime_id", "daita.runtime.id"),
+            ("runtime_kind", "daita.runtime.kind"),
+            ("operation_id", "daita.operation.id"),
+            ("execution_id", "daita.execution.id"),
+            ("operation_type", "daita.operation.type"),
+            ("intent_kind", "daita.intent.kind"),
+            ("command_kind", "daita.command.kind"),
+            ("control_plane", "daita.control_plane"),
+            ("monitor_id", "daita.monitor.id"),
+            ("monitor_name", "daita.monitor.name"),
+            ("task_id", "daita.task.id"),
+            ("capability_id", "daita.capability.id"),
+            ("executor_id", "daita.executor.id"),
+            ("plugin_id", "daita.plugin.id"),
+            ("policy_id", "daita.policy.id"),
+            ("approval_id", "daita.approval.id"),
+            ("evidence_id", "daita.evidence.id"),
+        )
+        if attrs.get(attribute_key) is not None
+    }
 
     return {
         "span_id": hex_span_id,
@@ -1132,7 +1245,7 @@ def _readable_span_to_dict(span) -> Dict[str, Any]:
         "parent_span_id": parent_span_id,
         "agent_id": attrs.get("daita.agent.id"),
         "operation": span.name,
-        "type": trace_type_str,
+        "type": attrs.get("daita.trace.type", "agent_execution"),
         "start_time": start_time,
         "end_time": end_time,
         "duration_ms": duration_ms,
@@ -1141,11 +1254,14 @@ def _readable_span_to_dict(span) -> Dict[str, Any]:
         "output_preview": output_preview,
         "error": error_message,
         "metadata": {
-            k: v
-            for k, v in attrs.items()
-            if not k.startswith("gen_ai.")
-            and not k.startswith("daita.")
-            and not k.startswith("deployment.")
+            **correlation_metadata,
+            **{
+                k: v
+                for k, v in attrs.items()
+                if not k.startswith("gen_ai.")
+                and not k.startswith("daita.")
+                and not k.startswith("deployment.")
+            },
         },
         "environment": attrs.get("deployment.environment", "development"),
         "deployment_id": attrs.get("deployment.id"),

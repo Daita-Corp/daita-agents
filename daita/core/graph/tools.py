@@ -31,7 +31,7 @@ from ..exceptions import ValidationError
 from .models import EdgeType
 
 if TYPE_CHECKING:
-    from ..tools import AgentTool
+    from ..tools import LocalTool
     from .backend import GraphBackend
 
 logger = logging.getLogger(__name__)
@@ -179,14 +179,14 @@ _GRAPH_TOOL_DEFAULTS = {
 def build_graph_tools(
     backend: "GraphBackend",
     default_edge_types: Optional[Iterable[EdgeType]] = None,
-) -> List["AgentTool"]:
-    """Build the list of generic graph-query AgentTools bound to ``backend``.
+) -> List["LocalTool"]:
+    """Build the list of generic graph-query LocalTools bound to ``backend``.
 
     ``default_edge_types`` sets the filter used when a tool invocation omits
     the ``edge_types`` argument. Pass ``LINEAGE_EDGE_TYPES`` to make these
     tools lineage-defaulted, or leave as None to follow every edge.
     """
-    from ..tools import AgentTool
+    from ..tools import LocalTool
 
     default_list: Optional[List[EdgeType]] = (
         list(default_edge_types) if default_edge_types else None
@@ -195,7 +195,7 @@ def build_graph_tools(
     edge_type_enum = sorted(e.value for e in EdgeType)
 
     return [
-        AgentTool(
+        LocalTool(
             name="graph_subgraph",
             description=(
                 "Return every node and edge reachable within a bounded radius "
@@ -237,7 +237,7 @@ def build_graph_tools(
             timeout_seconds=60,
             **_GRAPH_TOOL_DEFAULTS,
         ),
-        AgentTool(
+        LocalTool(
             name="graph_shortest_path",
             description=(
                 "Find the shortest path between two nodes, restricted to "
@@ -284,12 +284,12 @@ def register_graph_tools(
     backend: Optional["GraphBackend"] = None,
     default_edge_types: Optional[Iterable[EdgeType]] = None,
     graph_type: str = "lineage",
-) -> List["AgentTool"]:
+) -> List["LocalTool"]:
     """Attach the generic graph-query tools to ``agent``.
 
     Args:
         agent: An ``Agent`` instance (or anything exposing a
-            ``tool_registry`` with ``register_many``).
+            ``local_tool_catalog`` with ``register_many``).
         backend: Graph backend the tools should query. Defaults to
             ``auto_select_backend(graph_type)``.
         default_edge_types: Optional default filter applied when a tool
@@ -298,7 +298,7 @@ def register_graph_tools(
         graph_type: Graph namespace used when ``backend`` is None.
 
     Returns:
-        The list of registered AgentTool instances.
+        The list of registered LocalTool instances.
     """
     if backend is None:
         from .backend import auto_select_backend
@@ -307,9 +307,11 @@ def register_graph_tools(
 
     tools = build_graph_tools(backend, default_edge_types=default_edge_types)
 
-    registry = getattr(agent, "tool_registry", None)
+    registry = getattr(agent, "local_tool_catalog", None)
     if registry is None or not hasattr(registry, "register_many"):
-        raise TypeError("register_graph_tools requires an agent with a tool_registry.")
+        raise TypeError(
+            "register_graph_tools requires an agent with a local_tool_catalog."
+        )
     registry.register_many(tools)
     logger.info("Registered %d graph-query tools on agent", len(tools))
     return tools

@@ -41,13 +41,22 @@ Usage with Database Plugins:
 import logging
 import functools
 import re
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Callable, TYPE_CHECKING
 from datetime import datetime, timezone
+from enum import Enum
 
-from .base import BasePlugin
+from .base import BasePlugin, PluginContext
+from .lineage_extensions import (
+    LINEAGE_MANIFEST,
+    LineageExecutor,
+    lineage_capabilities,
+    lineage_evidence_schemas,
+    lineage_tool_views,
+)
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
     from ..core.graph.models import EdgeType
     from ..core.graph.resolution import AmbiguousReferencePolicy
 
@@ -77,6 +86,36 @@ def _parse_edge_types_arg(raw: Optional[List[str]]) -> Optional[List[Any]]:
     return out
 
 
+def _json_safe(value: Any) -> Any:
+    """Return a JSON-serializable copy of graph data for runtime evidence."""
+    if hasattr(value, "model_dump"):
+        try:
+            return _json_safe(value.model_dump(mode="json"))
+        except TypeError:
+            return _json_safe(value.model_dump())
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(v) for v in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _lineage_entity_payload(value: Any) -> Any:
+    """Ensure lineage node evidence exposes a stable entity_id key."""
+    if not isinstance(value, Mapping):
+        return value
+    payload = dict(value)
+    if "entity_id" not in payload and "node_id" in payload:
+        payload["entity_id"] = payload["node_id"]
+    return payload
+
+
 class LineagePlugin(BasePlugin):
     """
     Plugin for data lineage tracking and analysis.
@@ -91,6 +130,8 @@ class LineagePlugin(BasePlugin):
     - Pipeline definition
     - Lineage visualization export
     """
+
+    manifest = LINEAGE_MANIFEST
 
     def __init__(
         self,
@@ -107,7 +148,7 @@ class LineagePlugin(BasePlugin):
             storage: Optional legacy storage backend (GraphStore, BaseDatabasePlugin, etc.)
             organization_id: Optional organization ID for multi-tenant storage
             backend: Optional graph backend. If None, auto_select_backend() is called
-                     during initialize() to pick LocalGraphBackend or DynamoGraphBackend.
+                     during setup() to pick LocalGraphBackend or DynamoGraphBackend.
             risk_thresholds: Optional dict with "HIGH" and "MEDIUM" integer thresholds
                              used by the in-memory analyze_impact() fallback.
                              Defaults to {"HIGH": 20, "MEDIUM": 5}.
@@ -123,7 +164,7 @@ class LineagePlugin(BasePlugin):
 
         self._storage = storage
         self._organization_id = organization_id
-        self._graph_backend = backend  # None until initialize() resolves it
+        self._graph_backend = backend  # None until setup() resolves it
         self._agent_id: Optional[str] = None
         self._risk_thresholds = risk_thresholds or {"HIGH": 20, "MEDIUM": 5}
         self._ambiguity_policy = ambiguity_policy or AmbiguousReferencePolicy.STRICT
@@ -134,7 +175,48 @@ class LineagePlugin(BasePlugin):
 
         logger.debug(f"LineagePlugin initialized (storage: {storage is not None})")
 
-    def initialize(self, agent_id: str) -> None:
+    async def setup(self, context: PluginContext) -> None:
+        """Set up lineage runtime context and plugin-owned graph backend."""
+        self._configure_runtime(context.agent_id or context.runtime_id)
+
+    def declare_capabilities(self):
+        return lineage_capabilities()
+
+    def get_executors(self):
+        return (
+            LineageExecutor(
+                id="lineage.trace",
+                capability_ids=frozenset({"lineage.trace"}),
+                evidence_kind="lineage.trace",
+                handler=self._execute_trace_lineage,
+            ),
+            LineageExecutor(
+                id="lineage.impact.analyze",
+                capability_ids=frozenset({"lineage.impact.analyze"}),
+                evidence_kind="lineage.impact",
+                handler=self._execute_impact_analyze,
+            ),
+            LineageExecutor(
+                id="lineage.flow.register",
+                capability_ids=frozenset({"lineage.flow.register"}),
+                evidence_kind="lineage.flow_registered",
+                handler=self._execute_flow_register,
+            ),
+            LineageExecutor(
+                id="lineage.path.find",
+                capability_ids=frozenset({"lineage.path.find"}),
+                evidence_kind="lineage.path",
+                handler=self._execute_path_find,
+            ),
+        )
+
+    def declare_evidence_schemas(self):
+        return lineage_evidence_schemas()
+
+    def get_tool_views(self):
+        return lineage_tool_views()
+
+    def _configure_runtime(self, agent_id: str) -> None:
         self._agent_id = agent_id
         if self._graph_backend is None:
             from daita.core.graph.backend import auto_select_backend
@@ -149,217 +231,6 @@ class LineagePlugin(BasePlugin):
                     "LineagePlugin: graph backend unavailable; using in-memory flows: %s",
                     exc,
                 )
-
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose lineage tracking operations as agent tools.
-
-        5-tool surface covering every distinct lineage intent:
-          * trace_lineage       — upstream / downstream / both, edge-type filterable
-          * analyze_impact      — risk score for downstream breakage
-          * find_lineage_paths  — every path between two entities
-          * register_flow       — record a data movement
-          * export_lineage      — render the lineage graph as a diagram
-
-        register_pipeline and prune_stale_lineage remain on the Python API
-        (``self.register_pipeline`` / ``self.prune_stale``) but are not
-        exposed as tools — pipelines are declarative config and pruning is
-        scheduled maintenance, neither is an agent-driven action.
-        """
-        from ..core.tools import AgentTool
-        from ..core.graph.models import EdgeType
-
-        edge_type_enum = sorted(e.value for e in EdgeType)
-
-        def _lineage_tool(**kw) -> AgentTool:
-            return AgentTool(
-                category="lineage",
-                source="plugin",
-                plugin_name="Lineage",
-                **kw,
-            )
-
-        return [
-            _lineage_tool(
-                name="trace_lineage",
-                description=(
-                    "Trace the lineage of a data entity upstream, downstream, "
-                    "or both. Returns the reachable lineage graph scoped to "
-                    "LINEAGE_EDGE_TYPES by default (READS, WRITES, TRANSFORMS, "
-                    "SYNCS_TO, DERIVED_FROM, TRIGGERS, CALLS, PRODUCES). Pass "
-                    "a custom edge_types list to broaden or narrow the scope."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "entity_id": {
-                            "type": "string",
-                            "description": "ID of the entity to trace (e.g. 'table:orders', 'api:checkout').",
-                        },
-                        "direction": {
-                            "type": "string",
-                            "enum": ["upstream", "downstream", "both"],
-                            "description": "Traversal direction. Default 'both'.",
-                        },
-                        "max_depth": {
-                            "type": "integer",
-                            "description": "Maximum traversal depth (default 5).",
-                        },
-                        "edge_types": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": edge_type_enum},
-                            "description": (
-                                "Optional override of the edge-type allowlist. "
-                                "Omit for the default lineage set. Pass "
-                                "['references'] to follow FK edges only."
-                            ),
-                        },
-                    },
-                    "required": ["entity_id"],
-                },
-                handler=self._tool_trace_lineage,
-                timeout_seconds=60,
-            ),
-            _lineage_tool(
-                name="analyze_impact",
-                description=(
-                    "Score the downstream impact of a change to an entity. "
-                    "Returns affected entities ranked by cumulative "
-                    "impact_weight along the path, plus a HIGH / MEDIUM / LOW "
-                    "risk label. Traversal is bounded by max_depth and edge_types."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "entity_id": {
-                            "type": "string",
-                            "description": "Entity that will change.",
-                        },
-                        "change_type": {
-                            "type": "string",
-                            "description": "schema_change | deprecation | deletion | data_quality (default schema_change).",
-                        },
-                        "max_depth": {
-                            "type": "integer",
-                            "description": "Maximum impact radius in hops (default 5).",
-                        },
-                        "edge_types": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": edge_type_enum},
-                            "description": "Optional edge-type allowlist. Default: lineage edge types.",
-                        },
-                    },
-                    "required": ["entity_id"],
-                },
-                handler=self._tool_analyze_impact,
-                timeout_seconds=60,
-            ),
-            _lineage_tool(
-                name="find_lineage_paths",
-                description=(
-                    "Return every simple path from one entity to another "
-                    "(capped by cutoff). Use to answer 'how does data get "
-                    "from A to B?' with an explicit list of intermediate hops, "
-                    "rather than just a risk score."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "from_entity": {
-                            "type": "string",
-                            "description": "Source entity ID.",
-                        },
-                        "to_entity": {
-                            "type": "string",
-                            "description": "Target entity ID.",
-                        },
-                        "cutoff": {
-                            "type": "integer",
-                            "description": "Maximum path length in edges (default 5). Prevents combinatorial explosion on dense graphs.",
-                        },
-                        "edge_types": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": edge_type_enum},
-                            "description": "Optional edge-type allowlist. Default: lineage edge types.",
-                        },
-                    },
-                    "required": ["from_entity", "to_entity"],
-                },
-                handler=self._tool_find_lineage_paths,
-                timeout_seconds=60,
-            ),
-            _lineage_tool(
-                name="register_flow",
-                description=(
-                    "Record a data flow from a source entity to a target "
-                    "entity. Use for manual lineage capture (ETL jobs, API "
-                    "calls, syncs) that isn't covered by automatic SQL / "
-                    "function tracking."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "source_id": {
-                            "type": "string",
-                            "description": "Source entity ID.",
-                        },
-                        "target_id": {
-                            "type": "string",
-                            "description": "Target entity ID.",
-                        },
-                        "flow_type": {
-                            "type": "string",
-                            "description": "Edge semantic: reads | writes | transforms | syncs_to | derived_from | triggers | calls | produces (default transforms).",
-                        },
-                        "transformation": {
-                            "type": "string",
-                            "description": "Optional description of the transformation applied.",
-                        },
-                        "schedule": {
-                            "type": "string",
-                            "description": "Optional schedule pattern (e.g. '0 * * * *' for hourly).",
-                        },
-                        "metadata": {
-                            "type": "object",
-                            "description": "Optional additional metadata.",
-                        },
-                    },
-                    "required": ["source_id", "target_id"],
-                },
-                handler=self._tool_register_flow,
-                timeout_seconds=30,
-            ),
-            _lineage_tool(
-                name="export_lineage",
-                description="Render the lineage graph around an entity as a Mermaid or DOT diagram.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "entity_id": {
-                            "type": "string",
-                            "description": "Root entity for the diagram.",
-                        },
-                        "format": {
-                            "type": "string",
-                            "enum": ["mermaid", "dot"],
-                            "description": "Output format (default 'mermaid').",
-                        },
-                        "direction": {
-                            "type": "string",
-                            "enum": ["upstream", "downstream", "both"],
-                            "description": "Direction to include (default 'both').",
-                        },
-                        "max_depth": {
-                            "type": "integer",
-                            "description": "Maximum traversal depth (default 5).",
-                        },
-                    },
-                    "required": ["entity_id"],
-                },
-                handler=self._tool_export_lineage,
-                timeout_seconds=30,
-            ),
-        ]
 
     async def prune_stale(self, max_age_hours: float = 48) -> Dict[str, Any]:
         """
@@ -387,6 +258,10 @@ class LineagePlugin(BasePlugin):
     async def _tool_trace_lineage(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for trace_lineage"""
         entity_id = args.get("entity_id")
+        if not entity_id:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError("entity_id is required", field="entity_id")
         direction = args.get("direction", "both")
         max_depth = args.get("max_depth", 5)
         edge_types = _parse_edge_types_arg(args.get("edge_types"))
@@ -397,6 +272,22 @@ class LineagePlugin(BasePlugin):
             max_depth=max_depth,
             edge_types=edge_types,
         )
+
+    async def _execute_trace_lineage(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._tool_trace_lineage(args)
+
+    async def _execute_impact_analyze(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._tool_analyze_impact(args)
+
+    async def _execute_flow_register(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._tool_register_flow(args)
+
+    async def _execute_path_find(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._tool_find_lineage_paths(args)
 
     async def trace_lineage(
         self,
@@ -424,44 +315,55 @@ class LineagePlugin(BasePlugin):
             Lineage graph with sources and destinations
         """
         if self._graph_backend:
-            from daita.core.graph.algorithms import (
-                LINEAGE_EDGE_TYPES,
-                traverse,
-            )
+            try:
+                from daita.core.graph.algorithms import (
+                    LINEAGE_EDGE_TYPES,
+                    traverse,
+                )
 
-            effective_edge_types = edge_types or LINEAGE_EDGE_TYPES
-            graph = await self._graph_backend.subgraph(
-                root=entity_id,
-                direction=direction,
-                edge_types=effective_edge_types,
-                max_depth=max_depth,
-            )
-            result = traverse(
-                graph,
-                entity_id,
-                direction=direction,
-                max_depth=max_depth,
-                edge_types=effective_edge_types,
-            )
-            if direction == "both":
-                upstream = result.get("upstream", [])
-                downstream = result.get("downstream", [])
-            elif direction == "upstream":
-                upstream = result
-                downstream = []
-            else:
-                upstream = []
-                downstream = result
-            lineage = {
-                "entity_id": entity_id,
-                "upstream": upstream,
-                "downstream": downstream,
-            }
-            return {
-                "lineage": lineage,
-                "upstream_count": len(upstream),
-                "downstream_count": len(downstream),
-            }
+                effective_edge_types = edge_types or LINEAGE_EDGE_TYPES
+                graph = await self._graph_backend.subgraph(
+                    root=entity_id,
+                    direction=direction,
+                    edge_types=effective_edge_types,
+                    max_depth=max_depth,
+                )
+                result = traverse(
+                    graph,
+                    entity_id,
+                    direction=direction,
+                    max_depth=max_depth,
+                    edge_types=effective_edge_types,
+                )
+                if direction == "both":
+                    upstream = result.get("upstream", [])
+                    downstream = result.get("downstream", [])
+                elif direction == "upstream":
+                    upstream = result
+                    downstream = []
+                else:
+                    upstream = []
+                    downstream = result
+                upstream = _json_safe(upstream)
+                downstream = _json_safe(downstream)
+                upstream = [_lineage_entity_payload(item) for item in upstream]
+                downstream = [_lineage_entity_payload(item) for item in downstream]
+                lineage = {
+                    "entity_id": entity_id,
+                    "upstream": upstream,
+                    "downstream": downstream,
+                }
+                return {
+                    "lineage": lineage,
+                    "upstream_count": len(upstream),
+                    "downstream_count": len(downstream),
+                }
+            except ImportError as exc:
+                logger.debug(
+                    "LineagePlugin: graph traversal unavailable; using in-memory flows: %s",
+                    exc,
+                )
+                self._graph_backend = None
 
         # In-memory fallback (no backend initialized)
         lineage = {"entity_id": entity_id, "upstream": [], "downstream": []}
@@ -560,7 +462,8 @@ class LineagePlugin(BasePlugin):
 
             raise ValidationError("from_entity and to_entity are required")
 
-        cutoff = int(args.get("cutoff") or 5)
+        cutoff = int(args.get("max_depth") or args.get("cutoff") or 5)
+        max_paths = int(args.get("max_paths") or 20)
         edge_types = _parse_edge_types_arg(args.get("edge_types"))
 
         if self._graph_backend is None:
@@ -587,10 +490,12 @@ class LineagePlugin(BasePlugin):
             edge_types=effective_edge_types,
             cutoff=cutoff,
         )
+        paths = paths[:max_paths]
         return {
             "from_entity": from_entity,
             "to_entity": to_entity,
-            "cutoff": cutoff,
+            "max_depth": cutoff,
+            "max_paths": max_paths,
             "paths": paths,
             "path_count": len(paths),
             "reachable": bool(paths),
@@ -727,6 +632,10 @@ class LineagePlugin(BasePlugin):
     async def _tool_analyze_impact(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for analyze_impact"""
         entity_id = args.get("entity_id")
+        if not entity_id:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError("entity_id is required", field="entity_id")
         change_type = args.get("change_type", "schema_change")
         max_depth = int(args.get("max_depth") or 5)
         edge_types = _parse_edge_types_arg(args.get("edge_types"))
@@ -763,37 +672,46 @@ class LineagePlugin(BasePlugin):
             Impact analysis with affected entities
         """
         if self._graph_backend:
-            from daita.core.graph.algorithms import (
-                LINEAGE_EDGE_TYPES,
-                impact_analysis,
-            )
+            try:
+                from daita.core.graph.algorithms import (
+                    LINEAGE_EDGE_TYPES,
+                    impact_analysis,
+                )
 
-            effective_edge_types = edge_types or LINEAGE_EDGE_TYPES
-            graph = await self._graph_backend.subgraph(
-                root=entity_id,
-                direction="downstream",
-                edge_types=effective_edge_types,
-                max_depth=max_depth,
-            )
-            result = impact_analysis(graph, entity_id, edge_types=effective_edge_types)
+                effective_edge_types = edge_types or LINEAGE_EDGE_TYPES
+                graph = await self._graph_backend.subgraph(
+                    root=entity_id,
+                    direction="downstream",
+                    edge_types=effective_edge_types,
+                    max_depth=max_depth,
+                )
+                result = impact_analysis(
+                    graph, entity_id, edge_types=effective_edge_types
+                )
 
-            # Nodes with path_length == 1 are directly connected
-            directly_affected = sum(
-                1 for n in result["affected_nodes"] if n["path_length"] == 1
-            )
+                # Nodes with path_length == 1 are directly connected
+                directly_affected = sum(
+                    1 for n in result["affected_nodes"] if n["path_length"] == 1
+                )
 
-            return {
-                "entity_id": entity_id,
-                "change_type": change_type,
-                "max_depth": max_depth,
-                "directly_affected_count": directly_affected,
-                "total_affected_count": result["affected_count"],
-                "affected_entities": result["affected_nodes"],
-                "risk_level": result["risk_level"],
-                "recommendation": self._get_impact_recommendation(
-                    result["risk_level"], change_type
-                ),
-            }
+                return {
+                    "entity_id": entity_id,
+                    "change_type": change_type,
+                    "max_depth": max_depth,
+                    "directly_affected_count": directly_affected,
+                    "total_affected_count": result["affected_count"],
+                    "affected_entities": _json_safe(result["affected_nodes"]),
+                    "risk_level": result["risk_level"],
+                    "recommendation": self._get_impact_recommendation(
+                        result["risk_level"], change_type
+                    ),
+                }
+            except ImportError as exc:
+                logger.debug(
+                    "LineagePlugin: graph impact analysis unavailable; using in-memory flows: %s",
+                    exc,
+                )
+                self._graph_backend = None
 
         # In-memory fallback — no graph backend available
         downstream_result = await self.trace_lineage(

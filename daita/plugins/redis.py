@@ -18,10 +18,19 @@ Example:
 import logging
 import os
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from .base import PluginContext
 from .base_db import BaseDatabasePlugin
+from .redis_extensions import (
+    REDIS_MANIFEST,
+    RedisExecutor,
+    redis_capabilities,
+    redis_evidence_schemas,
+    redis_operation_definitions,
+    redis_tool_views,
+)
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +42,8 @@ class RedisPlugin(BaseDatabasePlugin):
     Provides key-value, hash, list, and set operations with optional
     key prefixing for namespace isolation.
     """
+
+    manifest = REDIS_MANIFEST
 
     def __init__(
         self,
@@ -50,7 +61,42 @@ class RedisPlugin(BaseDatabasePlugin):
         self.key_prefix = key_prefix or os.getenv("REDIS_KEY_PREFIX", "")
 
         super().__init__(**kwargs)
+        self._executor = RedisExecutor(self)
         logger.debug(f"RedisPlugin configured (url: {self.url}, db: {self.db})")
+
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the Redis connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the Redis connector from a runtime."""
+        await self.disconnect()
+
+    # ── Runtime extension declarations ───────────────────────────────
+
+    def declare_capabilities(self):
+        return redis_capabilities(self.read_only)
+
+    def get_executors(self):
+        return (self._executor,)
+
+    def declare_evidence_schemas(self):
+        return redis_evidence_schemas()
+
+    def get_tool_views(self):
+        return redis_tool_views(self.read_only)
+
+    def _definition_for_capability(self, capability_id: str) -> dict:
+        for definition in redis_operation_definitions(self.read_only):
+            if definition["capability_id"] == capability_id:
+                return definition
+        raise KeyError(capability_id)
+
+    def _definition_for_tool(self, tool_name: str) -> dict:
+        for definition in redis_operation_definitions(self.read_only):
+            if definition["tool_name"] == tool_name:
+                return definition
+        raise KeyError(tool_name)
 
     def _pk(self, key: str) -> str:
         """Prefix a key with the configured namespace."""
@@ -180,268 +226,6 @@ class RedisPlugin(BaseDatabasePlugin):
         return await self._client.dbsize()
 
     # ── Tools ─────────────────────────────────────────────────────────
-
-    def get_tools(self) -> List["AgentTool"]:
-        from ..core.tools import AgentTool
-
-        _common = dict(
-            category="database",
-            source="plugin",
-            plugin_name="Redis",
-            timeout_seconds=30,
-        )
-
-        tools = [
-            AgentTool(
-                name="redis_get",
-                description="Get the value of a Redis key.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string", "description": "Key name"}
-                    },
-                    "required": ["key"],
-                },
-                handler=self._tool_get,
-                **_common,
-            ),
-            AgentTool(
-                name="redis_keys",
-                description="Scan Redis keys matching a glob pattern (e.g. 'user:*').",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": "Glob pattern (default: '*')",
-                        },
-                        "count": {
-                            "type": "integer",
-                            "description": "Max keys to return (default: 1000)",
-                        },
-                    },
-                    "required": [],
-                },
-                handler=self._tool_keys,
-                **_common,
-            ),
-            AgentTool(
-                name="redis_exists",
-                description="Check if one or more Redis keys exist. Returns count of existing keys.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "keys": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Keys to check",
-                        }
-                    },
-                    "required": ["keys"],
-                },
-                handler=self._tool_exists,
-                **_common,
-            ),
-            AgentTool(
-                name="redis_ttl",
-                description="Get the remaining TTL (seconds) of a Redis key. Returns -1 if no TTL, -2 if key doesn't exist.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string", "description": "Key name"}
-                    },
-                    "required": ["key"],
-                },
-                handler=self._tool_ttl,
-                **_common,
-            ),
-            AgentTool(
-                name="redis_hgetall",
-                description="Get all fields and values of a Redis hash.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string", "description": "Hash key name"}
-                    },
-                    "required": ["key"],
-                },
-                handler=self._tool_hgetall,
-                **_common,
-            ),
-            AgentTool(
-                name="redis_lrange",
-                description="Get elements from a Redis list by index range.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string", "description": "List key name"},
-                        "start": {
-                            "type": "integer",
-                            "description": "Start index (default: 0)",
-                        },
-                        "stop": {
-                            "type": "integer",
-                            "description": "Stop index inclusive (default: -1 for all)",
-                        },
-                    },
-                    "required": ["key"],
-                },
-                handler=self._tool_lrange,
-                **_common,
-            ),
-            AgentTool(
-                name="redis_smembers",
-                description="Get all members of a Redis set.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string", "description": "Set key name"}
-                    },
-                    "required": ["key"],
-                },
-                handler=self._tool_smembers,
-                **_common,
-            ),
-            AgentTool(
-                name="redis_info",
-                description="Get Redis database size and connection info.",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_info,
-                **_common,
-            ),
-        ]
-
-        if not self.read_only:
-            tools += [
-                AgentTool(
-                    name="redis_set",
-                    description="Set a Redis key-value pair with optional TTL in seconds.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "Key name"},
-                            "value": {
-                                "type": "string",
-                                "description": "Value to store",
-                            },
-                            "ttl": {
-                                "type": "integer",
-                                "description": "Optional TTL in seconds",
-                            },
-                        },
-                        "required": ["key", "value"],
-                    },
-                    handler=self._tool_set,
-                    **_common,
-                ),
-                AgentTool(
-                    name="redis_delete",
-                    description="Delete one or more Redis keys. Returns count deleted.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "keys": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Keys to delete",
-                            }
-                        },
-                        "required": ["keys"],
-                    },
-                    handler=self._tool_delete,
-                    **_common,
-                ),
-                AgentTool(
-                    name="redis_hset",
-                    description="Set fields on a Redis hash.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "Hash key name"},
-                            "mapping": {
-                                "type": "object",
-                                "description": "Field-value pairs to set",
-                            },
-                        },
-                        "required": ["key", "mapping"],
-                    },
-                    handler=self._tool_hset,
-                    **_common,
-                ),
-                AgentTool(
-                    name="redis_lpush",
-                    description="Push values to the left (head) of a Redis list.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "List key name"},
-                            "values": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Values to push",
-                            },
-                        },
-                        "required": ["key", "values"],
-                    },
-                    handler=self._tool_lpush,
-                    **_common,
-                ),
-                AgentTool(
-                    name="redis_rpush",
-                    description="Push values to the right (tail) of a Redis list.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "List key name"},
-                            "values": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Values to push",
-                            },
-                        },
-                        "required": ["key", "values"],
-                    },
-                    handler=self._tool_rpush,
-                    **_common,
-                ),
-                AgentTool(
-                    name="redis_sadd",
-                    description="Add members to a Redis set.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "Set key name"},
-                            "members": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Members to add",
-                            },
-                        },
-                        "required": ["key", "members"],
-                    },
-                    handler=self._tool_sadd,
-                    **_common,
-                ),
-                AgentTool(
-                    name="redis_expire",
-                    description="Set a TTL (in seconds) on a Redis key.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "Key name"},
-                            "seconds": {
-                                "type": "integer",
-                                "description": "TTL in seconds",
-                            },
-                        },
-                        "required": ["key", "seconds"],
-                    },
-                    handler=self._tool_expire,
-                    **_common,
-                ),
-            ]
-
-        return tools
 
     # ── Tool handlers ─────────────────────────────────────────────────
 

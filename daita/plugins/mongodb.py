@@ -7,10 +7,19 @@ Simple MongoDB connection and querying - no over-engineering.
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from urllib.parse import urlparse, quote
+from .base import PluginContext
 from .base_db import BaseDatabasePlugin
+from .mongodb_extensions import (
+    MONGODB_MANIFEST,
+    MongoDBExecutor,
+    mongodb_capabilities,
+    mongodb_evidence_schemas,
+    mongodb_operation_definitions,
+    mongodb_tool_views,
+)
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +30,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
 
     Inherits common database functionality from BaseDatabasePlugin.
     """
+
+    manifest = MONGODB_MANIFEST
 
     def __init__(
         self,
@@ -82,8 +93,45 @@ class MongoDBPlugin(BaseDatabasePlugin):
             connection_string=connection_string,
             **kwargs,
         )
+        self._executor = MongoDBExecutor(self)
 
         logger.debug(f"MongoDB plugin configured for {host}:{port}/{database}")
+
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the MongoDB connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the MongoDB connector from a runtime."""
+        await self.disconnect()
+
+    # ------------------------------------------------------------------
+    # Runtime extension declarations
+    # ------------------------------------------------------------------
+
+    def declare_capabilities(self):
+        return mongodb_capabilities(self.read_only)
+
+    def get_executors(self):
+        return (self._executor,)
+
+    def declare_evidence_schemas(self):
+        return mongodb_evidence_schemas()
+
+    def get_tool_views(self):
+        return mongodb_tool_views(self.read_only)
+
+    def _definition_for_capability(self, capability_id: str) -> dict:
+        for definition in mongodb_operation_definitions(self.read_only):
+            if definition["capability_id"] == capability_id:
+                return definition
+        raise KeyError(capability_id)
+
+    def _definition_for_tool(self, tool_name: str) -> dict:
+        for definition in mongodb_operation_definitions(self.read_only):
+            if definition["tool_name"] == tool_name:
+                return definition
+        raise KeyError(tool_name)
 
     async def connect(self):
         """Connect to MongoDB."""
@@ -342,183 +390,6 @@ class MongoDBPlugin(BaseDatabasePlugin):
                 doc["_id"] = str(doc["_id"])
 
         return results
-
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose MongoDB operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for database operations
-        """
-        from ..core.tools import AgentTool
-
-        tools = [
-            AgentTool(
-                name="mongodb_find",
-                description="Find documents in a MongoDB collection. Returns matches. Use limit to control result size.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "collection": {
-                            "type": "string",
-                            "description": "Collection name to search in",
-                        },
-                        "filter": {
-                            "type": "object",
-                            "description": 'MongoDB query filter (e.g., {"status": "active"}). Empty object {} matches all documents.',
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of documents to return (default: 50)",
-                        },
-                        "projection": {
-                            "type": "object",
-                            "description": 'Optional field projection (e.g., {"name": 1, "email": 1, "_id": 0})',
-                        },
-                    },
-                    "required": ["collection"],
-                },
-                handler=self._tool_find,
-                category="database",
-                source="plugin",
-                plugin_name="MongoDB",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="mongodb_list_collections",
-                description="List all collections in the MongoDB database.",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_list_collections,
-                category="database",
-                source="plugin",
-                plugin_name="MongoDB",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="mongodb_aggregate",
-                description="Run a MongoDB aggregation pipeline for grouping, counting, or transformations.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "collection": {
-                            "type": "string",
-                            "description": "Collection name",
-                        },
-                        "pipeline": {
-                            "type": "array",
-                            "description": 'Aggregation pipeline stages (e.g., [{"$match": {...}}, {"$group": {...}}])',
-                            "items": {"type": "object"},
-                        },
-                    },
-                    "required": ["collection", "pipeline"],
-                },
-                handler=self._tool_aggregate,
-                category="database",
-                source="plugin",
-                plugin_name="MongoDB",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="mongodb_count",
-                description="Count documents in a MongoDB collection, optionally filtered.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "collection": {
-                            "type": "string",
-                            "description": "Collection name",
-                        },
-                        "filter": {
-                            "type": "object",
-                            "description": "Optional MongoDB query filter",
-                        },
-                    },
-                    "required": ["collection"],
-                },
-                handler=self._tool_count,
-                category="database",
-                source="plugin",
-                plugin_name="MongoDB",
-                timeout_seconds=30,
-            ),
-        ]
-        if not self.read_only:
-            tools += [
-                AgentTool(
-                    name="mongodb_insert",
-                    description="Insert a document into a MongoDB collection. Returns the inserted ID.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "collection": {
-                                "type": "string",
-                                "description": "Collection name to insert into",
-                            },
-                            "document": {
-                                "type": "object",
-                                "description": "Document data to insert as JSON object",
-                            },
-                        },
-                        "required": ["collection", "document"],
-                    },
-                    handler=self._tool_insert,
-                    category="database",
-                    source="plugin",
-                    plugin_name="MongoDB",
-                    timeout_seconds=30,
-                ),
-                AgentTool(
-                    name="mongodb_update",
-                    description="Update MongoDB documents. Returns matched and modified counts.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "collection": {
-                                "type": "string",
-                                "description": "Collection name",
-                            },
-                            "filter": {
-                                "type": "object",
-                                "description": "Query filter to match documents to update",
-                            },
-                            "update": {
-                                "type": "object",
-                                "description": 'Update operations (e.g., {"$set": {"status": "completed"}})',
-                            },
-                        },
-                        "required": ["collection", "filter", "update"],
-                    },
-                    handler=self._tool_update,
-                    category="database",
-                    source="plugin",
-                    plugin_name="MongoDB",
-                    timeout_seconds=60,
-                ),
-                AgentTool(
-                    name="mongodb_delete",
-                    description="Delete MongoDB documents by filter. Returns deleted count.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "collection": {
-                                "type": "string",
-                                "description": "Collection name",
-                            },
-                            "filter": {
-                                "type": "object",
-                                "description": "Query filter to match documents to delete",
-                            },
-                        },
-                        "required": ["collection", "filter"],
-                    },
-                    handler=self._tool_delete,
-                    category="database",
-                    source="plugin",
-                    plugin_name="MongoDB",
-                    timeout_seconds=60,
-                ),
-            ]
-        return tools
 
     async def _tool_find(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mongodb_find"""

@@ -1,7 +1,7 @@
 """
 Tests for the Database Health Monitor.
 
-Agent creation and watch registration are tested without any external services.
+Agent creation and tool registration are tested without any external services.
 Integration tests that need a real database are skipped automatically when
 DATABASE_URL is not set.
 """
@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 # ---------------------------------------------------------------------------
-# Agent creation and watch registration
+# Agent creation and tool registration
 # ---------------------------------------------------------------------------
 
 
@@ -27,41 +27,27 @@ class TestAgentCreation:
         assert agent is not None
         assert agent.name == "DB Health Monitor"
 
-    def test_three_watches_registered(self):
+    def test_watch_state_is_not_agent_owned(self):
         from agents.monitor_agent import create_agent
 
         agent = create_agent()
-        assert len(agent._watches) == 3
+        assert not hasattr(agent, "_watches")
 
-    def test_watch_names(self):
+    def test_diagnostic_tools_registered(self):
         from agents.monitor_agent import create_agent
 
         agent = create_agent()
-        names = [w.name for w in agent._watches]
-        assert "on_slow_queries" in names
-        assert "on_connection_pressure" in names
-        assert "on_table_bloat" in names
+        names = set(agent.tool_names)
+        assert "get_slow_queries" in names
+        assert "get_connection_stats" in names
+        assert "get_table_bloat" in names
 
-    def test_all_watches_have_on_resolve(self):
+    def test_agent_tools_project_before_setup(self):
         from agents.monitor_agent import create_agent
 
         agent = create_agent()
-        for w in agent._watches:
-            assert w.on_resolve is True, f"Watch '{w.name}' should have on_resolve=True"
-
-    def test_custom_intervals(self):
-        from agents.monitor_agent import create_agent
-        from datetime import timedelta
-
-        agent = create_agent(
-            slow_query_interval="10s",
-            connection_interval="5s",
-            bloat_interval="20s",
-        )
-        intervals = {w.name: w.interval for w in agent._watches}
-        assert intervals["on_slow_queries"] == timedelta(seconds=10)
-        assert intervals["on_connection_pressure"] == timedelta(seconds=5)
-        assert intervals["on_table_bloat"] == timedelta(seconds=20)
+        names = set(agent.health["tools"]["names"])
+        assert {"get_slow_queries", "get_connection_stats", "get_table_bloat"} <= names
 
 
 # ---------------------------------------------------------------------------

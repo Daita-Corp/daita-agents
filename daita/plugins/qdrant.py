@@ -7,10 +7,19 @@ Self-hosted vector database with advanced filtering and high performance.
 import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from .base import PluginContext
 from .base_vector import BaseVectorPlugin
+from .qdrant_extensions import (
+    QDRANT_MANIFEST,
+    QdrantExecutor,
+    qdrant_capabilities,
+    qdrant_evidence_schemas,
+    qdrant_operation_definitions,
+    qdrant_tool_views,
+)
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +31,8 @@ class QdrantPlugin(BaseVectorPlugin):
     Supports advanced payload filtering with automatic conversion
     from simple dict filters to Qdrant Filter objects.
     """
+
+    manifest = QDRANT_MANIFEST
 
     def __init__(
         self,
@@ -53,8 +64,45 @@ class QdrantPlugin(BaseVectorPlugin):
             collection=collection,
             **kwargs,  # embedding_fn is not forwarded
         )
+        self._executor = QdrantExecutor(self)
 
         logger.debug(f"Qdrant plugin configured for {url}, collection '{collection}'")
+
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the Qdrant connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the Qdrant connector from a runtime."""
+        await self.disconnect()
+
+    # ---------------------------------------------------------------------------
+    # Runtime extension declarations
+    # ---------------------------------------------------------------------------
+
+    def declare_capabilities(self):
+        return qdrant_capabilities()
+
+    def get_executors(self):
+        return (self._executor,)
+
+    def declare_evidence_schemas(self):
+        return qdrant_evidence_schemas()
+
+    def get_tool_views(self):
+        return qdrant_tool_views()
+
+    def _definition_for_capability(self, capability_id: str) -> dict:
+        for definition in qdrant_operation_definitions():
+            if definition["capability_id"] == capability_id:
+                return definition
+        raise KeyError(capability_id)
+
+    def _definition_for_tool(self, tool_name: str) -> dict:
+        for definition in qdrant_operation_definitions():
+            if definition["tool_name"] == tool_name:
+                return definition
+        raise KeyError(tool_name)
 
     async def connect(self):
         """Connect to Qdrant."""
@@ -76,11 +124,9 @@ class QdrantPlugin(BaseVectorPlugin):
                 )
 
         except ImportError:
-            self._handle_connection_error(
-                ImportError(
-                    "qdrant-client not installed. Install with: pip install 'daita-agents[qdrant]'"
-                ),
-                "connection",
+            raise ImportError(
+                "qdrant-client is required for QdrantPlugin. "
+                "Install with: pip install 'daita-agents[qdrant]'"
             )
         except Exception as e:
             self._handle_connection_error(e, "connection")
@@ -369,128 +415,6 @@ class QdrantPlugin(BaseVectorPlugin):
 
         collections = self._client.get_collections()
         return [col.name for col in collections.collections]
-
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose Qdrant operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for vector operations
-        """
-        from ..core.tools import AgentTool
-
-        return [
-            AgentTool(
-                name="qdrant_search",
-                description="Search Qdrant for similar vectors. Provide 'vector' (float array) or 'text' (auto-embedded).",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "vector": {
-                            "type": "array",
-                            "description": "Query vector as array of floats",
-                            "items": {"type": "number"},
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": "Query text (auto-embedded via configured embedding_fn; use instead of vector)",
-                        },
-                        "top_k": {
-                            "type": "integer",
-                            "description": "Maximum number of results to return (default: 10)",
-                        },
-                        "filter": {
-                            "type": "object",
-                            "description": 'Simple filter dict (e.g., {"category": "tech"})',
-                        },
-                    },
-                    "required": [],
-                },
-                handler=self._tool_search,
-                category="vector_db",
-                source="plugin",
-                plugin_name="Qdrant",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="qdrant_upsert",
-                description="Insert or update vectors in Qdrant with payload (metadata).",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "ids": {
-                            "type": "array",
-                            "description": "List of unique vector IDs",
-                            "items": {"type": "string"},
-                        },
-                        "vectors": {
-                            "type": "array",
-                            "description": "List of vectors (each vector is an array of floats)",
-                            "items": {"type": "array", "items": {"type": "number"}},
-                        },
-                        "metadata": {
-                            "type": "array",
-                            "description": "Optional list of metadata (payload) objects",
-                            "items": {"type": "object"},
-                        },
-                    },
-                    "required": ["ids", "vectors"],
-                },
-                handler=self._tool_upsert,
-                category="vector_db",
-                source="plugin",
-                plugin_name="Qdrant",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="qdrant_delete",
-                description="Delete vectors from Qdrant by ID or filter.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "ids": {
-                            "type": "array",
-                            "description": "List of vector IDs to delete",
-                            "items": {"type": "string"},
-                        },
-                        "filter": {
-                            "type": "object",
-                            "description": "Simple filter dict for deletion",
-                        },
-                    },
-                    "required": [],
-                },
-                handler=self._tool_delete,
-                category="vector_db",
-                source="plugin",
-                plugin_name="Qdrant",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="qdrant_create_collection",
-                description="Create a Qdrant collection with specified vector size and distance metric.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Collection name"},
-                        "vector_size": {
-                            "type": "integer",
-                            "description": "Dimension of vectors",
-                        },
-                        "distance": {
-                            "type": "string",
-                            "description": "Distance metric: 'Cosine', 'Euclid', or 'Dot' (default: 'Cosine')",
-                        },
-                    },
-                    "required": ["name", "vector_size"],
-                },
-                handler=self._tool_create_collection,
-                category="vector_db",
-                source="plugin",
-                plugin_name="Qdrant",
-                timeout_seconds=30,
-            ),
-        ]
 
     async def _tool_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for qdrant_search"""

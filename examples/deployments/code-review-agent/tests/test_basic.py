@@ -42,7 +42,7 @@ class TestAgentCreation:
         agent = create_agent()
         assert "read_file" in agent.tool_names
 
-    def test_has_skill_tools(self):
+    def test_has_skill_tool_views(self):
         from agents.reviewer import create_agent
 
         agent = create_agent()
@@ -67,13 +67,12 @@ class TestSecuritySkill:
         assert instructions is not None
         assert "severity classification" in instructions.lower()
 
-    def test_skill_provides_tools(self):
-        from skills.security import SecurityReviewSkill
+    def test_skill_tool_views_register_on_agent(self):
+        from agents.reviewer import create_agent
 
-        skill = SecurityReviewSkill()
-        tool_names = [t.name for t in skill.get_tools()]
-        assert "scan_security_patterns" in tool_names
-        assert "check_input_validation" in tool_names
+        agent = create_agent()
+        assert "scan_security_patterns" in agent.tool_names
+        assert "check_input_validation" in agent.tool_names
 
     @pytest.mark.asyncio
     async def test_scan_detects_sql_injection(self):
@@ -145,13 +144,12 @@ class TestCodeQualitySkill:
         assert "complexity" in instructions.lower()
         assert "naming" in instructions.lower()
 
-    def test_skill_provides_tools(self):
-        from skills.code_quality import create_code_quality_skill
+    def test_skill_tool_views_register_on_agent(self):
+        from agents.reviewer import create_agent
 
-        skill = create_code_quality_skill()
-        tool_names = [t.name for t in skill.get_tools()]
-        assert "analyze_complexity" in tool_names
-        assert "check_naming_conventions" in tool_names
+        agent = create_agent()
+        assert "analyze_complexity" in agent.tool_names
+        assert "check_naming_conventions" in agent.tool_names
 
     @pytest.mark.asyncio
     async def test_complexity_analysis(self):

@@ -76,16 +76,12 @@ professional markdown report with inline citations.
 You MUST follow these steps in order. Do NOT skip any step.
 
 Step 1: Call build_report_structure(query, section_count) to get the template.
-Step 2: Call recall(query="synthesis", category="synthesis") to retrieve the \
-Analyst's synthesis from shared memory.
-Step 3: Call recall(query="research findings", category="finding", limit=10) to \
-retrieve all key findings from shared memory.
-Step 4: Pick 2-3 key entities (companies, technologies) from the synthesis. For \
-each one, call traverse_memory(entity="entity name") to discover additional \
-context and connections that enrich the report.
-Step 5: Call format_citation(title, url, index) for each source to build the \
+Step 2: Use the synthesis JSON provided by the Analyst as the source of truth.
+Step 3: Pick 2-3 key entities (companies, technologies) from the synthesis and \
+explain their significance in the report.
+Step 4: Call format_citation(title, url, index) for each source to build the \
 References section. Number them starting at 1.
-Step 6: Write and output the full report in markdown:
+Step 5: Write and output the full report in markdown:
 
 # [Research Query]
 
@@ -96,8 +92,7 @@ Step 6: Write and output the full report in markdown:
 [Numbered list with inline citations like [1]]
 
 ## Detailed Analysis
-[Thematic sections — one H3 per theme, with evidence and citations. Use \
-information from traverse_memory to add depth.]
+[Thematic sections — one H3 per theme, with evidence and citations.]
 
 ## Knowledge Gaps & Limitations
 [What remains uncertain or was not covered]
@@ -107,5 +102,6 @@ information from traverse_memory to add depth.]
 
 Style: use [N] inline citations after claims, lead findings with the key number \
 or fact, write for informed non-specialists, every sentence adds value.""",
-        tools=[format_citation, build_report_structure, memory],
+        plugins=[memory],
+        tools=[format_citation, build_report_structure],
     )

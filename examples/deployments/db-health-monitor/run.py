@@ -1,13 +1,11 @@
 """
 Database Health Monitor — Entry Point
 
-Starts the agent with three watches that continuously poll PostgreSQL for
-slow queries, connection pressure, and table bloat. The agent runs
-indefinitely until interrupted with Ctrl-C.
+Starts the database health investigation agent and runs one operator prompt.
+Runtime-native monitoring should trigger this agent through runtime operations.
 
 Usage:
-    python run.py                     # Run with default intervals
-    python run.py --fast              # Shorter intervals for demo/testing
+    python run.py
 
 Requirements:
     OPENAI_API_KEY   — OpenAI API key
@@ -16,7 +14,6 @@ Requirements:
 
 import asyncio
 import os
-import signal
 import sys
 from pathlib import Path
 
@@ -45,45 +42,30 @@ def check_environment():
         sys.exit(1)
 
 
-async def run(fast: bool = False):
+async def run():
     from agents.monitor_agent import create_agent
 
-    if fast:
-        agent = create_agent(
-            slow_query_interval="10s",
-            connection_interval="10s",
-            bloat_interval="15s",
-        )
-    else:
-        agent = create_agent()
+    agent = create_agent()
 
     print("=" * 65)
-    print("DATABASE HEALTH MONITOR")
+    print("DATABASE HEALTH INVESTIGATOR")
     print("=" * 65)
     print(f"Database: {os.getenv('DATABASE_URL', '').split('@')[-1]}")
-    print(
-        f"Mode: {'fast (10-15s intervals)' if fast else 'standard (30s-5m intervals)'}"
-    )
-    print(f"Watches: slow_queries, connection_pressure, table_bloat")
+    print("Tools: slow queries, connection pressure, table bloat")
     print("=" * 65)
-    print("Monitoring... press Ctrl-C to stop.\n")
-
-    await agent.start()
-
-    # Wait until interrupted
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+    print("Investigating current database health...\n")
 
     try:
-        await stop.wait()
+        result = await agent.run(
+            "Check the current PostgreSQL health. Use the diagnostic tools for "
+            "slow queries, connection pressure, and table bloat, then summarize "
+            "severity and recommended actions."
+        )
+        print(result)
     finally:
-        print("\nShutting down...")
         await agent.stop()
-        print("Stopped.")
 
 
 if __name__ == "__main__":
     check_environment()
-    asyncio.run(run(fast="--fast" in sys.argv))
+    asyncio.run(run())

@@ -14,12 +14,12 @@ from ..core.exceptions import (
     ConnectionError as DaitaConnectionError,
     ValidationError,
 )
-from .base import BasePlugin
+from .base import ConnectorPlugin
 
 logger = logging.getLogger(__name__)
 
 
-class BaseDatabasePlugin(BasePlugin):
+class BaseDatabasePlugin(ConnectorPlugin):
     """
     Base class for all database plugins with common connection management.
 
@@ -168,7 +168,7 @@ class BaseDatabasePlugin(BasePlugin):
     def _validate_sql_policy(self, sql: str, *, operation: str):
         if not sql or not sql.strip():
             raise ValidationError("SQL must not be empty", field="sql")
-        from ..agents.db.query.sql_analysis import analyze_sql
+        from ..db.sql_analysis import analyze_sql
 
         analysis = analyze_sql(sql, dialect=self.sql_dialect)
         if analysis.has_multiple_statements:

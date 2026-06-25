@@ -75,7 +75,19 @@ def _record_to_case(
 def _expected_to_expectations(expected: Any) -> dict[str, Any]:
     if not isinstance(expected, dict):
         return {"answer": {"contains": [str(expected)]}}
-    if any(key in expected for key in ("answer", "tools", "sql", "operations")):
+    if any(
+        key in expected
+        for key in (
+            "answer",
+            "capabilities",
+            "tasks",
+            "evidence",
+            "result",
+            "governance",
+            "approvals",
+            "sql",
+        )
+    ):
         return expected
 
     answer_keys = {"equals", "contains", "not_contains", "regex", "numeric"}

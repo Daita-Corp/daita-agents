@@ -112,8 +112,13 @@ class OllamaProvider(OpenAICompatibleMixin, BaseLLMProvider):
         except Exception as e:
             error_msg = str(e)
             if "Connection" in error_msg or "refused" in error_msg:
-                raise LLMError(self._connection_error_message())
-            raise LLMError(f"Ollama generation failed: {error_msg}")
+                raise LLMError(
+                    self._connection_error_message(),
+                    provider=self.provider_name,
+                    model=self.model,
+                    retry_hint="transient",
+                ) from e
+            raise self._provider_error("Ollama generation failed", e) from e
 
     async def _stream_impl(
         self,
@@ -177,8 +182,13 @@ class OllamaProvider(OpenAICompatibleMixin, BaseLLMProvider):
         except Exception as e:
             error_msg = str(e)
             if "Connection" in error_msg or "refused" in error_msg:
-                raise LLMError(self._connection_error_message())
-            raise LLMError(f"Ollama streaming failed: {error_msg}")
+                raise LLMError(
+                    self._connection_error_message(),
+                    provider=self.provider_name,
+                    model=self.model,
+                    retry_hint="transient",
+                ) from e
+            raise self._provider_error("Ollama streaming failed", e) from e
 
     def _connection_error_message(self) -> str:
         if os.getenv("DAITA_RUNTIME") == "lambda":

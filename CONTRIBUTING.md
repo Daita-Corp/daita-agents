@@ -64,8 +64,10 @@ Open a [GitHub Issue](https://github.com/daita-tech/daita-agents/issues) with th
 
 1. Create a new file in `daita/plugins/`
 2. Subclass `BasePlugin` from `daita.plugins.base`
-3. Implement `get_tools()` returning a list of `AgentTool`
-4. Export it from `daita/plugins/__init__.py`
+3. Declare a `PluginManifest`
+4. Contribute extension declarations such as capabilities, executors, policies,
+   evidence schemas, context providers, and tool views
+5. Export it from `daita/plugins/__init__.py`
 
 ## Code Style
 

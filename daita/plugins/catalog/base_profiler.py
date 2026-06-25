@@ -24,6 +24,123 @@ class NormalizedColumn:
 
 
 @dataclass
+class NormalizedColumnValue:
+    """One bounded observed value for a cataloged column."""
+
+    value: Any
+    count: Optional[int] = None
+    display: Optional[str] = None
+    normalized: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {"value": self.value}
+        if self.count is not None:
+            result["count"] = self.count
+        if self.display is not None:
+            result["display"] = self.display
+        if self.normalized is not None:
+            result["normalized"] = self.normalized
+        return result
+
+    @classmethod
+    def from_dict(cls, value: Dict[str, Any]) -> "NormalizedColumnValue":
+        return cls(
+            value=value.get("value"),
+            count=value.get("count"),
+            display=value.get("display"),
+            normalized=value.get("normalized"),
+        )
+
+
+@dataclass
+class NormalizedColumnValueProfile:
+    """Canonical catalog profile of bounded observed values for one column."""
+
+    table: str
+    column: str
+    profile_kind: str = "categorical_values"
+    profile_status: str = "profiled"
+    distinct_count: Optional[int] = None
+    null_count: Optional[int] = None
+    row_count: Optional[int] = None
+    top_values: List[NormalizedColumnValue] = field(default_factory=list)
+    max_values: int = 25
+    sampled: bool = False
+    truncated: bool = False
+    redacted: bool = False
+    skipped_reason: Optional[str] = None
+    policy: Dict[str, Any] = field(default_factory=dict)
+    profiled_at: Optional[str] = None
+    source_evidence_id: Optional[str] = None
+    source_fingerprint: Optional[str] = None
+    source_fingerprint_status: Optional[str] = None
+    source_fingerprint_reason: Optional[str] = None
+    source_revision: Optional[str] = None
+
+    @property
+    def ref(self) -> str:
+        return f"{self.table}.{self.column}"
+
+    def to_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "table": self.table,
+            "column": self.column,
+            "profile_kind": self.profile_kind,
+            "profile_status": self.profile_status,
+            "top_values": [item.to_dict() for item in self.top_values],
+            "max_values": self.max_values,
+            "sampled": self.sampled,
+            "truncated": self.truncated,
+            "redacted": self.redacted,
+            "policy": dict(self.policy),
+        }
+        for key, value in (
+            ("distinct_count", self.distinct_count),
+            ("null_count", self.null_count),
+            ("row_count", self.row_count),
+            ("skipped_reason", self.skipped_reason),
+            ("profiled_at", self.profiled_at),
+            ("source_evidence_id", self.source_evidence_id),
+            ("source_fingerprint", self.source_fingerprint),
+            ("source_fingerprint_status", self.source_fingerprint_status),
+            ("source_fingerprint_reason", self.source_fingerprint_reason),
+            ("source_revision", self.source_revision),
+        ):
+            if value is not None:
+                result[key] = value
+        return result
+
+    @classmethod
+    def from_dict(cls, value: Dict[str, Any]) -> "NormalizedColumnValueProfile":
+        return cls(
+            table=str(value.get("table") or ""),
+            column=str(value.get("column") or ""),
+            profile_kind=str(value.get("profile_kind") or "categorical_values"),
+            profile_status=str(value.get("profile_status") or "profiled"),
+            distinct_count=value.get("distinct_count"),
+            null_count=value.get("null_count"),
+            row_count=value.get("row_count"),
+            top_values=[
+                NormalizedColumnValue.from_dict(dict(item))
+                for item in value.get("top_values", []) or []
+                if isinstance(item, dict)
+            ],
+            max_values=int(value.get("max_values") or 25),
+            sampled=bool(value.get("sampled", False)),
+            truncated=bool(value.get("truncated", False)),
+            redacted=bool(value.get("redacted", False)),
+            skipped_reason=value.get("skipped_reason"),
+            policy=dict(value.get("policy", {}) or {}),
+            profiled_at=value.get("profiled_at"),
+            source_evidence_id=value.get("source_evidence_id"),
+            source_fingerprint=value.get("source_fingerprint"),
+            source_fingerprint_status=value.get("source_fingerprint_status"),
+            source_fingerprint_reason=value.get("source_fingerprint_reason"),
+            source_revision=value.get("source_revision"),
+        )
+
+
+@dataclass
 class NormalizedIndex:
     """
     A declared access path over one or more columns.
@@ -130,9 +247,69 @@ class NormalizedSchema:
             ],
             "table_count": self.table_count,
         }
+        if self.store_id:
+            result["store_id"] = self.store_id
+        if self.profiled_at:
+            result["profiled_at"] = self.profiled_at
         if self.metadata:
             result["metadata"] = self.metadata
         return result
+
+    @classmethod
+    def from_dict(cls, value: Dict[str, Any]) -> "NormalizedSchema":
+        """Hydrate a NormalizedSchema from a persisted catalog record."""
+        tables = []
+        for table in value.get("tables", []) or []:
+            columns = [
+                NormalizedColumn(
+                    name=str(column.get("name", "")),
+                    type=str(column.get("type", "")),
+                    nullable=bool(column.get("nullable", True)),
+                    is_primary_key=bool(column.get("is_primary_key", False)),
+                    comment=column.get("column_comment") or column.get("comment"),
+                )
+                for column in table.get("columns", []) or []
+            ]
+            indexes = [
+                NormalizedIndex(
+                    name=str(index.get("name", "")),
+                    type=str(index.get("type", "")),
+                    columns=list(index.get("columns", []) or []),
+                    unique=bool(index.get("unique", False)),
+                    metadata=dict(index.get("metadata", {}) or {}),
+                )
+                for index in table.get("indexes", []) or []
+            ]
+            tables.append(
+                NormalizedTable(
+                    name=str(table.get("name", "")),
+                    row_count=table.get("row_count"),
+                    columns=columns,
+                    indexes=indexes,
+                    metadata=dict(table.get("metadata", {}) or {}),
+                )
+            )
+
+        foreign_keys = [
+            NormalizedForeignKey(
+                source_table=str(fk.get("source_table", "")),
+                source_column=str(fk.get("source_column", "")),
+                target_table=str(fk.get("target_table", "")),
+                target_column=str(fk.get("target_column", "")),
+            )
+            for fk in value.get("foreign_keys", []) or []
+        ]
+
+        return cls(
+            database_type=str(value.get("database_type", "unknown")),
+            database_name=str(value.get("database_name") or value.get("schema") or ""),
+            tables=tables,
+            foreign_keys=foreign_keys,
+            table_count=int(value.get("table_count") or len(tables)),
+            store_id=value.get("store_id"),
+            profiled_at=value.get("profiled_at"),
+            metadata=dict(value.get("metadata", {}) or {}),
+        )
 
 
 class BaseProfiler(ABC):

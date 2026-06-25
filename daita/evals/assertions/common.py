@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Any, Iterable
 
 from ..models import AssertionResult
 
@@ -19,7 +19,7 @@ def matches_any(expected: str, observed_values: Iterable[str]) -> bool:
     return any(matches(expected, observed) for observed in observed_values)
 
 
-def tool_row_count(result) -> int | None:
+def payload_row_count(result: Any) -> int | None:
     if isinstance(result, dict):
         for key in ("row_count", "total_rows", "count"):
             value = result.get(key)
@@ -42,7 +42,8 @@ def fail(
     observed=None,
     expected=None,
     fix_hints: list[str] | None = None,
-    related_tool_calls: list[int] | None = None,
+    related_task_ids: list[str] | None = None,
+    related_evidence_ids: list[str] | None = None,
 ) -> AssertionResult:
     return AssertionResult(
         id=assertion_id,
@@ -53,5 +54,6 @@ def fail(
         observed=observed,
         expected=expected,
         fix_hints=fix_hints or [],
-        related_tool_calls=related_tool_calls or [],
+        related_task_ids=related_task_ids or [],
+        related_evidence_ids=related_evidence_ids or [],
     )

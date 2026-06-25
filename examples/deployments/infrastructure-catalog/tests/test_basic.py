@@ -13,6 +13,7 @@ import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from daita.db.query_tool_views import CATALOG_SEARCH_TOOL_VIEW
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -56,17 +57,25 @@ class TestAgentCreation:
         agent = create_agent(enable_memory=False)
         assert agent is not None
 
-    def test_agent_has_memory_tools(self, monkeypatch):
+    def test_agent_registers_memory_runtime_declarations(self, monkeypatch):
         from agents.catalog_agent import create_agent
-        from daita.plugins.memory import MemoryPlugin
 
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-fake-key")
         agent = create_agent()
-        # Check registered tools include memory tools
-        tool_names = set(agent.tool_registry.tool_names)
-        assert "remember" in tool_names
-        assert "recall" in tool_names
-        assert "list_memories" in tool_names
+
+        capability_ids = {capability.id for capability in agent.capabilities}
+        provider_ids = {provider.id for provider in agent.context_providers}
+
+        assert "memory" in agent.attached_plugin_ids
+        assert {
+            "memory.semantic.recall",
+            "memory.semantic.write",
+            "memory.fact.query",
+            "memory.context.render",
+        } <= capability_ids
+        assert "memory.context" in provider_ids
+        assert "remember" not in agent.tool_names
+        assert "recall" not in agent.tool_names
 
 
 # ---------------------------------------------------------------------------
@@ -138,15 +147,60 @@ class TestCatalogConfiguration:
         assert catalog._profilers[0].supports("apigateway")
         assert not catalog._profilers[0].supports("s3")
 
-    def test_tools_registered(self):
-        catalog = self._build_catalog()
-        tools = catalog.get_tools()
-        tool_names = {t.name for t in tools}
-        assert "discover_infrastructure" in tool_names
-        assert "find_store" in tool_names
-        assert "profile_store" in tool_names
-        assert "discover_postgres" in tool_names
-        assert len(tools) == 10
+    def test_catalog_tool_views_registered_on_agent(self):
+        from agents.catalog_agent import create_agent
+
+        agent = create_agent(enable_memory=False)
+        assert agent.attached_plugin_ids == ["catalog"]
+
+        runtime_tool_views = {view.name for view in agent.tool_views}
+        assert {
+            CATALOG_SEARCH_TOOL_VIEW,
+            "catalog_inspect_asset",
+            "catalog_find_relationship_paths",
+        } <= runtime_tool_views
+
+        tool_names = set(agent.tool_names)
+        assert runtime_tool_views <= tool_names
+        assert "discover_infrastructure" not in tool_names
+        assert "find_store" not in tool_names
+        assert "profile_store" not in tool_names
+
+    async def test_discovery_helper_uses_runtime_capability(self):
+        from agents.catalog_agent import (
+            CATALOG_INFRASTRUCTURE_DISCOVERY_CAPABILITY,
+            discover_infrastructure,
+        )
+
+        class FakeAgent:
+            def __init__(self):
+                self.calls = []
+
+            async def execute_capability(self, capability_id, arguments, *, owner):
+                self.calls.append((capability_id, arguments, owner))
+                return {
+                    "evidence": [
+                        {
+                            "payload": {
+                                "store_count": 1,
+                                "stores": [{"id": "store-1"}],
+                            }
+                        }
+                    ]
+                }
+
+        agent = FakeAgent()
+
+        result = await discover_infrastructure(agent, concurrency=3)
+
+        assert result["store_count"] == 1
+        assert agent.calls == [
+            (
+                CATALOG_INFRASTRUCTURE_DISCOVERY_CAPABILITY,
+                {"concurrency": 3},
+                "catalog",
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +710,7 @@ class TestMemoryIntegration:
         assert "Old S3 bucket from last month" not in contents
 
     async def test_pinned_rules_always_injected(self, tmp_path):
-        """Pinned org rules should appear in on_before_run regardless of query."""
+        """Pinned org rules should render in memory context regardless of query."""
         from daita.plugins.memory.metadata import MemoryMetadata
 
         backend = self._make_backend(tmp_path)

@@ -7,10 +7,19 @@ Embeddable vector database supporting local, persistent, and client-server modes
 import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from .base import PluginContext
 from .base_vector import BaseVectorPlugin
+from .chroma_extensions import (
+    CHROMA_MANIFEST,
+    ChromaExecutor,
+    chroma_capabilities,
+    chroma_evidence_schemas,
+    chroma_operation_definitions,
+    chroma_tool_views,
+)
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +33,8 @@ class ChromaPlugin(BaseVectorPlugin):
     - Persistent local: path parameter specified
     - Remote client-server: host parameter specified
     """
+
+    manifest = CHROMA_MANIFEST
 
     def __init__(
         self,
@@ -68,10 +79,47 @@ class ChromaPlugin(BaseVectorPlugin):
             collection=collection,
             **kwargs,  # embedding_fn is not forwarded
         )
+        self._executor = ChromaExecutor(self)
 
         logger.debug(
             f"ChromaDB plugin configured in {self.mode} mode, collection '{collection}'"
         )
+
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the Chroma connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the Chroma connector from a runtime."""
+        await self.disconnect()
+
+    # ---------------------------------------------------------------------------
+    # Runtime extension declarations
+    # ---------------------------------------------------------------------------
+
+    def declare_capabilities(self):
+        return chroma_capabilities()
+
+    def get_executors(self):
+        return (self._executor,)
+
+    def declare_evidence_schemas(self):
+        return chroma_evidence_schemas()
+
+    def get_tool_views(self):
+        return chroma_tool_views()
+
+    def _definition_for_capability(self, capability_id: str) -> dict:
+        for definition in chroma_operation_definitions():
+            if definition["capability_id"] == capability_id:
+                return definition
+        raise KeyError(capability_id)
+
+    def _definition_for_tool(self, tool_name: str) -> dict:
+        for definition in chroma_operation_definitions():
+            if definition["tool_name"] == tool_name:
+                return definition
+        raise KeyError(tool_name)
 
     async def connect(self):
         """Connect to ChromaDB."""
@@ -96,11 +144,9 @@ class ChromaPlugin(BaseVectorPlugin):
 
             logger.info(f"Connected to ChromaDB in {self.mode} mode")
         except ImportError:
-            self._handle_connection_error(
-                ImportError(
-                    "chromadb not installed. Install with: pip install 'daita-agents[chromadb]'"
-                ),
-                "connection",
+            raise ImportError(
+                "chromadb is required for ChromaPlugin. "
+                "Install with: pip install 'daita-agents[chromadb]'"
             )
         except Exception as e:
             self._handle_connection_error(e, "connection")
@@ -295,119 +341,6 @@ class ChromaPlugin(BaseVectorPlugin):
 
         collections = self._client.list_collections()
         return [col.name for col in collections]
-
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose ChromaDB operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for vector operations
-        """
-        from ..core.tools import AgentTool
-
-        return [
-            AgentTool(
-                name="chroma_search",
-                description="Search ChromaDB for similar vectors. Provide 'vector' (float array) or 'text' (auto-embedded).",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "vector": {
-                            "type": "array",
-                            "description": "Query vector as array of floats",
-                            "items": {"type": "number"},
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": "Query text (auto-embedded via configured embedding_fn; use instead of vector)",
-                        },
-                        "top_k": {
-                            "type": "integer",
-                            "description": "Maximum number of results to return (default: 10)",
-                        },
-                        "filter": {
-                            "type": "object",
-                            "description": 'Chroma where filter (e.g., {"category": "tech"})',
-                        },
-                    },
-                    "required": [],
-                },
-                handler=self._tool_search,
-                category="vector_db",
-                source="plugin",
-                plugin_name="ChromaDB",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="chroma_upsert",
-                description="Insert or update vectors in ChromaDB with metadata and optional raw documents.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "ids": {
-                            "type": "array",
-                            "description": "List of unique vector IDs",
-                            "items": {"type": "string"},
-                        },
-                        "vectors": {
-                            "type": "array",
-                            "description": "List of vectors (each vector is an array of floats)",
-                            "items": {"type": "array", "items": {"type": "number"}},
-                        },
-                        "metadata": {
-                            "type": "array",
-                            "description": "Optional list of metadata objects (one per vector)",
-                            "items": {"type": "object"},
-                        },
-                        "documents": {
-                            "type": "array",
-                            "description": "Optional list of raw document texts",
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "required": ["ids", "vectors"],
-                },
-                handler=self._tool_upsert,
-                category="vector_db",
-                source="plugin",
-                plugin_name="ChromaDB",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="chroma_delete",
-                description="Delete vectors from ChromaDB by ID or filter.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "ids": {
-                            "type": "array",
-                            "description": "List of vector IDs to delete",
-                            "items": {"type": "string"},
-                        },
-                        "filter": {
-                            "type": "object",
-                            "description": "Chroma where filter for deletion",
-                        },
-                    },
-                    "required": [],
-                },
-                handler=self._tool_delete,
-                category="vector_db",
-                source="plugin",
-                plugin_name="ChromaDB",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="chroma_collections",
-                description="List all collections in the ChromaDB database.",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_collections,
-                category="vector_db",
-                source="plugin",
-                plugin_name="ChromaDB",
-                timeout_seconds=30,
-            ),
-        ]
 
     async def _tool_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for chroma_search"""

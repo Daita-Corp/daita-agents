@@ -35,12 +35,6 @@ def resource_group_from_id(resource_id: str) -> str:
         return ""
 
 
-def resource_name_from_id(resource_id: str) -> str:
-    """Return the final resource name segment from an Azure resource ID."""
-    parts = [part for part in resource_id.split("/") if part]
-    return parts[-1] if parts else ""
-
-
 def azure_location(value: Any) -> Optional[str]:
     """Normalize Azure location values without forcing empty strings."""
     location = getattr(value, "location", None) or ""

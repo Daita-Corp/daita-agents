@@ -5,22 +5,9 @@ This plugin enables agents to connect to any MCP server and autonomously use
 their tools via LLM function calling. Agents discover available tools and
 decide which ones to use based on the task.
 
-Usage:
-    ```python
-    from daita import Agent
-    from daita.plugins import mcp
-
-    # Agent with MCP tools
-    agent = Agent(
-        name="file_analyzer",
-        mcp_servers=[
-            mcp.server(command="uvx", args=["mcp-server-filesystem", "/data"])
-        ]
-    )
-
-    # Agent autonomously discovers and uses MCP tools
-    result = await agent.process("Read report.csv and calculate average revenue")
-    ```
+MCP integrations are owned by this plugin module. Agent-local MCP constructor
+arguments were removed in the clean-break runtime architecture; MCP tool calls
+should be exposed as registry declarations and executed through RuntimeKernel.
 
 MCP Protocol:
     The Model Context Protocol (MCP) is Anthropic's open standard for connecting
@@ -28,10 +15,22 @@ MCP Protocol:
     MCP client support for Daita agents.
 """
 
-import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+import asyncio
 from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from daita.runtime import (
+    AccessMode,
+    Capability,
+    Evidence,
+    EvidenceSchema,
+    RiskLevel,
+    ToolView,
+)
+
+from .base import PluginContext
+from .manifest import PluginKind, PluginManifest
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +95,27 @@ class MCPServer:
         self._session_lock = (
             asyncio.Lock()
         )  # Protects session access from concurrent calls
+        self.manifest = PluginManifest(
+            id=_plugin_id("mcp_server", self.server_name),
+            display_name=f"MCP Server {self.server_name}",
+            version="1.0.0",
+            kind=PluginKind.RUNTIME_EXTENSION,
+            domains=frozenset({"chat"}),
+        )
+
+    async def setup(self, context: PluginContext) -> None:
+        """Connect and register discovered MCP tools as runtime declarations."""
+        await self.connect()
+        registry = context.services.get("extension_registry")
+        if registry is None:
+            return
+        declarations = MCPToolDeclarations(self)
+        if declarations.manifest.id not in registry.plugin_ids:
+            registry.register(declarations)
+
+    async def teardown(self) -> None:
+        """Disconnect the MCP transport."""
+        await self.disconnect()
 
     async def _maintain_connection(self, server_params):
         """
@@ -266,7 +286,7 @@ class MCPServer:
 
         return self._tools.copy()
 
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
+    async def _call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
         """
         Execute a tool on the MCP server with thread-safe session access.
 
@@ -345,94 +365,103 @@ class MCPServer:
         await self.disconnect()
 
 
-class MCPToolRegistry:
-    """
-    Registry for managing multiple MCP servers and their tools.
+@dataclass(frozen=True)
+class MCPToolExecutor:
+    """Runtime executor for one discovered MCP tool."""
 
-    Used internally by Agent to aggregate tools from multiple
-    MCP servers and route tool calls to the appropriate server.
-    """
+    id: str
+    capability_ids: frozenset[str]
+    server: MCPServer
+    tool_name: str
 
-    def __init__(self):
-        """Initialize empty registry"""
-        self.servers: List[MCPServer] = []
-        self._tool_server_map: Dict[str, MCPServer] = {}
-
-    async def add_server(self, server: MCPServer) -> None:
-        """
-        Add an MCP server to the registry.
-
-        Args:
-            server: MCPServer instance to add
-        """
-        # Connect if not already connected
-        if not server.is_connected:
-            await server.connect()
-
-        # Add to registry
-        self.servers.append(server)
-
-        # Map tools to servers
-        for tool in server.list_tools():
-            if tool.name in self._tool_server_map:
-                logger.warning(
-                    f"Tool name collision: {tool.name} exists in multiple servers. "
-                    f"Using tool from {server.server_name}"
-                )
-            self._tool_server_map[tool.name] = server
-
-        logger.info(f"Added MCP server {server.server_name} to registry")
-
-    def get_all_tools(self) -> List[MCPTool]:
-        """Get aggregated list of all tools from all servers"""
-        all_tools = []
-        for server in self.servers:
-            all_tools.extend(server.list_tools())
-        return all_tools
-
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
-        """
-        Call a tool by routing to the appropriate server.
-
-        Args:
-            tool_name: Name of the tool to call
-            arguments: Arguments for the tool
-
-        Returns:
-            Tool execution result
-        """
-        server = self._tool_server_map.get(tool_name)
-        if not server:
-            available_tools = list(self._tool_server_map.keys())
-            raise RuntimeError(
-                f"Tool '{tool_name}' not found in any MCP server. "
-                f"Available tools: {', '.join(available_tools)}"
+    async def execute(self, task, operation, context):
+        result = await self.server._call_tool(self.tool_name, dict(task.input))
+        return [
+            Evidence(
+                kind="mcp.tool.result",
+                owner=context.get("tool_owner"),
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={
+                    "server": self.server.server_name,
+                    "tool": self.tool_name,
+                    "arguments": dict(task.input),
+                    "result": result,
+                },
             )
+        ]
 
-        return await server.call_tool(tool_name, arguments)
 
-    async def disconnect_all(self) -> None:
-        """Disconnect from all MCP servers"""
-        for server in self.servers:
-            try:
-                await server.disconnect()
-            except Exception as e:
-                logger.warning(
-                    f"Error disconnecting from {server.server_name}: {str(e)}"
-                )
+class MCPToolDeclarations:
+    """Declaration-only runtime plugin for one connected MCP server."""
 
-        self.servers.clear()
-        self._tool_server_map.clear()
+    def __init__(self, server: MCPServer):
+        self.server = server
+        self.server_id = _identifier(server.server_name)
+        self.manifest = PluginManifest(
+            id=_plugin_id("mcp", server.server_name),
+            display_name=f"MCP Tools {server.server_name}",
+            version="1.0.0",
+            kind=PluginKind.RUNTIME_EXTENSION,
+            domains=frozenset({"chat"}),
+        )
+        self._tools = tuple(server.list_tools())
+        self._tool_ids = {tool.name: _identifier(tool.name) for tool in self._tools}
 
-    @property
-    def tool_count(self) -> int:
-        """Total number of tools across all servers"""
-        return len(self._tool_server_map)
+    def declare_capabilities(self):
+        return tuple(
+            Capability(
+                id=f"mcp.{self.server_id}.{self._tool_ids[tool.name]}",
+                owner=self.manifest.id,
+                description=tool.description,
+                domains=frozenset({"chat", "mcp"}),
+                operation_types=frozenset({"chat.tool_call", "mcp.tool_call"}),
+                access=AccessMode.READ,
+                risk=RiskLevel.MEDIUM,
+                input_schema=tool.input_schema or {"type": "object"},
+                output_evidence=frozenset({"mcp.tool.result"}),
+                executor=f"{self.manifest.id}.{self._tool_ids[tool.name]}",
+                model_visible=True,
+                side_effecting=True,
+                metadata={"server": self.server.server_name, "tool": tool.name},
+            )
+            for tool in self._tools
+        )
 
-    @property
-    def server_count(self) -> int:
-        """Number of connected servers"""
-        return len(self.servers)
+    def get_executors(self):
+        return tuple(
+            MCPToolExecutor(
+                id=f"{self.manifest.id}.{self._tool_ids[tool.name]}",
+                capability_ids=frozenset(
+                    {f"mcp.{self.server_id}.{self._tool_ids[tool.name]}"}
+                ),
+                server=self.server,
+                tool_name=tool.name,
+            )
+            for tool in self._tools
+        )
+
+    def declare_evidence_schemas(self):
+        return (
+            EvidenceSchema(
+                kind="mcp.tool.result",
+                owner=self.manifest.id,
+                json_schema={"type": "object"},
+                description="Result returned by an MCP tool.",
+            ),
+        )
+
+    def get_tool_views(self):
+        return tuple(
+            ToolView(
+                name=f"{self.server_id}_{self._tool_ids[tool.name]}",
+                capability_id=f"mcp.{self.server_id}.{self._tool_ids[tool.name]}",
+                description=tool.description,
+                parameters=tool.input_schema or {"type": "object"},
+                metadata={"server": self.server.server_name, "tool": tool.name},
+            )
+            for tool in self._tools
+        )
 
 
 # Factory function for clean server configuration
@@ -478,5 +507,19 @@ def server(
     return {"command": command, "args": args or [], "env": env or {}, "name": name}
 
 
+def _plugin_id(prefix: str, value: str) -> str:
+    return f"{_identifier(prefix)}_{_identifier(value)}"
+
+
+def _identifier(value: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in value)
+    cleaned = "_".join(part for part in cleaned.split("_") if part)
+    if not cleaned:
+        cleaned = "mcp"
+    if not cleaned[0].isalpha():
+        cleaned = f"mcp_{cleaned}"
+    return cleaned
+
+
 # Export public API
-__all__ = ["MCPServer", "MCPTool", "MCPToolRegistry", "server"]
+__all__ = ["MCPServer", "MCPTool", "MCPToolDeclarations", "server"]

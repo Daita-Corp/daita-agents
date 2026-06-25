@@ -141,7 +141,7 @@ class OpenAIProvider(OpenAICompatibleMixin, BaseLLMProvider):
 
         except Exception as e:
             logger.error(f"OpenAI generation failed: {str(e)}")
-            raise LLMError(f"OpenAI generation failed: {str(e)}")
+            raise self._provider_error("OpenAI generation failed", e) from e
 
     async def _stream_impl(
         self,
@@ -237,7 +237,7 @@ class OpenAIProvider(OpenAICompatibleMixin, BaseLLMProvider):
 
         except Exception as e:
             logger.error(f"OpenAI streaming failed: {str(e)}")
-            raise LLMError(f"OpenAI streaming failed: {str(e)}")
+            raise self._provider_error("OpenAI streaming failed", e) from e
 
     @property
     def info(self) -> Dict[str, Any]:

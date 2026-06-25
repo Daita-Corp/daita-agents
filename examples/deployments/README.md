@@ -72,9 +72,9 @@ SQL injection, command injection, hardcoded secrets, cyclomatic complexity,
 naming conventions, and more.
 
 **Highlights:**
-- `BaseSkill` subclass with `instructions_file` (security review)
-- `Skill()` factory with inline instructions (code quality)
-- AST-based analysis tools (complexity, naming) + regex vulnerability scanning
+- `BaseSkill` subclass with `instructions_file` and declared capabilities (security review)
+- `Skill()` factory with inline instructions and ToolViews (code quality)
+- AST-based analysis capabilities (complexity, naming) + regex vulnerability scanning
 - Demonstrates composable agent capabilities via skills
 
 **Required env vars:**

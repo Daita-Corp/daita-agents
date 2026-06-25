@@ -19,8 +19,7 @@ def _print_tool_usage(result: dict, agent, stage_elapsed: float) -> None:
     """Print which tools an agent called during its run, with timing."""
     print(f"  Stage time: {stage_elapsed:.1f}s")
 
-    # Use agent's internal tool call history (has duration_ms)
-    history = getattr(agent, "_tool_call_history", [])
+    history = result.get("tool_calls", [])
     if not history:
         print(f"  Tools called: (none)")
         return
@@ -64,8 +63,8 @@ async def run_workflow(query: str) -> dict:
     Run a deep research pipeline for the given query.
 
     Each agent runs sequentially, passing its output as the next agent's input
-    via receive_message(). All agents share a 'deep_research' memory workspace,
-    so they can also recall findings stored by earlier agents.
+    via receive_message(). Memory plugins may contribute runtime context, but
+    stage data is passed explicitly through the workflow.
 
     Args:
         query: The research question (e.g. "What are the latest breakthroughs
@@ -137,7 +136,7 @@ async def run_workflow(query: str) -> dict:
         print(f"  ✓ Report written\n")
 
     finally:
-        # Stop all agents — flushes memory graph and triggers on_agent_stop
+        # Stop all agents, allowing registry teardown to flush memory state.
         for agent in agents:
             try:
                 await agent.stop()

@@ -1,19 +1,13 @@
 """
-Agent — The primary agent class for building AI-driven applications.
+Agent — Secondary generic chat facade.
 
-Provides autonomous tool-calling, multi-provider LLM support, plugin integration,
-and zero-configuration tracing. Use Agent for most use cases; subclass BaseAgent
-for full control over the execution loop.
+The data-first production interface is ``Agent.from_db()`` / ``daita.db``.
+Use this generic Agent for non-DB chat, local tools, skills, and lightweight
+runtime-extension experiments.
 """
 
-import hashlib
-import json
 import logging
 import time
-from dataclasses import dataclass
-from datetime import datetime, date
-from decimal import Decimal
-from uuid import UUID
 from typing import TYPE_CHECKING, Dict, Any, Optional, List, Union, Callable
 
 if TYPE_CHECKING:
@@ -23,204 +17,34 @@ import asyncio
 
 from ..config.base import AgentConfig, AgentType, RetryPolicy
 from ..core.interfaces import LLMProvider
-from ..core.exceptions import AgentError, SkillError
+from ..core.exceptions import AgentError
+from ..runtime import InMemoryRuntimeStore, RuntimeKernel
 from ..skills.base import BaseSkill
 from ..core.tracing import TraceType
 from .base import BaseAgent
+from .chat.facade import ChatAgentFacadeMixin
+from .chat.runtime import ChatRuntime, ChatRunResult, ChatToolCallResult, ModelToolSpec
 
 logger = logging.getLogger(__name__)
 
-
-async def _execute_tool_call(
-    tool_call: Dict[str, Any], tools: List["AgentTool"]
-) -> Any:
-    """
-    Execute a single tool call with timeout and error handling.
-
-    Intentionally lives in the agent layer — tool execution is an agent concern.
-    The LLM layer is responsible for generating tool call requests; the agent
-    layer is responsible for acting on them.
-    """
-    tool_name = tool_call["name"]
-    arguments = tool_call["arguments"]
-
-    tool = next((t for t in tools if t.name == tool_name), None)
-    if not tool:
-        return {"error": f"Tool '{tool_name}' not found"}
-
-    try:
-        result = await asyncio.wait_for(
-            tool.handler(arguments), timeout=tool.timeout_seconds
-        )
-        return result
-    except asyncio.TimeoutError:
-        return {"error": f"Tool '{tool_name}' timed out after {tool.timeout_seconds}s"}
-    except Exception as e:
-        return {"error": f"Tool '{tool_name}' failed: {str(e)}"}
-
-
-def _make_error_fingerprint(tool_call: Dict[str, Any]) -> str:
-    """Stable hash of (tool_name, arguments) used for loop detection."""
-    args_hash = hashlib.md5(
-        json.dumps(tool_call.get("arguments", {}), sort_keys=True, default=str).encode()
-    ).hexdigest()[:8]
-    return f"{tool_call['name']}:{args_hash}"
-
-
-def _has_terminal_tool_result(
-    results: List[Dict[str, Any]], terminal_tools: set[str]
-) -> bool:
-    """Return True when a configured terminal tool completed without an error."""
-    if not terminal_tools:
-        return False
-    for result in results:
-        if result.get("tool") not in terminal_tools:
-            continue
-        raw = result.get("result")
-        if isinstance(raw, dict) and raw.get("error"):
-            continue
-        if isinstance(raw, dict) and (
-            raw.get("repair_required")
-            or raw.get("preflight_failed")
-            or raw.get("blocked_repeat")
-        ):
-            continue
-        return True
-    return False
-
-
-def _tool_loop_error_message(raw: Any) -> Optional[str]:
-    """Return an error-like message for tool results that should count as loops."""
-    if not isinstance(raw, dict):
-        return None
-    if raw.get("error"):
-        return str(raw["error"])
-    if raw.get("blocked_repeat"):
-        return str(raw.get("message") or raw.get("status") or "blocked repeat")
-    if raw.get("repair_required") or raw.get("preflight_failed"):
-        return str(raw.get("message") or raw.get("guidance") or "repair required")
-    return None
-
-
-def _json_serializer(obj):
-    """
-    Custom JSON serializer for types commonly returned by database plugins.
-
-    Handles datetime, Decimal, UUID, and other non-JSON-native types that
-    plugins might return from queries.
-    """
-    if isinstance(obj, (datetime, date)):
-        return obj.isoformat()
-    elif isinstance(obj, Decimal):
-        return float(obj)
-    elif isinstance(obj, UUID):
-        return str(obj)
-    elif isinstance(obj, bytes):
-        return obj.decode("utf-8", errors="replace")
-    elif hasattr(obj, "to_dict") and callable(obj.to_dict):
-        return obj.to_dict()
-    elif hasattr(obj, "__dict__"):
-        # Exclude private/internal attributes to avoid leaking credentials or state
-        return {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+__all__ = [
+    "Agent",
+    "ChatRunResult",
+    "ChatToolCallResult",
+    "ModelToolSpec",
+]
 
 
 # Import unified plugin access
 from ..plugins import PluginAccess
-from ..plugins.base import BasePlugin, LifecyclePlugin
+from ..plugins.registry import ExtensionRegistry
 from ..llm.factory import create_llm_provider
 from ..config.settings import settings
-from ..core.tools import AgentTool, ToolRegistry
+from ..core.tools import LocalTool, LocalToolCatalog
 
 
-class FocusedTool:
-    """Wrapper that applies a Focus DSL expression to tool results before they reach the LLM."""
-
-    def __init__(self, tool: AgentTool, focus: str):
-        self._tool = tool
-        self._focus = focus
-
-    async def handler(self, arguments: Dict[str, Any]) -> Any:
-        # If the tool natively accepts a focus DSL (e.g. SQL plugin tools), inject
-        # it into the args so pushdown happens at the source.  If that fails,
-        # fall through to the Python-side evaluator below.
-        tool_props = self._tool.parameters.get("properties", {})
-        if "focus" in tool_props:
-            try:
-                return await self._tool.handler({**arguments, "focus": self._focus})
-            except Exception as e:
-                logger.warning(
-                    f"Focus injection failed for {self._tool.name} ({e}); "
-                    "falling back to Python evaluation"
-                )
-                # Fall through to Python-side application below
-
-        result = await self._tool.handler(arguments)
-        if result is None:
-            return result
-        try:
-            from ..core.focus import apply_focus
-
-            # Plugin tools wrap results in {"rows": [...], "row_count": N, ...}.
-            # Apply focus to the rows list, not the wrapper dict, then put it back.
-            if isinstance(result, dict) and isinstance(result.get("rows"), list):
-                focused = apply_focus(result["rows"], self._focus)
-                n = len(focused) if isinstance(focused, list) else 1
-                logger.debug(
-                    f"Focus applied to {self.name} rows: {result['row_count']} -> {n}"
-                )
-                return {**result, "rows": focused, "row_count": n}
-            focused = apply_focus(result, self._focus)
-            logger.debug(
-                f"Focus applied to {self.name}: {type(result).__name__} -> {type(focused).__name__}"
-            )
-            return focused
-        except Exception as e:
-            logger.warning(f"Focus application failed for {self.name}: {e}")
-            return result
-
-    def __getattr__(self, name):
-        return getattr(self._tool, name)
-
-    def __repr__(self):
-        return f"FocusedTool({self._tool.name}, focus={self._focus!r})"
-
-
-@dataclass
-class LLMResult:
-    """Unified LLM response format for both streaming and non-streaming."""
-
-    text: str
-    tool_calls: List[Dict[str, Any]]
-
-    @classmethod
-    def from_response(cls, response: Any) -> "LLMResult":
-        """Create LLMResult from non-streaming response."""
-        if isinstance(response, str):
-            return cls(text=response, tool_calls=[])
-        elif isinstance(response, dict):
-            return cls(
-                text=response.get("content", ""),
-                tool_calls=response.get("tool_calls", []),
-            )
-        else:
-            logger.warning(f"Unexpected response type: {type(response)}")
-            return cls(text=str(response), tool_calls=[])
-
-
-def _resolve_tool_focus(
-    agent_focus: Optional[Union[str, Dict[str, str]]],
-    t: "AgentTool",
-) -> Optional[str]:
-    """Return the effective focus DSL for a single tool, applying precedence rules."""
-    tool_default = getattr(t, "focus", None)
-    if isinstance(agent_focus, dict):
-        return agent_focus.get(t.name) or tool_default
-    return agent_focus or tool_default
-
-
-class Agent(BaseAgent):
-    """DAITA's primary agent with autonomous tool-calling and LLM-driven task execution."""
+class Agent(ChatAgentFacadeMixin, BaseAgent):
+    """Generic chat facade with autonomous tool-calling and LLM execution."""
 
     # Class-level defaults for smart constructor
     _default_llm_provider = "openai"
@@ -241,10 +65,10 @@ class Agent(BaseAgent):
 
     @classmethod
     async def from_db(cls, source, **kwargs):
-        """Create a fully configured Agent from a database connection string or plugin.
+        """Create a DB-aware agent from a database source.
 
-        Connects to the database, discovers the schema, generates a system prompt,
-        and returns an Agent with query tools ready to use.
+        This public entry point is backed by the operation-centric DB runtime.
+        It returns a ``DbAgent`` facade instead of a patched generic ``Agent``.
 
         Args:
             source: Connection string (e.g. "postgresql://user:pass@host/db") or
@@ -256,8 +80,9 @@ class Agent(BaseAgent):
                 db_schema: DB schema name override (e.g. "public" for PostgreSQL).
                 lineage: True to auto-create LineagePlugin, or pass an instance.
                     Seeds FK relationships into a persistent graph.
-                memory: True to auto-create MemoryPlugin, or pass an instance.
-                    Enables conversational business context annotations.
+                memory: Optional DB memory configuration mapping or DbMemoryConfig.
+                    Pass False to disable planning-time memory recall.
+                skills: Skill instances registered before DbRuntime setup.
                 cache_ttl: Schema cache TTL in seconds. None disables caching.
                 Additional kwargs forwarded to Agent.__init__.
 
@@ -265,12 +90,12 @@ class Agent(BaseAgent):
             agent = await Agent.from_db(
                 "postgresql://localhost/mydb",
                 lineage=True,
-                memory=True,
+                memory={"enabled": True},
                 cache_ttl=3600,
             )
             result = await agent.run("What are our top customers?")
         """
-        from .db import from_db
+        from daita.db import from_db
 
         return await from_db(source, **kwargs)
 
@@ -284,10 +109,12 @@ class Agent(BaseAgent):
         agent_id: Optional[str] = None,
         prompt: Optional[Union[str, Dict[str, str]]] = None,
         focus: Optional[Union[str, Dict[str, str]]] = None,
-        relay: Optional[str] = None,
-        mcp: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
         display_reasoning: bool = False,
-        # Tool sources
+        # Extension/plugin sources
+        plugins: Optional[List] = None,
+        extension_registry: Optional[ExtensionRegistry] = None,
+        skills: Optional[List[BaseSkill]] = None,
+        # Tool sources (local tool projection: LocalTool or plugin-like objects)
         tools: Optional[List] = None,
         # Reliability
         enable_reliability: bool = False,
@@ -338,7 +165,6 @@ class Agent(BaseAgent):
         # Store customization options
         self.prompt = prompt
         self.default_focus = focus
-        self.relay = relay
 
         # Decision display setup
         self.display_reasoning = display_reasoning
@@ -348,29 +174,62 @@ class Agent(BaseAgent):
             self._setup_decision_display()
 
         # Tool management (unified system)
-        self.tool_registry = ToolRegistry()
-        self.tool_sources = []
+        self.local_tool_catalog = LocalToolCatalog()
+        self.extension_registry = extension_registry or ExtensionRegistry()
+        self.runtime_store = InMemoryRuntimeStore()
+        self.runtime_kernel = RuntimeKernel(
+            runtime_id=self.agent_id,
+            runtime_kind="chat",
+            extension_registry=self.extension_registry,
+            runtime_store=self.runtime_store,
+        )
+        self._runtime: ChatRuntime | None = None
+        self._extension_setup_plugin_ids: set[str] = set()
+        self._local_tool_sources = []
         self._tools_setup = False
+        for plugin in plugins or []:
+            self.add_plugin(plugin)
         for source in tools or []:
             self.add_plugin(source)
-        self._focus_default_warned: set = (
-            set()
-        )  # tracks @tool focus defaults already logged
-
-        # Tool call history tracking for operations metadata
-        self._tool_call_history = []
-
-        # MCP server integration — setup happens lazily on first use
-        self.mcp_registry = None
-        self.mcp_tools = []
-        self._mcp_server_configs = (
-            ([mcp] if isinstance(mcp, dict) else mcp) if mcp is not None else []
-        )
-
+        for skill in skills or []:
+            self.add_skill(skill)
         # Plugin access for direct plugin usage
         self.plugins = PluginAccess()
 
         logger.debug(f"Agent {self.name} initialized")
+
+    @property
+    def runtime(self) -> ChatRuntime:
+        """Return the ChatRuntime implementation behind this Agent facade."""
+        if self._runtime is None:
+            runtime = ChatRuntime(
+                runtime_id=self.agent_id,
+                agent_name=self.name,
+                llm_getter=lambda: self.llm,
+                llm_provider_name_getter=lambda: self._llm_provider_name,
+                config=self.config,
+                prompt=self.prompt,
+                default_focus=self.default_focus,
+                extension_registry=self.extension_registry,
+                runtime_kernel=self.runtime_kernel,
+                runtime_store=self.runtime_store,
+                trace_manager=self.trace_manager,
+                setup_tools=self._setup_tools,
+                setup_extensions=self.setup_extensions,
+                emit_event=self._emit_event,
+                retry_with_tracing=self._retry_with_tracing,
+                final_answer_hooks_getter=lambda: getattr(
+                    self, "_daita_final_answer_readiness_hooks", []
+                ),
+            )
+            runtime.bind_local_tool_catalog(self.local_tool_catalog)
+            self._runtime = runtime
+        return self._runtime
+
+    @runtime.setter
+    def runtime(self, value: ChatRuntime) -> None:
+        """Allow advanced users and tests to replace the ChatRuntime."""
+        self._runtime = value
 
     @property
     def llm(self):
@@ -428,90 +287,6 @@ class Agent(BaseAgent):
             self.display_reasoning = False
             self._decision_display = None
 
-    async def _setup_mcp_tools(self):
-        """Setup MCP servers and discover available tools. Called lazily on first process()."""
-        if self.mcp_registry is not None:
-            # Already setup
-            return
-
-        if not self._mcp_server_configs:
-            # No MCP servers configured
-            return
-
-        try:
-            from ..plugins.mcp import MCPServer, MCPToolRegistry
-
-            logger.info(
-                f"Setting up {len(self._mcp_server_configs)} MCP server(s) for {self.name}"
-            )
-
-            # Create registry
-            self.mcp_registry = MCPToolRegistry()
-
-            # Connect to each server and register tools
-            for server_config in self._mcp_server_configs:
-                server = MCPServer(
-                    command=server_config.get("command"),
-                    args=server_config.get("args", []),
-                    env=server_config.get("env", {}),
-                    server_name=server_config.get("name"),
-                )
-
-                # Add to registry (automatically connects and discovers tools)
-                await self.mcp_registry.add_server(server)
-
-            # Get all tools from registry
-            self.mcp_tools = self.mcp_registry.get_all_tools()
-
-            logger.info(
-                f"MCP setup complete: {self.mcp_registry.tool_count} tools from {self.mcp_registry.server_count} server(s)"
-            )
-
-        except ImportError:
-            logger.error(
-                "MCP SDK not installed. Install with: pip install 'daita-agents[mcp]'"
-            )
-            raise
-
-        except Exception as e:
-            logger.error(f"Failed to setup MCP servers: {str(e)}")
-            raise
-
-    def _register_tool_source(self, source) -> None:
-        """Register a single tool source (AgentTool or plugin) into the tool registry."""
-        if isinstance(source, AgentTool):
-            self.tool_registry.register(source)
-        elif hasattr(source, "get_tools"):
-            plugin_tools = source.get_tools()
-            if plugin_tools:
-                self.tool_registry.register_many(plugin_tools)
-                logger.info(
-                    f"Registered {len(plugin_tools)} tools from "
-                    f"{source.__class__.__name__}"
-                )
-        else:
-            logger.warning(
-                f"Invalid tool source: {source}. "
-                f"Expected AgentTool or plugin with get_tools() method."
-            )
-
-    async def _setup_tools(self):
-        """Set up MCP tools. Non-MCP tools are registered eagerly in add_plugin()."""
-        if self._tools_setup:
-            return  # Already setup
-
-        # Setup MCP tools (requires async connection)
-        if self._mcp_server_configs and self.mcp_registry is None:
-            await self._setup_mcp_tools()
-            for mcp_tool in self.mcp_tools:
-                agent_tool = AgentTool.from_mcp_tool(mcp_tool, self.mcp_registry)
-                self.tool_registry.register(agent_tool)
-
-        self._tools_setup = True
-        logger.info(
-            f"Agent {self.name} ready with {self.tool_registry.tool_count} tools"
-        )
-
     # ========================================================================
     # USER API - What developers call directly
     # ========================================================================
@@ -519,7 +294,7 @@ class Agent(BaseAgent):
     async def run(
         self,
         prompt: str,
-        tools: Optional[List[Union[str, AgentTool]]] = None,
+        tools: Optional[List[Union[str, LocalTool]]] = None,
         max_iterations: int = 20,
         timeout_seconds: Optional[int] = None,
         on_event: Optional[Callable] = None,
@@ -548,7 +323,7 @@ class Agent(BaseAgent):
     async def stream(
         self,
         prompt: str,
-        tools: Optional[List[Union[str, AgentTool]]] = None,
+        tools: Optional[List[Union[str, LocalTool]]] = None,
         max_iterations: int = 20,
         timeout_seconds: Optional[int] = None,
         history: Optional["ConversationHistory"] = None,
@@ -612,7 +387,7 @@ class Agent(BaseAgent):
     async def _run_traced(
         self,
         prompt: str,
-        tools: Optional[List[Union[str, AgentTool]]],
+        tools: Optional[List[Union[str, LocalTool]]],
         max_iterations: int,
         timeout_seconds: Optional[int],
         on_event: Optional[Callable],
@@ -637,12 +412,9 @@ class Agent(BaseAgent):
             prompt=prompt[:200],  # Truncate for storage
             tools_requested=tools_requested,
             max_iterations=max_iterations,
-            entry_point="run",  # Distinguishes from _process() calls
+            entry_point="run",
             input_data={"prompt": prompt, "tools_requested": tools_requested},
         ) as span_id:
-            # Start watches lazily on first run (idempotent)
-            await self._start_watches()
-
             # Resolve history workspace and extract prior messages before branching
             if history is not None:
                 history._set_workspace(self.agent_id)
@@ -684,653 +456,3 @@ class Agent(BaseAgent):
 
             self.trace_manager.record_output(span_id, result)
             return result
-
-    def _resolve_tools(
-        self, tools: Optional[List[Union[str, AgentTool]]]
-    ) -> List[AgentTool]:
-        """Resolve tool names to AgentTool instances. If None, returns all registered tools."""
-        if tools is None:
-            # Use all registered tools
-            return list(self.tool_registry.tools)
-
-        tool_list = []
-        for t in tools:
-            if isinstance(t, str):
-                # Tool name - look up in registry
-                tool = self.tool_registry.get(t)
-                if not tool:
-                    raise ValueError(f"Tool '{t}' not found in registry")
-                tool_list.append(tool)
-            else:
-                # Already an AgentTool instance
-                tool_list.append(t)
-
-        return tool_list
-
-    def _emit_event(self, on_event: Optional[Callable], event_type, **kwargs):
-        """Emit event only if callback provided. Zero overhead when None."""
-        if on_event:
-            from ..core.streaming import AgentEvent
-
-            on_event(AgentEvent(type=event_type, **kwargs))
-
-    async def _prepare_tools_with_focus(
-        self, tools: Optional[List[Union[str, "AgentTool"]]]
-    ) -> List["AgentTool"]:
-        """Resolve tools and wrap with FocusedTool using the focus precedence chain.
-
-        Precedence (highest → lowest):
-            1. Agent dict focus  — Agent(focus={"tool_name": "..."})
-            2. Agent string focus — Agent(focus="...")
-            3. @tool default      — @tool(focus="..."), warned on first use
-            4. No focus           — result passes through unmodified
-        """
-        await self._setup_tools()
-        resolved_tools = self._resolve_tools(tools)
-
-        result = []
-        for t in resolved_tools:
-            effective = _resolve_tool_focus(self.default_focus, t)
-
-            if effective:
-                # Warn once when the only active focus is the @tool-level default
-                if effective == getattr(t, "focus", None) and not self.default_focus:
-                    if t.name not in self._focus_default_warned:
-                        logger.warning(
-                            f"Tool '{t.name}' has a built-in focus default: {effective!r}. "
-                            f"Applied automatically. To be explicit, set "
-                            f"Agent(focus={{'{t.name}': '...'}})"
-                        )
-                        self._focus_default_warned.add(t.name)
-                else:
-                    logger.debug(f"Focus applied to '{t.name}': {effective!r}")
-                result.append(FocusedTool(t, effective))
-            else:
-                result.append(t)
-
-        return result
-
-    async def _stream_llm_turn(
-        self,
-        conversation: List[Dict],
-        tools: List["AgentTool"],
-        on_event: Callable,
-        **kwargs,
-    ) -> LLMResult:
-        """Execute streaming LLM turn with event emission."""
-        from ..core.streaming import EventType
-
-        thinking_text = ""
-        tool_calls = []
-
-        async for chunk in await self.llm.generate(
-            messages=conversation, tools=tools, stream=True, **kwargs
-        ):
-            if chunk.type == "text":
-                thinking_text += chunk.content
-                self._emit_event(on_event, EventType.THINKING, content=chunk.content)
-
-            elif chunk.type == "tool_call_complete":
-                tool_calls.append(
-                    {
-                        "id": chunk.tool_call_id,
-                        "name": chunk.tool_name,
-                        "arguments": chunk.tool_args,
-                    }
-                )
-                self._emit_event(
-                    on_event,
-                    EventType.TOOL_CALL,
-                    tool_name=chunk.tool_name,
-                    tool_args=chunk.tool_args,
-                )
-
-        return LLMResult(text=thinking_text, tool_calls=tool_calls)
-
-    async def _nonstream_llm_turn(
-        self, conversation: List[Dict], tools: List["AgentTool"], **kwargs
-    ) -> LLMResult:
-        """Execute non-streaming LLM turn."""
-        return LLMResult.from_response(
-            await self.llm.generate(
-                messages=conversation, tools=tools, stream=False, **kwargs
-            )
-        )
-
-    async def _execute_and_track_tool(
-        self,
-        tool_call: Dict[str, Any],
-        tools: List["AgentTool"],
-        on_event: Optional[Callable],
-    ) -> Dict[str, Any]:
-        """Execute tool and emit result event."""
-        from ..core.streaming import EventType
-
-        tool_name = tool_call["name"]
-
-        async with self.trace_manager.span(
-            operation_name=f"tool_{tool_name}",
-            trace_type=TraceType.TOOL_EXECUTION,
-            agent_id=self.agent_id,
-            tool_name=tool_name,
-            input_data=tool_call.get("arguments"),
-        ) as span_id:
-            # Track execution time
-            start_time = time.time()
-
-            result = await _execute_tool_call(tool_call, tools)
-            self.trace_manager.record_output(span_id, result)
-
-            # Calculate duration
-            duration_ms = int((time.time() - start_time) * 1000)
-
-            # Track this tool call in history
-            tool_call_record = {
-                "name": tool_name,
-                "duration_ms": duration_ms,
-                "input": tool_call.get("arguments"),
-                "output": result,
-            }
-            self._tool_call_history.append(tool_call_record)
-
-            # Emit result event
-            self._emit_event(
-                on_event, EventType.TOOL_RESULT, tool_name=tool_name, result=result
-            )
-
-            return {
-                "tool": tool_name,
-                "arguments": tool_call["arguments"],
-                "result": result,
-                "duration_ms": duration_ms,
-            }
-
-    def _append_tool_messages(
-        self, conversation: List[Dict], tool_calls: List[Dict], results: List[Any]
-    ):
-        """Add tool calls and results to conversation history."""
-        # Add assistant message with tool calls
-        conversation.append({"role": "assistant", "tool_calls": tool_calls})
-
-        # Add tool result messages
-        for tool_call, result in zip(tool_calls, results):
-            content_result = result["result"]
-            compactor = getattr(self, "_compact_tool_result_for_context", None)
-            if callable(compactor):
-                content_result = compactor(tool_call["name"], content_result)
-            conversation.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "name": tool_call["name"],
-                    "content": json.dumps(content_result, default=_json_serializer),
-                }
-            )
-
-    def _build_final_result(
-        self,
-        final_text: str,
-        tools_called: List[Dict],
-        iterations: int,
-        on_event: Optional[Callable],
-    ) -> Dict[str, Any]:
-        """Build final result dictionary with metadata."""
-        from ..core.streaming import EventType
-
-        token_stats = self.llm.get_token_stats()
-        cost = token_stats.get("estimated_cost", 0.0)
-
-        result = {
-            "result": final_text,
-            "tool_calls": tools_called,
-            "iterations": iterations,
-            "tokens": token_stats,
-            "cost": cost,
-        }
-
-        # Emit completion event with all metadata
-        self._emit_event(
-            on_event,
-            EventType.COMPLETE,
-            final_result=final_text,
-            iterations=iterations,
-            token_usage=token_stats,
-            cost=cost,
-        )
-
-        return result
-
-    async def _execute_autonomous_with_retry(
-        self,
-        prompt: str,
-        tools: Optional[List[Union[str, "AgentTool"]]],
-        max_iterations: int,
-        on_event: Optional[Callable],
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """Execute autonomous tool calling with retry logic via the shared scaffold."""
-
-        async def execute(attempt: int, max_attempts: int) -> Dict[str, Any]:
-            result = await self._execute_autonomous(
-                prompt=prompt,
-                tools=tools,
-                max_iterations=max_iterations,
-                on_event=on_event,
-                **kwargs,
-            )
-            if attempt > 1:
-                result["retry_attempt"] = attempt
-            return result
-
-        return await self._retry_with_tracing(execute, "autonomous_retry_attempt")
-
-    async def _build_initial_conversation(
-        self,
-        prompt: str,
-        initial_messages: Optional[List[Dict]] = None,
-    ) -> List[Dict]:
-        """Build the opening conversation list for a run.
-
-        Assembles: system prompt + memory context (from on_before_run hooks)
-        + prior history + current user message.
-        """
-        conversation = []
-        system_parts = []
-
-        if self.prompt:
-            system_parts.append(self.prompt)
-
-        skill_parts = []
-        for source in self.tool_sources:
-            disabled_for = getattr(
-                source, "_daita_disable_lifecycle_context_for_agent_ids", set()
-            )
-            if self.agent_id in disabled_for:
-                continue
-            if isinstance(source, LifecyclePlugin):
-                try:
-                    context = await source.on_before_run(prompt)
-                    if context:
-                        if isinstance(source, BaseSkill):
-                            skill_parts.append(f"### {source.name}\n{context}")
-                        else:
-                            system_parts.append(context)
-                except Exception as e:
-                    source_name = getattr(source, "name", source.__class__.__name__)
-                    logger.warning("on_before_run failed for '%s': %s", source_name, e)
-
-        if skill_parts:
-            system_parts.append("## Skills & Expertise\n" + "\n\n".join(skill_parts))
-
-        if system_parts:
-            conversation.append(
-                {"role": "system", "content": "\n\n".join(system_parts)}
-            )
-
-        if initial_messages:
-            conversation.extend(initial_messages)
-
-        conversation.append({"role": "user", "content": prompt})
-        return conversation
-
-    async def _execute_autonomous(
-        self,
-        prompt: str,
-        tools: Optional[List[Union[str, "AgentTool"]]],
-        max_iterations: int,
-        on_event: Optional[Callable],
-        initial_messages: Optional[List[Dict]] = None,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """Unified autonomous execution path for both streaming and non-streaming."""
-        from ..core.streaming import EventType
-
-        # Check if LLM provider is available
-        if self.llm is None:
-            provider_name = self._llm_provider_name or "openai"
-            raise AgentError(
-                f"Cannot execute: No API key found for '{provider_name}'. "
-                f"Set {provider_name.upper()}_API_KEY environment variable "
-                f"or pass api_key parameter to Agent."
-            )
-
-        # Prepare tools with focus wrapping
-        resolved_tools = await self._prepare_tools_with_focus(tools)
-        active_tools = resolved_tools
-        final_synthesis_without_tools = bool(
-            kwargs.pop("final_synthesis_without_tools", False)
-        )
-        terminal_tools = set(kwargs.pop("terminal_tools", []) or [])
-
-        # Reset tool call history for this execution
-        self._tool_call_history = []
-
-        conversation = await self._build_initial_conversation(prompt, initial_messages)
-        tools_called = []
-
-        # Tracks consecutive error count per (tool_name, args) fingerprint.
-        # Reset to 0 on any successful call with that fingerprint.
-        # Raised to AgentError when the same call fails 3 times in a row —
-        # the agent has demonstrated it cannot self-correct from this error.
-        _error_fingerprints: Dict[str, int] = {}
-
-        # Autonomous tool calling loop
-        for iteration in range(max_iterations):
-            # Emit iteration event
-            self._emit_event(
-                on_event,
-                EventType.ITERATION,
-                iteration=iteration + 1,
-                max_iterations=max_iterations,
-            )
-
-            # Get LLM response (streaming or non-streaming based on on_event)
-            if on_event:
-                llm_result = await self._stream_llm_turn(
-                    conversation, active_tools, on_event, **kwargs
-                )
-            else:
-                llm_result = await self._nonstream_llm_turn(
-                    conversation, active_tools, **kwargs
-                )
-
-            # Check if LLM wants to call tools
-            if llm_result.tool_calls:
-                # Execute each tool
-                results = []
-                for tool_call in llm_result.tool_calls:
-                    result = await self._execute_and_track_tool(
-                        tool_call, active_tools, on_event
-                    )
-                    tools_called.append(result)
-                    results.append(result)
-
-                    # Loop detection: identical (tool, args) producing consecutive errors
-                    raw = result.get("result", {})
-                    fp = _make_error_fingerprint(tool_call)
-                    loop_error = _tool_loop_error_message(raw)
-                    if loop_error:
-                        _error_fingerprints[fp] = _error_fingerprints.get(fp, 0) + 1
-                        if _error_fingerprints[fp] >= 3:
-                            raise AgentError(
-                                f"Loop detected: '{tool_call['name']}' returned a repair/error result "
-                                f"{_error_fingerprints[fp]} consecutive times with identical "
-                                f"arguments. Last result: {loop_error}"
-                            )
-                    else:
-                        _error_fingerprints.pop(fp, None)
-
-                # Add to conversation and continue loop
-                self._append_tool_messages(conversation, llm_result.tool_calls, results)
-                if final_synthesis_without_tools and _has_terminal_tool_result(
-                    results, terminal_tools
-                ):
-                    active_tools = []
-                else:
-                    active_tools = resolved_tools
-                continue
-
-            # Final answer received
-            return self._build_final_result(
-                llm_result.text, tools_called, iteration + 1, on_event
-            )
-
-        # Max iterations reached without final answer
-        token_stats = self.llm.get_token_stats() if self.llm is not None else {}
-        raise AgentError(
-            f"Max iterations ({max_iterations}) reached without final answer",
-            agent_id=self.agent_id,
-            task=prompt,
-            context={
-                "max_iterations": max_iterations,
-                "iterations": max_iterations,
-                "tool_calls": tools_called,
-                "tokens": token_stats,
-            },
-        )
-
-    # ========================================================================
-    # INTERNAL - Backward compatibility for system integration
-    # ========================================================================
-
-    async def _process(
-        self,
-        task: str,
-        data: Any = None,
-        context: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """INTERNAL: Legacy entry point — delegates to receive_message.
-
-        Prefer receive_message() for new integrations; this exists for
-        backward compatibility with older workflow and lambda callers.
-        """
-        result = await self.receive_message(
-            data=data if data is not None else task,
-            source_agent="internal",
-            channel="process",
-            workflow_name=task,
-            **kwargs,
-        )
-
-        if context:
-            result["context"] = {**result.get("context", {}), **context}
-
-        # Legacy fields expected by older internal callers
-        result["task"] = task
-        result["status"] = "success" if "result" in result else "error"
-
-        return result
-
-    # ========================================================================
-    # SYSTEM INTEGRATION API - What infrastructure calls
-    # ========================================================================
-
-    def _frame_payload(self, data: Any, tag: str) -> str:
-        """Wrap data in an XML-like tag for safe LLM framing (prevents prompt injection)."""
-        if isinstance(data, (dict, list)):
-            return f"\n\n<{tag}>{json.dumps(data, default=_json_serializer)}</{tag}>"
-        elif data is not None:
-            return f"\n\n<{tag}>{str(data)[:4000]}</{tag}>"
-        return ""
-
-    async def receive_message(
-        self,
-        data: Any,
-        source_agent: str,
-        channel: str,
-        workflow_name: Optional[str] = None,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """Handle workflow relay message from another agent. Called automatically by workflow system."""
-        prompt = "A message has arrived from the workflow system. Process the input data below."
-        prompt += self._frame_payload(data, "input_data")
-
-        result = await self.run(prompt, detailed=True, **kwargs)
-
-        # Add workflow metadata to result
-        result["workflow_metadata"] = {
-            "source_agent": source_agent,
-            "channel": channel,
-            "workflow": workflow_name,
-            "entry_point": "receive_message",
-        }
-
-        return result
-
-    async def on_webhook(
-        self, payload: Dict[str, Any], webhook_config: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Handle webhook trigger from external service. Called automatically by webhook system.
-
-        Note: `instructions` in webhook_config must be developer-controlled configuration,
-        not end-user-supplied content, as it is passed directly to the LLM.
-        The payload is framed as structured data (not instructions) to prevent prompt injection.
-        """
-        instructions = str(webhook_config.get("instructions", "Process webhook data"))[
-            :2000
-        ]
-
-        # Inject payload as structured content so the agent can act on it
-        instructions += self._frame_payload(payload, "webhook_payload")
-
-        result = await self.run(instructions, detailed=True)
-
-        result["webhook_metadata"] = {
-            "webhook_id": webhook_config.get("webhook_id"),
-            "webhook_slug": webhook_config.get("webhook_slug"),
-            "entry_point": "on_webhook",
-        }
-
-        return result
-
-    async def on_schedule(self, schedule_config: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle scheduled task execution (cron jobs). Called automatically by scheduler."""
-        task = schedule_config.get("task", "Execute scheduled task")
-
-        result = await self.run(task, detailed=True)
-
-        result["schedule_metadata"] = {
-            "schedule_id": schedule_config.get("schedule_id"),
-            "cron": schedule_config.get("cron"),
-            "entry_point": "on_schedule",
-        }
-
-        return result
-
-    # User customization methods
-
-    def add_plugin(self, plugin: Any):
-        """
-        Add a plugin to agent's tool sources and immediately register its tools.
-
-        Automatically initializes plugin with agent context if plugin has initialize() method.
-        """
-        if hasattr(plugin, "initialize") and callable(plugin.initialize):
-            plugin.initialize(agent_id=self.agent_id)
-
-        self.tool_sources.append(plugin)
-        self._register_tool_source(plugin)
-        logger.debug(f"Added plugin: {plugin.__class__.__name__}")
-
-    def add_skill(self, skill: "BaseSkill"):
-        """Add a skill to the agent.
-
-        Plugin dependencies declared in ``skill.requires()`` are resolved
-        against already-registered plugins. Add plugins before skills that
-        need them.
-        """
-        requirements = skill.requires()
-        if requirements:
-            available = [s for s in self.tool_sources if isinstance(s, BasePlugin)]
-            unmet = []
-            for key, plugin_type in requirements.items():
-                match = next((p for p in available if isinstance(p, plugin_type)), None)
-                if match is None:
-                    unmet.append(f"'{key}' ({plugin_type.__name__})")
-                else:
-                    skill._resolved_plugins[key] = match
-            if unmet:
-                raise SkillError(
-                    f"Skill '{skill.name}' requires plugins not yet added: "
-                    f"{', '.join(unmet)}. Add the required plugin(s) before "
-                    f"adding this skill.",
-                    plugin_name=skill.name,
-                )
-
-        self.add_plugin(skill)
-
-    @property
-    def skills(self) -> List["BaseSkill"]:
-        """Return all attached skills."""
-        return [s for s in self.tool_sources if isinstance(s, BaseSkill)]
-
-    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
-        """Execute a tool by name with arguments."""
-        await self._setup_tools()
-        return await self.tool_registry.execute(name, arguments)
-
-    @property
-    def available_tools(self) -> List[AgentTool]:
-        """Get list of all available tools."""
-        return self.tool_registry.tools.copy()
-
-    @property
-    def tool_names(self) -> List[str]:
-        """Get list of all tool names"""
-        return self.tool_registry.tool_names
-
-    async def __aenter__(self):
-        """Support ``async with agent:`` for automatic lifecycle management."""
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Call stop() on exit to flush plugins and release resources."""
-        try:
-            await self.stop()
-        except Exception as e:
-            if exc_type is None:
-                raise
-            logger.error("Error during agent stop: %s", e, exc_info=True)
-        return False
-
-    async def stop(self) -> None:
-        """Stop agent and clean up all resources including MCP connections."""
-        # Trigger auto-curation in memory plugins
-        for source in self.tool_sources:
-            if isinstance(source, LifecyclePlugin):
-                try:
-                    await source.on_agent_stop()
-                except Exception as e:
-                    logger.warning(f"Error during on_agent_stop: {e}")
-
-        # Clean up MCP connections first
-        if self.mcp_registry:
-            try:
-                await self.mcp_registry.disconnect_all()
-                logger.info(f"Cleaned up MCP connections for agent {self.name}")
-            except Exception as e:
-                logger.warning(f"Error cleaning up MCP connections: {e}")
-
-        # Call parent stop for standard cleanup
-        await super().stop()
-
-    def get_token_usage(self) -> Dict[str, int]:
-        """Get token usage statistics from automatic tracing."""
-        if not self.llm or not hasattr(self.llm, "get_token_stats"):
-            # Fallback for agents without LLM or tracing
-            return {
-                "total_tokens": 0,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "requests": 0,
-            }
-
-        return self.llm.get_token_stats()
-
-    @property
-    def health(self) -> Dict[str, Any]:
-        """Enhanced health information for Agent."""
-        base_health = super().health
-
-        # Add Agent-specific health info
-        base_health.update(
-            {
-                "tools": {
-                    "count": self.tool_registry.tool_count,
-                    "setup": self._tools_setup,
-                    "names": self.tool_registry.tool_names if self._tools_setup else [],
-                },
-                "relay": {"enabled": self.relay is not None, "channel": self.relay},
-                "llm": {
-                    "available": self.llm is not None,
-                    "provider": (
-                        self.llm.provider_name
-                        if self.llm and hasattr(self.llm, "provider_name")
-                        else None
-                    ),
-                },
-            }
-        )
-
-        return base_health

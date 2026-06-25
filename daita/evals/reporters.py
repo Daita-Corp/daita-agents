@@ -120,27 +120,24 @@ def _render_case_lines(case) -> list[str]:
         lines.append(
             "    stability: "
             f"{case.stability.answer_variants} answer variants, "
-            f"{case.stability.tool_sequence_variants} tool sequences"
+            f"{case.stability.capability_sequence_variants} capability sequences"
         )
-    tool_sequence = _first_tool_sequence(case)
-    if tool_sequence:
-        lines.append(f"    tools: {' -> '.join(tool_sequence)}")
-    skill_summary = _span_summary(case, "skill")
-    if skill_summary:
-        lines.append(f"    skills: {skill_summary}")
-    plugin_summary = _span_summary(case, "plugin")
-    if plugin_summary:
-        lines.append(f"    plugins: {plugin_summary}")
+    capability_sequence = _first_capability_sequence(case)
+    if capability_sequence:
+        lines.append(f"    capabilities: {' -> '.join(capability_sequence)}")
+    owner_summary = _owner_summary(case)
+    if owner_summary:
+        lines.append(f"    owners: {owner_summary}")
     judge_summary = _judge_summary(case)
     if judge_summary:
         lines.append(f"    judge: {judge_summary}")
     return lines
 
 
-def _first_tool_sequence(case) -> list[str]:
+def _first_capability_sequence(case) -> list[str]:
     if not case.runs:
         return []
-    return [call.name for call in case.runs[0].tool_calls]
+    return [task.capability_id for task in case.runs[0].tasks]
 
 
 def _judge_summary(case) -> str:
@@ -152,22 +149,16 @@ def _judge_summary(case) -> str:
     return f"{passed}/{len(judges)} passed, avg score {avg_score:.2f}"
 
 
-def _span_summary(case, kind: str) -> str:
+def _owner_summary(case) -> str:
     if not case.runs:
         return ""
-    spans = [span for span in case.runs[0].execution_spans if span.kind == kind]
-    if not spans:
+    owners = []
+    for task in case.runs[0].tasks:
+        if task.owner and task.owner not in owners:
+            owners.append(task.owner)
+    if not owners:
         return ""
-    items = []
-    for span in spans[:5]:
-        label = span.name
-        if span.operation:
-            label = f"{label}.{span.operation}"
-        if span.latency_ms is not None:
-            label = f"{label} {span.latency_ms:.0f}ms"
-        elif span.status:
-            label = f"{label} {span.status}"
-        items.append(label)
-    if len(spans) > 5:
-        items.append(f"+{len(spans) - 5} more")
+    items = owners[:5]
+    if len(owners) > 5:
+        items.append(f"+{len(owners) - 5} more")
     return ", ".join(items)

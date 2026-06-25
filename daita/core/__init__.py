@@ -5,10 +5,7 @@ This module provides the essential building blocks for the Daita framework:
 - Exception hierarchy with intelligent retry hints
 - Core interfaces that define contracts for agents, LLM providers, and processors
 - Focus system for data filtering and selection
-- Relay system for agent-to-agent communication
-- Workflow orchestration for multi-agent systems
 - Unified tracing system for automatic observability
-- Plugin tracing for tool execution monitoring
 - Decision tracing for agent reasoning capture
 
 The core module is designed to be imported by other framework components
@@ -23,7 +20,6 @@ from .exceptions import (
     ConfigError,
     LLMError,
     PluginError,
-    WorkflowError,
     # Retry-specific exceptions with built-in hints
     TransientError,
     RetryableError,
@@ -108,7 +104,6 @@ __all__ = [
     "ConfigError",
     "LLMError",
     "PluginError",
-    "WorkflowError",
     # Retry-specific exceptions
     "TransientError",
     "RetryableError",

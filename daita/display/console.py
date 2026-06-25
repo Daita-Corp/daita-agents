@@ -71,8 +71,6 @@ class ConsoleDecisionDisplay:
         # Determine the decision outcome for display
         outcome = self._determine_outcome(decision_point, final_conf, success)
 
-        status_icon = "" if success else ""
-
         # Simple one-line format: Decision → Outcome (confidence)
         print(f" Decision: {decision_point} → {outcome} ({final_conf:.2f})")
 

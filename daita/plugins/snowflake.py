@@ -10,10 +10,19 @@ import logging
 import os
 import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from .base import PluginContext
 from .base_db import BaseDatabasePlugin
+from .snowflake_extensions import (
+    SNOWFLAKE_MANIFEST,
+    SnowflakeExecutor,
+    snowflake_capabilities,
+    snowflake_evidence_schemas,
+    snowflake_operation_definitions,
+    snowflake_tool_views,
+)
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -60,11 +69,12 @@ class SnowflakePlugin(BaseDatabasePlugin):
         # Use with agent
         agent = Agent(
             name="Data Analyst",
-            tools=[db]
+            plugins=[db]
         )
     """
 
     sql_dialect = "snowflake"
+    manifest = SNOWFLAKE_MANIFEST
 
     def __init__(
         self,
@@ -201,6 +211,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
             role=self.role,
             **kwargs,
         )
+        self._executor = SnowflakeExecutor(self)
 
         # Determine auth method for logging
         if self._use_key_pair:
@@ -213,6 +224,57 @@ class SnowflakePlugin(BaseDatabasePlugin):
         logger.debug(
             f"Snowflake plugin configured for {self.account}/{self.database_name} (auth: {auth_method})"
         )
+
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the Snowflake connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the Snowflake connector from a runtime."""
+        await self.disconnect()
+
+    # ---------------------------------------------------------------------------
+    # Runtime extension declarations
+    # ---------------------------------------------------------------------------
+
+    def _include_admin_extensions(self) -> bool:
+        return False
+
+    def declare_capabilities(self):
+        return snowflake_capabilities(
+            self.read_only,
+            self._include_admin_extensions(),
+        )
+
+    def get_executors(self):
+        return (self._executor,)
+
+    def declare_evidence_schemas(self):
+        return snowflake_evidence_schemas()
+
+    def get_tool_views(self):
+        return snowflake_tool_views(
+            self.read_only,
+            self._include_admin_extensions(),
+        )
+
+    def _definition_for_capability(self, capability_id: str) -> dict:
+        for definition in snowflake_operation_definitions(
+            self.read_only,
+            self._include_admin_extensions(),
+        ):
+            if definition["capability_id"] == capability_id:
+                return definition
+        raise KeyError(capability_id)
+
+    def _definition_for_tool(self, tool_name: str) -> dict:
+        for definition in snowflake_operation_definitions(
+            self.read_only,
+            self._include_admin_extensions(),
+        ):
+            if definition["tool_name"] == tool_name:
+                return definition
+        raise KeyError(tool_name)
 
     def _load_private_key(self):
         """Load and decode private key for key-pair authentication."""
@@ -246,7 +308,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         except ImportError:
             raise ImportError(
                 "cryptography library is required for key-pair authentication. "
-                "Install with: pip install 'snowflake-connector-python[secure-local-storage]'"
+                "Install with: pip install 'daita-agents[snowflake]'"
             )
         except FileNotFoundError:
             raise FileNotFoundError(
@@ -296,12 +358,9 @@ class SnowflakePlugin(BaseDatabasePlugin):
             )
 
         except ImportError:
-            self._handle_connection_error(
-                ImportError(
-                    "snowflake-connector-python not installed. "
-                    "Install with: pip install 'daita-agents[snowflake]'"
-                ),
-                "connection",
+            raise ImportError(
+                "snowflake-connector-python is required for SnowflakePlugin. "
+                "Install with: pip install 'daita-agents[snowflake]'"
             )
         except Exception as e:
             self._handle_connection_error(e, "connection")
@@ -681,156 +740,6 @@ class SnowflakePlugin(BaseDatabasePlugin):
         sql = f"SELECT * FROM {table} SAMPLE ({int(n)} ROWS)"
         return await self.query(sql)
 
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose Snowflake operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for Snowflake operations
-        """
-        from ..core.tools import AgentTool
-
-        tools = [
-            AgentTool(
-                name="snowflake_query",
-                description="Run a SELECT query on Snowflake. Include LIMIT in your SQL to control result size.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "sql": {
-                            "type": "string",
-                            "description": "SQL SELECT query with %s placeholders",
-                        },
-                        "params": {
-                            "type": "array",
-                            "description": "Optional parameter values",
-                            "items": {},
-                        },
-                        "focus": {
-                            "type": "string",
-                            "description": "Focus DSL to filter/project at the database level, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\"",
-                        },
-                    },
-                    "required": ["sql"],
-                },
-                handler=self._tool_query,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="snowflake_inspect",
-                description="List all tables and their column schemas in one call. Use tables param to filter specific tables.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "tables": {
-                            "type": "array",
-                            "description": "Filter to specific tables (returns all if omitted)",
-                            "items": {"type": "string"},
-                        },
-                        "schema": {
-                            "type": "string",
-                            "description": "Optional schema name to filter tables",
-                        },
-                    },
-                    "required": [],
-                },
-                handler=self._tool_inspect,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="snowflake_count",
-                description="Count rows in a Snowflake table, optionally filtered.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name (optionally schema-qualified)",
-                        },
-                        "filter": {
-                            "type": "string",
-                            "description": "Optional WHERE clause (without WHERE keyword)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_count,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="snowflake_sample",
-                description="Return a random sample of rows from a Snowflake table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name",
-                        },
-                        "n": {
-                            "type": "integer",
-                            "description": "Number of rows to sample (default: 5)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_sample,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="snowflake_list_schemas",
-                description="List all schemas in the Snowflake database.",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_list_schemas,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=30,
-            ),
-        ]
-
-        if not self.read_only:
-            tools.append(
-                AgentTool(
-                    name="snowflake_execute",
-                    description="Execute INSERT, UPDATE, or DELETE on Snowflake. Returns affected row count.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "sql": {
-                                "type": "string",
-                                "description": "SQL statement (INSERT, UPDATE, or DELETE)",
-                            },
-                            "params": {
-                                "type": "array",
-                                "description": "Optional parameter values",
-                                "items": {},
-                            },
-                        },
-                        "required": ["sql"],
-                    },
-                    handler=self._tool_execute,
-                    category="database",
-                    source="plugin",
-                    plugin_name="Snowflake",
-                    timeout_seconds=60,
-                )
-            )
-
-        return tools
-
     # Tool handler methods
 
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -973,127 +882,5 @@ class SnowflakeAdminPlugin(SnowflakePlugin):
     warehouses, inspect query history, or load data from stages.
     """
 
-    def get_tools(self) -> List["AgentTool"]:
-        from ..core.tools import AgentTool
-
-        tools = super().get_tools()
-
-        tools += [
-            AgentTool(
-                name="snowflake_list_warehouses",
-                description="List all available Snowflake compute warehouses with their status and configuration",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_list_warehouses,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="snowflake_get_query_history",
-                description="Get recent Snowflake query history (last 20 queries).",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of queries to return (default: 20, max: 20)",
-                        }
-                    },
-                    "required": [],
-                },
-                handler=self._tool_get_query_history,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=45,
-            ),
-            AgentTool(
-                name="snowflake_list_stages",
-                description="List all Snowflake stages (internal and external) for data loading",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=self._tool_list_stages,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="snowflake_load_from_stage",
-                description="Load data from a Snowflake stage into a table using COPY INTO command",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {"type": "string", "description": "Target table name"},
-                        "stage": {
-                            "type": "string",
-                            "description": "Stage location (e.g., '@my_stage/path/')",
-                        },
-                        "file_format": {
-                            "type": "string",
-                            "description": "File format type (default: CSV)",
-                            "default": "CSV",
-                        },
-                        "pattern": {
-                            "type": "string",
-                            "description": "Optional file pattern to match (e.g., '.*\\.csv')",
-                        },
-                    },
-                    "required": ["table", "stage"],
-                },
-                handler=self._tool_load_from_stage,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=180,
-            ),
-            AgentTool(
-                name="snowflake_create_stage",
-                description="Create a new Snowflake stage (internal or external) for data loading",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Stage name"},
-                        "url": {
-                            "type": "string",
-                            "description": "External URL for external stages (e.g., 's3://bucket/path/')",
-                        },
-                        "storage_integration": {
-                            "type": "string",
-                            "description": "Storage integration name for cloud storage",
-                        },
-                    },
-                    "required": ["name"],
-                },
-                handler=self._tool_create_stage,
-                category="database",
-                source="plugin",
-                plugin_name="Snowflake",
-                timeout_seconds=30,
-            ),
-        ]
-
-        if not self.read_only:
-            tools.append(
-                AgentTool(
-                    name="snowflake_switch_warehouse",
-                    description="Switch to a different Snowflake compute warehouse for subsequent queries",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "warehouse": {
-                                "type": "string",
-                                "description": "Name of the warehouse to switch to (alphanumeric + underscore)",
-                            }
-                        },
-                        "required": ["warehouse"],
-                    },
-                    handler=self._tool_switch_warehouse,
-                    category="database",
-                    source="plugin",
-                    plugin_name="Snowflake",
-                    timeout_seconds=30,
-                )
-            )
-
-        return tools
+    def _include_admin_extensions(self) -> bool:
+        return True

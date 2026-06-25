@@ -5,15 +5,28 @@ Simple database connection and querying - no over-engineering.
 """
 
 import asyncio
+from datetime import date, datetime, time
+from decimal import Decimal
 import logging
 import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from urllib.parse import quote
+from uuid import UUID
+
+from .base import PluginContext
 from .base_db import BaseDatabasePlugin
+from .postgresql_extensions import (
+    POSTGRESQL_MANIFEST,
+    PostgreSQLExecutor,
+    postgresql_capabilities,
+    postgresql_evidence_schemas,
+    postgresql_tool_views,
+)
+from .sql_params import coerce_sql_params, param_specs_from_payload
 from ..core.exceptions import PluginError, ValidationError
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +39,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
     """
 
     sql_dialect = "postgresql"
+    manifest = POSTGRESQL_MANIFEST
 
     def __init__(
         self,
@@ -85,6 +99,348 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         )
 
         logger.debug(f"PostgreSQL plugin configured for {host}:{port}/{database}")
+
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the PostgreSQL connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the PostgreSQL connector from a runtime."""
+        await self.disconnect()
+
+    def declare_capabilities(self):
+        return postgresql_capabilities()
+
+    def get_executors(self):
+        return (
+            PostgreSQLExecutor(
+                id="postgresql.schema.inspect",
+                capability_ids=frozenset({"db.schema.inspect"}),
+                evidence_kind="schema.asset_profile",
+                handler=self._execute_schema_inspect,
+            ),
+            PostgreSQLExecutor(
+                id="postgresql.sql.validate",
+                capability_ids=frozenset({"db.sql.validate"}),
+                evidence_kind="sql.validation",
+                handler=self._execute_sql_validate,
+            ),
+            PostgreSQLExecutor(
+                id="postgresql.sql.execute_read",
+                capability_ids=frozenset({"db.sql.execute_read"}),
+                evidence_kind="query.result",
+                handler=self._execute_sql_read,
+            ),
+            PostgreSQLExecutor(
+                id="postgresql.sql.execute_write",
+                capability_ids=frozenset({"db.sql.execute_write"}),
+                evidence_kind="write.execution",
+                handler=self._execute_sql_write,
+            ),
+            PostgreSQLExecutor(
+                id="postgresql.sql.explain",
+                capability_ids=frozenset({"db.sql.explain"}),
+                evidence_kind="sql.explain.plan",
+                handler=self._execute_sql_explain,
+            ),
+            PostgreSQLExecutor(
+                id="postgresql.column_values.profile",
+                capability_ids=frozenset({"db.column_values.profile"}),
+                evidence_kind="column_values.profile",
+                handler=self._execute_column_values_profile,
+            ),
+        )
+
+    def declare_evidence_schemas(self):
+        return postgresql_evidence_schemas()
+
+    def get_tool_views(self):
+        return postgresql_tool_views()
+
+    async def _execute_schema_inspect(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        requested = args.get("tables")
+        all_tables = await self.tables()
+        targets = (
+            [table for table in all_tables if table in requested]
+            if requested
+            else all_tables
+        )
+        schemas = await asyncio.gather(*[self.describe(table) for table in targets])
+        tables = []
+        for table, columns in zip(targets, schemas):
+            tables.append(
+                {
+                    "name": table,
+                    "columns": [
+                        {
+                            "name": column.get("column_name") or column.get("name"),
+                            "data_type": column.get("data_type") or column.get("type"),
+                            "is_nullable": column.get("is_nullable"),
+                            "default_value": column.get("column_default"),
+                            "is_primary_key": bool(column.get("is_primary_key")),
+                        }
+                        for column in columns
+                    ],
+                }
+            )
+        return {
+            "database_type": "postgresql",
+            "database_name": self.config.get("database") or "",
+            "table_count": len(tables),
+            "tables": tables,
+            "foreign_keys": await self.foreign_keys(),
+        }
+
+    async def _execute_sql_validate(self, payload: Any) -> Dict[str, Any]:
+        from daita.db.query_sql_validation import sql_statement_facts
+
+        args = dict(payload or {})
+        sql = self._normalize_sql(str(args.get("sql") or ""))
+        operation = str(args.get("operation") or "query")
+        analysis = self._validate_sql_policy(sql, operation=operation)
+        return {
+            "valid": True,
+            "sql": sql,
+            "operation": operation,
+            "statement_type": analysis.statement_type,
+            "is_read": analysis.is_read,
+            "has_limit": analysis.has_limit,
+            "tables": [table.short_key for table in analysis.tables],
+            "columns": sorted(analysis.referenced_column_names),
+            "statement_facts": sql_statement_facts(sql, analysis),
+        }
+
+    async def _execute_sql_read(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        params = coerce_sql_params(
+            list(args.get("params") or []),
+            param_specs_from_payload(args),
+            dialect="postgresql",
+            json_binding="text",
+        )
+        return await self._run_guarded_tool_query(
+            str(args.get("sql") or ""),
+            params,
+            args.get("focus"),
+        )
+
+    async def _execute_sql_write(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        sql = self._prepare_tool_execute_sql(str(args.get("sql") or ""))
+        params = coerce_sql_params(
+            list(args.get("params") or []),
+            param_specs_from_payload(args),
+            dialect="postgresql",
+            json_binding="text",
+        )
+        affected_rows = await self.execute(sql, params)
+        return {"sql": sql, "affected_rows": affected_rows}
+
+    async def _execute_sql_explain(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        sql = self._prepare_tool_query_sql(str(args.get("sql") or ""))
+        params = coerce_sql_params(
+            list(args.get("params") or []),
+            param_specs_from_payload(args),
+            dialect="postgresql",
+            json_binding="text",
+        )
+        rows = await self.query(f"EXPLAIN {sql}", params)
+        return {"sql": sql, "plan": rows}
+
+    async def _execute_column_values_profile(self, payload: Any) -> Dict[str, Any]:
+        from datetime import datetime, timezone
+
+        args = dict(payload or {})
+        schema_name, table = _postgresql_table_parts(
+            str(args.get("table") or ""),
+            schema=args.get("schema"),
+        )
+        column = _validate_postgresql_identifier(str(args.get("column") or ""))
+        max_values = max(1, min(int(args.get("max_values") or 25), 100))
+        max_distinct = max(1, int(args.get("max_distinct_count") or 100))
+        max_value_length = max(1, int(args.get("max_value_length") or 80))
+        max_profile_rows = max(1, int(args.get("max_profile_rows") or 1_000_000))
+        timeout_seconds = max(1, min(int(args.get("profile_timeout_seconds") or 5), 60))
+        fingerprint_only = bool(args.get("fingerprint_only", False))
+        include_source_revision = bool(
+            args.get("include_source_revision") or fingerprint_only
+        )
+
+        table_ref = f"{schema_name}.{table}" if schema_name != "public" else table
+        blocked_tables = {
+            str(item).lower() for item in getattr(self, "blocked_tables", set())
+        }
+        blocked_columns = {
+            str(item).lower() for item in getattr(self, "blocked_columns", set())
+        }
+        profile = {
+            "table": table_ref,
+            "schema": schema_name,
+            "column": column,
+            "profile_kind": "categorical_values",
+            "profile_status": "profiled",
+            "max_values": max_values,
+            "sampled": False,
+            "truncated": False,
+            "redacted": False,
+            "top_values": [],
+            "policy": {
+                "policy_owner": "postgresql",
+                "bounded_aggregate": True,
+                "eligibility_checks": [
+                    "blocked_table",
+                    "sensitive_or_blocked_column",
+                    "max_profile_rows",
+                    "max_distinct_count",
+                    "max_value_length",
+                    "profile_timeout",
+                ],
+                "max_distinct_count": max_distinct,
+                "max_value_length": max_value_length,
+                "max_profile_rows": max_profile_rows,
+                "profile_timeout_seconds": timeout_seconds,
+                "profile_only_readable_tables": True,
+                "redact_pii_columns": True,
+                "fingerprint_only_supported": True,
+                "include_source_revision": include_source_revision,
+            },
+            "profiled_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if table.lower() in blocked_tables or table_ref.lower() in blocked_tables:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "blocked_table",
+            }
+        if column.lower() in blocked_columns or _looks_sensitive_column(column):
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "redacted": True,
+                "skipped_reason": "sensitive_or_blocked_column",
+            }
+
+        source_info = (
+            await _postgresql_live_source_revision(
+                self,
+                schema_name,
+                table,
+                timeout_seconds=timeout_seconds,
+            )
+            if include_source_revision
+            else {
+                "revision": None,
+                "status": "best_effort",
+                "reason": "source_revision_not_requested",
+            }
+        )
+        source_revision = source_info.get("revision")
+        source_status = str(source_info.get("status") or "unavailable")
+        profile["source_fingerprint_status"] = source_status
+        if source_info.get("reason"):
+            profile["source_fingerprint_reason"] = source_info["reason"]
+        if source_revision is not None:
+            profile["source_revision"] = source_revision
+        if source_status != "unavailable":
+            profile["source_fingerprint"] = _postgresql_source_fingerprint(
+                schema_name,
+                table,
+                column,
+                max_values=max_values,
+                max_distinct=max_distinct,
+                max_value_length=max_value_length,
+                source_revision=source_revision,
+            )
+        if fingerprint_only:
+            return {
+                **profile,
+                "profile_kind": "source_fingerprint",
+                "profile_status": "fingerprint",
+                "policy": {
+                    **profile["policy"],
+                    "fingerprint_only": True,
+                    "include_source_revision": True,
+                },
+            }
+
+        quoted_table = _quote_postgresql_table(schema_name, table)
+        quoted_column = _quote_postgresql_identifier(column)
+        stats_sql = (
+            "SELECT COUNT(*)::bigint AS row_count, "
+            f"SUM(CASE WHEN {quoted_column} IS NULL THEN 1 ELSE 0 END)::bigint "
+            "AS null_count, "
+            f"COUNT(DISTINCT {quoted_column})::bigint AS distinct_count, "
+            f"MAX(LENGTH(CAST({quoted_column} AS TEXT)))::bigint "
+            "AS max_value_length "
+            f"FROM {quoted_table}"
+        )
+        try:
+            stats_rows = await asyncio.wait_for(
+                self.query(stats_sql),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "profile_timeout",
+            }
+        stats = stats_rows[0] if stats_rows else {}
+        distinct_count = stats.get("distinct_count") or 0
+        profile.update(
+            {
+                "row_count": stats.get("row_count") or 0,
+                "null_count": stats.get("null_count") or 0,
+                "distinct_count": distinct_count,
+                "max_observed_value_length": stats.get("max_value_length") or 0,
+            }
+        )
+        if (stats.get("row_count") or 0) > max_profile_rows:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "row_count_exceeds_profile_limit",
+            }
+        if distinct_count > max_distinct:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "high_distinct_count",
+            }
+        if (stats.get("max_value_length") or 0) > max_value_length:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "redacted": True,
+                "skipped_reason": "value_too_long",
+            }
+
+        values_sql = (
+            f"SELECT {quoted_column} AS value, COUNT(*)::bigint AS count "
+            f"FROM {quoted_table} "
+            f"WHERE {quoted_column} IS NOT NULL "
+            f"GROUP BY {quoted_column} "
+            f"ORDER BY COUNT(*) DESC, {quoted_column} ASC "
+            f"LIMIT {max_values}"
+        )
+        try:
+            rows = await asyncio.wait_for(
+                self.query(values_sql),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "profile_timeout",
+            }
+        profile["top_values"] = [
+            {"value": row.get("value"), "count": row.get("count")} for row in rows
+        ]
+        profile["truncated"] = distinct_count > len(rows)
+        return profile
 
     async def connect(self):
         """Connect to PostgreSQL database."""
@@ -182,7 +538,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             else:
                 rows = await conn.fetch(sql)
 
-            return [dict(row) for row in rows]
+            return [_json_safe_row(dict(row)) for row in rows]
 
     async def execute(self, sql: str, params: Optional[List] = None) -> int:
         """
@@ -262,12 +618,51 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
     async def describe(self, table: str) -> List[Dict[str, Any]]:
         """Get table column information."""
         sql = """
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_name = $1
+            SELECT
+                c.column_name,
+                c.data_type,
+                c.is_nullable,
+                c.column_default,
+                EXISTS (
+                    SELECT 1
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                     AND tc.table_schema = kcu.table_schema
+                     AND tc.table_name = kcu.table_name
+                    WHERE tc.constraint_type = 'PRIMARY KEY'
+                      AND tc.table_schema = c.table_schema
+                      AND tc.table_name = c.table_name
+                      AND kcu.column_name = c.column_name
+                ) AS is_primary_key
+            FROM information_schema.columns c
+            WHERE c.table_schema = 'public'
+              AND c.table_name = $1
             ORDER BY ordinal_position
         """
         return await self.query(sql, [table])
+
+    async def foreign_keys(self) -> List[Dict[str, Any]]:
+        """Return declared PostgreSQL foreign key relationships."""
+        sql = """
+            SELECT
+                kcu.table_name AS source_table,
+                kcu.column_name AS source_column,
+                ccu.table_name AS target_table,
+                ccu.column_name AS target_column
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.table_schema = kcu.table_schema
+             AND tc.table_name = kcu.table_name
+            JOIN information_schema.constraint_column_usage ccu
+              ON ccu.constraint_name = tc.constraint_name
+             AND ccu.table_schema = tc.table_schema
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+              AND tc.table_schema = 'public'
+            ORDER BY kcu.table_name, kcu.column_name
+        """
+        return await self.query(sql)
 
     async def count_rows(self, table: str, filter: Optional[str] = None) -> int:
         """Count rows in a table with an optional WHERE clause."""
@@ -467,223 +862,6 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 plugin_name="PostgreSQL",
             ) from e
 
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose PostgreSQL operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for database operations
-        """
-        from ..core.tools import AgentTool
-
-        tools = [
-            AgentTool(
-                name="postgres_query",
-                description="Run a SELECT query on PostgreSQL. Use the focus DSL or add LIMIT to avoid oversized responses (default LIMIT 50 applied if omitted).",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "sql": {
-                            "type": "string",
-                            "description": "SQL SELECT query with $1, $2, etc. placeholders",
-                        },
-                        "params": {
-                            "type": "array",
-                            "description": "Optional parameter values for placeholders",
-                            "items": {},
-                        },
-                        "focus": {
-                            "type": "string",
-                            "description": "Focus DSL to filter/project at the database level, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\"",
-                        },
-                    },
-                    "required": ["sql"],
-                },
-                handler=self._tool_query,
-                category="database",
-                source="plugin",
-                plugin_name="PostgreSQL",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="postgres_inspect",
-                description="List all tables and their column schemas in one call. Use instead of calling postgres_list_tables then postgres_get_schema for each table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "tables": {
-                            "type": "array",
-                            "description": "Filter to specific tables (returns all if omitted, capped at 50)",
-                            "items": {"type": "string"},
-                        }
-                    },
-                    "required": [],
-                },
-                handler=self._tool_inspect,
-                category="database",
-                source="plugin",
-                plugin_name="PostgreSQL",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="postgres_count",
-                description="Count rows in a PostgreSQL table with an optional filter.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name",
-                        },
-                        "filter": {
-                            "type": "string",
-                            "description": "Optional SQL WHERE clause (without the WHERE keyword)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_count,
-                category="database",
-                source="plugin",
-                plugin_name="PostgreSQL",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="postgres_sample",
-                description="Return a random sample of rows from a PostgreSQL table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name",
-                        },
-                        "n": {
-                            "type": "integer",
-                            "description": "Number of rows to sample (default: 5)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_sample,
-                category="database",
-                source="plugin",
-                plugin_name="PostgreSQL",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="postgres_vector_search",
-                description="Search for similar vectors using pgvector extension. Returns matching rows with similarity scores.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name containing vector data",
-                        },
-                        "vector_column": {
-                            "type": "string",
-                            "description": "Column name with vector embeddings",
-                        },
-                        "query_vector": {
-                            "type": "array",
-                            "description": "Query vector as array of floats",
-                            "items": {"type": "number"},
-                        },
-                        "top_k": {
-                            "type": "integer",
-                            "description": "Maximum number of results to return (default: 10)",
-                        },
-                        "filter": {
-                            "type": "string",
-                            "description": "Optional SQL WHERE clause for filtering (e.g., \"category = 'tech'\")",
-                        },
-                        "distance_type": {
-                            "type": "string",
-                            "description": "Distance metric: 'cosine', 'l2', or 'inner_product' (default: 'cosine')",
-                        },
-                    },
-                    "required": ["table", "vector_column", "query_vector"],
-                },
-                handler=self._tool_vector_search,
-                category="database",
-                source="plugin",
-                plugin_name="PostgreSQL",
-                timeout_seconds=60,
-            ),
-        ]
-        if not self.read_only:
-            tools += [
-                AgentTool(
-                    name="postgres_execute",
-                    description="Execute INSERT, UPDATE, or DELETE on PostgreSQL. Returns affected row count.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "sql": {
-                                "type": "string",
-                                "description": "SQL statement (INSERT, UPDATE, or DELETE)",
-                            },
-                            "params": {
-                                "type": "array",
-                                "description": "Optional parameter values",
-                                "items": {},
-                            },
-                        },
-                        "required": ["sql"],
-                    },
-                    handler=self._tool_execute,
-                    category="database",
-                    source="plugin",
-                    plugin_name="PostgreSQL",
-                    timeout_seconds=60,
-                ),
-                AgentTool(
-                    name="postgres_vector_upsert",
-                    description="Insert or update a vector with metadata in PostgreSQL using pgvector. Uses ON CONFLICT to handle duplicates.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "table": {"type": "string", "description": "Table name"},
-                            "id_column": {
-                                "type": "string",
-                                "description": "Primary key column name",
-                            },
-                            "vector_column": {
-                                "type": "string",
-                                "description": "Vector column name",
-                            },
-                            "id": {
-                                "type": "string",
-                                "description": "ID value for the row",
-                            },
-                            "vector": {
-                                "type": "array",
-                                "description": "Vector as array of floats",
-                                "items": {"type": "number"},
-                            },
-                            "extra_columns": {
-                                "type": "object",
-                                "description": "Optional additional columns to upsert as key-value pairs",
-                            },
-                        },
-                        "required": [
-                            "table",
-                            "id_column",
-                            "vector_column",
-                            "id",
-                            "vector",
-                        ],
-                    },
-                    handler=self._tool_vector_upsert,
-                    category="database",
-                    source="plugin",
-                    plugin_name="PostgreSQL",
-                    timeout_seconds=60,
-                ),
-            ]
-        return tools
-
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_list_tables (kept for backward compat, not in get_tools)"""
         tables = await self.tables()
@@ -789,3 +967,155 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
 def postgresql(**kwargs) -> PostgreSQLPlugin:
     """Create PostgreSQL plugin with simplified interface."""
     return PostgreSQLPlugin(**kwargs)
+
+
+def _json_safe_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: _json_safe_value(value) for key, value in row.items()}
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    return value
+
+
+def _postgresql_table_parts(
+    table: str,
+    *,
+    schema: Any = None,
+) -> tuple[str, str]:
+    raw_schema = str(schema or "").strip()
+    raw_table = table.strip()
+    if "." in raw_table:
+        parts = [part.strip('" ') for part in raw_table.split(".") if part.strip()]
+        if len(parts) != 2:
+            raise ValidationError("Invalid PostgreSQL table identifier", field="table")
+        raw_schema, raw_table = parts
+    schema_name = _validate_postgresql_identifier(raw_schema or "public")
+    table_name = _validate_postgresql_identifier(raw_table)
+    return schema_name, table_name
+
+
+def _validate_postgresql_identifier(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value or ""):
+        raise ValidationError("Invalid PostgreSQL identifier", field="identifier")
+    return value
+
+
+def _quote_postgresql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _quote_postgresql_table(schema: str, table: str) -> str:
+    return (
+        f"{_quote_postgresql_identifier(schema)}."
+        f"{_quote_postgresql_identifier(table)}"
+    )
+
+
+def _looks_sensitive_column(column: str) -> bool:
+    lowered = column.lower()
+    sensitive = {
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "credential",
+        "email",
+        "phone",
+        "address",
+        "ssn",
+        "comment",
+        "message",
+        "body",
+        "notes",
+        "note",
+    }
+    return any(term in lowered for term in sensitive)
+
+
+def _postgresql_source_fingerprint(
+    schema: str,
+    table: str,
+    column: str,
+    *,
+    max_values: int,
+    max_distinct: int,
+    max_value_length: int,
+    source_revision: str | None = None,
+) -> str:
+    payload = (
+        f"postgresql:{schema.lower()}.{table.lower()}.{column.lower()}:"
+        f"{max_values}:{max_distinct}:{max_value_length}"
+    )
+    if source_revision:
+        payload = f"{payload}:{source_revision}"
+    import hashlib
+
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+async def _postgresql_live_source_revision(
+    plugin: PostgreSQLPlugin,
+    schema: str,
+    table: str,
+    *,
+    timeout_seconds: int,
+) -> dict[str, str | None]:
+    safe_schema = schema.replace("'", "''")
+    safe_table = table.replace("'", "''")
+    sql = (
+        "SELECT c.oid::text AS table_oid, "
+        "c.relfilenode::text AS relfilenode, "
+        "c.relpages::bigint AS relpages, "
+        "c.reltuples::bigint AS reltuples, "
+        "COALESCE(s.n_tup_ins, 0)::bigint AS n_tup_ins, "
+        "COALESCE(s.n_tup_upd, 0)::bigint AS n_tup_upd, "
+        "COALESCE(s.n_tup_del, 0)::bigint AS n_tup_del "
+        "FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid "
+        f"WHERE n.nspname = '{safe_schema}' AND c.relname = '{safe_table}' "
+        "LIMIT 1"
+    )
+    try:
+        rows = await asyncio.wait_for(plugin.query(sql), timeout=timeout_seconds)
+    except Exception:
+        return {
+            "revision": None,
+            "status": "unavailable",
+            "reason": "postgresql_stats_unavailable",
+        }
+    if not rows:
+        return {
+            "revision": None,
+            "status": "unavailable",
+            "reason": "postgresql_stats_missing",
+        }
+    row = rows[0]
+    return {
+        "revision": "|".join(
+            f"{key}:{row.get(key)}"
+            for key in (
+                "table_oid",
+                "relfilenode",
+                "relpages",
+                "reltuples",
+                "n_tup_ins",
+                "n_tup_upd",
+                "n_tup_del",
+            )
+        ),
+        "status": "best_effort",
+        "reason": "postgresql_catalog_stats",
+    }

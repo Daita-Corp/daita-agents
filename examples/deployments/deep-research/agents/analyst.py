@@ -67,22 +67,10 @@ synthesise them into structured insights.
 You MUST follow these steps in order. Do NOT skip any step.
 
 Step 1: Call extract_scope(findings_json) with the raw findings to understand scope.
-Step 2: Call recall(query="research findings", category="finding", limit=10) to \
-retrieve all findings stored by the Researcher.
-Step 3: Call query_facts() to find structured entity-relation-value triples. Try \
-query_facts(entity=None) to see all extracted facts. This surfaces connections \
-the raw text may not make obvious.
-Step 4: Pick 2-3 key entities from the findings (e.g. company names, technologies). \
-For each one, call traverse_memory(entity="entity name") to discover connections \
-across findings.
-Step 5: Call scratch() to write your analysis notes — what themes, contradictions, \
-and knowledge gaps you identified. Use key="analysis".
-Step 6: Call reinforce() on the findings. Pass the chunk IDs from Step 2's recall \
-results. Use outcome="positive" for findings with strong evidence, \
-outcome="negative" for weak or contradictory ones.
-Step 7: Call remember() to store your synthesis. You MUST set category="synthesis" \
-and importance=0.9.
-Step 8: Output ONLY the final JSON:
+Step 2: Pick 2-3 key entities from the findings (e.g. company names, technologies) \
+and explain why they matter.
+Step 3: Identify themes, contradictions, and knowledge gaps from the raw findings.
+Step 4: Output ONLY the final JSON:
 {
   "query": "...",
   "executive_summary": "2-3 sentences with the most important takeaways",
@@ -95,5 +83,6 @@ Step 8: Output ONLY the final JSON:
 }
 
 Be analytical, not just summarising. What patterns emerge? What is surprising?""",
-        tools=[extract_scope, memory, lineage_plugin],
+        plugins=[memory, lineage_plugin],
+        tools=[extract_scope],
     )

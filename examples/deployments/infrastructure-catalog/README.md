@@ -1,12 +1,12 @@
 # infrastructure-catalog
 
-A single agent that discovers data stores across AWS accounts and GitHub
-repositories, builds a unified catalog, and answers questions about the
-organization's data landscape.
+A single agent example that catalogs data stores across AWS accounts and GitHub
+repositories, then answers questions about the organization's data landscape.
 
-**Use case:** "What production databases do we have?" -> the agent scans AWS
-RDS/DynamoDB/S3/ElastiCache/Redshift/API Gateway across regions, scans GitHub repos for
-connection strings, deduplicates results, and returns a categorized summary.
+**Use case:** "What production databases do we have?" -> the runner invokes
+Catalog's infrastructure discovery capability, passes the resulting inventory to
+the agent, and the agent summarizes/searches the catalog through registry
+ToolViews and memory context.
 
 ## Highlights
 
@@ -16,7 +16,8 @@ connection strings, deduplicates results, and returns a categorized summary.
 - Store deduplication — same database found by AWS and GitHub is merged into one record
 - Environment inference — tags stores as production/staging/dev from naming patterns
 - Schema profiling — drill into any discovered store to extract full table/column metadata
-- Paginated tool responses — handles large catalogs without blowing the LLM context
+- Catalog ToolViews — model-visible search, inspection, and relationship lookup
+  over runtime-owned catalog capabilities
 
 ## Required environment variables
 
@@ -55,10 +56,10 @@ export GITHUB_ORG=my-org             # optional
 ## Run
 
 ```bash
-# Demo mode — discover, summarize, and answer sample questions
+# Demo mode — run runtime discovery, summarize, and answer sample questions
 python run.py
 
-# One-shot question
+# One-shot question with runtime discovery inventory included
 python run.py "What databases do we have in us-west-2?"
 
 # Custom regions

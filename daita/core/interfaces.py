@@ -5,32 +5,7 @@ Defines the essential contracts that components must implement.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
-
-
-class AgentABC(ABC):
-    """Abstract base interface for all agents. Use Agent or BaseAgent for concrete implementations."""
-
-    @abstractmethod
-    async def _process(
-        self,
-        task: str,
-        data: Any = None,
-        context: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """INTERNAL: Process a task with data and context."""
-        pass
-
-    @abstractmethod
-    async def start(self) -> None:
-        """Start the agent."""
-        pass
-
-    @abstractmethod
-    async def stop(self) -> None:
-        """Stop the agent."""
-        pass
+from typing import Any, Dict, List
 
 
 class LLMProvider(ABC):

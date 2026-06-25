@@ -7,10 +7,20 @@ File-based (or in-memory) async SQLite access via aiosqlite.
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+from .base import PluginContext
 from .base_db import BaseDatabasePlugin
+from daita.runtime import EvidenceWrappingExecutor
+from .sql_params import coerce_sql_params, param_specs_from_payload
+from .sqlite_extensions import (
+    SQLITE_MANIFEST,
+    sqlite_capabilities,
+    sqlite_evidence_schemas,
+    sqlite_tool_views,
+)
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +47,7 @@ class SQLitePlugin(BaseDatabasePlugin):
     """
 
     sql_dialect = "sqlite"
+    manifest = SQLITE_MANIFEST
 
     def __init__(
         self,
@@ -81,6 +92,14 @@ class SQLitePlugin(BaseDatabasePlugin):
     # Lifecycle
     # ------------------------------------------------------------------
 
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the SQLite connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the SQLite connector from a runtime."""
+        await self.disconnect()
+
     async def connect(self) -> None:
         """Open the SQLite database connection."""
         if self._db is not None:
@@ -111,6 +130,336 @@ class SQLitePlugin(BaseDatabasePlugin):
         except Exception as e:
             self._db = None
             self._handle_connection_error(e, "connection")
+
+    # ------------------------------------------------------------------
+    # Runtime extension declarations
+    # ------------------------------------------------------------------
+
+    def declare_capabilities(self):
+        return sqlite_capabilities()
+
+    def get_executors(self):
+        return (
+            EvidenceWrappingExecutor(
+                id="sqlite.schema.inspect",
+                owner="sqlite",
+                capability_ids=frozenset({"db.schema.inspect"}),
+                evidence_kind="schema.asset_profile",
+                handler=self._execute_schema_inspect,
+            ),
+            EvidenceWrappingExecutor(
+                id="sqlite.sql.validate",
+                owner="sqlite",
+                capability_ids=frozenset({"db.sql.validate"}),
+                evidence_kind="sql.validation",
+                handler=self._execute_sql_validate,
+            ),
+            EvidenceWrappingExecutor(
+                id="sqlite.sql.execute_read",
+                owner="sqlite",
+                capability_ids=frozenset({"db.sql.execute_read"}),
+                evidence_kind="query.result",
+                handler=self._execute_sql_read,
+            ),
+            EvidenceWrappingExecutor(
+                id="sqlite.sql.execute_write",
+                owner="sqlite",
+                capability_ids=frozenset({"db.sql.execute_write"}),
+                evidence_kind="write.execution",
+                handler=self._execute_sql_write,
+            ),
+            EvidenceWrappingExecutor(
+                id="sqlite.sql.explain",
+                owner="sqlite",
+                capability_ids=frozenset({"db.sql.explain"}),
+                evidence_kind="sql.explain.plan",
+                handler=self._execute_sql_explain,
+            ),
+            EvidenceWrappingExecutor(
+                id="sqlite.column_values.profile",
+                owner="sqlite",
+                capability_ids=frozenset({"db.column_values.profile"}),
+                evidence_kind="column_values.profile",
+                handler=self._execute_column_values_profile,
+            ),
+        )
+
+    def declare_evidence_schemas(self):
+        return sqlite_evidence_schemas()
+
+    def get_tool_views(self):
+        return sqlite_tool_views()
+
+    async def _execute_schema_inspect(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        requested = args.get("tables")
+        all_tables = await self.tables()
+        targets = (
+            [table for table in all_tables if table in requested]
+            if requested
+            else all_tables
+        )
+        schemas = await asyncio.gather(*[self.describe(table) for table in targets])
+        tables = []
+        for table, columns in zip(targets, schemas):
+            tables.append(
+                {
+                    "name": table,
+                    "columns": [
+                        {
+                            "name": column["column_name"],
+                            "data_type": column["data_type"],
+                            "is_nullable": column["is_nullable"],
+                            "default_value": column["default_value"],
+                            "is_primary_key": column["is_primary_key"],
+                        }
+                        for column in columns
+                    ],
+                }
+            )
+        return {
+            "database_type": "sqlite",
+            "database_name": self.path,
+            "table_count": len(tables),
+            "tables": tables,
+            "foreign_keys": await self.foreign_keys(),
+        }
+
+    async def _execute_sql_validate(self, payload: Any) -> Dict[str, Any]:
+        from daita.db.query_sql_validation import sql_statement_facts
+
+        args = dict(payload or {})
+        sql = self._normalize_sql(str(args.get("sql") or ""))
+        operation = str(args.get("operation") or "query")
+        analysis = self._validate_sql_policy(sql, operation=operation)
+        return {
+            "valid": True,
+            "sql": sql,
+            "operation": operation,
+            "statement_type": analysis.statement_type,
+            "is_read": analysis.is_read,
+            "has_limit": analysis.has_limit,
+            "tables": [table.short_key for table in analysis.tables],
+            "columns": sorted(analysis.referenced_column_names),
+            "statement_facts": sql_statement_facts(sql, analysis),
+        }
+
+    async def _execute_sql_read(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        params = coerce_sql_params(
+            list(args.get("params") or []),
+            param_specs_from_payload(args),
+            dialect="sqlite",
+            json_binding="text",
+        )
+        return await self._run_guarded_tool_query(
+            str(args.get("sql") or ""),
+            params,
+            args.get("focus"),
+        )
+
+    async def _execute_sql_write(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        sql = self._prepare_tool_execute_sql(str(args.get("sql") or ""))
+        params = coerce_sql_params(
+            list(args.get("params") or []),
+            param_specs_from_payload(args),
+            dialect="sqlite",
+            json_binding="text",
+        )
+        affected_rows = await self.execute(sql, params)
+        return {"sql": sql, "affected_rows": affected_rows}
+
+    async def _execute_sql_explain(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        sql = self._prepare_tool_query_sql(str(args.get("sql") or ""))
+        params = coerce_sql_params(
+            list(args.get("params") or []),
+            param_specs_from_payload(args),
+            dialect="sqlite",
+            json_binding="text",
+        )
+        rows = await self.query(f"EXPLAIN QUERY PLAN {sql}", params)
+        return {"sql": sql, "plan": rows}
+
+    async def _execute_column_values_profile(self, payload: Any) -> Dict[str, Any]:
+        from datetime import datetime, timezone
+
+        args = dict(payload or {})
+        table = _validate_sqlite_identifier(str(args.get("table") or ""))
+        column = _validate_sqlite_identifier(str(args.get("column") or ""))
+        max_values = max(1, min(int(args.get("max_values") or 25), 100))
+        max_distinct = max(1, int(args.get("max_distinct_count") or 100))
+        max_value_length = max(1, int(args.get("max_value_length") or 80))
+        max_profile_rows = max(1, int(args.get("max_profile_rows") or 1_000_000))
+        timeout_seconds = max(1, min(int(args.get("profile_timeout_seconds") or 5), 60))
+        fingerprint_only = bool(args.get("fingerprint_only", False))
+        include_source_revision = bool(
+            args.get("include_source_revision") or fingerprint_only
+        )
+
+        blocked_tables = {
+            item.lower() for item in getattr(self, "blocked_tables", set())
+        }
+        blocked_columns = {
+            item.lower() for item in getattr(self, "blocked_columns", set())
+        }
+        profile = {
+            "table": table,
+            "column": column,
+            "profile_kind": "categorical_values",
+            "profile_status": "profiled",
+            "max_values": max_values,
+            "sampled": False,
+            "truncated": False,
+            "redacted": False,
+            "top_values": [],
+            "policy": {
+                "policy_owner": "sqlite",
+                "bounded_aggregate": True,
+                "eligibility_checks": [
+                    "blocked_table",
+                    "sensitive_or_blocked_column",
+                    "max_profile_rows",
+                    "max_distinct_count",
+                    "max_value_length",
+                    "profile_timeout",
+                ],
+                "max_distinct_count": max_distinct,
+                "max_value_length": max_value_length,
+                "max_profile_rows": max_profile_rows,
+                "profile_timeout_seconds": timeout_seconds,
+                "fingerprint_only_supported": True,
+                "include_source_revision": include_source_revision,
+                "redact_pii_columns": True,
+            },
+            "profiled_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if table.lower() in blocked_tables:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "blocked_table",
+            }
+        if column.lower() in blocked_columns or _looks_sensitive_column(column):
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "redacted": True,
+                "skipped_reason": "sensitive_or_blocked_column",
+            }
+
+        source_info = (
+            await _sqlite_live_source_revision(self, timeout_seconds=timeout_seconds)
+            if include_source_revision
+            else {
+                "revision": None,
+                "status": "best_effort",
+                "reason": "source_revision_not_requested",
+            }
+        )
+        source_revision = source_info.get("revision")
+        source_status = str(source_info.get("status") or "unavailable")
+        profile["source_fingerprint_status"] = source_status
+        if source_info.get("reason"):
+            profile["source_fingerprint_reason"] = source_info["reason"]
+        if source_revision is not None:
+            profile["source_revision"] = source_revision
+        if source_status != "unavailable":
+            profile["source_fingerprint"] = _sqlite_source_fingerprint(
+                self.path,
+                table,
+                column,
+                max_values=max_values,
+                max_distinct=max_distinct,
+                max_value_length=max_value_length,
+                source_revision=source_revision,
+            )
+        if fingerprint_only:
+            return {
+                **profile,
+                "profile_kind": "source_fingerprint",
+                "profile_status": "fingerprint",
+                "policy": {
+                    **profile["policy"],
+                    "fingerprint_only": True,
+                    "include_source_revision": True,
+                },
+            }
+
+        quoted_table = _quote_sqlite_identifier(table)
+        quoted_column = _quote_sqlite_identifier(column)
+        try:
+            stats_rows = await asyncio.wait_for(
+                self.query(
+                    "SELECT COUNT(*) AS row_count, "
+                    f"SUM(CASE WHEN {quoted_column} IS NULL THEN 1 ELSE 0 END) AS null_count, "
+                    f"COUNT(DISTINCT {quoted_column}) AS distinct_count, "
+                    f"MAX(LENGTH(CAST({quoted_column} AS TEXT))) AS max_value_length "
+                    f"FROM {quoted_table}"
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "profile_timeout",
+            }
+        stats = stats_rows[0] if stats_rows else {}
+        distinct_count = stats.get("distinct_count") or 0
+        profile.update(
+            {
+                "row_count": stats.get("row_count") or 0,
+                "null_count": stats.get("null_count") or 0,
+                "distinct_count": distinct_count,
+                "max_observed_value_length": stats.get("max_value_length") or 0,
+            }
+        )
+        if (stats.get("row_count") or 0) > max_profile_rows:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "row_count_exceeds_profile_limit",
+            }
+        if distinct_count > max_distinct:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "high_distinct_count",
+            }
+        if (stats.get("max_value_length") or 0) > max_value_length:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "redacted": True,
+                "skipped_reason": "value_too_long",
+            }
+
+        try:
+            rows = await asyncio.wait_for(
+                self.query(
+                    f"SELECT {quoted_column} AS value, COUNT(*) AS count "
+                    f"FROM {quoted_table} "
+                    f"WHERE {quoted_column} IS NOT NULL "
+                    f"GROUP BY {quoted_column} "
+                    f"ORDER BY COUNT(*) DESC, {quoted_column} ASC "
+                    "LIMIT ?",
+                    [max_values],
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "profile_timeout",
+            }
+        profile["top_values"] = [
+            {"value": row.get("value"), "count": row.get("count")} for row in rows
+        ]
+        profile["truncated"] = distinct_count > len(rows)
+        return profile
 
     async def disconnect(self) -> None:
         """Close the SQLite database connection."""
@@ -266,6 +615,23 @@ class SQLitePlugin(BaseDatabasePlugin):
             for row in rows
         ]
 
+    async def foreign_keys(self) -> List[Dict[str, Any]]:
+        """Return declared SQLite foreign key relationships."""
+        keys: List[Dict[str, Any]] = []
+        for table in await self.tables():
+            quoted_table = '"' + table.replace('"', '""') + '"'
+            rows = await self.query(f"PRAGMA foreign_key_list({quoted_table})")
+            for row in rows:
+                keys.append(
+                    {
+                        "source_table": table,
+                        "source_column": row.get("from", ""),
+                        "target_table": row.get("table", ""),
+                        "target_column": row.get("to", ""),
+                    }
+                )
+        return keys
+
     async def pragma(self, key: str, value: Any = None) -> Any:
         """
         Get or set a SQLite PRAGMA value.
@@ -328,135 +694,6 @@ class SQLitePlugin(BaseDatabasePlugin):
     # ------------------------------------------------------------------
     # Agent tools
     # ------------------------------------------------------------------
-
-    def get_tools(self) -> List["AgentTool"]:
-        """Expose SQLite operations as agent tools."""
-        from ..core.tools import AgentTool
-
-        tools = [
-            AgentTool(
-                name="sqlite_query",
-                description="Run a SELECT query on SQLite. Use ? placeholders for parameters. Include LIMIT in your SQL to control result size.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "sql": {
-                            "type": "string",
-                            "description": "SQL SELECT query with ? placeholders",
-                        },
-                        "params": {
-                            "type": "array",
-                            "description": "Optional parameter values for ? placeholders",
-                            "items": {},
-                        },
-                        "focus": {
-                            "type": "string",
-                            "description": "Focus DSL to filter/project results, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\"",
-                        },
-                    },
-                    "required": ["sql"],
-                },
-                handler=self._tool_query,
-                category="database",
-                source="plugin",
-                plugin_name="SQLite",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="sqlite_inspect",
-                description="List all tables and their column schemas in one call. Prefer this over calling sqlite_list_tables then sqlite_get_schema for each table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "tables": {
-                            "type": "array",
-                            "description": "Filter to specific tables (returns all if omitted)",
-                            "items": {"type": "string"},
-                        }
-                    },
-                    "required": [],
-                },
-                handler=self._tool_inspect,
-                category="database",
-                source="plugin",
-                plugin_name="SQLite",
-                timeout_seconds=15,
-            ),
-            AgentTool(
-                name="sqlite_count",
-                description="Count rows in a SQLite table, optionally filtered by a WHERE clause.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name",
-                        },
-                        "filter": {
-                            "type": "string",
-                            "description": "Optional WHERE clause (without WHERE keyword)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_count,
-                category="database",
-                source="plugin",
-                plugin_name="SQLite",
-                timeout_seconds=15,
-            ),
-            AgentTool(
-                name="sqlite_sample",
-                description="Return a random sample of rows from a SQLite table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name",
-                        },
-                        "n": {
-                            "type": "integer",
-                            "description": "Number of rows to sample (default: 5)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_sample,
-                category="database",
-                source="plugin",
-                plugin_name="SQLite",
-                timeout_seconds=15,
-            ),
-        ]
-        if not self.read_only:
-            tools.append(
-                AgentTool(
-                    name="sqlite_execute",
-                    description="Execute INSERT, UPDATE, or DELETE on SQLite. Use ? placeholders. Returns affected row count.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "sql": {
-                                "type": "string",
-                                "description": "SQL statement (INSERT, UPDATE, or DELETE) with ? placeholders",
-                            },
-                            "params": {
-                                "type": "array",
-                                "description": "Optional parameter values for ? placeholders",
-                                "items": {},
-                            },
-                        },
-                        "required": ["sql"],
-                    },
-                    handler=self._tool_execute,
-                    category="database",
-                    source="plugin",
-                    plugin_name="SQLite",
-                    timeout_seconds=60,
-                )
-            )
-        return tools
 
     # ------------------------------------------------------------------
     # Tool handlers
@@ -526,3 +763,105 @@ def sqlite(**kwargs) -> SQLitePlugin:
             rows = await db.query("SELECT * FROM products WHERE price < ?", [50])
     """
     return SQLitePlugin(**kwargs)
+
+
+def _validate_sqlite_identifier(value: str) -> str:
+    import re
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value or ""):
+        from ..core.exceptions import ValidationError
+
+        raise ValidationError("Invalid SQLite identifier", field="identifier")
+    return value
+
+
+def _quote_sqlite_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _looks_sensitive_column(column: str) -> bool:
+    lowered = column.lower()
+    sensitive = {
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "credential",
+        "email",
+        "phone",
+        "address",
+        "ssn",
+        "comment",
+        "message",
+        "body",
+        "notes",
+        "note",
+    }
+    return any(term in lowered for term in sensitive)
+
+
+def _sqlite_source_fingerprint(
+    path: str,
+    table: str,
+    column: str,
+    *,
+    max_values: int,
+    max_distinct: int,
+    max_value_length: int,
+    source_revision: str | None = None,
+) -> str:
+    import hashlib
+
+    payload = (
+        f"sqlite:{path}:{table.lower()}.{column.lower()}:"
+        f"{max_values}:{max_distinct}:{max_value_length}"
+    )
+    if source_revision:
+        payload = f"{payload}:{source_revision}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+async def _sqlite_live_source_revision(
+    plugin: SQLitePlugin,
+    *,
+    timeout_seconds: int,
+) -> dict[str, str | None]:
+    import os
+
+    parts: list[str] = []
+    status = "best_effort"
+    reason = "sqlite_data_version"
+    if plugin.path and plugin.path != ":memory:":
+        try:
+            stat = os.stat(plugin.path)
+            parts.append(f"file:{stat.st_mtime_ns}:{stat.st_size}")
+            status = "authoritative"
+            reason = "sqlite_file_metadata"
+        except OSError:
+            reason = "sqlite_file_metadata_unavailable"
+    else:
+        reason = "sqlite_in_memory_data_version"
+    try:
+        rows = await asyncio.wait_for(
+            plugin.query("PRAGMA data_version"),
+            timeout=timeout_seconds,
+        )
+        if rows:
+            value = next(iter(rows[0].values()))
+            parts.append(f"data_version:{value}")
+    except Exception:
+        if not parts:
+            return {
+                "revision": None,
+                "status": "unavailable",
+                "reason": "sqlite_data_version_unavailable",
+            }
+    if not parts:
+        return {
+            "revision": None,
+            "status": "unavailable",
+            "reason": "sqlite_source_revision_unavailable",
+        }
+    return {"revision": "|".join(parts), "status": status, "reason": reason}

@@ -22,7 +22,7 @@ Usage:
     # Option 1: Use with agent
     agent = Agent(
         name="researcher",
-        tools=[exa_search(api_key=os.getenv("EXA_API_KEY"))],
+        plugins=[exa_search(api_key=os.getenv("EXA_API_KEY"))],
         model="gpt-4o-mini"
     )
 
@@ -48,9 +48,21 @@ Getting Started:
 import os
 import logging
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Mapping, Optional
 
-from .base import BasePlugin
+from daita.runtime import (
+    AccessMode,
+    Capability,
+    Evidence,
+    EvidenceSchema,
+    Operation,
+    RiskLevel,
+    Task,
+    ToolView,
+)
+
+from .base import ConnectorPlugin
+from .manifest import PluginKind, PluginManifest
 from ..core.exceptions import (
     TransientError,
     RetryableError,
@@ -60,6 +72,7 @@ from ..core.exceptions import (
     ConnectionError as DaitaConnectionError,
     AuthenticationError,
 )
+from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +89,171 @@ VALID_CATEGORIES = {
     "financial report",
     "people",
 }
+
+
+def _search_web_parameters(num_results: int, search_type: str) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query (e.g., 'Python async best practices')",
+            },
+            "num_results": {
+                "type": "integer",
+                "description": f"Number of results to return (optional, default: {num_results}, max: 100)",
+            },
+            "search_type": {
+                "type": "string",
+                "enum": sorted(VALID_SEARCH_TYPES),
+                "description": f"Search mode (optional, default: {search_type})",
+            },
+            "category": {
+                "type": "string",
+                "enum": sorted(VALID_CATEGORIES),
+                "description": "Restrict results to a category (optional)",
+            },
+            "include_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Only return results from these domains (optional)",
+            },
+            "exclude_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Skip results from these domains (optional)",
+            },
+            "start_published_date": {
+                "type": "string",
+                "description": "ISO 8601 earliest publish date (optional, e.g., '2025-01-01')",
+            },
+            "end_published_date": {
+                "type": "string",
+                "description": "ISO 8601 latest publish date (optional)",
+            },
+            "include_text": {
+                "type": "boolean",
+                "description": "Include full page text on each result (optional)",
+            },
+            "include_highlights": {
+                "type": "boolean",
+                "description": "Include AI-extracted highlight passages (optional)",
+            },
+            "include_summary": {
+                "type": "boolean",
+                "description": "Include an AI-generated summary per result (optional)",
+            },
+        },
+        "required": ["query"],
+    }
+
+
+def _find_similar_parameters(num_results: int) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "URL to find similar pages for (HTTP/HTTPS)",
+            },
+            "num_results": {
+                "type": "integer",
+                "description": f"Number of results (optional, default: {num_results})",
+            },
+            "include_text": {
+                "type": "boolean",
+                "description": "Include full page text on each result (optional)",
+            },
+            "include_highlights": {
+                "type": "boolean",
+                "description": "Include AI-extracted highlight passages (optional)",
+            },
+            "include_summary": {
+                "type": "boolean",
+                "description": "Include an AI-generated summary per result (optional)",
+            },
+        },
+        "required": ["url"],
+    }
+
+
+def _tool_definitions(num_results: int, search_type: str) -> tuple[Dict[str, Any], ...]:
+    return (
+        {
+            "name": "search_web",
+            "capability_id": "exa_search.web.search",
+            "operation_type": "web.search",
+            "description": (
+                "Search the web for information using Exa's AI-powered semantic search. "
+                "Returns high-quality results with optional AI highlights or summaries. "
+                "Supports filtering by domain, date range, and category "
+                "(news, research paper, company, etc.). Use for: research, fact-checking, "
+                "current information, technical documentation, finding sources."
+            ),
+            "parameters": _search_web_parameters(num_results, search_type),
+        },
+        {
+            "name": "find_similar",
+            "capability_id": "exa_search.web.find_similar",
+            "operation_type": "web.find_similar",
+            "description": (
+                "Find pages on the web that are semantically similar to a given URL "
+                "using Exa. Use for: discovering related sources, expanding research "
+                "from a known good page, finding alternatives or comparisons."
+            ),
+            "parameters": _find_similar_parameters(num_results),
+        },
+    )
+
+
+_TOOL_BY_CAPABILITY = {
+    "exa_search.web.search": "search_web",
+    "exa_search.web.find_similar": "find_similar",
+}
+
+
+class _ExaSearchExecutor:
+    """Executor backing Exa search capability declarations."""
+
+    id = "exa_search.web"
+    capability_ids = frozenset(_TOOL_BY_CAPABILITY)
+
+    def __init__(self, plugin: "ExaSearchPlugin") -> None:
+        self._plugin = plugin
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        tool_name = _TOOL_BY_CAPABILITY.get(task.capability_id)
+        if tool_name is None:
+            raise ValueError(f"Unsupported Exa capability: {task.capability_id}")
+
+        handler = self._plugin._tool_handler(tool_name)
+        result = await handler(dict(task.input))
+        tool_view = context.get("tool_view")
+        tool_view_name = (
+            tool_view.get("name") if isinstance(tool_view, Mapping) else None
+        )
+        return [
+            Evidence(
+                kind="web.search.results",
+                owner="exa_search",
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={
+                    "operation": tool_name,
+                    "request": dict(task.input),
+                    "response": result,
+                },
+                metadata={
+                    "capability_id": task.capability_id,
+                    "tool_view": tool_view_name,
+                },
+            )
+        ]
 
 
 @dataclass
@@ -142,7 +320,7 @@ def _result_from_item(item: Dict[str, Any]) -> ExaSearchResult:
     )
 
 
-class ExaSearchPlugin(BasePlugin):
+class ExaSearchPlugin(ConnectorPlugin):
     """
     Exa search plugin using the Exa AI search API.
 
@@ -162,6 +340,16 @@ class ExaSearchPlugin(BasePlugin):
         include_domains: Optional default domain include list
         exclude_domains: Optional default domain exclude list
     """
+
+    manifest = PluginManifest(
+        id="exa_search",
+        display_name="Exa Search",
+        version="2.0.0",
+        kind=PluginKind.CONNECTOR,
+        domains=frozenset({"web", "search"}),
+        provides=frozenset({"web_search", "similarity_search"}),
+        optional_dependencies=frozenset({"exa-py"}),
+    )
 
     def __init__(
         self,
@@ -209,11 +397,80 @@ class ExaSearchPlugin(BasePlugin):
         self._exclude_domains = exclude_domains
 
         self._client = None
+        self._executor = _ExaSearchExecutor(self)
 
         logger.info(
             f"ExaSearchPlugin initialized (type: {search_type}, "
             f"num_results: {num_results}, highlights: {include_highlights}, "
             f"summary: {include_summary})"
+        )
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether the Exa client is currently initialized."""
+        return self._client is not None
+
+    async def teardown(self) -> None:
+        """Release runtime-owned Exa resources."""
+        await self.disconnect()
+
+    def declare_capabilities(self) -> tuple[Capability, ...]:
+        """Declare Exa search operations as runtime-plannable capabilities."""
+        return tuple(
+            Capability(
+                id=definition["capability_id"],
+                owner=self.manifest.id,
+                description=definition["description"],
+                domains=frozenset({"web", "search"}),
+                operation_types=frozenset({definition["operation_type"]}),
+                access=AccessMode.READ,
+                risk=RiskLevel.LOW,
+                input_schema=definition["parameters"],
+                output_evidence=frozenset({"web.search.results"}),
+                executor=self._executor.id,
+                model_visible=True,
+                retry_safe=True,
+                idempotent=True,
+                side_effecting=False,
+                timeout_seconds=30,
+                metadata={"tool_name": definition["name"]},
+            )
+            for definition in _tool_definitions(self._num_results, self._search_type)
+        )
+
+    def declare_evidence_schemas(self) -> tuple[EvidenceSchema, ...]:
+        """Declare typed evidence returned by Exa search execution."""
+        return (
+            EvidenceSchema(
+                kind="web.search.results",
+                owner=self.manifest.id,
+                description="Search results returned by Exa web search operations.",
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string"},
+                        "request": {"type": "object"},
+                        "response": {"type": "object"},
+                    },
+                    "required": ["operation", "request", "response"],
+                },
+            ),
+        )
+
+    def get_executors(self) -> tuple[_ExaSearchExecutor, ...]:
+        """Return the executor for Exa search runtime capabilities."""
+        return (self._executor,)
+
+    def get_tool_views(self) -> tuple[ToolView, ...]:
+        """Expose Exa capabilities as model-visible tool views."""
+        return tuple(
+            ToolView(
+                name=definition["name"],
+                capability_id=definition["capability_id"],
+                description=definition["description"],
+                parameters=definition["parameters"],
+            )
+            for definition in _tool_definitions(self._num_results, self._search_type)
         )
 
     async def connect(self):
@@ -552,120 +809,13 @@ class ExaSearchPlugin(BasePlugin):
             include_summary=args.get("include_summary"),
         )
 
-    def get_tools(self) -> List["AgentTool"]:
-        """Expose Exa search operations as agent tools."""
-        from ..core.tools import AgentTool
-
-        return [
-            AgentTool(
-                name="search_web",
-                description=(
-                    "Search the web for information using Exa's AI-powered semantic search. "
-                    "Returns high-quality results with optional AI highlights or summaries. "
-                    "Supports filtering by domain, date range, and category "
-                    "(news, research paper, company, etc.). Use for: research, fact-checking, "
-                    "current information, technical documentation, finding sources."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query (e.g., 'Python async best practices')",
-                        },
-                        "num_results": {
-                            "type": "integer",
-                            "description": f"Number of results to return (optional, default: {self._num_results}, max: 100)",
-                        },
-                        "search_type": {
-                            "type": "string",
-                            "enum": sorted(VALID_SEARCH_TYPES),
-                            "description": f"Search mode (optional, default: {self._search_type})",
-                        },
-                        "category": {
-                            "type": "string",
-                            "enum": sorted(VALID_CATEGORIES),
-                            "description": "Restrict results to a category (optional)",
-                        },
-                        "include_domains": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Only return results from these domains (optional)",
-                        },
-                        "exclude_domains": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Skip results from these domains (optional)",
-                        },
-                        "start_published_date": {
-                            "type": "string",
-                            "description": "ISO 8601 earliest publish date (optional, e.g., '2025-01-01')",
-                        },
-                        "end_published_date": {
-                            "type": "string",
-                            "description": "ISO 8601 latest publish date (optional)",
-                        },
-                        "include_text": {
-                            "type": "boolean",
-                            "description": "Include full page text on each result (optional)",
-                        },
-                        "include_highlights": {
-                            "type": "boolean",
-                            "description": "Include AI-extracted highlight passages (optional)",
-                        },
-                        "include_summary": {
-                            "type": "boolean",
-                            "description": "Include an AI-generated summary per result (optional)",
-                        },
-                    },
-                    "required": ["query"],
-                },
-                handler=self._tool_search_web,
-                category="search",
-                source="plugin",
-                plugin_name="ExaSearch",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="find_similar",
-                description=(
-                    "Find pages on the web that are semantically similar to a given URL "
-                    "using Exa. Use for: discovering related sources, expanding research "
-                    "from a known good page, finding alternatives or comparisons."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "URL to find similar pages for (HTTP/HTTPS)",
-                        },
-                        "num_results": {
-                            "type": "integer",
-                            "description": f"Number of results (optional, default: {self._num_results})",
-                        },
-                        "include_text": {
-                            "type": "boolean",
-                            "description": "Include full page text on each result (optional)",
-                        },
-                        "include_highlights": {
-                            "type": "boolean",
-                            "description": "Include AI-extracted highlight passages (optional)",
-                        },
-                        "include_summary": {
-                            "type": "boolean",
-                            "description": "Include an AI-generated summary per result (optional)",
-                        },
-                    },
-                    "required": ["url"],
-                },
-                handler=self._tool_find_similar,
-                category="search",
-                source="plugin",
-                plugin_name="ExaSearch",
-                timeout_seconds=30,
-            ),
-        ]
+    def _tool_handler(self, name: str):
+        """Return the legacy tool handler for an Exa tool name."""
+        handlers = {
+            "search_web": self._tool_search_web,
+            "find_similar": self._tool_find_similar,
+        }
+        return handlers[name]
 
 
 def exa_search(**kwargs) -> ExaSearchPlugin:
@@ -702,7 +852,7 @@ def exa_search(**kwargs) -> ExaSearchPlugin:
         from daita import Agent
         agent = Agent(
             name="researcher",
-            tools=[exa_search()],
+            plugins=[exa_search()],
             model="gpt-4o-mini"
         )
         ```

@@ -1,0 +1,553 @@
+"""
+Tests for BaseDiscoverer contract, discovery orchestration, and new tools.
+"""
+
+import pytest
+from typing import AsyncIterator, List
+
+from daita.plugins.catalog.base_discoverer import (
+    BaseDiscoverer,
+    DiscoveredStore,
+    DiscoveryError,
+    DiscoveryResult,
+)
+from daita.plugins.catalog.base_profiler import (
+    BaseProfiler,
+    NormalizedColumn,
+    NormalizedForeignKey,
+    NormalizedSchema,
+    NormalizedTable,
+)
+from daita.plugins.base import PluginContext
+from daita.plugins.catalog import CatalogPlugin
+
+# ---------------------------------------------------------------------------
+# Fake implementations for testing
+# ---------------------------------------------------------------------------
+
+
+class FakeDiscoverer(BaseDiscoverer):
+    """A discoverer that yields pre-configured stores."""
+
+    name = "fake"
+
+    def __init__(self, stores: List[DiscoveredStore] = None, should_fail: bool = False):
+        self._stores = stores or []
+        self._should_fail = should_fail
+        self.authenticated = False
+        self.closed = False
+
+    async def authenticate(self) -> None:
+        if self._should_fail:
+            raise RuntimeError("Auth failed")
+        self.authenticated = True
+
+    async def enumerate(self) -> AsyncIterator[DiscoveredStore]:
+        for store in self._stores:
+            yield store
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class FakeProfiler(BaseProfiler):
+    """A profiler that returns a fixed schema."""
+
+    def __init__(self, supported_types: List[str] = None):
+        self._supported_types = supported_types or ["postgresql"]
+
+    def supports(self, store_type: str) -> bool:
+        return store_type in self._supported_types
+
+    async def profile(self, store: DiscoveredStore) -> NormalizedSchema:
+        return NormalizedSchema(
+            database_type=store.store_type,
+            database_name="test_db",
+            tables=[
+                NormalizedTable(
+                    name="users",
+                    row_count=100,
+                    columns=[
+                        NormalizedColumn(
+                            name="id",
+                            type="integer",
+                            nullable=False,
+                            is_primary_key=True,
+                        ),
+                        NormalizedColumn(
+                            name="email",
+                            type="varchar",
+                            nullable=True,
+                            is_primary_key=False,
+                        ),
+                    ],
+                )
+            ],
+            foreign_keys=[],
+            table_count=1,
+            store_id=store.id,
+        )
+
+
+class FakeGraphBackend:
+    """Minimal graph backend for catalog persistence tests."""
+
+    def __init__(self):
+        self.nodes = {}
+        self.edges = {}
+        self.flushed = False
+
+    async def add_node(self, node):
+        self.nodes[node.node_id] = node
+
+    async def add_edge(self, edge):
+        self.edges[edge.edge_id] = edge
+
+    async def get_node(self, node_id):
+        return self.nodes.get(node_id)
+
+    async def find_nodes(self, node_type=None, **kwargs):
+        if node_type is None:
+            return list(self.nodes.values())
+        return [node for node in self.nodes.values() if node.node_type == node_type]
+
+    async def promote_node(self, old_id, new_id):
+        node = self.nodes.pop(old_id, None)
+        if node is not None:
+            self.nodes[new_id] = node.model_copy(update={"node_id": new_id})
+
+    async def flush(self):
+        self.flushed = True
+
+
+def _make_store(
+    id: str = "abc123",
+    store_type: str = "postgresql",
+    display_name: str = "test-db",
+    source: str = "fake",
+    **kwargs,
+) -> DiscoveredStore:
+    return DiscoveredStore(
+        id=id,
+        store_type=store_type,
+        display_name=display_name,
+        connection_hint=kwargs.get(
+            "connection_hint", {"host": "localhost", "port": 5432}
+        ),
+        source=source,
+        region=kwargs.get("region"),
+        environment=kwargs.get("environment"),
+        confidence=kwargs.get("confidence", 0.8),
+        tags=kwargs.get("tags", []),
+        metadata=kwargs.get("metadata", {}),
+    )
+
+
+# ---------------------------------------------------------------------------
+# BaseDiscoverer contract tests
+# ---------------------------------------------------------------------------
+
+
+async def test_fake_discoverer_enumerate_yields_stores():
+    stores = [_make_store(id="s1"), _make_store(id="s2")]
+    d = FakeDiscoverer(stores=stores)
+    await d.authenticate()
+    assert d.authenticated
+
+    result = [s async for s in d.enumerate()]
+    assert len(result) == 2
+    assert result[0].id == "s1"
+    assert result[1].id == "s2"
+
+
+async def test_fake_discoverer_close():
+    d = FakeDiscoverer()
+    await d.close()
+    assert d.closed
+
+
+async def test_base_discoverer_default_fingerprint():
+    d = FakeDiscoverer()
+    store = _make_store(connection_hint={"host": "db.example.com", "port": 5432})
+    fp = d.fingerprint(store)
+    assert isinstance(fp, str)
+    assert len(fp) == 16
+
+    # Same inputs produce same fingerprint
+    fp2 = d.fingerprint(store)
+    assert fp == fp2
+
+
+async def test_base_discoverer_test_access_default():
+    d = FakeDiscoverer()
+    assert await d.test_access() is True
+
+
+# ---------------------------------------------------------------------------
+# BaseProfiler contract tests
+# ---------------------------------------------------------------------------
+
+
+async def test_fake_profiler_profile():
+    profiler = FakeProfiler(supported_types=["postgresql"])
+    assert profiler.supports("postgresql")
+    assert not profiler.supports("mysql")
+
+    store = _make_store()
+    schema = await profiler.profile(store)
+    assert isinstance(schema, NormalizedSchema)
+    assert schema.database_type == "postgresql"
+    assert schema.table_count == 1
+    assert schema.store_id == store.id
+
+
+async def test_normalized_schema_to_dict():
+    schema = NormalizedSchema(
+        database_type="postgresql",
+        database_name="test",
+        tables=[
+            NormalizedTable(
+                name="users",
+                row_count=100,
+                columns=[
+                    NormalizedColumn(
+                        name="id", type="integer", nullable=False, is_primary_key=True
+                    ),
+                    NormalizedColumn(
+                        name="name",
+                        type="varchar",
+                        nullable=True,
+                        is_primary_key=False,
+                        comment="User name",
+                    ),
+                ],
+            )
+        ],
+        foreign_keys=[
+            NormalizedForeignKey(
+                source_table="orders",
+                source_column="user_id",
+                target_table="users",
+                target_column="id",
+            )
+        ],
+        table_count=1,
+    )
+    d = schema.to_dict()
+
+    assert d["database_type"] == "postgresql"
+    assert d["database_name"] == "test"
+    assert len(d["tables"]) == 1
+    assert d["tables"][0]["name"] == "users"
+    assert d["tables"][0]["row_count"] == 100
+    assert len(d["tables"][0]["columns"]) == 2
+    assert d["tables"][0]["columns"][1]["column_comment"] == "User name"
+    assert d["tables"][0]["columns"][0].get("column_comment") is None
+    assert len(d["foreign_keys"]) == 1
+    assert d["foreign_keys"][0]["source_table"] == "orders"
+    assert d["table_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# CatalogPlugin orchestration tests
+# ---------------------------------------------------------------------------
+
+
+async def test_discover_all_with_fake_discoverers():
+    plugin = CatalogPlugin()
+    stores = [_make_store(id="s1"), _make_store(id="s2")]
+    plugin.add_discoverer(FakeDiscoverer(stores=stores))
+
+    result = await plugin.discover_all()
+    assert result.store_count == 2
+    assert result.error_count == 0
+    assert not result.has_errors
+
+
+async def test_discover_all_merges_from_multiple_discoverers():
+    plugin = CatalogPlugin()
+    plugin.add_discoverer(FakeDiscoverer(stores=[_make_store(id="s1", source="aws")]))
+    plugin.add_discoverer(
+        FakeDiscoverer(stores=[_make_store(id="s2", source="github")])
+    )
+
+    result = await plugin.discover_all()
+    assert result.store_count == 2
+
+
+async def test_discover_all_partial_failure():
+    plugin = CatalogPlugin()
+    plugin.add_discoverer(FakeDiscoverer(stores=[_make_store(id="s1")]))
+    plugin.add_discoverer(FakeDiscoverer(should_fail=True))
+
+    result = await plugin.discover_all()
+    # Stores from successful discoverer are still returned
+    assert result.store_count == 1
+    # Error from failed discoverer is captured
+    assert result.error_count == 1
+    assert result.has_errors
+
+
+async def test_discover_all_dedup():
+    plugin = CatalogPlugin()
+    # Two discoverers finding the same store (same ID)
+    store = _make_store(id="same_id", source="aws", confidence=0.9)
+    store2 = _make_store(id="same_id", source="github", confidence=0.7)
+    plugin.add_discoverer(FakeDiscoverer(stores=[store]))
+    plugin.add_discoverer(FakeDiscoverer(stores=[store2]))
+
+    result = await plugin.discover_all()
+    assert result.store_count == 1
+    # Higher confidence source should win
+    assert result.stores[0].confidence == 0.9
+
+
+async def test_discover_all_empty():
+    plugin = CatalogPlugin()
+    result = await plugin.discover_all()
+    assert result.store_count == 0
+    assert result.error_count == 0
+
+
+async def test_public_accessor_api():
+    plugin = CatalogPlugin()
+    stores = [
+        _make_store(id="s1", store_type="postgresql", environment="production"),
+        _make_store(id="s2", store_type="mysql", environment="staging"),
+        _make_store(id="s3", store_type="postgresql", environment="staging"),
+    ]
+    plugin.add_discoverer(FakeDiscoverer(stores=stores))
+    await plugin.discover_all()
+
+    # get_stores no filter
+    assert len(plugin.get_stores()) == 3
+
+    # Filter by type
+    pg_stores = plugin.get_stores(store_type="postgresql")
+    assert len(pg_stores) == 2
+
+    # Filter by environment
+    staging = plugin.get_stores(environment="staging")
+    assert len(staging) == 2
+
+    # Filter by both
+    pg_staging = plugin.get_stores(store_type="postgresql", environment="staging")
+    assert len(pg_staging) == 1
+
+    # get_store by ID
+    assert plugin.get_store("s1") is not None
+    assert plugin.get_store("nonexistent") is None
+
+
+async def test_catalog_exposes_registry_tool_views_not_legacy_agent_tools():
+    plugin = CatalogPlugin()
+    views = plugin.get_tool_views()
+    names = {view.name for view in views}
+
+    assert not hasattr(plugin, "get_tools")
+    assert names == {
+        "catalog_search_schema",
+        "catalog_inspect_asset",
+        "catalog_find_relationship_paths",
+    }
+
+
+async def test_context_provider_renders_empty_catalog_summary():
+    plugin = CatalogPlugin()
+    provider = plugin.get_context_providers()[0]
+
+    block = await provider.render(
+        {"prompt": "test prompt"},
+        next(iter(provider.audiences)),
+        2000,
+    )
+
+    assert "Catalog has no registered stores" in block.content
+
+
+async def test_context_provider_renders_catalog_summary_with_stores():
+    plugin = CatalogPlugin()
+    plugin.add_discoverer(FakeDiscoverer(stores=[_make_store(id="s1")]))
+    await plugin.discover_all()
+    provider = plugin.get_context_providers()[0]
+
+    block = await provider.render(
+        {"prompt": "test prompt"},
+        next(iter(provider.audiences)),
+        2000,
+    )
+
+    assert block is not None
+    assert "1 known stores" in block.content
+
+
+async def test_teardown_closes_discoverers():
+    d = FakeDiscoverer()
+    plugin = CatalogPlugin()
+    plugin.add_discoverer(d)
+
+    await plugin.teardown()
+
+    assert d.closed
+
+
+async def test_get_stores_supports_legacy_find_store_filters():
+    plugin = CatalogPlugin()
+    stores = [
+        _make_store(
+            id="s1",
+            display_name="prod-orders",
+            store_type="postgresql",
+            environment="production",
+            tags=["team:backend"],
+        ),
+        _make_store(
+            id="s2",
+            display_name="staging-users",
+            store_type="mysql",
+            environment="staging",
+        ),
+    ]
+    plugin.add_discoverer(FakeDiscoverer(stores=stores))
+    await plugin.discover_all()
+
+    # Search by query
+    result = [
+        store
+        for store in plugin.get_stores()
+        if "orders" in store.display_name.lower() or "orders" in store.id.lower()
+    ]
+    assert len(result) == 1
+    assert result[0].id == "s1"
+
+    # Filter by type
+    result = plugin.get_stores(store_type="mysql")
+    assert len(result) == 1
+
+    # Filter by tag
+    result = [store for store in plugin.get_stores() if "team:backend" in store.tags]
+    assert len(result) == 1
+
+    # Pagination
+    result = plugin.get_stores()[0:1]
+    assert len(result) == 1
+    assert len(plugin.get_stores()) == 2
+
+
+async def test_discover_and_profile():
+    plugin = CatalogPlugin()
+    stores = [_make_store(id="s1", store_type="postgresql")]
+    plugin.add_discoverer(FakeDiscoverer(stores=stores))
+    plugin.add_profiler(FakeProfiler(supported_types=["postgresql"]))
+
+    result = await plugin.discover_and_profile()
+    assert result.store_count == 1
+
+    schema = plugin.get_schema("s1")
+    assert schema is not None
+    assert schema.database_type == "postgresql"
+    assert schema.store_id == "s1"
+
+
+async def test_discover_and_profile_auto_persists_to_graph(tmp_path, monkeypatch):
+    from daita.core.graph.models import NodeType
+
+    monkeypatch.chdir(tmp_path)
+    backend = FakeGraphBackend()
+    plugin = CatalogPlugin(backend=backend, auto_persist=True)
+    stores = [_make_store(id="s1", store_type="postgresql")]
+    plugin.add_discoverer(FakeDiscoverer(stores=stores))
+    plugin.add_profiler(FakeProfiler(supported_types=["postgresql"]))
+    await plugin.setup(
+        PluginContext(
+            runtime_id="catalog-auto-persist-test",
+            runtime_kind="agent",
+            agent_id="catalog-auto-persist-test",
+        )
+    )
+
+    await plugin.discover_and_profile()
+
+    table = await backend.get_node("table:postgresql:test_db.users")
+    assert table is not None
+    assert table.node_type == NodeType.TABLE
+    assert table.properties["database_type"] == "postgresql"
+    assert backend.flushed is True
+
+    columns = await backend.find_nodes(NodeType.COLUMN)
+    column_names = {column.name for column in columns}
+    assert {"id", "email"} <= column_names
+
+
+async def test_direct_schema_registration_hydrates_catalog_state():
+    plugin = CatalogPlugin()
+
+    result = await plugin.register_schema(
+        {
+            "database_type": "postgresql",
+            "database_name": "shop",
+            "tables": [
+                {
+                    "name": "orders",
+                    "row_count": 10,
+                    "columns": [
+                        {
+                            "name": "id",
+                            "type": "integer",
+                            "nullable": False,
+                            "is_primary_key": True,
+                        },
+                        {
+                            "name": "customer_id",
+                            "type": "integer",
+                            "nullable": False,
+                            "is_primary_key": False,
+                        },
+                    ],
+                },
+                {
+                    "name": "customers",
+                    "row_count": 3,
+                    "columns": [
+                        {
+                            "name": "id",
+                            "type": "integer",
+                            "nullable": False,
+                            "is_primary_key": True,
+                        }
+                    ],
+                },
+            ],
+            "foreign_keys": [
+                {
+                    "source_table": "orders",
+                    "source_column": "customer_id",
+                    "target_table": "customers",
+                    "target_column": "id",
+                }
+            ],
+            "table_count": 2,
+        },
+        store_type="postgresql",
+        connection_string="postgresql://user:secret@localhost/shop",
+    )
+
+    store_id = result["store_id"]
+    assert plugin.get_store(store_id) is not None
+    assert plugin.get_schema(store_id) is not None
+    assert result["schema"]["store_id"] == store_id
+    assert result["schema"]["profiled_at"]
+
+    search = plugin.search_catalog(store_id, "customer")
+    assert search["assets"][0]["name"] in {"customers", "orders"}
+
+    inspected = plugin.get_table_schema(store_id, "orders", column_pattern="customer")
+    assert inspected["success"] is True
+    assert inspected["columns"][0]["name"] == "customer_id"
+    assert inspected["foreign_keys"][0]["target_asset"] == "customers"
+
+    paths = plugin.find_relationship_paths(store_id, ["orders"], ["customers"])
+    assert paths["reachable"] is True
+    assert paths["paths"][0]["joins"][0]["predicate"] == (
+        "orders.customer_id = customers.id"
+    )

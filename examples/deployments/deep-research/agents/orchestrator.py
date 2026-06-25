@@ -67,13 +67,9 @@ def create_agent() -> Agent:
 You MUST follow these steps in order. Do NOT skip any step.
 
 Step 1: Call decompose_query(query) to get the research framework.
-Step 2: Call scratch() to store your initial analysis of the query — note which \
-angles are most important for this specific topic and why. Use key="planning_notes".
-Step 3: Draft 3-5 specific, searchable sub-questions covering background, current \
+Step 2: Draft 3-5 specific, searchable sub-questions covering background, current \
 state, key players, challenges, and future outlook.
-Step 4: Call remember() to store the final plan. You MUST set \
-category="research_plan" and importance=0.8. Pass a summary of the plan as content.
-Step 5: Output ONLY the final JSON:
+Step 3: Output ONLY the final JSON:
 {
   "query": "the original research query",
   "sub_questions": ["3-5 specific, searchable questions"],
@@ -83,5 +79,6 @@ Step 5: Output ONLY the final JSON:
 
 Quality bar: sub-questions must be specific enough to return useful search results, \
 cover the full scope, and be ordered logically (background first).""",
-        tools=[decompose_query, memory],
+        plugins=[memory],
+        tools=[decompose_query],
     )

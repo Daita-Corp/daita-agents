@@ -14,12 +14,25 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Mapping, Optional, Union, TYPE_CHECKING
 from datetime import datetime
-from .base import BasePlugin
+
+from daita.runtime import (
+    AccessMode,
+    Capability,
+    Evidence,
+    EvidenceSchema,
+    Operation,
+    RiskLevel,
+    Task,
+    ToolView,
+)
+
+from .base import ConnectorPlugin
+from .manifest import PluginKind, PluginManifest
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -57,13 +70,218 @@ EMAIL_PROVIDERS = {
 }
 
 
-class EmailPlugin(BasePlugin):
+_EMAIL_TOOL_DEFINITIONS = (
+    {
+        "name": "list_emails",
+        "capability_id": "email.message.list",
+        "operation_type": "email.message.list",
+        "description": "List emails from inbox or a specific folder. Returns email summaries with subject, sender, date, and ID.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "folder": {
+                    "type": "string",
+                    "description": "Email folder name (default: INBOX)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of emails to return (default: 10)",
+                },
+                "unread_only": {
+                    "type": "boolean",
+                    "description": "Only return unread emails (default: false)",
+                },
+            },
+            "required": [],
+        },
+        "access": AccessMode.READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+    },
+    {
+        "name": "read_email",
+        "capability_id": "email.message.read",
+        "operation_type": "email.message.read",
+        "description": "Read full email content including body, attachments, and metadata. Use the email ID from list_emails.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "email_id": {
+                    "type": "string",
+                    "description": "Email ID from list_emails",
+                },
+                "folder": {
+                    "type": "string",
+                    "description": "Email folder name (default: INBOX)",
+                },
+                "mark_as_read": {
+                    "type": "boolean",
+                    "description": "Mark email as read after fetching (default: false)",
+                },
+            },
+            "required": ["email_id"],
+        },
+        "access": AccessMode.READ,
+        "risk": RiskLevel.MEDIUM,
+        "retry_safe": True,
+        "idempotent": False,
+        "side_effecting": True,
+    },
+    {
+        "name": "send_email",
+        "capability_id": "email.message.send",
+        "operation_type": "email.message.send",
+        "description": "Send an email with optional HTML formatting and attachments.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "description": "Recipient email address",
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Email subject line",
+                },
+                "body": {"type": "string", "description": "Email body content"},
+                "html": {
+                    "type": "boolean",
+                    "description": "Whether body is HTML formatted (default: false)",
+                },
+                "cc": {
+                    "type": "string",
+                    "description": "Optional CC recipient email address",
+                },
+            },
+            "required": ["to", "subject", "body"],
+        },
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.HIGH,
+        "retry_safe": False,
+        "idempotent": False,
+        "side_effecting": True,
+    },
+    {
+        "name": "reply_to_email",
+        "capability_id": "email.message.reply",
+        "operation_type": "email.message.reply",
+        "description": "Reply to an existing email. Automatically sets the reply-to address and subject.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "email_id": {
+                    "type": "string",
+                    "description": "ID of email to reply to",
+                },
+                "body": {"type": "string", "description": "Reply message body"},
+                "html": {
+                    "type": "boolean",
+                    "description": "Whether body is HTML formatted (default: false)",
+                },
+            },
+            "required": ["email_id", "body"],
+        },
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.HIGH,
+        "retry_safe": False,
+        "idempotent": False,
+        "side_effecting": True,
+    },
+    {
+        "name": "search_emails",
+        "capability_id": "email.message.search",
+        "operation_type": "email.message.search",
+        "description": "Search emails using IMAP search criteria. Supports searching by sender, subject, date, etc.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "IMAP search query (e.g., 'FROM \"sender@example.com\"', 'SUBJECT \"meeting\"')",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results (default: 10)",
+                },
+            },
+            "required": ["query"],
+        },
+        "access": AccessMode.READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+    },
+)
+
+_EMAIL_TOOL_BY_CAPABILITY = {
+    definition["capability_id"]: definition for definition in _EMAIL_TOOL_DEFINITIONS
+}
+
+
+class _EmailExecutor:
+    """Executor backing Email plugin capability declarations."""
+
+    id = "email.message"
+    capability_ids = frozenset(_EMAIL_TOOL_BY_CAPABILITY)
+
+    def __init__(self, plugin: "EmailPlugin") -> None:
+        self._plugin = plugin
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        definition = _EMAIL_TOOL_BY_CAPABILITY.get(task.capability_id)
+        if definition is None:
+            raise ValueError(f"Unsupported email capability: {task.capability_id}")
+
+        tool_name = definition["name"]
+        handler = self._plugin._tool_handler(tool_name)
+        result = await handler(dict(task.input))
+        tool_view = context.get("tool_view")
+        tool_view_name = (
+            tool_view.get("name") if isinstance(tool_view, Mapping) else None
+        )
+        return [
+            Evidence(
+                kind="email.operation.result",
+                owner="email",
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={
+                    "operation": tool_name,
+                    "request": dict(task.input),
+                    "result": result,
+                },
+                metadata={
+                    "capability_id": task.capability_id,
+                    "tool_view": tool_view_name,
+                },
+            )
+        ]
+
+
+class EmailPlugin(ConnectorPlugin):
     """
     Universal email plugin for agents supporting IMAP/SMTP protocols.
 
     Works with Gmail, Outlook, Yahoo, iCloud, and any email provider
     supporting standard IMAP/SMTP protocols.
     """
+
+    manifest = PluginManifest(
+        id="email",
+        display_name="Email",
+        version="2.0.0",
+        kind=PluginKind.CONNECTOR,
+        domains=frozenset({"email", "messaging"}),
+        provides=frozenset({"email_read", "email_send"}),
+    )
 
     def __init__(
         self,
@@ -142,10 +360,79 @@ class EmailPlugin(BasePlugin):
 
         self._imap = None
         self._smtp = None
+        self._executor = _EmailExecutor(self)
 
         logger.debug(
             f"Email plugin configured for {email_address} "
             f"(IMAP: {self.imap_host}:{self.imap_port}, SMTP: {self.smtp_host}:{self.smtp_port})"
+        )
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether both IMAP and SMTP connections are open."""
+        return self._imap is not None and self._smtp is not None
+
+    async def teardown(self) -> None:
+        """Release runtime-owned email resources."""
+        await self.disconnect()
+
+    def declare_capabilities(self) -> tuple[Capability, ...]:
+        """Declare email operations as runtime-plannable capabilities."""
+        return tuple(
+            Capability(
+                id=definition["capability_id"],
+                owner=self.manifest.id,
+                description=definition["description"],
+                domains=frozenset({"email", "messaging"}),
+                operation_types=frozenset({definition["operation_type"]}),
+                access=definition["access"],
+                risk=definition["risk"],
+                input_schema=definition["parameters"],
+                output_evidence=frozenset({"email.operation.result"}),
+                executor=self._executor.id,
+                model_visible=True,
+                retry_safe=definition["retry_safe"],
+                idempotent=definition["idempotent"],
+                side_effecting=definition["side_effecting"],
+                timeout_seconds=60,
+                metadata={"tool_name": definition["name"]},
+            )
+            for definition in _EMAIL_TOOL_DEFINITIONS
+        )
+
+    def declare_evidence_schemas(self) -> tuple[EvidenceSchema, ...]:
+        """Declare typed evidence returned by email operation execution."""
+        return (
+            EvidenceSchema(
+                kind="email.operation.result",
+                owner=self.manifest.id,
+                description="Result evidence from an email operation.",
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string"},
+                        "request": {"type": "object"},
+                        "result": {"type": "object"},
+                    },
+                    "required": ["operation", "request", "result"],
+                },
+            ),
+        )
+
+    def get_executors(self) -> tuple[_EmailExecutor, ...]:
+        """Return the executor for email runtime capabilities."""
+        return (self._executor,)
+
+    def get_tool_views(self) -> tuple[ToolView, ...]:
+        """Expose email capabilities as model-visible tool views."""
+        return tuple(
+            ToolView(
+                name=definition["name"],
+                capability_id=definition["capability_id"],
+                description=definition["description"],
+                parameters=definition["parameters"],
+            )
+            for definition in _EMAIL_TOOL_DEFINITIONS
         )
 
     async def connect(self):
@@ -630,150 +917,16 @@ class EmailPlugin(BasePlugin):
             logger.error(f"Failed to delete email: {e}")
             raise RuntimeError(f"Email delete_email failed: {e}")
 
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose email operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for email operations
-        """
-        from ..core.tools import AgentTool
-
-        return [
-            AgentTool(
-                name="list_emails",
-                description="List emails from inbox or a specific folder. Returns email summaries with subject, sender, date, and ID.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "folder": {
-                            "type": "string",
-                            "description": "Email folder name (default: INBOX)",
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of emails to return (default: 10)",
-                        },
-                        "unread_only": {
-                            "type": "boolean",
-                            "description": "Only return unread emails (default: false)",
-                        },
-                    },
-                    "required": [],
-                },
-                handler=self._tool_list_emails,
-                category="email",
-                source="plugin",
-                plugin_name="Email",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="read_email",
-                description="Read full email content including body, attachments, and metadata. Use the email ID from list_emails.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "email_id": {
-                            "type": "string",
-                            "description": "Email ID from list_emails",
-                        },
-                        "folder": {
-                            "type": "string",
-                            "description": "Email folder name (default: INBOX)",
-                        },
-                        "mark_as_read": {
-                            "type": "boolean",
-                            "description": "Mark email as read after fetching (default: false)",
-                        },
-                    },
-                    "required": ["email_id"],
-                },
-                handler=self._tool_read_email,
-                category="email",
-                source="plugin",
-                plugin_name="Email",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="send_email",
-                description="Send an email with optional HTML formatting and attachments.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "to": {
-                            "type": "string",
-                            "description": "Recipient email address",
-                        },
-                        "subject": {
-                            "type": "string",
-                            "description": "Email subject line",
-                        },
-                        "body": {"type": "string", "description": "Email body content"},
-                        "html": {
-                            "type": "boolean",
-                            "description": "Whether body is HTML formatted (default: false)",
-                        },
-                        "cc": {
-                            "type": "string",
-                            "description": "Optional CC recipient email address",
-                        },
-                    },
-                    "required": ["to", "subject", "body"],
-                },
-                handler=self._tool_send_email,
-                category="email",
-                source="plugin",
-                plugin_name="Email",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="reply_to_email",
-                description="Reply to an existing email. Automatically sets the reply-to address and subject.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "email_id": {
-                            "type": "string",
-                            "description": "ID of email to reply to",
-                        },
-                        "body": {"type": "string", "description": "Reply message body"},
-                        "html": {
-                            "type": "boolean",
-                            "description": "Whether body is HTML formatted (default: false)",
-                        },
-                    },
-                    "required": ["email_id", "body"],
-                },
-                handler=self._tool_reply_to_email,
-                category="email",
-                source="plugin",
-                plugin_name="Email",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="search_emails",
-                description="Search emails using IMAP search criteria. Supports searching by sender, subject, date, etc.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "IMAP search query (e.g., 'FROM \"sender@example.com\"', 'SUBJECT \"meeting\"')",
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of results (default: 10)",
-                        },
-                    },
-                    "required": ["query"],
-                },
-                handler=self._tool_search_emails,
-                category="email",
-                source="plugin",
-                plugin_name="Email",
-                timeout_seconds=60,
-            ),
-        ]
+    def _tool_handler(self, name: str):
+        """Return the legacy tool handler for an email tool name."""
+        handlers = {
+            "list_emails": self._tool_list_emails,
+            "read_email": self._tool_read_email,
+            "send_email": self._tool_send_email,
+            "reply_to_email": self._tool_reply_to_email,
+            "search_emails": self._tool_search_emails,
+        }
+        return handlers[name]
 
     async def _tool_list_emails(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for list_emails"""

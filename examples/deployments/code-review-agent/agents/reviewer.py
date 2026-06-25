@@ -2,10 +2,10 @@
 Code review agent — demonstrates the daita-agents skills system.
 
 This agent composes two skills:
-- **SecurityReviewSkill** (BaseSkill subclass) — file-based instructions + tools
-- **code_quality skill** (Skill factory) — inline instructions + tools
+- **SecurityReviewSkill** (BaseSkill subclass) — file-based instructions + capabilities
+- **code_quality skill** (Skill factory) — inline instructions + capabilities
 
-Each skill contributes its own tools and domain-specific instructions.
+Each skill contributes ToolViews over its capabilities plus domain-specific instructions.
 The agent's system prompt receives all skill instructions under a
 structured "## Skills & Expertise" header automatically.
 """

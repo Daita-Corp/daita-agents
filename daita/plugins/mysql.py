@@ -8,10 +8,20 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from urllib.parse import urlparse, quote
+
+from .base import PluginContext
 from .base_db import BaseDatabasePlugin
+from .mysql_extensions import (
+    MYSQL_MANIFEST,
+    MySQLExecutor,
+    mysql_capabilities,
+    mysql_evidence_schemas,
+    mysql_tool_views,
+)
+from .sql_params import coerce_sql_params, param_specs_from_payload
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +34,7 @@ class MySQLPlugin(BaseDatabasePlugin):
     """
 
     sql_dialect = "mysql"
+    manifest = MYSQL_MANIFEST
 
     def __init__(
         self,
@@ -81,6 +92,153 @@ class MySQLPlugin(BaseDatabasePlugin):
         )
 
         logger.debug(f"MySQL plugin configured for {host}:{port}/{database}")
+
+    async def setup(self, context: PluginContext) -> None:
+        """Set up the MySQL connector for a runtime."""
+        await self.connect()
+
+    async def teardown(self) -> None:
+        """Disconnect the MySQL connector from a runtime."""
+        await self.disconnect()
+
+    # ------------------------------------------------------------------
+    # Runtime extension declarations
+    # ------------------------------------------------------------------
+
+    def declare_capabilities(self):
+        return mysql_capabilities()
+
+    def get_executors(self):
+        return (
+            MySQLExecutor(
+                id="mysql.schema.inspect",
+                capability_ids=frozenset({"db.schema.inspect"}),
+                evidence_kind="schema.asset_profile",
+                handler=self._execute_schema_inspect,
+            ),
+            MySQLExecutor(
+                id="mysql.sql.validate",
+                capability_ids=frozenset({"db.sql.validate"}),
+                evidence_kind="sql.validation",
+                handler=self._execute_sql_validate,
+            ),
+            MySQLExecutor(
+                id="mysql.sql.execute_read",
+                capability_ids=frozenset({"db.sql.execute_read"}),
+                evidence_kind="query.result",
+                handler=self._execute_sql_read,
+            ),
+            MySQLExecutor(
+                id="mysql.sql.execute_write",
+                capability_ids=frozenset({"db.sql.execute_write"}),
+                evidence_kind="write.execution",
+                handler=self._execute_sql_write,
+            ),
+            MySQLExecutor(
+                id="mysql.sql.explain",
+                capability_ids=frozenset({"db.sql.explain"}),
+                evidence_kind="sql.explain.plan",
+                handler=self._execute_sql_explain,
+            ),
+        )
+
+    def declare_evidence_schemas(self):
+        return mysql_evidence_schemas()
+
+    def get_tool_views(self):
+        return mysql_tool_views()
+
+    async def _execute_schema_inspect(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        requested = args.get("tables")
+        all_tables = await self.tables()
+        targets = (
+            [table for table in all_tables if table in requested]
+            if requested
+            else all_tables
+        )
+        schemas = await asyncio.gather(*[self.describe(table) for table in targets])
+        tables = []
+        for table, columns in zip(targets, schemas):
+            tables.append(
+                {
+                    "name": table,
+                    "columns": [
+                        {
+                            "name": column.get("column_name") or column.get("name"),
+                            "data_type": column.get("data_type") or column.get("type"),
+                            "is_nullable": column.get("is_nullable"),
+                            "default_value": column.get("column_default"),
+                            "is_primary_key": bool(column.get("is_primary_key")),
+                        }
+                        for column in columns
+                    ],
+                }
+            )
+        return {
+            "database_type": "mysql",
+            "database_name": self.db,
+            "table_count": len(tables),
+            "tables": tables,
+            "foreign_keys": await self.foreign_keys(),
+        }
+
+    async def _execute_sql_validate(self, payload: Any) -> Dict[str, Any]:
+        from daita.db.query_sql_validation import sql_statement_facts
+
+        args = dict(payload or {})
+        sql = self._normalize_sql(str(args.get("sql") or ""))
+        operation = str(args.get("operation") or "query")
+        analysis = self._validate_sql_policy(sql, operation=operation)
+        return {
+            "valid": True,
+            "sql": sql,
+            "operation": operation,
+            "statement_type": analysis.statement_type,
+            "is_read": analysis.is_read,
+            "has_limit": analysis.has_limit,
+            "tables": [table.short_key for table in analysis.tables],
+            "columns": sorted(analysis.referenced_column_names),
+            "statement_facts": sql_statement_facts(sql, analysis),
+        }
+
+    async def _execute_sql_read(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        params = coerce_sql_params(
+            list(args.get("params") or []),
+            param_specs_from_payload(args),
+            dialect="mysql",
+            json_binding="text",
+        )
+        return await self._run_guarded_tool_query(
+            str(args.get("sql") or ""),
+            params,
+            args.get("focus"),
+        )
+
+    async def _execute_sql_write(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        sql = self._prepare_tool_execute_sql(str(args.get("sql") or ""))
+        params = coerce_sql_params(
+            list(args.get("params") or []),
+            param_specs_from_payload(args),
+            dialect="mysql",
+            json_binding="text",
+        )
+        affected_rows = await self.execute(sql, params)
+        return {"sql": sql, "affected_rows": affected_rows}
+
+    async def _execute_sql_explain(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        sql = self._prepare_tool_query_sql(str(args.get("sql") or ""))
+        params = coerce_sql_params(
+            list(args.get("params") or []),
+            param_specs_from_payload(args),
+            dialect="mysql",
+            json_binding="text",
+        )
+        rows = await self.query(f"EXPLAIN {sql}", params)
+        return {"sql": sql, "plan": rows}
 
     async def connect(self):
         """Connect to MySQL database."""
@@ -227,13 +385,30 @@ class MySQLPlugin(BaseDatabasePlugin):
             DATA_TYPE as data_type,
             IS_NULLABLE as is_nullable,
             COLUMN_DEFAULT as column_default,
-            COLUMN_TYPE as column_type
+            COLUMN_TYPE as column_type,
+            COLUMN_KEY = 'PRI' as is_primary_key
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_NAME = %s
         AND TABLE_SCHEMA = DATABASE()
         ORDER BY ORDINAL_POSITION
         """
         return await self.query(sql, [table])
+
+    async def foreign_keys(self) -> List[Dict[str, Any]]:
+        """List foreign-key relationships in the current MySQL database."""
+        sql = """
+        SELECT
+            TABLE_NAME AS table_name,
+            COLUMN_NAME AS column_name,
+            REFERENCED_TABLE_NAME AS referenced_table_name,
+            REFERENCED_COLUMN_NAME AS referenced_column_name,
+            CONSTRAINT_NAME AS constraint_name
+        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+        WHERE TABLE_SCHEMA = DATABASE()
+        AND REFERENCED_TABLE_NAME IS NOT NULL
+        ORDER BY TABLE_NAME, COLUMN_NAME
+        """
+        return await self.query(sql)
 
     async def count_rows(self, table: str, filter: Optional[str] = None) -> int:
         """
@@ -265,140 +440,6 @@ class MySQLPlugin(BaseDatabasePlugin):
         """
         sql = f"SELECT * FROM `{table}` ORDER BY RAND() LIMIT {int(n)}"
         return await self.query(sql)
-
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose MySQL operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for database operations
-        """
-        from ..core.tools import AgentTool
-
-        tools = [
-            AgentTool(
-                name="mysql_query",
-                description="Run a SELECT query on MySQL. Include LIMIT in your SQL to control result size.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "sql": {
-                            "type": "string",
-                            "description": "SQL SELECT query with %s placeholders",
-                        },
-                        "params": {
-                            "type": "array",
-                            "description": "Optional parameter values",
-                            "items": {},
-                        },
-                        "focus": {
-                            "type": "string",
-                            "description": "Focus DSL to filter/project at the database level, e.g. \"status == 'active' | SELECT id, name | LIMIT 100\"",
-                        },
-                    },
-                    "required": ["sql"],
-                },
-                handler=self._tool_query,
-                category="database",
-                source="plugin",
-                plugin_name="MySQL",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="mysql_inspect",
-                description="List all tables and their column schemas in one call. Use tables param to filter specific tables.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "tables": {
-                            "type": "array",
-                            "description": "Filter to specific tables (returns all if omitted)",
-                            "items": {"type": "string"},
-                        }
-                    },
-                    "required": [],
-                },
-                handler=self._tool_inspect,
-                category="database",
-                source="plugin",
-                plugin_name="MySQL",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="mysql_count",
-                description="Count rows in a MySQL table, optionally filtered by a WHERE clause.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name",
-                        },
-                        "filter": {
-                            "type": "string",
-                            "description": "Optional WHERE clause (without WHERE keyword), e.g. 'status = \"active\"'",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_count,
-                category="database",
-                source="plugin",
-                plugin_name="MySQL",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="mysql_sample",
-                description="Return a random sample of rows from a MySQL table.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name",
-                        },
-                        "n": {
-                            "type": "integer",
-                            "description": "Number of rows to sample (default: 5)",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_sample,
-                category="database",
-                source="plugin",
-                plugin_name="MySQL",
-                timeout_seconds=30,
-            ),
-        ]
-        if not self.read_only:
-            tools.append(
-                AgentTool(
-                    name="mysql_execute",
-                    description="Execute INSERT, UPDATE, or DELETE on MySQL. Returns affected row count.",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "sql": {
-                                "type": "string",
-                                "description": "SQL statement (INSERT, UPDATE, or DELETE)",
-                            },
-                            "params": {
-                                "type": "array",
-                                "description": "Optional parameter values",
-                                "items": {},
-                            },
-                        },
-                        "required": ["sql"],
-                    },
-                    handler=self._tool_execute,
-                    category="database",
-                    source="plugin",
-                    plugin_name="MySQL",
-                    timeout_seconds=60,
-                )
-            )
-        return tools
 
     async def _tool_list_tables(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mysql_list_tables (kept for backward compat)"""

@@ -11,8 +11,10 @@ Guide for AI assistants (and humans) working on this codebase.
 ```
 daita/
   agents/       # Agent and BaseAgent — the main user-facing classes
+  db/           # Operation-centric DB runtime, planning, execution, verification
+  runtime/      # Shared runtime primitives: capabilities, tasks, evidence, policy
   llm/          # LLM providers (OpenAI, Anthropic, Gemini, Grok, Mock)
-  plugins/      # Infrastructure integrations (databases, APIs, storage)
+  plugins/      # Extension-first integrations and the ExtensionRegistry
   core/         # Internals: tools, workflow, relay, streaming, tracing, exceptions
   config/       # AgentConfig, RetryPolicy, RetryStrategy
   cli/          # `daita` CLI commands
@@ -67,6 +69,30 @@ Before editing during a refactor, briefly identify:
 - Smallest change that fixes it
 - Why the change is not adding a parallel abstraction
 - Tests that will catch behavior drift
+
+### Root-cause fixes
+
+When fixing bugs or reliability issues, trace the failure to the underlying contract, state ownership, lifecycle, or architectural boundary that allowed it. Do not stack narrow patches, special cases, retries, or defensive checks on top of a broken design indefinitely. Prefer replacing the incorrect mechanism with a coherent owner and removing the obsolete path it supersedes, with regression tests that prove the root issue stays fixed.
+
+### Catalog ownership
+
+The catalog plugin is the owner for cataloging infrastructure, normalized schemas, relationships, and graph traversal/search over data assets. `Agent.from_db()` should use the catalog as its source of structural truth when planning queries, finding tables, resolving joins, and traversing relationships. Do not move catalog graphing, infrastructure discovery, or relationship-search ownership into the from_db runtime; from_db should consume catalog capabilities to make querying easier.
+
+### Extension-first plugin architecture
+
+Manifest plugins register through `ExtensionRegistry` and declare runtime contracts: `Capability`, `Executor`, `EvidenceSchema`, `Policy`, `ContextProvider`, `ToolView`, and `Worker`. Runtime behavior should consume those declarations from the registry instead of calling plugin-local tool methods or inferring behavior from tool names.
+
+`Agent` can project registered `ToolView`s for model-visible tools, but tools are a presentation layer over capabilities. When adding runtime behavior, prefer declared capabilities, executors, evidence schemas, policies, workers, and context providers over ad hoc tool wiring.
+
+### DB runtime governance and resume ownership
+
+`DbRuntime` owns DB operation planning, task execution, governance, approval state, resume, evidence, verification, and synthesis. Runtime-owned DB work must execute through declared capabilities, persisted `Task` records, registered executors, and the shared governance boundary.
+
+`execute_task()` is the executor-invocation choke point. `DbRuntime.run()`, `DbRuntime.execute_capability()`, worker execution, operation executor dispatch, monitors, scheduled work, and resume flows must pass through `execute_task()` before any executor runs.
+
+Runtime policy consumes facts produced by existing owners: planning, SQL validation, connector guardrails, capability metadata, evidence storage, and operation context. Do not duplicate those systems inside policy; policy decides permission from their facts.
+
+Approval channels mutate approval state only. `DbRuntime.resume_operation()` owns execution resume. Resume should use persisted planned tasks plus lightweight operation context; do not resume by reclassifying the original prompt or rebuilding a plan from scratch. Completed tasks must be skipped and not rerun.
 
 ## Critical: the lazy import rule
 
@@ -152,11 +178,13 @@ When a plugin or provider needs a package, add it to the matching extra in `pypr
 
 ## Adding a new plugin
 
-1. Create `daita/plugins/myplugin.py`, subclass `BasePlugin` (or `BaseDatabasePlugin` for DB plugins)
-2. Implement `connect()` with lazy import, and `get_tools()` returning `List[AgentTool]`
-3. Export from `daita/plugins/__init__.py`
-4. Add the package to a new or existing extra in `pyproject.toml`
-5. Export from `daita/__init__.py` if it should be part of the top-level public API
+1. Create `daita/plugins/myplugin.py`, subclass the appropriate extension-first plugin base.
+2. Declare a stable `PluginManifest` with an ID, display name, version, kind, and domains.
+3. Declare capabilities, executors, evidence schemas, policies, context providers, workers, and optional `ToolView`s as appropriate for the plugin.
+4. Implement `connect()` with lazy imports when the plugin owns an optional external client.
+5. Export from `daita/plugins/__init__.py` and `daita/__init__.py` only when the plugin should be part of the public API.
+6. Add optional packages to the matching extra in `pyproject.toml`.
+7. Add focused tests in `tests/unit/` for registry declarations and runtime behavior.
 
 ## Things to avoid
 
@@ -172,6 +200,13 @@ When a plugin or provider needs a package, add it to the matching extra in `pypr
 | `daita/__init__.py`        | Public API surface — what users import                |
 | `daita/agents/agent.py`    | Main `Agent` class                                    |
 | `daita/agents/base.py`     | `BaseAgent` — extend this for custom agents           |
+| `daita/db/runtime.py`      | `DbRuntime` — DB operation lifecycle owner            |
+| `daita/db/execution.py`    | DB planned-task execution through runtime capabilities |
+| `daita/runtime/primitives.py` | Capability, task, evidence, policy, approval records |
+| `daita/runtime/governance.py` | Shared policy evaluation boundary                  |
+| `daita/runtime/approvals.py` | Runtime approval channel helpers                    |
+| `daita/runtime/store.py`   | Operation, task, evidence, event, and approval stores |
+| `daita/plugins/registry.py` | `ExtensionRegistry` — plugin declaration registry    |
 | `daita/llm/base.py`        | `BaseLLMProvider` — extend this for new LLM providers |
 | `daita/plugins/base.py`    | `BasePlugin` — extend this for new plugins            |
 | `daita/plugins/base_db.py` | `BaseDatabasePlugin` — extend this for DB plugins     |

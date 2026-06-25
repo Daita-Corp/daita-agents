@@ -1,4 +1,4 @@
-"""Factories used by eval unit tests."""
+"""Runtime-native factories used by eval unit tests."""
 
 from __future__ import annotations
 
@@ -18,36 +18,56 @@ class FakeEvalAgent:
     async def stop(self):
         self.stopped = True
 
-    async def run(self, prompt, detailed=False, **kwargs):
+    async def run_detailed(self, prompt, **kwargs):
+        del prompt, kwargs
         if self.index < len(self.responses):
             result = self.responses[self.index]
             self.index += 1
         else:
             result = self.responses[-1]
-        return result if detailed else result["result"]
+        return result
 
 
 def create_passing_agent():
     return FakeEvalAgent(
         [
-            {
-                "result": "Widget A revenue: 12840.50",
-                "tool_calls": [
-                    {
-                        "tool": "sqlite_query",
-                        "arguments": {
-                            "sql": "SELECT product, SUM(revenue) FROM sales GROUP BY product LIMIT 5"
-                        },
-                        "result": {
-                            "rows": [{"product": "Widget A", "revenue": 12840.50}]
-                        },
-                    }
+            runtime_result(
+                "Widget A revenue: 12840.50",
+                tasks=[
+                    task("task-1", "db.sql.validate", owner="sqlite"),
+                    task("task-2", "db.sql.execute_read", owner="sqlite"),
                 ],
-                "iterations": 2,
-                "tokens": {"total_tokens": 100},
-                "cost": 0.001,
-                "processing_time_ms": 12,
-            }
+                evidence=[
+                    evidence_record(
+                        "evidence-1",
+                        "sql.validation",
+                        "sqlite",
+                        "task-1",
+                        {
+                            "sql": (
+                                "SELECT product, SUM(revenue) FROM sales "
+                                "GROUP BY product LIMIT 5"
+                            ),
+                            "statement_facts": {"statement_type": "select"},
+                        },
+                    ),
+                    evidence_record(
+                        "evidence-2",
+                        "query.result",
+                        "sqlite",
+                        "task-2",
+                        {
+                            "sql": (
+                                "SELECT product, SUM(revenue) FROM sales "
+                                "GROUP BY product LIMIT 5"
+                            ),
+                            "rows": [{"product": "Widget A", "revenue": 12840.50}],
+                        },
+                    ),
+                ],
+                tokens_total=100,
+                cost=0.001,
+            )
         ]
     )
 
@@ -55,95 +75,112 @@ def create_passing_agent():
 def create_sql_failure_agent():
     return FakeEvalAgent(
         [
-            {
-                "result": "Done",
-                "tool_calls": [
-                    {
-                        "tool": "sqlite_query",
-                        "arguments": {"sql": "SELECT * FROM users_pii"},
-                        "result": {"rows": []},
-                    }
+            runtime_result(
+                "Done",
+                tasks=[
+                    task("task-1", "db.sql.validate", owner="sqlite"),
+                    task("task-2", "db.sql.execute_read", owner="sqlite"),
                 ],
-                "iterations": 1,
-            }
+                evidence=[
+                    evidence_record(
+                        "evidence-1",
+                        "sql.validation",
+                        "sqlite",
+                        "task-1",
+                        {
+                            "sql": "SELECT * FROM users_pii",
+                            "statement_facts": {"statement_type": "select"},
+                        },
+                    ),
+                    evidence_record(
+                        "evidence-2",
+                        "query.result",
+                        "sqlite",
+                        "task-2",
+                        {"sql": "SELECT * FROM users_pii", "rows": []},
+                    ),
+                ],
+            )
         ]
     )
 
 
-def create_data_ops_agent():
+def create_runtime_capability_agent():
     return FakeEvalAgent(
         [
-            {
-                "result": "Loaded sales.csv and checked the customer API.",
-                "tool_calls": [
-                    {
-                        "tool": "file_read",
-                        "arguments": {"path": "data/sales.csv"},
-                        "result": {"rows": 10},
-                    },
-                    {
-                        "tool": "rest_request",
-                        "arguments": {
-                            "method": "GET",
-                            "url": "https://api.example.com/customers",
-                        },
-                        "result": {"status": 200},
-                    },
-                    {
-                        "tool": "s3_get_object",
-                        "arguments": {"bucket": "analytics", "key": "sales.csv"},
-                        "result": {"bytes": 128},
-                    },
-                    {
-                        "tool": "vector_search",
-                        "arguments": {
-                            "index": "docs",
-                            "top_k": 5,
-                            "filters": {"tenant_id": "acme"},
-                        },
-                        "result": {"matches": []},
-                    },
+            runtime_result(
+                "Loaded runtime evidence.",
+                tasks=[
+                    task("task-1", "catalog.schema.search", owner="catalog"),
+                    task("task-2", "db.sql.validate", owner="sqlite"),
+                    task("task-3", "db.sql.execute_read", owner="sqlite"),
                 ],
-                "iterations": 1,
-            }
+                evidence=[
+                    evidence_record(
+                        "evidence-1",
+                        "schema.search_result",
+                        "catalog",
+                        "task-1",
+                        {"tables": ["sales"]},
+                    ),
+                    evidence_record(
+                        "evidence-2",
+                        "sql.validation",
+                        "sqlite",
+                        "task-2",
+                        {
+                            "sql": "SELECT product FROM sales LIMIT 5",
+                            "statement_facts": {"statement_type": "select"},
+                        },
+                    ),
+                    evidence_record(
+                        "evidence-3",
+                        "query.result",
+                        "sqlite",
+                        "task-3",
+                        {
+                            "sql": "SELECT product FROM sales LIMIT 5",
+                            "rows": [{"product": "Widget A"}],
+                        },
+                    ),
+                ],
+            )
         ]
     )
 
 
-def create_execution_agent():
+def create_governance_agent():
     return FakeEvalAgent(
         [
-            {
-                "result": "Schema discovery and SQLite query completed.",
-                "tool_calls": [
-                    {
-                        "tool": "sqlite_query",
-                        "plugin": "sqlite",
-                        "skill": "schema_discovery",
-                        "operation": "query",
-                        "arguments": {"sql": "SELECT product FROM sales LIMIT 5"},
-                        "result": {"rows": [{"product": "Widget A"}]},
-                        "latency_ms": 18,
-                    }
+            runtime_result(
+                "Governance approved runtime work.",
+                tasks=[task("task-1", "db.sql.validate", owner="sqlite")],
+                evidence=[
+                    evidence_record(
+                        "evidence-1",
+                        "sql.validation",
+                        "sqlite",
+                        "task-1",
+                        {
+                            "sql": "SELECT 1",
+                            "statement_facts": {"statement_type": "select"},
+                        },
+                    )
                 ],
-                "skill_calls": [
-                    {
-                        "name": "schema_discovery",
-                        "operation": "inspect",
-                        "latency_ms": 25,
-                        "status": "passed",
-                    }
-                ],
-                "plugin_calls": [
-                    {
-                        "name": "sqlite",
-                        "operation": "query",
-                        "latency_ms": 18,
-                        "status": "passed",
-                    }
-                ],
-                "iterations": 1,
-            }
+                governance={
+                    "allowed": True,
+                    "blocked": False,
+                    "pending_approval": False,
+                    "decisions": [
+                        {
+                            "policy_id": "read_only_sql",
+                            "effect": "allow",
+                            "reason": "Read-only SQL passed validation.",
+                        }
+                    ],
+                    "approval_requests": [],
+                },
+            )
         ]
     )
 
@@ -151,18 +188,107 @@ def create_execution_agent():
 def create_unstable_agent():
     return FakeEvalAgent(
         [
-            {
-                "result": "Answer A",
-                "tool_calls": [{"tool": "file_read", "arguments": {"path": "a.csv"}}],
-            },
-            {
-                "result": "Answer B",
-                "tool_calls": [
-                    {
-                        "tool": "api_get",
-                        "arguments": {"url": "https://api.example.com/b"},
-                    }
+            runtime_result(
+                "Answer A",
+                tasks=[task("task-1", "catalog.schema.search", owner="catalog")],
+                evidence=[
+                    evidence_record(
+                        "evidence-1",
+                        "schema.search_result",
+                        "catalog",
+                        "task-1",
+                        {"tables": ["a"]},
+                    )
                 ],
-            },
+            ),
+            runtime_result(
+                "Answer B",
+                tasks=[task("task-2", "db.sql.execute_read", owner="sqlite")],
+                evidence=[
+                    evidence_record(
+                        "evidence-2",
+                        "query.result",
+                        "sqlite",
+                        "task-2",
+                        {"sql": "SELECT * FROM b LIMIT 5", "rows": []},
+                    )
+                ],
+            ),
         ]
     )
+
+
+def create_legacy_agent():
+    class LegacyAgent(FakeEvalAgent):
+        async def run_detailed(self, prompt, **kwargs):
+            del prompt, kwargs
+            return {
+                "result": "legacy",
+                "tool_calls": [
+                    {"tool": "sqlite_query", "arguments": {"sql": "SELECT 1"}}
+                ],
+            }
+
+    return LegacyAgent([])
+
+
+def runtime_result(
+    answer,
+    *,
+    tasks,
+    evidence,
+    governance=None,
+    tokens_total=None,
+    cost=None,
+):
+    return {
+        "operation_id": "operation-1",
+        "status": "succeeded",
+        "answer": answer,
+        "intent": {"kind": "query"},
+        "contract": {"operation_type": "db.query"},
+        "evidence": evidence,
+        "warnings": [],
+        "diagnostics": {
+            "execution": {
+                "task_count": len(tasks),
+                "tasks": tasks,
+            },
+            "governance": governance
+            or {
+                "allowed": True,
+                "blocked": False,
+                "pending_approval": False,
+                "decisions": [],
+                "approval_requests": [],
+            },
+            "llm": {"tokens": {"total_tokens": tokens_total}, "cost": cost},
+        },
+    }
+
+
+def task(task_id, capability_id, *, owner, status="succeeded"):
+    return {
+        "id": task_id,
+        "operation_id": "operation-1",
+        "capability_id": capability_id,
+        "executor_id": capability_id,
+        "input": {},
+        "status": status,
+        "required_evidence": [],
+        "dependencies": [],
+        "metadata": {"owner": owner},
+    }
+
+
+def evidence_record(evidence_id, kind, owner, task_id, payload, *, accepted=True):
+    return {
+        "id": evidence_id,
+        "kind": kind,
+        "owner": owner,
+        "operation_id": "operation-1",
+        "task_id": task_id,
+        "accepted": accepted,
+        "payload": payload,
+        "metadata": {},
+    }

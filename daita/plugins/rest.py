@@ -5,21 +5,205 @@ Simple REST API client - no over-engineering.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
-from .base import BasePlugin
+from typing import Any, Dict, List, Mapping, Optional, TYPE_CHECKING
+
+from daita.runtime import (
+    AccessMode,
+    Capability,
+    Evidence,
+    EvidenceSchema,
+    Operation,
+    RiskLevel,
+    Task,
+    ToolView,
+)
+
+from .base import ConnectorPlugin
+from .manifest import PluginKind, PluginManifest
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 
+_HTTP_GET_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "endpoint": {
+            "type": "string",
+            "description": "API endpoint path (without base URL, e.g., /users or /data/123)",
+        },
+        "params": {
+            "type": "object",
+            "description": "Optional query parameters as key-value pairs",
+        },
+    },
+    "required": ["endpoint"],
+}
 
-class RESTPlugin(BasePlugin):
+_HTTP_BODY_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "endpoint": {
+            "type": "string",
+            "description": "API endpoint path (without base URL)",
+        },
+        "data": {
+            "type": "object",
+            "description": "JSON data to send in the request body",
+        },
+    },
+    "required": ["endpoint", "data"],
+}
+
+_HTTP_DELETE_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "endpoint": {
+            "type": "string",
+            "description": "API endpoint path (without base URL)",
+        },
+        "params": {
+            "type": "object",
+            "description": "Optional query parameters",
+        },
+    },
+    "required": ["endpoint"],
+}
+
+_REST_TOOL_DEFINITIONS = (
+    {
+        "name": "http_get",
+        "method": "GET",
+        "capability_id": "rest.http.get",
+        "description": "Make an HTTP GET request to the REST API endpoint. Use for retrieving data.",
+        "parameters": _HTTP_GET_PARAMETERS,
+        "operation_types": frozenset({"api.http.read"}),
+        "access": AccessMode.READ,
+        "risk": RiskLevel.LOW,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": False,
+    },
+    {
+        "name": "http_post",
+        "method": "POST",
+        "capability_id": "rest.http.post",
+        "description": "Make an HTTP POST request to the REST API endpoint. Use for creating new resources.",
+        "parameters": _HTTP_BODY_PARAMETERS,
+        "operation_types": frozenset({"api.http.write"}),
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.MEDIUM,
+        "retry_safe": False,
+        "idempotent": False,
+        "side_effecting": True,
+    },
+    {
+        "name": "http_put",
+        "method": "PUT",
+        "capability_id": "rest.http.put",
+        "description": "Make an HTTP PUT request to the REST API endpoint. Use for updating existing resources.",
+        "parameters": _HTTP_BODY_PARAMETERS,
+        "operation_types": frozenset({"api.http.write"}),
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.MEDIUM,
+        "retry_safe": True,
+        "idempotent": True,
+        "side_effecting": True,
+    },
+    {
+        "name": "http_patch",
+        "method": "PATCH",
+        "capability_id": "rest.http.patch",
+        "description": "Make an HTTP PATCH request to the REST API endpoint. Use for partial resource updates.",
+        "parameters": _HTTP_BODY_PARAMETERS,
+        "operation_types": frozenset({"api.http.write"}),
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.MEDIUM,
+        "retry_safe": False,
+        "idempotent": False,
+        "side_effecting": True,
+    },
+    {
+        "name": "http_delete",
+        "method": "DELETE",
+        "capability_id": "rest.http.delete",
+        "description": "Make an HTTP DELETE request to the REST API endpoint. Use for deleting resources.",
+        "parameters": _HTTP_DELETE_PARAMETERS,
+        "operation_types": frozenset({"api.http.write"}),
+        "access": AccessMode.WRITE,
+        "risk": RiskLevel.HIGH,
+        "retry_safe": False,
+        "idempotent": False,
+        "side_effecting": True,
+    },
+)
+
+_REST_TOOL_BY_CAPABILITY = {
+    definition["capability_id"]: definition for definition in _REST_TOOL_DEFINITIONS
+}
+
+
+class _RestHttpExecutor:
+    """Executor backing REST plugin capability declarations."""
+
+    id = "rest.http"
+    capability_ids = frozenset(_REST_TOOL_BY_CAPABILITY)
+
+    def __init__(self, plugin: "RESTPlugin") -> None:
+        self._plugin = plugin
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        definition = _REST_TOOL_BY_CAPABILITY.get(task.capability_id)
+        if definition is None:
+            raise ValueError(f"Unsupported REST capability: {task.capability_id}")
+
+        tool_name = definition["name"]
+        handler = self._plugin._tool_handler(tool_name)
+        result = await handler(dict(task.input))
+        tool_view = context.get("tool_view")
+        tool_view_name = (
+            tool_view.get("name") if isinstance(tool_view, Mapping) else None
+        )
+        return [
+            Evidence(
+                kind="api.http.response",
+                owner="rest",
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={
+                    "method": definition["method"],
+                    "endpoint": task.input.get("endpoint"),
+                    "response": result,
+                },
+                metadata={
+                    "capability_id": task.capability_id,
+                    "tool_view": tool_view_name,
+                },
+            )
+        ]
+
+
+class RESTPlugin(ConnectorPlugin):
     """
     Simple REST API plugin for agents.
 
     Just makes HTTP requests and handles responses. Nothing fancy.
     """
+
+    manifest = PluginManifest(
+        id="rest",
+        display_name="REST API",
+        version="2.0.0",
+        kind=PluginKind.CONNECTOR,
+        domains=frozenset({"api", "http"}),
+        provides=frozenset({"http_client", "api_requests"}),
+    )
 
     def __init__(
         self,
@@ -68,7 +252,80 @@ class RESTPlugin(BasePlugin):
                 self.default_headers[self.auth_header] = self.api_key
 
         self._session = None
+        self._executor = _RestHttpExecutor(self)
         logger.debug(f"REST plugin configured for {self.base_url}")
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether an HTTP session is currently open."""
+        return self._session is not None
+
+    async def teardown(self) -> None:
+        """Release runtime-owned HTTP resources."""
+        await self.disconnect()
+
+    def declare_capabilities(self) -> tuple[Capability, ...]:
+        """Declare REST operations as runtime-plannable capabilities."""
+        return tuple(
+            Capability(
+                id=definition["capability_id"],
+                owner=self.manifest.id,
+                description=definition["description"],
+                domains=frozenset({"api", "http"}),
+                operation_types=definition["operation_types"],
+                access=definition["access"],
+                risk=definition["risk"],
+                input_schema=definition["parameters"],
+                output_evidence=frozenset({"api.http.response"}),
+                executor=self._executor.id,
+                model_visible=True,
+                retry_safe=definition["retry_safe"],
+                idempotent=definition["idempotent"],
+                side_effecting=definition["side_effecting"],
+                timeout_seconds=60,
+                metadata={
+                    "method": definition["method"],
+                    "tool_name": definition["name"],
+                },
+            )
+            for definition in _REST_TOOL_DEFINITIONS
+        )
+
+    def declare_evidence_schemas(self) -> tuple[EvidenceSchema, ...]:
+        """Declare the typed evidence returned by REST capability execution."""
+        return (
+            EvidenceSchema(
+                kind="api.http.response",
+                owner=self.manifest.id,
+                description="HTTP response evidence from a REST API operation.",
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "method": {"type": "string"},
+                        "endpoint": {"type": "string"},
+                        "response": {"type": "object"},
+                    },
+                    "required": ["method", "endpoint", "response"],
+                },
+            ),
+        )
+
+    def get_executors(self) -> tuple[_RestHttpExecutor, ...]:
+        """Return the executor for REST runtime capabilities."""
+        return (self._executor,)
+
+    def get_tool_views(self) -> tuple[ToolView, ...]:
+        """Expose REST capabilities as model-visible tool views."""
+        return tuple(
+            ToolView(
+                name=definition["name"],
+                capability_id=definition["capability_id"],
+                description=definition["description"],
+                parameters=definition["parameters"],
+                metadata={"method": definition["method"]},
+            )
+            for definition in _REST_TOOL_DEFINITIONS
+        )
 
     async def connect(self):
         """Initialize HTTP session."""
@@ -395,132 +652,16 @@ class RESTPlugin(BasePlugin):
             logger.info(f"Downloaded file to {save_path}")
             return save_path
 
-    def get_tools(self) -> List["AgentTool"]:
-        """
-        Expose REST API operations as agent tools.
-
-        Returns:
-            List of AgentTool instances for REST API operations
-        """
-        from ..core.tools import AgentTool
-
-        return [
-            AgentTool(
-                name="http_get",
-                description="Make an HTTP GET request to the REST API endpoint. Use for retrieving data.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "endpoint": {
-                            "type": "string",
-                            "description": "API endpoint path (without base URL, e.g., /users or /data/123)",
-                        },
-                        "params": {
-                            "type": "object",
-                            "description": "Optional query parameters as key-value pairs",
-                        },
-                    },
-                    "required": ["endpoint"],
-                },
-                handler=self._tool_get,
-                category="api",
-                source="plugin",
-                plugin_name="REST",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="http_post",
-                description="Make an HTTP POST request to the REST API endpoint. Use for creating new resources.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "endpoint": {
-                            "type": "string",
-                            "description": "API endpoint path (without base URL)",
-                        },
-                        "data": {
-                            "type": "object",
-                            "description": "JSON data to send in the request body",
-                        },
-                    },
-                    "required": ["endpoint", "data"],
-                },
-                handler=self._tool_post,
-                category="api",
-                source="plugin",
-                plugin_name="REST",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="http_put",
-                description="Make an HTTP PUT request to the REST API endpoint. Use for updating existing resources.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "endpoint": {
-                            "type": "string",
-                            "description": "API endpoint path (without base URL)",
-                        },
-                        "data": {
-                            "type": "object",
-                            "description": "JSON data to send in the request body",
-                        },
-                    },
-                    "required": ["endpoint", "data"],
-                },
-                handler=self._tool_put,
-                category="api",
-                source="plugin",
-                plugin_name="REST",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="http_patch",
-                description="Make an HTTP PATCH request to the REST API endpoint. Use for partial resource updates.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "endpoint": {
-                            "type": "string",
-                            "description": "API endpoint path (without base URL)",
-                        },
-                        "data": {
-                            "type": "object",
-                            "description": "JSON data to send in the request body",
-                        },
-                    },
-                    "required": ["endpoint", "data"],
-                },
-                handler=self._tool_patch,
-                category="api",
-                source="plugin",
-                plugin_name="REST",
-                timeout_seconds=60,
-            ),
-            AgentTool(
-                name="http_delete",
-                description="Make an HTTP DELETE request to the REST API endpoint. Use for deleting resources.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "endpoint": {
-                            "type": "string",
-                            "description": "API endpoint path (without base URL)",
-                        },
-                        "params": {
-                            "type": "object",
-                            "description": "Optional query parameters",
-                        },
-                    },
-                    "required": ["endpoint"],
-                },
-                handler=self._tool_delete,
-                category="api",
-                source="plugin",
-                plugin_name="REST",
-                timeout_seconds=60,
-            ),
-        ]
+    def _tool_handler(self, name: str):
+        """Return the legacy tool handler for a REST tool name."""
+        handlers = {
+            "http_get": self._tool_get,
+            "http_post": self._tool_post,
+            "http_put": self._tool_put,
+            "http_patch": self._tool_patch,
+            "http_delete": self._tool_delete,
+        }
+        return handlers[name]
 
     async def _tool_get(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for http_get"""

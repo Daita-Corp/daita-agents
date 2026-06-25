@@ -1,7 +1,10 @@
 """
-Plugin system for Daita Agents.
+Extension-first plugin system for Daita Agents.
 
-This module provides database, vector database, API, cloud storage, search, collaboration, and MCP integrations:
+This module provides database, vector database, API, cloud storage, search,
+collaboration, and MCP integrations. Plugins expose direct Python APIs and may
+also declare runtime capabilities, executors, evidence schemas, context
+providers, and optional model-visible tool views.
 
 Database Plugins:
 - PostgreSQL plugin for async database operations (with pgvector support)
@@ -27,14 +30,14 @@ Integration Plugins:
 - MCP plugin for Model Context Protocol server integration
 - Memory plugin for persistent semantic memory (local + cloud)
 
-Knowledge & Orchestration Plugins:
+Knowledge Plugins:
 - CatalogPlugin for schema discovery and metadata management
 - LineagePlugin for data lineage tracking and impact analysis
 - Neo4jPlugin for graph database operations with Cypher queries
-- OrchestratorPlugin for multi-agent coordination and task routing
 
-All plugins follow async patterns and provide simple, clean interfaces
-without over-engineering.
+All plugins follow async patterns and provide simple, clean interfaces. New
+runtime behavior should be planned from capability/evidence declarations rather
+than inferred from legacy tool names.
 
 Usage:
     ```python
@@ -134,9 +137,6 @@ Usage:
         result = await graph.query("MATCH (n:Person) RETURN n LIMIT 10")
         await graph.create_node("Person", {"name": "Alice", "age": 30})
 
-    # Orchestrator plugin - multi-agent coordination
-    orchestrator_plugin = orchestrator(agents={"analyst": analyst_agent, "reporter": reporter_agent})
-    result = await orchestrator_plugin.route_task("Analyze Q4 sales and generate report")
     ```
 """
 
@@ -187,10 +187,9 @@ from . import mcp
 # Memory plugin
 from .memory import MemoryPlugin, memory
 
-# Knowledge & Orchestration plugins
+# Knowledge plugins
 from .catalog import CatalogPlugin, catalog
 from .lineage import LineagePlugin, lineage
-from .orchestrator import OrchestratorPlugin, orchestrator
 
 # Graph database plugins
 from .neo4j_graph import Neo4jPlugin, neo4j
@@ -198,6 +197,23 @@ from .neo4j_graph import Neo4jPlugin, neo4j
 # Data operations plugins
 from .data_quality import DataQualityPlugin, data_quality
 from .transformer import TransformerPlugin, transformer
+
+# Runtime extension plugin contracts and registry
+from .base import (
+    BasePlugin,
+    ConnectorPlugin,
+    DomainServicePlugin,
+    EmptySecretProvider,
+    ObservabilityPlugin,
+    PluginContext,
+    RuntimeExtensionPlugin,
+    SecretProvider,
+    ServiceRegistry,
+    SkillPlugin,
+    WorkerProviderPlugin,
+)
+from .manifest import PluginKind, PluginManifest
+from .registry import ExtensionRegistry, RegistryDiagnostic
 
 
 # Simple plugin access class for SDK
@@ -296,10 +312,6 @@ class PluginAccess:
         """Create Neo4j graph database plugin."""
         return neo4j(**kwargs)
 
-    def orchestrator(self, **kwargs) -> OrchestratorPlugin:
-        """Create Orchestrator plugin for multi-agent coordination."""
-        return orchestrator(**kwargs)
-
     def data_quality(self, **kwargs) -> DataQualityPlugin:
         """Create DataQuality plugin for profiling and quality checks."""
         return data_quality(**kwargs)
@@ -342,10 +354,24 @@ __all__ = [
     "CatalogPlugin",
     "LineagePlugin",
     "Neo4jPlugin",
-    "OrchestratorPlugin",
     "MemoryPlugin",
     "DataQualityPlugin",
     "TransformerPlugin",
+    "BasePlugin",
+    "ConnectorPlugin",
+    "DomainServicePlugin",
+    "EmptySecretProvider",
+    "ObservabilityPlugin",
+    "PluginContext",
+    "PluginKind",
+    "PluginManifest",
+    "RuntimeExtensionPlugin",
+    "SecretProvider",
+    "ServiceRegistry",
+    "SkillPlugin",
+    "WorkerProviderPlugin",
+    "ExtensionRegistry",
+    "RegistryDiagnostic",
     # Factory functions
     "postgresql",
     "mysql",
@@ -369,7 +395,6 @@ __all__ = [
     "catalog",
     "lineage",
     "neo4j",
-    "orchestrator",
     "data_quality",
     "transformer",
     "memory",

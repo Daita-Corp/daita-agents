@@ -24,8 +24,8 @@ Usage::
     dq = data_quality(db=db)
     report = await dq.dq_report("orders")
 
-    # As agent tools
-    agent = Agent(name="quality_checker", tools=[db, data_quality(db=db)])
+    # As agent plugins
+    agent = Agent(name="quality_checker", plugins=[db, data_quality(db=db)])
 """
 
 import logging
@@ -34,10 +34,16 @@ from datetime import datetime, timezone
 from inspect import iscoroutinefunction
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from .base import BasePlugin
+from .base import BasePlugin, PluginContext
+from .data_quality_extensions import (
+    DATA_QUALITY_MANIFEST,
+    DataQualityExecutor,
+    data_quality_capabilities,
+    data_quality_evidence_schemas,
+)
 
 if TYPE_CHECKING:
-    from ..core.tools import AgentTool
+    from ..core.tools import LocalTool
     from .base_db import BaseDatabasePlugin
 
 logger = logging.getLogger(__name__)
@@ -109,6 +115,101 @@ def _column_discovery_sql(table_name: str, dialect: str) -> tuple:
     )
 
 
+def _catalog_value_profile_quality_signal(
+    table: str,
+    column: str,
+    profiles: Any,
+    *,
+    observed_distinct_count: int,
+) -> Optional[Dict[str, Any]]:
+    """Project catalog-owned value profiles into DQ freshness/drift metadata."""
+    profile = _find_catalog_value_profile(table, column, profiles)
+    if not profile:
+        return None
+
+    catalog_distinct_count = profile.get("distinct_count")
+    notes: List[str] = []
+    if profile.get("stale") or profile.get("profile_status") == "stale":
+        notes.append("catalog_profile_stale")
+    if profile.get("redacted"):
+        notes.append("catalog_profile_redacted")
+    if profile.get("sampled"):
+        notes.append("catalog_profile_sampled")
+    if profile.get("truncated"):
+        notes.append("catalog_profile_truncated")
+    catalog_distinct_int = _optional_int(catalog_distinct_count)
+    if (
+        catalog_distinct_int is not None
+        and not profile.get("stale")
+        and profile.get("profile_status") not in {"stale", "skipped", "redacted"}
+        and catalog_distinct_int != int(observed_distinct_count)
+    ):
+        notes.append("distinct_count_changed_since_catalog_profile")
+
+    return {
+        "source": "catalog.metadata.column_value_profiles",
+        "profile_ref": profile.get("profile_ref")
+        or profile.get("ref")
+        or f"{profile.get('table')}.{profile.get('column')}",
+        "profile_status": profile.get("profile_status") or "profiled",
+        "stale": bool(profile.get("stale", False)),
+        "stale_reason": profile.get("stale_reason"),
+        "catalog_distinct_count": catalog_distinct_count,
+        "current_distinct_count": observed_distinct_count,
+        "source_fingerprint": profile.get("source_fingerprint"),
+        "profiled_at": profile.get("profiled_at"),
+        "quality_notes": notes,
+    }
+
+
+def _find_catalog_value_profile(
+    table: str,
+    column: str,
+    profiles: Any,
+) -> Optional[Dict[str, Any]]:
+    if not profiles:
+        return None
+    profile_map: Dict[str, Any] = {}
+    if isinstance(profiles, dict):
+        if "profiles" in profiles and isinstance(profiles["profiles"], list):
+            for item in profiles["profiles"]:
+                if isinstance(item, dict):
+                    ref = item.get("profile_ref") or item.get("ref")
+                    if not ref:
+                        ref = f"{item.get('table')}.{item.get('column')}"
+                    profile_map[str(ref).lower()] = item
+        else:
+            profile_map = {str(key).lower(): value for key, value in profiles.items()}
+    elif isinstance(profiles, list):
+        for item in profiles:
+            if not isinstance(item, dict):
+                continue
+            ref = item.get("profile_ref") or item.get("ref")
+            if not ref:
+                ref = f"{item.get('table')}.{item.get('column')}"
+            profile_map[str(ref).lower()] = item
+
+    candidates = (
+        f"{table}.{column}".lower(),
+        f"{table.split('.', 1)[-1]}.{column}".lower(),
+        column.lower(),
+    )
+    for candidate in candidates:
+        profile = profile_map.get(candidate)
+        if isinstance(profile, dict):
+            return profile
+    return None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class DataQualityPlugin(BasePlugin):
     """
     Plugin for analytical data quality: profiling, anomaly detection,
@@ -117,6 +218,8 @@ class DataQualityPlugin(BasePlugin):
     Pair with ItemAssertion / query_checked() on the DB plugin for
     enforcement at query time.
     """
+
+    manifest = DATA_QUALITY_MANIFEST
 
     def __init__(
         self,
@@ -137,7 +240,45 @@ class DataQualityPlugin(BasePlugin):
         self._agent_id: Optional[str] = None
         self._thresholds = thresholds or {"z_score": 3.0, "iqr_multiplier": 1.5}
 
-    def initialize(self, agent_id: str) -> None:
+    async def setup(self, context: PluginContext) -> None:
+        """Set up data-quality runtime context without taking DB ownership."""
+        self._configure_runtime(context.agent_id or context.runtime_id)
+
+    def declare_capabilities(self):
+        return data_quality_capabilities()
+
+    def get_executors(self):
+        return (
+            DataQualityExecutor(
+                id="data_quality.profile",
+                capability_ids=frozenset({"quality.profile"}),
+                evidence_kind="quality.profile",
+                handler=self._execute_quality_profile,
+            ),
+            DataQualityExecutor(
+                id="data_quality.anomaly.detect",
+                capability_ids=frozenset({"quality.anomaly.detect"}),
+                evidence_kind="quality.anomaly",
+                handler=self._execute_anomaly_detect,
+            ),
+            DataQualityExecutor(
+                id="data_quality.freshness.check",
+                capability_ids=frozenset({"quality.freshness.check"}),
+                evidence_kind="quality.freshness",
+                handler=self._execute_freshness_check,
+            ),
+            DataQualityExecutor(
+                id="data_quality.report.generate",
+                capability_ids=frozenset({"quality.report.generate"}),
+                evidence_kind="quality.report",
+                handler=self._execute_quality_report,
+            ),
+        )
+
+    def declare_evidence_schemas(self):
+        return data_quality_evidence_schemas()
+
+    def _configure_runtime(self, agent_id: str) -> None:
         self._agent_id = agent_id
         if self._graph_backend is None:
             from daita.core.graph.backend import auto_select_backend
@@ -178,134 +319,6 @@ class DataQualityPlugin(BasePlugin):
             self._graph_backend, table, store=store, agent_id=self._agent_id
         )
 
-    def get_tools(self) -> List["AgentTool"]:
-        from ..core.tools import AgentTool
-
-        return [
-            AgentTool(
-                name="dq_profile",
-                description=(
-                    "Generate statistical profile for each column in a table: "
-                    "row count, null rate, cardinality, min, max, avg."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": "Table name to profile",
-                        },
-                        "columns": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Specific columns to profile. Profiles all columns if omitted.",
-                        },
-                        "sample_size": {
-                            "type": "integer",
-                            "description": "Optional row sample size to limit scan cost.",
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_profile,
-                category="data_quality",
-                source="plugin",
-                plugin_name="DataQuality",
-                timeout_seconds=120,
-            ),
-            AgentTool(
-                name="dq_detect_anomaly",
-                description=(
-                    "Detect statistical outliers in a numeric column using z-score "
-                    "(scipy if available, numpy fallback) or IQR method."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {"type": "string", "description": "Table name"},
-                        "column": {
-                            "type": "string",
-                            "description": "Numeric column to analyse",
-                        },
-                        "method": {
-                            "type": "string",
-                            "description": "'zscore' (default) or 'iqr'",
-                        },
-                        "sample_size": {
-                            "type": "integer",
-                            "description": "Optional row limit to reduce scan cost",
-                        },
-                    },
-                    "required": ["table", "column"],
-                },
-                handler=self._tool_detect_anomaly,
-                category="data_quality",
-                source="plugin",
-                plugin_name="DataQuality",
-                timeout_seconds=120,
-            ),
-            AgentTool(
-                name="dq_check_freshness",
-                description=(
-                    "Check that data in a table is recent by comparing MAX(timestamp_column) "
-                    "to an expected maximum age."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {"type": "string", "description": "Table name"},
-                        "timestamp_column": {
-                            "type": "string",
-                            "description": "Column containing event/update timestamps",
-                        },
-                        "expected_interval_hours": {
-                            "type": "number",
-                            "description": "Maximum acceptable age in hours (default: 24)",
-                        },
-                    },
-                    "required": ["table", "timestamp_column"],
-                },
-                handler=self._tool_check_freshness,
-                category="data_quality",
-                source="plugin",
-                plugin_name="DataQuality",
-                timeout_seconds=30,
-            ),
-            AgentTool(
-                name="dq_report",
-                description=(
-                    "Generate a consolidated data quality report for a table: "
-                    "column profiles and an overall completeness score. "
-                    "Persists results to graph backend as a stable METRIC node."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "table": {"type": "string", "description": "Table name"},
-                        "sample_size": {
-                            "type": "integer",
-                            "description": "Optional row sample size passed to profiling.",
-                        },
-                        "store": {
-                            "type": "string",
-                            "description": (
-                                "Optional store qualifier (e.g. "
-                                "'postgres:host/db') used to disambiguate the "
-                                "table when the same name exists in multiple "
-                                "stores."
-                            ),
-                        },
-                    },
-                    "required": ["table"],
-                },
-                handler=self._tool_report,
-                category="data_quality",
-                source="plugin",
-                plugin_name="DataQuality",
-                timeout_seconds=180,
-            ),
-        ]
-
     # -------------------------------------------------------------------------
     # Tool handlers
     # -------------------------------------------------------------------------
@@ -315,8 +328,15 @@ class DataQualityPlugin(BasePlugin):
         table = _validate_identifier(args["table"])
         columns = [_validate_identifier(c) for c in args.get("columns", [])]
         sample_size = args.get("sample_size")
+        value_profiles = args.get("column_value_profiles") or args.get(
+            "catalog_value_profiles"
+        )
         return await self.profile(
-            db, table, columns=columns or None, sample_size=sample_size
+            db,
+            table,
+            columns=columns or None,
+            sample_size=sample_size,
+            column_value_profiles=value_profiles,
         )
 
     async def _tool_detect_anomaly(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -343,7 +363,32 @@ class DataQualityPlugin(BasePlugin):
         table = _validate_identifier(args["table"])
         store = args.get("store")
         sample_size = args.get("sample_size")
-        return await self.report(db, table, sample_size=sample_size, store=store)
+        value_profiles = args.get("column_value_profiles") or args.get(
+            "catalog_value_profiles"
+        )
+        return await self.report(
+            db,
+            table,
+            sample_size=sample_size,
+            store=store,
+            column_value_profiles=value_profiles,
+        )
+
+    async def _execute_quality_profile(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._tool_profile(args)
+
+    async def _execute_anomaly_detect(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._tool_detect_anomaly(args)
+
+    async def _execute_freshness_check(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._tool_check_freshness(args)
+
+    async def _execute_quality_report(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return await self._tool_report(args)
 
     # -------------------------------------------------------------------------
     # Core methods
@@ -355,6 +400,7 @@ class DataQualityPlugin(BasePlugin):
         table: str,
         columns: Optional[List[str]] = None,
         sample_size: Optional[int] = None,
+        column_value_profiles: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Generate statistical profile for columns in a table.
@@ -464,6 +510,14 @@ class DataQualityPlugin(BasePlugin):
                     "max": max_v,
                     "avg": avg_v,
                 }
+                catalog_profile = _catalog_value_profile_quality_signal(
+                    table,
+                    col,
+                    column_value_profiles,
+                    observed_distinct_count=distinct_count,
+                )
+                if catalog_profile:
+                    col_profiles[col]["catalog_value_profile"] = catalog_profile
             except Exception as exc:
                 col_profiles[col] = {"error": str(exc)}
 
@@ -624,6 +678,7 @@ class DataQualityPlugin(BasePlugin):
         table: str,
         sample_size: Optional[int] = None,
         store: Optional[str] = None,
+        column_value_profiles: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Generate a consolidated quality report: column profiles + completeness score.
@@ -643,7 +698,12 @@ class DataQualityPlugin(BasePlugin):
                 ambiguous names raise unless the graph contains exactly one
                 match.
         """
-        profile_result = await self.profile(db, table, sample_size=sample_size)
+        profile_result = await self.profile(
+            db,
+            table,
+            sample_size=sample_size,
+            column_value_profiles=column_value_profiles,
+        )
 
         # Completeness: average non-null rate across successfully profiled columns
         profile_data = profile_result.get("profile", {})

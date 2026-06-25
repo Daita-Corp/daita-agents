@@ -65,14 +65,14 @@ def compare_baseline(
         comparison["latency_increase_pct"] = pct
         if pct > policy.latency_increase_pct_gt:
             _add_regression(comparison, "latency_increase", pct)
-    if policy.tool_sequence_changed:
+    if policy.capability_sequence_changed:
         changed = [
             change
             for change in comparison["case_changes"]
-            if change.get("tool_sequence_changed")
+            if change.get("capability_sequence_changed")
         ]
         if changed:
-            _add_regression(comparison, "tool_sequence_changed", changed)
+            _add_regression(comparison, "capability_sequence_changed", changed)
     return comparison
 
 
@@ -102,23 +102,23 @@ def _case_changes(baseline: EvalReport, report: EvalReport) -> list[dict[str, An
         if old is None:
             changes.append({"case_id": case.case_id, "change": "new_case"})
             continue
-        old_tools = _tool_sequences(old)
-        new_tools = _tool_sequences(case)
+        old_capabilities = _capability_sequences(old)
+        new_capabilities = _capability_sequences(case)
         changes.append(
             {
                 "case_id": case.case_id,
                 "status_before": old.status,
                 "status_after": case.status,
-                "tool_sequence_changed": old_tools != new_tools,
-                "tool_sequences_before": old_tools,
-                "tool_sequences_after": new_tools,
+                "capability_sequence_changed": old_capabilities != new_capabilities,
+                "capability_sequences_before": old_capabilities,
+                "capability_sequences_after": new_capabilities,
             }
         )
     return changes
 
 
-def _tool_sequences(case) -> list[list[str]]:
-    return [[call.name for call in run.tool_calls] for run in case.runs]
+def _capability_sequences(case) -> list[list[str]]:
+    return [[task.capability_id for task in run.tasks] for run in case.runs]
 
 
 def _pct_increase(old: float, new: float) -> float:
