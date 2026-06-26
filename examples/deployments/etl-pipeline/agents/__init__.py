@@ -1,1 +1,0 @@
-"""Daita project components."""

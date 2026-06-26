@@ -1,0 +1,5 @@
+# Daita Agents Framework with local SQLite support
+daita-agents[sqlite]>=1.0.0
+
+# Development
+pytest>=7.0.0

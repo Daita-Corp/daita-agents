@@ -1,10 +1,10 @@
 # Daita Agents
 
-**Build production-ready AI agents that can reason over real data.**
+**Build AI agents that can reason over real data.**
 
-Daita Agents is a Python framework for data agents: agents that inspect
-structured sources, plan governed work, execute through declared capabilities,
-collect typed evidence, verify results, and leave an audit trail. The primary
+Daita Agents is a Python framework for data agents.
+
+Inspect structured sources, plan governed work, execute through declared capabilities, collect typed evidence, verify results, and leave an audit trail. The primary
 entry point is `Agent.from_db()`.
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
@@ -14,11 +14,11 @@ entry point is `Agent.from_db()`.
 
 ## Why Daita?
 
-- **Data-native agents**: connect to SQLite or PostgreSQL and ask questions in
+- **Data native agents**: connect to SQLite or PostgreSQL and ask questions in
   natural language.
 - **Production runtime**: operation records, persisted tasks, governance,
   approvals, evidence, verification, resume, and audit summaries.
-- **Extension-first plugins**: integrations declare capabilities, executors,
+- **Extension first plugins**: integrations declare capabilities, executors,
   evidence schemas, policies, context providers, workers, and tool views.
 - **Local Python ergonomics**: install with pip, write normal async Python, and
   add local tools with a decorator.
@@ -156,7 +156,7 @@ Current direct source support:
 | Converted `BaseDatabasePlugin` instance                | Supported by `Agent.from_db()`                                            |
 | Other database URL schemes                             | Available through plugin APIs while direct `from_db` routing is converted |
 
-Built-in modes:
+Built in modes:
 
 | Mode        | Default posture                                            |
 | ----------- | ---------------------------------------------------------- |
@@ -176,7 +176,7 @@ Built-in modes:
 
 ## Local Tool Agents
 
-The generic `Agent` is useful for non-DB assistants, local tool calling,
+The generic `Agent` is useful for non DB assistants, local tool calling,
 streaming, conversation history, and experiments. Data agents should usually
 start with `Agent.from_db()`.
 
@@ -218,7 +218,7 @@ print(result["tool_calls"])
 
 ## Architecture
 
-Daita's runtime is operation-centric. Runtime-owned work flows through declared
+Daita's runtime is operation centric. Runtime owned work flows through declared
 capabilities, persisted tasks, registered executors, and the shared governance
 boundary before any executor runs.
 
@@ -240,7 +240,7 @@ Ownership rules that matter:
 
 - `DbRuntime` owns DB planning, task execution, governance, approvals, resume,
   evidence, verification, monitors, and synthesis.
-- `execute_task()` is the executor-invocation choke point.
+- `execute_task()` is the executor choke point.
 - The catalog plugin owns cataloging infrastructure, normalized schemas,
   relationships, and graph traversal/search over data assets.
 - Generic `Agent` projects tools and local chat behavior; it should not grow a
@@ -326,7 +326,7 @@ region_skill = Skill.with_tools(
 ```
 
 Eval suites run agents locally or in CI and write structured artifacts such as
-`report.json`, `summary.md`, JUnit XML, per-case artifacts, judge artifacts, and
+`report.json`, `summary.md`, JUnit XML, per case artifacts, judge artifacts, and
 baseline comparisons. The eval API is developer-preview.
 
 ## Project Layout
@@ -344,16 +344,19 @@ baseline comparisons. The eval API is developer-preview.
 | `daita/llm/`             | OpenAI, Anthropic, Gemini, Grok, Ollama, OpenAI-compatible, and mock providers |
 | `daita/embeddings/`      | OpenAI, Gemini, Voyage, sentence-transformers, and mock embeddings             |
 | `daita/evals/`           | Eval suites, assertions, judges, reporters, artifacts, datasets, baselines     |
-| `examples/`              | Basic scripts and deployment-style project templates                           |
+| `examples/`              | Data-first learning path scripts and one deployment-style project template     |
 | `tests/`                 | Unit, integration, performance, fixture, mock, and live-gated tests            |
 
 ## Examples
 
-- [`examples/basic_agent.py`](examples/basic_agent.py): local tool-calling agent.
-- [`examples/db_chat.py`](examples/db_chat.py): interactive `Agent.from_db()` chat.
-- [`examples/deployments/`](examples/deployments/): deployment-style templates
-  for CSV analysis, SQL agents, code review, infrastructure cataloging, Slack
-  reporting, ETL, support routing, and deep research.
+- [`examples/`](examples/): numbered data first learning path from a local
+  SQLite quickstart through inspection, catalog joins, governance, persistence,
+  memory, quality, lineage, monitors, infrastructure discovery, extensions, and
+  CSV-to-SQLite ingestion.
+- [`examples/deployments/data-team-agent/`](examples/deployments/data-team-agent/):
+  production shaped local data-team template using `Agent.from_db()`,
+  `DbRuntime`, catalog, quality, lineage, memory, monitors, and a persistent
+  runtime store.
 
 ## Development
 
