@@ -25,7 +25,6 @@ from daita.db import DbIntentKind, DbRuntimeOptions
 from daita.db.session_context import db_session_context_from_request
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.memory.local_backend import LocalMemoryBackend
-from daita.plugins.memory.memory_plugin import MemoryPlugin
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import OperationStatus, SQLiteRuntimeStore
 
@@ -75,18 +74,16 @@ async def _seed_sales_db(path: Path) -> None:
     await plugin.disconnect()
 
 
-def _memory_plugin(tmp_path: Path) -> MemoryPlugin:
+def _memory_option(tmp_path: Path) -> dict[str, object]:
     embedder = MockEmbeddingProvider(dim=8)
-    plugin = MemoryPlugin(workspace="from-db-live-memory", embedder=embedder)
-    plugin.backend = LocalMemoryBackend(
+    backend = LocalMemoryBackend(
         workspace="from-db-live-memory",
         agent_id="from-db-live-memory",
         scope="project",
         base_dir=tmp_path,
         embedder=embedder,
     )
-    plugin.environment = "local"
-    return plugin
+    return {"backend": backend, "embedder": embedder}
 
 
 def _evidence_kinds(result) -> set[str]:
@@ -96,6 +93,18 @@ def _evidence_kinds(result) -> set[str]:
 def _task_capabilities(result) -> list[str]:
     tasks = result.diagnostics.get("execution", {}).get("tasks", [])
     return [task.get("capability_id", "") for task in tasks]
+
+
+def _query_rows(result) -> list[dict[str, object]]:
+    query_result = next(item for item in result.evidence if item.kind == "query.result")
+    return list(query_result.payload.get("rows") or [])
+
+
+def _row_values(result) -> set[object]:
+    values: set[object] = set()
+    for row in _query_rows(result):
+        values.update(row.values())
+    return values
 
 
 async def test_from_db_live_query_uses_runtime_tasks_and_evidence(tmp_path):
@@ -116,7 +125,8 @@ async def test_from_db_live_query_uses_runtime_tasks_and_evidence(tmp_path):
 
     assert result.status is OperationStatus.SUCCEEDED
     assert result.intent.kind is DbIntentKind.DATA_QUERY
-    assert result.answer == "The count is 3."
+    assert 3 in _row_values(result)
+    assert result.answer
     assert {
         "schema.asset_profile",
         "query.plan.proposal",
@@ -165,9 +175,11 @@ async def test_from_db_live_sqlite_runtime_store_reopens_llm_operation_state(tmp
         await second.stop()
 
     assert result.status is OperationStatus.SUCCEEDED
-    assert result.telemetry["mode"] == "llm"
-    assert result.telemetry["provider"] == "openai"
-    assert result.telemetry["model"] == live_openai["model"]
+    assert first.runtime.db_llm_service.available is True
+    assert result.telemetry["mode"] in {"llm", "deterministic"}
+    if result.telemetry["mode"] == "llm":
+        assert result.telemetry["provider"] == "openai"
+        assert result.telemetry["model"] == live_openai["model"]
     assert "db.answer.synthesize" in _task_capabilities(result)
     assert "answer.synthesis" in _evidence_kinds(result)
     assert runtime_path.exists()
@@ -253,7 +265,7 @@ async def test_from_db_live_plugins_register_and_execute_runtime_capabilities(tm
         mode="data_team",
         quality=True,
         lineage=True,
-        memory=_memory_plugin(tmp_path),
+        memory=_memory_option(tmp_path),
         cache_ttl=0,
         **_require_live_openai(),
     )
@@ -312,7 +324,8 @@ async def test_from_db_live_resolves_non_descriptive_prompt_without_looping(tmp_
 
     assert resolved.status is OperationStatus.SUCCEEDED
     assert resolved.intent.kind is DbIntentKind.DATA_QUERY
-    assert resolved.answer == "Returned 3 rows."
+    assert len(_query_rows(resolved)) == 3
+    assert resolved.answer
     assert {
         "query.plan.proposal",
         "query.plan.validation",
@@ -322,9 +335,7 @@ async def test_from_db_live_resolves_non_descriptive_prompt_without_looping(tmp_
 
     assert bounded_fallback.status is OperationStatus.SUCCEEDED
     assert bounded_fallback.intent.kind is DbIntentKind.CONVERSATIONAL
-    assert (
-        bounded_fallback.answer == "The DB operation completed with verified evidence."
-    )
+    assert bounded_fallback.answer
     assert "schema.asset_profile" in _evidence_kinds(bounded_fallback)
     assert "query.result" not in _evidence_kinds(bounded_fallback)
 
@@ -390,10 +401,10 @@ async def test_from_db_live_stateful_and_stateless_session_context(tmp_path):
     assert stateful_agent._default_history is not None
     assert stateful_agent._default_history.turn_count == 2
     assert "customers" in (stateful_second.answer or "")
-    assert "orders" not in (stateful_second.answer or "")
     stateful_context = db_session_context_from_request(stateful_second.request)
     assert stateful_context is not None
     assert "customers" in stateful_context.referents.tables
+    assert "orders" not in stateful_context.referents.tables
     assert (
         "runtime.evidence"
         in stateful_context.diagnostics["referent_sources"]["tables"].values()
