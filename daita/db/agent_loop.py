@@ -5,9 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import inspect
 from typing import Any, Mapping, Protocol
-from uuid import uuid4
 
-from daita.runtime import Capability, Evidence, Operation, Task, TaskDependency
+from daita.runtime import Evidence, Operation, Task
 
 from .models import DbOperationContract, DbRequest
 from .planner_protocol import (
@@ -16,6 +15,7 @@ from .planner_protocol import (
     DbPlannerDecision,
     DbPlannerObservation,
 )
+from .runtime.tasks import DbTaskSpec
 from .safety import DbCapabilityLane
 
 
@@ -185,21 +185,10 @@ class DbAgentLoop:
             return ()
         specs = _action_task_specs(action)
         self._validate_action_specs(action, specs, contract)
-        tasks: list[Task] = []
-        validation_task: Task | None = None
-        for index, spec in enumerate(specs, start=1):
-            task = self._task_for_spec(
-                operation,
-                action=action,
-                spec=spec,
-                contract=contract,
-                sequence=index,
-                validation_task=validation_task,
-            )
-            tasks.append(task)
-            if spec.kind == "validate":
-                validation_task = task
-        return tuple(tasks)
+        return self.runtime.materialize_task_specs(
+            operation,
+            _runtime_task_specs_for_action(action, specs, contract),
+        )
 
     def _validate_action_specs(
         self,
@@ -232,65 +221,14 @@ class DbAgentLoop:
                     f"action {action.kind!r} uses capability "
                     f"{spec.capability_id!r} outside the operation contract"
                 )
-            capability = _capability_for_spec(self.runtime, contract, spec)
             if (
                 contract.metadata.get("approval_required")
-                and capability.side_effecting
+                and _spec_side_effecting(contract, spec)
                 and not action.payload.get("approval_id")
             ):
                 raise DbAgentLoopBlocked(
                     f"action {action.kind!r} requires approval before execution"
                 )
-
-    def _task_for_spec(
-        self,
-        operation: Operation,
-        *,
-        action: DbPlannerAction,
-        spec: "_TaskSpec",
-        contract: DbOperationContract,
-        sequence: int,
-        validation_task: Task | None,
-    ) -> Task:
-        capability = _capability_for_spec(self.runtime, contract, spec)
-        task_input = spec.input_builder(action)
-        dependencies = (
-            (
-                TaskDependency(
-                    kind="evidence",
-                    evidence_kind="sql.validation",
-                    producer_task_id=validation_task.id,
-                    producer_capability_id=validation_task.capability_id,
-                    producer_executor_id=validation_task.executor_id,
-                    operation_id=operation.id,
-                ),
-            )
-            if validation_task is not None
-            and capability.id.startswith("db.sql.execute")
-            else ()
-        )
-        return Task(
-            id=f"db-task-{uuid4()}",
-            operation_id=operation.id,
-            capability_id=capability.id,
-            executor_id=capability.executor,
-            input=task_input,
-            required_evidence=capability.output_evidence,
-            dependencies=dependencies,
-            metadata={
-                "owner": capability.owner,
-                "reason": str(
-                    action.payload.get("reason") or f"planner_action:{action.kind}"
-                ),
-                "sequence": sequence,
-                "planner_action_kind": action.kind,
-                "planner_action_id": action.action_id,
-                "required_lane": _matched_lane(
-                    spec,
-                    _contract_lanes(contract),
-                ).value,
-            },
-        )
 
 
 @dataclass(frozen=True)
@@ -301,6 +239,7 @@ class _TaskSpec:
     input_builder: Any
     owner: str | None = None
     must_be_contract_required: bool = True
+    depends_on_validation: bool = False
 
 
 def _action_task_specs(action: DbPlannerAction) -> tuple[_TaskSpec, ...]:
@@ -395,6 +334,7 @@ def _action_task_specs(action: DbPlannerAction) -> tuple[_TaskSpec, ...]:
                 capability_id="db.sql.execute_read",
                 required_lanes=(DbCapabilityLane.READ,),
                 input_builder=_sql_execute_input,
+                depends_on_validation=True,
             ),
         ),
         "execute_validated_write": (
@@ -409,6 +349,7 @@ def _action_task_specs(action: DbPlannerAction) -> tuple[_TaskSpec, ...]:
                 capability_id="db.sql.execute_write",
                 required_lanes=(DbCapabilityLane.WRITE_EXECUTE,),
                 input_builder=_sql_execute_input,
+                depends_on_validation=True,
             ),
         ),
         "recall_memory": (
@@ -497,14 +438,46 @@ def _action_task_specs(action: DbPlannerAction) -> tuple[_TaskSpec, ...]:
         ) from exc
 
 
-def _capability_for_spec(
-    runtime: Any,
+def _runtime_task_specs_for_action(
+    action: DbPlannerAction,
+    specs: tuple[_TaskSpec, ...],
     contract: DbOperationContract,
-    spec: _TaskSpec,
-) -> Capability:
+) -> tuple[DbTaskSpec, ...]:
+    return tuple(
+        DbTaskSpec(
+            capability_id=spec.capability_id,
+            owner=_owner_for_spec(contract, spec),
+            input=spec.input_builder(action),
+            reason=str(action.payload.get("reason") or f"planner_action:{action.kind}"),
+            sequence=index,
+            metadata={
+                "planner_action_kind": action.kind,
+                "planner_action_id": action.action_id,
+                "required_lane": _matched_lane(spec, _contract_lanes(contract)).value,
+            },
+            depends_on_validation=spec.depends_on_validation,
+        )
+        for index, spec in enumerate(specs, start=1)
+    )
+
+
+def _owner_for_spec(contract: DbOperationContract, spec: _TaskSpec) -> str | None:
     selected = _selected_capability_by_id(contract, spec.capability_id)
-    owner = spec.owner or (selected.get("owner") if selected else None)
-    return runtime.registry.get_capability(spec.capability_id, owner=owner)
+    if spec.owner is not None:
+        return spec.owner
+    owner = selected.get("owner")
+    return str(owner) if owner else None
+
+
+def _spec_side_effecting(contract: DbOperationContract, spec: _TaskSpec) -> bool:
+    selected = _selected_capability_by_id(contract, spec.capability_id)
+    if "side_effecting" in selected:
+        return bool(selected["side_effecting"])
+    return spec.capability_id in {
+        "db.sql.execute_write",
+        "db.memory.commit_update",
+        "db.monitor.execute",
+    }
 
 
 def _matched_lane(

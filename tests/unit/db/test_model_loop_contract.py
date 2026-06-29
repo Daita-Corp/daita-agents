@@ -8,6 +8,7 @@ from daita.db.models import DbRequest, DbRuntimeConfig
 from daita.db.planner_protocol import DbPlannerAction, DbPlannerDecision
 from daita.db.runtime import resume as resume_module
 from daita.db.runtime import DbRuntime
+from daita.db.runtime.tasks import DbRuntimeTasksMixin
 from daita.db.safety import DbSafetyVerifier
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
@@ -28,11 +29,16 @@ class MockPlanner:
         )
 
 
-class RecordingRuntime:
+class RecordingRuntime(DbRuntimeTasksMixin):
     def __init__(self, registry):
         self.registry = registry
         self.store = InMemoryRuntimeStore()
         self.executed_tasks = []
+        self.materialized_specs = []
+
+    def materialize_task_specs(self, operation, specs):
+        self.materialized_specs.append(specs)
+        return super().materialize_task_specs(operation, specs)
 
     async def execute_task(self, task: Task, operation: Operation, context=None):
         await self.store.save_task(task)
@@ -160,6 +166,10 @@ async def test_model_valid_read_inside_read_lane_persists_tasks():
         "db.sql.validate",
         "db.sql.execute_read",
     ]
+    assert [
+        [spec.capability_id for spec in specs] for specs in runtime.materialized_specs
+    ] == [["db.sql.validate", "db.sql.execute_read"]]
+    assert runtime.materialized_specs[0][1].depends_on_validation is True
     assert persisted[1].dependencies[0].producer_task_id == persisted[0].id
     assert persisted[1].metadata["required_lane"] == "read"
 

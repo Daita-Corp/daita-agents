@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import json
-from typing import Any
+from typing import Any, Mapping
 from uuid import uuid4
 
 from daita.runtime import (
@@ -34,6 +34,19 @@ from .types import (
     DbRuntimeGovernanceBlocked,
     DbRuntimeTaskNotRunnable,
 )
+
+
+@dataclass(frozen=True)
+class DbTaskSpec:
+    """Runtime-owned description of one DB task to materialize."""
+
+    capability_id: str
+    input: Mapping[str, Any] = field(default_factory=dict)
+    reason: str = "planned"
+    sequence: int = 1
+    owner: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    depends_on_validation: bool = False
 
 
 class DbRuntimeTasksMixin:
@@ -273,6 +286,54 @@ class DbRuntimeTasksMixin:
             metadata=task.metadata,
             dependencies=task.dependencies,
         )
+
+    def materialize_task_specs(
+        self,
+        operation: Operation,
+        specs: tuple[DbTaskSpec, ...],
+    ) -> tuple[Task, ...]:
+        """Turn DB task specs into concrete runtime ``Task`` records."""
+        tasks: list[Task] = []
+        validation_task: Task | None = None
+        for spec in specs:
+            if spec.depends_on_validation and validation_task is None:
+                raise ValueError(
+                    f"task spec {spec.capability_id!r} requires a preceding "
+                    "db.sql.validate task"
+                )
+            task = self.materialize_task_spec(
+                operation,
+                spec,
+                validation_task=(
+                    validation_task if spec.depends_on_validation else None
+                ),
+            )
+            tasks.append(task)
+            if task.capability_id == "db.sql.validate":
+                validation_task = task
+        return tuple(tasks)
+
+    def materialize_task_spec(
+        self,
+        operation: Operation,
+        spec: DbTaskSpec,
+        *,
+        validation_task: Task | None = None,
+    ) -> Task:
+        """Materialize one DB task spec using registered capability facts."""
+        capability = self._capability_for_task_spec(spec)
+        return self._task_for_capability(
+            operation,
+            capability,
+            input=dict(spec.input),
+            reason=spec.reason,
+            sequence=spec.sequence,
+            validation_task=validation_task,
+            metadata=dict(spec.metadata),
+        )
+
+    def _capability_for_task_spec(self, spec: DbTaskSpec) -> Capability:
+        return self.registry.get_capability(spec.capability_id, owner=spec.owner)
 
     async def _persist_contract_tasks(
         self,
@@ -541,28 +602,18 @@ class DbRuntimeTasksMixin:
             capability.id not in {"db.sql.execute_read", "db.sql.execute_write"}
             or validation_capability is None
         ):
-            task = self._task_for_capability(
+            return self.materialize_task_specs(
                 operation,
-                capability,
-                input=input,
-                reason="direct",
-                sequence=1,
-            )
-            return (task,)
-        validation_task = self._task_for_capability(
-            operation,
-            validation_capability,
-            input={
-                "sql": str(input.get("sql") or ""),
-                "operation": (
-                    "query"
-                    if capability.id == "db.sql.execute_read"
-                    else operation.operation_type
+                (
+                    DbTaskSpec(
+                        capability_id=capability.id,
+                        owner=capability.owner,
+                        input=input,
+                        reason="direct",
+                        sequence=1,
+                    ),
                 ),
-            },
-            reason="direct_validation",
-            sequence=1,
-        )
+            )
         execute_input = (
             {
                 "sql_ref": "sql.validation",
@@ -584,15 +635,33 @@ class DbRuntimeTasksMixin:
                 ),
             }
         )
-        execute_task = self._task_for_capability(
+        return self.materialize_task_specs(
             operation,
-            capability,
-            input=execute_input,
-            reason="direct",
-            sequence=2,
-            validation_task=validation_task,
+            (
+                DbTaskSpec(
+                    capability_id=validation_capability.id,
+                    owner=validation_capability.owner,
+                    input={
+                        "sql": str(input.get("sql") or ""),
+                        "operation": (
+                            "query"
+                            if capability.id == "db.sql.execute_read"
+                            else operation.operation_type
+                        ),
+                    },
+                    reason="direct_validation",
+                    sequence=1,
+                ),
+                DbTaskSpec(
+                    capability_id=capability.id,
+                    owner=capability.owner,
+                    input=execute_input,
+                    reason="direct",
+                    sequence=2,
+                    depends_on_validation=True,
+                ),
+            ),
         )
-        return (validation_task, execute_task)
 
     def plan_validated_read_tasks(
         self,
@@ -618,14 +687,6 @@ class DbRuntimeTasksMixin:
         )
         if validation_capability is None:
             raise KeyError("db.sql.validate")
-        validation_task = self._task_for_capability(
-            operation,
-            validation_capability,
-            input={"sql": sql, "operation": "query"},
-            reason=f"{reason}_validation",
-            sequence=sequence,
-            metadata=metadata,
-        )
         execute_input: dict[str, Any] = {
             "sql_ref": "sql.validation",
             "params": list(params),
@@ -634,14 +695,27 @@ class DbRuntimeTasksMixin:
             execute_input["param_specs"] = list(param_specs)
         if focus is not None:
             execute_input["focus"] = focus
-        read_task = self._task_for_capability(
+        validation_task, read_task = self.materialize_task_specs(
             operation,
-            read_capability,
-            input=execute_input,
-            reason=reason,
-            sequence=sequence + 1,
-            validation_task=validation_task,
-            metadata=metadata,
+            (
+                DbTaskSpec(
+                    capability_id=validation_capability.id,
+                    owner=validation_capability.owner,
+                    input={"sql": sql, "operation": "query"},
+                    reason=f"{reason}_validation",
+                    sequence=sequence,
+                    metadata=dict(metadata or {}),
+                ),
+                DbTaskSpec(
+                    capability_id=read_capability.id,
+                    owner=read_capability.owner,
+                    input=execute_input,
+                    reason=reason,
+                    sequence=sequence + 1,
+                    metadata=dict(metadata or {}),
+                    depends_on_validation=True,
+                ),
+            ),
         )
         return validation_task, read_task
 
