@@ -12,7 +12,6 @@ from daita.runtime.monitors import summarize_monitor_value
 
 from ..monitors import DbMonitor, DbMonitorState
 from ..sql_evidence import (
-    blocked_scope_resources,
     effective_source_scope,
     sql_validation_facts_from_evidence,
 )
@@ -138,7 +137,7 @@ class DbMonitorObservationRunner:
         owner = _observation_capability_owner(plan)
         params, param_specs = resolve_observation_params(plan, state)
         try:
-            validation_task, read_task = self.runtime.plan_validated_read_tasks(
+            read_result = await self.runtime.execute_monitor_validated_read(
                 operation,
                 sql=sql,
                 params=params,
@@ -146,12 +145,35 @@ class DbMonitorObservationRunner:
                 owner=owner,
                 reason="monitor_observation_read",
                 sequence=1,
+                source_scope=monitor.source_scope,
+                source_plan=plan,
                 metadata={
                     "monitor_id": monitor.id,
                     "monitor_run_id": run_id,
                     "tick_operation_id": operation.id,
+                    "monitor_role": "observation",
                     "observation_plan_kind": kind,
                 },
+                validation_context={
+                    "monitor_id": monitor.id,
+                    "monitor_run_id": run_id,
+                    "tick_operation_id": operation.id,
+                    "db_monitor_phase": 5,
+                    "monitor_observation_role": "validation",
+                },
+                read_context={
+                    "monitor_id": monitor.id,
+                    "monitor_run_id": run_id,
+                    "tick_operation_id": operation.id,
+                    "db_monitor_phase": 5,
+                    "monitor_observation_role": "read",
+                },
+                invalid_reason="observation_sql_validation_failed",
+                unsafe_reason="unsafe_observation_sql",
+                scope_reason="observation_source_scope_blocked",
+                missing_result_reason="observation_query_result_missing",
+                validation_failed_reason="observation_validation_failed",
+                execution_failed_reason="observation_execution_failed",
             )
         except (KeyError, ValueError) as exc:
             raise DbMonitorObservationBlocked(
@@ -162,107 +184,48 @@ class DbMonitorObservationRunner:
                     "error": str(exc),
                 },
             ) from exc
-
-        try:
-            validation_evidence = await self.runtime.execute_task(
-                validation_task,
-                operation,
-                context={
-                    "monitor_id": monitor.id,
-                    "monitor_run_id": run_id,
-                    "tick_operation_id": operation.id,
-                    "db_monitor_phase": 4,
-                    "monitor_observation_role": "validation",
-                },
-            )
-        except Exception as exc:
-            raise DbMonitorObservationFailed(
-                "observation_validation_failed",
-                details={"type": type(exc).__name__, "message": str(exc)},
-                task_ids=(validation_task.id,),
-            ) from exc
-        validation = _validation_evidence(validation_evidence)
-        validation_ids = tuple(item.id for item in validation_evidence if item.id)
-        task_ids = (validation_task.id, read_task.id)
-        if validation is None or not validation.accepted:
-            raise DbMonitorObservationBlocked(
-                "observation_sql_validation_failed",
-                details={
-                    "validation_evidence_id": (
-                        validation.id if validation is not None else None
-                    )
-                },
-                task_ids=(validation_task.id,),
-                evidence_ids=validation_ids,
-            )
-        validation_facts = sql_validation_facts_from_evidence(validation)
-        if validation_facts.is_read is False:
-            raise DbMonitorObservationBlocked(
-                "unsafe_observation_sql",
-                details={"validation": validation.payload},
-                task_ids=(validation_task.id,),
-                evidence_ids=validation_ids,
-            )
-        if validation_facts.valid is False:
-            raise DbMonitorObservationBlocked(
-                "observation_sql_validation_failed",
-                details={"validation": validation.payload},
-                task_ids=(validation_task.id,),
-                evidence_ids=validation_ids,
-            )
-        source_scope = effective_source_scope(monitor.source_scope, plan)
-        blocked_scope = blocked_scope_resources(
-            validation_facts.target_resources,
-            source_scope,
-        )
-        if blocked_scope:
-            raise DbMonitorObservationBlocked(
-                "observation_source_scope_blocked",
-                details={
-                    "source_scope": list(source_scope),
-                    "target_resources": list(validation_facts.target_resources),
-                    "blocked_resources": list(blocked_scope),
-                },
-                task_ids=(validation_task.id,),
-                evidence_ids=validation_ids,
-            )
-
-        try:
-            read_evidence = await self.runtime.execute_task(
-                read_task,
-                operation,
-                context={
-                    "monitor_id": monitor.id,
-                    "monitor_run_id": run_id,
-                    "tick_operation_id": operation.id,
-                    "db_monitor_phase": 4,
-                    "monitor_observation_role": "read",
-                },
-            )
         except Exception as exc:
             raise DbMonitorObservationFailed(
                 "observation_execution_failed",
                 details={"type": type(exc).__name__, "message": str(exc)},
-                task_ids=task_ids,
-                evidence_ids=validation_ids,
             ) from exc
+        validation = _validation_evidence(read_result.validation_evidence)
+        validation_ids = tuple(
+            item.id for item in read_result.validation_evidence if item.id
+        )
+        task_ids = read_result.task_ids
+        if read_result.status != "succeeded":
+            task_ids_for_block = read_result.task_ids
+            if not read_result.read_evidence and not read_result.validation_evidence:
+                task_ids_for_block = (read_result.validation_task.id,)
+            elif not read_result.read_evidence and read_result.status != "failed":
+                task_ids_for_block = (read_result.validation_task.id,)
+            if read_result.status == "failed":
+                raise DbMonitorObservationFailed(
+                    str(read_result.block_reason or "observation_execution_failed"),
+                    details=dict(read_result.details),
+                    task_ids=task_ids_for_block,
+                    evidence_ids=read_result.evidence_ids,
+                )
+            raise DbMonitorObservationBlocked(
+                str(read_result.block_reason or "observation_read_blocked"),
+                details=dict(read_result.details),
+                task_ids=task_ids_for_block,
+                evidence_ids=read_result.evidence_ids,
+            )
+        if validation is None:
+            raise DbMonitorObservationBlocked(
+                "observation_sql_validation_failed",
+                details={},
+                task_ids=(read_result.validation_task.id,),
+                evidence_ids=validation_ids,
+            )
+        validation_facts = sql_validation_facts_from_evidence(validation)
+        source_scope = effective_source_scope(monitor.source_scope, plan)
         query_result = next(
-            (item for item in read_evidence if item.kind == "query.result"),
+            (item for item in read_result.read_evidence if item.kind == "query.result"),
             None,
         )
-        if query_result is None or not query_result.accepted:
-            raise DbMonitorObservationBlocked(
-                "observation_query_result_missing",
-                details={"read_task_id": read_task.id},
-                task_ids=tuple(
-                    task.id for task in (validation_task, read_task) if task is not None
-                ),
-                evidence_ids=tuple(
-                    item.id
-                    for item in (*validation_evidence, *read_evidence)
-                    if item.id
-                ),
-            )
 
         value = _observed_value(plan, query_result.payload, now=now)
         cursor_updates = {
@@ -270,9 +233,7 @@ class DbMonitorObservationRunner:
             "last_observation_fingerprint": validation_facts.sql_fingerprint,
             **_cursor_updates_from_plan(plan, query_result.payload),
         }
-        evidence_ids = tuple(
-            item.id for item in (*validation_evidence, *read_evidence) if item.id
-        )
+        evidence_ids = tuple(item.id for item in read_result.evidence if item.id)
         row_count = _query_row_count(query_result.payload)
         summary = {
             "observation_plan_kind": kind,

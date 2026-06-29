@@ -8,11 +8,6 @@ from daita.runtime import Evidence, Operation, OperationStatus, Task
 
 from ...analysis import DbAnalysisPlan
 from ...evidence import DbEvidenceStore
-from ...sql_evidence import (
-    blocked_scope_resources,
-    effective_source_scope,
-    sql_validation_facts_from_evidence,
-)
 from ..monitor_helpers import _monitor_report_has_analysis_work
 from ..resume import (
     _db_contract_from_context,
@@ -358,7 +353,7 @@ class DbRuntimeMonitorActionReportsMixin:
         sequence: int,
         tasks: list[Task],
     ) -> tuple[Evidence, ...]:
-        validation_task, read_task = self.plan_validated_read_tasks(
+        result = await self.execute_monitor_validated_read(
             operation,
             sql=str(step.get("sql") or ""),
             params=list(step.get("parameters") or step.get("params") or ()),
@@ -369,54 +364,38 @@ class DbRuntimeMonitorActionReportsMixin:
             ),
             reason="monitor_report_read",
             sequence=sequence,
+            source_scope=source_scope,
+            source_plan=step,
             metadata={
                 "monitor_id": monitor_id,
                 "monitor_run_id": monitor_run_id,
                 "tick_operation_id": tick_operation_id,
+                "monitor_role": "report",
                 "monitor_action_kind": "scheduled_report",
                 "monitor_action_fingerprint": action_plan_fingerprint,
                 "monitor_report_step_id": step.get("id"),
                 "monitor_report_step_kind": step.get("kind"),
             },
-        )
-        validation_task = await self._plan_kernel_task(validation_task)
-        read_task = await self._plan_kernel_task(read_task)
-        tasks.extend([validation_task, read_task])
-        validation_evidence = await self.execute_task(
-            validation_task,
-            operation,
-            context={
+            validation_context={
                 "monitor_id": monitor_id,
                 "monitor_run_id": monitor_run_id,
                 "tick_operation_id": tick_operation_id,
                 "db_monitor_phase": 5,
                 "monitor_action_role": "report_validation",
             },
-        )
-        validation = next(
-            (item for item in validation_evidence if item.kind == "sql.validation"),
-            None,
-        )
-        if validation is None or not validation.accepted:
-            raise RuntimeError("report_sql_validation_failed")
-        facts = sql_validation_facts_from_evidence(validation)
-        if facts.is_read is False or facts.valid is False:
-            raise RuntimeError("unsafe_report_sql")
-        blocked = blocked_scope_resources(
-            facts.target_resources,
-            effective_source_scope(source_scope, step),
-        )
-        if blocked:
-            raise RuntimeError("report_source_scope_blocked")
-        read_evidence = await self.execute_task(
-            read_task,
-            operation,
-            context={
+            read_context={
                 "monitor_id": monitor_id,
                 "monitor_run_id": monitor_run_id,
                 "tick_operation_id": tick_operation_id,
                 "db_monitor_phase": 5,
                 "monitor_action_role": "report_read",
             },
+            invalid_reason="report_sql_validation_failed",
+            unsafe_reason="unsafe_report_sql",
+            scope_reason="report_source_scope_blocked",
+            missing_result_reason="report_query_result_missing",
         )
-        return (*validation_evidence, *read_evidence)
+        tasks.extend([result.validation_task, result.read_task])
+        if result.status != "succeeded":
+            raise RuntimeError(result.block_reason or "report_read_blocked")
+        return result.evidence

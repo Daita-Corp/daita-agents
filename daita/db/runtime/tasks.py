@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from daita.runtime import (
+    ApprovalRequest,
     ApprovalStatus,
     Capability,
     Evidence,
@@ -28,9 +29,14 @@ from daita.runtime import (
 
 from ..authorization import authorization_mode
 from ..models import DbOperationContract
-from ..sql_evidence import blocked_scope_resources, sql_validation_facts_from_evidence
+from ..sql_evidence import (
+    blocked_scope_resources,
+    effective_source_scope,
+    sql_validation_facts_from_evidence,
+)
 from .types import (
     _DEFAULT_TASK_LEASE_SECONDS,
+    _TERMINAL_TASK_STATUSES,
     DbRuntimeGovernanceBlocked,
     DbRuntimeTaskNotRunnable,
 )
@@ -47,6 +53,44 @@ class DbTaskSpec:
     owner: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
     depends_on_validation: bool = False
+    task_id: str | None = None
+    deterministic_key: str | None = None
+    input_hash: str | None = None
+    idempotency_key: str | None = None
+    dependencies: tuple[TaskDependency, ...] = ()
+    approval_requests: tuple[ApprovalRequest, ...] = ()
+    monitor_role: str | None = None
+    monitor_id: str | None = None
+    monitor_run_id: str | None = None
+    tick_operation_id: str | None = None
+    replay_safe: bool | None = None
+    idempotent: bool | None = None
+    side_effecting: bool | None = None
+
+
+@dataclass(frozen=True)
+class DbValidatedReadResult:
+    """Outcome of a monitor validated SQL read pair."""
+
+    status: str
+    validation_task: Task
+    read_task: Task
+    validation_evidence: tuple[Evidence, ...] = ()
+    read_evidence: tuple[Evidence, ...] = ()
+    block_reason: str | None = None
+    details: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def evidence(self) -> tuple[Evidence, ...]:
+        return (*self.validation_evidence, *self.read_evidence)
+
+    @property
+    def task_ids(self) -> tuple[str, ...]:
+        return (self.validation_task.id, self.read_task.id)
+
+    @property
+    def evidence_ids(self) -> tuple[str, ...]:
+        return tuple(item.id for item in self.evidence if item.id)
 
 
 class DbRuntimeTasksMixin:
@@ -330,10 +374,85 @@ class DbRuntimeTasksMixin:
             sequence=spec.sequence,
             validation_task=validation_task,
             metadata=dict(spec.metadata),
+            task_id=spec.task_id,
+            deterministic_key=spec.deterministic_key,
+            input_hash=spec.input_hash,
+            idempotency_key=spec.idempotency_key,
+            dependencies=spec.dependencies,
+            approval_requests=spec.approval_requests,
+            monitor_role=spec.monitor_role,
+            monitor_id=spec.monitor_id,
+            monitor_run_id=spec.monitor_run_id,
+            tick_operation_id=spec.tick_operation_id,
+            replay_safe=spec.replay_safe,
+            idempotent=spec.idempotent,
+            side_effecting=spec.side_effecting,
         )
 
     def _capability_for_task_spec(self, spec: DbTaskSpec) -> Capability:
         return self.registry.get_capability(spec.capability_id, owner=spec.owner)
+
+    def monitor_plugin_task_spec(
+        self,
+        capability: Capability,
+        *,
+        input_payload: dict[str, Any],
+        input_hash: str,
+        idempotency_key: str,
+        reason: str,
+        sequence: int,
+        metadata: dict[str, Any],
+        approval_requests: tuple[ApprovalRequest, ...] = (),
+        monitor_role: str | None = None,
+        monitor_id: str | None = None,
+        monitor_run_id: str | None = None,
+        tick_operation_id: str | None = None,
+    ) -> DbTaskSpec:
+        """Describe monitor plugin work using runtime-owned task spec fields."""
+        return DbTaskSpec(
+            capability_id=capability.id,
+            owner=capability.owner,
+            input=input_payload,
+            reason=reason,
+            sequence=sequence,
+            metadata=dict(metadata),
+            deterministic_key=idempotency_key,
+            input_hash=input_hash,
+            idempotency_key=idempotency_key,
+            approval_requests=approval_requests,
+            monitor_role=monitor_role,
+            monitor_id=monitor_id,
+            monitor_run_id=monitor_run_id,
+            tick_operation_id=tick_operation_id,
+        )
+
+    async def persist_task_specs(
+        self,
+        operation: Operation,
+        specs: tuple[DbTaskSpec, ...],
+    ) -> tuple[Task, ...]:
+        """Materialize and persist DB task specs without executing them."""
+        persisted: list[Task] = []
+        for task in self.materialize_task_specs(operation, specs):
+            persisted.append(await self.persist_task(task))
+        return tuple(persisted)
+
+    async def persist_task(self, task: Task) -> Task:
+        """Persist a DB-owned task, reusing terminal tasks and updating pending input."""
+        stored = await self.store.load_task(task.id)
+        if stored is None:
+            return await self._plan_kernel_task(task)
+        if stored.status in _TERMINAL_TASK_STATUSES:
+            return stored
+        if stored.input != task.input and stored.status is TaskStatus.PENDING:
+            stored = replace(
+                stored,
+                input=task.input,
+                dependencies=task.dependencies or stored.dependencies,
+                metadata={**stored.metadata, **task.metadata},
+            )
+            await self.store.save_task(stored)
+        return stored
 
     async def _persist_contract_tasks(
         self,
@@ -719,6 +838,146 @@ class DbRuntimeTasksMixin:
         )
         return validation_task, read_task
 
+    async def execute_monitor_validated_read(
+        self,
+        operation: Operation,
+        *,
+        sql: str,
+        params: tuple[Any, ...] | list[Any] = (),
+        param_specs: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
+        owner: str | None = None,
+        reason: str,
+        sequence: int,
+        source_scope: tuple[str, ...],
+        source_plan: Mapping[str, Any],
+        focus: Any = None,
+        metadata: dict[str, Any] | None = None,
+        validation_context: dict[str, Any] | None = None,
+        read_context: dict[str, Any] | None = None,
+        invalid_reason: str = "monitor_sql_validation_failed",
+        unsafe_reason: str = "unsafe_monitor_sql",
+        scope_reason: str = "monitor_source_scope_blocked",
+        missing_result_reason: str = "monitor_query_result_missing",
+        validation_failed_reason: str = "monitor_validation_failed",
+        execution_failed_reason: str = "monitor_execution_failed",
+    ) -> DbValidatedReadResult:
+        """Validate, scope-check, and execute one monitor read task pair."""
+        validation_task, read_task = self.plan_validated_read_tasks(
+            operation,
+            sql=sql,
+            params=params,
+            param_specs=param_specs,
+            owner=owner,
+            reason=reason,
+            sequence=sequence,
+            focus=focus,
+            metadata=metadata,
+        )
+        try:
+            validation_evidence = await self.execute_task(
+                validation_task,
+                operation,
+                context=validation_context,
+            )
+        except Exception as exc:
+            return DbValidatedReadResult(
+                status="failed",
+                validation_task=validation_task,
+                read_task=read_task,
+                block_reason=validation_failed_reason,
+                details={"type": type(exc).__name__, "message": str(exc)},
+            )
+        validation = next(
+            (item for item in validation_evidence if item.kind == "sql.validation"),
+            None,
+        )
+        if validation is None or not validation.accepted:
+            return DbValidatedReadResult(
+                status="blocked",
+                validation_task=validation_task,
+                read_task=read_task,
+                validation_evidence=validation_evidence,
+                block_reason=invalid_reason,
+                details={
+                    "validation_evidence_id": (
+                        validation.id if validation is not None else None
+                    )
+                },
+            )
+        validation_facts = sql_validation_facts_from_evidence(validation)
+        if validation_facts.is_read is False:
+            return DbValidatedReadResult(
+                status="blocked",
+                validation_task=validation_task,
+                read_task=read_task,
+                validation_evidence=validation_evidence,
+                block_reason=unsafe_reason,
+                details={"validation": validation.payload},
+            )
+        if validation_facts.valid is False:
+            return DbValidatedReadResult(
+                status="blocked",
+                validation_task=validation_task,
+                read_task=read_task,
+                validation_evidence=validation_evidence,
+                block_reason=invalid_reason,
+                details={"validation": validation.payload},
+            )
+        allowed_scope = effective_source_scope(source_scope, source_plan)
+        blocked = blocked_scope_resources(
+            validation_facts.target_resources,
+            allowed_scope,
+        )
+        if blocked:
+            return DbValidatedReadResult(
+                status="blocked",
+                validation_task=validation_task,
+                read_task=read_task,
+                validation_evidence=validation_evidence,
+                block_reason=scope_reason,
+                details={
+                    "source_scope": list(allowed_scope),
+                    "target_resources": list(validation_facts.target_resources),
+                    "blocked_resources": list(blocked),
+                },
+            )
+        try:
+            read_evidence = await self.execute_task(
+                read_task,
+                operation,
+                context=read_context,
+            )
+        except Exception as exc:
+            return DbValidatedReadResult(
+                status="failed",
+                validation_task=validation_task,
+                read_task=read_task,
+                validation_evidence=validation_evidence,
+                block_reason=execution_failed_reason,
+                details={"type": type(exc).__name__, "message": str(exc)},
+            )
+        query_result = next(
+            (item for item in read_evidence if item.kind == "query.result"),
+            None,
+        )
+        if query_result is None or not query_result.accepted:
+            return DbValidatedReadResult(
+                status="blocked",
+                validation_task=validation_task,
+                read_task=read_task,
+                validation_evidence=validation_evidence,
+                read_evidence=read_evidence,
+                block_reason=missing_result_reason,
+                details={"read_task_id": read_task.id},
+            )
+        return DbValidatedReadResult(
+            status="succeeded",
+            validation_task=validation_task,
+            read_task=read_task,
+            validation_evidence=validation_evidence,
+            read_evidence=read_evidence,
+        )
+
     def _task_for_capability(
         self,
         operation: Operation,
@@ -729,40 +988,104 @@ class DbRuntimeTasksMixin:
         sequence: int,
         validation_task: Task | None = None,
         metadata: dict[str, Any] | None = None,
+        task_id: str | None = None,
+        deterministic_key: str | None = None,
+        input_hash: str | None = None,
+        idempotency_key: str | None = None,
+        dependencies: tuple[TaskDependency, ...] = (),
+        approval_requests: tuple[ApprovalRequest, ...] = (),
+        monitor_role: str | None = None,
+        monitor_id: str | None = None,
+        monitor_run_id: str | None = None,
+        tick_operation_id: str | None = None,
+        replay_safe: bool | None = None,
+        idempotent: bool | None = None,
+        side_effecting: bool | None = None,
     ) -> Task:
-        input_hash = _stable_hash(input)
+        explicit_input_hash = input_hash is not None
+        input_hash = input_hash or _stable_hash(input)
+        input_payload = (
+            {**input, "input_hash": input_hash}
+            if explicit_input_hash and input.get("input_hash") is None
+            else dict(input)
+        )
+        if task_id is None and deterministic_key:
+            task_key = _stable_hash(
+                {
+                    "operation_id": operation.id,
+                    "capability_id": capability.id,
+                    "capability_owner": capability.owner,
+                    "deterministic_key": deterministic_key,
+                }
+            )
+            task_id = f"db-task-{task_key[:32]}"
+        idempotency_key = idempotency_key or _stable_hash(
+            {
+                "operation_id": operation.id,
+                "capability_id": capability.id,
+                "executor_id": capability.executor,
+                "input": input,
+            }
+        )
+        monitor_metadata = {
+            key: value
+            for key, value in {
+                "monitor_role": monitor_role,
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+            }.items()
+            if value is not None
+        }
         task = Task(
-            id=f"db-task-{uuid4()}",
+            id=task_id or f"db-task-{uuid4()}",
             operation_id=operation.id,
             capability_id=capability.id,
             executor_id=capability.executor,
-            input=input,
+            input=input_payload,
             required_evidence=capability.output_evidence,
             metadata={
                 **dict(metadata or {}),
+                **monitor_metadata,
                 "owner": capability.owner,
                 "reason": reason,
                 "sequence": sequence,
                 "input_hash": input_hash,
-                "idempotency_key": _stable_hash(
-                    {
-                        "operation_id": operation.id,
-                        "capability_id": capability.id,
-                        "executor_id": capability.executor,
-                        "input": input,
-                    }
+                "idempotency_key": idempotency_key,
+                "idempotent": (
+                    capability.idempotent if idempotent is None else idempotent
                 ),
-                "idempotent": capability.idempotent,
-                "replay_safe": capability.replay_safe,
-                "side_effecting": capability.side_effecting,
+                "replay_safe": (
+                    capability.replay_safe if replay_safe is None else replay_safe
+                ),
+                "side_effecting": (
+                    capability.side_effecting
+                    if side_effecting is None
+                    else side_effecting
+                ),
             },
+        )
+        approval_dependencies = tuple(
+            TaskDependency(
+                kind="approval",
+                approval_status=ApprovalStatus.APPROVED,
+                approval_id=request.approval_id,
+                approval_policy_id=request.requested_by_policy_id,
+                approval_name=str(request.proposed_action.get("approval") or ""),
+                operation_id=operation.id,
+            )
+            for request in approval_requests
         )
         return replace(
             task,
-            dependencies=_task_dependencies_for_capability(
-                operation,
-                capability,
-                validation_task=validation_task,
+            dependencies=(
+                *_task_dependencies_for_capability(
+                    operation,
+                    capability,
+                    validation_task=validation_task,
+                ),
+                *dependencies,
+                *approval_dependencies,
             ),
         )
 

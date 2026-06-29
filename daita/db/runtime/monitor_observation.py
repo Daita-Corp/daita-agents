@@ -48,15 +48,21 @@ class DbRuntimeMonitorObservationMixin:
                 "plugin_evidence_refs": [],
             }
 
-        task = self._monitor_plugin_task_for_capability(
+        task = self.materialize_task_spec(
             operation,
-            plan.capability,
-            input_payload=plan.input_payload,
-            input_hash=plan.input_hash,
-            idempotency_key=plan.idempotency_key,
-            reason=plan.reason,
-            sequence=plan.sequence,
-            metadata=plan.metadata,
+            self.monitor_plugin_task_spec(
+                plan.capability,
+                input_payload=plan.input_payload,
+                input_hash=plan.input_hash,
+                idempotency_key=plan.idempotency_key,
+                reason=plan.reason,
+                sequence=plan.sequence,
+                metadata=plan.metadata,
+                monitor_role="source",
+                monitor_id=monitor_id,
+                monitor_run_id=monitor_run_id,
+                tick_operation_id=tick_operation_id,
+            ),
         )
         try:
             evidence = await self._execute_or_reuse_monitor_plugin_task(

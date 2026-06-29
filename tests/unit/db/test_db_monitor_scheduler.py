@@ -4,7 +4,10 @@ import inspect
 
 import pytest
 
-import daita.db.monitor_scheduler as monitor_scheduler_module
+import daita.db.monitor_scheduler.actions as monitor_scheduler_actions_module
+import daita.db.monitor_scheduler.delivery as monitor_scheduler_delivery_module
+import daita.db.monitor_scheduler.observation as monitor_scheduler_observation_module
+import daita.db.monitor_scheduler.scheduler as monitor_scheduler_module
 from daita.db import (
     DbMonitor,
     DbMonitorMutation,
@@ -14,6 +17,7 @@ from daita.db import (
     SQLiteDbMonitorStore,
 )
 from daita.db.monitor_commands import DbMonitorValidation
+from daita.db.monitor_scheduler.observation import DbMonitorObservationRunner
 from daita.plugins import RuntimeExtensionPlugin, PluginKind, PluginManifest
 from daita.runtime import (
     AccessMode,
@@ -2482,6 +2486,72 @@ async def test_report_action_unsafe_sql_fails_before_read_execution():
     assert all(task.status is not TaskStatus.SUCCEEDED for task in report_read_tasks)
 
 
+@pytest.mark.parametrize(
+    ("sql", "source_scope", "source_plan", "reason"),
+    [
+        (
+            "select * from",
+            ("orders",),
+            {"kind": "metric_sql", "source_scope": ["orders"]},
+            "monitor_sql_validation_failed",
+        ),
+        (
+            "delete from orders",
+            ("orders",),
+            {"kind": "metric_sql", "source_scope": ["orders"]},
+            "unsafe_monitor_sql",
+        ),
+        (
+            "select count(*) from customers",
+            ("orders",),
+            {"kind": "metric_sql", "source_scope": ["orders"]},
+            "monitor_source_scope_blocked",
+        ),
+    ],
+)
+async def test_observation_and_report_reads_share_validation_helper_block_reasons(
+    sql,
+    source_scope,
+    source_plan,
+    reason,
+):
+    plugin = MonitorReadProbePlugin(rows=[{"pending_count": 12}])
+    runtime = DbRuntime(
+        runtime_id=f"db-monitor-shared-read-{reason}",
+        plugins=(plugin,),
+    )
+    await runtime.setup()
+
+    results = []
+    for operation_id, read_reason, role in (
+        ("monitor-shared-observation", "monitor_observation_read", "observation"),
+        ("monitor-shared-report", "monitor_report_read", "report"),
+    ):
+        operation = Operation(
+            id=f"{operation_id}-{reason}",
+            operation_type="monitor.tick",
+            request={"prompt": sql},
+        )
+        await runtime.store.save_operation(operation)
+        results.append(
+            await runtime.execute_monitor_validated_read(
+                operation,
+                sql=sql,
+                owner="monitor_read_probe",
+                reason=read_reason,
+                sequence=1,
+                source_scope=source_scope,
+                source_plan=source_plan,
+                metadata={"monitor_role": role},
+            )
+        )
+
+    assert [result.status for result in results] == ["blocked", "blocked"]
+    assert [result.block_reason for result in results] == [reason, reason]
+    assert plugin.validate_executor.calls == 2
+    assert plugin.read_executor.calls == 0
+
+
 async def test_write_proposal_validates_sql_and_does_not_execute_write():
     read_plugin = MonitorReadProbePlugin(rows=[{"pending_count": 12}])
     write_plugin = MonitorWriteProbePlugin()
@@ -2788,3 +2858,36 @@ def test_phase7_monitor_runtime_boundaries_do_not_add_direct_paths():
     assert "httpx" not in source
     assert "requests." not in source
     assert "regenerate" not in source.lower()
+
+
+def test_phase5_monitor_work_uses_runtime_task_materialization_boundaries():
+    monitor_work_source = "\n".join(
+        inspect.getsource(item)
+        for item in (
+            DbRuntime.execute_monitor_source_observation,
+            DbRuntime._execute_monitor_report_read_step,
+            DbRuntime._execute_monitor_write_proposal_action,
+            DbRuntime.execute_monitor_delivery,
+        )
+    )
+    scheduler_source = "\n".join(
+        inspect.getsource(item)
+        for item in (
+            monitor_scheduler_module,
+            monitor_scheduler_observation_module,
+            monitor_scheduler_actions_module,
+            monitor_scheduler_delivery_module,
+        )
+    )
+
+    assert "Task(" not in monitor_work_source
+    assert "._task_for_capability(" not in monitor_work_source
+    assert "._plan_kernel_task(" not in monitor_work_source
+    assert ".kernel.plan_task(" not in monitor_work_source
+    assert ".kernel.plan_task(" not in scheduler_source
+    assert "execute_monitor_validated_read(" in inspect.getsource(
+        DbRuntime._execute_monitor_report_read_step
+    )
+    assert "execute_monitor_validated_read(" in inspect.getsource(
+        DbMonitorObservationRunner.observe
+    )
