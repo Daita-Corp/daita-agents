@@ -28,6 +28,7 @@ from daita.runtime import (
 )
 
 from ..authorization import authorization_mode
+from ..analysis import with_analysis_evidence_trace
 from ..models import DbOperationContract
 from ..sql_evidence import (
     blocked_scope_resources,
@@ -989,6 +990,9 @@ class DbRuntimeTasksMixin:
         sequence: int = 1,
         focus: Any = None,
         metadata: dict[str, Any] | None = None,
+        validation_dependencies: tuple[TaskDependency, ...] = (),
+        read_dependencies: tuple[TaskDependency, ...] = (),
+        deterministic_key: str | None = None,
     ) -> tuple[Task, Task]:
         """Plan a DB SQL validation/read task pair under an existing operation."""
 
@@ -1009,6 +1013,29 @@ class DbRuntimeTasksMixin:
             execute_input["param_specs"] = list(param_specs)
         if focus is not None:
             execute_input["focus"] = focus
+        task_metadata = with_analysis_evidence_trace(dict(metadata or {}))
+        validation_key = (
+            _stable_hash(
+                {
+                    "kind": f"{deterministic_key}:validation",
+                    "sql": sql,
+                    "metadata": task_metadata,
+                }
+            )
+            if deterministic_key
+            else None
+        )
+        read_key = (
+            _stable_hash(
+                {
+                    "kind": f"{deterministic_key}:read",
+                    "sql": sql,
+                    "metadata": task_metadata,
+                }
+            )
+            if deterministic_key
+            else None
+        )
         validation_task, read_task = self.materialize_task_specs(
             operation,
             (
@@ -1018,7 +1045,9 @@ class DbRuntimeTasksMixin:
                     input={"sql": sql, "operation": "query"},
                     reason=f"{reason}_validation",
                     sequence=sequence,
-                    metadata=dict(metadata or {}),
+                    metadata=task_metadata,
+                    dependencies=validation_dependencies,
+                    deterministic_key=validation_key,
                 ),
                 DbTaskSpec(
                     capability_id=read_capability.id,
@@ -1026,12 +1055,192 @@ class DbRuntimeTasksMixin:
                     input=execute_input,
                     reason=reason,
                     sequence=sequence + 1,
-                    metadata=dict(metadata or {}),
+                    metadata=task_metadata,
                     depends_on_validation=True,
+                    dependencies=read_dependencies,
+                    deterministic_key=read_key,
                 ),
             ),
         )
         return validation_task, read_task
+
+    def analysis_task_spec(
+        self,
+        operation: Operation,
+        capability: Capability,
+        *,
+        input: dict[str, Any],
+        metadata: dict[str, Any],
+        dependencies: tuple[TaskDependency, ...],
+        sequence: int,
+        reason: str = "analysis",
+    ) -> DbTaskSpec:
+        """Describe an analysis-owned task using runtime task-spec semantics."""
+        task_input = dict(input)
+        input_hash = _stable_hash(task_input)
+        task_metadata = with_analysis_evidence_trace(
+            {
+                "owner": capability.owner,
+                "reason": reason,
+                "sequence": sequence,
+                "input_hash": input_hash,
+                "idempotency_key": _stable_hash(
+                    {
+                        "operation_id": operation.id,
+                        "capability_id": capability.id,
+                        "input": task_input,
+                        **metadata,
+                    }
+                ),
+                "idempotent": capability.idempotent,
+                "replay_safe": capability.replay_safe,
+                "side_effecting": capability.side_effecting,
+                **metadata,
+            }
+        )
+        return DbTaskSpec(
+            capability_id=capability.id,
+            owner=capability.owner,
+            input=task_input,
+            reason=reason,
+            sequence=sequence,
+            metadata=task_metadata,
+            dependencies=dependencies,
+            deterministic_key=_stable_hash(
+                {
+                    "kind": "analysis_task",
+                    "analysis_id": metadata.get("analysis_id"),
+                    "analysis_step_id": metadata.get("analysis_step_id"),
+                    "analysis_phase": metadata.get("analysis_phase"),
+                    "capability_id": capability.id,
+                    "capability_owner": capability.owner,
+                    "input_hash": input_hash,
+                }
+            ),
+            input_hash=input_hash,
+            idempotency_key=str(task_metadata["idempotency_key"]),
+        )
+
+    def materialize_analysis_task(
+        self,
+        operation: Operation,
+        capability: Capability,
+        *,
+        input: dict[str, Any],
+        metadata: dict[str, Any],
+        dependencies: tuple[TaskDependency, ...],
+        sequence: int,
+        reason: str = "analysis",
+    ) -> Task:
+        """Materialize an analysis task through ``DbRuntimeTasksMixin``."""
+        return self.materialize_task_spec(
+            operation,
+            self.analysis_task_spec(
+                operation,
+                capability,
+                input=input,
+                metadata=metadata,
+                dependencies=dependencies,
+                sequence=sequence,
+                reason=reason,
+            ),
+        )
+
+    async def execute_validated_read_task_pair(
+        self,
+        operation: Operation,
+        *,
+        sql: str,
+        owner: str | None = None,
+        reason: str,
+        sequence: int,
+        metadata: dict[str, Any] | None = None,
+        validation_dependencies: tuple[TaskDependency, ...] = (),
+        read_dependencies: tuple[TaskDependency, ...] = (),
+        deterministic_key: str | None = None,
+        validation_context: dict[str, Any] | None = None,
+        read_context: dict[str, Any] | None = None,
+    ) -> DbValidatedReadResult:
+        """Execute a persisted SQL validation/read pair once."""
+        validation_task, read_task = self.plan_validated_read_tasks(
+            operation,
+            sql=sql,
+            owner=owner,
+            reason=reason,
+            sequence=sequence,
+            metadata=metadata,
+            validation_dependencies=validation_dependencies,
+            read_dependencies=read_dependencies,
+            deterministic_key=deterministic_key,
+        )
+        validation_task = await self.persist_task(validation_task)
+        if validation_task.status is TaskStatus.SUCCEEDED:
+            validation_evidence = tuple(
+                item
+                for item in await self.store.list_evidence(operation.id)
+                if item.task_id == validation_task.id
+            )
+        else:
+            validation_evidence = await self.execute_task(
+                validation_task,
+                operation,
+                context=validation_context,
+            )
+        validation = next(
+            (item for item in validation_evidence if item.kind == "sql.validation"),
+            None,
+        )
+        if validation is None or not validation.accepted:
+            return DbValidatedReadResult(
+                status="blocked",
+                validation_task=validation_task,
+                read_task=read_task,
+                validation_evidence=validation_evidence,
+                block_reason="sql_validation_failed",
+                details={
+                    "validation_evidence_id": (
+                        validation.id if validation is not None else None
+                    )
+                },
+            )
+        exact_validation_dependency = TaskDependency(
+            kind="evidence",
+            evidence_kind=validation.kind,
+            evidence_id=validation.id,
+            evidence_owner=validation.owner,
+            producer_task_id=validation.task_id,
+            producer_capability_id=validation_task.capability_id,
+            producer_executor_id=validation_task.executor_id,
+            evidence_payload={"valid": True},
+            evidence_accepted=True,
+            operation_id=operation.id,
+            payload_fingerprint=validation.metadata.get("payload_fingerprint")
+            or _payload_fingerprint(validation.payload),
+        )
+        read_task = replace(
+            read_task,
+            dependencies=(exact_validation_dependency, *read_dependencies),
+        )
+        read_task = await self.persist_task(read_task)
+        if read_task.status is TaskStatus.SUCCEEDED:
+            read_evidence = tuple(
+                item
+                for item in await self.store.list_evidence(operation.id)
+                if item.task_id == read_task.id
+            )
+        else:
+            read_evidence = await self.execute_task(
+                read_task,
+                operation,
+                context=read_context,
+            )
+        return DbValidatedReadResult(
+            status="succeeded",
+            validation_task=validation_task,
+            read_task=read_task,
+            validation_evidence=validation_evidence,
+            read_evidence=read_evidence,
+        )
 
     async def execute_monitor_validated_read(
         self,
