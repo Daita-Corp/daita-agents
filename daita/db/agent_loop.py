@@ -294,6 +294,8 @@ class DbAgentLoop:
                 contract.metadata.get("approval_required")
                 and _spec_side_effecting(contract, spec)
                 and not action.payload.get("approval_id")
+                and spec.capability_id
+                not in {"db.monitor.commit_create", "db.monitor.commit_lifecycle"}
             ):
                 raise DbAgentLoopBlocked(
                     f"action {action.kind!r} requires approval before execution"
@@ -548,30 +550,43 @@ def _action_task_specs(action: DbPlannerAction) -> tuple[_TaskSpec, ...]:
                 owner="db_runtime",
             ),
         ),
+        "create_monitor": _monitor_create_specs(action),
         "inspect_monitor": (
             _TaskSpec(
                 kind="monitor",
                 capability_id="db.monitor.inspect",
                 required_lanes=(DbCapabilityLane.MONITOR_READ,),
                 input_builder=_payload_input,
+                owner="db_runtime",
                 must_be_contract_required=False,
             ),
         ),
-        "update_monitor": (
-            _TaskSpec(
-                kind="monitor",
-                capability_id="db.monitor.plan_lifecycle",
-                required_lanes=(DbCapabilityLane.MONITOR_WRITE,),
-                input_builder=_payload_input,
-                owner="db_runtime",
-            ),
-        ),
+        "update_monitor": _monitor_lifecycle_specs(action, default_action="update"),
+        "pause_monitor": _monitor_lifecycle_specs(action, default_action="pause"),
+        "resume_monitor": _monitor_lifecycle_specs(action, default_action="resume"),
+        "delete_monitor": _monitor_lifecycle_specs(action, default_action="delete"),
         "execute_monitor": (
             _TaskSpec(
                 kind="monitor",
                 capability_id="db.monitor.execute",
                 required_lanes=(DbCapabilityLane.MONITOR_EXECUTE,),
                 input_builder=_payload_input,
+                must_be_contract_required=False,
+            ),
+        ),
+        "deliver_monitor": (
+            _TaskSpec(
+                kind="monitor",
+                capability_id=str(
+                    action.payload.get("capability_id") or "monitor.delivery.local"
+                ),
+                required_lanes=(DbCapabilityLane.MONITOR_EXECUTE,),
+                input_builder=_payload_input,
+                owner=(
+                    str(action.payload["owner"])
+                    if action.payload.get("owner") is not None
+                    else "db_runtime"
+                ),
                 must_be_contract_required=False,
             ),
         ),
@@ -601,6 +616,59 @@ def _action_task_specs(action: DbPlannerAction) -> tuple[_TaskSpec, ...]:
         raise DbAgentLoopBlocked(
             f"unsupported executable action {action.kind!r}"
         ) from exc
+
+
+def _monitor_create_specs(action: DbPlannerAction) -> tuple[_TaskSpec, ...]:
+    phase = str(action.payload.get("phase") or "plan")
+    if phase == "commit":
+        return (
+            _TaskSpec(
+                kind="monitor",
+                capability_id="db.monitor.commit_create",
+                required_lanes=(DbCapabilityLane.MONITOR_WRITE,),
+                input_builder=_monitor_commit_input,
+                owner="db_runtime",
+            ),
+        )
+    return (
+        _TaskSpec(
+            kind="monitor",
+            capability_id="db.monitor.plan_create",
+            required_lanes=(DbCapabilityLane.MONITOR_WRITE,),
+            input_builder=_monitor_create_plan_input,
+            owner="db_runtime",
+        ),
+    )
+
+
+def _monitor_lifecycle_specs(
+    action: DbPlannerAction,
+    *,
+    default_action: str,
+) -> tuple[_TaskSpec, ...]:
+    phase = str(action.payload.get("phase") or "plan")
+    if phase == "commit":
+        return (
+            _TaskSpec(
+                kind="monitor",
+                capability_id="db.monitor.commit_lifecycle",
+                required_lanes=(DbCapabilityLane.MONITOR_WRITE,),
+                input_builder=_monitor_commit_input,
+                owner="db_runtime",
+            ),
+        )
+    return (
+        _TaskSpec(
+            kind="monitor",
+            capability_id="db.monitor.plan_lifecycle",
+            required_lanes=(DbCapabilityLane.MONITOR_WRITE,),
+            input_builder=lambda item: _monitor_lifecycle_plan_input(
+                item,
+                default_action=default_action,
+            ),
+            owner="db_runtime",
+        ),
+    )
 
 
 def _runtime_task_specs_for_action(
@@ -735,6 +803,38 @@ def _sql_execute_input(action: DbPlannerAction) -> dict[str, Any]:
     if action.payload.get("focus") is not None:
         output["focus"] = action.payload["focus"]
     return output
+
+
+def _monitor_create_plan_input(action: DbPlannerAction) -> dict[str, Any]:
+    command = dict(action.payload.get("command") or {})
+    return {
+        "command": command,
+        "prompt": str(action.payload.get("prompt") or command.get("prompt") or ""),
+        "source_scope": list(action.payload.get("source_scope") or ()),
+        "owner": dict(action.payload.get("owner") or {}),
+    }
+
+
+def _monitor_lifecycle_plan_input(
+    action: DbPlannerAction,
+    *,
+    default_action: str,
+) -> dict[str, Any]:
+    patch = dict(action.payload.get("patch") or {})
+    patch.pop("paused_until", None)
+    return {
+        "action": str(action.payload.get("action") or default_action),
+        "monitor_id": str(action.payload.get("monitor_id") or ""),
+        "patch": patch,
+        "paused_until": action.payload.get("paused_until"),
+    }
+
+
+def _monitor_commit_input(action: DbPlannerAction) -> dict[str, Any]:
+    return {
+        "proposal_evidence_id": action.payload.get("proposal_evidence_id"),
+        "proposal_fingerprint": action.payload.get("proposal_fingerprint"),
+    }
 
 
 def _action_message(action: DbPlannerAction) -> str | None:

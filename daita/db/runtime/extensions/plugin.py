@@ -31,6 +31,7 @@ from .memory_learning import (
 )
 from .monitor_lifecycle import (
     DbMonitorCommitLifecycleExecutor,
+    DbMonitorInspectExecutor,
     DbMonitorLocalDeliveryExecutor,
     DbMonitorPlanLifecycleExecutor,
 )
@@ -252,6 +253,29 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 idempotent=True,
             ),
             Capability(
+                id="db.monitor.inspect",
+                owner="db_runtime",
+                description="Project durable DB monitor definitions and state.",
+                domains=frozenset({"db", "monitor"}),
+                operation_types=frozenset(
+                    {
+                        "monitor.read",
+                        "monitor.list",
+                        "monitor.inspect",
+                        "monitor.explain_run",
+                    }
+                ),
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.LOW,
+                input_schema=common_schema,
+                output_evidence=frozenset({"monitor.snapshot"}),
+                executor="db_runtime.monitor.inspect",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
                 id="db.monitor.plan_create",
                 owner="db_runtime",
                 description="Plan an executable DB monitor proposal from a monitor create prompt.",
@@ -330,6 +354,8 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                         "monitor.definition",
                         "monitor.deleted",
                         "monitor.disabled",
+                        "monitor.paused",
+                        "monitor.resumed",
                     }
                 ),
                 executor="db_runtime.monitor.commit_lifecycle",
@@ -511,6 +537,7 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
             DbAnalysisCheckpointExecutor(self),
             DbAnalysisSummarizeExecutor(self),
             DbAnalysisReplanExecutor(self),
+            DbMonitorInspectExecutor(self),
             DbMonitorPlanCreateExecutor(self),
             DbMonitorCommitCreateExecutor(self),
             DbMemoryPlanUpdateExecutor(self),
@@ -606,6 +633,12 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 json_schema=object_schema,
                 description="Auditable multi-step analysis replan or repair revision.",
+            ),
+            EvidenceSchema(
+                kind="monitor.snapshot",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Projected durable monitor definitions, state, and run summaries.",
             ),
             EvidenceSchema(
                 kind="monitor.proposal",

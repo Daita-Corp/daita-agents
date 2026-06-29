@@ -168,6 +168,28 @@ class DbSafetyVerifier:
         }:
             lanes.append(DbCapabilityLane.MEMORY_ANSWER)
             assumptions.append("explicit_request_mode_grants_memory_answer_lane")
+        elif request_mode in {
+            "monitor.read",
+            "monitor.list",
+            "monitor.inspect",
+            "monitor.explain_run",
+        }:
+            lanes.append(DbCapabilityLane.MONITOR_READ)
+            assumptions.append("explicit_request_mode_grants_monitor_read_lane")
+        elif request_mode in {
+            "monitor.write",
+            "monitor.create",
+            "monitor.update",
+            "monitor.pause",
+            "monitor.resume",
+            "monitor.delete",
+            "monitor.disable",
+        }:
+            lanes.append(DbCapabilityLane.MONITOR_WRITE)
+            assumptions.append("explicit_request_mode_grants_monitor_write_lane")
+        elif request_mode in {"monitor.execute", "monitor.delivery"}:
+            lanes.append(DbCapabilityLane.MONITOR_EXECUTE)
+            assumptions.append("explicit_request_mode_grants_monitor_execute_lane")
         elif explicit_schema_only:
             lanes.append(DbCapabilityLane.SCHEMA)
             assumptions.append("schema_only_forbids_row_access")

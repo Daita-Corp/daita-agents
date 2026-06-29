@@ -35,6 +35,7 @@ from ..authorization import normalize_authorization
 from ..contracts import DbContractBuilder
 from ..fallback_planner import ContractFallbackDbAgentPlanner
 from ..llm_service import DbLLMService, db_llm_service_from_metadata
+from ..monitor_commands.loop_adapter import DbMonitorCommandLoopPlanner
 from ..models import (
     DbOperationContract,
     DbOperationResult,
@@ -341,6 +342,19 @@ class DbRuntime(
             "contract_metadata": contract.metadata,
             "resume_context": resume_context,
         }
+        monitor_command = db_request.metadata.get("db_monitor_command")
+        if isinstance(monitor_command, dict):
+            operation_metadata.update(
+                {
+                    "control_plane": "db.monitor",
+                    "command_kind": monitor_command.get("kind"),
+                    "monitor_id": monitor_command.get("monitor_id"),
+                    "user_id": db_request.user_id,
+                    "session_id": db_request.session_id,
+                    "source_scope": list(db_request.source_scope),
+                    "request_metadata": dict(db_request.metadata),
+                }
+            )
         operation = await self.kernel.create_operation(
             operation_type=contract.operation_type,
             request={
@@ -392,7 +406,17 @@ class DbRuntime(
             )
 
         try:
-            governance = await self.kernel.evaluate_operation_governance(operation.id)
+            if _defer_monitor_management_governance(contract):
+                governance = GovernanceResult(
+                    True,
+                    False,
+                    False,
+                    metadata={"deferred_to_task_governance": True},
+                )
+            else:
+                governance = await self.kernel.evaluate_operation_governance(
+                    operation.id
+                )
         except RuntimeKernelGovernanceBlocked as exc:
             governance = exc.governance or GovernanceResult(False, True, False)
             base_diagnostics = {
@@ -439,7 +463,7 @@ class DbRuntime(
 
         outcome_diagnostics: dict[str, Any] = {}
         outcome_warnings: tuple[str, ...] = ()
-        planner = self._db_agent_planner()
+        planner = self._db_agent_planner(db_request)
         planner_source = self._db_agent_planner_source(planner)
         try:
             loop_result = await DbAgentLoop(
@@ -657,12 +681,19 @@ class DbRuntime(
             operation=operation,
         )
 
-    def _db_agent_planner(self) -> Any:
+    def _db_agent_planner(self, request: DbRequest | None = None) -> Any:
+        monitor_command = (
+            request.metadata.get("db_monitor_command") if request is not None else None
+        )
+        if isinstance(monitor_command, dict):
+            return DbMonitorCommandLoopPlanner(monitor_command)
         return self._injected_db_agent_planner() or ContractFallbackDbAgentPlanner(
             self.config.metadata
         )
 
     def _db_agent_planner_source(self, planner: Any) -> str:
+        if isinstance(planner, DbMonitorCommandLoopPlanner):
+            return "monitor_command_adapter"
         injected = self._injected_db_agent_planner()
         if injected is not None and planner is injected:
             return "injected"
@@ -855,6 +886,15 @@ class DbRuntime(
 
 def _inspection_counts(operation: Operation) -> bool:
     return operation.operation_type != "db.memory.learning"
+
+
+def _defer_monitor_management_governance(contract: DbOperationContract) -> bool:
+    lanes = set(contract.metadata.get("granted_lanes") or ())
+    return (
+        contract.operation_type.startswith("monitor.")
+        and "monitor_write" in lanes
+        and "monitor_execute" not in lanes
+    )
 
 
 def _latest_sql_from_evidence(evidence: tuple[Evidence, ...]) -> str | None:

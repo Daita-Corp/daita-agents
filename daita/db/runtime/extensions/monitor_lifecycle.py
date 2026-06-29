@@ -125,6 +125,59 @@ class DbMonitorPlanLifecycleExecutor:
 
 
 @dataclass(frozen=True)
+class DbMonitorInspectExecutor:
+    """Executor that projects durable monitor definitions into snapshot evidence."""
+
+    plugin: DbRuntimePlanningPlugin
+    id: str = "db_runtime.monitor.inspect"
+    owner: str = "db_runtime"
+    capability_ids: frozenset[str] = frozenset({"db.monitor.inspect"})
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        runtime = _bound_runtime(self.plugin)
+        monitor_id = task.input.get("monitor_id")
+        status = task.input.get("status")
+        if monitor_id:
+            inspection = await runtime.inspect_monitor(str(monitor_id))
+            inspections = [] if inspection is None else [inspection.to_dict()]
+            monitors = [] if inspection is None else [inspection.monitor.to_dict()]
+        else:
+            listed = await runtime.list_monitors(
+                status=str(status) if status is not None else None
+            )
+            monitors = [monitor.to_dict() for monitor in listed]
+            inspections = []
+        payload = {
+            "command": dict(task.input.get("command") or {}),
+            "monitor_id": None if monitor_id is None else str(monitor_id),
+            "status": status,
+            "detail": task.input.get("detail"),
+            "monitors": monitors,
+            "inspections": inspections,
+        }
+        return [
+            Evidence(
+                kind="monitor.snapshot",
+                owner="db_runtime",
+                operation_id=operation.id,
+                task_id=task.id,
+                accepted=True,
+                payload=payload,
+                metadata={
+                    "payload_fingerprint": stable_fingerprint(payload),
+                    "monitor_id": payload["monitor_id"],
+                    "status": status,
+                },
+            )
+        ]
+
+
+@dataclass(frozen=True)
 class DbMonitorCommitLifecycleExecutor:
     """Executor that idempotently commits a monitor lifecycle proposal."""
 

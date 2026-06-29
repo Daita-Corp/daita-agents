@@ -337,6 +337,14 @@ def _support_capabilities_for_lanes(
         )
     if DbCapabilityLane.MEMORY_WRITE in lane_set:
         support.extend(("memory.semantic.write", "db.schema.inspect"))
+    if DbCapabilityLane.MONITOR_WRITE in lane_set:
+        support.extend(
+            (
+                "db.monitor.commit_create",
+                "db.monitor.commit_lifecycle",
+                "db.schema.inspect",
+            )
+        )
     return tuple(_ordered_unique(support))
 
 

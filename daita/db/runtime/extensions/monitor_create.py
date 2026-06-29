@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Mapping
 from uuid import uuid4
 
@@ -165,6 +166,18 @@ class DbMonitorCommitCreateExecutor:
         committed_state = await runtime.monitor_store.load_monitor_state(monitor.id)
         if committed_state is None:
             committed_state = DbMonitorState(monitor_id=monitor.id)
+        await runtime.store.save_operation(
+            replace(
+                operation,
+                metadata={
+                    **operation.metadata,
+                    "monitor_id": monitor.id,
+                    "monitor_name": monitor.name,
+                    "proposal_fingerprint": actual_fingerprint,
+                    "proposal_evidence_id": proposal_evidence.id,
+                },
+            )
+        )
         return [
             Evidence(
                 kind="monitor.definition",

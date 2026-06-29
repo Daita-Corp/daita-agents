@@ -1326,6 +1326,19 @@ def _task_dependencies_for_capability(
     *,
     validation_task: Task | None = None,
 ) -> tuple[TaskDependency, ...]:
+    if capability.id in {
+        "db.monitor.commit_create",
+        "db.monitor.commit_lifecycle",
+    } and _monitor_command_requires_approval(operation):
+        return (
+            TaskDependency(
+                kind="approval",
+                approval_status=ApprovalStatus.APPROVED,
+                approval_policy_id="runtime.approval_required",
+                approval_name="monitor",
+                operation_id=operation.id,
+            ),
+        )
     if capability.id not in {"db.sql.execute_read", "db.sql.execute_write"}:
         return ()
     if capability.id == "db.sql.execute_read" and validation_task is None:
@@ -1360,4 +1373,17 @@ def _task_dependencies_for_capability(
             approval_name="human",
             operation_id=operation.id,
         ),
+    )
+
+
+def _monitor_command_requires_approval(operation: Operation) -> bool:
+    metadata = operation.request.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return False
+    command = metadata.get("db_monitor_command")
+    if not isinstance(command, Mapping):
+        return False
+    diagnostics = command.get("diagnostics")
+    return isinstance(diagnostics, Mapping) and bool(
+        diagnostics.get("approval_required")
     )

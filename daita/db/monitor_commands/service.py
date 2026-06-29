@@ -14,6 +14,7 @@ from daita.runtime import (
     RiskLevel,
     RuntimeEventType,
     TaskDependency,
+    TaskStatus,
 )
 
 from ..models import (
@@ -22,6 +23,7 @@ from ..models import (
     DbRequest,
 )
 from ..monitors import DbMonitor
+from ..runtime.tasks import DbTaskSpec
 from ..session_context import db_session_context_from_request
 from .answers import (
     _approval_action_answer,
@@ -32,7 +34,6 @@ from .answers import (
     _monitor_validation_answer,
     _resolution_failure_answer,
 )
-from .planner import _stable_monitor_payload_hash
 from .resolver import DbMonitorResolver
 from .router import DbCommandRouter
 from .types import DbMonitorCommand, DbMonitorResolution, DbMonitorValidation
@@ -59,8 +60,34 @@ class DbMonitorCommandService:
         if command is None:
             return None
         try:
-            return await self._run_command(command, request)
+            if command.kind == "approve_action":
+                return await self._approve_action(command, request)
+            command = await self._resolved_loop_command(command, request)
+            loop_result = await self.runtime.run(_loop_request(command, request))
+            pending_approval = await self._maybe_create_loop_approval(
+                command,
+                request,
+                loop_result,
+            )
+            if pending_approval is not None:
+                return pending_approval
+            projected = _project_monitor_loop_result(command, loop_result)
+            if (
+                projected.status is OperationStatus.BLOCKED
+                and "db_monitor_validation_failed" in projected.warnings
+            ):
+                await self.runtime.kernel.block_operation(
+                    projected.operation_id,
+                    message="Monitor proposal is incomplete or unsupported.",
+                    payload={"status": "blocked"},
+                )
+            return projected
         except ValueError as exc:
+            warning = (
+                "db_monitor_reference_required"
+                if str(exc) == "Please specify which monitor to manage."
+                else "db_monitor_command_failed"
+            )
             return await self.runtime.record_monitor_command_result(
                 request=request,
                 kind=command.kind,
@@ -72,217 +99,91 @@ class DbMonitorCommandService:
                     "command": _command_payload(command),
                     "error": {"type": type(exc).__name__, "message": str(exc)},
                 },
-                warnings=("db_monitor_command_failed",),
+                warnings=(warning,),
             )
 
-    async def _run_command(
+    async def _resolved_loop_command(
         self,
         command: DbMonitorCommand,
         request: DbRequest,
-    ) -> DbOperationResult:
-        if command.kind == "create":
-            return await self._create(command, request)
-        if command.kind == "list":
-            return await self._list(command, request)
-        if command.kind in {"inspect", "explain_run"}:
-            return await self._inspect(command, request)
-        if command.kind == "update":
-            return await self._update(command, request)
-        if command.kind == "pause":
-            return await self._pause(command, request)
-        if command.kind == "resume":
-            return await self._resume(command, request)
-        if command.kind == "delete":
-            return await self._delete(command, request)
-        if command.kind == "approve_action":
-            return await self._approve_action(command, request)
-        raise AssertionError(f"unsupported monitor command kind: {command.kind}")
+    ) -> DbMonitorCommand:
+        if command.kind in {"create", "list"}:
+            return command
+        resolution = await self._resolve(command, request)
+        if not resolution.accepted:
+            reason = resolution.errors[0] if resolution.errors else "monitor_not_found"
+            raise ValueError(_resolution_failure_answer(reason, resolution))
+        diagnostics = {**command.diagnostics, "resolution": resolution.to_dict()}
+        if resolution.proposal_evidence is not None:
+            diagnostics["proposal_evidence"] = resolution.proposal_evidence.to_dict()
+        if resolution.definition_evidence is not None:
+            diagnostics["definition_evidence"] = (
+                resolution.definition_evidence.to_dict()
+            )
+        return replace(
+            command,
+            monitor_id=resolution.monitor_ref or command.monitor_id,
+            diagnostics=diagnostics,
+        )
 
-    async def _create(
+    async def _maybe_create_loop_approval(
         self,
         command: DbMonitorCommand,
         request: DbRequest,
-    ) -> DbOperationResult:
-        if not self.runtime.is_setup:
-            await self.runtime.setup()
-
-        operation = await self.runtime.kernel.create_operation(
-            operation_type="monitor.create",
-            request={
-                "kind": "monitor.create",
-                "prompt": request.prompt,
-                "user_id": request.user_id,
-                "session_id": request.session_id,
-                "source_scope": list(request.source_scope),
-                "metadata": request.metadata,
-                "command": _command_payload(command),
-            },
-            required_evidence=frozenset({"monitor.proposal", "monitor.definition"}),
-            metadata={
-                "control_plane": "db.monitor",
-                "command_kind": "create",
-                "user_id": request.user_id,
-                "session_id": request.session_id,
-                "source_scope": list(request.source_scope),
-                "request_metadata": request.metadata,
-                "resume_context": {
-                    "request": {
-                        "prompt": request.prompt,
-                        "user_id": request.user_id,
-                        "session_id": request.session_id,
-                        "source_scope": list(request.source_scope),
-                        "metadata": request.metadata,
-                    },
-                    "contract": {
-                        "operation_type": "monitor.create",
-                        "required_evidence": [
-                            "monitor.proposal",
-                            "monitor.definition",
-                        ],
-                        "access": AccessMode.WRITE.value,
-                    },
-                },
-            },
-            evaluate_governance=False,
-        )
-        operation = await self.runtime._persist_trace_correlation(operation)
-        plan_task = await self.runtime.kernel.plan_task(
-            operation_id=operation.id,
-            capability_id="db.monitor.plan_create",
-            owner="db_runtime",
-            input={
-                "command": _command_payload(command),
-                "prompt": request.prompt,
-                "source_scope": list(request.source_scope),
-                "owner": _owner_from_request(request),
-            },
-            metadata={
-                "reason": "monitor_create_planning",
-                "sequence": 1,
-                "idempotency_key": _stable_monitor_payload_hash(
-                    {
-                        "prompt": request.prompt,
-                        "command": _command_payload(command),
-                        "source_scope": list(request.source_scope),
-                    }
-                ),
-            },
-        )
-        plan_evidence = await self.runtime.execute_task(plan_task, operation)
+        result: DbOperationResult,
+    ) -> DbOperationResult | None:
+        if command.kind != "create" or not command.diagnostics.get("approval_required"):
+            return None
+        evidence = await self.runtime.store.list_evidence(result.operation_id)
         proposal_evidence = next(
-            (item for item in plan_evidence if item.kind == "monitor.proposal"),
+            (item for item in evidence if item.kind == "monitor.proposal"),
             None,
         )
-        if proposal_evidence is None:
-            raise RuntimeError("monitor planning did not produce proposal evidence")
+        if proposal_evidence is None or not proposal_evidence.accepted:
+            return None
         proposal = dict(proposal_evidence.payload)
+        tasks = await self.runtime.store.list_tasks(result.operation_id)
+        commit_task = next(
+            (
+                task
+                for task in reversed(tasks)
+                if task.capability_id == "db.monitor.commit_create"
+            ),
+            None,
+        )
+        if commit_task is None:
+            operation = await self.runtime.store.load_operation(result.operation_id)
+            if operation is None:
+                return None
+            commit_task = self.runtime.materialize_task_specs(
+                operation,
+                (
+                    DbTaskSpec(
+                        capability_id="db.monitor.commit_create",
+                        owner="db_runtime",
+                        input={
+                            "proposal_evidence_id": proposal_evidence.id,
+                            "proposal_fingerprint": proposal["proposal_fingerprint"],
+                        },
+                        reason="monitor_create_commit",
+                        sequence=2,
+                        metadata={
+                            "idempotency_key": proposal["proposal_fingerprint"],
+                        },
+                    ),
+                ),
+            )[0]
+            commit_task = await self.runtime._plan_kernel_task(commit_task)
         validation = DbMonitorValidation.from_dict(
             dict(proposal.get("validation") or {})
         )
-        operation = replace(
-            operation,
-            metadata={
-                **operation.metadata,
-                "monitor_id": proposal["monitor_id"],
-                "monitor_name": proposal["name"],
-                "proposal_fingerprint": proposal["proposal_fingerprint"],
-            },
-        )
-        await self.runtime.store.save_operation(operation)
-        operation = await self.runtime._persist_trace_correlation(operation)
-        if not validation.accepted:
-            await self.runtime.kernel.block_operation(
-                operation.id,
-                message="Monitor proposal is incomplete or unsupported.",
-                payload={"validation": validation.to_dict()},
-            )
-            return await self.runtime.record_monitor_command_result(
-                request=request,
-                kind=command.kind,
-                command=_command_payload(command),
-                status=OperationStatus.BLOCKED,
-                answer=_monitor_validation_answer(validation),
-                operation_id=operation.id,
-                evidence=tuple(plan_evidence),
-                payload={
-                    "command": _command_payload(command),
-                    "proposal": proposal,
-                    "validation": validation.to_dict(),
-                },
-                warnings=("db_monitor_validation_failed", *validation.warnings),
-                diagnostics={"validation": validation.to_dict()},
-                persist_operation=False,
-            )
-        commit_task = await self.runtime.kernel.plan_task(
-            operation_id=operation.id,
-            capability_id="db.monitor.commit_create",
-            owner="db_runtime",
-            input={
-                "proposal_evidence_id": proposal_evidence.id,
-                "proposal_fingerprint": proposal["proposal_fingerprint"],
-            },
-            metadata={
-                "reason": "monitor_create_commit",
-                "sequence": 2,
-                "idempotency_key": proposal["proposal_fingerprint"],
-            },
-            dependencies=(
-                TaskDependency(
-                    kind="evidence",
-                    evidence_kind="monitor.proposal",
-                    evidence_id=proposal_evidence.id,
-                    evidence_owner="db_runtime",
-                    producer_task_id=plan_task.id,
-                    producer_capability_id=plan_task.capability_id,
-                    producer_executor_id=plan_task.executor_id,
-                    evidence_payload={
-                        "proposal_fingerprint": proposal["proposal_fingerprint"],
-                    },
-                    evidence_accepted=True,
-                    operation_id=operation.id,
-                ),
-            ),
-        )
-        if command.diagnostics.get("approval_required") is True:
-            return await self._create_pending_approval(
-                command,
-                request,
-                proposal,
-                proposal_evidence,
-                commit_task.id,
-                validation,
-            )
-        commit_evidence = await self.runtime.execute_task(commit_task, operation)
-        definition = next(
-            (item for item in commit_evidence if item.kind == "monitor.definition"),
-            None,
-        )
-        if definition is None:
-            raise RuntimeError("monitor commit did not produce definition evidence")
-        committed = DbMonitor.from_dict(definition.payload["monitor"])
-        inspection = await self.runtime.inspect_monitor(committed.id)
-        await self.runtime.kernel.complete_operation(
-            operation.id,
-            status=OperationStatus.SUCCEEDED,
-            message=f"Monitor {committed.id} created from proposal.",
-            payload={"monitor_id": committed.id},
-        )
-        return await self.runtime.record_monitor_command_result(
-            request=request,
-            kind=command.kind,
-            command=_command_payload(command),
-            status=OperationStatus.SUCCEEDED,
-            answer=_create_monitor_answer(committed),
-            operation_id=operation.id,
-            evidence=(*plan_evidence, *commit_evidence),
-            warnings=validation.warnings,
-            diagnostics={
-                "monitor": committed.to_dict(),
-                "inspection": None if inspection is None else inspection.to_dict(),
-                "validation": validation.to_dict(),
-                "proposal_evidence_id": proposal_evidence.id,
-            },
-            persist_operation=False,
+        return await self._create_pending_approval(
+            command,
+            request,
+            proposal,
+            proposal_evidence,
+            commit_task.id,
+            validation,
         )
 
     async def _create_pending_approval(
@@ -301,6 +202,19 @@ class DbMonitorCommandService:
             raise RuntimeError(
                 f"monitor create operation {proposal_evidence.operation_id} missing"
             )
+        operation = replace(
+            operation,
+            metadata={
+                **operation.metadata,
+                "control_plane": "db.monitor",
+                "command_kind": command.kind,
+                "monitor_id": proposal["monitor_id"],
+                "monitor_name": proposal["name"],
+                "proposal_fingerprint": proposal["proposal_fingerprint"],
+                "proposal_evidence_id": proposal_evidence.id,
+            },
+        )
+        await self.runtime.store.save_operation(operation)
         command_payload = _command_payload(command)
         approval = ApprovalRequest(
             approval_id=f"{operation.id}:runtime.approval_required:monitor.create",
@@ -333,13 +247,21 @@ class DbMonitorCommandService:
         await self.runtime.store.save_approval_request(approval)
         commit_task = await self.runtime.store.load_task(commit_task_id)
         if commit_task is not None:
-            from dataclasses import replace
-
+            retained_dependencies = tuple(
+                dependency
+                for dependency in commit_task.dependencies
+                if not (
+                    dependency.kind.value == "approval"
+                    and dependency.approval_id is None
+                    and dependency.approval_policy_id == "runtime.approval_required"
+                )
+            )
             await self.runtime.store.save_task(
                 replace(
                     commit_task,
+                    status=TaskStatus.PENDING,
                     dependencies=(
-                        *commit_task.dependencies,
+                        *retained_dependencies,
                         TaskDependency(
                             kind="approval",
                             approval_id=approval.approval_id,
@@ -396,220 +318,6 @@ class DbMonitorCommandService:
         for item in result.evidence:
             await self.runtime.store.save_evidence(item)
         return await self.runtime._record_operation_result(result, operation=operation)
-
-    async def _list(
-        self,
-        command: DbMonitorCommand,
-        request: DbRequest,
-    ) -> DbOperationResult:
-        monitors = await self.runtime.list_monitors(status=command.patch.get("status"))
-        return await self.runtime.record_monitor_command_result(
-            request=request,
-            kind=command.kind,
-            command=_command_payload(command),
-            status=OperationStatus.SUCCEEDED,
-            answer=_list_monitors_answer(monitors),
-            evidence_kind="monitor.listing",
-            payload={
-                "command": _command_payload(command),
-                "status": command.patch.get("status"),
-                "monitors": [monitor.to_dict() for monitor in monitors],
-            },
-            diagnostics={"monitors": [monitor.to_dict() for monitor in monitors]},
-        )
-
-    async def _inspect(
-        self,
-        command: DbMonitorCommand,
-        request: DbRequest,
-    ) -> DbOperationResult:
-        resolution = await self._resolve(command, request)
-        if not resolution.accepted:
-            return await self._resolution_failure(command, request, resolution)
-        if command.patch.get("detail"):
-            monitor_id = (
-                resolution.monitor.id if resolution.monitor is not None else None
-            )
-            return await self.runtime.record_monitor_command_result(
-                request=request,
-                kind=command.kind,
-                command=_command_payload(command, monitor_id=monitor_id),
-                status=OperationStatus.SUCCEEDED,
-                answer=_monitor_detail_answer(resolution, command=command),
-                evidence_kind="monitor.inspection",
-                payload={
-                    "command": _command_payload(command, monitor_id=monitor_id),
-                    "resolution": resolution.to_dict(),
-                    "detail": command.patch.get("detail"),
-                },
-                warnings=resolution.warnings,
-                diagnostics={
-                    "resolution": resolution.to_dict(),
-                    "detail": command.patch.get("detail"),
-                },
-            )
-        assert resolution.monitor is not None
-        inspection = await self.runtime.inspect_monitor(resolution.monitor.id)
-        if inspection is None:
-            return await self._resolution_failure(
-                command,
-                request,
-                DbMonitorResolution(
-                    None,
-                    resolution.monitor_ref,
-                    errors=("monitor_not_found",),
-                ),
-            )
-        evidence_kind = (
-            "monitor.run_summary"
-            if command.kind == "explain_run"
-            else "monitor.inspection"
-        )
-        return await self.runtime.record_monitor_command_result(
-            request=request,
-            kind=command.kind,
-            command=_command_payload(command),
-            status=OperationStatus.SUCCEEDED,
-            answer=_inspect_monitor_answer(inspection, command=command),
-            evidence_kind=evidence_kind,
-            payload={
-                "command": _command_payload(command),
-                "resolution": resolution.to_dict(),
-                "inspection": inspection.to_dict(),
-            },
-            warnings=resolution.warnings,
-            diagnostics={
-                "resolution": resolution.to_dict(),
-                "inspection": inspection.to_dict(),
-            },
-        )
-
-    async def _update(
-        self,
-        command: DbMonitorCommand,
-        request: DbRequest,
-    ) -> DbOperationResult:
-        resolution = await self._resolve(command, request)
-        if not resolution.accepted:
-            return await self._resolution_failure(command, request, resolution)
-        assert resolution.monitor is not None
-        updated = await self.runtime.update_monitor(
-            resolution.monitor.id, command.patch
-        )
-        inspection = await self.runtime.inspect_monitor(updated.id)
-        operation_id = _inspection_operation_id(inspection)
-        evidence = await _operation_evidence(self.runtime, operation_id)
-        return await self.runtime.record_monitor_command_result(
-            request=request,
-            kind=command.kind,
-            command=_command_payload(command, monitor_id=updated.id),
-            status=OperationStatus.SUCCEEDED,
-            answer=f"Updated monitor {updated.name} ({updated.id}).",
-            operation_id=operation_id,
-            evidence=tuple(evidence),
-            warnings=resolution.warnings,
-            diagnostics={
-                "resolution": resolution.to_dict(),
-                "monitor": updated.to_dict(),
-                "inspection": None if inspection is None else inspection.to_dict(),
-            },
-            persist_operation=False,
-        )
-
-    async def _pause(
-        self,
-        command: DbMonitorCommand,
-        request: DbRequest,
-    ) -> DbOperationResult:
-        resolution = await self._resolve(command, request)
-        if not resolution.accepted:
-            return await self._resolution_failure(command, request, resolution)
-        assert resolution.monitor is not None
-        paused = await self.runtime.pause_monitor(
-            resolution.monitor.id,
-            paused_until=command.patch.get("paused_until"),
-        )
-        inspection = await self.runtime.inspect_monitor(paused.id)
-        operation_id = _inspection_operation_id(inspection)
-        evidence = await _operation_evidence(self.runtime, operation_id)
-        return await self.runtime.record_monitor_command_result(
-            request=request,
-            kind=command.kind,
-            command=_command_payload(command, monitor_id=paused.id),
-            status=OperationStatus.SUCCEEDED,
-            answer=f"Paused monitor {paused.name} ({paused.id}).",
-            operation_id=operation_id,
-            evidence=tuple(evidence),
-            warnings=resolution.warnings,
-            diagnostics={
-                "resolution": resolution.to_dict(),
-                "monitor": paused.to_dict(),
-                "inspection": None if inspection is None else inspection.to_dict(),
-            },
-            persist_operation=False,
-        )
-
-    async def _resume(
-        self,
-        command: DbMonitorCommand,
-        request: DbRequest,
-    ) -> DbOperationResult:
-        resolution = await self._resolve(command, request)
-        if not resolution.accepted:
-            return await self._resolution_failure(command, request, resolution)
-        assert resolution.monitor is not None
-        resumed = await self.runtime.resume_monitor(resolution.monitor.id)
-        inspection = await self.runtime.inspect_monitor(resumed.id)
-        operation_id = _inspection_operation_id(inspection)
-        evidence = await _operation_evidence(self.runtime, operation_id)
-        return await self.runtime.record_monitor_command_result(
-            request=request,
-            kind=command.kind,
-            command=_command_payload(command, monitor_id=resumed.id),
-            status=OperationStatus.SUCCEEDED,
-            answer=f"Resumed monitor {resumed.name} ({resumed.id}).",
-            operation_id=operation_id,
-            evidence=tuple(evidence),
-            warnings=resolution.warnings,
-            diagnostics={
-                "resolution": resolution.to_dict(),
-                "monitor": resumed.to_dict(),
-                "inspection": None if inspection is None else inspection.to_dict(),
-            },
-            persist_operation=False,
-        )
-
-    async def _delete(
-        self,
-        command: DbMonitorCommand,
-        request: DbRequest,
-    ) -> DbOperationResult:
-        resolution = await self._resolve(command, request)
-        if not resolution.accepted:
-            return await self._resolution_failure(command, request, resolution)
-        assert resolution.monitor is not None
-        deleted = await self.runtime.delete_monitor(resolution.monitor.id)
-        operation_id = await _latest_monitor_operation_id(
-            self.runtime,
-            "delete",
-            deleted.id,
-        )
-        evidence = await _operation_evidence(self.runtime, operation_id)
-        return await self.runtime.record_monitor_command_result(
-            request=request,
-            kind=command.kind,
-            command=_command_payload(command, monitor_id=deleted.id),
-            status=OperationStatus.SUCCEEDED,
-            answer=f"Deleted monitor {deleted.name} ({deleted.id}).",
-            operation_id=operation_id,
-            evidence=tuple(evidence),
-            warnings=resolution.warnings,
-            diagnostics={
-                "resolution": resolution.to_dict(),
-                "monitor": deleted.to_dict(),
-            },
-            persist_operation=False,
-        )
 
     async def _approve_action(
         self,
@@ -682,14 +390,7 @@ class DbMonitorCommandService:
             approval = await self.runtime.approve_monitor_approval(approval_id)
 
         operation_id = str(approval_context.get("operation_id") or "")
-        resumed = None
-        if operation_id:
-            resumed = await self.runtime.resume_operation(operation_id)
-        status = (
-            resumed.operation.status
-            if resumed is not None
-            else OperationStatus.SUCCEEDED
-        )
+        status = OperationStatus.SUCCEEDED
         answer = _approval_action_answer(
             action,
             resolution.monitor.id,
@@ -710,7 +411,7 @@ class DbMonitorCommandService:
                 "approval_id": approval_id,
                 "approval_status": approval.status.value,
                 "operation_id": operation_id or None,
-                "operation_status": status.value,
+                "operation_status": "approval_state_changed",
                 "approval_context": approval_context.get("context"),
             },
             warnings=resolution.warnings,
@@ -719,7 +420,7 @@ class DbMonitorCommandService:
                 "approval_id": approval_id,
                 "approval_status": approval.status.value,
                 "operation_id": operation_id or None,
-                "operation_status": status.value,
+                "operation_status": "approval_state_changed",
             },
         )
 
@@ -959,13 +660,209 @@ class DbMonitorCommandService:
         )
 
 
-def _owner_from_request(request: DbRequest) -> dict[str, Any]:
-    owner: dict[str, Any] = {}
-    if request.user_id is not None:
-        owner["user_id"] = request.user_id
-    if request.session_id is not None:
-        owner["session_id"] = request.session_id
-    return owner
+def _loop_request(command: DbMonitorCommand, request: DbRequest) -> DbRequest:
+    metadata = {
+        **request.metadata,
+        "db_monitor_command": _command_payload(command),
+    }
+    return replace(
+        request,
+        mode=_operation_type_for_command(command),
+        metadata=metadata,
+    )
+
+
+def _operation_type_for_command(command: DbMonitorCommand) -> str:
+    if command.kind == "create":
+        return "monitor.create"
+    if command.kind == "list":
+        return "monitor.list"
+    if command.kind == "inspect":
+        return "monitor.inspect"
+    if command.kind == "explain_run":
+        return "monitor.explain_run"
+    return f"monitor.{command.kind}"
+
+
+def _project_monitor_loop_result(
+    command: DbMonitorCommand,
+    result: DbOperationResult,
+) -> DbOperationResult:
+    evidence = tuple(result.evidence)
+    diagnostics = dict(result.diagnostics)
+    if command.patch.get("detail") and (
+        command.diagnostics.get("proposal_evidence")
+        or command.diagnostics.get("definition_evidence")
+    ):
+        proposal_evidence = (
+            Evidence.from_dict(command.diagnostics["proposal_evidence"])
+            if command.diagnostics.get("proposal_evidence")
+            else None
+        )
+        definition_evidence = (
+            Evidence.from_dict(command.diagnostics["definition_evidence"])
+            if command.diagnostics.get("definition_evidence")
+            else None
+        )
+        resolution = DbMonitorResolution(
+            monitor=None,
+            monitor_ref=command.monitor_id,
+            proposal_evidence=proposal_evidence,
+            definition_evidence=definition_evidence,
+            operation_id=dict(command.diagnostics.get("resolution") or {}).get(
+                "operation_id"
+            ),
+            resolution_source=dict(command.diagnostics.get("resolution") or {}).get(
+                "resolution_source"
+            ),
+        )
+        return replace(
+            result,
+            answer=_monitor_detail_answer(resolution, command=command),
+            diagnostics={**diagnostics, "resolution": resolution.to_dict()},
+        )
+    proposal = _latest_evidence_by_kind(evidence, "monitor.proposal")
+    if proposal is not None:
+        validation = DbMonitorValidation.from_dict(
+            dict(proposal.payload.get("validation") or {})
+        )
+        diagnostics.setdefault("proposal", proposal.payload)
+        diagnostics.setdefault("validation", validation.to_dict())
+        if not validation.accepted:
+            return replace(
+                result,
+                status=OperationStatus.BLOCKED,
+                answer=_monitor_validation_answer(validation),
+                warnings=("db_monitor_validation_failed", *validation.warnings),
+                diagnostics=diagnostics,
+            )
+    if command.kind == "create":
+        definition = _latest_evidence_by_kind(evidence, "monitor.definition")
+        if definition is not None and isinstance(
+            definition.payload.get("monitor"), dict
+        ):
+            monitor = DbMonitor.from_dict(dict(definition.payload["monitor"]))
+            diagnostics.setdefault("monitor", monitor.to_dict())
+            return replace(
+                result,
+                answer=_create_monitor_answer(monitor),
+                diagnostics=diagnostics,
+            )
+    if command.kind in {"update", "pause", "resume", "delete"}:
+        committed = _latest_lifecycle_evidence(evidence)
+        if committed is not None:
+            monitor_payload = (
+                committed.payload.get("monitor")
+                or committed.payload.get("after")
+                or committed.payload.get("before")
+            )
+            monitor_name = command.monitor_id or str(
+                committed.payload.get("monitor_id")
+            )
+            monitor_id = monitor_name
+            if isinstance(monitor_payload, dict):
+                monitor = DbMonitor.from_dict(monitor_payload)
+                monitor_name = monitor.name
+                monitor_id = monitor.id
+                diagnostics.setdefault("monitor", monitor.to_dict())
+            verb = {
+                "update": "Updated",
+                "pause": "Paused",
+                "resume": "Resumed",
+                "delete": "Deleted",
+            }[command.kind]
+            return replace(
+                result,
+                answer=f"{verb} monitor {monitor_name} ({monitor_id}).",
+                diagnostics=diagnostics,
+            )
+    snapshot = _latest_evidence_by_kind(evidence, "monitor.snapshot")
+    if snapshot is not None:
+        payload = dict(snapshot.payload)
+        diagnostics.setdefault("snapshot", payload)
+        if command.kind == "list":
+            monitors = tuple(
+                DbMonitor.from_dict(dict(item))
+                for item in payload.get("monitors") or ()
+                if isinstance(item, dict)
+            )
+            return replace(
+                result,
+                answer=_list_monitors_answer(monitors),
+                diagnostics={
+                    **diagnostics,
+                    "monitors": [m.to_dict() for m in monitors],
+                },
+            )
+        inspections = payload.get("inspections") or ()
+        if inspections and isinstance(inspections[0], dict):
+            from ..monitors import DbMonitorInspection, DbMonitorRun, DbMonitorState
+
+            inspection_payload = dict(inspections[0])
+            inspection = DbMonitorInspection(
+                monitor=DbMonitor.from_dict(dict(inspection_payload["monitor"])),
+                state=(
+                    None
+                    if inspection_payload.get("state") is None
+                    else DbMonitorState.from_dict(dict(inspection_payload["state"]))
+                ),
+                runs=tuple(
+                    DbMonitorRun.from_dict(dict(item))
+                    for item in inspection_payload.get("runs") or ()
+                    if isinstance(item, dict)
+                ),
+            )
+            if command.patch.get("detail"):
+                resolution = DbMonitorResolution(
+                    monitor=inspection.monitor,
+                    monitor_ref=inspection.monitor.id,
+                    matches=(inspection.monitor,),
+                    operation_id=dict(command.diagnostics.get("resolution") or {}).get(
+                        "operation_id"
+                    ),
+                    resolution_source=dict(
+                        command.diagnostics.get("resolution") or {}
+                    ).get("resolution_source"),
+                )
+                return replace(
+                    result,
+                    answer=_monitor_detail_answer(resolution, command=command),
+                    diagnostics={
+                        **diagnostics,
+                        "inspection": inspection.to_dict(),
+                        "resolution": resolution.to_dict(),
+                    },
+                )
+            return replace(
+                result,
+                answer=_inspect_monitor_answer(inspection, command=command),
+                diagnostics={**diagnostics, "inspection": inspection.to_dict()},
+            )
+    return result
+
+
+def _latest_evidence_by_kind(
+    evidence: tuple[Evidence, ...],
+    kind: str,
+) -> Evidence | None:
+    for item in reversed(evidence):
+        if item.kind == kind:
+            return item
+    return None
+
+
+def _latest_lifecycle_evidence(evidence: tuple[Evidence, ...]) -> Evidence | None:
+    for kind in (
+        "monitor.state_update",
+        "monitor.paused",
+        "monitor.resumed",
+        "monitor.deleted",
+        "monitor.disabled",
+    ):
+        item = _latest_evidence_by_kind(evidence, kind)
+        if item is not None:
+            return item
+    return None
 
 
 def _request_has_monitor_context(request: DbRequest) -> bool:
@@ -1013,32 +910,3 @@ def _command_payload(
         "confidence": command.confidence,
         "diagnostics": command.diagnostics,
     }
-
-
-def _inspection_operation_id(inspection: Any) -> str | None:
-    if inspection is None or inspection.state is None:
-        return None
-    return inspection.state.last_operation_id
-
-
-async def _operation_evidence(
-    runtime: Any, operation_id: str | None
-) -> tuple[Any, ...]:
-    if not operation_id:
-        return ()
-    return tuple(await runtime.store.list_evidence(operation_id))
-
-
-async def _latest_monitor_operation_id(
-    runtime: Any,
-    action: str,
-    monitor_id: str,
-) -> str | None:
-    operations = await runtime.store.list_operations()
-    for operation in reversed(operations):
-        if (
-            operation.operation_type == f"monitor.{action}"
-            and operation.metadata.get("monitor_id") == monitor_id
-        ):
-            return operation.id
-    return None

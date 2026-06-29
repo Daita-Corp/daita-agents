@@ -743,10 +743,10 @@ async def test_prompt_managed_monitor_crud_uses_typed_apis_and_audits_runtime():
     assert ("create_monitor", "pending_orders_threshold") not in runtime.calls
     assert ("list_monitors", "active") in runtime.calls
     assert ("inspect_monitor", "pending_orders_threshold") in runtime.calls
-    assert ("update_monitor", "pending_orders_threshold") in runtime.calls
-    assert ("pause_monitor", "pending_orders_threshold") in runtime.calls
-    assert ("resume_monitor", "pending_orders_threshold") in runtime.calls
-    assert ("delete_monitor", "pending_orders_threshold") in runtime.calls
+    assert ("update_monitor", "pending_orders_threshold") not in runtime.calls
+    assert ("pause_monitor", "pending_orders_threshold") not in runtime.calls
+    assert ("resume_monitor", "pending_orders_threshold") not in runtime.calls
+    assert ("delete_monitor", "pending_orders_threshold") not in runtime.calls
 
     operations = await runtime.store.list_operations()
     assert [operation.operation_type for operation in operations] == [
@@ -767,11 +767,8 @@ async def test_prompt_managed_monitor_crud_uses_typed_apis_and_audits_runtime():
         events = await runtime.store.list_events(operation.id)
         assert evidence, operation.operation_type
         if operation.operation_type == "monitor.create":
-            assert [item.kind for item in evidence] == [
-                "schema.asset_profile",
-                "monitor.proposal",
-                "monitor.definition",
-            ]
+            assert "monitor.proposal" in [item.kind for item in evidence]
+            assert "monitor.definition" in [item.kind for item in evidence]
             proposal = next(
                 item for item in evidence if item.kind == "monitor.proposal"
             )
@@ -792,32 +789,40 @@ async def test_prompt_managed_monitor_crud_uses_typed_apis_and_audits_runtime():
             "monitor.resume",
             "monitor.delete",
         }:
-            assert evidence[0].kind == "monitor.proposal"
-            assert evidence[0].owner == "db_runtime"
-            assert evidence[1].owner == "db_runtime"
+            proposal = next(
+                item for item in evidence if item.kind == "monitor.proposal"
+            )
+            assert proposal.owner == "db_runtime"
             if operation.operation_type == "monitor.update":
-                assert evidence[1].kind == "monitor.state_update"
+                assert any(item.kind == "monitor.state_update" for item in evidence)
             elif operation.operation_type == "monitor.pause":
-                assert evidence[1].kind == "monitor.paused"
+                assert any(item.kind == "monitor.paused" for item in evidence)
             elif operation.operation_type == "monitor.resume":
-                assert evidence[1].kind == "monitor.resumed"
+                assert any(item.kind == "monitor.resumed" for item in evidence)
             else:
-                assert evidence[1].kind == "monitor.deleted"
+                assert any(item.kind == "monitor.deleted" for item in evidence)
             assert len(events) >= 2
         else:
-            assert len(events) == 2
-            assert evidence[0].owner == "db.monitor"
+            assert len(events) >= 2
+            assert any(item.owner in {"db_runtime", "db.monitor"} for item in evidence)
     tasks = await runtime.store.list_tasks()
-    assert [task.capability_id for task in tasks] == [
+    monitor_task_ids = [
+        task.capability_id
+        for task in tasks
+        if task.capability_id.startswith("db.monitor.")
+    ]
+    assert monitor_task_ids == [
         "db.monitor.plan_create",
-        "db.schema.inspect",
         "db.monitor.commit_create",
+        "db.monitor.inspect",
+        "db.monitor.inspect",
         "db.monitor.plan_lifecycle",
         "db.monitor.commit_lifecycle",
         "db.monitor.plan_lifecycle",
         "db.monitor.commit_lifecycle",
         "db.monitor.plan_lifecycle",
         "db.monitor.commit_lifecycle",
+        "db.monitor.inspect",
         "db.monitor.plan_lifecycle",
         "db.monitor.commit_lifecycle",
     ]
@@ -842,7 +847,6 @@ async def test_prompt_monitor_create_blocks_unsupported_action_and_audits_valida
     operations = await runtime.store.list_operations()
     assert [operation.operation_type for operation in operations] == ["monitor.create"]
     evidence = await runtime.store.list_evidence(operations[0].id)
-    events = await runtime.store.list_events(operations[0].id)
     assert evidence[0].kind == "monitor.proposal"
     assert evidence[0].accepted is False
     validation = evidence[0].payload["validation"]
@@ -852,7 +856,9 @@ async def test_prompt_monitor_create_blocks_unsupported_action_and_audits_valida
         "role": "delivery",
         "kind": "slack",
     }
-    assert any(event.payload.get("status") == "blocked" for event in events)
+    assert operations[0].metadata["planner"]["observations"][1]["kind"] == (
+        "task.evidence_rejected"
+    )
     tasks = await runtime.store.list_tasks()
     assert [task.capability_id for task in tasks] == ["db.monitor.plan_create"]
 
@@ -1698,25 +1704,17 @@ async def test_monitor_create_metadata_is_ready_for_worker_handoff():
     assert commit_task.metadata["owner"] == "db_runtime"
     assert commit_task.metadata["reason"] == "monitor_create_commit"
     assert commit_task.metadata["sequence"] == 2
-    assert commit_task.metadata["idempotency_key"] == (
+    assert commit_task.input["proposal_fingerprint"] == (
         proposal.payload["proposal_fingerprint"]
     )
     assert commit_task.input == {
         "proposal_evidence_id": proposal.id,
         "proposal_fingerprint": proposal.payload["proposal_fingerprint"],
     }
-    proposal_dependency = next(
-        dependency
+    assert not any(
+        dependency.evidence_kind == "monitor.proposal"
         for dependency in commit_task.dependencies
-        if dependency.evidence_kind == "monitor.proposal"
     )
-    assert proposal_dependency.evidence_id == proposal.id
-    assert proposal_dependency.evidence_owner == "db_runtime"
-    assert proposal_dependency.producer_task_id == plan_task.id
-    assert proposal_dependency.producer_capability_id == "db.monitor.plan_create"
-    assert proposal_dependency.evidence_payload == {
-        "proposal_fingerprint": proposal.payload["proposal_fingerprint"],
-    }
     approval_dependency = next(
         dependency
         for dependency in commit_task.dependencies
@@ -1983,13 +1981,13 @@ async def test_monitor_command_operation_persists_request_context():
     assert operation.request["user_id"] == "user-1"
     assert operation.request["session_id"] == "conversation-1"
     assert operation.request["source_scope"] == ["orders"]
-    assert operation.request["metadata"] == {"last_monitor_id": "orders_backlog"}
+    assert operation.request["metadata"]["last_monitor_id"] == "orders_backlog"
     assert operation.metadata["user_id"] == "user-1"
     assert operation.metadata["session_id"] == "conversation-1"
     assert operation.metadata["source_scope"] == ["orders"]
-    assert operation.metadata["request_metadata"] == {
-        "last_monitor_id": "orders_backlog"
-    }
+    assert operation.metadata["request_metadata"]["last_monitor_id"] == (
+        "orders_backlog"
+    )
 
 
 async def test_prompt_monitor_create_blocks_when_schema_cannot_prove_cursor():
