@@ -301,6 +301,33 @@ def _action_task_specs(action: DbPlannerAction) -> tuple[_TaskSpec, ...]:
                 must_be_contract_required=False,
             ),
         ),
+        "find_relationship_paths": (
+            _TaskSpec(
+                kind="catalog_relationships",
+                capability_id="catalog.relationship_paths.find",
+                required_lanes=(DbCapabilityLane.SCHEMA, DbCapabilityLane.READ),
+                input_builder=_payload_input,
+                owner="catalog",
+            ),
+        ),
+        "search_column_values": (
+            _TaskSpec(
+                kind="catalog_column_values",
+                capability_id="catalog.column_values.search",
+                required_lanes=(DbCapabilityLane.READ,),
+                input_builder=_payload_input,
+                owner="catalog",
+            ),
+        ),
+        "resolve_column_value_hints": (
+            _TaskSpec(
+                kind="catalog_column_value_hints",
+                capability_id="catalog.column_value_hints.resolve",
+                required_lanes=(DbCapabilityLane.READ,),
+                input_builder=_payload_input,
+                owner="catalog",
+            ),
+        ),
         "propose_sql_read": (
             _TaskSpec(
                 kind="prepare",
@@ -309,6 +336,15 @@ def _action_task_specs(action: DbPlannerAction) -> tuple[_TaskSpec, ...]:
                 input_builder=_payload_input,
                 owner="db_runtime",
                 must_be_contract_required=False,
+            ),
+        ),
+        "repair_query_plan": (
+            _TaskSpec(
+                kind="repair",
+                capability_id="db.query.repair",
+                required_lanes=(DbCapabilityLane.READ,),
+                input_builder=_payload_input,
+                owner="db_runtime",
             ),
         ),
         "propose_sql_write": (

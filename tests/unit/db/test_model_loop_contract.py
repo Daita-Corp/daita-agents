@@ -4,6 +4,7 @@ import pytest
 
 from daita.db.agent_loop import DbAgentLoop, DbAgentLoopBlocked
 from daita.db.contracts import DbContractBuilder
+from daita.db.fallback_planner import ContractFallbackDbAgentPlanner
 from daita.db.models import DbRequest, DbRuntimeConfig
 from daita.db.planner_protocol import DbPlannerAction, DbPlannerDecision
 from daita.db.runtime import resume as resume_module
@@ -12,7 +13,13 @@ from daita.db.runtime.tasks import DbRuntimeTasksMixin
 from daita.db.safety import DbSafetyVerifier
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import InMemoryRuntimeStore, Operation, OperationStatus, Task
+from daita.runtime import (
+    Evidence,
+    InMemoryRuntimeStore,
+    Operation,
+    OperationStatus,
+    Task,
+)
 
 
 class MockPlanner:
@@ -46,10 +53,10 @@ class RecordingRuntime(DbRuntimeTasksMixin):
         return ()
 
 
-def _contract(prompt, *, requested_capabilities=()):
+def _contract(prompt, *, requested_capabilities=(), plugins=()):
     request = DbRequest(prompt, requested_capabilities=tuple(requested_capabilities))
     frame = DbSafetyVerifier().verify(request)
-    runtime = DbRuntime(plugins=(SQLitePlugin(path=":memory:"),))
+    runtime = DbRuntime(plugins=(SQLitePlugin(path=":memory:"), *plugins))
     contract = DbContractBuilder(runtime.registry, DbRuntimeConfig()).build(
         request,
         frame,
@@ -64,10 +71,11 @@ def _contract(prompt, *, requested_capabilities=()):
     return request, runtime.registry, contract, operation
 
 
-async def _prepared_loop(prompt, *decisions, requested_capabilities=()):
+async def _prepared_loop(prompt, *decisions, requested_capabilities=(), plugins=()):
     request, registry, contract, operation = _contract(
         prompt,
         requested_capabilities=requested_capabilities,
+        plugins=plugins,
     )
     runtime = RecordingRuntime(registry)
     await runtime.store.save_operation(operation)
@@ -79,11 +87,12 @@ async def _prepared_loop(prompt, *decisions, requested_capabilities=()):
     return runtime, loop, request, operation, contract
 
 
-async def _run(prompt, *decisions, requested_capabilities=()):
+async def _run(prompt, *decisions, requested_capabilities=(), plugins=()):
     runtime, loop, request, operation, contract = await _prepared_loop(
         prompt,
         *decisions,
         requested_capabilities=requested_capabilities,
+        plugins=plugins,
     )
     result = await loop.run(
         request=request,
@@ -91,6 +100,192 @@ async def _run(prompt, *decisions, requested_capabilities=()):
         contract=contract,
     )
     return runtime, result
+
+
+def _fallback_decision(prompt, lanes, *, evidence=(), available=()):
+    planner = ContractFallbackDbAgentPlanner(
+        {
+            "from_db_options": {
+                "catalog_store_id": "runtime_source",
+                "memory": {"limit": 2, "score_threshold": 0.5},
+            }
+        }
+    )
+    return planner.decide(
+        {
+            "request": {"prompt": prompt},
+            "contract": {"granted_lanes": list(lanes)},
+            "evidence_observations": list(evidence),
+            "available_capabilities": [{"id": capability} for capability in available],
+        },
+        (),
+    )
+
+
+def _action_kind(decision):
+    return decision.actions[0].kind
+
+
+def test_fallback_planner_emits_expected_schema_read_memory_and_write_actions():
+    schema = {
+        "kind": "schema.asset_profile",
+        "id": "schema-1",
+        "accepted": True,
+        "payload": {"tables": [{"name": "orders"}]},
+    }
+    validation = {
+        "kind": "query.plan.validation",
+        "accepted": True,
+        "payload": {"valid": True, "sql": "select count(*) from orders"},
+    }
+
+    assert (
+        _action_kind(
+            _fallback_decision(
+                "what columns are in orders",
+                ("schema",),
+                available=("db.schema.inspect",),
+            )
+        )
+        == "inspect_schema"
+    )
+    assert (
+        _action_kind(
+            _fallback_decision(
+                "register the schema",
+                ("schema",),
+                evidence=(schema,),
+                available=("catalog.source.register",),
+            )
+        )
+        == "register_catalog_source"
+    )
+    assert (
+        _action_kind(
+            _fallback_decision(
+                "how many orders are there",
+                ("read",),
+                evidence=(schema,),
+                available=("db.query.prepare_read",),
+            )
+        )
+        == "propose_sql_read"
+    )
+    assert (
+        _action_kind(
+            _fallback_decision(
+                "how many orders are there",
+                ("read",),
+                evidence=(schema, validation),
+                available=("db.sql.execute_read",),
+            )
+        )
+        == "execute_validated_read"
+    )
+    assert (
+        _action_kind(
+            _fallback_decision(
+                "what did we learn about orders",
+                ("memory_answer",),
+            )
+        )
+        == "recall_memory"
+    )
+    assert (
+        _action_kind(
+            _fallback_decision(
+                "remember that orders joins customers by customer_id",
+                ("memory_write",),
+            )
+        )
+        == "write_memory"
+    )
+    assert (
+        _action_kind(
+            _fallback_decision(
+                "update orders set status = 'closed'",
+                ("write_propose",),
+            )
+        )
+        == "propose_sql_write"
+    )
+    assert (
+        _action_kind(
+            _fallback_decision(
+                "update orders set status = 'closed'",
+                ("write_execute",),
+            )
+        )
+        == "execute_validated_write"
+    )
+
+
+async def test_fallback_planner_uses_same_loop_task_spec_path():
+    request, registry, contract, operation = _contract("how many orders are there")
+    runtime = RecordingRuntime(registry)
+    await runtime.store.save_operation(operation)
+    await runtime.store.save_evidence(
+        Evidence(
+            kind="schema.asset_profile",
+            id="schema-1",
+            operation_id=operation.id,
+            payload={"tables": [{"name": "orders"}]},
+        )
+    )
+    loop = DbAgentLoop(
+        runtime,
+        ContractFallbackDbAgentPlanner({}),
+        max_steps=1,
+    )
+
+    result = await loop.run(
+        request=request,
+        operation=operation,
+        contract=contract,
+    )
+
+    assert result.status == "blocked"
+    assert [task.capability_id for task, _ in runtime.executed_tasks] == [
+        "db.query.prepare_read"
+    ]
+    assert [
+        [spec.capability_id for spec in specs] for specs in runtime.materialized_specs
+    ] == [["db.query.prepare_read"]]
+
+
+async def test_catalog_and_value_parity_actions_materialize_task_specs():
+    runtime, result = await _run(
+        "how many orders for acme by customer",
+        DbPlannerDecision(
+            actions=(
+                DbPlannerAction(
+                    kind="find_relationship_paths",
+                    payload={
+                        "store_id": "runtime_source",
+                        "source_assets": ["orders"],
+                        "target_assets": ["customers"],
+                    },
+                ),
+                DbPlannerAction(
+                    kind="search_column_values",
+                    payload={"store_id": "runtime_source", "query": "acme"},
+                ),
+                DbPlannerAction(
+                    kind="resolve_column_value_hints",
+                    payload={"store_id": "runtime_source", "prompt": "acme orders"},
+                ),
+            )
+        ),
+        _finish(),
+        plugins=(CatalogPlugin(auto_persist=False),),
+    )
+
+    assert result.status == "finish"
+    assert [task.capability_id for task, _ in runtime.executed_tasks] == [
+        "catalog.relationship_paths.find",
+        "catalog.column_values.search",
+        "catalog.column_value_hints.resolve",
+    ]
 
 
 async def test_model_read_action_inside_schema_lane_is_blocked():

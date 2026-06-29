@@ -6,13 +6,16 @@ from dataclasses import dataclass, field
 import json
 from typing import Any, Mapping
 
-
 ALLOWED_DB_PLANNER_ACTION_KINDS: tuple[str, ...] = (
     "clarify",
     "inspect_schema",
     "register_catalog_source",
+    "find_relationship_paths",
     "build_planning_context",
+    "search_column_values",
+    "resolve_column_value_hints",
     "propose_sql_read",
+    "repair_query_plan",
     "propose_sql_write",
     "execute_validated_read",
     "execute_validated_write",
