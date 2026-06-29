@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import hashlib
 import inspect
+import json
 from typing import Any, Mapping, Protocol
+from uuid import uuid4
 
 from daita.runtime import Evidence, Operation, Task
 
@@ -16,6 +19,7 @@ from .planner_protocol import (
     DbPlannerObservation,
 )
 from .runtime.tasks import DbTaskSpec
+from .runtime.types import DbRuntimeGovernanceBlocked
 from .safety import DbCapabilityLane
 
 
@@ -47,7 +51,13 @@ class DbAgentLoopBlocked(ValueError):
 class DbAgentLoop:
     """Run planner actions inside a lane-based DB operation contract."""
 
-    def __init__(self, runtime: Any, planner: DbPlanner, *, max_steps: int = 8) -> None:
+    def __init__(
+        self,
+        runtime: Any,
+        planner: DbPlanner,
+        *,
+        max_steps: int = 12,
+    ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
         self.runtime = runtime
@@ -67,7 +77,24 @@ class DbAgentLoop:
 
         for _ in range(self.max_steps):
             context = await self._planner_context(db_request, operation, contract)
-            decision = await self._next_decision(context, tuple(observations))
+            try:
+                decision = await self._next_decision(context, tuple(observations))
+            except (KeyError, TypeError, ValueError) as exc:
+                observations.append(
+                    DbPlannerObservation(
+                        kind="planner.output.invalid",
+                        blocked=True,
+                        message=str(exc),
+                        payload={
+                            "error": {
+                                "type": type(exc).__name__,
+                                "message": str(exc),
+                            }
+                        },
+                    )
+                )
+                continue
+            decision_failed = False
             for action in decision.actions:
                 if action.kind == "clarify":
                     return DbAgentLoopResult(
@@ -86,17 +113,47 @@ class DbAgentLoop:
                         message=_action_message(action),
                     )
                 action_tasks = self._tasks_for_action(action, operation, contract)
+                action_failed = False
                 for task in action_tasks:
-                    evidence = await self.runtime.execute_task(
-                        task,
-                        operation,
-                        context={
-                            "db_planner_action": action.to_dict(),
-                            "db_operation_contract": _contract_context(contract),
-                        },
-                    )
+                    try:
+                        evidence = await self.runtime.execute_task(
+                            task,
+                            operation,
+                            context={
+                                "db_planner_action": action.to_dict(),
+                                "db_operation_contract": _contract_context(contract),
+                            },
+                        )
+                    except DbRuntimeGovernanceBlocked:
+                        raise
+                    except Exception as exc:
+                        stored = await self.runtime.store.load_task(task.id)
+                        tasks.append(stored or task)
+                        observations.append(
+                            DbPlannerObservation(
+                                kind="task.failed",
+                                action_id=action.action_id,
+                                task_ids=(task.id,),
+                                blocked=True,
+                                message=str(exc),
+                                payload={
+                                    "capability_id": task.capability_id,
+                                    "error": {
+                                        "type": type(exc).__name__,
+                                        "message": str(exc),
+                                    },
+                                },
+                            )
+                        )
+                        action_failed = True
+                        break
                     stored = await self.runtime.store.load_task(task.id)
                     tasks.append(stored or task)
+                    evidence_items = tuple(
+                        item
+                        for item in tuple(evidence or ())
+                        if isinstance(item, Evidence)
+                    )
                     observations.append(
                         DbPlannerObservation(
                             kind="task.executed",
@@ -104,15 +161,24 @@ class DbAgentLoop:
                             task_ids=(task.id,),
                             payload={
                                 "capability_id": task.capability_id,
-                                "evidence": [
-                                    item.to_dict()
-                                    for item in tuple(evidence or ())
-                                    if isinstance(item, Evidence)
-                                ],
+                                "evidence": [item.to_dict() for item in evidence_items],
                             },
                         )
                     )
-            if any(action.kind == "synthesize" for action in decision.actions):
+                    observations.extend(
+                        _planner_observations_for_evidence(
+                            action=action,
+                            task=task,
+                            evidence=evidence_items,
+                        )
+                    )
+                    await _remember_loop_evidence(self.runtime, operation)
+                if action_failed:
+                    decision_failed = True
+                    break
+            if not decision_failed and any(
+                action.kind == "synthesize" for action in decision.actions
+            ):
                 return DbAgentLoopResult(
                     status="synthesize",
                     observations=tuple(observations),
@@ -152,11 +218,14 @@ class DbAgentLoop:
         operation: Operation,
         contract: DbOperationContract,
     ) -> dict[str, Any]:
+        await _seed_cached_loop_evidence(self.runtime, request, operation)
         tasks = await self.runtime.store.list_tasks(operation.id)
         evidence = await self.runtime.store.list_evidence(operation.id)
         return {
             "request": {
                 "prompt": request.prompt,
+                "mode": request.mode,
+                "metadata": dict(request.metadata),
                 "source_scope": list(request.source_scope),
                 "constraints": request.constraints,
                 "session_context": request.session_context,
@@ -229,6 +298,49 @@ class DbAgentLoop:
                 raise DbAgentLoopBlocked(
                     f"action {action.kind!r} requires approval before execution"
                 )
+
+
+def _planner_observations_for_evidence(
+    *,
+    action: DbPlannerAction,
+    task: Task,
+    evidence: tuple[Evidence, ...],
+) -> tuple[DbPlannerObservation, ...]:
+    observations: list[DbPlannerObservation] = []
+    rejected = tuple(item for item in evidence if not item.accepted)
+    if rejected:
+        observations.append(
+            DbPlannerObservation(
+                kind="task.evidence_rejected",
+                action_id=action.action_id,
+                task_ids=(task.id,),
+                payload={
+                    "capability_id": task.capability_id,
+                    "evidence": [item.to_dict() for item in rejected],
+                },
+                message="task produced rejected evidence",
+            )
+        )
+    for item in evidence:
+        if item.kind != "query.result" or not item.accepted:
+            continue
+        payload = item.payload
+        rows = payload.get("rows")
+        total_rows = payload.get("total_rows")
+        if total_rows == 0 or rows == []:
+            observations.append(
+                DbPlannerObservation(
+                    kind="query.zero_rows",
+                    action_id=action.action_id,
+                    task_ids=(task.id,),
+                    payload={
+                        "capability_id": task.capability_id,
+                        "evidence": [item.to_dict()],
+                    },
+                    message="read query returned zero rows",
+                )
+            )
+    return tuple(observations)
 
 
 @dataclass(frozen=True)
@@ -314,6 +426,23 @@ def _action_task_specs(action: DbPlannerAction) -> tuple[_TaskSpec, ...]:
             _TaskSpec(
                 kind="catalog_column_values",
                 capability_id="catalog.column_values.search",
+                required_lanes=(DbCapabilityLane.READ,),
+                input_builder=_payload_input,
+                owner="catalog",
+            ),
+        ),
+        "profile_column_values": (
+            _TaskSpec(
+                kind="column_values",
+                capability_id="db.column_values.profile",
+                required_lanes=(DbCapabilityLane.READ,),
+                input_builder=_payload_input,
+            ),
+        ),
+        "register_column_values": (
+            _TaskSpec(
+                kind="catalog_column_values",
+                capability_id="catalog.column_values.register",
                 required_lanes=(DbCapabilityLane.READ,),
                 input_builder=_payload_input,
                 owner="catalog",
@@ -563,7 +692,7 @@ def _contract_context(contract: DbOperationContract) -> dict[str, Any]:
 
 
 def _payload_input(action: DbPlannerAction) -> dict[str, Any]:
-    return dict(action.payload)
+    return {key: value for key, value in action.payload.items() if key != "reason"}
 
 
 def _schema_input(action: DbPlannerAction) -> dict[str, Any]:
@@ -611,3 +740,119 @@ def _sql_execute_input(action: DbPlannerAction) -> dict[str, Any]:
 def _action_message(action: DbPlannerAction) -> str | None:
     value = action.payload.get("message") or action.payload.get("answer")
     return str(value) if value is not None else None
+
+
+async def _seed_cached_loop_evidence(
+    runtime: Any,
+    request: DbRequest,
+    operation: Operation,
+) -> None:
+    evidence = tuple(await runtime.store.list_evidence(operation.id))
+    if not _accepted_evidence(evidence, "schema.asset_profile"):
+        cached_schema = None
+        if hasattr(runtime, "cached_schema_evidence"):
+            cached_schema = runtime.cached_schema_evidence(operation_id=operation.id)
+        if cached_schema is None and hasattr(runtime, "persisted_schema_evidence"):
+            cached_schema = runtime.persisted_schema_evidence(operation_id=operation.id)
+        if cached_schema is not None:
+            await runtime.store.save_evidence(
+                _loop_seed_evidence(operation, cached_schema)
+            )
+            evidence = tuple(await runtime.store.list_evidence(operation.id))
+
+    schema = _latest_evidence(evidence, "schema.asset_profile")
+    if (
+        schema is not None
+        and not _accepted_evidence(evidence, "catalog.source_registered")
+        and hasattr(runtime, "cached_catalog_source_evidence")
+    ):
+        cached_catalog = runtime.cached_catalog_source_evidence(
+            operation_id=operation.id,
+            schema=schema.payload,
+            store_id=_loop_store_id(request, runtime),
+        )
+        if cached_catalog is not None:
+            await runtime.store.save_evidence(
+                _loop_seed_evidence(operation, cached_catalog)
+            )
+
+
+async def _remember_loop_evidence(runtime: Any, operation: Operation) -> None:
+    evidence = tuple(await runtime.store.list_evidence(operation.id))
+    schema = _latest_evidence(evidence, "schema.asset_profile")
+    if schema is not None and hasattr(runtime, "remember_schema_evidence"):
+        runtime.remember_schema_evidence(schema)
+    catalog = _latest_evidence(evidence, "catalog.source_registered")
+    if (
+        catalog is not None
+        and schema is not None
+        and hasattr(runtime, "remember_catalog_source_evidence")
+    ):
+        runtime.remember_catalog_source_evidence(
+            catalog,
+            schema=schema.payload,
+            store_id=str(
+                catalog.payload.get("store_id")
+                or _loop_store_id_from_operation(operation)
+            ),
+        )
+
+
+def _loop_seed_evidence(operation: Operation, evidence: Evidence) -> Evidence:
+    payload_fingerprint = _stable_payload_fingerprint(evidence.payload)
+    return replace(
+        evidence,
+        id=evidence.id or f"evidence-{uuid4()}",
+        operation_id=operation.id,
+        task_id=None,
+        metadata={
+            **evidence.metadata,
+            "payload_fingerprint": payload_fingerprint,
+        },
+    )
+
+
+def _latest_evidence(
+    evidence: tuple[Evidence, ...],
+    kind: str,
+) -> Evidence | None:
+    for item in reversed(evidence):
+        if item.kind == kind and item.accepted:
+            return item
+    return None
+
+
+def _accepted_evidence(evidence: tuple[Evidence, ...], kind: str) -> bool:
+    return _latest_evidence(evidence, kind) is not None
+
+
+def _loop_store_id(request: DbRequest, runtime: Any) -> str:
+    options = getattr(getattr(runtime, "config", None), "metadata", {}).get(
+        "from_db_options"
+    )
+    options = options if isinstance(options, dict) else {}
+    value = (
+        request.metadata.get("store_id")
+        or request.constraints.get("store_id")
+        or (request.source_scope[0] if request.source_scope else None)
+        or options.get("catalog_store_id")
+    )
+    return str(value or "runtime_source")
+
+
+def _loop_store_id_from_operation(operation: Operation) -> str:
+    request = dict(operation.request or {})
+    metadata = dict(request.get("metadata") or {})
+    constraints = dict(request.get("constraints") or {})
+    source_scope = list(request.get("source_scope") or ())
+    value = (
+        metadata.get("store_id")
+        or constraints.get("store_id")
+        or (source_scope[0] if source_scope else None)
+    )
+    return str(value or "runtime_source")
+
+
+def _stable_payload_fingerprint(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

@@ -1,4 +1,4 @@
-"""Deterministic fallback planner for contract-bound DB agent loops."""
+"""Minimal deterministic fallback planner for DB agent loops."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from .planner_protocol import DbPlannerAction, DbPlannerDecision
 
 
 class ContractFallbackDbAgentPlanner:
-    """Conservative planner for contract facts when no model planner is injected."""
+    """Small no-LLM adapter for contract facts when no model planner is injected."""
 
     def __init__(self, runtime_metadata: dict[str, Any]) -> None:
         self.runtime_metadata = dict(runtime_metadata)
@@ -21,14 +21,13 @@ class ContractFallbackDbAgentPlanner:
         lanes = set(str(item) for item in contract.get("granted_lanes") or ())
         evidence = _planner_evidence(ctx, observations)
         available = _available_capability_ids(ctx)
-        store_id = _planner_store_id(request, self.runtime_metadata)
 
         if "none" in lanes:
             return _planner_finish("No deterministic DB work was authorized.")
         if "schema" in lanes:
-            return self._schema_decision(prompt, request, evidence, available, store_id)
+            return self._schema_decision(prompt, request, evidence, available)
         if "read" in lanes:
-            return self._read_decision(prompt, request, evidence, available, store_id)
+            return self._read_decision(prompt, request, evidence, available)
         if "memory_answer" in lanes:
             return self._memory_answer_decision(prompt, evidence)
         if "memory_write" in lanes:
@@ -57,10 +56,11 @@ class ContractFallbackDbAgentPlanner:
         request: dict[str, Any],
         evidence: tuple[dict[str, Any], ...],
         available: set[str],
-        store_id: str,
     ) -> DbPlannerDecision:
-        schema = _database_schema_payload(evidence)
-        if schema is None and "db.schema.inspect" in available:
+        if (
+            _database_schema_payload(evidence) is None
+            and "db.schema.inspect" in available
+        ):
             return DbPlannerDecision(
                 actions=(
                     DbPlannerAction(
@@ -72,44 +72,7 @@ class ContractFallbackDbAgentPlanner:
                     ),
                 )
             )
-        if (
-            schema is not None
-            and "catalog.source.register" in available
-            and not _has_evidence(evidence, "catalog.source_registered")
-        ):
-            return DbPlannerDecision(
-                actions=(
-                    DbPlannerAction(
-                        kind="register_catalog_source",
-                        payload=_catalog_source_payload(
-                            schema,
-                            prompt=prompt,
-                            request=request,
-                            store_id=store_id,
-                            runtime_metadata=self.runtime_metadata,
-                        ),
-                    ),
-                )
-            )
-        if (
-            "catalog.schema.search" in available
-            and _has_evidence(evidence, "catalog.source_registered")
-            and not _has_evidence(evidence, "schema.search_result")
-        ):
-            return DbPlannerDecision(
-                actions=(
-                    DbPlannerAction(
-                        kind="inspect_schema",
-                        payload={
-                            "local_schema": False,
-                            "catalog_search_store_id": store_id,
-                            "query": prompt,
-                            "limit": 10,
-                        },
-                    ),
-                )
-            )
-        return _planner_finish("DB planner completed.")
+        return _planner_finish("Schema inspection completed.")
 
     def _read_decision(
         self,
@@ -117,55 +80,24 @@ class ContractFallbackDbAgentPlanner:
         request: dict[str, Any],
         evidence: tuple[dict[str, Any], ...],
         available: set[str],
-        store_id: str,
     ) -> DbPlannerDecision:
         schema = _database_schema_payload(evidence)
-        if schema is None and "db.schema.inspect" in available:
-            return DbPlannerDecision(
-                actions=(
-                    DbPlannerAction(
-                        kind="inspect_schema",
-                        payload={
-                            "focus": _focus_for_prompt(prompt),
-                            "source_scope": list(request.get("source_scope") or ()),
-                        },
-                    ),
-                )
-            )
-        if (
-            schema is not None
-            and "catalog.source.register" in available
-            and not _has_evidence(evidence, "catalog.source_registered")
-        ):
-            return DbPlannerDecision(
-                actions=(
-                    DbPlannerAction(
-                        kind="register_catalog_source",
-                        payload=_catalog_source_payload(
-                            schema,
-                            prompt=prompt,
-                            request=request,
-                            store_id=store_id,
-                            runtime_metadata=self.runtime_metadata,
+        if schema is None:
+            if "db.schema.inspect" in available:
+                return DbPlannerDecision(
+                    actions=(
+                        DbPlannerAction(
+                            kind="inspect_schema",
+                            payload={
+                                "focus": _focus_for_prompt(prompt),
+                                "source_scope": list(request.get("source_scope") or ()),
+                            },
                         ),
-                    ),
+                    )
                 )
-            )
+            return _planner_finish("Schema evidence is unavailable.")
+
         validation_sql = _accepted_query_plan_sql(evidence)
-        if validation_sql is None and "db.query.prepare_read" in available:
-            schema_ref = _latest_evidence_ref(evidence, "schema.asset_profile")
-            return DbPlannerDecision(
-                actions=(
-                    DbPlannerAction(
-                        kind="propose_sql_read",
-                        payload={
-                            "prompt": prompt,
-                            "schema_evidence_id": schema_ref,
-                            "reason": "deterministic_read_prepare",
-                        },
-                    ),
-                )
-            )
         if (
             validation_sql
             and not _has_evidence(evidence, "query.result")
@@ -179,7 +111,31 @@ class ContractFallbackDbAgentPlanner:
                     ),
                 )
             )
-        return _planner_finish("DB planner completed.")
+        if _has_rejected_query_plan_validation(evidence):
+            return _planner_finish(
+                "The fallback planner could not prepare a valid read query."
+            )
+        if (
+            validation_sql is None
+            and "db.query.prepare_read" in available
+            and _simple_read_prompt(prompt)
+        ):
+            return DbPlannerDecision(
+                actions=(
+                    DbPlannerAction(
+                        kind="propose_sql_read",
+                        payload={
+                            "prompt": prompt,
+                            "schema_evidence_id": _latest_evidence_ref(
+                                evidence,
+                                "schema.asset_profile",
+                            ),
+                            "reason": "minimal_fallback_read_prepare",
+                        },
+                    ),
+                )
+            )
+        return _planner_finish("A model planner is required for this DB read request.")
 
     def _memory_answer_decision(
         self,
@@ -208,7 +164,7 @@ class ContractFallbackDbAgentPlanner:
                     ),
                 )
             )
-        return _planner_finish("DB planner completed.")
+        return _planner_finish("DB memory recall completed.")
 
     def _memory_write_decision(
         self,
@@ -234,7 +190,7 @@ class ContractFallbackDbAgentPlanner:
                     ),
                 )
             )
-        return _planner_finish("DB planner completed.")
+        return _planner_finish("DB memory write completed.")
 
     @staticmethod
     def _write_decision(
@@ -243,6 +199,8 @@ class ContractFallbackDbAgentPlanner:
         *,
         execute: bool,
     ) -> DbPlannerDecision:
+        if not _write_sql_prompt(prompt):
+            return _planner_finish("A model planner is required for this write.")
         if execute and not _has_evidence(evidence, "write.execution"):
             return DbPlannerDecision(
                 actions=(
@@ -261,7 +219,7 @@ class ContractFallbackDbAgentPlanner:
                     ),
                 )
             )
-        return _planner_finish("DB planner completed.")
+        return _planner_finish("DB write handling completed.")
 
 
 def _planner_finish(message: str) -> DbPlannerDecision:
@@ -332,58 +290,19 @@ def _accepted_query_plan_sql(evidence: tuple[dict[str, Any], ...]) -> str | None
         if (
             isinstance(payload, dict)
             and payload.get("valid") is True
-            and payload.get("sql")
+            and (payload.get("accepted_sql") or payload.get("sql"))
         ):
-            return str(payload["sql"])
-    for item in reversed(evidence):
-        if item.get("kind") != "query.plan.proposal" or not item.get("accepted", True):
-            continue
-        payload = item.get("payload")
-        if isinstance(payload, dict) and payload.get("sql"):
-            return str(payload["sql"])
+            return str(payload.get("accepted_sql") or payload.get("sql"))
     return None
 
 
-def _planner_store_id(request: dict[str, Any], runtime_metadata: dict[str, Any]) -> str:
-    metadata = dict(request.get("metadata") or {})
-    constraints = dict(request.get("constraints") or {})
-    source_scope = list(request.get("source_scope") or ())
-    options = _from_db_options(runtime_metadata)
-    value = (
-        metadata.get("store_id")
-        or constraints.get("store_id")
-        or (source_scope[0] if source_scope else None)
-        or options.get("catalog_store_id")
+def _has_rejected_query_plan_validation(
+    evidence: tuple[dict[str, Any], ...],
+) -> bool:
+    return any(
+        item.get("kind") == "query.plan.validation" and not item.get("accepted", True)
+        for item in evidence
     )
-    return str(value or "runtime_source")
-
-
-def _catalog_source_payload(
-    schema: dict[str, Any],
-    *,
-    prompt: str,
-    request: dict[str, Any],
-    store_id: str,
-    runtime_metadata: dict[str, Any],
-) -> dict[str, Any]:
-    options = _from_db_options(runtime_metadata)
-    schema_payload = dict(schema)
-    schema_payload["store_id"] = store_id
-    profile_key = options.get("catalog_profile_key")
-    if profile_key:
-        schema_payload["profile_key"] = str(profile_key)
-        metadata = dict(schema_payload.get("metadata") or {})
-        metadata.setdefault("profile_key", str(profile_key))
-        schema_payload["metadata"] = metadata
-    request_metadata = dict(request.get("metadata") or {})
-    return {
-        "schema": schema_payload,
-        "store_type": schema.get("database_type") or "db",
-        "connection_string": request_metadata.get("connection_string"),
-        "store_id": store_id,
-        "persist": bool(profile_key),
-        "prompt": prompt,
-    }
 
 
 def _focus_for_prompt(prompt: str) -> str | None:
@@ -398,6 +317,44 @@ def _focus_for_prompt(prompt: str) -> str | None:
     stop = {"what", "which", "show", "list", "describe", "inspect", "are", "the", "in"}
     candidates = [word for word in words if word not in stop]
     return candidates[-1] if candidates else None
+
+
+def _simple_read_prompt(prompt: str) -> bool:
+    lowered = prompt.lower()
+    if any(
+        token in lowered
+        for token in (
+            " join ",
+            "relationship",
+            "related",
+            " by ",
+            " for ",
+            " where ",
+            " compare ",
+            " trend ",
+            " across ",
+            " group ",
+        )
+    ):
+        return False
+    simple_tokens = (
+        "how many",
+        "count",
+        "list",
+        "show",
+        "describe",
+        "what columns",
+        "which columns",
+    )
+    return any(token in lowered for token in simple_tokens)
+
+
+def _write_sql_prompt(prompt: str) -> bool:
+    return (
+        prompt.lstrip()
+        .lower()
+        .startswith(("insert ", "update ", "delete ", "create ", "alter ", "drop "))
+    )
 
 
 def _memory_options(runtime_metadata: dict[str, Any]) -> dict[str, Any]:

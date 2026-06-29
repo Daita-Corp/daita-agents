@@ -30,10 +30,9 @@ from daita.runtime import (
 )
 from daita.skills import SkillResolution, SkillResolver
 
-from ..agent_loop import DbAgentLoop, DbAgentLoopBlocked, DbAgentLoopResult
+from ..agent_loop import DbAgentLoop, DbAgentLoopBlocked
 from ..authorization import normalize_authorization
 from ..contracts import DbContractBuilder
-from ..execution import DbOperationExecutor
 from ..fallback_planner import ContractFallbackDbAgentPlanner
 from ..llm_service import DbLLMService, db_llm_service_from_metadata
 from ..models import (
@@ -440,35 +439,17 @@ class DbRuntime(
 
         outcome_diagnostics: dict[str, Any] = {}
         outcome_warnings: tuple[str, ...] = ()
+        planner = self._db_agent_planner()
+        planner_source = self._db_agent_planner_source(planner)
         try:
-            planner = self._injected_db_agent_planner()
-            if planner is None:
-                # Migration-only until Phase 3 of
-                # FROM_DB_AGENT_LOOP_UNIFICATION_CLEANUP: fallback planner parity is
-                # now defined, but DbRuntime.run() keeps executor dispatch as the
-                # temporary default for this phase.
-                outcome = await DbOperationExecutor(self).execute(
-                    db_request,
-                    contract,
-                    operation,
-                )
-                outcome_diagnostics = dict(outcome.diagnostics)
-                outcome_warnings = tuple(outcome.warnings)
-                loop_result = DbAgentLoopResult(
-                    status="finish",
-                    observations=(),
-                    tasks=outcome.tasks,
-                    message=None,
-                )
-            else:
-                loop_result = await DbAgentLoop(
-                    self,
-                    planner,
-                ).run(
-                    request=db_request,
-                    operation=operation,
-                    contract=contract,
-                )
+            loop_result = await DbAgentLoop(
+                self,
+                planner,
+            ).run(
+                request=db_request,
+                operation=operation,
+                contract=contract,
+            )
         except DbRuntimeGovernanceBlocked as exc:
             return await self._record_operation_result(
                 DbOperationResult(
@@ -503,6 +484,7 @@ class DbRuntime(
                         **base_diagnostics,
                         "planner": {
                             "status": "blocked",
+                            "source": planner_source,
                             "error": {
                                 "type": type(exc).__name__,
                                 "message": str(exc),
@@ -624,6 +606,7 @@ class DbRuntime(
                     **base_diagnostics,
                     "planner": {
                         "status": loop_result.status,
+                        "source": planner_source,
                         "decision": (
                             loop_result.decision.to_dict()
                             if loop_result.decision
@@ -678,6 +661,12 @@ class DbRuntime(
         return self._injected_db_agent_planner() or ContractFallbackDbAgentPlanner(
             self.config.metadata
         )
+
+    def _db_agent_planner_source(self, planner: Any) -> str:
+        injected = self._injected_db_agent_planner()
+        if injected is not None and planner is injected:
+            return "injected"
+        return "fallback"
 
     def _injected_db_agent_planner(self) -> Any:
         return self.host_services.get("db_agent_planner") or self.host_services.get(

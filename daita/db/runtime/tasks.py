@@ -736,7 +736,7 @@ class DbRuntimeTasksMixin:
             operation_id=operation.id,
             capability_id=capability.id,
             executor_id=capability.executor,
-            input={**input, "input_hash": input_hash},
+            input=input,
             required_evidence=capability.output_evidence,
             metadata={
                 **dict(metadata or {}),

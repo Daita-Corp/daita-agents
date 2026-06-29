@@ -209,11 +209,32 @@ class DbQueryPrepareReadExecutor:
             operation.id,
             task.input.get("planning_context_evidence_id"),
         )
+        relationship_evidence = await _load_evidence(
+            runtime,
+            operation.id,
+            task.input.get("relationship_evidence_id"),
+        )
+        if relationship_evidence is None and planning_context_evidence is not None:
+            for evidence_id in planning_context_evidence.payload.get(
+                "relationship_evidence_refs", ()
+            ):
+                relationship_evidence = await _load_evidence(
+                    runtime,
+                    operation.id,
+                    evidence_id,
+                )
+                if relationship_evidence is not None:
+                    break
         schema = dict(schema_evidence.payload) if schema_evidence is not None else {}
         plan = DbQueryPlanner().plan_read_query(
             base_request,
             operation,
             schema,
+            relationship_payload=(
+                dict(relationship_evidence.payload)
+                if relationship_evidence is not None
+                else None
+            ),
             planning_context=(
                 dict(planning_context_evidence.payload)
                 if planning_context_evidence is not None

@@ -13,6 +13,8 @@ ALLOWED_DB_PLANNER_ACTION_KINDS: tuple[str, ...] = (
     "find_relationship_paths",
     "build_planning_context",
     "search_column_values",
+    "profile_column_values",
+    "register_column_values",
     "resolve_column_value_hints",
     "propose_sql_read",
     "repair_query_plan",

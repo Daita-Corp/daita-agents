@@ -19,6 +19,7 @@ from daita.runtime import (
     Operation,
     OperationStatus,
     Task,
+    TaskStatus,
 )
 
 
@@ -158,7 +159,7 @@ def test_fallback_planner_emits_expected_schema_read_memory_and_write_actions():
                 available=("catalog.source.register",),
             )
         )
-        == "register_catalog_source"
+        == "finish"
     )
     assert (
         _action_kind(
@@ -181,6 +182,21 @@ def test_fallback_planner_emits_expected_schema_read_memory_and_write_actions():
             )
         )
         == "execute_validated_read"
+    )
+    assert (
+        _action_kind(
+            _fallback_decision(
+                "how many orders for acme by customer",
+                ("read",),
+                evidence=(schema,),
+                available=(
+                    "catalog.relationship_paths.find",
+                    "catalog.column_values.search",
+                    "db.query.prepare_read",
+                ),
+            )
+        )
+        == "finish"
     )
     assert (
         _action_kind(
@@ -251,6 +267,129 @@ async def test_fallback_planner_uses_same_loop_task_spec_path():
     assert [
         [spec.capability_id for spec in specs] for specs in runtime.materialized_specs
     ] == [["db.query.prepare_read"]]
+
+
+async def test_invalid_planner_output_is_observed_and_can_retry():
+    runtime, result = await _run(
+        "how many orders are there",
+        {"actions": [{"kind": "unsupported_action"}]},
+        _finish("recovered"),
+    )
+
+    assert result.status == "finish"
+    assert result.message == "recovered"
+    assert [observation.kind for observation in result.observations] == [
+        "planner.output.invalid"
+    ]
+    assert await runtime.store.list_tasks("op-model-loop") == []
+    assert runtime.executed_tasks == []
+
+
+async def test_validation_and_execution_failures_are_planner_observations():
+    read_decision = DbPlannerDecision(
+        actions=(
+            DbPlannerAction(
+                kind="execute_validated_read",
+                payload={"sql": "select * from orders"},
+                action_id="read-1",
+            ),
+        )
+    )
+    runtime, loop, request, operation, contract = await _prepared_loop(
+        "show orders",
+        read_decision,
+        _finish("planner handled failure"),
+    )
+
+    async def execute_task(task: Task, operation: Operation, context=None):
+        await runtime.store.save_task(task)
+        runtime.executed_tasks.append((task, context or {}))
+        if task.capability_id == "db.sql.validate":
+            return (
+                Evidence(
+                    kind="sql.validation",
+                    operation_id=operation.id,
+                    task_id=task.id,
+                    accepted=False,
+                    payload={
+                        "valid": False,
+                        "sql": task.input.get("sql"),
+                        "errors": ["invalid SQL"],
+                    },
+                ),
+            )
+        raise RuntimeError("validation dependency not satisfied")
+
+    runtime.execute_task = execute_task
+
+    result = await loop.run(
+        request=request,
+        operation=operation,
+        contract=contract,
+    )
+
+    assert result.status == "finish"
+    assert result.message == "planner handled failure"
+    assert [task.capability_id for task, _ in runtime.executed_tasks] == [
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    assert [observation.kind for observation in result.observations] == [
+        "task.executed",
+        "task.evidence_rejected",
+        "task.failed",
+    ]
+
+
+async def test_zero_row_read_result_is_planner_observation():
+    read_decision = DbPlannerDecision(
+        actions=(
+            DbPlannerAction(
+                kind="execute_validated_read",
+                payload={"sql": "select * from orders where status = 'missing'"},
+                action_id="read-1",
+            ),
+        )
+    )
+    runtime, loop, request, operation, contract = await _prepared_loop(
+        "show missing orders",
+        read_decision,
+        _finish("planner handled zero rows"),
+    )
+
+    async def execute_task(task: Task, operation: Operation, context=None):
+        await runtime.store.save_task(task)
+        runtime.executed_tasks.append((task, context or {}))
+        if task.capability_id == "db.sql.validate":
+            return (
+                Evidence(
+                    kind="sql.validation",
+                    operation_id=operation.id,
+                    task_id=task.id,
+                    payload={"valid": True, "sql": task.input.get("sql")},
+                ),
+            )
+        return (
+            Evidence(
+                kind="query.result",
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={"rows": [], "total_rows": 0, "truncated": False},
+            ),
+        )
+
+    runtime.execute_task = execute_task
+
+    result = await loop.run(
+        request=request,
+        operation=operation,
+        contract=contract,
+    )
+
+    assert result.status == "finish"
+    assert "query.zero_rows" in [
+        observation.kind for observation in result.observations
+    ]
 
 
 async def test_catalog_and_value_parity_actions_materialize_task_specs():
@@ -453,6 +592,115 @@ async def _spy_execute_task(runtime):
     return executed
 
 
+async def _stub_loop_execute_task(runtime):
+    executed = []
+    sql = "select count(*) as count from orders"
+
+    async def execute_task(task: Task, operation: Operation, context=None):
+        stored = replace(task, status=TaskStatus.SUCCEEDED)
+        await runtime.store.save_task(stored)
+        executed.append((stored, context or {}))
+        evidence = _evidence_for_stubbed_task(task, operation, sql)
+        for item in evidence:
+            await runtime.store.save_evidence(item)
+        return evidence
+
+    runtime.execute_task = execute_task
+    return executed, sql
+
+
+def _evidence_for_stubbed_task(
+    task: Task,
+    operation: Operation,
+    sql: str,
+) -> tuple[Evidence, ...]:
+    common = {
+        "operation_id": operation.id,
+        "task_id": task.id,
+        "owner": task.metadata.get("owner") or "db_runtime",
+    }
+    evidence_id = f"evidence-{task.id}"
+    if task.capability_id == "db.schema.inspect":
+        return (
+            Evidence(
+                id=evidence_id,
+                kind="schema.asset_profile",
+                payload={
+                    "database_type": "sqlite",
+                    "tables": [
+                        {
+                            "name": "orders",
+                            "columns": [{"name": "id"}, {"name": "total"}],
+                        }
+                    ],
+                },
+                **common,
+            ),
+        )
+    if task.capability_id == "catalog.source.register":
+        return (
+            Evidence(
+                id=evidence_id,
+                kind="catalog.source_registered",
+                payload={"store_id": "runtime_source"},
+                **common,
+            ),
+        )
+    if task.capability_id == "db.query.prepare_read":
+        return (
+            Evidence(
+                id=evidence_id,
+                kind="query.plan.proposal",
+                payload={"sql": sql},
+                **common,
+            ),
+            Evidence(
+                id=f"{evidence_id}-validation",
+                kind="query.plan.validation",
+                payload={"valid": True, "sql": sql, "accepted_sql": sql},
+                **common,
+            ),
+        )
+    if task.capability_id == "db.sql.validate":
+        return (
+            Evidence(
+                id=evidence_id,
+                kind="sql.validation",
+                payload={"valid": True, "sql": sql},
+                **common,
+            ),
+        )
+    if task.capability_id == "db.sql.execute_read":
+        return (
+            Evidence(
+                id=evidence_id,
+                kind="query.result",
+                payload={
+                    "sql": sql,
+                    "rows": [{"count": 2}],
+                    "total_rows": 1,
+                    "truncated": False,
+                },
+                **common,
+            ),
+        )
+    if task.capability_id == "db.answer.synthesize":
+        return (
+            Evidence(
+                id=evidence_id,
+                kind="answer.synthesis",
+                payload={
+                    "answer": "The count is 2.",
+                    "sufficiency": "sufficient",
+                    "cited_evidence_refs": [],
+                    "diagnostics": {},
+                },
+                **common,
+            ),
+        )
+    return ()
+
+
 async def test_db_runtime_run_persists_safety_contract_metadata_without_intent_metadata():
     runtime, _ = _runtime_for_run(_finish())
     executed = await _spy_execute_task(runtime)
@@ -526,19 +774,80 @@ async def test_db_runtime_read_prompt_creates_validate_and_read_tasks_through_lo
         "db.sql.execute_read",
     ]
     assert tasks[1].dependencies[0].producer_task_id == tasks[0].id
+    assert result.diagnostics["planner"]["source"] == "injected"
     assert result.diagnostics["planner"]["observations"]
+    assert [task.metadata["planner_action_kind"] for task in tasks] == [
+        "execute_validated_read",
+        "execute_validated_read",
+    ]
 
 
-async def test_db_runtime_invalid_planner_action_blocks_before_executor_tasks():
-    runtime, _ = _runtime_for_run({"actions": [{"kind": "unsupported_action"}]})
+async def test_db_runtime_fallback_planner_uses_normal_loop_path():
+    runtime = DbRuntime(
+        plugins=(
+            CatalogPlugin(auto_persist=False),
+            SQLitePlugin(path=":memory:"),
+        )
+    )
+    executed, sql = await _stub_loop_execute_task(runtime)
+
+    result = await runtime.run("how many orders are there")
+
+    tasks = await runtime.store.list_tasks(result.operation_id)
+    loop_tasks = [
+        task for task in tasks if task.capability_id != "db.answer.synthesize"
+    ]
+    assert result.status is OperationStatus.SUCCEEDED
+    assert result.answer == "The count is 2."
+    assert result.diagnostics["planner"]["source"] == "fallback"
+    assert result.diagnostics["planner"]["status"] == "finish"
+    assert result.diagnostics["execution"]["task_count"] == len(tasks)
+    assert result.diagnostics["execution"]["tasks"] == [
+        task.to_dict() for task in tasks
+    ]
+    assert result.diagnostics["execution"]["evidence_refs"]
+    assert result.diagnostics["execution"]["planned_sql"] == sql
+    assert [task.capability_id for task in loop_tasks] == [
+        "db.schema.inspect",
+        "db.query.prepare_read",
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    assert [task.capability_id for task, _ in executed] == [
+        "db.schema.inspect",
+        "db.query.prepare_read",
+        "db.sql.validate",
+        "db.sql.execute_read",
+        "db.answer.synthesize",
+    ]
+    assert [task.metadata["planner_action_kind"] for task in loop_tasks] == [
+        "inspect_schema",
+        "propose_sql_read",
+        "execute_validated_read",
+        "execute_validated_read",
+    ]
+    assert all(
+        "db_planner_action" in context
+        for task, context in executed
+        if task.capability_id != "db.answer.synthesize"
+    )
+
+
+async def test_db_runtime_repeated_invalid_planner_output_blocks_with_observations():
+    invalid = {"actions": [{"kind": "unsupported_action"}]}
+    runtime, _ = _runtime_for_run(*(invalid for _ in range(12)))
     executed = await _spy_execute_task(runtime)
 
     result = await runtime.run("how many orders are there")
 
     assert result.status is OperationStatus.BLOCKED
-    assert result.warnings == ("db_planner_action_blocked",)
+    assert result.warnings == ("db_planner_loop_blocked",)
     assert await runtime.store.list_tasks(result.operation_id) == []
     assert executed == []
+    assert {
+        observation["kind"]
+        for observation in result.diagnostics["planner"]["observations"]
+    } == {"planner.output.invalid", "loop.blocked"}
 
 
 async def test_db_runtime_contract_block_blocks_before_executor_tasks():
