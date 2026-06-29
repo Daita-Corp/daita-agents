@@ -106,7 +106,6 @@ def build_judge_input(
             "operation_id": evidence.operation_id,
             "operation_status": evidence.operation_status,
             "operation_type": evidence.operation_type,
-            "intent": evidence.intent,
             "tasks": runtime_tasks,
             "evidence": runtime_evidence,
             "governance": (

@@ -293,7 +293,6 @@ def _to_run_result(
         operation_id=evidence.operation_id,
         operation_status=evidence.operation_status,
         operation_type=evidence.operation_type,
-        intent=evidence.intent,
         tasks=evidence.tasks,
         evidence=evidence.evidence,
         governance=evidence.governance,

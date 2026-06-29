@@ -6,7 +6,8 @@ from daita.runtime import OperationStatus
 
 
 async def _seed(plugin: SQLitePlugin) -> None:
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             customer_id INTEGER NOT NULL,
@@ -17,7 +18,8 @@ async def _seed(plugin: SQLitePlugin) -> None:
             (1, 10, 42.5, 'paid'),
             (2, 11, NULL, 'pending'),
             (3, 12, 99.0, 'paid');
-        """)
+        """
+    )
 
 
 async def _runtime() -> tuple[DbRuntime, SQLitePlugin]:
@@ -49,7 +51,11 @@ def test_db_runtime_can_require_quality_evidence_when_service_registered():
     runtime = DbRuntime(plugins=(sqlite, DataQualityPlugin(db=sqlite)))
 
     contract = runtime.build_contract(
-        DbRequest("Check data quality for the orders table", mode="quality.check")
+        DbRequest(
+            "Check data quality for the orders table",
+            mode="quality.check",
+            requested_capabilities=("quality.profile",),
+        )
     )
 
     assert contract.required_capabilities == ("quality.profile",)
@@ -68,6 +74,8 @@ async def test_db_runtime_executes_quality_check_with_typed_evidence():
             DbRequest(
                 "Check data quality for the orders table",
                 mode="quality.check",
+                requested_capabilities=("quality.profile",),
+                metadata={"table": "orders"},
             )
         )
     finally:

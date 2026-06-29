@@ -57,7 +57,8 @@ class FailingRuntimeDbPlugin(BaseDatabasePlugin):
 
 async def _seed_sqlite(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL
@@ -69,19 +70,22 @@ async def _seed_sqlite(path):
         );
         INSERT INTO customers (name) VALUES ('Ada'), ('Linus');
         INSERT INTO orders (customer_id, total) VALUES (1, 10.0), (2, 20.0);
-        """)
+        """
+    )
     await plugin.disconnect()
 
 
 async def _seed_sqlite_with_cents(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             total_cents INTEGER NOT NULL
         );
         INSERT INTO orders (total_cents) VALUES (1234);
-        """)
+        """
+    )
     await plugin.disconnect()
 
 
@@ -225,11 +229,11 @@ async def test_agent_from_db_registers_skills_before_runtime_setup(tmp_path):
     try:
         inspection = await agent.describe()
         db_request = DbRequest("How many orders are there?")
-        intent = agent.runtime.classify_request(db_request)
+        safety_frame = agent.runtime.build_safety_frame(db_request)
         skill_resolution = agent.runtime._resolve_skills(db_request)
         contract = agent.runtime.build_contract(
             db_request,
-            intent,
+            safety_frame=safety_frame,
             skill_resolution=skill_resolution,
         )
     finally:
@@ -427,7 +431,7 @@ async def test_agent_from_db_passes_request_mode_to_runtime(tmp_path):
     finally:
         await agent.stop()
 
-    assert result.intent.kind.value == "schema.query"
+    assert result.operation_type == "schema.query"
     assert result.request.mode == "schema.query"
     assert result.status is OperationStatus.SUCCEEDED
 
@@ -508,7 +512,7 @@ async def test_agent_from_db_stream_yields_typed_runtime_result(tmp_path):
     assert len(agent.audit_log) == 1
     assert agent.audit_log[0]["prompt"] == "How many customers are there?"
     assert agent.audit_log[0]["status"] == "succeeded"
-    assert agent.audit_log[0]["intent_kind"] == "data.query"
+    assert agent.audit_log[0]["operation_type"] == "data.query"
     assert not hasattr(agent, "_db_original_stream")
     assert not hasattr(agent, "_db_last_context_metadata")
 
@@ -608,7 +612,7 @@ async def test_agent_from_db_records_runtime_operation_history(tmp_path):
     assert len(agent.audit_log) == 2
     assert agent.audit_log[0]["prompt"] == "How many customers are there?"
     assert agent.audit_log[0]["status"] == "succeeded"
-    assert agent.audit_log[0]["intent_kind"] == "data.query"
+    assert agent.audit_log[0]["operation_type"] == "data.query"
     assert agent.audit_log[0]["evidence_refs"]
 
 
@@ -712,6 +716,8 @@ async def test_agent_from_db_registers_db_adjacent_extension_plugins(tmp_path):
         quality_result = await agent.run_detailed(
             "Profile the orders table",
             mode="quality.check",
+            requested_capabilities=("quality.profile",),
+            metadata={"table": "orders"},
         )
     finally:
         await agent.stop()
@@ -745,6 +751,8 @@ async def test_agent_from_db_lineage_true_registers_runtime_plugin(tmp_path):
         result = await agent.run_detailed(
             "Trace lineage for orders",
             mode="lineage.trace",
+            requested_capabilities=("lineage.trace",),
+            metadata={"entity_id": "table:orders"},
         )
     finally:
         await agent.stop()
@@ -1101,7 +1109,7 @@ async def test_agent_from_db_memory_update_uses_runtime_capability_not_generic_t
         await agent.stop()
 
     assert result.status is OperationStatus.SUCCEEDED
-    assert result.intent.kind.value == "memory.update"
+    assert result.operation_type == "memory.update"
     assert "remember" not in inspection.tool_view_names
     assert "update_memory" not in inspection.tool_view_names
     backend.remember.assert_awaited_once()

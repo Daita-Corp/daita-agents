@@ -15,7 +15,7 @@ from ..capabilities import (
     QUERY_ZERO_ROW_DIAGNOSIS_EVIDENCE,
 )
 from ..evidence import DbEvidenceStore
-from ..models import DbIntent, DbOperationContract, DbRequest
+from ..models import DbOperationContract, DbRequest
 from .helpers import _short_table_name
 from .planning import _accepted_sql
 
@@ -164,6 +164,8 @@ class _ExecutionRepairMixin:
         )
         if _query_result_evidence(repaired_read) is not None:
             evidence_store.discard(query_result.id)
+            if query_result.id is not None:
+                await self.runtime.store.discard_evidence(query_result.id)
             return str(repaired_sql)
         return None
 
@@ -226,7 +228,6 @@ class _ExecutionRepairMixin:
     async def _try_deterministic_repair_fallback(
         self,
         request: DbRequest,
-        intent: DbIntent,
         operation: Operation,
         schema: dict[str, Any],
         relationship_payload: dict[str, Any] | None,
@@ -240,7 +241,6 @@ class _ExecutionRepairMixin:
     ) -> tuple[Evidence, Evidence, tuple[str, ...], dict[str, Any]] | None:
         plan = self.query_planner.plan_read_query(
             request,
-            intent,
             operation,
             schema,
             relationship_payload=relationship_payload,

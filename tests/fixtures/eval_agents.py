@@ -245,7 +245,6 @@ def runtime_result(
         "operation_id": "operation-1",
         "status": "succeeded",
         "answer": answer,
-        "intent": {"kind": "query"},
         "contract": {"operation_type": "db.query"},
         "evidence": evidence,
         "warnings": [],

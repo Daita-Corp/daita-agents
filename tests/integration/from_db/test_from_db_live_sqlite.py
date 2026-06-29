@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 from daita.agents.agent import Agent
 from daita.agents.conversation import ConversationHistory
-from daita.db import DbIntentKind, DbRuntimeOptions
+from daita.db import DbRuntimeOptions
 from daita.db.session_context import db_session_context_from_request
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.memory.local_backend import LocalMemoryBackend
@@ -49,7 +49,8 @@ def _require_live_openai() -> dict[str, object]:
 
 async def _seed_sales_db(path: Path) -> None:
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
@@ -70,7 +71,8 @@ async def _seed_sales_db(path: Path) -> None:
             (1, 80.00, 'pending'),
             (2, 50.00, 'complete'),
             (3, 175.00, 'complete');
-        """)
+        """
+    )
     await plugin.disconnect()
 
 
@@ -124,7 +126,7 @@ async def test_from_db_live_query_uses_runtime_tasks_and_evidence(tmp_path):
         await agent.stop()
 
     assert result.status is OperationStatus.SUCCEEDED
-    assert result.intent.kind is DbIntentKind.DATA_QUERY
+    assert result.operation_type == "data.query"
     assert 3 in _row_values(result)
     assert result.answer
     assert {
@@ -208,7 +210,7 @@ async def test_from_db_live_catalog_assisted_join_records_relationship_path(tmp_
         await agent.stop()
 
     assert result.status is OperationStatus.SUCCEEDED
-    assert result.intent.kind is DbIntentKind.CATALOG_ASSISTED_DATA_QUERY
+    assert result.operation_type == "data.query"
     assert result.answer == "Returned 4 rows."
     assert {
         "catalog.source_registered",
@@ -245,7 +247,7 @@ async def test_from_db_live_grounds_completed_orders_to_observed_status(tmp_path
     statuses = {row.get("status") for row in query_result.payload.get("rows", [])}
 
     assert result.status is OperationStatus.SUCCEEDED
-    assert result.intent.kind is DbIntentKind.DATA_QUERY
+    assert result.operation_type == "data.query"
     assert statuses == {"complete"}
     assert (
         len(query_result.payload["rows"]) == 3
@@ -323,7 +325,7 @@ async def test_from_db_live_resolves_non_descriptive_prompt_without_looping(tmp_
         await agent.stop()
 
     assert resolved.status is OperationStatus.SUCCEEDED
-    assert resolved.intent.kind is DbIntentKind.DATA_QUERY
+    assert resolved.operation_type == "data.query"
     assert len(_query_rows(resolved)) == 3
     assert resolved.answer
     assert {
@@ -334,7 +336,7 @@ async def test_from_db_live_resolves_non_descriptive_prompt_without_looping(tmp_
     } <= _evidence_kinds(resolved)
 
     assert bounded_fallback.status is OperationStatus.SUCCEEDED
-    assert bounded_fallback.intent.kind is DbIntentKind.CONVERSATIONAL
+    assert bounded_fallback.operation_type == "schema.query"
     assert bounded_fallback.answer
     assert "schema.asset_profile" in _evidence_kinds(bounded_fallback)
     assert "query.result" not in _evidence_kinds(bounded_fallback)

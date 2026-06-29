@@ -5,31 +5,11 @@ Typed records for the new database runtime.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from os import PathLike
 import json
 from typing import Any, Literal, Mapping
 
 from daita.runtime import AccessMode, Evidence, OperationStatus, RuntimeStore
-
-
-class DbIntentKind(str, Enum):
-    """Semantic categories the DB runtime can plan around."""
-
-    CONVERSATIONAL = "conversational"
-    SCHEMA_QUERY = "schema.query"
-    SCHEMA_RELATIONSHIP_QUERY = "schema.relationship_query"
-    DATA_QUERY = "data.query"
-    CATALOG_ASSISTED_DATA_QUERY = "data.query.catalog_assisted"
-    METRIC_QUERY = "metric.query"
-    REPORT_GENERATE = "report.generate"
-    QUALITY_CHECK = "quality.check"
-    LINEAGE_TRACE = "lineage.trace"
-    ANOMALY_INVESTIGATE = "anomaly.investigate"
-    MEMORY_UPDATE = "memory.update"
-    WRITE_PROPOSE = "write.propose"
-    WRITE_EXECUTE = "write.execute"
-    ADMIN = "admin"
 
 
 def _tuple_strings(values: tuple[str, ...] | list[str] | set[str]) -> tuple[str, ...]:
@@ -211,30 +191,6 @@ class DbRequest:
 
 
 @dataclass(frozen=True)
-class DbIntent:
-    """Classified intent used by contract builders."""
-
-    kind: DbIntentKind
-    confidence: float = 1.0
-    access: AccessMode = AccessMode.NONE
-    evidence_mode: str = "none"
-    requested_outputs: tuple[str, ...] = ()
-    constraints: dict[str, Any] = field(default_factory=dict)
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "kind", DbIntentKind(self.kind))
-        object.__setattr__(self, "access", AccessMode(self.access))
-        if not 0 <= self.confidence <= 1:
-            raise ValueError("confidence must be between 0 and 1")
-        object.__setattr__(
-            self, "requested_outputs", _tuple_strings(self.requested_outputs)
-        )
-        object.__setattr__(self, "constraints", _json_dict(self.constraints))
-        object.__setattr__(self, "diagnostics", _json_dict(self.diagnostics))
-
-
-@dataclass(frozen=True)
 class DbOperationContract:
     """Structured operation contract enforced by `DbRuntime`."""
 
@@ -266,7 +222,6 @@ class DbOperationResult:
 
     operation_id: str
     request: DbRequest
-    intent: DbIntent
     contract: DbOperationContract
     status: OperationStatus
     answer: str | None = None
@@ -284,6 +239,11 @@ class DbOperationResult:
     def telemetry(self) -> dict[str, Any]:
         """Normalized DB operation telemetry for framework and hosted consumers."""
         return db_operation_telemetry(self)
+
+    @property
+    def operation_type(self) -> str:
+        """Concrete operation type from the operation contract."""
+        return self.contract.operation_type
 
 
 def db_operation_telemetry(result: DbOperationResult) -> dict[str, Any]:
@@ -385,9 +345,8 @@ def normalize_db_telemetry_diagnostics(
     diagnostics: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Normalize one synthesis diagnostics payload into DB telemetry fields."""
-    tokens = (
-        diagnostics.get("tokens") if isinstance(diagnostics.get("tokens"), dict) else {}
-    )
+    raw_tokens = diagnostics.get("tokens")
+    tokens = raw_tokens if isinstance(raw_tokens, Mapping) else {}
     input_tokens = db_optional_int(
         diagnostics.get("input_tokens")
         if diagnostics.get("input_tokens") is not None

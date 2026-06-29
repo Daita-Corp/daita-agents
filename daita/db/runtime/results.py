@@ -38,8 +38,7 @@ class DbRuntimeResultsMixin:
                 operation_for_trace = None
         if operation_for_trace is not None:
             operation_for_trace = await self._persist_trace_correlation(
-                operation_for_trace,
-                intent_kind=result.intent.kind.value,
+                operation_for_trace
             )
             result = self._result_with_observability(result, operation_for_trace)
         else:
@@ -96,11 +95,9 @@ class DbRuntimeResultsMixin:
     async def _persist_trace_correlation(
         self,
         operation: Operation,
-        *,
-        intent_kind: str | None = None,
     ) -> Operation:
         trace = self._current_trace_metadata()
-        self._record_active_span_correlation(operation, intent_kind=intent_kind)
+        self._record_active_span_correlation(operation)
         if not trace:
             return operation
         updated = replace(
@@ -133,8 +130,6 @@ class DbRuntimeResultsMixin:
     def _record_active_span_correlation(
         self,
         operation: Operation,
-        *,
-        intent_kind: str | None = None,
     ) -> None:
         try:
             from daita.core.tracing import get_trace_manager
@@ -150,7 +145,6 @@ class DbRuntimeResultsMixin:
                 runtime_id=self.runtime_id,
                 runtime_kind=self.runtime_kind,
                 operation_type=operation.operation_type,
-                intent_kind=intent_kind or operation.metadata.get("intent_kind"),
                 command_kind=operation.metadata.get("command_kind"),
                 control_plane=operation.metadata.get("control_plane"),
                 monitor_id=operation.metadata.get("monitor_id"),
@@ -186,8 +180,8 @@ def _audit_entry_from_result(result: DbOperationResult) -> dict[str, Any]:
         "operation_id": result.operation_id,
         "prompt": result.request.prompt,
         "status": result.status.value,
-        "intent_kind": result.intent.kind.value,
         "operation_type": result.contract.operation_type,
+        "granted_lanes": list(result.contract.metadata.get("granted_lanes", ())),
         "warnings": list(result.warnings),
         "evidence": [_evidence_audit_summary(item) for item in result.evidence],
         "evidence_refs": (

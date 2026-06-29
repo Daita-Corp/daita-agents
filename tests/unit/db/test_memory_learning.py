@@ -1,8 +1,6 @@
 from unittest.mock import AsyncMock, MagicMock
 
 from daita.db import (
-    DbIntent,
-    DbIntentKind,
     DbOperationContract,
     DbOperationResult,
     DbRequest,
@@ -169,22 +167,16 @@ async def _source_operation(runtime, *, operation_type="data.query"):
         operation_type=operation_type,
         request={"prompt": "How much revenue is in orders?"},
         required_evidence=frozenset({"schema.asset_profile", "verification.result"}),
-        metadata={"intent_kind": operation_type},
+        metadata={"operation_type": operation_type},
         evaluate_governance=False,
     )
     return operation
 
 
 def _result(operation, evidence, *, status=OperationStatus.SUCCEEDED, verified=True):
-    intent_kind = (
-        DbIntentKind.MEMORY_UPDATE
-        if operation.operation_type == "memory.update"
-        else DbIntentKind.DATA_QUERY
-    )
     return DbOperationResult(
         operation_id=operation.id,
         request=DbRequest("How much revenue is in orders?"),
-        intent=DbIntent(kind=intent_kind, confidence=1.0),
         contract=DbOperationContract(
             operation_type=operation.operation_type,
             required_capabilities=(),

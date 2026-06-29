@@ -19,7 +19,7 @@ from ..memory import (
     db_memory_options_from_runtime_metadata,
     db_memory_planning_recall_decision,
 )
-from ..models import DbIntent, DbOperationContract, DbRequest
+from ..models import DbOperationContract, DbRequest
 from ..query_planning import DbQueryPlanner
 from ..query_sql_validation import sql_fingerprint
 
@@ -44,10 +44,8 @@ class _ExecutionPlanningMixin:
                 schema_evidence,
             )
             evidence_store.add(schema_evidence)
-        intent = self.runtime._db_intent_from_operation(operation)
         memory_evidence, memory_diagnostics = await self._recall_db_memory_for_planning(
             request,
-            intent,
             operation,
             tasks,
             evidence_store,
@@ -102,7 +100,6 @@ class _ExecutionPlanningMixin:
     async def _recall_db_memory_for_planning(
         self,
         request: DbRequest,
-        intent: DbIntent,
         operation: Operation,
         tasks: list[Task],
         evidence_store: DbEvidenceStore,
@@ -118,7 +115,7 @@ class _ExecutionPlanningMixin:
         )
         decision = db_memory_planning_recall_decision(
             prompt=request.prompt,
-            intent_kind=intent.kind.value,
+            operation_type=operation.operation_type,
             schema=schema,
             memory_config=options,
             matched_schema_terms=matched_schema_terms or None,
@@ -175,7 +172,6 @@ class _ExecutionPlanningMixin:
     async def _plan_query(
         self,
         request: DbRequest,
-        intent: DbIntent,
         operation: Operation,
         schema: dict[str, Any],
         relationship_payload: dict[str, Any] | None,
@@ -221,7 +217,6 @@ class _ExecutionPlanningMixin:
 
         plan = self.query_planner.plan_read_query(
             request,
-            intent,
             operation,
             schema,
             relationship_payload=relationship_payload,

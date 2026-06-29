@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
-from daita.runtime import Evidence, Operation, Task
+from daita.runtime import Evidence, Operation, Task, TaskDependencyKind
 
 from ...analysis import (
     DbAnalysisBudgets,
@@ -17,6 +17,16 @@ from ...analysis import (
     stable_fingerprint,
     validate_analysis_plan_payload,
 )
+
+if TYPE_CHECKING:
+    from .plugin import DbRuntimePlanningPlugin
+
+
+def _bound_runtime(plugin: DbRuntimePlanningPlugin) -> Any:
+    runtime = plugin.runtime
+    if runtime is None:
+        raise RuntimeError("DB runtime planning plugin is not bound to a runtime")
+    return runtime
 
 
 async def _analysis_context_ref_errors(
@@ -77,7 +87,7 @@ class DbAnalysisPlanExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         analysis_id = str(task.input.get("analysis_id") or f"analysis-{operation.id}")
         planning_context = await _load_evidence(
             runtime,
@@ -207,7 +217,7 @@ class DbAnalysisPlanValidationExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         plan_evidence = await _load_evidence(
             runtime,
             operation.id,
@@ -219,7 +229,7 @@ class DbAnalysisPlanValidationExecutor:
             plan_evidence.payload,
             plan_evidence=plan_evidence,
             registered_capabilities={
-                (capability.owner, capability.id): capability
+                capability.id: capability
                 for capability in runtime.registry.capabilities
             },
         )
@@ -233,13 +243,11 @@ class DbAnalysisPlanValidationExecutor:
             payload = {
                 **payload,
                 "valid": False,
-                "errors": [
-                    *list(payload.get("errors") or ()),
-                    *context_errors,
-                ],
+                "errors": [str(item) for item in payload.get("errors") or ()]
+                + context_errors,
             }
         if not plan_evidence.accepted:
-            errors = list(payload.get("errors") or ())
+            errors: list[str] = [str(item) for item in payload.get("errors") or ()]
             errors.append(
                 str(
                     (plan_evidence.payload.get("diagnostics") or {}).get("failure")
@@ -294,7 +302,7 @@ class DbAnalysisCheckpointExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         cited = await _accepted_dependency_evidence(runtime, task, operation)
         rows = sum(_row_count(item) for item in cited if item.kind == "query.result")
         analysis_id = str(
@@ -352,7 +360,7 @@ class DbAnalysisSummarizeExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         cited = await _accepted_dependency_evidence(runtime, task, operation)
         analysis_id = str(
             task.metadata.get("analysis_id") or task.input.get("analysis_id") or ""
@@ -450,7 +458,7 @@ class DbAnalysisReplanExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         parent = await _load_evidence(
             runtime,
             operation.id,
@@ -579,9 +587,9 @@ async def _accepted_dependency_evidence(
     task: Task,
     operation: Operation,
 ) -> tuple[Evidence, ...]:
-    evidence = []
+    evidence: list[Evidence] = []
     for dependency in task.dependencies:
-        if dependency.kind.value != "evidence":
+        if TaskDependencyKind(dependency.kind) is not TaskDependencyKind.EVIDENCE:
             continue
         item = await runtime._accepted_evidence_for_dependency(operation.id, dependency)
         if item is not None and item.accepted and item.operation_id == operation.id:
@@ -734,8 +742,9 @@ def _row_count(evidence: Evidence) -> int:
 
 def _compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
     compact = {key: payload.get(key) for key in ("rows", "total_rows", "sql", "valid")}
-    if isinstance(compact.get("rows"), list):
-        compact["rows"] = compact["rows"][:10]
+    rows = compact.get("rows")
+    if isinstance(rows, list):
+        compact["rows"] = rows[:10]
     return {key: value for key, value in compact.items() if value is not None}
 
 

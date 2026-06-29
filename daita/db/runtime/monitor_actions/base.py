@@ -8,11 +8,10 @@ from typing import Any
 from daita.runtime import AccessMode, Operation, OperationStatus
 
 from ...analysis import stable_fingerprint
-from ...models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
+from ...models import DbOperationContract, DbRequest
 from ..monitor_helpers import _normalize_monitor_action_plan
 from ..resume import (
     _db_contract_context,
-    _db_intent_context,
     _db_request_context,
 )
 from .reports import DbRuntimeMonitorActionReportsMixin
@@ -176,18 +175,6 @@ class DbRuntimeMonitorActionsMixin(
                 "monitor_action_fingerprint": action_fingerprint,
             },
         )
-        intent = DbIntent(
-            kind=(
-                DbIntentKind.REPORT_GENERATE
-                if action_kind == "scheduled_report"
-                else DbIntentKind.ANOMALY_INVESTIGATE
-            ),
-            access=(
-                AccessMode.WRITE if action_kind == "write_proposal" else AccessMode.READ
-            ),
-            evidence_mode="analysis",
-            requested_outputs=("analysis.synthesis", "monitor.action_result"),
-        )
         contract = DbOperationContract(
             operation_type=operation.operation_type,
             required_capabilities=(
@@ -232,7 +219,6 @@ class DbRuntimeMonitorActionsMixin(
             },
             "resume_context": {
                 "request": _db_request_context(request),
-                "intent": _db_intent_context(intent),
                 "contract": _db_contract_context(contract),
             },
         }

@@ -16,8 +16,6 @@ from daita.runtime import (
 )
 
 from ..models import (
-    DbIntent,
-    DbIntentKind,
     DbLimits,
     DbOperationContract,
     DbOperationResult,
@@ -216,7 +214,6 @@ class DbRuntimeResumeMixin:
 
         if _snapshot_has_incomplete_analysis(completed):
             request = _db_request_from_context(completed.operation)
-            intent = _db_intent_from_context(completed.operation)
             contract = _db_contract_from_context(completed.operation)
             operation = await self.kernel.update_operation(
                 operation_id,
@@ -225,7 +222,6 @@ class DbRuntimeResumeMixin:
             )
             await self._run_multi_step_analysis(
                 request,
-                intent,
                 contract,
                 operation,
                 base_diagnostics={
@@ -298,7 +294,9 @@ class DbRuntimeResumeMixin:
                 raise KeyError(operation_id)
             return resumed
 
-        if _operation_has_run_context(completed.operation):
+        if _operation_has_lane_run_context(completed.operation):
+            await self._complete_resumed_lane_run_operation(completed)
+        elif _operation_has_run_context(completed.operation):
             await self._complete_resumed_run_operation(completed)
         elif (
             completed.tasks
@@ -313,22 +311,57 @@ class DbRuntimeResumeMixin:
             raise KeyError(operation_id)
         return resumed
 
+    async def _complete_resumed_lane_run_operation(
+        self,
+        snapshot: OperationSnapshot,
+    ) -> None:
+        request = _db_request_from_context(snapshot.operation)
+        contract = _db_contract_from_context(snapshot.operation)
+        evidence = tuple(await self.store.list_evidence(snapshot.operation.id))
+        tasks = tuple(await self.store.list_tasks(snapshot.operation.id))
+        planner = _planner_context_from_operation(snapshot.operation)
+        await self._record_operation_result(
+            DbOperationResult(
+                operation_id=snapshot.operation.id,
+                request=request,
+                contract=contract,
+                status=OperationStatus.SUCCEEDED,
+                answer=_answer_from_lane_resume(snapshot.operation),
+                evidence=evidence,
+                diagnostics={
+                    "resume": {
+                        "source": "lane_contract_context",
+                        "granted_lanes": _granted_lanes_from_operation(
+                            snapshot.operation
+                        ),
+                        "forbidden_capabilities": _forbidden_capabilities_from_operation(
+                            snapshot.operation
+                        ),
+                    },
+                    "planner": planner,
+                    "execution": {
+                        "task_count": len(tasks),
+                        "tasks": [task.to_dict() for task in tasks],
+                    },
+                },
+            ),
+            operation=snapshot.operation,
+        )
+
     async def _complete_resumed_run_operation(
         self,
         snapshot: OperationSnapshot,
     ) -> None:
         request = _db_request_from_context(snapshot.operation)
-        intent = _db_intent_from_context(snapshot.operation)
         contract = _db_contract_from_context(snapshot.operation)
         evidence = tuple(await self.store.list_evidence(snapshot.operation.id))
         tasks = tuple(await self.store.list_tasks(snapshot.operation.id))
-        verification = self.verifier.verify(contract, intent, evidence, tasks)
+        verification = self.verifier.verify(contract, evidence, tasks)
         if not verification.passed:
             await self._record_operation_result(
                 DbOperationResult(
                     operation_id=snapshot.operation.id,
                     request=request,
-                    intent=intent,
                     contract=contract,
                     status=OperationStatus.FAILED,
                     answer="DB operation could not be verified against required evidence.",
@@ -347,7 +380,6 @@ class DbRuntimeResumeMixin:
         )
         synthesis_evidence, synthesis_task = await self._execute_answer_synthesis(
             operation=snapshot.operation,
-            intent=intent,
             outcome_evidence=(*evidence, verification_evidence),
         )
         final_evidence = (*evidence, verification_evidence, synthesis_evidence)
@@ -356,7 +388,6 @@ class DbRuntimeResumeMixin:
             DbOperationResult(
                 operation_id=snapshot.operation.id,
                 request=request,
-                intent=intent,
                 contract=contract,
                 status=OperationStatus.SUCCEEDED,
                 answer=_answer_from_synthesis_evidence(synthesis_evidence),
@@ -388,6 +419,14 @@ def _tasks_in_resume_order(tasks: tuple[Task, ...]) -> tuple[Task, ...]:
 
 def _operation_has_run_context(operation: Operation) -> bool:
     return isinstance(operation.metadata.get("resume_context"), dict)
+
+
+def _operation_has_lane_run_context(operation: Operation) -> bool:
+    context = _resume_context(operation)
+    return isinstance(context.get("safety_frame"), dict) and isinstance(
+        context.get("contract"),
+        dict,
+    )
 
 
 def _monitor_create_context(operation: Operation) -> bool:
@@ -480,6 +519,58 @@ def _resume_context(operation: Operation) -> dict[str, Any]:
     return context if isinstance(context, dict) else {}
 
 
+def _planner_context_from_operation(operation: Operation) -> dict[str, Any]:
+    planner = operation.metadata.get("planner")
+    if isinstance(planner, dict):
+        return dict(planner)
+    diagnostics = operation.metadata.get("planner_diagnostics")
+    if isinstance(diagnostics, dict):
+        return dict(diagnostics)
+    return {}
+
+
+def _granted_lanes_from_operation(operation: Operation) -> list[str]:
+    context = _resume_context(operation)
+    safety_frame = context.get("safety_frame")
+    if isinstance(safety_frame, dict):
+        lanes = safety_frame.get("granted_lanes")
+        if isinstance(lanes, list):
+            return [str(lane) for lane in lanes]
+    lanes = operation.metadata.get("granted_lanes")
+    if isinstance(lanes, list):
+        return [str(lane) for lane in lanes]
+    return []
+
+
+def _forbidden_capabilities_from_operation(operation: Operation) -> list[str]:
+    context = _resume_context(operation)
+    safety_frame = context.get("safety_frame")
+    if isinstance(safety_frame, dict):
+        capabilities = safety_frame.get("forbidden_capabilities")
+        if isinstance(capabilities, list):
+            return [str(capability) for capability in capabilities]
+    capabilities = operation.metadata.get("forbidden_capabilities")
+    if isinstance(capabilities, list):
+        return [str(capability) for capability in capabilities]
+    return []
+
+
+def _answer_from_lane_resume(operation: Operation) -> str:
+    planner = _planner_context_from_operation(operation)
+    decision = planner.get("decision")
+    if isinstance(decision, dict):
+        for action in decision.get("actions") or ():
+            if not isinstance(action, dict):
+                continue
+            payload = action.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            answer = payload.get("answer") or payload.get("message")
+            if isinstance(answer, str) and answer.strip():
+                return answer
+    return "DB operation resumed from persisted lane contract context."
+
+
 def _db_request_from_context(operation: Operation) -> DbRequest:
     context = _resume_context(operation).get("request") or operation.request
     return DbRequest(
@@ -491,19 +582,11 @@ def _db_request_from_context(operation: Operation) -> DbRequest:
         requested_capabilities=tuple(context.get("requested_capabilities") or ()),
         constraints=dict(context.get("constraints") or {}),
         metadata=dict(context.get("metadata") or {}),
-    )
-
-
-def _db_intent_from_context(operation: Operation) -> DbIntent:
-    context = _resume_context(operation).get("intent") or {}
-    return DbIntent(
-        kind=DbIntentKind(str(context.get("kind") or operation.operation_type)),
-        confidence=float(context.get("confidence", 1.0)),
-        access=AccessMode(str(context.get("access") or AccessMode.NONE.value)),
-        evidence_mode=str(context.get("evidence_mode") or "none"),
-        requested_outputs=tuple(context.get("requested_outputs") or ()),
-        constraints=dict(context.get("constraints") or {}),
-        diagnostics=dict(context.get("diagnostics") or {}),
+        session_context=(
+            dict(context.get("session_context"))
+            if isinstance(context.get("session_context"), dict)
+            else None
+        ),
     )
 
 
@@ -533,18 +616,7 @@ def _db_request_context(request: DbRequest) -> dict[str, Any]:
         "requested_capabilities": list(request.requested_capabilities),
         "constraints": request.constraints,
         "metadata": request.metadata,
-    }
-
-
-def _db_intent_context(intent: DbIntent) -> dict[str, Any]:
-    return {
-        "kind": intent.kind.value,
-        "confidence": intent.confidence,
-        "access": intent.access.value,
-        "evidence_mode": intent.evidence_mode,
-        "requested_outputs": list(intent.requested_outputs),
-        "constraints": intent.constraints,
-        "diagnostics": intent.diagnostics,
+        "session_context": request.session_context,
     }
 
 

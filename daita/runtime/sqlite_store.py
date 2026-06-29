@@ -250,6 +250,10 @@ class SQLiteRuntimeStore(RuntimeStore):
         with self._transaction() as conn:
             self._insert_evidence(conn, evidence)
 
+    async def discard_evidence(self, evidence_id: str) -> None:
+        with self._transaction() as conn:
+            conn.execute("delete from evidence where evidence_id = ?", (evidence_id,))
+
     async def append_event(self, event: RuntimeEvent) -> None:
         with self._transaction() as conn:
             self._insert_event(conn, event)
@@ -405,7 +409,8 @@ class SQLiteRuntimeStore(RuntimeStore):
 
     def _initialize(self) -> None:
         with self._transaction() as conn:
-            conn.executescript("""
+            conn.executescript(
+                """
                 create table if not exists operations (
                     id text primary key,
                     data text not null
@@ -442,7 +447,8 @@ class SQLiteRuntimeStore(RuntimeStore):
                     status text not null,
                     data text not null
                 );
-                """)
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)

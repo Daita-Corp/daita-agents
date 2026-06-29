@@ -4,6 +4,7 @@ Skeleton database runtime built on the extension registry.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
@@ -29,10 +30,12 @@ from daita.runtime import (
 )
 from daita.skills import SkillResolution, SkillResolver
 
+from ..agent_loop import DbAgentLoop, DbAgentLoopBlocked, DbAgentLoopResult
+from ..authorization import normalize_authorization
+from ..contracts import DbContractBuilder
 from ..execution import DbOperationExecutor
 from ..llm_service import DbLLMService, db_llm_service_from_metadata
 from ..models import (
-    DbIntent,
     DbOperationContract,
     DbOperationResult,
     DbRequest,
@@ -40,7 +43,8 @@ from ..models import (
     DbRuntimeInspection,
 )
 from ..monitors import DbMonitorStore
-from ..planning import DbContractBuilder, DbIntentClassifier
+from ..planner_protocol import DbPlannerAction, DbPlannerDecision
+from ..safety import DbCapabilityLane, DbSafetyFrame, DbSafetyVerifier
 from ..session_context import db_session_context_from_request
 from ..synthesis import DbSynthesizer
 from ..verification import DbVerifier
@@ -55,11 +59,8 @@ from .memory_learning import DbRuntimeMemoryLearningMixin
 from .monitors import DbRuntimeMonitorsMixin, _default_monitor_store
 from .resume import (
     DbRuntimeResumeMixin,
-    _answer_from_synthesis_evidence,
     _db_contract_context,
     _db_contract_from_context,
-    _db_intent_context,
-    _db_intent_from_context,
     _db_request_context,
     _db_request_from_context,
 )
@@ -113,7 +114,7 @@ class DbRuntime(
         self.monitor_store = monitor_store or _default_monitor_store(self.store)
         self.approval_channel = approval_channel or InMemoryApprovalChannel(self.store)
         self.runtime_id = runtime_id or f"db-runtime-{uuid4()}"
-        self.intent_classifier = DbIntentClassifier()
+        self.safety_verifier = DbSafetyVerifier()
         self.verifier = DbVerifier()
         self.synthesizer = DbSynthesizer()
         self.db_llm_service = db_llm_service or db_llm_service_from_metadata(
@@ -279,36 +280,33 @@ class DbRuntime(
                 blocks.append(block)
         return tuple(sorted(blocks, key=lambda item: item.priority, reverse=True))
 
-    def classify_request(self, request: DbRequest | str) -> DbIntent:
-        """Classify a prompt into a DB intent."""
+    def build_safety_frame(self, request: DbRequest | str) -> DbSafetyFrame:
+        """Build deterministic DB safety facts for a request."""
         db_request = request if isinstance(request, DbRequest) else DbRequest(request)
-        return self.intent_classifier.classify(db_request)
+        return self.safety_verifier.verify(db_request)
 
     def build_contract(
         self,
         request: DbRequest | str,
-        intent: DbIntent | None = None,
         *,
+        safety_frame: DbSafetyFrame | None = None,
         skill_resolution: SkillResolution | None = None,
         include_skills: bool = True,
     ) -> DbOperationContract:
-        """Build a structured operation contract from registry capabilities."""
+        """Build a lane-based operation contract from registry capabilities."""
         db_request = request if isinstance(request, DbRequest) else DbRequest(request)
-        resolved_intent = intent or self.classify_request(db_request)
+        resolved_safety_frame = safety_frame or self.build_safety_frame(db_request)
         resolved_skills = skill_resolution
         if resolved_skills is None and include_skills:
             resolved_skills = self._resolve_skills(db_request)
         return DbContractBuilder(self.registry, self.config).build(
             db_request,
-            resolved_intent,
+            resolved_safety_frame,
             skill_effects=resolved_skills.effects if resolved_skills else (),
         )
 
     def _db_request_from_operation(self, operation: Operation) -> DbRequest:
         return _db_request_from_context(operation)
-
-    def _db_intent_from_operation(self, operation: Operation) -> DbIntent:
-        return _db_intent_from_context(operation)
 
     def _db_contract_from_context(self, operation: Operation) -> DbOperationContract:
         return _db_contract_from_context(operation)
@@ -318,13 +316,32 @@ class DbRuntime(
         db_request = request if isinstance(request, DbRequest) else DbRequest(request)
         if not self._is_setup:
             await self.setup()
-        intent = self.classify_request(db_request)
+        safety_frame = self.build_safety_frame(db_request)
         skill_resolution = self._resolve_skills(db_request)
         contract = self.build_contract(
             db_request,
-            intent,
+            safety_frame=safety_frame,
             skill_resolution=skill_resolution,
         )
+        resume_context = {
+            "request": _db_request_context(db_request),
+            "safety_frame": safety_frame.to_dict(),
+            "contract": _db_contract_context(contract),
+            "skills": skill_resolution.to_metadata(),
+        }
+        authorization = normalize_authorization(db_request.metadata)
+        resume_context["authorization"] = authorization
+        operation_metadata = {
+            "access": contract.access.value,
+            "authorization": authorization,
+            "skills": skill_resolution.to_metadata(),
+            "safety_frame": safety_frame.to_dict(),
+            "granted_lanes": [lane.value for lane in safety_frame.granted_lanes],
+            "forbidden_capabilities": list(safety_frame.forbidden_capabilities),
+            "contract": contract.metadata,
+            "contract_metadata": contract.metadata,
+            "resume_context": resume_context,
+        }
         operation = await self.kernel.create_operation(
             operation_type=contract.operation_type,
             request={
@@ -335,32 +352,26 @@ class DbRuntime(
                 "mode": db_request.mode,
                 "requested_capabilities": list(db_request.requested_capabilities),
                 "constraints": db_request.constraints,
-                "metadata": db_request.metadata,
-            },
-            required_evidence=frozenset(contract.required_evidence),
-            metadata={
-                "intent_kind": intent.kind.value,
-                "access": contract.access.value,
-                "skills": skill_resolution.to_metadata(),
-                "resume_context": {
-                    "request": _db_request_context(db_request),
-                    "intent": _db_intent_context(intent),
-                    "contract": _db_contract_context(contract),
-                    "skills": skill_resolution.to_metadata(),
+                "session_context": db_request.session_context,
+                "metadata": {
+                    **db_request.metadata,
+                    "authorization": authorization,
                 },
             },
+            required_evidence=frozenset(contract.required_evidence),
+            metadata=operation_metadata,
             evaluate_governance=False,
         )
         operation_id = operation.id
-        operation = await self._persist_trace_correlation(
-            operation,
-            intent_kind=intent.kind.value,
-        )
+        operation = await self._persist_trace_correlation(operation)
         await self._record_skill_resolution(operation_id, skill_resolution, contract)
 
         base_diagnostics = {
             "runtime_id": self.runtime_id,
             "registered_plugins": list(self.registry.plugin_ids),
+            "safety_frame": safety_frame.to_dict(),
+            "granted_lanes": [lane.value for lane in safety_frame.granted_lanes],
+            "forbidden_capabilities": list(safety_frame.forbidden_capabilities),
             "contract": contract.metadata,
             "skills": skill_resolution.to_metadata(),
         }
@@ -372,7 +383,6 @@ class DbRuntime(
                 DbOperationResult(
                     operation_id=operation_id,
                     request=db_request,
-                    intent=intent,
                     contract=contract,
                     status=OperationStatus.BLOCKED,
                     answer="Required DB capabilities are not registered.",
@@ -382,9 +392,6 @@ class DbRuntime(
                 operation=operation,
             )
 
-        analysis_route = self._should_route_multi_step_analysis(db_request, intent)
-        if not analysis_route:
-            await self._persist_contract_tasks(operation, contract)
         try:
             governance = await self.kernel.evaluate_operation_governance(operation.id)
         except RuntimeKernelGovernanceBlocked as exc:
@@ -398,7 +405,6 @@ class DbRuntime(
                     DbOperationResult(
                         operation_id=operation_id,
                         request=db_request,
-                        intent=intent,
                         contract=contract,
                         status=OperationStatus.BLOCKED,
                         answer="This operation was denied by governance policy.",
@@ -411,7 +417,6 @@ class DbRuntime(
                 DbOperationResult(
                     operation_id=operation_id,
                     request=db_request,
-                    intent=intent,
                     contract=contract,
                     status=OperationStatus.BLOCKED,
                     answer="This operation requires approval before execution.",
@@ -425,25 +430,46 @@ class DbRuntime(
             "governance": governance.to_dict(),
         }
 
-        if analysis_route:
+        if self._should_route_multi_step_analysis(db_request, contract):
             return await self._run_multi_step_analysis(
                 db_request,
-                intent,
                 contract,
                 operation,
                 base_diagnostics=base_diagnostics,
             )
 
+        outcome_diagnostics: dict[str, Any] = {}
+        outcome_warnings: tuple[str, ...] = ()
         try:
-            outcome = await DbOperationExecutor(self).execute(
-                db_request, intent, contract, operation
-            )
+            planner = self._injected_db_agent_planner()
+            if planner is None:
+                outcome = await DbOperationExecutor(self).execute(
+                    db_request,
+                    contract,
+                    operation,
+                )
+                outcome_diagnostics = dict(outcome.diagnostics)
+                outcome_warnings = tuple(outcome.warnings)
+                loop_result = DbAgentLoopResult(
+                    status="finish",
+                    observations=(),
+                    tasks=outcome.tasks,
+                    message=None,
+                )
+            else:
+                loop_result = await DbAgentLoop(
+                    self,
+                    planner,
+                ).run(
+                    request=db_request,
+                    operation=operation,
+                    contract=contract,
+                )
         except DbRuntimeGovernanceBlocked as exc:
             return await self._record_operation_result(
                 DbOperationResult(
                     operation_id=operation_id,
                     request=db_request,
-                    intent=intent,
                     contract=contract,
                     status=OperationStatus.BLOCKED,
                     answer=_governance_blocked_answer(exc.governance),
@@ -455,12 +481,38 @@ class DbRuntime(
                 ),
                 operation=operation,
             )
+        except (DbAgentLoopBlocked, ValueError) as exc:
+            operation = await self._persist_planner_loop_metadata(
+                operation,
+                planner_status="blocked",
+                planner_error=exc,
+            )
+            return await self._record_operation_result(
+                DbOperationResult(
+                    operation_id=operation_id,
+                    request=db_request,
+                    contract=contract,
+                    status=OperationStatus.BLOCKED,
+                    answer="DB planner action was blocked by the operation contract.",
+                    warnings=("db_planner_action_blocked",),
+                    diagnostics={
+                        **base_diagnostics,
+                        "planner": {
+                            "status": "blocked",
+                            "error": {
+                                "type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                        },
+                    },
+                ),
+                operation=operation,
+            )
         except Exception as exc:
             return await self._record_operation_result(
                 DbOperationResult(
                     operation_id=operation_id,
                     request=db_request,
-                    intent=intent,
                     contract=contract,
                     status=OperationStatus.FAILED,
                     answer=f"DB operation failed: {exc}",
@@ -473,79 +525,194 @@ class DbRuntime(
                 operation=operation,
             )
 
-        verification = self.verifier.verify(
-            contract, intent, outcome.evidence, outcome.tasks
-        )
-        if not verification.passed:
-            return await self._record_operation_result(
-                DbOperationResult(
-                    operation_id=operation_id,
-                    request=db_request,
-                    intent=intent,
-                    contract=contract,
-                    status=OperationStatus.FAILED,
-                    answer="DB operation could not be verified against required evidence.",
-                    evidence=outcome.evidence,
-                    warnings=tuple((*outcome.warnings, *verification.warnings)),
-                    diagnostics={
-                        **base_diagnostics,
-                        "execution": {
-                            **outcome.diagnostics,
-                            "task_count": len(outcome.tasks),
-                            "tasks": [task.to_dict() for task in outcome.tasks],
-                        },
-                        "verification": verification.to_dict(),
-                    },
-                ),
-                operation=operation,
-            )
-
-        verification_evidence = await self._persist_verification_result_evidence(
+        operation = await self._persist_planner_loop_metadata(
             operation,
-            verification,
-            outcome.evidence,
+            planner_status=loop_result.status,
+            planner_observations=[
+                observation.to_dict() for observation in loop_result.observations
+            ],
+            planner_decision=(
+                loop_result.decision.to_dict() if loop_result.decision else None
+            ),
+            planner_task_ids=[task.id for task in loop_result.tasks],
         )
-        synthesis_evidence, synthesis_task = await self._execute_answer_synthesis(
-            operation=operation,
-            intent=intent,
-            outcome_evidence=(*outcome.evidence, verification_evidence),
+        final_evidence = tuple(await self.store.list_evidence(operation_id))
+        final_tasks = tuple(await self.store.list_tasks(operation_id))
+        verification = None
+        synthesis = None
+        if loop_result.status not in {"blocked", "clarify"} and any(
+            item.accepted for item in final_evidence
+        ):
+            verification = self.verifier.verify(contract, final_evidence, final_tasks)
+            verification_evidence = await self._persist_verification_result_evidence(
+                operation,
+                verification,
+                final_evidence,
+            )
+            final_evidence = tuple(await self.store.list_evidence(operation_id))
+            if verification.passed:
+                synthesis, _synthesis_task = await self._execute_answer_synthesis(
+                    operation=operation,
+                    outcome_evidence=(*final_evidence, verification_evidence),
+                )
+                final_evidence = tuple(await self.store.list_evidence(operation_id))
+                final_tasks = tuple(await self.store.list_tasks(operation_id))
+            else:
+                final_tasks = tuple(await self.store.list_tasks(operation_id))
+        result_status = (
+            OperationStatus.FAILED
+            if _has_rejected_memory_proposal(final_evidence)
+            or bool(outcome_diagnostics.get("repair_exhausted"))
+            else (
+                OperationStatus.BLOCKED
+                if loop_result.status in {"blocked", "clarify"}
+                or (verification is not None and not verification.passed)
+                else OperationStatus.SUCCEEDED
+            )
         )
-        final_evidence = (*outcome.evidence, verification_evidence, synthesis_evidence)
-        final_tasks = (*outcome.tasks, synthesis_task)
+        warnings = (
+            ("db_planner_clarification_required",)
+            if loop_result.status == "clarify"
+            else (
+                ("db_planner_loop_blocked",)
+                if loop_result.status == "blocked"
+                else (
+                    tuple(
+                        [
+                            *(
+                                f"missing_evidence:{kind}"
+                                for kind in verification.missing_evidence
+                            ),
+                            *verification.warnings,
+                        ]
+                    )
+                    if verification is not None and not verification.passed
+                    else outcome_warnings
+                )
+            )
+        )
+        if _has_rejected_memory_proposal(final_evidence):
+            warnings = tuple(
+                dict.fromkeys(
+                    (
+                        *warnings,
+                        *_memory_proposal_rejection_reasons(final_evidence),
+                    )
+                )
+            )
+        synthesized_answer = (
+            str(synthesis.payload.get("answer"))
+            if synthesis is not None and synthesis.payload.get("answer")
+            else None
+        )
         return await self._record_operation_result(
             DbOperationResult(
                 operation_id=operation_id,
                 request=db_request,
-                intent=intent,
                 contract=contract,
-                status=OperationStatus.SUCCEEDED,
-                answer=_answer_from_synthesis_evidence(synthesis_evidence),
+                status=result_status,
+                answer=synthesized_answer
+                or loop_result.message
+                or _answer_from_planner_status(loop_result.status),
                 evidence=final_evidence,
-                warnings=tuple(
-                    (
-                        *outcome.warnings,
-                        *(
-                            synthesis_evidence.payload.get("warnings")
-                            if isinstance(
-                                synthesis_evidence.payload.get("warnings"), list
-                            )
-                            else ()
-                        ),
-                    )
-                ),
+                warnings=warnings,
                 diagnostics={
                     **base_diagnostics,
+                    "planner": {
+                        "status": loop_result.status,
+                        "decision": (
+                            loop_result.decision.to_dict()
+                            if loop_result.decision
+                            else None
+                        ),
+                        "observations": [
+                            observation.to_dict()
+                            for observation in loop_result.observations
+                        ],
+                    },
                     "execution": {
-                        **outcome.diagnostics,
+                        **outcome_diagnostics,
                         "task_count": len(final_tasks),
                         "tasks": [task.to_dict() for task in final_tasks],
+                        "evidence_refs": [
+                            {
+                                "id": item.id,
+                                "kind": item.kind,
+                                "owner": item.owner,
+                                "task_id": item.task_id,
+                            }
+                            for item in final_evidence
+                            if item.id
+                        ],
+                        "planned_sql": outcome_diagnostics.get("planned_sql")
+                        or _latest_sql_from_evidence(final_evidence),
                     },
-                    "verification": verification.to_dict(),
-                    "synthesis": synthesis_evidence.payload,
+                    **(
+                        {"verification": verification.to_dict()}
+                        if verification is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "synthesis": {
+                                "sufficiency": synthesis.payload.get("sufficiency"),
+                                "cited_evidence_refs": synthesis.payload.get(
+                                    "cited_evidence_refs", []
+                                ),
+                                "diagnostics": synthesis.payload.get("diagnostics", {}),
+                            }
+                        }
+                        if synthesis is not None
+                        else {}
+                    ),
                 },
             ),
             operation=operation,
         )
+
+    def _db_agent_planner(self) -> Any:
+        return self._injected_db_agent_planner() or _ContractFallbackDbAgentPlanner(
+            self.config.metadata
+        )
+
+    def _injected_db_agent_planner(self) -> Any:
+        return self.host_services.get("db_agent_planner") or self.host_services.get(
+            "db_planner"
+        )
+
+    async def _persist_planner_loop_metadata(
+        self,
+        operation: Operation,
+        *,
+        planner_status: str,
+        planner_observations: list[dict[str, Any]] | None = None,
+        planner_decision: dict[str, Any] | None = None,
+        planner_task_ids: list[str] | None = None,
+        planner_error: Exception | None = None,
+    ) -> Operation:
+        planner_metadata: dict[str, Any] = {
+            "status": planner_status,
+            "observations": list(planner_observations or ()),
+            "task_ids": list(planner_task_ids or ()),
+        }
+        if planner_decision is not None:
+            planner_metadata["decision"] = planner_decision
+        if planner_error is not None:
+            planner_metadata["error"] = {
+                "type": type(planner_error).__name__,
+                "message": str(planner_error),
+            }
+        updated = replace(
+            operation,
+            metadata={
+                **operation.metadata,
+                "planner": planner_metadata,
+                "planner_diagnostics": planner_metadata,
+                "planner_observations": planner_metadata["observations"],
+            },
+        )
+        await self.store.save_operation(updated)
+        return updated
 
     def _resolve_skills(self, request: DbRequest) -> SkillResolution:
         return SkillResolver(self.registry).resolve(
@@ -695,6 +862,462 @@ class DbRuntime(
 
 def _inspection_counts(operation: Operation) -> bool:
     return operation.operation_type != "db.memory.learning"
+
+
+class _ContractFallbackDbAgentPlanner:
+    """Conservative planner for contract facts when no model planner is injected."""
+
+    def __init__(self, runtime_metadata: dict[str, Any]) -> None:
+        self.runtime_metadata = dict(runtime_metadata)
+
+    def decide(self, context: Any, observations: Any) -> DbPlannerDecision:
+        ctx = dict(context or {})
+        request = dict(ctx.get("request") or {})
+        contract = dict(ctx.get("contract") or {})
+        prompt = str(request.get("prompt") or "")
+        lanes = set(str(item) for item in contract.get("granted_lanes") or ())
+        evidence = _planner_evidence(ctx, observations)
+        available = _available_capability_ids(ctx)
+        store_id = _planner_store_id(request, self.runtime_metadata)
+
+        if "none" in lanes:
+            return _planner_finish("No deterministic DB work was authorized.")
+        if "schema" in lanes:
+            return self._schema_decision(prompt, request, evidence, available, store_id)
+        if "read" in lanes:
+            return self._read_decision(prompt, request, evidence, available, store_id)
+        if "memory_answer" in lanes:
+            return self._memory_answer_decision(prompt, evidence)
+        if "memory_write" in lanes:
+            return self._memory_write_decision(prompt, request, evidence)
+        if "write_propose" in lanes:
+            return self._write_decision(prompt, evidence, execute=False)
+        if "write_execute" in lanes:
+            return self._write_decision(prompt, evidence, execute=True)
+        if "monitor_read" in lanes and not _has_evidence(evidence, "monitor.snapshot"):
+            return DbPlannerDecision(
+                actions=(DbPlannerAction(kind="inspect_monitor", payload={}),)
+            )
+        if "monitor_write" in lanes and not _has_monitor_write_evidence(evidence):
+            return DbPlannerDecision(
+                actions=(DbPlannerAction(kind="update_monitor", payload={}),)
+            )
+        if "monitor_execute" in lanes and not _has_monitor_execute_evidence(evidence):
+            return DbPlannerDecision(
+                actions=(DbPlannerAction(kind="execute_monitor", payload={}),)
+            )
+        return _planner_finish("DB planner completed.")
+
+    def _schema_decision(
+        self,
+        prompt: str,
+        request: dict[str, Any],
+        evidence: tuple[dict[str, Any], ...],
+        available: set[str],
+        store_id: str,
+    ) -> DbPlannerDecision:
+        schema = _database_schema_payload(evidence)
+        if schema is None and "db.schema.inspect" in available:
+            return DbPlannerDecision(
+                actions=(
+                    DbPlannerAction(
+                        kind="inspect_schema",
+                        payload={
+                            "focus": _focus_for_prompt(prompt),
+                            "source_scope": list(request.get("source_scope") or ()),
+                        },
+                    ),
+                )
+            )
+        if (
+            schema is not None
+            and "catalog.source.register" in available
+            and not _has_evidence(evidence, "catalog.source_registered")
+        ):
+            return DbPlannerDecision(
+                actions=(
+                    DbPlannerAction(
+                        kind="register_catalog_source",
+                        payload=_catalog_source_payload(
+                            schema,
+                            prompt=prompt,
+                            request=request,
+                            store_id=store_id,
+                            runtime_metadata=self.runtime_metadata,
+                        ),
+                    ),
+                )
+            )
+        if (
+            "catalog.schema.search" in available
+            and _has_evidence(evidence, "catalog.source_registered")
+            and not _has_evidence(evidence, "schema.search_result")
+        ):
+            return DbPlannerDecision(
+                actions=(
+                    DbPlannerAction(
+                        kind="inspect_schema",
+                        payload={
+                            "local_schema": False,
+                            "catalog_search_store_id": store_id,
+                            "query": prompt,
+                            "limit": 10,
+                        },
+                    ),
+                )
+            )
+        return _planner_finish("DB planner completed.")
+
+    def _read_decision(
+        self,
+        prompt: str,
+        request: dict[str, Any],
+        evidence: tuple[dict[str, Any], ...],
+        available: set[str],
+        store_id: str,
+    ) -> DbPlannerDecision:
+        schema = _database_schema_payload(evidence)
+        if schema is None and "db.schema.inspect" in available:
+            return DbPlannerDecision(
+                actions=(
+                    DbPlannerAction(
+                        kind="inspect_schema",
+                        payload={
+                            "focus": _focus_for_prompt(prompt),
+                            "source_scope": list(request.get("source_scope") or ()),
+                        },
+                    ),
+                )
+            )
+        if (
+            schema is not None
+            and "catalog.source.register" in available
+            and not _has_evidence(evidence, "catalog.source_registered")
+        ):
+            return DbPlannerDecision(
+                actions=(
+                    DbPlannerAction(
+                        kind="register_catalog_source",
+                        payload=_catalog_source_payload(
+                            schema,
+                            prompt=prompt,
+                            request=request,
+                            store_id=store_id,
+                            runtime_metadata=self.runtime_metadata,
+                        ),
+                    ),
+                )
+            )
+        validation_sql = _accepted_query_plan_sql(evidence)
+        if validation_sql is None and "db.query.prepare_read" in available:
+            schema_ref = _latest_evidence_ref(evidence, "schema.asset_profile")
+            return DbPlannerDecision(
+                actions=(
+                    DbPlannerAction(
+                        kind="propose_sql_read",
+                        payload={
+                            "prompt": prompt,
+                            "schema_evidence_id": schema_ref,
+                            "reason": "deterministic_read_prepare",
+                        },
+                    ),
+                )
+            )
+        if (
+            validation_sql
+            and not _has_evidence(evidence, "query.result")
+            and "db.sql.execute_read" in available
+        ):
+            return DbPlannerDecision(
+                actions=(
+                    DbPlannerAction(
+                        kind="execute_validated_read",
+                        payload={"sql": validation_sql},
+                    ),
+                )
+            )
+        return _planner_finish("DB planner completed.")
+
+    def _memory_answer_decision(
+        self,
+        prompt: str,
+        evidence: tuple[dict[str, Any], ...],
+    ) -> DbPlannerDecision:
+        if not _has_evidence(evidence, "memory.semantic.recall"):
+            options = _memory_options(self.runtime_metadata)
+            return DbPlannerDecision(
+                actions=(
+                    DbPlannerAction(
+                        kind="recall_memory",
+                        payload={
+                            "query": prompt,
+                            "prompt": prompt,
+                            "category": "db_semantics",
+                            "limit": int(options.get("limit") or 5) * 3,
+                            "score_threshold": float(
+                                options.get("score_threshold") or 0.45
+                            ),
+                            "retrieval_mode": options.get(
+                                "retrieval_mode", "structured"
+                            ),
+                            "source_identity": options.get("source_identity"),
+                        },
+                    ),
+                )
+            )
+        return _planner_finish("DB planner completed.")
+
+    def _memory_write_decision(
+        self,
+        prompt: str,
+        request: dict[str, Any],
+        evidence: tuple[dict[str, Any], ...],
+    ) -> DbPlannerDecision:
+        if not _has_evidence(evidence, "memory.semantic.write"):
+            return DbPlannerDecision(
+                actions=(
+                    DbPlannerAction(
+                        kind="write_memory",
+                        payload={
+                            "prompt": prompt,
+                            "request": {
+                                "prompt": prompt,
+                                "mode": request.get("mode"),
+                                "metadata": dict(request.get("metadata") or {}),
+                                "constraints": dict(request.get("constraints") or {}),
+                                "source_scope": list(request.get("source_scope") or ()),
+                            },
+                        },
+                    ),
+                )
+            )
+        return _planner_finish("DB planner completed.")
+
+    @staticmethod
+    def _write_decision(
+        prompt: str,
+        evidence: tuple[dict[str, Any], ...],
+        *,
+        execute: bool,
+    ) -> DbPlannerDecision:
+        if execute and not _has_evidence(evidence, "write.execution"):
+            return DbPlannerDecision(
+                actions=(
+                    DbPlannerAction(
+                        kind="execute_validated_write",
+                        payload={"sql": prompt},
+                    ),
+                )
+            )
+        if not execute and not _has_evidence(evidence, "sql.validation"):
+            return DbPlannerDecision(
+                actions=(
+                    DbPlannerAction(
+                        kind="propose_sql_write",
+                        payload={"sql": prompt},
+                    ),
+                )
+            )
+        return _planner_finish("DB planner completed.")
+
+
+def _planner_finish(message: str) -> DbPlannerDecision:
+    return DbPlannerDecision(
+        actions=(DbPlannerAction(kind="finish", payload={"message": message}),)
+    )
+
+
+def _planner_evidence(
+    context: dict[str, Any],
+    observations: Any,
+) -> tuple[dict[str, Any], ...]:
+    items: list[dict[str, Any]] = []
+    for item in context.get("evidence_observations") or ():
+        if isinstance(item, dict):
+            items.append(dict(item))
+    for observation in observations or ():
+        payload = getattr(observation, "payload", {}) or {}
+        for item in payload.get("evidence") or ():
+            if isinstance(item, dict):
+                items.append(dict(item))
+    return tuple(items)
+
+
+def _available_capability_ids(context: dict[str, Any]) -> set[str]:
+    return {
+        str(item.get("id"))
+        for item in context.get("available_capabilities") or ()
+        if isinstance(item, dict) and item.get("id")
+    }
+
+
+def _has_evidence(evidence: tuple[dict[str, Any], ...], kind: str) -> bool:
+    return any(
+        item.get("kind") == kind and item.get("accepted", True) for item in evidence
+    )
+
+
+def _latest_evidence_ref(
+    evidence: tuple[dict[str, Any], ...],
+    kind: str,
+) -> str | None:
+    for item in reversed(evidence):
+        if item.get("kind") == kind and item.get("accepted", True) and item.get("id"):
+            return str(item["id"])
+    return None
+
+
+def _database_schema_payload(
+    evidence: tuple[dict[str, Any], ...]
+) -> dict[str, Any] | None:
+    for item in reversed(evidence):
+        if item.get("kind") != "schema.asset_profile" or not item.get("accepted", True):
+            continue
+        payload = item.get("payload")
+        if isinstance(payload, dict) and payload.get("tables"):
+            return dict(payload)
+    return None
+
+
+def _accepted_query_plan_sql(evidence: tuple[dict[str, Any], ...]) -> str | None:
+    for item in reversed(evidence):
+        if item.get("kind") != "query.plan.validation" or not item.get(
+            "accepted", True
+        ):
+            continue
+        payload = item.get("payload")
+        if (
+            isinstance(payload, dict)
+            and payload.get("valid") is True
+            and payload.get("sql")
+        ):
+            return str(payload["sql"])
+    for item in reversed(evidence):
+        if item.get("kind") != "query.plan.proposal" or not item.get("accepted", True):
+            continue
+        payload = item.get("payload")
+        if isinstance(payload, dict) and payload.get("sql"):
+            return str(payload["sql"])
+    return None
+
+
+def _planner_store_id(request: dict[str, Any], runtime_metadata: dict[str, Any]) -> str:
+    metadata = dict(request.get("metadata") or {})
+    constraints = dict(request.get("constraints") or {})
+    source_scope = list(request.get("source_scope") or ())
+    options = _from_db_options(runtime_metadata)
+    value = (
+        metadata.get("store_id")
+        or constraints.get("store_id")
+        or (source_scope[0] if source_scope else None)
+        or options.get("catalog_store_id")
+    )
+    return str(value or "runtime_source")
+
+
+def _catalog_source_payload(
+    schema: dict[str, Any],
+    *,
+    prompt: str,
+    request: dict[str, Any],
+    store_id: str,
+    runtime_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    options = _from_db_options(runtime_metadata)
+    schema_payload = dict(schema)
+    schema_payload["store_id"] = store_id
+    profile_key = options.get("catalog_profile_key")
+    if profile_key:
+        schema_payload["profile_key"] = str(profile_key)
+        metadata = dict(schema_payload.get("metadata") or {})
+        metadata.setdefault("profile_key", str(profile_key))
+        schema_payload["metadata"] = metadata
+    request_metadata = dict(request.get("metadata") or {})
+    return {
+        "schema": schema_payload,
+        "store_type": schema.get("database_type") or "db",
+        "connection_string": request_metadata.get("connection_string"),
+        "store_id": store_id,
+        "persist": bool(profile_key),
+        "prompt": prompt,
+    }
+
+
+def _focus_for_prompt(prompt: str) -> str | None:
+    lowered = prompt.lower()
+    for token in ("table", "tables", "columns", "fields", "schema"):
+        lowered = lowered.replace(token, " ")
+    words = [
+        word.strip(" ,.?;:'\"`")
+        for word in lowered.split()
+        if len(word.strip(" ,.?;:'\"`")) > 2
+    ]
+    stop = {"what", "which", "show", "list", "describe", "inspect", "are", "the", "in"}
+    candidates = [word for word in words if word not in stop]
+    return candidates[-1] if candidates else None
+
+
+def _memory_options(runtime_metadata: dict[str, Any]) -> dict[str, Any]:
+    options = _from_db_options(runtime_metadata).get("memory")
+    return dict(options) if isinstance(options, dict) else {}
+
+
+def _from_db_options(runtime_metadata: dict[str, Any]) -> dict[str, Any]:
+    options = runtime_metadata.get("from_db_options")
+    return dict(options) if isinstance(options, dict) else {}
+
+
+def _has_monitor_write_evidence(evidence: tuple[dict[str, Any], ...]) -> bool:
+    return any(
+        str(item.get("kind", "")).startswith("monitor.")
+        and "proposal" in str(item.get("kind", ""))
+        for item in evidence
+    )
+
+
+def _has_monitor_execute_evidence(evidence: tuple[dict[str, Any], ...]) -> bool:
+    return any(
+        str(item.get("kind", "")).startswith("monitor.")
+        and "execution" in str(item.get("kind", ""))
+        for item in evidence
+    )
+
+
+def _latest_sql_from_evidence(evidence: tuple[Evidence, ...]) -> str | None:
+    for kind in ("query.result", "sql.validation", "query.plan.validation"):
+        for item in reversed(evidence):
+            if item.kind == kind and item.accepted and item.payload.get("sql"):
+                return str(item.payload["sql"])
+    return None
+
+
+def _has_rejected_memory_proposal(evidence: tuple[Evidence, ...]) -> bool:
+    return any(
+        item.kind == "db.memory.proposal" and item.accepted is False
+        for item in evidence
+    )
+
+
+def _memory_proposal_rejection_reasons(
+    evidence: tuple[Evidence, ...]
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    for item in evidence:
+        if item.kind != "db.memory.proposal" or item.accepted is not False:
+            continue
+        reasons.append("memory_proposal_not_accepted")
+        validation = item.payload.get("validation")
+        if isinstance(validation, dict):
+            reasons.extend(str(reason) for reason in validation.get("reasons") or ())
+    return tuple(dict.fromkeys(reasons))
+
+
+def _answer_from_planner_status(status: str) -> str:
+    if status == "clarify":
+        return "The DB planner needs clarification before it can continue."
+    if status == "blocked":
+        return "The DB planner could not complete within the operation contract."
+    return "DB planner completed."
 
 
 def _skill_names_from_request(request: DbRequest) -> tuple[str, ...]:

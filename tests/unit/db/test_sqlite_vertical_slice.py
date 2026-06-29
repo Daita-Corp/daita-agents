@@ -5,7 +5,8 @@ from daita.plugins.sqlite import SQLitePlugin
 
 
 async def _seed(plugin: SQLitePlugin) -> None:
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             email TEXT NOT NULL
@@ -17,7 +18,8 @@ async def _seed(plugin: SQLitePlugin) -> None:
         );
         INSERT INTO customers (id, email) VALUES (1, 'ada@example.com');
         INSERT INTO orders (id, customer_id, total) VALUES (10, 1, 42.5);
-        """)
+        """
+    )
 
 
 async def test_sqlite_registers_provider_neutral_db_capabilities():
@@ -156,14 +158,16 @@ async def test_sqlite_column_value_profile_registers_with_catalog():
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(catalog, sqlite))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (status)
         VALUES ('complete'), ('complete'), ('pending');
-        """)
+        """
+    )
 
     try:
         schema_evidence = await runtime.execute_capability(
@@ -223,13 +227,15 @@ async def test_sqlite_column_value_profile_fingerprint_only_uses_live_revision()
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(sqlite,))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (status) VALUES ('complete'), ('pending');
-        """)
+        """
+    )
 
     try:
         fingerprint = await runtime.execute_capability(
@@ -339,14 +345,16 @@ async def test_sqlite_column_value_profile_skips_when_row_count_exceeds_limit():
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(sqlite,))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (status)
         VALUES ('complete'), ('complete'), ('pending');
-        """)
+        """
+    )
 
     try:
         raw_profile = await runtime.execute_capability(

@@ -16,7 +16,6 @@ from ...sql_evidence import (
 from ..monitor_helpers import _monitor_report_has_analysis_work
 from ..resume import (
     _db_contract_from_context,
-    _db_intent_from_context,
     _db_request_from_context,
 )
 from ..types import DbRuntimeGovernanceBlocked
@@ -86,12 +85,10 @@ class DbRuntimeMonitorActionReportsMixin:
             tick_evidence_refs=tick_evidence_refs,
         )
         request = _db_request_from_context(operation)
-        intent = _db_intent_from_context(operation)
         contract = _db_contract_from_context(operation)
         try:
             result = await self._run_multi_step_analysis(
                 request,
-                intent,
                 contract,
                 operation,
                 base_diagnostics={
@@ -177,7 +174,6 @@ class DbRuntimeMonitorActionReportsMixin:
             if _monitor_report_has_analysis_work(analysis_plan):
                 result = await self._run_multi_step_analysis(
                     _db_request_from_context(operation),
-                    _db_intent_from_context(operation),
                     _db_contract_from_context(operation),
                     operation,
                     base_diagnostics={

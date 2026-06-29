@@ -5,8 +5,6 @@ from daita.core.tracing import TraceType, get_trace_manager
 from daita.db import DbRuntime
 from daita.db.llm_service import DbLLMResponse
 from daita.db.models import (
-    DbIntent,
-    DbIntentKind,
     DbOperationContract,
     DbOperationResult,
     DbRequest,
@@ -19,13 +17,15 @@ from daita.runtime import AccessMode, Evidence, OperationStatus
 
 async def _seed_sqlite(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL
         );
         INSERT INTO customers (name) VALUES ('Ada'), ('Linus');
-        """)
+        """
+    )
     await plugin.disconnect()
 
 
@@ -152,7 +152,7 @@ async def test_from_db_run_records_root_trace_events_and_child_spans(tmp_path):
     assert root["attributes"]["daita.runtime.id"] == agent.runtime.runtime_id
     assert root["attributes"]["daita.runtime.kind"] == "db"
     assert root["attributes"]["daita.execution.id"] == result.operation_id
-    assert root["attributes"]["daita.intent.kind"] == result.intent.kind.value
+    assert root["attributes"]["daita.operation.type"] == result.operation_type
     assert child_spans
     assert all(span["trace_id"] == trace["trace_id"] for span in child_spans)
     assert all(span["parent_span_id"] == root["span_id"] for span in child_spans)
@@ -257,7 +257,6 @@ def test_llm_telemetry_normalization_from_synthesis_evidence():
     result = DbOperationResult(
         operation_id="db-op-llm",
         request=DbRequest("Summarize customers"),
-        intent=DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         contract=DbOperationContract(
             operation_type="db.query",
             access=AccessMode.READ,
@@ -325,7 +324,6 @@ def test_analysis_telemetry_prefers_final_synthesis_over_partial():
     result = DbOperationResult(
         operation_id="analysis-op",
         request=DbRequest("Analyze customers"),
-        intent=DbIntent(kind=DbIntentKind.ANOMALY_INVESTIGATE, access=AccessMode.READ),
         contract=DbOperationContract(
             operation_type="analysis.run",
             access=AccessMode.READ,

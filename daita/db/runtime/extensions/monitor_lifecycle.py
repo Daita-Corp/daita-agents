@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Literal, Mapping, cast
 
 from daita.runtime import Evidence, Operation, Task
 
@@ -12,9 +12,23 @@ from ...monitor_commands.types import DbMonitorValidation
 from ...monitors import (
     DbMonitor,
     DbMonitorMutation,
+    DbMonitorMutationAction,
     DbMonitorState,
     monitor_with_updates,
 )
+
+if TYPE_CHECKING:
+    from .plugin import DbRuntimePlanningPlugin
+
+
+DbMonitorLifecycleAction = Literal["update", "pause", "resume", "delete", "disable"]
+
+
+def _bound_runtime(plugin: DbRuntimePlanningPlugin) -> Any:
+    runtime = plugin.runtime
+    if runtime is None:
+        raise RuntimeError("DB runtime planning plugin is not bound to a runtime")
+    return runtime
 
 
 @dataclass(frozen=True)
@@ -32,7 +46,7 @@ class DbMonitorPlanLifecycleExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         action = _monitor_lifecycle_action(
             str(task.input.get("action") or operation.operation_type)
         )
@@ -125,7 +139,7 @@ class DbMonitorCommitLifecycleExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         proposal_evidence = await _load_evidence(
             runtime,
             operation.id,
@@ -148,12 +162,12 @@ class DbMonitorCommitLifecycleExecutor:
         before_payload = proposal.get("before")
         after_payload = proposal.get("after")
         before = (
-            DbMonitor.from_dict(before_payload)
+            DbMonitor.from_dict(dict(before_payload))
             if isinstance(before_payload, Mapping)
             else None
         )
         after = (
-            DbMonitor.from_dict(after_payload)
+            DbMonitor.from_dict(dict(after_payload))
             if isinstance(after_payload, Mapping)
             else None
         )
@@ -244,7 +258,7 @@ class DbMonitorLocalDeliveryExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         payload_source = dict(task.input.get("payload_source") or {})
         report = await _load_evidence(
             runtime,
@@ -317,10 +331,10 @@ async def _load_evidence(
     return None
 
 
-def _monitor_lifecycle_action(value: str) -> str:
+def _monitor_lifecycle_action(value: str) -> DbMonitorLifecycleAction:
     normalized = value.removeprefix("monitor.").replace("_", ".").lower()
     if normalized in {"update", "pause", "resume", "delete", "disable"}:
-        return normalized
+        return cast(DbMonitorLifecycleAction, normalized)
     if normalized == "disabled":
         return "disable"
     raise ValueError(f"unsupported monitor lifecycle action: {value!r}")
@@ -358,17 +372,19 @@ def _monitor_lifecycle_commit_evidence_kind(action: str) -> str:
     return "monitor.state_update"
 
 
-def _monitor_lifecycle_mutation_action(action: str) -> str:
+def _monitor_lifecycle_mutation_action(
+    action: DbMonitorLifecycleAction,
+) -> DbMonitorMutationAction:
     if action == "disable":
         return "update"
-    return action
+    return cast(DbMonitorMutationAction, action)
 
 
 def _monitor_lifecycle_already_committed(
     existing: DbMonitor | None,
     *,
     after: DbMonitor | None,
-    action: str,
+    action: DbMonitorLifecycleAction,
 ) -> bool:
     if action == "delete":
         return existing is None

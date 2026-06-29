@@ -664,7 +664,8 @@ class SQLiteDbMonitorStore:
 
     def _initialize(self) -> None:
         with self._transaction() as conn:
-            conn.executescript("""
+            conn.executescript(
+                """
                 create table if not exists monitors (
                     id text primary key,
                     status text not null,
@@ -688,7 +689,8 @@ class SQLiteDbMonitorStore:
                     claimed_at text not null,
                     expires_at text not null
                 );
-                """)
+                """
+            )
 
     def _validate_expected_monitor(
         self,

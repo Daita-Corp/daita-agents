@@ -264,6 +264,9 @@ class InMemoryRuntimeStore(RuntimeStore):
     async def save_evidence(self, evidence: Evidence) -> None:
         self._evidence.append(evidence)
 
+    async def discard_evidence(self, evidence_id: str) -> None:
+        self._evidence = [item for item in self._evidence if item.id != evidence_id]
+
     async def append_event(self, event: RuntimeEvent) -> None:
         self._events.append(event)
 

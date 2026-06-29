@@ -31,8 +31,6 @@ from ...analysis import (
 from ...evidence import DbEvidenceStore
 from ...execution import DbOperationExecutor
 from ...models import (
-    DbIntent,
-    DbIntentKind,
     DbOperationContract,
     DbOperationResult,
     DbRequest,
@@ -88,12 +86,10 @@ class DbRuntimeAnalysisMixin(
     def _should_route_multi_step_analysis(
         self,
         request: DbRequest,
-        intent: DbIntent,
+        contract: DbOperationContract,
     ) -> bool:
-        if intent.kind not in {
-            DbIntentKind.DATA_QUERY,
-            DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-        }:
+        granted_lanes = set(contract.metadata.get("granted_lanes") or ())
+        if "read" not in granted_lanes and contract.access.value != "read":
             return False
         if request.metadata.get("analysis_mode") == "multi_step":
             return True
@@ -119,7 +115,6 @@ class DbRuntimeAnalysisMixin(
     async def _run_multi_step_analysis(
         self,
         request: DbRequest,
-        intent: DbIntent,
         contract: DbOperationContract,
         operation: Operation,
         *,
@@ -209,7 +204,6 @@ class DbRuntimeAnalysisMixin(
                     DbOperationResult(
                         operation_id=operation.id,
                         request=request,
-                        intent=intent,
                         contract=contract,
                         status=OperationStatus.BLOCKED,
                         answer=str(
@@ -301,7 +295,6 @@ class DbRuntimeAnalysisMixin(
                         DbOperationResult(
                             operation_id=operation.id,
                             request=request,
-                            intent=intent,
                             contract=contract,
                             status=OperationStatus.BLOCKED,
                             answer=_answer_from_analysis_synthesis_evidence(
@@ -345,7 +338,6 @@ class DbRuntimeAnalysisMixin(
                         await self._execute_parallel_analysis_query_steps(
                             executor,
                             request,
-                            intent,
                             contract,
                             operation,
                             schema=schema,
@@ -400,7 +392,6 @@ class DbRuntimeAnalysisMixin(
                     produced = await self._execute_analysis_query_step(
                         executor,
                         request,
-                        intent,
                         contract,
                         operation,
                         tasks,
@@ -418,7 +409,6 @@ class DbRuntimeAnalysisMixin(
                         await self._persist_analysis_verification_result_evidence(
                             operation,
                             contract,
-                            intent,
                             produced,
                             tuple(tasks),
                             step_metadata=step_meta,
@@ -515,7 +505,6 @@ class DbRuntimeAnalysisMixin(
                 DbOperationResult(
                     operation_id=operation.id,
                     request=request,
-                    intent=intent,
                     contract=contract,
                     status=OperationStatus.SUCCEEDED,
                     answer=_answer_from_analysis_synthesis_evidence(synthesis),
@@ -551,7 +540,6 @@ class DbRuntimeAnalysisMixin(
                 DbOperationResult(
                     operation_id=operation.id,
                     request=request,
-                    intent=intent,
                     contract=contract,
                     status=OperationStatus.BLOCKED,
                     answer=(
@@ -579,7 +567,6 @@ class DbRuntimeAnalysisMixin(
                 DbOperationResult(
                     operation_id=operation.id,
                     request=request,
-                    intent=intent,
                     contract=contract,
                     status=OperationStatus.FAILED,
                     answer=f"DB analysis failed: {exc}",
@@ -686,7 +673,6 @@ class DbRuntimeAnalysisMixin(
         self,
         executor: DbOperationExecutor,
         request: DbRequest,
-        intent: DbIntent,
         contract: DbOperationContract,
         operation: Operation,
         tasks: list[Task],
@@ -715,7 +701,6 @@ class DbRuntimeAnalysisMixin(
         )
         plan_evidence, strategy_warnings, _ = await executor._plan_query(
             step_request,
-            intent,
             operation,
             schema,
             None,
@@ -778,7 +763,6 @@ class DbRuntimeAnalysisMixin(
         self,
         executor: DbOperationExecutor,
         request: DbRequest,
-        intent: DbIntent,
         contract: DbOperationContract,
         operation: Operation,
         *,
@@ -805,7 +789,6 @@ class DbRuntimeAnalysisMixin(
                 produced = await self._execute_analysis_query_step(
                     executor,
                     request,
-                    intent,
                     contract,
                     operation,
                     step_tasks,
@@ -825,7 +808,6 @@ class DbRuntimeAnalysisMixin(
                     await self._persist_analysis_verification_result_evidence(
                         operation,
                         contract,
-                        intent,
                         produced,
                         tuple(step_tasks),
                         step_metadata=step_meta,
@@ -841,13 +823,12 @@ class DbRuntimeAnalysisMixin(
         self,
         operation: Operation,
         contract: DbOperationContract,
-        intent: DbIntent,
         evidence: tuple[Evidence, ...],
         tasks: tuple[Task, ...],
         *,
         step_metadata: dict[str, Any],
     ) -> Evidence:
-        verification = self.verifier.verify(contract, intent, evidence, tasks)
+        verification = self.verifier.verify(contract, evidence, tasks)
         evidence_details = [
             evidence_ref(item) for item in evidence if item.accepted and item.id
         ]

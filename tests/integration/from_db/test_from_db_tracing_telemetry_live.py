@@ -38,7 +38,8 @@ def _require_live_openai() -> str:
 
 async def _seed_trace_demo_db(path) -> None:
     sqlite = SQLitePlugin(path=str(path))
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
@@ -53,7 +54,8 @@ async def _seed_trace_demo_db(path) -> None:
         VALUES ('Ada', 'enterprise'), ('Linus', 'startup');
         INSERT INTO orders (customer_id, total)
         VALUES (1, 120.50), (2, 42.00);
-        """)
+        """
+    )
     await sqlite.disconnect()
 
 
@@ -85,7 +87,6 @@ def _present_trace_summary(trace_manager, operation_id: str) -> dict[str, object
                         "operation_id",
                         "execution_id",
                         "operation_type",
-                        "intent_kind",
                         "task_id",
                         "capability_id",
                         "executor_id",

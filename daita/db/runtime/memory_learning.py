@@ -13,11 +13,9 @@ from ..models import DbOperationResult
 _ELIGIBLE_OPERATION_TYPES = frozenset(
     {
         "data.query",
-        "data.query.catalog_assisted",
-        "metric.query",
-        "report.generate",
-        "quality.check",
-        "anomaly.investigate",
+        "query",
+        "read",
+        "db.read",
     }
 )
 
@@ -100,8 +98,6 @@ class DbRuntimeMemoryLearningMixin:
         if result.status is not OperationStatus.SUCCEEDED:
             return False
         if result.contract.operation_type not in _ELIGIBLE_OPERATION_TYPES:
-            return False
-        if result.intent.kind.value == "memory.update":
             return False
         if result.contract.operation_type in {"memory.update", "db.memory.learning"}:
             return False

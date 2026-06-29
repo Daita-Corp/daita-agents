@@ -3,8 +3,6 @@ import pytest
 from daita.db import (
     DbAnswerCitation,
     DbAnswerSynthesisPayload,
-    DbIntent,
-    DbIntentKind,
     DbOperationContract,
     DbRequest,
     DbSynthesizer,
@@ -34,7 +32,6 @@ def _verification(passed: bool = True) -> DbVerificationResult:
 def test_synthesizer_answers_count_from_query_result_evidence_only():
     result = DbSynthesizer().synthesize(
         request=DbRequest("How many orders are there?"),
-        intent=DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         contract=DbOperationContract(
             operation_type="data.query",
             required_evidence=("sql.validation", "query.result"),
@@ -57,7 +54,6 @@ def test_synthesizer_refuses_to_answer_before_verification_passes():
     with pytest.raises(ValueError, match="verification passes"):
         DbSynthesizer().synthesize(
             request=DbRequest("How many orders?"),
-            intent=DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
             contract=DbOperationContract(operation_type="data.query"),
             evidence=(),
             verification=_verification(passed=False),
@@ -67,10 +63,6 @@ def test_synthesizer_refuses_to_answer_before_verification_passes():
 def test_schema_synthesis_uses_database_scope_for_database_wide_prompts():
     result = DbSynthesizer().synthesize(
         request=DbRequest("Summarize the database schema."),
-        intent=DbIntent(
-            kind=DbIntentKind.SCHEMA_QUERY,
-            access=AccessMode.METADATA_READ,
-        ),
         contract=DbOperationContract(
             operation_type="schema.query",
             required_evidence=("schema.asset_profile",),
@@ -134,10 +126,6 @@ def test_llm_schema_synthesis_appends_db_memory_annotation():
 
     annotated = _apply_schema_db_memory_annotation(
         payload,
-        intent=DbIntent(
-            kind=DbIntentKind.SCHEMA_QUERY,
-            access=AccessMode.METADATA_READ,
-        ),
         evidence=(
             Evidence(
                 kind="planning.context",
@@ -161,10 +149,6 @@ def test_llm_schema_synthesis_appends_db_memory_annotation():
     assert (
         _apply_schema_db_memory_annotation(
             annotated,
-            intent=DbIntent(
-                kind=DbIntentKind.SCHEMA_QUERY,
-                access=AccessMode.METADATA_READ,
-            ),
             evidence=(
                 Evidence(
                     kind="planning.context",
@@ -184,13 +168,96 @@ def test_llm_schema_synthesis_appends_db_memory_annotation():
     )
 
 
+def test_schema_memory_annotation_prefers_answer_memory_context():
+    payload = DbAnswerSynthesisPayload(
+        answer="The operations table stores execution metadata.",
+        reasoning_summary="Used accepted schema evidence.",
+        cited_evidence_refs=(),
+        assumptions=(),
+        limitations=(),
+        warnings=(),
+        follow_up_questions=(),
+        sufficiency="answered",
+        confidence=0.88,
+        truncation={
+            "rows_truncated": False,
+            "fields_truncated": False,
+            "context_chars_truncated": False,
+        },
+        grounding={"all_claims_from_evidence": True},
+        diagnostics={"mode": "llm"},
+    )
+
+    annotated = _apply_schema_db_memory_annotation(
+        payload,
+        evidence=(
+            Evidence(
+                kind="planning.context",
+                accepted=True,
+                payload={
+                    "db_memory_refs": [
+                        {
+                            "key": "business_rule:operations",
+                            "text": "planner-only memory should not be first",
+                        }
+                    ]
+                },
+            ),
+            Evidence(
+                kind="answer.memory.context",
+                accepted=True,
+                payload={
+                    "refs": [
+                        {
+                            "key": "business_rule:operations",
+                            "text": "answer memory is first",
+                        }
+                    ]
+                },
+            ),
+        ),
+    )
+
+    assert annotated.answer == (
+        "The operations table stores execution metadata. "
+        "Semantic memory note: answer memory is first"
+    )
+
+
+def test_memory_recall_synthesizes_from_answer_memory_without_planner_refs():
+    result = DbSynthesizer().synthesize(
+        request=DbRequest("What do you remember about operations?"),
+        contract=DbOperationContract(
+            operation_type="memory.recall",
+            required_evidence=("answer.memory.context",),
+            access=AccessMode.METADATA_READ,
+        ),
+        evidence=(
+            Evidence(
+                kind="answer.memory.context",
+                accepted=True,
+                payload={
+                    "refs": [
+                        {
+                            "kind": "business_rule",
+                            "key": "operations",
+                            "text": "operations are agent runs",
+                        }
+                    ],
+                    "diagnostics": {"included_count": 1},
+                },
+            ),
+        ),
+        verification=_verification(),
+    )
+
+    assert "operations are agent runs" in result.answer
+    assert "did not find" not in result.answer
+
+
 def test_schema_synthesis_uses_exact_asset_scope_for_table_prompts():
     result = DbSynthesizer().synthesize(
         request=DbRequest("Tell me about the customers table."),
-        intent=DbIntent(
-            kind=DbIntentKind.SCHEMA_QUERY,
-            access=AccessMode.METADATA_READ,
-        ),
         contract=DbOperationContract(
             operation_type="schema.query",
             required_evidence=("schema.asset_profile",),
@@ -233,10 +300,6 @@ def test_schema_synthesis_uses_exact_asset_scope_for_table_prompts():
 def test_schema_synthesis_missing_table_returns_closest_matches_not_full_schema():
     result = DbSynthesizer().synthesize(
         request=DbRequest("Tell me about the custmers table."),
-        intent=DbIntent(
-            kind=DbIntentKind.SCHEMA_QUERY,
-            access=AccessMode.METADATA_READ,
-        ),
         contract=DbOperationContract(operation_type="schema.query"),
         evidence=(
             Evidence(
@@ -272,12 +335,8 @@ def test_schema_synthesis_missing_table_returns_closest_matches_not_full_schema(
 def test_relationship_synthesis_uses_relationship_path_evidence():
     result = DbSynthesizer().synthesize(
         request=DbRequest("What relationships do I need to join customers to orders?"),
-        intent=DbIntent(
-            kind=DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
-            access=AccessMode.METADATA_READ,
-        ),
         contract=DbOperationContract(
-            operation_type="schema.relationship_query",
+            operation_type="schema.relationships",
             required_evidence=("schema.relationship_path",),
         ),
         evidence=(

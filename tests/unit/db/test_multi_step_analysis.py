@@ -57,7 +57,8 @@ class FakeAnalysisLLMService:
 async def _runtime(tmp_path, llm_service, *, config=None):
     db_path = tmp_path / f"multi_step_{uuid4().hex}.sqlite"
     sqlite = SQLitePlugin(path=str(db_path), query_default_limit=20)
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             month TEXT NOT NULL,
@@ -70,7 +71,8 @@ async def _runtime(tmp_path, llm_service, *, config=None):
             (2, 'March', 'East', 40.0),
             (3, 'March', 'West', 30.0),
             (4, 'April', 'East', 90.0);
-        """)
+        """
+    )
     runtime = DbRuntime(
         config=config,
         plugins=(CatalogPlugin(auto_persist=False), sqlite),

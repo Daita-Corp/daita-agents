@@ -15,7 +15,7 @@ from .memory import (
     db_memory_refs_from_recall_evidence,
 )
 from .memory_contracts import project_db_memory_semantic_contracts
-from .models import DbIntent, DbRequest, DbRuntimeConfig
+from .models import DbRequest, DbRuntimeConfig
 from .session_context import db_session_context_from_request
 
 
@@ -25,10 +25,12 @@ class DbPlanningContext:
 
     operation_id: str
     prompt: str
-    intent_kind: str
+    operation_type: str
     source_scope: tuple[str, ...]
     dialect: str | None
     schema: dict[str, Any]
+    granted_lanes: tuple[str, ...] = ()
+    forbidden_capabilities: tuple[str, ...] = ()
     schema_evidence_refs: tuple[str, ...] = ()
     catalog_evidence_refs: tuple[str, ...] = ()
     relationship_evidence_refs: tuple[str, ...] = ()
@@ -58,7 +60,9 @@ class DbPlanningContext:
         return {
             "operation_id": self.operation_id,
             "prompt": self.prompt,
-            "intent_kind": self.intent_kind,
+            "operation_type": self.operation_type,
+            "granted_lanes": list(self.granted_lanes),
+            "forbidden_capabilities": list(self.forbidden_capabilities),
             "source_scope": list(self.source_scope),
             "dialect": self.dialect,
             "schema": self.schema,
@@ -99,7 +103,6 @@ class DbPlanningContextBuilder:
         self,
         *,
         request: DbRequest,
-        intent: DbIntent,
         operation: Operation,
         schema_evidence: Evidence | None,
         catalog_evidence: tuple[Evidence, ...] = (),
@@ -216,7 +219,14 @@ class DbPlanningContextBuilder:
         context = DbPlanningContext(
             operation_id=operation.id,
             prompt=request.prompt,
-            intent_kind=intent.kind.value,
+            operation_type=operation.operation_type,
+            granted_lanes=tuple(
+                str(item) for item in operation.metadata.get("granted_lanes") or ()
+            ),
+            forbidden_capabilities=tuple(
+                str(item)
+                for item in operation.metadata.get("forbidden_capabilities") or ()
+            ),
             source_scope=request.source_scope,
             dialect=dialect,
             schema=_compact_schema(schema),
@@ -322,7 +332,8 @@ def _compact_schema(schema: dict[str, Any]) -> dict[str, Any]:
 def _render_context_summary(context: DbPlanningContext) -> str:
     lines = [
         f"Prompt: {context.prompt}",
-        f"Intent: {context.intent_kind}",
+        f"Operation type: {context.operation_type}",
+        f"Granted lanes: {', '.join(context.granted_lanes) or 'none'}",
         f"Dialect: {context.dialect or 'unknown'}",
         "Tables:",
     ]

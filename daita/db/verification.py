@@ -9,7 +9,7 @@ from typing import Any
 
 from daita.runtime import Evidence, Task
 
-from .models import DbIntent, DbIntentKind, DbOperationContract
+from .models import DbOperationContract
 
 
 @dataclass(frozen=True)
@@ -38,7 +38,6 @@ class DbVerifier:
     def verify(
         self,
         contract: DbOperationContract,
-        intent: DbIntent,
         evidence: tuple[Evidence, ...],
         tasks: tuple[Task, ...],
     ) -> DbVerificationResult:
@@ -56,19 +55,15 @@ class DbVerifier:
             ),
         }
 
-        if intent.kind in {
-            DbIntentKind.DATA_QUERY,
-            DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-        }:
+        if "query.result" in kinds or "sql.validation" in kinds:
             warnings.extend(_verify_data_query(evidence, tasks, diagnostics))
-        elif intent.kind in {
-            DbIntentKind.SCHEMA_QUERY,
-            DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
-        }:
+        if _has_schema_evidence(kinds):
             diagnostics["schema_answer_uses_query_result"] = "query.result" in kinds
-            if "query.result" in kinds:
+            if "query.result" in kinds and contract.operation_type.startswith(
+                "schema."
+            ):
                 warnings.append("metadata_operation_includes_query_result")
-        elif intent.kind is DbIntentKind.MEMORY_UPDATE:
+        if "db.memory.proposal" in kinds or "memory.semantic.write" in kinds:
             warnings.extend(_verify_memory_update(evidence))
 
         passed = not missing and not warnings
@@ -119,6 +114,18 @@ def _verify_data_query(
             warnings.append("sql_validation_did_not_precede_query_result")
 
     return tuple(warnings)
+
+
+def _has_schema_evidence(kinds: set[str]) -> bool:
+    return any(
+        kind in kinds
+        for kind in (
+            "schema.asset_profile",
+            "schema.search_result",
+            "schema.relationship_path",
+            "catalog.source",
+        )
+    )
 
 
 def _verify_memory_update(evidence: tuple[Evidence, ...]) -> tuple[str, ...]:

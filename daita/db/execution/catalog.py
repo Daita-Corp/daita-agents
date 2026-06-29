@@ -9,7 +9,7 @@ from daita.runtime import Evidence, Operation, Task
 
 from ..capabilities import SCHEMA_SEARCH_RESULT_EVIDENCE
 from ..evidence import DbEvidenceStore
-from ..models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
+from ..models import DbOperationContract, DbRequest
 from .helpers import _runtime_from_db_option
 
 
@@ -17,7 +17,6 @@ class _ExecutionCatalogMixin:
     async def _relationship_payload_if_needed(
         self,
         request: DbRequest,
-        intent: DbIntent,
         contract: DbOperationContract,
         operation: Operation,
         schema: dict[str, Any],
@@ -25,8 +24,6 @@ class _ExecutionCatalogMixin:
         evidence_store: DbEvidenceStore,
         store_id: str,
     ) -> dict[str, Any] | None:
-        if intent.kind is not DbIntentKind.CATALOG_ASSISTED_DATA_QUERY:
-            return None
         await self._execute_capability(
             "catalog.schema.search",
             contract,

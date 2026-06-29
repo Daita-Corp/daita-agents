@@ -35,6 +35,7 @@ from .monitor_lifecycle import (
     DbMonitorPlanLifecycleExecutor,
 )
 from .query import (
+    DbMemoryAnswerContextExecutor,
     DbPlanningContextExecutor,
     DbQueryPlanValidationExecutor,
     DbQueryPrepareReadExecutor,
@@ -73,7 +74,7 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                         "data.query",
                         "query.plan",
                         "schema.query",
-                        "schema.relationship_query",
+                        "schema.relationships",
                     }
                 ),
                 access=AccessMode.METADATA_READ,
@@ -129,8 +130,11 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                     {
                         "data.query",
                         "schema.query",
-                        "schema.relationship_query",
-                        "data.query.catalog_assisted",
+                        "schema.relationships",
+                        "data.query",
+                        "memory.recall",
+                        "memory.list",
+                        "memory.inspect",
                     }
                 ),
                 access=AccessMode.NONE,
@@ -144,13 +148,35 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 idempotent=True,
             ),
             Capability(
+                id="db.memory.answer_context.build",
+                owner="db_runtime",
+                description="Build answer-safe DB memory context from recalled memory.",
+                domains=frozenset({"db"}),
+                operation_types=frozenset(
+                    {
+                        "memory.recall",
+                        "memory.list",
+                        "memory.inspect",
+                        "schema.query",
+                        "schema.relationships",
+                    }
+                ),
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.LOW,
+                input_schema=common_schema,
+                output_evidence=frozenset({"answer.memory.context"}),
+                executor="db_runtime.memory.answer_context.build",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
                 id="db.analysis.plan",
                 owner="db_runtime",
                 description="Plan a serial multi-step DB analysis DAG.",
                 domains=frozenset({"db"}),
-                operation_types=frozenset(
-                    {"data.query", "data.query.catalog_assisted"}
-                ),
+                operation_types=frozenset({"data.query", "data.query"}),
                 access=AccessMode.METADATA_READ,
                 risk=RiskLevel.LOW,
                 input_schema=common_schema,
@@ -166,9 +192,7 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 description="Validate a multi-step DB analysis DAG.",
                 domains=frozenset({"db"}),
-                operation_types=frozenset(
-                    {"data.query", "data.query.catalog_assisted"}
-                ),
+                operation_types=frozenset({"data.query", "data.query"}),
                 access=AccessMode.METADATA_READ,
                 risk=RiskLevel.LOW,
                 input_schema=common_schema,
@@ -184,9 +208,7 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 description="Checkpoint accepted multi-step DB analysis evidence.",
                 domains=frozenset({"db"}),
-                operation_types=frozenset(
-                    {"data.query", "data.query.catalog_assisted"}
-                ),
+                operation_types=frozenset({"data.query", "data.query"}),
                 access=AccessMode.NONE,
                 risk=RiskLevel.LOW,
                 input_schema=common_schema,
@@ -202,9 +224,7 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 description="Synthesize an analysis answer from accepted evidence.",
                 domains=frozenset({"db"}),
-                operation_types=frozenset(
-                    {"data.query", "data.query.catalog_assisted"}
-                ),
+                operation_types=frozenset({"data.query", "data.query"}),
                 access=AccessMode.NONE,
                 risk=RiskLevel.LOW,
                 input_schema=common_schema,
@@ -220,9 +240,7 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 description="Persist an auditable multi-step analysis plan revision.",
                 domains=frozenset({"db"}),
-                operation_types=frozenset(
-                    {"data.query", "data.query.catalog_assisted"}
-                ),
+                operation_types=frozenset({"data.query", "data.query"}),
                 access=AccessMode.METADATA_READ,
                 risk=RiskLevel.LOW,
                 input_schema=common_schema,
@@ -484,6 +502,7 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
     def get_executors(self) -> tuple[Any, ...]:
         executors: list[Any] = [
             DbPlanningContextExecutor(self),
+            DbMemoryAnswerContextExecutor(self),
             DbQueryPrepareReadExecutor(self),
             DbQueryPlanValidationExecutor(self),
             DbAnswerSynthesisExecutor(runtime=self),
@@ -551,6 +570,12 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 json_schema=object_schema,
                 description="Final answer synthesized from accepted evidence.",
+            ),
+            EvidenceSchema(
+                kind="answer.memory.context",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Answer-safe DB semantic memory context.",
             ),
             EvidenceSchema(
                 kind="analysis.plan",

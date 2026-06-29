@@ -1,11 +1,12 @@
-from daita.db import DbIntentKind, DbRequest, DbRuntime
+from daita.db import DbRequest, DbRuntime
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import OperationStatus
 
 
 async def _seed(plugin: SQLitePlugin) -> None:
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             email TEXT NOT NULL,
@@ -22,7 +23,8 @@ async def _seed(plugin: SQLitePlugin) -> None:
         INSERT INTO orders (id, customer_id, total) VALUES
             (10, 1, 42.5),
             (11, 2, 12.0);
-        """)
+        """
+    )
 
 
 async def _runtime() -> tuple[DbRuntime, SQLitePlugin]:
@@ -205,7 +207,8 @@ async def test_run_natural_language_count_uses_catalog_value_hints_before_planni
     catalog = runtime.registry.get_plugin("catalog")
 
     try:
-        await sqlite.execute_script("""
+        await sqlite.execute_script(
+            """
             CREATE TABLE support_tickets (
                 id INTEGER PRIMARY KEY,
                 customer_id INTEGER REFERENCES customers(id),
@@ -216,7 +219,8 @@ async def test_run_natural_language_count_uses_catalog_value_hints_before_planni
                 (100, 1, 'open', 'high'),
                 (101, 1, 'open', 'low'),
                 (102, 2, 'closed', 'high');
-            """)
+            """
+        )
         schema_evidence = await runtime.execute_capability(
             "db.schema.inspect",
             owner="sqlite",
@@ -858,7 +862,7 @@ async def test_run_executes_filtered_data_query():
     assert 'WHERE "total" > 40' in query_result.payload["sql"]
 
 
-async def test_run_executes_catalog_assisted_join_query():
+async def test_run_executes_catalog_join_query():
     runtime, _ = await _runtime()
 
     try:
@@ -881,7 +885,7 @@ async def test_run_executes_catalog_assisted_join_query():
     assert query_result.payload["rows"][0]["orders_total"] == 42.5
 
 
-async def test_run_executes_relationship_query_without_sql_execution():
+async def test_run_executes_relationship_inspection_without_sql_execution():
     runtime, _ = await _runtime()
 
     try:
@@ -893,7 +897,7 @@ async def test_run_executes_relationship_query_without_sql_execution():
         await runtime.teardown()
 
     assert result.status is OperationStatus.SUCCEEDED
-    assert result.intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY
+    assert result.operation_type == "schema.query"
     assert {
         "schema.asset_profile",
         "schema.search_result",

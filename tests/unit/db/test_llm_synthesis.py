@@ -40,7 +40,8 @@ class FakeSynthesisLLMService:
 async def _runtime(tmp_path, llm_service=None, **sqlite_options):
     db_path = tmp_path / f"llm_synthesis_{uuid4().hex}.sqlite"
     sqlite = SQLitePlugin(path=str(db_path), **sqlite_options)
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             email TEXT
@@ -55,7 +56,8 @@ async def _runtime(tmp_path, llm_service=None, **sqlite_options):
             (1, 'ada@example.com', 10.0),
             (2, 'linus@example.com', 20.0),
             (3, 'grace@example.com', 30.0);
-        """)
+        """
+    )
     runtime = DbRuntime(
         plugins=(CatalogPlugin(auto_persist=False), sqlite),
         db_llm_service=llm_service,
@@ -221,7 +223,7 @@ async def test_llm_context_uses_accepted_dependency_evidence_only(tmp_path):
     runtime, sqlite = await _runtime(tmp_path, llm)
     original = runtime._execute_answer_synthesis
 
-    async def inject_noise(*, operation, intent, outcome_evidence):
+    async def inject_noise(*, operation, outcome_evidence):
         await runtime.store.save_evidence(
             Evidence(
                 id="rejected-noise",
@@ -246,7 +248,6 @@ async def test_llm_context_uses_accepted_dependency_evidence_only(tmp_path):
         )
         return await original(
             operation=operation,
-            intent=intent,
             outcome_evidence=outcome_evidence,
         )
 

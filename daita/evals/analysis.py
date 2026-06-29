@@ -26,7 +26,6 @@ class RunEvidence:
     operation_id: str | None
     operation_status: str | None
     operation_type: str | None
-    intent: str | None
     tasks: list[RuntimeTaskEvidence]
     evidence: list[RuntimeEvidenceRecord]
     governance: RuntimeGovernanceRecord | None
@@ -69,7 +68,6 @@ def extract_run_evidence(prompt: str, raw_result: Any) -> RunEvidence:
         _enum_value(result.get("status") or operation.get("status"))
     )
     contract = _mapping(result.get("contract"))
-    intent = _mapping(result.get("intent"))
     tasks = [_task_from_mapping(item) for item in _list(execution.get("tasks"))]
     if not tasks and "tasks" in result:
         tasks = [_task_from_mapping(item) for item in _list(result.get("tasks"))]
@@ -87,7 +85,6 @@ def extract_run_evidence(prompt: str, raw_result: Any) -> RunEvidence:
         operation_type=_optional_string(
             contract.get("operation_type") or operation.get("operation_type")
         ),
-        intent=_optional_string(_enum_value(intent.get("kind"))),
         tasks=tasks,
         evidence=evidence,
         governance=governance,
@@ -234,7 +231,6 @@ def _runtime_result_mapping(raw: Any) -> dict[str, Any]:
     for name in (
         "operation_id",
         "request",
-        "intent",
         "contract",
         "status",
         "answer",

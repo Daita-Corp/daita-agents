@@ -14,8 +14,7 @@ from daita.db.monitor_commands import (
     MonitorTargetIntent,
     monitor_display_name,
 )
-from daita.db.models import DbIntent, DbIntentKind, DbOperationContract
-from daita.db.models import DbOperationResult, DbRequest
+from daita.db.models import DbOperationContract, DbOperationResult, DbRequest
 from daita.db.runtime.extensions import HostedInAppMonitorDeliveryPlugin
 from daita.runtime import (
     AccessMode,
@@ -391,11 +390,6 @@ class RunSpyRuntime(DbRuntime):
         return DbOperationResult(
             operation_id="ordinary-db-run",
             request=db_request,
-            intent=DbIntent(
-                kind=DbIntentKind.DATA_QUERY,
-                confidence=0.9,
-                access=AccessMode.READ,
-            ),
             contract=DbOperationContract(
                 operation_type="data.query",
                 access=AccessMode.READ,

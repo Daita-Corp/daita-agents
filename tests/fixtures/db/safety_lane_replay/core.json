@@ -1,0 +1,222 @@
+[
+  {
+    "id": "phrase_write_up",
+    "prompt": "write up a summary",
+    "lanes": ["none"],
+    "forbidden_capabilities": ["db.sql.execute_read", "db.sql.execute_write"],
+    "rewrite_rules": [],
+    "assumptions": [],
+    "approval_required": false,
+    "blocked_actions": ["row_read", "write_execute", "admin", "monitor_action"]
+  },
+  {
+    "id": "schema_columns",
+    "prompt": "what columns are in orders",
+    "lanes": ["schema"],
+    "forbidden_capabilities": ["db.sql.execute_read", "db.sql.execute_write"],
+    "rewrite_rules": [],
+    "assumptions": [],
+    "approval_required": false,
+    "blocked_actions": ["row_read", "write_execute", "admin", "monitor_action"]
+  },
+  {
+    "id": "schema_only_blocks_requested_read",
+    "prompt": "schema evidence only; do not query rows",
+    "requested_capabilities": ["db.sql.execute_read"],
+    "lanes": ["schema"],
+    "forbidden_capabilities": ["db.sql.execute_read", "db.sql.execute_write"],
+    "rewrite_rules": ["requested_capability_blocked_by_forbid"],
+    "assumptions": [
+      "schema_only_forbids_row_access",
+      "requested_capabilities_cannot_override_forbids"
+    ],
+    "approval_required": false,
+    "blocked_actions": ["row_read", "write_execute", "admin", "monitor_action"]
+  },
+  {
+    "id": "memory_write",
+    "prompt": "remember that revenue excludes tax",
+    "lanes": ["memory_write"],
+    "forbidden_capabilities": [
+      "db.sql.validate",
+      "db.sql.execute_read",
+      "db.sql.execute_write"
+    ],
+    "rewrite_rules": [],
+    "assumptions": ["direct_memory_write_forbids_sql"],
+    "approval_required": false,
+    "blocked_actions": ["row_read", "write_execute", "admin", "monitor_action"]
+  },
+  {
+    "id": "memory_write_colon",
+    "prompt": "remember this: revenue excludes tax",
+    "lanes": ["memory_write"],
+    "forbidden_capabilities": [
+      "db.sql.validate",
+      "db.sql.execute_read",
+      "db.sql.execute_write"
+    ],
+    "rewrite_rules": [],
+    "assumptions": ["direct_memory_write_forbids_sql"],
+    "approval_required": false,
+    "blocked_actions": ["row_read", "write_execute", "admin", "monitor_action"]
+  },
+  {
+    "id": "schema_only_embedded_select",
+    "prompt": "schema only: select * from orders",
+    "lanes": ["schema"],
+    "forbidden_capabilities": ["db.sql.execute_read", "db.sql.execute_write"],
+    "rewrite_rules": ["schema_only_forbids_sql_execution"],
+    "assumptions": ["schema_only_forbids_row_access"],
+    "approval_required": false,
+    "blocked_actions": ["row_read", "write_execute", "admin", "monitor_action"]
+  },
+  {
+    "id": "schema_only_embedded_write",
+    "prompt": "metadata only: execute update orders set status = closed",
+    "lanes": ["schema"],
+    "forbidden_capabilities": ["db.sql.execute_read", "db.sql.execute_write"],
+    "rewrite_rules": ["schema_only_forbids_sql_execution"],
+    "assumptions": ["schema_only_forbids_row_access"],
+    "approval_required": false,
+    "blocked_actions": ["row_read", "write_execute", "admin", "monitor_action"]
+  },
+  {
+    "id": "memory_answer",
+    "prompt": "what do you remember about revenue",
+    "lanes": ["memory_answer"],
+    "forbidden_capabilities": [
+      "db.sql.validate",
+      "db.sql.execute_read",
+      "db.sql.execute_write"
+    ],
+    "rewrite_rules": [],
+    "assumptions": ["direct_memory_prompt_forbids_sql"],
+    "approval_required": false,
+    "blocked_actions": ["row_read", "write_execute", "admin", "monitor_action"]
+  },
+  {
+    "id": "read_count",
+    "prompt": "how many orders are there",
+    "lanes": ["read"],
+    "forbidden_capabilities": ["db.sql.execute_write"],
+    "rewrite_rules": [],
+    "assumptions": [],
+    "approval_required": false,
+    "blocked_actions": ["write_execute", "admin", "monitor_action"]
+  },
+  {
+    "id": "write_propose",
+    "prompt": "update orders set status = 'closed'",
+    "lanes": ["write_propose"],
+    "forbidden_capabilities": ["db.sql.execute_write"],
+    "rewrite_rules": [],
+    "assumptions": ["write_execution_requires_explicit_run_word"],
+    "approval_required": true,
+    "blocked_actions": ["row_read", "write_execute", "admin", "monitor_action"]
+  },
+  {
+    "id": "write_execute",
+    "prompt": "execute update orders set status = 'closed'",
+    "lanes": ["write_execute"],
+    "forbidden_capabilities": [],
+    "rewrite_rules": [],
+    "assumptions": [],
+    "approval_required": true,
+    "blocked_actions": ["row_read", "admin", "monitor_action"]
+  },
+  {
+    "id": "admin_drop_table",
+    "prompt": "drop table orders",
+    "lanes": ["admin"],
+    "forbidden_capabilities": ["db.sql.execute_read", "db.sql.execute_write"],
+    "rewrite_rules": [],
+    "assumptions": ["admin_requires_explicit_sql_structure"],
+    "approval_required": true,
+    "blocked_actions": ["row_read", "write_execute", "monitor_action"]
+  },
+  {
+    "id": "admin_truncate_table",
+    "prompt": "truncate orders",
+    "lanes": ["admin"],
+    "forbidden_capabilities": ["db.sql.execute_read", "db.sql.execute_write"],
+    "rewrite_rules": [],
+    "assumptions": ["admin_requires_explicit_sql_structure"],
+    "approval_required": true,
+    "blocked_actions": ["row_read", "write_execute", "monitor_action"]
+  },
+  {
+    "id": "monitor_read",
+    "prompt": "show monitor status",
+    "lanes": ["monitor_read"],
+    "forbidden_capabilities": [
+      "db.monitor.commit_create",
+      "db.monitor.commit_lifecycle",
+      "monitor.delivery.local",
+      "monitor.delivery.in_app",
+      "db.sql.execute_write"
+    ],
+    "rewrite_rules": [],
+    "assumptions": [],
+    "approval_required": false,
+    "blocked_actions": ["row_read", "write_execute", "admin", "monitor_action"]
+  },
+  {
+    "id": "monitor_write",
+    "prompt": "pause the revenue monitor",
+    "lanes": ["monitor_write"],
+    "forbidden_capabilities": ["db.sql.execute_write"],
+    "rewrite_rules": [],
+    "assumptions": [],
+    "approval_required": true,
+    "blocked_actions": ["row_read", "write_execute", "admin"]
+  },
+  {
+    "id": "monitor_write_alert",
+    "prompt": "alert me when revenue drops",
+    "lanes": ["monitor_write"],
+    "forbidden_capabilities": ["db.sql.execute_write"],
+    "rewrite_rules": [],
+    "assumptions": [],
+    "approval_required": true,
+    "blocked_actions": ["row_read", "write_execute", "admin"]
+  },
+  {
+    "id": "monitor_execute",
+    "prompt": "run the revenue monitor now",
+    "lanes": ["monitor_execute"],
+    "forbidden_capabilities": [
+      "db.monitor.commit_create",
+      "db.monitor.commit_lifecycle",
+      "db.sql.execute_write"
+    ],
+    "rewrite_rules": [],
+    "assumptions": [],
+    "approval_required": true,
+    "blocked_actions": ["row_read", "write_execute", "admin"]
+  },
+  {
+    "id": "monitor_vague",
+    "prompt": "monitor revenue trends",
+    "lanes": ["none"],
+    "forbidden_capabilities": ["db.sql.execute_read", "db.sql.execute_write"],
+    "rewrite_rules": [],
+    "assumptions": [],
+    "approval_required": false,
+    "blocked_actions": ["row_read", "write_execute", "admin", "monitor_action"]
+  },
+  {
+    "id": "requested_write_forbidden",
+    "prompt": "metadata only",
+    "requested_capabilities": ["db.sql.execute_write"],
+    "lanes": ["schema"],
+    "forbidden_capabilities": ["db.sql.execute_read", "db.sql.execute_write"],
+    "rewrite_rules": ["requested_capability_blocked_by_forbid"],
+    "assumptions": [
+      "schema_only_forbids_row_access",
+      "requested_capabilities_cannot_override_forbids"
+    ],
+    "approval_required": false,
+    "blocked_actions": ["row_read", "write_execute", "admin", "monitor_action"]
+  }
+]

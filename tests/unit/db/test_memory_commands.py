@@ -120,12 +120,15 @@ async def test_explicit_remember_metric_definition_proposes_commits_and_writes()
     )
 
     assert result.status is OperationStatus.SUCCEEDED
-    assert [item.kind for item in result.evidence[:3]] == [
-        "db.memory.proposal",
-        "db.memory.definition",
-        "memory.semantic.write",
-    ]
-    proposal, definition, write = result.evidence[:3]
+    proposal = next(
+        item for item in result.evidence if item.kind == "db.memory.proposal"
+    )
+    definition = next(
+        item for item in result.evidence if item.kind == "db.memory.definition"
+    )
+    write = next(
+        item for item in result.evidence if item.kind == "memory.semantic.write"
+    )
     assert proposal.accepted is True
     assert definition.payload["proposal_evidence_id"] == proposal.id
     assert write.payload["success"] is True

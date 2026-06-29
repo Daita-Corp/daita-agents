@@ -1152,6 +1152,9 @@ class RuntimeStore(Protocol):
     async def save_evidence(self, evidence: Evidence) -> None:
         """Persist accepted or rejected evidence."""
 
+    async def discard_evidence(self, evidence_id: str) -> None:
+        """Remove persisted evidence by ID when runtime-owned work supersedes it."""
+
     async def append_event(self, event: RuntimeEvent) -> None:
         """Persist a runtime event."""
 

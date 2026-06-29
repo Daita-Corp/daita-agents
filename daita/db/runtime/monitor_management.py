@@ -23,8 +23,6 @@ from daita.runtime import (
 )
 
 from ..models import (
-    DbIntent,
-    DbIntentKind,
     DbOperationContract,
     DbOperationResult,
     DbRequest,
@@ -207,10 +205,7 @@ class DbRuntimeMonitorManagementMixin:
             },
             evaluate_governance=False,
         )
-        operation = await self._persist_trace_correlation(
-            operation,
-            intent_kind=DbIntentKind.ADMIN.value,
-        )
+        operation = await self._persist_trace_correlation(operation)
         plan_task = await self.kernel.plan_task(
             operation_id=operation.id,
             capability_id="db.monitor.plan_lifecycle",
@@ -381,12 +376,6 @@ class DbRuntimeMonitorManagementMixin:
                     key: value for key, value in request.items() if key != "prompt"
                 },
             ),
-            intent=DbIntent(
-                kind=DbIntentKind.ADMIN,
-                confidence=1.0,
-                access=AccessMode.WRITE,
-                diagnostics={"command_kind": action},
-            ),
             contract=DbOperationContract(
                 operation_type=operation.operation_type,
                 required_evidence=tuple(item.kind for item in evidence),
@@ -524,10 +513,7 @@ class DbRuntimeMonitorManagementMixin:
                     "request_metadata": request.metadata,
                 },
             )
-            operation = await self._persist_trace_correlation(
-                operation=operation,
-                intent_kind=DbIntentKind.ADMIN.value,
-            )
+            operation = await self._persist_trace_correlation(operation=operation)
             if evidence_kind is not None:
                 persisted_evidence = (
                     Evidence(
@@ -577,15 +563,6 @@ class DbRuntimeMonitorManagementMixin:
         result = DbOperationResult(
             operation_id=operation_id,
             request=request,
-            intent=DbIntent(
-                kind=DbIntentKind.ADMIN,
-                confidence=float(command_payload.get("confidence") or 0.0),
-                access=AccessMode.NONE,
-                diagnostics={
-                    "command_kind": kind,
-                    **dict(command_payload.get("diagnostics") or {}),
-                },
-            ),
             contract=DbOperationContract(
                 operation_type=f"monitor.{kind}",
                 required_evidence=tuple(item.kind for item in persisted_evidence),
@@ -637,10 +614,7 @@ class DbRuntimeMonitorManagementMixin:
                 **({"trace": trace} if trace else {}),
             },
         )
-        self._record_active_span_correlation(
-            operation,
-            intent_kind=DbIntentKind.ADMIN.value,
-        )
+        self._record_active_span_correlation(operation)
         evidence = Evidence(
             id=f"monitor-evidence-{uuid4()}",
             kind=evidence_kind,

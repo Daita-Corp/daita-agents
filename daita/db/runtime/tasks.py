@@ -22,10 +22,12 @@ from daita.runtime import (
     RuntimeKernelTaskNotRunnable,
     Task,
     TaskDependency,
+    TaskDependencyKind,
     TaskStatus,
 )
 
-from ..models import DbIntent, DbIntentKind, DbOperationContract
+from ..authorization import authorization_mode
+from ..models import DbOperationContract
 from ..sql_evidence import blocked_scope_resources, sql_validation_facts_from_evidence
 from .types import (
     _DEFAULT_TASK_LEASE_SECONDS,
@@ -35,6 +37,14 @@ from .types import (
 
 
 class DbRuntimeTasksMixin:
+    store: Any
+    kernel: Any
+    registry: Any
+    config: Any
+    runtime_id: str
+    _is_setup: bool
+    setup: Any
+
     async def execute_task(
         self,
         task: Task,
@@ -418,7 +428,6 @@ class DbRuntimeTasksMixin:
         self,
         *,
         operation: Operation,
-        intent: DbIntent,
         outcome_evidence: tuple[Evidence, ...],
     ) -> tuple[Evidence, Task]:
         existing = await self._latest_accepted_evidence(
@@ -446,7 +455,7 @@ class DbRuntimeTasksMixin:
         capability = self.registry.get_capability(
             "db.answer.synthesize", owner="db_runtime"
         )
-        dependencies = _synthesis_dependencies(operation, intent, outcome_evidence)
+        dependencies = _synthesis_dependencies(operation, outcome_evidence)
         task_input = {
             "evidence_refs": [
                 {
@@ -690,10 +699,11 @@ class DbRuntimeTasksMixin:
     ) -> dict[str, Any]:
         unsatisfied: list[dict[str, Any]] = []
         for dependency in task.dependencies:
-            if dependency.kind.value == "evidence":
+            dependency_kind = TaskDependencyKind(dependency.kind)
+            if dependency_kind is TaskDependencyKind.EVIDENCE:
                 if not await self._evidence_dependency_satisfied(dependency, operation):
                     unsatisfied.append(dependency.to_dict())
-            elif dependency.kind.value == "approval":
+            elif dependency_kind is TaskDependencyKind.APPROVAL:
                 if not await self._approval_dependency_satisfied(dependency, operation):
                     unsatisfied.append(dependency.to_dict())
         return {
@@ -788,7 +798,7 @@ class DbRuntimeTasksMixin:
             (
                 dependency
                 for dependency in task.dependencies
-                if dependency.kind.value == "evidence"
+                if TaskDependencyKind(dependency.kind) is TaskDependencyKind.EVIDENCE
                 and dependency.evidence_kind == "sql.validation"
             ),
             None,
@@ -916,7 +926,7 @@ class DbRuntimeTasksMixin:
             (
                 dependency
                 for dependency in task.dependencies
-                if dependency.kind.value == "evidence"
+                if TaskDependencyKind(dependency.kind) is TaskDependencyKind.EVIDENCE
                 and dependency.evidence_kind == "sql.validation"
             ),
             None,
@@ -1005,7 +1015,6 @@ def _planned_task_input(operation: Operation, capability: Capability) -> dict[st
 
 def _synthesis_dependencies(
     operation: Operation,
-    intent: DbIntent,
     evidence: tuple[Evidence, ...],
 ) -> tuple[TaskDependency, ...]:
     accepted = tuple(
@@ -1014,10 +1023,8 @@ def _synthesis_dependencies(
         if item.accepted and item.operation_id == operation.id and item.id
     )
     dependencies: list[TaskDependency] = []
-    if intent.kind in {
-        DbIntentKind.DATA_QUERY,
-        DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-    }:
+    accepted_kinds = {item.kind for item in accepted}
+    if "query.result" in accepted_kinds or "sql.validation" in accepted_kinds:
         _append_dependency_for_kind(dependencies, accepted, "planning.context")
         if not any(item.evidence_kind == "planning.context" for item in dependencies):
             _append_dependency_for_any(
@@ -1033,21 +1040,34 @@ def _synthesis_dependencies(
             "verification.result",
         ):
             _append_dependency_for_kind(dependencies, accepted, kind)
-    elif intent.kind is DbIntentKind.SCHEMA_QUERY:
-        _append_database_schema_dependency(dependencies, accepted)
-        for kind in ("planning.context", "schema.search_result"):
-            _append_dependency_for_kind(dependencies, accepted, kind)
-        _append_schema_asset_dependencies(dependencies, accepted)
-        _append_dependency_for_kind(dependencies, accepted, "verification.result")
-    elif intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY:
+    elif "schema.relationship_path" in accepted_kinds:
         _append_database_schema_dependency(dependencies, accepted)
         for kind in (
             "planning.context",
+            "answer.memory.context",
             "schema.relationship_path",
             "schema.search_result",
         ):
             _append_dependency_for_kind(dependencies, accepted, kind)
         _append_dependency_for_kind(dependencies, accepted, "verification.result")
+    elif _has_schema_dependency_evidence(accepted_kinds):
+        _append_database_schema_dependency(dependencies, accepted)
+        for kind in (
+            "planning.context",
+            "answer.memory.context",
+            "schema.search_result",
+        ):
+            _append_dependency_for_kind(dependencies, accepted, kind)
+        _append_schema_asset_dependencies(dependencies, accepted)
+        _append_dependency_for_kind(dependencies, accepted, "verification.result")
+    elif _has_memory_dependency_evidence(accepted_kinds):
+        _append_database_schema_dependency(dependencies, accepted)
+        for kind in (
+            "memory.semantic.recall",
+            "answer.memory.context",
+            "verification.result",
+        ):
+            _append_dependency_for_kind(dependencies, accepted, kind)
     else:
         _append_dependency_for_kind(dependencies, accepted, "verification.result")
     seen: set[tuple[str | None, str | None]] = set()
@@ -1059,6 +1079,27 @@ def _synthesis_dependencies(
         seen.add(key)
         unique.append(dependency)
     return tuple(unique)
+
+
+def _has_schema_dependency_evidence(kinds: set[str]) -> bool:
+    return any(
+        kind in kinds
+        for kind in (
+            "schema.asset_profile",
+            "schema.search_result",
+            "catalog.source",
+        )
+    )
+
+
+def _has_memory_dependency_evidence(kinds: set[str]) -> bool:
+    return any(
+        kind in kinds
+        for kind in (
+            "memory.semantic.recall",
+            "answer.memory.context",
+        )
+    )
 
 
 def _append_dependency_for_kind(
@@ -1233,6 +1274,8 @@ def _task_dependencies_for_capability(
         ),
     )
     if capability.id == "db.sql.execute_read":
+        return (validation_dependency,)
+    if authorization_mode(operation) == "preauthorized":
         return (validation_dependency,)
     return (
         validation_dependency,

@@ -1,6 +1,4 @@
 from daita.db import (
-    DbIntent,
-    DbIntentKind,
     DbOperationContract,
     DbVerifier,
 )
@@ -27,7 +25,6 @@ def _data_contract() -> DbOperationContract:
 def test_verifier_accepts_data_query_when_validation_precedes_result():
     result = DbVerifier().verify(
         _data_contract(),
-        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         (
             Evidence(
                 kind="sql.validation",
@@ -54,7 +51,6 @@ def test_verifier_accepts_data_query_when_validation_precedes_result():
 def test_verifier_rejects_query_result_without_prior_validation():
     result = DbVerifier().verify(
         _data_contract(),
-        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         (
             Evidence(
                 kind="query.result",
@@ -77,7 +73,6 @@ def test_verifier_allows_schema_evidence_without_query_result():
             required_evidence=("schema.asset_profile",),
             access=AccessMode.METADATA_READ,
         ),
-        DbIntent(kind=DbIntentKind.SCHEMA_QUERY, access=AccessMode.METADATA_READ),
         (
             Evidence(
                 kind="schema.asset_profile",
@@ -94,12 +89,8 @@ def test_verifier_allows_schema_evidence_without_query_result():
 def test_verifier_rejects_relationship_operation_with_query_result():
     result = DbVerifier().verify(
         DbOperationContract(
-            operation_type="schema.relationship_query",
+            operation_type="schema.relationships",
             required_evidence=("schema.relationship_path",),
-            access=AccessMode.METADATA_READ,
-        ),
-        DbIntent(
-            kind=DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
             access=AccessMode.METADATA_READ,
         ),
         (

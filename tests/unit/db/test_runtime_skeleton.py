@@ -5,6 +5,7 @@ import pytest
 from daita.db import (
     DbAgent,
     DbLimits,
+    DbRequest,
     DbRuntime,
     DbRuntimeConfig,
     DbRuntimeInspection,
@@ -21,6 +22,7 @@ from daita.runtime import (
     RiskLevel,
     RuntimeEventType,
     Task,
+    TaskStatus,
 )
 
 
@@ -312,6 +314,23 @@ async def test_db_runtime_persists_operation_state_for_inspection_and_resume():
         RuntimeEventType.OPERATION_RESUMED,
         RuntimeEventType.TASK_SKIPPED,
     ]
+
+
+async def test_db_runtime_run_persists_safety_contract_metadata():
+    runtime = DbRuntime()
+
+    result = await runtime.run(DbRequest("What tables exist?", mode="schema.query"))
+    snapshot = await runtime.inspect_operation(result.operation_id)
+
+    assert snapshot is not None
+    metadata = snapshot.operation.metadata
+    resume_context = metadata["resume_context"]
+
+    assert "safety_frame" in metadata
+    assert "schema" in metadata["granted_lanes"]
+    assert "db.sql.execute_read" in metadata["forbidden_capabilities"]
+    assert resume_context["safety_frame"] == metadata["safety_frame"]
+    assert metadata["contract_metadata"] == resume_context["contract"]["metadata"]
 
 
 async def test_db_agent_facade_uses_runtime_without_generic_agent_patch():

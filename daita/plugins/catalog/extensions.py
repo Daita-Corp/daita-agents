@@ -74,7 +74,7 @@ def catalog_capabilities() -> tuple[Capability, ...]:
             description="Search catalog schema assets and fields.",
             domains=frozenset({"db"}),
             operation_types=frozenset(
-                {"schema.query", "schema.relationship_query", "data.query"}
+                {"schema.query", "schema.relationships", "data.query"}
             ),
             access=AccessMode.METADATA_READ,
             risk=RiskLevel.LOW,
@@ -90,7 +90,7 @@ def catalog_capabilities() -> tuple[Capability, ...]:
             description="Inspect one bounded catalog asset.",
             domains=frozenset({"db"}),
             operation_types=frozenset(
-                {"schema.query", "schema.relationship_query", "data.query"}
+                {"schema.query", "schema.relationships", "data.query"}
             ),
             access=AccessMode.METADATA_READ,
             risk=RiskLevel.LOW,
@@ -108,7 +108,7 @@ def catalog_capabilities() -> tuple[Capability, ...]:
             operation_types=frozenset(
                 {
                     "schema.query",
-                    "schema.relationship_query",
+                    "schema.relationships",
                     "data.query",
                     "lineage.trace",
                 }

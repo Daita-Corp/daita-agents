@@ -12,7 +12,7 @@ from typing import Any
 
 from daita.runtime import Evidence, Operation
 
-from .models import DbIntent, DbIntentKind, DbRequest
+from .models import DbRequest
 from .planning_context import planner_eligible_column_value_hint
 from .query_plan import DbFilterSpec
 from .query_plan import DbQueryPlan as StructuredDbQueryPlan
@@ -44,12 +44,12 @@ class DbQueryPlanner:
     def plan_read_query(
         self,
         request: DbRequest,
-        intent: DbIntent,
         operation: Operation,
         schema: dict[str, Any],
         *,
         relationship_payload: dict[str, Any] | None = None,
         planning_context: dict[str, Any] | None = None,
+        planner_hints: dict[str, Any] | None = None,
     ) -> DbQueryPlan:
         """Build a deterministic read query for the current vertical slice."""
         warnings: list[str] = []
@@ -58,7 +58,7 @@ class DbQueryPlanner:
             sql = explicit
             filters: tuple[DbFilterSpec, ...] = ()
             strategy = "explicit_sql"
-        elif intent.kind is DbIntentKind.CATALOG_ASSISTED_DATA_QUERY:
+        elif relationship_payload or (planner_hints or {}).get("relationship_join"):
             from_table, to_table = self.relationship_tables_for_prompt(
                 request.prompt, schema
             )

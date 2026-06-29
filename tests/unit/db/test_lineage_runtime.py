@@ -9,7 +9,8 @@ from daita.runtime import OperationStatus
 
 
 async def _seed(plugin: SQLitePlugin) -> None:
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE raw_orders (
             id INTEGER PRIMARY KEY,
             total REAL
@@ -20,7 +21,8 @@ async def _seed(plugin: SQLitePlugin) -> None:
         );
         INSERT INTO raw_orders (id, total) VALUES (1, 42.5);
         INSERT INTO orders (id, total) VALUES (1, 42.5);
-        """)
+        """
+    )
 
 
 async def _runtime() -> tuple[DbRuntime, SQLitePlugin, LineagePlugin]:
@@ -75,7 +77,11 @@ def test_db_runtime_can_require_lineage_evidence_when_service_registered():
     )
 
     contract = runtime.build_contract(
-        DbRequest("Trace lineage for orders", mode="lineage.trace")
+        DbRequest(
+            "Trace lineage for orders",
+            mode="lineage.trace",
+            requested_capabilities=("lineage.trace",),
+        )
     )
 
     assert contract.required_capabilities == ("lineage.trace",)
@@ -177,7 +183,12 @@ async def test_db_runtime_executes_lineage_trace_with_typed_evidence():
 
     try:
         result = await runtime.run(
-            DbRequest("Trace lineage for orders", mode="lineage.trace")
+            DbRequest(
+                "Trace lineage for orders",
+                mode="lineage.trace",
+                requested_capabilities=("lineage.trace",),
+                metadata={"entity_id": "table:orders"},
+            )
         )
     finally:
         await runtime.teardown()

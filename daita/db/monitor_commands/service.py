@@ -17,8 +17,6 @@ from daita.runtime import (
 )
 
 from ..models import (
-    DbIntent,
-    DbIntentKind,
     DbOperationContract,
     DbOperationResult,
     DbRequest,
@@ -135,11 +133,6 @@ class DbMonitorCommandService:
                         "source_scope": list(request.source_scope),
                         "metadata": request.metadata,
                     },
-                    "intent": {
-                        "kind": DbIntentKind.ADMIN.value,
-                        "confidence": command.confidence,
-                        "access": AccessMode.WRITE.value,
-                    },
                     "contract": {
                         "operation_type": "monitor.create",
                         "required_evidence": [
@@ -152,10 +145,7 @@ class DbMonitorCommandService:
             },
             evaluate_governance=False,
         )
-        operation = await self.runtime._persist_trace_correlation(
-            operation,
-            intent_kind=DbIntentKind.ADMIN.value,
-        )
+        operation = await self.runtime._persist_trace_correlation(operation)
         plan_task = await self.runtime.kernel.plan_task(
             operation_id=operation.id,
             capability_id="db.monitor.plan_create",
@@ -199,10 +189,7 @@ class DbMonitorCommandService:
             },
         )
         await self.runtime.store.save_operation(operation)
-        operation = await self.runtime._persist_trace_correlation(
-            operation,
-            intent_kind=DbIntentKind.ADMIN.value,
-        )
+        operation = await self.runtime._persist_trace_correlation(operation)
         if not validation.accepted:
             await self.runtime.kernel.block_operation(
                 operation.id,
@@ -381,15 +368,6 @@ class DbMonitorCommandService:
         result = DbOperationResult(
             operation_id=operation.id,
             request=request,
-            intent=DbIntent(
-                kind=DbIntentKind.ADMIN,
-                confidence=command.confidence,
-                access=AccessMode.WRITE,
-                diagnostics={
-                    "command_kind": "create",
-                    **dict(command.diagnostics),
-                },
-            ),
             contract=DbOperationContract(
                 operation_type="monitor.create",
                 required_evidence=("monitor.definition",),

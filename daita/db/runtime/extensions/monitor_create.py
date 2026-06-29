@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 from uuid import uuid4
 
 from daita.runtime import Evidence, Operation, Task
@@ -14,6 +14,16 @@ from ...monitor_commands.extractor import DeterministicMonitorIntentExtractor
 from ...monitor_commands.planner import DbMonitorPlanner, _monitor_from_proposal
 from ...monitor_commands.types import DbMonitorCommand, DbMonitorValidation
 from ...monitors import DbMonitorMutation, DbMonitorState
+
+if TYPE_CHECKING:
+    from .plugin import DbRuntimePlanningPlugin
+
+
+def _bound_runtime(plugin: DbRuntimePlanningPlugin) -> Any:
+    runtime = plugin.runtime
+    if runtime is None:
+        raise RuntimeError("DB runtime planning plugin is not bound to a runtime")
+    return runtime
 
 
 @dataclass(frozen=True)
@@ -31,7 +41,7 @@ class DbMonitorPlanCreateExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         command = DbMonitorCommand(
             **dict(task.input.get("command") or operation.request.get("command") or {})
         )
@@ -109,7 +119,7 @@ class DbMonitorCommitCreateExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         proposal_evidence = await _load_evidence(
             runtime,
             operation.id,

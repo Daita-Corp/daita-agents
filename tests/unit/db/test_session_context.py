@@ -4,8 +4,6 @@ from daita.agents.agent import Agent
 from daita.agents.conversation import ConversationHistory
 from daita.db import DbAgent, DbRequest, DbRuntime
 from daita.db.models import (
-    DbIntent,
-    DbIntentKind,
     DbOperationContract,
     DbOperationResult,
 )
@@ -28,11 +26,6 @@ class SpyRuntime(DbRuntime):
         return DbOperationResult(
             operation_id=f"spy-{len(self.run_requests)}",
             request=db_request,
-            intent=DbIntent(
-                kind=DbIntentKind.CONVERSATIONAL,
-                confidence=1.0,
-                access=AccessMode.NONE,
-            ),
             contract=DbOperationContract(operation_type="conversational"),
             status=OperationStatus.SUCCEEDED,
             answer="spy answer",
@@ -41,7 +34,8 @@ class SpyRuntime(DbRuntime):
 
 async def _seed_agent_schema(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE agent_profiles (
             id INTEGER PRIMARY KEY,
             agent_name TEXT NOT NULL
@@ -58,7 +52,8 @@ async def _seed_agent_schema(path):
         INSERT INTO agent_profiles (agent_name) VALUES ('alpha');
         INSERT INTO agent_runs (profile_id, status) VALUES (1, 'ok');
         INSERT INTO billing_events (amount_cents) VALUES (100);
-        """)
+        """
+    )
     await plugin.disconnect()
 
 

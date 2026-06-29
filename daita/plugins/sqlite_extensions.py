@@ -34,7 +34,7 @@ def sqlite_capabilities() -> tuple[Capability, ...]:
             description="Inspect SQLite schema metadata.",
             domains=frozenset({"db"}),
             operation_types=frozenset(
-                {"schema.query", "schema.relationship_query", "source.profile"}
+                {"schema.query", "schema.relationships", "source.profile"}
             ),
             access=AccessMode.METADATA_READ,
             risk=RiskLevel.LOW,

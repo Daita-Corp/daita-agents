@@ -10,12 +10,10 @@ import json
 import re
 from typing import Any, Literal
 
-from daita.runtime import Evidence, Operation, Task
+from daita.runtime import Evidence, Operation, Task, TaskDependencyKind
 
 from .context import DbContextRenderer
 from .models import (
-    DbIntent,
-    DbIntentKind,
     DbOperationContract,
     DbRequest,
     db_optional_int,
@@ -111,7 +109,6 @@ class DbSynthesizer:
     def synthesize(
         self,
         request: DbRequest,
-        intent: DbIntent,
         contract: DbOperationContract,
         evidence: tuple[Evidence, ...],
         verification: DbVerificationResult,
@@ -122,24 +119,28 @@ class DbSynthesizer:
                 "cannot synthesize final answer before verification passes"
             )
 
-        if intent.kind is DbIntentKind.SCHEMA_QUERY:
-            scope = _schema_answer_scope(request, contract, evidence)
-            answer = _append_db_memory_annotation(
-                _schema_answer(scope),
-                evidence,
-            )
-        elif intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY:
+        accepted_kinds = {item.kind for item in evidence if item.accepted}
+        if _has_schema_relationship_evidence(accepted_kinds):
             scope = None
             answer = _append_db_memory_annotation(
                 _schema_relationship_answer(evidence),
                 evidence,
             )
-        elif intent.kind in {
-            DbIntentKind.DATA_QUERY,
-            DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-        }:
+        elif (
+            _has_schema_evidence(accepted_kinds)
+            and "query.result" not in accepted_kinds
+        ):
+            scope = _schema_answer_scope(request, contract, evidence)
+            answer = _append_db_memory_annotation(
+                _schema_answer(scope),
+                evidence,
+            )
+        elif "query.result" in accepted_kinds:
             scope = None
             answer = _data_answer(evidence)
+        elif _has_memory_answer_evidence(accepted_kinds):
+            scope = None
+            answer = _memory_answer(evidence)
         else:
             scope = None
             answer = "The DB operation completed with verified evidence."
@@ -172,7 +173,8 @@ def _schema_answer(scope: SchemaAnswerScope) -> str:
             if len(scope.requested_assets) == 1
             else ""
         )
-        matches = tuple(scope.diagnostics.get("closest_matches") or ())
+        raw_matches = scope.diagnostics.get("closest_matches")
+        matches = tuple(raw_matches) if isinstance(raw_matches, (list, tuple)) else ()
         if matches:
             return (
                 f"I could not find an exact table{requested}. "
@@ -195,6 +197,32 @@ def _schema_answer(scope: SchemaAnswerScope) -> str:
         prefix = f"Found {len(tables)} matching tables. " if len(tables) != 1 else ""
         return prefix + "; ".join(parts)
     return f"Found {len(tables)} tables. " + "; ".join(parts)
+
+
+def _has_schema_evidence(kinds: set[str]) -> bool:
+    return any(
+        kind in kinds
+        for kind in (
+            "schema.asset_profile",
+            "schema.search_result",
+            "catalog.source",
+            "planning.context",
+        )
+    )
+
+
+def _has_schema_relationship_evidence(kinds: set[str]) -> bool:
+    return "schema.relationship_path" in kinds
+
+
+def _has_memory_answer_evidence(kinds: set[str]) -> bool:
+    return any(
+        kind in kinds
+        for kind in (
+            "memory.semantic.recall",
+            "answer.memory.context",
+        )
+    )
 
 
 def _schema_answer_scope(
@@ -274,7 +302,9 @@ def _schema_answer_scope(
     if asset_tables:
         return SchemaAnswerScope(
             mode="asset",
-            requested_assets=tuple(table.get("name") for table, _ in asset_tables),
+            requested_assets=tuple(
+                str(table.get("name")) for table, _ in asset_tables if table.get("name")
+            ),
             selected_tables=tuple(table for table, _ in asset_tables),
             evidence_refs=tuple(
                 dict.fromkeys(ref for _, refs in asset_tables for ref in refs if ref)
@@ -293,9 +323,12 @@ def _schema_answer_scope(
 
 
 def _schema_relationship_answer(evidence: tuple[Evidence, ...]) -> str:
-    relationship = next(
+    relationship_payload: Any = next(
         (item.payload for item in evidence if item.kind == "schema.relationship_path"),
         {},
+    )
+    relationship = (
+        relationship_payload if isinstance(relationship_payload, dict) else {}
     )
     if relationship.get("reachable") is False:
         return "No relationship path was found between the requested tables."
@@ -315,7 +348,9 @@ def _schema_relationship_answer(evidence: tuple[Evidence, ...]) -> str:
 def _append_db_memory_annotation(answer: str, evidence: tuple[Evidence, ...]) -> str:
     if "Semantic memory note:" in answer:
         return answer
-    refs = _db_memory_refs_from_planning_context(evidence)
+    refs = _answer_memory_refs_from_context(evidence)
+    if not refs:
+        refs = _db_memory_refs_from_planning_context(evidence)
     if not refs:
         return answer
     notes = []
@@ -329,16 +364,83 @@ def _append_db_memory_annotation(answer: str, evidence: tuple[Evidence, ...]) ->
     return answer.rstrip() + " Semantic memory note: " + " ".join(notes)
 
 
+def _memory_answer(evidence: tuple[Evidence, ...]) -> str:
+    refs = _answer_memory_refs_from_context(evidence)
+    if not refs:
+        diagnostics = _answer_memory_diagnostics(evidence)
+        omitted = diagnostics.get("omitted_reasons") if diagnostics else None
+        if omitted:
+            reasons = ", ".join(
+                f"{key}: {value}" for key, value in sorted(dict(omitted).items())
+            )
+            return f"I found DB memory, but none was safe to include ({reasons})."
+        return "I did not find any DB semantic memory for that request."
+    lines = []
+    for ref in refs:
+        label = " ".join(
+            part
+            for part in (
+                str(ref.get("kind") or "").strip(),
+                str(ref.get("key") or "").strip(),
+            )
+            if part
+        ).strip()
+        text = str(ref.get("text") or "").strip()
+        if not text:
+            continue
+        prefix = f"{label}: " if label else ""
+        caveats = tuple(str(item) for item in ref.get("caveats") or () if item)
+        suffix = " Caveat: " + ", ".join(caveats) + "." if caveats else ""
+        lines.append(f"- {prefix}{text}{suffix}")
+    if not lines:
+        return "I did not find any DB semantic memory for that request."
+    return "I found DB semantic memory for that request:\n" + "\n".join(lines)
+
+
+def _answer_memory_refs_from_context(
+    evidence: tuple[Evidence, ...],
+) -> tuple[dict[str, Any], ...]:
+    context = next(
+        (
+            item
+            for item in reversed(evidence)
+            if item.accepted and item.kind == "answer.memory.context"
+        ),
+        None,
+    )
+    if context is None:
+        return ()
+    refs = context.payload.get("refs")
+    if not isinstance(refs, list):
+        return ()
+    return tuple(item for item in refs if isinstance(item, dict))
+
+
+def _answer_memory_diagnostics(evidence: tuple[Evidence, ...]) -> dict[str, Any]:
+    context = next(
+        (
+            item
+            for item in reversed(evidence)
+            if item.accepted and item.kind == "answer.memory.context"
+        ),
+        None,
+    )
+    if context is None:
+        return {}
+    diagnostics = context.payload.get("diagnostics")
+    return diagnostics if isinstance(diagnostics, dict) else {}
+
+
 def _apply_schema_db_memory_annotation(
     payload: DbAnswerSynthesisPayload,
     *,
-    intent: DbIntent,
     evidence: tuple[Evidence, ...],
 ) -> DbAnswerSynthesisPayload:
-    if intent.kind not in {
-        DbIntentKind.SCHEMA_QUERY,
-        DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
-    }:
+    accepted_kinds = {item.kind for item in evidence if item.accepted}
+    if not (
+        _has_schema_evidence(accepted_kinds)
+        or _has_schema_relationship_evidence(accepted_kinds)
+    ):
         return payload
     answer = _append_db_memory_annotation(payload.answer, evidence)
     if answer == payload.answer:
@@ -503,7 +605,13 @@ def _preferred_table_entry(
     entries: list[tuple[dict[str, Any], tuple[str, ...], str]],
 ) -> tuple[dict[str, Any], tuple[str, ...], str]:
     order = {"asset": 0, "search": 1, "database": 2}
-    return sorted(entries, key=lambda item: order.get(item[2], 99))[0]
+    return sorted(
+        entries,
+        key=lambda item: (
+            0 if _columns_from_schema_table(item[0]) else 1,
+            order.get(item[2], 99),
+        ),
+    )[0]
 
 
 def _database_tables(
@@ -771,11 +879,11 @@ class DbAnswerSynthesisExecutor:
     ) -> list[Evidence]:
         runtime = _runtime_from_boundary(self.runtime)
         request = runtime._db_request_from_operation(operation)
-        intent = runtime._db_intent_from_operation(operation)
         contract = runtime._db_contract_from_context(operation)
         dependency_evidence = await _accepted_dependency_evidence(
             runtime, task, operation
         )
+        accepted_kinds = {item.kind for item in dependency_evidence if item.accepted}
         verification_evidence = next(
             (
                 item
@@ -789,7 +897,6 @@ class DbAnswerSynthesisExecutor:
         verification = verification_from_evidence(verification_evidence)
         synthesis_context = build_synthesis_context(
             request=request,
-            intent=intent,
             contract=contract,
             evidence=dependency_evidence,
             row_budget=int(task.input.get("row_budget") or _DEFAULT_CONTEXT_ROW_BUDGET),
@@ -799,7 +906,8 @@ class DbAnswerSynthesisExecutor:
         )
         payload: DbAnswerSynthesisPayload | None = None
         fallback_reason: str | None = None
-        if runtime.db_llm_service.available:
+        memory_answer = _has_memory_answer_evidence(accepted_kinds)
+        if runtime.db_llm_service.available and not memory_answer:
             try:
                 response = await runtime.db_llm_service.generate_synthesis_json(
                     _synthesis_messages(synthesis_context.payload)
@@ -814,12 +922,15 @@ class DbAnswerSynthesisExecutor:
             except Exception as exc:
                 fallback_reason = f"{type(exc).__name__}:{exc}"
         else:
-            fallback_reason = "db_llm_service_unavailable"
+            fallback_reason = (
+                "deterministic_memory_synthesis"
+                if memory_answer
+                else "db_llm_service_unavailable"
+            )
 
         if payload is None:
             payload = deterministic_synthesis_payload(
                 request=request,
-                intent=intent,
                 contract=contract,
                 evidence=dependency_evidence,
                 verification=verification,
@@ -829,7 +940,6 @@ class DbAnswerSynthesisExecutor:
             )
         payload = _apply_schema_db_memory_annotation(
             payload,
-            intent=intent,
             evidence=dependency_evidence,
         )
 
@@ -877,7 +987,6 @@ def verification_from_evidence(evidence: Evidence) -> DbVerificationResult:
 def build_synthesis_context(
     *,
     request: DbRequest,
-    intent: DbIntent,
     contract: DbOperationContract,
     evidence: tuple[Evidence, ...],
     row_budget: int = _DEFAULT_CONTEXT_ROW_BUDGET,
@@ -890,15 +999,17 @@ def build_synthesis_context(
         (item for item in accepted if item.kind == "query.result"), None
     )
     rows, row_metadata = _bounded_rows(query_result, row_budget=row_budget)
+    accepted_kinds = {item.kind for item in accepted}
     schema_scope = (
         _schema_answer_scope(request, contract, accepted)
-        if intent.kind is DbIntentKind.SCHEMA_QUERY
+        if _has_schema_evidence(accepted_kinds)
+        and not _has_schema_relationship_evidence(accepted_kinds)
+        and "query.result" not in accepted_kinds
         else None
     )
     semantics = _catalog_semantics(accepted, schema_scope=schema_scope)
     payload = {
         "prompt": request.prompt,
-        "intent_kind": intent.kind.value,
         "operation_type": contract.operation_type,
         "evidence": evidence_summaries,
         "query_result": {
@@ -960,7 +1071,6 @@ def build_synthesis_context(
 def deterministic_synthesis_payload(
     *,
     request: DbRequest,
-    intent: DbIntent,
     contract: DbOperationContract,
     evidence: tuple[Evidence, ...],
     verification: DbVerificationResult,
@@ -970,7 +1080,7 @@ def deterministic_synthesis_payload(
 ) -> DbAnswerSynthesisPayload:
     """Build deterministic fallback through the same answer evidence path."""
     result = (synthesizer or DbSynthesizer()).synthesize(
-        request, intent, contract, evidence, verification
+        request, contract, evidence, verification
     )
     citations = tuple(
         DbAnswerCitation(
@@ -1049,7 +1159,7 @@ def validate_synthesis_payload(
     if grounding.get("all_claims_from_evidence") is not True:
         raise ValueError("synthesis_grounding_missing")
 
-    accepted_by_id = {
+    accepted_by_id: dict[str, Evidence] = {
         item.id: item for item in dependency_evidence if item.accepted and item.id
     }
     citations = _parse_citations(parsed.get("cited_evidence_refs"), accepted_by_id)
@@ -1106,7 +1216,7 @@ async def _accepted_dependency_evidence(
 ) -> tuple[Evidence, ...]:
     evidence: list[Evidence] = []
     for dependency in task.dependencies:
-        if dependency.kind.value != "evidence":
+        if TaskDependencyKind(dependency.kind) is not TaskDependencyKind.EVIDENCE:
             continue
         item = await runtime._accepted_evidence_for_dependency(operation.id, dependency)
         if item is not None and item.accepted and item.operation_id == operation.id:
@@ -1300,9 +1410,12 @@ def _catalog_semantics(
             None,
         )
     payload = planning.payload if planning is not None else {}
-    schema = (
-        payload.get("schema") if isinstance(payload.get("schema"), dict) else payload
-    )
+    if isinstance(payload, dict) and isinstance(payload.get("schema"), dict):
+        schema = payload["schema"]
+    elif isinstance(payload, dict):
+        schema = payload
+    else:
+        schema = {}
     tables = []
     source_tables = (
         list(schema_scope.selected_tables)
@@ -1425,7 +1538,7 @@ def _required_caveats(
 
 
 def _parse_citations(
-    value: Any, accepted_by_id: dict[str | None, Evidence]
+    value: Any, accepted_by_id: dict[str, Evidence]
 ) -> list[DbAnswerCitation]:
     if not isinstance(value, list):
         raise ValueError("synthesis_citations_not_list")
@@ -1468,17 +1581,16 @@ def _validate_required_citations(
 def _validate_caveats_preserved(
     parsed: dict[str, Any], context_metadata: dict[str, Any]
 ) -> None:
-    required = tuple(context_metadata.get("required_caveats") or ())
+    raw_required = context_metadata.get("required_caveats")
+    required = tuple(raw_required) if isinstance(raw_required, (list, tuple)) else ()
     if not required:
         return
-    provided = " ".join(
-        str(item)
-        for item in (
-            *(parsed.get("limitations") or ()),
-            *(parsed.get("warnings") or ()),
-            *(parsed.get("assumptions") or ()),
-        )
-    )
+    provided_items: list[str] = []
+    for key in ("limitations", "warnings", "assumptions"):
+        values = parsed.get(key)
+        if isinstance(values, list):
+            provided_items.extend(str(item) for item in values)
+    provided = " ".join(provided_items)
     for caveat in required:
         if str(caveat) not in provided:
             raise ValueError(f"synthesis_dropped_caveat:{caveat}")
@@ -1487,7 +1599,7 @@ def _validate_caveats_preserved(
 def _validate_relationship_claims(
     answer: str,
     citations: list[DbAnswerCitation],
-    accepted_by_id: dict[str | None, Evidence],
+    accepted_by_id: dict[str, Evidence],
 ) -> None:
     lowered = answer.lower()
     if not any(
@@ -1521,9 +1633,8 @@ def _requests_db_work(parsed: dict[str, Any]) -> bool:
 
 
 def _diagnostics_from_llm(diagnostics: dict[str, Any]) -> dict[str, Any]:
-    tokens = (
-        diagnostics.get("tokens") if isinstance(diagnostics.get("tokens"), dict) else {}
-    )
+    raw_tokens = diagnostics.get("tokens")
+    tokens = raw_tokens if isinstance(raw_tokens, dict) else {}
     input_tokens = db_optional_int(
         diagnostics.get("input_tokens")
         if diagnostics.get("input_tokens") is not None

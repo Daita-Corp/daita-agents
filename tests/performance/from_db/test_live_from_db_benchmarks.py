@@ -168,7 +168,7 @@ async def test_live_from_db_simple_query_latency_cost_and_output(
     _record_benchmark("from_db_simple_query", result, elapsed_ms, database="sqlite")
 
 
-async def test_live_from_db_relationship_query_latency_cost_and_output(
+async def test_live_from_db_relationships_latency_cost_and_output(
     benchmark_db_path,
     benchmark_agent_kwargs,
 ):
@@ -197,7 +197,7 @@ async def test_live_from_db_relationship_query_latency_cost_and_output(
         },
     )
     _record_benchmark(
-        "from_db_relationship_query",
+        "from_db_relationships",
         result,
         elapsed_ms,
         database="sqlite",
@@ -309,7 +309,7 @@ async def test_live_from_db_postgres_simple_query_latency_cost_and_output(
     )
 
 
-async def test_live_from_db_postgres_relationship_query_latency_cost_and_output(
+async def test_live_from_db_postgres_relationships_latency_cost_and_output(
     benchmark_postgres_url,
     benchmark_agent_kwargs,
 ):
@@ -338,7 +338,7 @@ async def test_live_from_db_postgres_relationship_query_latency_cost_and_output(
         },
     )
     _record_benchmark(
-        "from_db_postgres_relationship_query",
+        "from_db_postgres_relationships",
         result,
         elapsed_ms,
         database="postgresql",
@@ -375,7 +375,8 @@ async def test_live_from_db_postgres_ambiguous_prompt_latency_cost_and_output(
 
 async def _seed_benchmark_db(path: Path) -> None:
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
@@ -396,7 +397,8 @@ async def _seed_benchmark_db(path: Path) -> None:
             (1, 80.00, 'pending'),
             (2, 50.00, 'complete'),
             (3, 175.00, 'complete');
-        """)
+        """
+    )
     await plugin.disconnect()
 
 
@@ -507,7 +509,6 @@ def _record_benchmark(
         "elapsed_ms": round(elapsed_ms, 2),
         "operation_id": result.operation_id,
         "operation_type": result.contract.operation_type,
-        "intent": result.intent.kind.value,
         "status": result.status.value,
         "answer": result.answer,
         "warnings": list(result.warnings),

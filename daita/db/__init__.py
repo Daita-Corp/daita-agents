@@ -17,8 +17,6 @@ from .catalog_prompt import (
     estimate_tokens,
 )
 from .models import (
-    DbIntent,
-    DbIntentKind,
     DbLimits,
     DbOperationContract,
     DbOperationResult,
@@ -67,7 +65,8 @@ from .memory import (
     write_db_memory_record,
     write_db_memory_records,
 )
-from .planning import DbContractBuilder, DbIntentClassifier
+from .contracts import DbContractBuilder
+from .safety import DbCapabilityLane, DbLaneGrant, DbSafetyFrame, DbSafetyVerifier
 from .query_plan import (
     DbAggregationSpec,
     DbFilterSpec,
@@ -136,8 +135,6 @@ __all__ = [
     "recall_db_memory_records",
     "write_db_memory_record",
     "write_db_memory_records",
-    "DbIntent",
-    "DbIntentKind",
     "DbLimits",
     "DbOperationContract",
     "DbOperationResult",
@@ -169,7 +166,10 @@ __all__ = [
     "InMemoryDbMonitorStore",
     "SQLiteDbMonitorStore",
     "DbContractBuilder",
-    "DbIntentClassifier",
+    "DbCapabilityLane",
+    "DbLaneGrant",
+    "DbSafetyFrame",
+    "DbSafetyVerifier",
     "DbQueryPlan",
     "DbQueryPlanCandidate",
     "DbQueryPlanValidation",

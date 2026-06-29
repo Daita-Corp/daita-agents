@@ -3,15 +3,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from daita.runtime import Evidence, Operation, Task
 
 from ...analysis import stable_fingerprint, structural_schema_fingerprint
+from ...memory import (
+    db_answer_memory_refs_from_recall_evidence,
+    db_memory_options_from_runtime_metadata,
+)
 from ...plan_validation import DbQueryPlanValidator
 from ...planning_context import DbPlanningContextBuilder
 from ...query_plan import DbQueryPlan
 from ...query_planning import DbQueryPlanner
+
+if TYPE_CHECKING:
+    from .plugin import DbRuntimePlanningPlugin
+
+
+def _bound_runtime(plugin: DbRuntimePlanningPlugin) -> Any:
+    runtime = plugin.runtime
+    if runtime is None:
+        raise RuntimeError("DB runtime planning plugin is not bound to a runtime")
+    return runtime
 
 
 @dataclass(frozen=True)
@@ -29,7 +43,7 @@ class DbPlanningContextExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         builder = DbPlanningContextBuilder(runtime.config)
         base_request = runtime._db_request_from_operation(operation)
         prompt = task.input.get("prompt")
@@ -69,7 +83,6 @@ class DbPlanningContextExecutor:
         memory_recall_diagnostics = task.input.get("memory_recall_diagnostics")
         planning_context = builder.build(
             request=base_request,
-            intent=runtime._db_intent_from_operation(operation),
             operation=operation,
             schema_evidence=schema_evidence,
             catalog_evidence=catalog_evidence,
@@ -87,6 +100,84 @@ class DbPlanningContextExecutor:
 
 
 @dataclass(frozen=True)
+class DbMemoryAnswerContextExecutor:
+    """Executor that persists answer-safe DB memory context evidence."""
+
+    plugin: DbRuntimePlanningPlugin
+    id: str = "db_runtime.memory.answer_context.build"
+    owner: str = "db_runtime"
+    capability_ids: frozenset[str] = frozenset({"db.memory.answer_context.build"})
+
+    async def execute(
+        self,
+        task: Task,
+        operation: Operation,
+        context: Mapping[str, Any],
+    ) -> list[Evidence]:
+        runtime = _bound_runtime(self.plugin)
+        base_request = runtime._db_request_from_operation(operation)
+        prompt = task.input.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            from dataclasses import replace
+
+            base_request = replace(base_request, prompt=prompt)
+        schema_evidence = await _load_evidence(
+            runtime,
+            operation.id,
+            task.input.get("schema_evidence_id"),
+        )
+        memory_recall_evidence = tuple(
+            item
+            for item in [
+                await _load_evidence(runtime, operation.id, evidence_id)
+                for evidence_id in task.input.get("memory_recall_evidence_ids", ())
+            ]
+            if item is not None
+        )
+        if not memory_recall_evidence:
+            memory_recall_evidence = tuple(
+                item
+                for item in await runtime.store.list_evidence(operation.id)
+                if item.kind == "memory.semantic.recall" and item.accepted
+            )
+        schema = dict(schema_evidence.payload) if schema_evidence is not None else {}
+        memory_options = db_memory_options_from_runtime_metadata(
+            runtime.config.metadata
+        )
+        refs, evidence_refs, diagnostics = db_answer_memory_refs_from_recall_evidence(
+            tuple(item for item in memory_recall_evidence if item.accepted),
+            prompt=base_request.prompt,
+            schema=schema,
+            source_identity=memory_options.get("source_identity"),
+            schema_fingerprint=structural_schema_fingerprint(schema),
+            limit=int(memory_options.get("limit") or 5),
+            char_budget=int(memory_options.get("answer_char_budget") or 1200),
+            score_threshold=float(memory_options.get("score_threshold") or 0.45),
+        )
+        payload = {
+            "prompt_hash": stable_fingerprint(base_request.prompt),
+            "refs": [dict(item) for item in refs],
+            "memory_evidence_refs": list(evidence_refs),
+            "diagnostics": diagnostics,
+            "schema_fingerprint": structural_schema_fingerprint(schema),
+        }
+        return [
+            Evidence(
+                kind="answer.memory.context",
+                owner=self.owner,
+                operation_id=operation.id,
+                task_id=task.id,
+                accepted=True,
+                payload=payload,
+                metadata={
+                    "payload_fingerprint": stable_fingerprint(payload),
+                    "schema_fingerprint": payload["schema_fingerprint"],
+                },
+            )
+        ]
+
+
+@dataclass(frozen=True)
 class DbQueryPrepareReadExecutor:
     """Executor that prepares deterministic read evidence without full context."""
 
@@ -101,7 +192,7 @@ class DbQueryPrepareReadExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         base_request = runtime._db_request_from_operation(operation)
         prompt = task.input.get("prompt")
         if isinstance(prompt, str) and prompt.strip():
@@ -121,7 +212,6 @@ class DbQueryPrepareReadExecutor:
         schema = dict(schema_evidence.payload) if schema_evidence is not None else {}
         plan = DbQueryPlanner().plan_read_query(
             base_request,
-            runtime._db_intent_from_operation(operation),
             operation,
             schema,
             planning_context=(
@@ -205,7 +295,7 @@ class DbQueryPlanValidationExecutor:
         operation: Operation,
         context: Mapping[str, Any],
     ) -> list[Evidence]:
-        runtime = self.plugin.runtime
+        runtime = _bound_runtime(self.plugin)
         plan_evidence = await _load_evidence(
             runtime,
             operation.id,
@@ -273,7 +363,11 @@ def _compact_prepare_context(
     return {
         "operation_id": operation.id,
         "prompt": operation.request.get("prompt"),
-        "intent_kind": runtime._db_intent_from_operation(operation).kind.value,
+        "operation_type": operation.operation_type,
+        "granted_lanes": list(operation.metadata.get("granted_lanes") or ()),
+        "forbidden_capabilities": list(
+            operation.metadata.get("forbidden_capabilities") or ()
+        ),
         "dialect": dialect,
         "schema": {
             "database_type": schema.get("database_type"),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import re
 from typing import Any
 
 from daita.runtime import Evidence, Operation, Task, TaskDependency
@@ -10,8 +11,9 @@ from daita.runtime import Evidence, Operation, Task, TaskDependency
 from ..capabilities import SCHEMA_RELATIONSHIP_PATH_EVIDENCE
 from ..evidence import DbEvidenceStore
 from ..analysis import stable_fingerprint, structural_schema_fingerprint
-from ..memory import DB_MEMORY_METADATA_RECALL_INTENTS
-from ..models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
+from ..memory import DB_MEMORY_METADATA_RECALL_OPERATION_TYPES
+from ..memory import db_memory_options_from_runtime_metadata
+from ..models import DbOperationContract, DbRequest
 from ..query_planning import DbQueryPlanner
 from ..session_context import db_session_context_from_request
 from .catalog import (
@@ -19,7 +21,7 @@ from .catalog import (
     _catalog_column_value_search_exists,
     _catalog_evidence_for_planning,
 )
-from .helpers import _lineage_entity_for_request, _store_id_for_request
+from .helpers import _store_id_for_request
 from .planning import (
     _ExecutionPlanningMixin,
     _accepted_sql,
@@ -57,7 +59,6 @@ class DbOperationExecutor(
     async def execute(
         self,
         request: DbRequest,
-        intent: DbIntent,
         contract: DbOperationContract,
         operation: Operation,
     ) -> DbExecutionOutcome:
@@ -70,16 +71,25 @@ class DbOperationExecutor(
             "planner_strategy": None,
             "store_id": _store_id_for_request(request, self.runtime),
         }
+        operation_type = contract.operation_type
+        memory_answer_operation = operation_type in {
+            "memory.recall",
+            "memory.list",
+            "memory.inspect",
+        }
 
-        schema_evidence = await self._inspect_schema_if_available(
-            operation, tasks, evidence_store
+        schema_evidence = (
+            None
+            if memory_answer_operation
+            else await self._inspect_schema_if_available(
+                operation, tasks, evidence_store
+            )
         )
         schema = schema_evidence.payload if schema_evidence is not None else {}
 
-        if self._needs_catalog(contract) or intent.kind in {
-            DbIntentKind.DATA_QUERY,
-            DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-        }:
+        if not memory_answer_operation and (
+            self._needs_catalog(contract) or _is_read_operation(operation_type)
+        ):
             await self._register_catalog_source_if_available(
                 operation,
                 request,
@@ -89,7 +99,7 @@ class DbOperationExecutor(
                 diagnostics["store_id"],
             )
 
-        if intent.kind is DbIntentKind.SCHEMA_QUERY:
+        if operation_type == "schema.query":
             await self._execute_schema_steps(
                 request,
                 contract,
@@ -99,15 +109,31 @@ class DbOperationExecutor(
                 evidence_store,
                 diagnostics["store_id"],
             )
+            if _is_relationship_metadata_prompt(request.prompt):
+                await self._execute_relationship_schema_steps(
+                    request,
+                    contract,
+                    operation,
+                    schema,
+                    tasks,
+                    evidence_store,
+                    diagnostics["store_id"],
+                )
             await self._build_metadata_planning_context_if_allowed(
                 request,
-                intent,
                 operation,
                 schema_evidence,
                 tasks,
                 evidence_store,
             )
-        elif intent.kind is DbIntentKind.SCHEMA_RELATIONSHIP_QUERY:
+            await self._build_answer_memory_context_if_available(
+                request,
+                operation,
+                schema_evidence,
+                tasks,
+                evidence_store,
+            )
+        elif operation_type == "schema.relationships":
             await self._execute_relationship_schema_steps(
                 request,
                 contract,
@@ -119,19 +145,21 @@ class DbOperationExecutor(
             )
             await self._build_metadata_planning_context_if_allowed(
                 request,
-                intent,
                 operation,
                 schema_evidence,
                 tasks,
                 evidence_store,
             )
-        elif intent.kind in {
-            DbIntentKind.DATA_QUERY,
-            DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-        }:
+            await self._build_answer_memory_context_if_available(
+                request,
+                operation,
+                schema_evidence,
+                tasks,
+                evidence_store,
+            )
+        elif _is_read_operation(operation_type):
             relationship_payload = await self._relationship_payload_if_needed(
                 request,
-                intent,
                 contract,
                 operation,
                 schema,
@@ -145,10 +173,31 @@ class DbOperationExecutor(
                 llm_available=self.runtime.db_llm_service.available,
             )
             planning_context: Evidence | None = None
-            if (
-                route["strategy"] == "deterministic"
-                and intent.kind is DbIntentKind.DATA_QUERY
-            ):
+
+            async def _ensure_planning_context(
+                analysis_metadata: dict[str, Any] | None = None,
+            ) -> Evidence:
+                nonlocal planning_context
+                context = planning_context
+                if context is None:
+                    context = await self._build_planning_context(
+                        request,
+                        operation,
+                        tasks,
+                        evidence_store,
+                        schema_evidence=schema_evidence,
+                        catalog_evidence=_catalog_evidence_for_planning(evidence_store),
+                        relationship_evidence=tuple(
+                            item
+                            for item in evidence_store.list()
+                            if item.kind == SCHEMA_RELATIONSHIP_PATH_EVIDENCE
+                        ),
+                        analysis_metadata=analysis_metadata,
+                    )
+                    planning_context = context
+                return context
+
+            if route["strategy"] == "deterministic" and not relationship_payload:
                 if (
                     self._value_grounding_available()
                     and _deterministic_value_hint_search_needed(request, schema)
@@ -254,7 +303,6 @@ class DbOperationExecutor(
                 plan_evidence, strategy_warnings, strategy_diagnostics = (
                     await self._plan_query(
                         request,
-                        intent,
                         operation,
                         schema,
                         relationship_payload,
@@ -320,26 +368,14 @@ class DbOperationExecutor(
                 and self.runtime.db_llm_service.available
             ):
                 repair_attempted = True
-                if planning_context is None:
-                    planning_context = await self._build_planning_context(
-                        request,
-                        operation,
-                        tasks,
-                        evidence_store,
-                        schema_evidence=schema_evidence,
-                        catalog_evidence=_catalog_evidence_for_planning(evidence_store),
-                        relationship_evidence=tuple(
-                            item
-                            for item in evidence_store.list()
-                            if item.kind == SCHEMA_RELATIONSHIP_PATH_EVIDENCE
-                        ),
-                        analysis_metadata={"prepare_read_repair_context": True},
-                    )
+                repair_context = await _ensure_planning_context(
+                    {"prepare_read_repair_context": True}
+                )
                 repaired = await self._repair_query_plan(
                     operation,
                     tasks,
                     evidence_store,
-                    planning_context=planning_context,
+                    planning_context=repair_context,
                     prior_plan=plan_evidence,
                     failure=validation,
                     repair_attempt=1,
@@ -351,7 +387,7 @@ class DbOperationExecutor(
                         tasks,
                         evidence_store,
                         plan_evidence=plan_evidence,
-                        planning_context=planning_context,
+                        planning_context=repair_context,
                     )
             if (
                 repair_attempted
@@ -360,7 +396,6 @@ class DbOperationExecutor(
             ):
                 fallback = await self._try_deterministic_repair_fallback(
                     request,
-                    intent,
                     operation,
                     schema,
                     relationship_payload,
@@ -403,22 +438,21 @@ class DbOperationExecutor(
                         evidence_store,
                         sql_validation,
                     )
-                    zero_row_sql = (
-                        await self._repair_zero_row_result_if_available(
+                    zero_row_sql = None
+                    zero_row_context = planning_context
+                    if zero_row_context is not None:
+                        zero_row_sql = await self._repair_zero_row_result_if_available(
                             request,
                             contract,
                             operation,
                             schema,
                             tasks,
                             evidence_store,
-                            planning_context=planning_context,
+                            planning_context=zero_row_context,
                             plan_evidence=plan_evidence,
                             sql_validation=sql_validation,
                             read_evidence=read_evidence,
                         )
-                        if planning_context is not None
-                        else None
-                    )
                     if zero_row_sql:
                         diagnostics["planned_sql"] = zero_row_sql
                 except Exception as exc:
@@ -436,11 +470,14 @@ class DbOperationExecutor(
                                 },
                             },
                         )
+                        repair_context = await _ensure_planning_context(
+                            {"execution_failure_repair_context": True}
+                        )
                         repaired = await self._repair_query_plan(
                             operation,
                             tasks,
                             evidence_store,
-                            planning_context=planning_context,
+                            planning_context=repair_context,
                             prior_plan=plan_evidence,
                             failure=failure,
                             repair_attempt=1,
@@ -451,7 +488,7 @@ class DbOperationExecutor(
                                 tasks,
                                 evidence_store,
                                 plan_evidence=repaired,
-                                planning_context=planning_context,
+                                planning_context=repair_context,
                             )
                             repaired_sql = _accepted_sql(validation)
                             if repaired_sql:
@@ -487,7 +524,6 @@ class DbOperationExecutor(
                                 fallback = (
                                     await self._try_deterministic_repair_fallback(
                                         request,
-                                        intent,
                                         operation,
                                         schema,
                                         relationship_payload,
@@ -508,6 +544,8 @@ class DbOperationExecutor(
                                     ) = fallback
                                     warnings.extend(fallback_warnings)
                                     fallback_sql = _accepted_sql(fallback_validation)
+                                    if not fallback_sql:
+                                        raise
                                     sql_validation = await self._execute_sql_validation(
                                         contract,
                                         operation,
@@ -544,25 +582,7 @@ class DbOperationExecutor(
                                         warnings=tuple(warnings),
                                     )
                     raise
-        elif intent.kind is DbIntentKind.QUALITY_CHECK:
-            await self._execute_quality_steps(
-                request,
-                contract,
-                operation,
-                schema,
-                tasks,
-                evidence_store,
-            )
-        elif intent.kind is DbIntentKind.LINEAGE_TRACE:
-            await self._execute_lineage_steps(
-                request,
-                contract,
-                operation,
-                schema,
-                tasks,
-                evidence_store,
-            )
-        elif intent.kind is DbIntentKind.MEMORY_UPDATE:
+        elif operation_type == "memory.update":
             await self._execute_memory_update(
                 request,
                 contract,
@@ -571,8 +591,25 @@ class DbOperationExecutor(
                 tasks,
                 evidence_store,
             )
+        elif operation_type in {"memory.recall", "memory.list", "memory.inspect"}:
+            await self._execute_memory_answer(
+                request,
+                contract,
+                operation,
+                schema_evidence,
+                tasks,
+                evidence_store,
+            )
         else:
-            warnings.append(f"db_runtime_intent_not_executable:{intent.kind.value}")
+            executed = await self._execute_selected_contract_capabilities(
+                request,
+                contract,
+                operation,
+                tasks,
+                evidence_store,
+            )
+            if not executed:
+                warnings.append(f"db_runtime_operation_not_executable:{operation_type}")
 
         evidence = evidence_store.list()
         diagnostics["evidence_kinds"] = [item.kind for item in evidence]
@@ -661,61 +698,6 @@ class DbOperationExecutor(
             },
         )
 
-    async def _execute_quality_steps(
-        self,
-        request: DbRequest,
-        contract: DbOperationContract,
-        operation: Operation,
-        schema: dict[str, Any],
-        tasks: list[Task],
-        evidence_store: DbEvidenceStore,
-    ) -> None:
-        table = self.query_planner.best_table_for_prompt(request.prompt, schema)
-        if not table:
-            return
-        await self._execute_capability(
-            "quality.profile",
-            contract,
-            operation,
-            tasks,
-            evidence_store,
-            {
-                "table": table,
-                "sample_size": request.constraints.get("sample_size")
-                or request.metadata.get("sample_size"),
-            },
-        )
-
-    async def _execute_lineage_steps(
-        self,
-        request: DbRequest,
-        contract: DbOperationContract,
-        operation: Operation,
-        schema: dict[str, Any],
-        tasks: list[Task],
-        evidence_store: DbEvidenceStore,
-    ) -> None:
-        entity_id = _lineage_entity_for_request(
-            request,
-            self.query_planner.best_table_for_prompt(request.prompt, schema),
-        )
-        await self._execute_capability(
-            "lineage.trace",
-            contract,
-            operation,
-            tasks,
-            evidence_store,
-            {
-                "entity_id": entity_id,
-                "direction": request.constraints.get("direction")
-                or request.metadata.get("direction")
-                or "both",
-                "max_depth": request.constraints.get("max_depth")
-                or request.metadata.get("max_depth")
-                or 5,
-            },
-        )
-
     async def _execute_memory_update(
         self,
         request: DbRequest,
@@ -774,6 +756,58 @@ class DbOperationExecutor(
             ),
         )
 
+    async def _execute_memory_answer(
+        self,
+        request: DbRequest,
+        contract: DbOperationContract,
+        operation: Operation,
+        schema_evidence: Evidence | None,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+    ) -> None:
+        options = db_memory_options_from_runtime_metadata(self.runtime.config.metadata)
+        recall_evidence = await self._execute_capability(
+            "memory.semantic.recall",
+            contract,
+            operation,
+            tasks,
+            evidence_store,
+            {
+                "query": request.prompt,
+                "category": "db_semantics",
+                "limit": int(options.get("limit") or 5) * 3,
+                "score_threshold": float(options.get("score_threshold") or 0.45),
+                "retrieval_mode": options.get("retrieval_mode", "structured"),
+                "source_identity": options.get("source_identity"),
+            },
+        )
+        await self._execute_capability(
+            "db.memory.answer_context.build",
+            contract,
+            operation,
+            tasks,
+            evidence_store,
+            {
+                "prompt": request.prompt,
+                "schema_evidence_id": schema_evidence.id if schema_evidence else None,
+                "memory_recall_evidence_ids": [
+                    item.id for item in recall_evidence if item.id is not None
+                ],
+            },
+            dependencies=(
+                *(
+                    TaskDependency(
+                        kind="evidence",
+                        producer_task_id=str(item.task_id),
+                        evidence_kind=item.kind,
+                        evidence_id=item.id,
+                    )
+                    for item in recall_evidence
+                    if item.id is not None
+                ),
+            ),
+        )
+
     def _value_grounding_available(self) -> bool:
         required = {
             "db.column_values.profile",
@@ -793,13 +827,12 @@ class DbOperationExecutor(
     async def _build_metadata_planning_context_if_allowed(
         self,
         request: DbRequest,
-        intent: DbIntent,
         operation: Operation,
         schema_evidence: Evidence | None,
         tasks: list[Task],
         evidence_store: DbEvidenceStore,
     ) -> Evidence | None:
-        if intent.kind.value not in DB_MEMORY_METADATA_RECALL_INTENTS:
+        if operation.operation_type not in DB_MEMORY_METADATA_RECALL_OPERATION_TYPES:
             return None
         existing = next(
             (item for item in evidence_store.list() if item.kind == "planning.context"),
@@ -819,8 +852,98 @@ class DbOperationExecutor(
                 for item in evidence_store.list()
                 if item.kind == SCHEMA_RELATIONSHIP_PATH_EVIDENCE
             ),
-            analysis_metadata={"metadata_context_enrichment": intent.kind.value},
+            analysis_metadata={"metadata_context_enrichment": operation.operation_type},
         )
+
+    async def _build_answer_memory_context_if_available(
+        self,
+        request: DbRequest,
+        operation: Operation,
+        schema_evidence: Evidence | None,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+    ) -> Evidence | None:
+        memory_evidence = tuple(
+            item
+            for item in evidence_store.list()
+            if item.accepted and item.kind == "memory.semantic.recall" and item.id
+        )
+        if not memory_evidence:
+            return None
+        existing = next(
+            (
+                item
+                for item in evidence_store.list()
+                if item.kind == "answer.memory.context"
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        try:
+            capability = self.runtime.registry.get_capability(
+                "db.memory.answer_context.build",
+                owner="db_runtime",
+            )
+        except KeyError:
+            return None
+        evidence = await self._execute_direct_capability(
+            capability,
+            operation,
+            tasks,
+            evidence_store,
+            {
+                "prompt": request.prompt,
+                "schema_evidence_id": schema_evidence.id if schema_evidence else None,
+                "memory_recall_evidence_ids": [item.id for item in memory_evidence],
+            },
+            reason="answer_memory_context",
+            dependencies=(
+                *(
+                    TaskDependency(
+                        kind="evidence",
+                        producer_task_id=str(item.task_id),
+                        evidence_kind=item.kind,
+                        evidence_id=item.id,
+                    )
+                    for item in memory_evidence
+                    if item.id is not None
+                ),
+            ),
+        )
+        return evidence[0] if evidence else None
+
+    async def _execute_selected_contract_capabilities(
+        self,
+        request: DbRequest,
+        contract: DbOperationContract,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+    ) -> bool:
+        executed = False
+        for selected in contract.metadata.get("selected_capabilities", ()):
+            if not isinstance(selected, dict):
+                continue
+            capability_id = str(selected.get("id") or "")
+            if not capability_id or capability_id.startswith("db."):
+                continue
+            capability = self.runtime.registry.get_capability(
+                capability_id,
+                owner=str(selected.get("owner") or ""),
+            )
+            if capability_id not in contract.required_capabilities:
+                continue
+            await self._execute_direct_capability(
+                capability,
+                operation,
+                tasks,
+                evidence_store,
+                _generic_capability_input(request, capability_id),
+                reason="contract_selected_capability",
+            )
+            executed = True
+        return executed
 
 
 def _relationship_assets_for_metadata_prompt(
@@ -846,6 +969,67 @@ def _relationship_assets_for_metadata_prompt(
     return [source], all_tables[:5]
 
 
+def _is_relationship_metadata_prompt(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return "relationship" in lowered or "relationships" in lowered
+
+
+def _generic_capability_input(
+    request: DbRequest,
+    capability_id: str,
+) -> dict[str, Any]:
+    payload = {
+        "prompt": request.prompt,
+        **dict(request.constraints),
+        **dict(request.metadata),
+    }
+    if capability_id == "quality.profile" and "table" not in payload:
+        table = DbQueryPlanner.best_table_for_prompt(
+            request.prompt,
+            {
+                "tables": [
+                    {"name": item}
+                    for item in (
+                        request.source_scope
+                        or tuple(
+                            word.strip(" ,.?;:'\"`") for word in request.prompt.split()
+                        )
+                    )
+                ]
+            },
+        )
+        payload["table"] = table or _last_prompt_identifier(request.prompt)
+    if capability_id == "lineage.trace":
+        value = payload.get("entity_id") or payload.get("table")
+        if not value:
+            value = _last_prompt_identifier(request.prompt)
+        if value:
+            payload["entity_id"] = str(value) if ":" in str(value) else f"table:{value}"
+    return payload
+
+
+def _last_prompt_identifier(prompt: str) -> str | None:
+    stop = {
+        "the",
+        "for",
+        "table",
+        "tables",
+        "profile",
+        "trace",
+        "lineage",
+        "quality",
+        "check",
+        "data",
+    }
+    candidates = [
+        word.strip(" ,.?;:'\"`").lower()
+        for word in prompt.split()
+        if word.strip(" ,.?;:'\"`")
+    ]
+    filtered = [word for word in candidates if word not in stop]
+    return filtered[-1] if filtered else None
+
+
 def _schema_tables_for_request(
     request: DbRequest,
     schema: dict[str, Any],
@@ -864,10 +1048,13 @@ def _schema_tables_for_request(
             if short_name in schema_tables:
                 scoped_tables.append(short_name)
         return tuple(dict.fromkeys(scoped_tables))
+    session_tables = _session_tables_for_request(request, schema_tables)
+    if session_tables and _session_table_followup_prompt(request.prompt):
+        return session_tables
     explicit_table = query_planner.best_table_for_prompt(request.prompt, schema)
     if explicit_table:
         return (explicit_table,)
-    return _session_tables_for_request(request, schema_tables)
+    return session_tables
 
 
 def _session_tables_for_request(
@@ -907,6 +1094,14 @@ def _schema_table_names(schema: dict[str, Any]) -> set[str]:
     }
 
 
+def _session_table_followup_prompt(prompt: str) -> bool:
+    text = str(prompt or "").lower()
+    return bool(
+        re.search(r"\b(those|these|them|that|it)\b", text)
+        or re.search(r"\b(detail|columns?|fields?)\b.*\b(previous|same)\b", text)
+    )
+
+
 def _related_tables_for_schema_asset(schema: dict[str, Any], asset: str) -> list[str]:
     related: list[str] = []
     for relationship in schema.get("foreign_keys", []) or []:
@@ -928,3 +1123,12 @@ def _with_schema_asset_scope(evidence: Evidence, scope: str) -> Evidence:
     payload_metadata.setdefault("scope", scope)
     payload["metadata"] = payload_metadata
     return replace(evidence, payload=payload, metadata=metadata)
+
+
+def _is_read_operation(operation_type: str) -> bool:
+    return operation_type in {
+        "data.query",
+        "query",
+        "read",
+        "db.read",
+    }

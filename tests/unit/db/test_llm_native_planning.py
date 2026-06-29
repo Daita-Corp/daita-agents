@@ -95,7 +95,8 @@ def _board_revenue_contract_metadata(source_identity: str) -> dict:
 async def _runtime_with_llm(tmp_path, responses):
     db_path = tmp_path / "llm_planning.sqlite"
     sqlite = SQLitePlugin(path=str(db_path))
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL
@@ -112,7 +113,8 @@ async def _runtime_with_llm(tmp_path, responses):
             (1, 10.0, 'complete'),
             (1, 30.0, 'complete'),
             (2, 20.0, 'pending');
-        """)
+        """
+    )
     runtime = DbRuntime(
         plugins=(CatalogPlugin(auto_persist=False), sqlite),
         db_llm_service=FakeDbLLMService(responses),
@@ -124,7 +126,8 @@ async def _runtime_with_llm(tmp_path, responses):
 async def _runtime_with_board_revenue_memory(tmp_path, responses):
     db_path = tmp_path / "llm_board_revenue.sqlite"
     sqlite = SQLitePlugin(path=str(db_path))
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             total REAL NOT NULL,
@@ -141,7 +144,8 @@ async def _runtime_with_board_revenue_memory(tmp_path, responses):
             (2, 30.0, 'complete'),
             (3, 20.0, 'pending');
         INSERT INTO refunds (order_id, amount) VALUES (1, 5.0);
-        """)
+        """
+    )
     source_identity = "sqlite:from_db:board-revenue"
     schema = {
         "database_type": "sqlite",
@@ -549,7 +553,7 @@ async def test_repair_exhaustion_records_terminal_diagnostics_without_sql_execut
     tmp_path,
     monkeypatch,
 ):
-    def invalid_plan(self, request, intent, operation, schema, **kwargs):
+    def invalid_plan(self, request, operation, schema, **kwargs):
         structured = StructuredDbQueryPlan.deterministic(
             sql=None,
             tables=(),

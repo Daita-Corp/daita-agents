@@ -1,5 +1,5 @@
-from daita.db import DbIntent, DbIntentKind, DbQueryPlan, DbQueryPlanner, DbRequest
-from daita.runtime import AccessMode, Operation
+from daita.db import DbQueryPlan, DbQueryPlanner, DbRequest
+from daita.runtime import Operation
 
 
 def _schema():
@@ -87,7 +87,6 @@ def test_query_planner_builds_count_plan_without_executing_sql():
     planner = DbQueryPlanner()
     plan = planner.plan_read_query(
         DbRequest("How many orders are there?"),
-        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         Operation(id="op-1", operation_type="data.query"),
         _schema(),
     )
@@ -127,7 +126,6 @@ def test_query_planner_uses_catalog_metadata_business_name_for_table_match():
     planner = DbQueryPlanner()
     plan = planner.plan_read_query(
         DbRequest("How many signups?"),
-        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         Operation(id="op-1", operation_type="data.query"),
         schema,
     )
@@ -139,7 +137,6 @@ def test_query_planner_builds_filtered_select_plan():
     planner = DbQueryPlanner()
     plan = planner.plan_read_query(
         DbRequest("List orders where total > 40"),
-        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         Operation(id="op-1", operation_type="data.query"),
         _schema(),
     )
@@ -155,7 +152,6 @@ def test_query_planner_preserves_multiple_prompt_filters():
     planner = DbQueryPlanner()
     plan = planner.plan_read_query(
         DbRequest("Show support_tickets where status = 'open' and severity = 'high'"),
-        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         Operation(id="op-1", operation_type="data.query"),
         _schema(),
     )
@@ -175,7 +171,6 @@ def test_query_planner_preserves_explicit_filters_in_count_plan():
     planner = DbQueryPlanner()
     plan = planner.plan_read_query(
         DbRequest("How many support_tickets have status='open' and severity='high'?"),
-        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         Operation(id="op-1", operation_type="data.query"),
         _schema(),
     )
@@ -195,7 +190,6 @@ def test_query_planner_preserves_explicit_filters_for_spaced_table_phrase_count(
     planner = DbQueryPlanner()
     plan = planner.plan_read_query(
         DbRequest("How many support tickets have status='open' and severity='high'?"),
-        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         Operation(id="op-1", operation_type="data.query"),
         _schema(),
     )
@@ -262,21 +256,18 @@ def test_query_planner_matches_observed_value_variants_from_hints():
 
     completed = planner.plan_read_query(
         DbRequest("Show completed orders by status"),
-        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         Operation(id="op-completed", operation_type="data.query"),
         schema,
         planning_context=context,
     )
     pending = planner.plan_read_query(
         DbRequest("Show pending orders by status"),
-        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         Operation(id="op-pending", operation_type="data.query"),
         schema,
         planning_context=context,
     )
     unrelated = planner.plan_read_query(
         DbRequest("Show shipping orders by status"),
-        DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
         Operation(id="op-shipping", operation_type="data.query"),
         schema,
         planning_context=context,
@@ -293,10 +284,6 @@ def test_query_planner_builds_join_plan_from_relationship_payload():
     planner = DbQueryPlanner()
     plan = planner.plan_read_query(
         DbRequest("Join orders to customers using their relationship"),
-        DbIntent(
-            kind=DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-            access=AccessMode.READ,
-        ),
         Operation(id="op-1", operation_type="data.query"),
         _schema(),
         relationship_payload={
@@ -326,12 +313,9 @@ def test_query_planner_preserves_and_qualifies_join_filters():
         DbRequest(
             "Join customers to support_tickets where status='open' and severity='high'"
         ),
-        DbIntent(
-            kind=DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-            access=AccessMode.READ,
-        ),
         Operation(id="op-1", operation_type="data.query"),
         _schema_without_customer_status(),
+        planner_hints={"relationship_join": True},
     )
 
     assert 'JOIN "customers"' in plan.sql
@@ -353,12 +337,9 @@ def test_query_planner_normalizes_join_endpoint_phrases():
         DbRequest(
             "Which customers have open high severity support tickets? Join customers to support tickets."
         ),
-        DbIntent(
-            kind=DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-            access=AccessMode.READ,
-        ),
         Operation(id="op-1", operation_type="data.query"),
         _schema(),
+        planner_hints={"relationship_join": True},
     )
 
     assert plan.sql is not None
@@ -370,12 +351,9 @@ def test_query_planner_does_not_guess_ambiguous_join_filter_table():
     planner = DbQueryPlanner()
     plan = planner.plan_read_query(
         DbRequest("Join customers to support tickets where status='open'"),
-        DbIntent(
-            kind=DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-            access=AccessMode.READ,
-        ),
         Operation(id="op-1", operation_type="data.query"),
         _schema(),
+        planner_hints={"relationship_join": True},
     )
 
     assert plan.sql is None

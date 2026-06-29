@@ -99,7 +99,6 @@ class RunResult(BaseModel):
     operation_id: str | None = None
     operation_status: str | None = None
     operation_type: str | None = None
-    intent: str | None = None
     tasks: list[RuntimeTaskEvidence] = Field(default_factory=list)
     evidence: list[RuntimeEvidenceRecord] = Field(default_factory=list)
     governance: RuntimeGovernanceRecord | None = None

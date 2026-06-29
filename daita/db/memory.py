@@ -45,20 +45,18 @@ DB_SEMANTIC_MEMORY_KINDS = (
     "value_alias",
 )
 DB_PLANNING_MEMORY_KINDS = frozenset(DB_SEMANTIC_MEMORY_KINDS)
-DB_MEMORY_SEMANTIC_QUERY_INTENTS = frozenset(
+DB_MEMORY_QUERY_OPERATION_TYPES = frozenset(
     {
         "data.query",
-        "data.query.catalog_assisted",
-        "metric.query",
-        "report.generate",
-        "quality.check",
-        "anomaly.investigate",
+        "query",
+        "read",
+        "db.read",
     }
 )
-DB_MEMORY_METADATA_RECALL_INTENTS = frozenset(
+DB_MEMORY_METADATA_RECALL_OPERATION_TYPES = frozenset(
     {
         "schema.query",
-        "schema.relationship_query",
+        "schema.relationships",
     }
 )
 
@@ -257,7 +255,7 @@ async def recall_db_memory_records(
 def db_memory_planning_recall_decision(
     *,
     prompt: str,
-    intent_kind: str,
+    operation_type: str,
     schema: dict[str, Any],
     memory_config: dict[str, Any],
     matched_schema_terms: Iterable[str] | None = None,
@@ -271,10 +269,10 @@ def db_memory_planning_recall_decision(
         return {"recall": False, "reason": "limit_zero"}
     if int(memory_config.get("char_budget") or 0) <= 0:
         return {"recall": False, "reason": "char_budget_zero"}
-    if intent_kind not in (
-        DB_MEMORY_SEMANTIC_QUERY_INTENTS | DB_MEMORY_METADATA_RECALL_INTENTS
+    if operation_type not in (
+        DB_MEMORY_QUERY_OPERATION_TYPES | DB_MEMORY_METADATA_RECALL_OPERATION_TYPES
     ):
-        return {"recall": False, "reason": "intent_not_semantic_query"}
+        return {"recall": False, "reason": "operation_not_memory_eligible"}
     if _looks_row_level(prompt):
         return {"recall": False, "reason": "row_level_or_pii_prompt"}
 
@@ -288,7 +286,7 @@ def db_memory_planning_recall_decision(
             "query": db_memory_planning_recall_query(
                 prompt,
                 schema,
-                intent_kind,
+                operation_type,
                 matched_schema_terms=matched_schema_terms,
             ),
         }
@@ -301,7 +299,7 @@ def db_memory_planning_recall_decision(
         "query": db_memory_planning_recall_query(
             prompt,
             schema,
-            intent_kind,
+            operation_type,
             matched_schema_terms=matched_schema_terms,
         ),
     }
@@ -310,7 +308,7 @@ def db_memory_planning_recall_decision(
 def db_memory_planning_recall_query(
     prompt: str,
     schema: dict[str, Any],
-    intent_kind: str,
+    operation_type: str,
     *,
     matched_schema_terms: Iterable[str] | None = None,
 ) -> str:
@@ -324,10 +322,10 @@ def db_memory_planning_recall_query(
         limit=24,
     )
     recall_terms = _bounded_recall_terms(
-        _recall_terms_for_prompt(prompt, schema_terms, intent_kind),
+        _recall_terms_for_prompt(prompt, schema_terms, operation_type),
         limit=32,
     )
-    lines = [str(prompt or "").strip(), f"Intent: {intent_kind}"]
+    lines = [str(prompt or "").strip(), f"Operation type: {operation_type}"]
     if schema_terms:
         lines.append(f"Matched schema terms: {' '.join(schema_terms)}")
     if recall_terms:
@@ -380,7 +378,7 @@ def _matched_schema_terms_for_recall(
 def _recall_terms_for_prompt(
     prompt: str,
     schema_terms: Iterable[str],
-    intent_kind: str,
+    operation_type: str,
 ) -> tuple[str, ...]:
     terms: list[str] = []
     prompt_terms = set(_meaningful_tokens(prompt))
@@ -391,7 +389,7 @@ def _recall_terms_for_prompt(
         terms.append(cleaned)
         if "." not in cleaned and "table" in prompt_terms:
             terms.append(f"{cleaned} table")
-    if intent_kind == "schema.relationship_query":
+    if operation_type == "schema.relationships":
         terms.append("relationship")
     return tuple(terms)
 
@@ -494,9 +492,7 @@ def db_memory_refs_from_recall_evidence(
         if used_chars + len(line) > max(0, int(char_budget)):
             _bump_omitted(diagnostics, "budget")
             continue
-        metadata = (
-            record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-        )
+        metadata = _record_metadata(record)
         ref_evidence = _memory_evidence_ref_ids(metadata)
         if getattr(evidence, "id", None):
             evidence_refs.append(evidence.id)
@@ -529,6 +525,95 @@ def db_memory_refs_from_recall_evidence(
             contract = None
         if contract is not None:
             ref[DB_MEMORY_SEMANTIC_CONTRACT_KEY] = contract
+        refs.append(ref)
+        used_chars += len(line)
+    diagnostics["included_count"] = len(refs)
+    diagnostics["char_budget"] = int(char_budget)
+    diagnostics["used_chars"] = used_chars
+    return tuple(refs), tuple(dict.fromkeys(evidence_refs)), diagnostics
+
+
+def db_answer_memory_refs_from_recall_evidence(
+    recall_evidence: tuple[Any, ...],
+    *,
+    prompt: str,
+    schema: dict[str, Any],
+    source_identity: str | None,
+    schema_fingerprint: str | None,
+    limit: int = 5,
+    char_budget: int = 1200,
+    score_threshold: float = 0.45,
+) -> tuple[tuple[dict[str, Any], ...], tuple[str, ...], dict[str, Any]]:
+    """Project semantic recall evidence into answer-safe DB memory refs."""
+    diagnostics: dict[str, Any] = {
+        "registered": bool(recall_evidence),
+        "queried": bool(recall_evidence),
+        "candidate_count": 0,
+        "included_count": 0,
+        "omitted_reasons": {},
+        "caveat_reasons": {},
+        "lane": "answer",
+    }
+    candidates: list[tuple[dict[str, Any], Any]] = []
+    for evidence in recall_evidence:
+        payload = getattr(evidence, "payload", {}) or {}
+        for result in payload.get("results", []) or []:
+            if isinstance(result, dict):
+                candidates.append((result, evidence))
+    diagnostics["candidate_count"] = len(candidates)
+
+    refs: list[dict[str, Any]] = []
+    evidence_refs: list[str] = []
+    used_chars = 0
+    for result, evidence in candidates:
+        if len(refs) >= max(0, int(limit)):
+            _bump_omitted(diagnostics, "limit")
+            continue
+        record = _db_memory_record_from_recall_result(result)
+        reason = _answer_memory_omit_reason(
+            record,
+            result,
+            prompt=prompt,
+            schema=schema,
+            source_identity=source_identity,
+            score_threshold=score_threshold,
+        )
+        if reason:
+            _bump_omitted(diagnostics, reason)
+            continue
+        text = str(record.get("text") or "").strip()
+        key = str(record.get("key") or "").strip()
+        kind = str(record.get("kind") or "").strip()
+        line = f"- {kind} {key}: {text}"
+        if used_chars + len(line) > max(0, int(char_budget)):
+            _bump_omitted(diagnostics, "budget")
+            continue
+        metadata = _record_metadata(record)
+        ref_evidence = _memory_evidence_ref_ids(metadata)
+        if getattr(evidence, "id", None):
+            evidence_refs.append(evidence.id)
+        evidence_refs.extend(ref_evidence)
+        caveats: list[str] = []
+        record_schema = metadata.get("source_schema_fingerprint") or metadata.get(
+            "schema_fingerprint"
+        )
+        if record_schema and schema_fingerprint and record_schema != schema_fingerprint:
+            caveats.append("schema_fingerprint_mismatch")
+            _bump_caveat(diagnostics, "schema_fingerprint_mismatch")
+        ref = {
+            "chunk_id": result.get("chunk_id"),
+            "kind": kind,
+            "key": key,
+            "text": text,
+            "confidence": _confidence_value(metadata.get("confidence"), default=1.0),
+            "importance": float(record.get("importance") or 0.0),
+            "source_identity": metadata.get("source_identity"),
+            "evidence_refs": ref_evidence,
+            "schema_fingerprint": record_schema,
+            "caveats": caveats,
+        }
+        if metadata.get("creation_path"):
+            ref["creation_path"] = metadata.get("creation_path")
         refs.append(ref)
         used_chars += len(line)
     diagnostics["included_count"] = len(refs)
@@ -1003,11 +1088,16 @@ def _looks_direct_query(text: str) -> bool:
 
 def _looks_count_intent(text: str) -> bool:
     lowered = str(text or "").lower()
-    return any(term in lowered for term in ("count", "how many", "number of", "total"))
+    return bool(_matched_terms(lowered, ("count", "how many", "number of", "total")))
 
 
 def _matched_terms(text: str, terms: tuple[str, ...]) -> list[str]:
-    return [term for term in terms if term in text]
+    lowered = str(text or "").lower()
+    return [
+        term
+        for term in terms
+        if re.search(rf"(?<!\w){re.escape(str(term).lower())}(?!\w)", lowered)
+    ]
 
 
 def _identifier_matches(text: str) -> list[str]:
@@ -1416,7 +1506,7 @@ def _db_memory_record_from_recall_result(result: dict[str, Any]) -> dict[str, An
     metadata = result.get("metadata") or {}
     db_memory = metadata.get("db_memory") if isinstance(metadata, dict) else None
     if isinstance(db_memory, dict):
-        return dict(db_memory)
+        return _coerce_str_dict(db_memory)
 
     content = str(result.get("content", ""))
     try:
@@ -1424,10 +1514,20 @@ def _db_memory_record_from_recall_result(result: dict[str, Any]) -> dict[str, An
         if content.startswith(marker):
             payload = json.loads(content[len(marker) :])
             if isinstance(payload, dict):
-                return payload
+                return _coerce_str_dict(payload)
     except Exception:
         return {}
     return {}
+
+
+def _coerce_str_dict(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): item for key, item in value.items()}
+
+
+def _record_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    return _coerce_str_dict(record.get("metadata"))
 
 
 def _planner_memory_omit_reason(
@@ -1443,9 +1543,7 @@ def _planner_memory_omit_reason(
     kind = str(record.get("kind") or "")
     key = str(record.get("key") or "")
     text = str(record.get("text") or "")
-    metadata = (
-        record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    )
+    metadata = _record_metadata(record)
     if kind not in DB_PLANNING_MEMORY_KINDS:
         return "unsupported_kind"
     if not key or not text:
@@ -1470,7 +1568,48 @@ def _planner_memory_omit_reason(
         return "missing_catalog_citation"
     if db_memory_pii_error(key=key, text=text, metadata=metadata):
         return "unsafe"
-    if not _record_refs_known_schema(metadata, schema):
+    if (
+        schema.get("tables") or schema.get("foreign_keys")
+    ) and not _record_refs_known_schema(metadata, schema):
+        return "schema_scope_mismatch"
+    if not _memory_relevant_to_prompt(prompt, record):
+        return "irrelevant"
+    return None
+
+
+def _answer_memory_omit_reason(
+    record: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    prompt: str,
+    schema: dict[str, Any],
+    source_identity: str | None,
+    score_threshold: float,
+) -> str | None:
+    kind = str(record.get("kind") or "")
+    key = str(record.get("key") or "")
+    text = str(record.get("text") or "")
+    metadata = _record_metadata(record)
+    if kind not in DB_SEMANTIC_MEMORY_KINDS:
+        return "unsupported_kind"
+    if not key or not text:
+        return "malformed"
+    if not _score_is_high_enough(result, score_threshold):
+        return "low_score"
+    record_source = metadata.get("source_identity")
+    if source_identity and record_source != source_identity:
+        return "cross_source" if record_source else "missing_source_identity"
+    if metadata.get("active") is False:
+        return "inactive"
+    if bool(metadata.get("stale")) or _is_memory_expired(metadata):
+        return "stale"
+    if _confidence_value(metadata.get("confidence"), default=1.0) < 0.5:
+        return "low_confidence"
+    if db_memory_pii_error(key=key, text=text, metadata=metadata):
+        return "unsafe"
+    if (
+        schema.get("tables") or schema.get("foreign_keys")
+    ) and not _record_refs_known_schema(metadata, schema):
         return "schema_scope_mismatch"
     if not _memory_relevant_to_prompt(prompt, record):
         return "irrelevant"
@@ -1603,9 +1742,7 @@ def _memory_relevant_to_prompt(prompt: str, record: dict[str, Any]) -> bool:
     prompt_tokens = set(_meaningful_tokens(prompt))
     if not prompt_tokens:
         return True
-    metadata = (
-        record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    )
+    metadata = _record_metadata(record)
     record_text = " ".join(
         str(value)
         for value in (
@@ -1685,6 +1822,11 @@ def _memory_evidence_ref_ids(metadata: dict[str, Any]) -> list[str]:
 def _bump_omitted(diagnostics: dict[str, Any], reason: str) -> None:
     omitted = diagnostics.setdefault("omitted_reasons", {})
     omitted[reason] = int(omitted.get(reason) or 0) + 1
+
+
+def _bump_caveat(diagnostics: dict[str, Any], reason: str) -> None:
+    caveats = diagnostics.setdefault("caveat_reasons", {})
+    caveats[reason] = int(caveats.get(reason) or 0) + 1
 
 
 def _dedupe_recall_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:

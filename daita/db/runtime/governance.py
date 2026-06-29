@@ -24,6 +24,7 @@ from daita.runtime import (
 from daita.runtime import Evidence
 from daita.runtime import GovernanceResult, PolicyEffect
 
+from ..authorization import authorization_from_operation
 from ..governance import default_db_policies
 from ..models import DbOperationContract
 from .resume import _db_contract_from_context, _operation_has_run_context
@@ -485,6 +486,10 @@ def _approval_governance_facts(
     }
 
 
+def _authorization_governance_facts(operation: Operation) -> dict[str, Any]:
+    return authorization_from_operation(operation)
+
+
 def _sql_validation_governance_facts(
     evidence: tuple[Evidence, ...],
 ) -> dict[str, Any]:
@@ -775,12 +780,13 @@ def _approval_action_summary(action: dict[str, Any]) -> dict[str, Any]:
 
 def _metadata_summary(metadata: dict[str, Any]) -> dict[str, Any]:
     safe_values = {}
-    for key in ("runtime_id", "intent_kind", "access", "governance_stage"):
+    for key in ("runtime_id", "access", "governance_stage"):
         if key in metadata:
             safe_values[key] = metadata[key]
+    legacy_intent_key = "intent" + "_kind"
     return {
         **safe_values,
-        "keys": sorted(str(key) for key in metadata),
+        "keys": sorted(str(key) for key in metadata if str(key) != legacy_intent_key),
     }
 
 
@@ -894,6 +900,9 @@ def _task_trace_context(task: Task | None) -> dict[str, Any]:
         "operation_id": task.operation_id,
         "capability_id": task.capability_id,
         "executor_id": task.executor_id,
+        "owner": task.metadata.get("owner"),
+        "requested_lane": task.metadata.get("requested_lane"),
+        "required_lane": task.metadata.get("required_lane"),
         "status": task.status.value,
         "input": _task_input_summary(task.input),
         "required_evidence": sorted(task.required_evidence),
@@ -941,15 +950,19 @@ def _governance_fact_envelope(
     approvals: tuple[ApprovalRequest, ...],
 ) -> dict[str, Any]:
     planned = _planned_governance_facts(operation, contract, capability)
+    contract_facts = _contract_governance_facts(operation, contract)
     validation_context = _sql_validation_governance_facts(evidence)
     authoritative_validation = _sql_validation_governance_facts(
         authoritative_validation_evidence
     )
     task_facts = _task_governance_facts(task)
     approval_facts = _approval_governance_facts(approvals)
+    authorization_facts = _authorization_governance_facts(operation)
     sources = ["runtime"]
     if planned.get("has_planned_facts"):
         sources.append("planning")
+    if contract_facts.get("has_contract_facts"):
+        sources.append("contract")
     if validation_context.get("evidence_ids"):
         sources.append("sql_validation")
     if authoritative_validation.get("evidence_ids"):
@@ -960,6 +973,7 @@ def _governance_fact_envelope(
         sources.append("task")
     if approvals:
         sources.append("approval_store")
+    sources.append("authorization")
     return {
         "version": "15.10",
         "fact_source": {
@@ -972,6 +986,7 @@ def _governance_fact_envelope(
             "task": task is not None,
             "capability": capability is not None,
             "approvals": bool(approvals),
+            "authorization": True,
         },
         "stage": stage,
         "authoritative": {
@@ -982,6 +997,7 @@ def _governance_fact_envelope(
                 planned=planned,
             ),
             "operation": planned,
+            "contract": contract_facts,
             "capability": (
                 _capability_governance_facts(capability)
                 if capability is not None
@@ -989,6 +1005,7 @@ def _governance_fact_envelope(
             ),
             "task": task_facts,
             "validation": authoritative_validation,
+            "authorization": authorization_facts,
         },
         "context": {
             "validation": {
@@ -996,12 +1013,14 @@ def _governance_fact_envelope(
             },
         },
         "operation": planned,
+        "contract": contract_facts,
         "capability": (
             _capability_governance_facts(capability) if capability is not None else {}
         ),
         "task": task_facts,
         "validation": authoritative_validation,
         "approvals": approval_facts,
+        "authorization": authorization_facts,
         "actor": _actor_context(operation),
         "tenant": _tenant_context(operation),
         "source_scope": list(_source_scope_context(operation)),
@@ -1016,6 +1035,7 @@ def _planned_governance_facts(
 ) -> dict[str, Any]:
     contract_metadata = contract.metadata if contract is not None else {}
     planned = dict(contract_metadata.get("planned_operation") or {})
+    safety_frame = _safety_frame_from_operation(operation, contract_metadata)
     access = (
         contract.access.value
         if contract is not None
@@ -1046,8 +1066,14 @@ def _planned_governance_facts(
         "operation_id": operation.id,
         "operation_type": operation_type,
         "access": access,
-        "intent_kind": operation.metadata.get("intent_kind")
-        or planned.get("intent_kind"),
+        "granted_lanes": _granted_lanes_from_metadata(operation, contract_metadata),
+        "forbidden_capabilities": _forbidden_capabilities_from_metadata(
+            operation, contract_metadata
+        ),
+        "requested_capabilities": _requested_capabilities_from_context(
+            operation, contract_metadata, safety_frame
+        ),
+        "safety": _safety_governance_facts(safety_frame),
         "required_evidence": sorted(operation.required_evidence),
         "capability_ids": (
             list(contract.required_capabilities)
@@ -1058,6 +1084,164 @@ def _planned_governance_facts(
         "destructive": destructive,
         "write_or_admin_context": write_or_admin,
         "side_effecting": side_effecting,
+    }
+
+
+def _contract_governance_facts(
+    operation: Operation,
+    contract: DbOperationContract | None,
+) -> dict[str, Any]:
+    if contract is not None:
+        metadata = contract.metadata
+        operation_type = contract.operation_type
+        access = contract.access.value
+        required_capabilities = list(contract.required_capabilities)
+        required_evidence = list(contract.required_evidence)
+        policy_ids = list(contract.policy_ids)
+    else:
+        metadata = _contract_metadata_from_operation(operation)
+        operation_type = str(metadata.get("operation_type") or operation.operation_type)
+        access = str(metadata.get("access") or operation.metadata.get("access") or "")
+        required_capabilities = _safe_string_list(
+            metadata.get("required_capabilities") or ()
+        )
+        required_evidence = _safe_string_list(
+            metadata.get("required_evidence") or sorted(operation.required_evidence)
+        )
+        policy_ids = _safe_string_list(metadata.get("policy_ids") or ())
+
+    safety_frame = _safety_frame_from_operation(operation, metadata)
+    granted_lanes = _granted_lanes_from_metadata(operation, metadata)
+    forbidden_capabilities = _forbidden_capabilities_from_metadata(operation, metadata)
+    selected_capabilities = [
+        {
+            "id": item.get("id"),
+            "owner": item.get("owner"),
+            "executor": item.get("executor"),
+            "access": item.get("access"),
+            "risk": item.get("risk"),
+            "side_effecting": item.get("side_effecting"),
+        }
+        for item in metadata.get("selected_capabilities") or ()
+        if isinstance(item, dict)
+    ]
+    return {
+        "has_contract_facts": bool(contract is not None or metadata or granted_lanes),
+        "operation_type": operation_type,
+        "access": access or None,
+        "required_capabilities": list(required_capabilities),
+        "required_evidence": list(required_evidence),
+        "policy_ids": list(policy_ids),
+        "granted_lanes": granted_lanes,
+        "forbidden_capabilities": forbidden_capabilities,
+        "requested_capabilities": _requested_capabilities_from_context(
+            operation, metadata, safety_frame
+        ),
+        "approval_required": bool(
+            metadata.get("approval_required")
+            or (safety_frame or {}).get("approval_required")
+        ),
+        "selected_capabilities": selected_capabilities,
+        "selected_capability_ids": _ordered_unique(
+            item["id"] for item in selected_capabilities if item.get("id")
+        ),
+        "safety": _safety_governance_facts(safety_frame),
+    }
+
+
+def _contract_metadata_from_operation(operation: Operation) -> dict[str, Any]:
+    for key in ("contract", "contract_metadata"):
+        value = operation.metadata.get(key)
+        if isinstance(value, dict):
+            return dict(value)
+    context = operation.metadata.get("resume_context")
+    if isinstance(context, dict) and isinstance(context.get("contract"), dict):
+        contract = dict(context["contract"])
+        metadata = contract.get("metadata")
+        return dict(metadata) if isinstance(metadata, dict) else contract
+    return {}
+
+
+def _safety_frame_from_operation(
+    operation: Operation,
+    contract_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    value = contract_metadata.get("safety_frame")
+    if isinstance(value, dict):
+        return dict(value)
+    value = operation.metadata.get("safety_frame")
+    if isinstance(value, dict):
+        return dict(value)
+    context = operation.metadata.get("resume_context")
+    if isinstance(context, dict) and isinstance(context.get("safety_frame"), dict):
+        return dict(context["safety_frame"])
+    return {}
+
+
+def _granted_lanes_from_metadata(
+    operation: Operation,
+    contract_metadata: dict[str, Any],
+) -> list[str]:
+    value = contract_metadata.get("granted_lanes")
+    if value is None:
+        planned = contract_metadata.get("planned_operation")
+        if isinstance(planned, dict):
+            value = planned.get("granted_lanes")
+    if value is None:
+        value = operation.metadata.get("granted_lanes")
+    if value is None:
+        safety = _safety_frame_from_operation(operation, contract_metadata)
+        value = safety.get("granted_lanes")
+    return list(_safe_string_list(value or ()))
+
+
+def _forbidden_capabilities_from_metadata(
+    operation: Operation,
+    contract_metadata: dict[str, Any],
+) -> list[str]:
+    value = contract_metadata.get("forbidden_capabilities")
+    if value is None:
+        value = operation.metadata.get("forbidden_capabilities")
+    if value is None:
+        safety = _safety_frame_from_operation(operation, contract_metadata)
+        value = safety.get("forbidden_capabilities")
+    return list(_safe_string_list(value or ()))
+
+
+def _requested_capabilities_from_context(
+    operation: Operation,
+    contract_metadata: dict[str, Any],
+    safety_frame: dict[str, Any],
+) -> list[str]:
+    diagnostics = contract_metadata.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    return list(
+        _ordered_unique(
+            (
+                *_safe_string_list(operation.request.get("requested_capabilities")),
+                *_safe_string_list(diagnostics.get("requested_capabilities")),
+                *_safe_string_list(safety_frame.get("requested_capabilities")),
+            )
+        )
+    )
+
+
+def _safety_governance_facts(safety_frame: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "granted_lanes": list(_safe_string_list(safety_frame.get("granted_lanes"))),
+        "forbidden_capabilities": list(
+            _safe_string_list(safety_frame.get("forbidden_capabilities"))
+        ),
+        "requested_capabilities": list(
+            _safe_string_list(safety_frame.get("requested_capabilities"))
+        ),
+        "rewrites": list(safety_frame.get("rewrites") or ()),
+        "assumptions": list(_safe_string_list(safety_frame.get("assumptions"))),
+        "destructive": bool(safety_frame.get("destructive")),
+        "admin": bool(safety_frame.get("admin")),
+        "explicit_schema_only": bool(safety_frame.get("explicit_schema_only")),
+        "approval_required": bool(safety_frame.get("approval_required")),
     }
 
 
@@ -1083,9 +1267,15 @@ def _task_governance_facts(task: Task | None) -> dict[str, Any]:
         "operation_id": task.operation_id,
         "capability_id": task.capability_id,
         "executor_id": task.executor_id,
+        "owner": task.metadata.get("owner"),
+        "requested_lane": task.metadata.get("requested_lane"),
+        "required_lane": task.metadata.get("required_lane"),
         "status": task.status.value,
         "required_evidence": sorted(task.required_evidence),
         "input": _task_input_summary(task.input),
+        "idempotency_key_present": bool(
+            task.input.get("idempotency_key") or task.metadata.get("idempotency_key")
+        ),
         "dependencies": [
             {
                 "kind": dependency.kind.value,
@@ -1180,14 +1370,31 @@ def _governance_contract(
             "required_evidence": list(contract.required_evidence),
             "access": contract.access.value,
             "policy_ids": list(contract.policy_ids),
-            "metadata": contract.metadata,
+            "granted_lanes": list(contract.metadata.get("granted_lanes", ())),
+            "forbidden_capabilities": list(
+                contract.metadata.get("forbidden_capabilities", ())
+            ),
+            "requested_capabilities": list(
+                (
+                    contract.metadata.get("diagnostics", {})
+                    if isinstance(contract.metadata.get("diagnostics"), dict)
+                    else {}
+                ).get("requested_capabilities", ())
+            ),
+            "selected_capabilities": list(
+                contract.metadata.get("selected_capabilities", ())
+            ),
+            "safety": _safety_governance_facts(
+                _safety_frame_from_operation(operation, contract.metadata)
+            ),
+            "metadata": _contract_metadata_trace_summary(contract.metadata),
         }
     else:
         shaped = {
             "operation_type": operation.operation_type,
             "required_capabilities": [],
             "required_evidence": sorted(operation.required_evidence),
-            "metadata": operation.metadata,
+            "metadata": _contract_metadata_trace_summary(operation.metadata),
         }
     shaped["governance_stage"] = stage
     shaped["governance_facts"] = governance_facts
@@ -1229,6 +1436,32 @@ def _capability_governance_facts(capability: Capability) -> dict[str, Any]:
         "executor": capability.executor,
         "output_evidence": sorted(capability.output_evidence),
     }
+
+
+def _contract_metadata_trace_summary(metadata: dict[str, Any]) -> dict[str, Any]:
+    summarized = dict(metadata)
+    for key in ("safety_frame",):
+        if isinstance(summarized.get(key), dict):
+            summarized[key] = _safety_governance_facts(dict(summarized[key]))
+    diagnostics = summarized.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        diagnostics = dict(diagnostics)
+        if isinstance(diagnostics.get("safety_frame"), dict):
+            diagnostics["safety_frame"] = _safety_governance_facts(
+                dict(diagnostics["safety_frame"])
+            )
+        summarized["diagnostics"] = diagnostics
+    context = summarized.get("resume_context")
+    if isinstance(context, dict):
+        context = dict(context)
+        if isinstance(context.get("request"), dict):
+            context["request"] = _request_summary(context["request"])
+        if isinstance(context.get("safety_frame"), dict):
+            context["safety_frame"] = _safety_governance_facts(
+                dict(context["safety_frame"])
+            )
+        summarized["resume_context"] = context
+    return summarized
 
 
 def _safe_source_repr(source: Any) -> str:

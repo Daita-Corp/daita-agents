@@ -27,7 +27,6 @@ asyncpg = pytest.importorskip(
 )
 
 from daita.agents.agent import Agent
-from daita.db import DbIntentKind
 from daita.runtime import OperationStatus
 
 from tests.integration._harness import start_container
@@ -136,7 +135,7 @@ async def test_from_db_live_postgres_query_uses_runtime_tasks_and_evidence(
         await agent.stop()
 
     assert result.status is OperationStatus.SUCCEEDED
-    assert result.intent.kind is DbIntentKind.DATA_QUERY
+    assert result.operation_type == "data.query"
     assert result.answer == "The count is 3."
     assert {
         "schema.asset_profile",
@@ -172,7 +171,7 @@ async def test_from_db_live_postgres_catalog_assisted_join_records_relationship_
         await agent.stop()
 
     assert result.status is OperationStatus.SUCCEEDED
-    assert result.intent.kind is DbIntentKind.CATALOG_ASSISTED_DATA_QUERY
+    assert result.operation_type == "data.query"
     assert result.answer == "Returned 4 rows."
     assert {
         "catalog.source_registered",
@@ -210,7 +209,7 @@ async def test_from_db_live_postgres_grounds_completed_orders_to_observed_status
     statuses = {row.get("status") for row in query_result.payload.get("rows", [])}
 
     assert result.status is OperationStatus.SUCCEEDED
-    assert result.intent.kind is DbIntentKind.DATA_QUERY
+    assert result.operation_type == "data.query"
     assert statuses == {"complete"}
     assert len(query_result.payload["rows"]) == 3
     assert "orders.status: complete" in planning_context.payload["rendered_context"]
@@ -235,7 +234,7 @@ async def test_from_db_live_postgres_resolves_non_descriptive_prompt_without_loo
         await agent.stop()
 
     assert resolved.status is OperationStatus.SUCCEEDED
-    assert resolved.intent.kind is DbIntentKind.DATA_QUERY
+    assert resolved.operation_type == "data.query"
     assert resolved.answer == "Returned 3 rows."
     assert {
         "query.plan.proposal",
@@ -246,7 +245,7 @@ async def test_from_db_live_postgres_resolves_non_descriptive_prompt_without_loo
     assert resolved.diagnostics["execution"]["task_count"] == 3
 
     assert bounded_fallback.status is OperationStatus.SUCCEEDED
-    assert bounded_fallback.intent.kind is DbIntentKind.CONVERSATIONAL
+    assert bounded_fallback.operation_type == "schema.query"
     assert _evidence_kinds(bounded_fallback) == {"schema.asset_profile"}
     assert bounded_fallback.diagnostics["execution"]["task_count"] == 1
 

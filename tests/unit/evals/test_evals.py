@@ -17,8 +17,6 @@ from daita.evals.models import (
 )
 from daita.evals.reporters import render_junit, render_pretty
 from daita.db.models import (
-    DbIntent,
-    DbIntentKind,
     DbOperationContract,
     DbOperationResult,
     DbRequest,
@@ -28,7 +26,8 @@ from daita.runtime import Evidence, OperationStatus
 
 def test_load_yaml_config(tmp_path):
     path = tmp_path / "eval.yaml"
-    path.write_text("""
+    path.write_text(
+        """
 name: sales-evals
 version: 1
 agent:
@@ -39,7 +38,8 @@ cases:
     expectations:
       answer:
         contains: ["Widget A"]
-""")
+"""
+    )
 
     config = EvalSuiteConfig.from_file(path)
 
@@ -112,7 +112,6 @@ def test_extracts_real_db_operation_result_dataclasses():
     result = DbOperationResult(
         operation_id="operation-real",
         request=DbRequest("How many?"),
-        intent=DbIntent(DbIntentKind.DATA_QUERY),
         contract=DbOperationContract(
             operation_type="db.query",
             required_evidence=("query.result",),
@@ -157,7 +156,6 @@ def test_extracts_real_db_operation_result_dataclasses():
     evidence = extract_run_evidence("How many?", {"runtime_result": result})
 
     assert evidence.operation_type == "db.query"
-    assert evidence.intent == "data.query"
     assert evidence.tasks[0].capability_id == "db.sql.execute_read"
     assert evidence.evidence[0].kind == "query.result"
 
@@ -805,7 +803,6 @@ def _run_evidence(
         operation_id="operation-1",
         operation_status="succeeded",
         operation_type="db.query",
-        intent="query",
         tasks=tasks,
         evidence=records,
         governance=None,

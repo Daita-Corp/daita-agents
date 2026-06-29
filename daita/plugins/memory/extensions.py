@@ -43,8 +43,10 @@ def memory_capabilities() -> tuple[Capability, ...]:
                 {
                     "data.query",
                     "memory.recall",
+                    "memory.list",
+                    "memory.inspect",
                     "schema.query",
-                    "schema.relationship_query",
+                    "schema.relationships",
                 }
             ),
             access=AccessMode.METADATA_READ,
