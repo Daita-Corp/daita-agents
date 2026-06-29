@@ -454,6 +454,201 @@ class DbRuntimeTasksMixin:
             await self.store.save_task(stored)
         return stored
 
+    async def execute_task_spec_once(
+        self,
+        operation: Operation,
+        spec: DbTaskSpec,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> tuple[Evidence, ...]:
+        """Persist a task spec and execute it unless it already succeeded."""
+        task = await self.persist_task(self.materialize_task_spec(operation, spec))
+        if task.status is TaskStatus.SUCCEEDED:
+            return tuple(
+                item
+                for item in await self.store.list_evidence(operation.id)
+                if item.task_id == task.id
+            )
+        return await self.execute_task(task, operation, context=context)
+
+    def memory_learning_enqueue_task_spec(
+        self,
+        *,
+        source_operation_id: str,
+        source_operation_type: str,
+        source_identity: str,
+        source_schema_fingerprint: str | None,
+        source_evidence_ids: tuple[str, ...] | list[str],
+        learning_mode: str,
+    ) -> DbTaskSpec:
+        """Describe cold-path memory-learning enqueue work."""
+        input_payload = {
+            "source_operation_id": source_operation_id,
+            "source_operation_type": source_operation_type,
+            "source_identity": source_identity,
+            "source_schema_fingerprint": source_schema_fingerprint,
+            "source_evidence_ids": list(source_evidence_ids),
+            "learning_mode": learning_mode,
+        }
+        input_hash = _stable_hash(input_payload)
+        idempotency_key = _stable_hash(
+            {
+                "kind": "db_memory_learning_enqueue",
+                "source_operation_id": source_operation_id,
+                "source_identity": source_identity,
+                "learning_mode": learning_mode,
+            }
+        )
+        return DbTaskSpec(
+            capability_id="db.memory.learning.enqueue",
+            owner="db_runtime",
+            input=input_payload,
+            reason="db_memory_learning_enqueue",
+            sequence=1,
+            metadata={
+                "queue": "memory_learning",
+                "source_operation_id": source_operation_id,
+                "source_operation_type": source_operation_type,
+                "source_identity": source_identity,
+                "source_schema_fingerprint": source_schema_fingerprint,
+                "source_evidence_ids": list(source_evidence_ids),
+                "learning_mode": learning_mode,
+            },
+            deterministic_key=idempotency_key,
+            input_hash=input_hash,
+            idempotency_key=idempotency_key,
+        )
+
+    def memory_learning_run_task_spec(
+        self,
+        *,
+        source_operation_id: str,
+        source_operation_type: str | None,
+        source_identity: str,
+        source_schema_fingerprint: str | None,
+        source_evidence_ids: tuple[str, ...] | list[str],
+        learning_mode: str,
+    ) -> DbTaskSpec:
+        """Describe worker-owned memory-learning run work."""
+        input_payload = {
+            "source_operation_id": source_operation_id,
+            "source_operation_type": source_operation_type,
+            "source_identity": source_identity,
+            "source_schema_fingerprint": source_schema_fingerprint,
+            "source_evidence_ids": list(source_evidence_ids),
+            "learning_mode": learning_mode,
+        }
+        input_hash = _stable_hash(input_payload)
+        idempotency_key = _stable_hash(
+            {
+                "kind": "db_memory_learning_run",
+                "source_operation_id": source_operation_id,
+                "source_identity": source_identity,
+                "learning_mode": learning_mode,
+            }
+        )
+        return DbTaskSpec(
+            capability_id="db.memory.learning.run",
+            owner="db_runtime",
+            input=input_payload,
+            reason="db_memory_learning_run",
+            sequence=2,
+            metadata={
+                "queue": "memory_learning",
+                "source_operation_id": source_operation_id,
+                "source_operation_type": source_operation_type,
+                "source_identity": source_identity,
+                "source_schema_fingerprint": source_schema_fingerprint,
+                "source_evidence_ids": list(source_evidence_ids),
+                "learning_mode": learning_mode,
+                "worker_id": "db.memory.learner",
+                "worker_owner": "db_runtime",
+            },
+            deterministic_key=idempotency_key,
+            input_hash=input_hash,
+            idempotency_key=idempotency_key,
+        )
+
+    def memory_learning_semantic_write_task_spec(
+        self,
+        *,
+        record: Mapping[str, Any],
+        prompt: str,
+        source_operation_id: str,
+        source_identity: str,
+        candidate_key: str,
+        candidate_kind: str,
+    ) -> DbTaskSpec:
+        """Describe a candidate-level semantic memory promotion task."""
+        input_payload = {
+            "db_memory_payload": dict(record),
+            "db_memory_prompt": prompt,
+        }
+        input_hash = _stable_hash(input_payload)
+        idempotency_key = _stable_hash(
+            {
+                "kind": "db_memory_learning_promotion",
+                "source_operation_id": source_operation_id,
+                "source_identity": source_identity,
+                "candidate_key": candidate_key,
+                "candidate_kind": candidate_kind,
+            }
+        )
+        return DbTaskSpec(
+            capability_id="memory.semantic.write",
+            owner="memory",
+            input=input_payload,
+            reason="db_memory_learning_promotion",
+            sequence=100,
+            metadata={
+                "source_operation_id": source_operation_id,
+                "source_identity": source_identity,
+                "candidate_key": candidate_key,
+                "candidate_kind": candidate_kind,
+            },
+            deterministic_key=idempotency_key,
+            input_hash=input_hash,
+            idempotency_key=idempotency_key,
+        )
+
+    def memory_update_semantic_write_task_spec(
+        self,
+        *,
+        record: Mapping[str, Any],
+        proposal_evidence_id: str,
+        proposal_fingerprint: str,
+        source_identity: str,
+    ) -> DbTaskSpec:
+        """Describe an explicit memory-update semantic write task."""
+        input_payload = {
+            "db_memory_payload": dict(record),
+            "db_memory_prompt": str(record.get("text") or ""),
+        }
+        input_hash = _stable_hash(input_payload)
+        idempotency_key = _stable_hash(
+            {
+                "kind": "db_memory_commit_update",
+                "proposal_evidence_id": proposal_evidence_id,
+                "proposal_fingerprint": proposal_fingerprint,
+                "source_identity": source_identity,
+            }
+        )
+        return DbTaskSpec(
+            capability_id="memory.semantic.write",
+            owner="memory",
+            input=input_payload,
+            reason="db_memory_commit_update",
+            sequence=100,
+            metadata={
+                "proposal_evidence_id": proposal_evidence_id,
+                "proposal_fingerprint": proposal_fingerprint,
+                "source_identity": source_identity,
+            },
+            deterministic_key=idempotency_key,
+            input_hash=input_hash,
+            idempotency_key=idempotency_key,
+        )
+
     async def _persist_contract_tasks(
         self,
         operation: Operation,

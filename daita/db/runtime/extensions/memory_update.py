@@ -155,25 +155,14 @@ class DbMemoryCommitUpdateExecutor:
             "memory.semantic.write",
             owner="memory",
         )
-        write_task = await runtime.kernel.plan_task(
-            operation_id=operation.id,
-            capability_id=memory_capability.id,
-            owner=memory_capability.owner,
-            input={
-                "db_memory_payload": record,
-                "db_memory_prompt": str(record.get("text") or ""),
-            },
-            metadata={
-                "owner": memory_capability.owner,
-                "reason": "db_memory_commit_update",
-                "proposal_evidence_id": proposal_evidence.id,
-                "proposal_fingerprint": actual_fingerprint,
-                "source_identity": proposal_source_identity,
-            },
-        )
-        write_evidence = await runtime.execute_task(
-            write_task,
+        write_evidence = await runtime.execute_task_spec_once(
             operation,
+            runtime.memory_update_semantic_write_task_spec(
+                record=record,
+                proposal_evidence_id=str(proposal_evidence.id or ""),
+                proposal_fingerprint=actual_fingerprint,
+                source_identity=proposal_source_identity,
+            ),
             context={"capability_owner": memory_capability.owner},
         )
         write_success = bool(write_evidence) and all(

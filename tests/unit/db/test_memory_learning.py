@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from daita.db import (
@@ -14,6 +15,7 @@ from daita.runtime import (
     Evidence,
     Operation,
     OperationStatus,
+    RuntimeEventType,
     TaskStatus,
     WorkerRuntime,
     WorkerRuntimeOptions,
@@ -202,7 +204,7 @@ async def _record_successful_source(runtime, *, schema_evidence=None):
 
 async def test_successful_eligible_operation_enqueues_child_learning_operation():
     runtime = _runtime()
-    source_operation, _ = await _record_successful_source(runtime)
+    source_operation, result = await _record_successful_source(runtime)
 
     source_snapshot = await runtime.inspect_operation(source_operation.id)
     operations = await runtime.store.list_operations()
@@ -226,9 +228,39 @@ async def test_successful_eligible_operation_enqueues_child_learning_operation()
         "db.memory.learning.enqueue",
         "db.memory.learning.run",
     ]
+    expected_enqueue = runtime.materialize_task_spec(
+        child,
+        runtime.memory_learning_enqueue_task_spec(
+            source_operation_id=source_operation.id,
+            source_operation_type=source_operation.operation_type,
+            source_identity=SOURCE_IDENTITY,
+            source_schema_fingerprint=child.metadata["source_schema_fingerprint"],
+            source_evidence_ids=[item.id for item in result.evidence if item.id],
+            learning_mode="safe",
+        ),
+    )
+    expected_run = runtime.materialize_task_spec(
+        child,
+        runtime.memory_learning_run_task_spec(
+            source_operation_id=source_operation.id,
+            source_operation_type=source_operation.operation_type,
+            source_identity=SOURCE_IDENTITY,
+            source_schema_fingerprint=child.metadata["source_schema_fingerprint"],
+            source_evidence_ids=[item.id for item in result.evidence if item.id],
+            learning_mode="safe",
+        ),
+    )
+    assert child_tasks[0].id == expected_enqueue.id
+    assert child_tasks[0].metadata["idempotency_key"]
+    assert child_tasks[0].metadata["input_hash"] == child_tasks[0].input["input_hash"]
+    assert child_tasks[1].id == expected_run.id
     assert child_tasks[1].metadata["queue"] == "memory_learning"
+    assert child_tasks[1].metadata["worker_id"] == "db.memory.learner"
+    assert child_tasks[1].metadata["idempotency_key"]
+    assert child_tasks[1].metadata["input_hash"] == child_tasks[1].input["input_hash"]
     assert child_tasks[1].status is TaskStatus.PENDING
     assert enqueue_evidence[0].kind == "db.memory.learning.enqueue"
+    assert enqueue_evidence[0].payload["run_task_id"] == child_tasks[1].id
 
 
 async def test_learning_enqueue_gates_skip_ineligible_operations():
@@ -275,6 +307,16 @@ async def test_learner_promotes_safe_unit_candidate_through_memory_write():
     backend = _memory_backend()
     runtime = _runtime(backend=backend)
     source_operation, _ = await _record_successful_source(runtime)
+    child = next(
+        item
+        for item in await runtime.store.list_operations()
+        if item.operation_type == "db.memory.learning"
+    )
+    pending_run_task = next(
+        item
+        for item in await runtime.store.list_tasks(child.id)
+        if item.capability_id == "db.memory.learning.run"
+    )
     worker = WorkerRuntime(
         kernel=runtime.kernel,
         options=WorkerRuntimeOptions(
@@ -287,7 +329,13 @@ async def test_learner_promotes_safe_unit_candidate_through_memory_write():
     run = await worker.run_once()
     child_snapshot = await runtime.inspect_operation(run.handoff.operation_id)
     evidence = await runtime.store.list_evidence(run.handoff.operation_id)
+    write_task = next(
+        item
+        for item in child_snapshot.tasks
+        if item.capability_id == "memory.semantic.write"
+    )
 
+    assert run.execution.task.id == pending_run_task.id
     assert child_snapshot.operation.status is OperationStatus.SUCCEEDED
     assert {item.kind for item in evidence} >= {
         "db.memory.learning.enqueue",
@@ -300,7 +348,25 @@ async def test_learner_promotes_safe_unit_candidate_through_memory_write():
     assert promotion.payload["promoted"] is True
     assert write.payload["success"] is True
     assert write.payload["kind"] == "unit_convention"
+    assert write.task_id == write_task.id
+    assert write_task.metadata["reason"] == "db_memory_learning_promotion"
+    assert write_task.metadata["candidate_key"] == "unit_convention:orders.total_cents"
+    assert write_task.metadata["idempotency_key"]
+    assert write_task.metadata["input_hash"] == write_task.input["input_hash"]
+    assert RuntimeEventType.WORKER_COMPLETED in {
+        event.type for event in child_snapshot.events
+    }
     backend.remember.assert_awaited_once()
+
+    await runtime.resume_operation(child.id)
+    assert backend.remember.await_count == 1
+    assert (
+        sum(
+            task.capability_id == "memory.semantic.write"
+            for task in await runtime.store.list_tasks(child.id)
+        )
+        == 1
+    )
 
 
 async def test_learner_promotes_catalog_cited_value_alias_without_observed_values():
@@ -452,3 +518,20 @@ async def test_runtime_inspection_exposes_memory_learning_worker_and_capabilitie
     assert "db_runtime:db.memory.learner" in inspection.worker_ids
     assert "db_runtime:db.memory.learning.enqueue" in inspection.evidence_schema_kinds
     assert "db_runtime.memory.learning.run" in inspection.executor_ids
+
+
+def test_memory_learning_and_update_sources_use_runtime_task_specs():
+    root = Path(__file__).parents[3]
+    sources = {
+        "memory_learning_mixin": root / "daita/db/runtime/memory_learning.py",
+        "memory_learning_executors": (
+            root / "daita/db/runtime/extensions/memory_learning.py"
+        ),
+        "memory_update_executors": root
+        / "daita/db/runtime/extensions/memory_update.py",
+    }
+
+    for source in sources.values():
+        text = source.read_text()
+        assert ".kernel.plan_task(" not in text
+        assert "Task(" not in text

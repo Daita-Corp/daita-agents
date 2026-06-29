@@ -21,7 +21,6 @@ from ...memory import (
     unit_records_from_schema,
 )
 from ...memory_contracts import extract_db_memory_semantic_contract
-from ..memory_learning import _learner_task_id_from_operation
 
 _LEARNING_SOURCE_EVIDENCE_KINDS = frozenset(
     {
@@ -67,50 +66,22 @@ class DbMemoryLearningEnqueueExecutor:
             for item in task.input.get("source_evidence_ids", []) or []
             if str(item).strip()
         ]
-        run_capability = runtime.registry.get_capability(
-            "db.memory.learning.run",
-            owner="db_runtime",
-        )
-        existing = [
-            item
-            for item in await runtime.store.list_tasks(operation.id)
-            if item.capability_id == run_capability.id
-            and item.metadata.get("owner") == run_capability.owner
-        ]
-        if not existing:
-            await runtime.kernel.plan_task(
-                task_id=_learner_task_id_from_operation(operation.id),
-                operation_id=operation.id,
-                capability_id=run_capability.id,
-                owner=run_capability.owner,
-                input={
-                    "source_operation_id": source_operation_id,
-                    "source_operation_type": task.input.get("source_operation_type"),
-                    "source_identity": source_identity,
-                    "source_schema_fingerprint": task.input.get(
+        run_tasks = await runtime.persist_task_specs(
+            operation,
+            (
+                runtime.memory_learning_run_task_spec(
+                    source_operation_id=source_operation_id,
+                    source_operation_type=task.input.get("source_operation_type"),
+                    source_identity=source_identity,
+                    source_schema_fingerprint=task.input.get(
                         "source_schema_fingerprint"
                     ),
-                    "source_evidence_ids": source_evidence_ids,
-                    "learning_mode": learning_mode,
-                },
-                metadata={
-                    "owner": run_capability.owner,
-                    "reason": "db_memory_learning_run",
-                    "queue": "memory_learning",
-                    "source_operation_id": source_operation_id,
-                    "source_identity": source_identity,
-                    "learning_mode": learning_mode,
-                    "worker_id": "db.memory.learner",
-                    "worker_owner": "db_runtime",
-                    "idempotency_key": stable_fingerprint(
-                        {
-                            "source_operation_id": source_operation_id,
-                            "source_identity": source_identity,
-                            "learning_mode": learning_mode,
-                        }
-                    ),
-                },
-            )
+                    source_evidence_ids=source_evidence_ids,
+                    learning_mode=learning_mode,
+                ),
+            ),
+        )
+        run_task = run_tasks[0]
         payload = {
             "enqueued": True,
             "source_operation_id": source_operation_id,
@@ -121,7 +92,7 @@ class DbMemoryLearningEnqueueExecutor:
             "queue": "memory_learning",
             "worker_id": "db.memory.learner",
             "worker_owner": "db_runtime",
-            "run_task_id": _learner_task_id_from_operation(operation.id),
+            "run_task_id": run_task.id,
             "source_evidence_ids": source_evidence_ids,
         }
         return [
@@ -579,26 +550,16 @@ async def _write_candidate(
         "memory.semantic.write",
         owner="memory",
     )
-    write_task = await runtime.kernel.plan_task(
-        operation_id=operation.id,
-        capability_id=memory_capability.id,
-        owner=memory_capability.owner,
-        input={
-            "db_memory_payload": record.to_dict(),
-            "db_memory_prompt": record.text,
-        },
-        metadata={
-            "owner": memory_capability.owner,
-            "reason": "db_memory_learning_promotion",
-            "source_operation_id": candidate.source_operation_id,
-            "source_identity": candidate.source_identity,
-            "candidate_key": candidate.key,
-            "candidate_kind": candidate.kind,
-        },
-    )
-    return await runtime.execute_task(
-        write_task,
+    return await runtime.execute_task_spec_once(
         operation,
+        runtime.memory_learning_semantic_write_task_spec(
+            record=record.to_dict(),
+            prompt=record.text,
+            source_operation_id=candidate.source_operation_id,
+            source_identity=candidate.source_identity,
+            candidate_key=candidate.key,
+            candidate_kind=candidate.kind,
+        ),
         context={"capability_owner": memory_capability.owner},
     )
 

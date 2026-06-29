@@ -67,32 +67,17 @@ class DbRuntimeMemoryLearningMixin:
             },
             evaluate_governance=False,
         )
-        enqueue_capability = self.registry.get_capability(
-            "db.memory.learning.enqueue",
-            owner="db_runtime",
+        await self.execute_task_spec_once(
+            child,
+            self.memory_learning_enqueue_task_spec(
+                source_operation_id=operation.id,
+                source_operation_type=operation.operation_type,
+                source_identity=source_identity,
+                source_schema_fingerprint=source_schema_fingerprint,
+                source_evidence_ids=evidence_refs,
+                learning_mode=learning_mode,
+            ),
         )
-        enqueue_task = await self.kernel.plan_task(
-            operation_id=child.id,
-            capability_id=enqueue_capability.id,
-            owner=enqueue_capability.owner,
-            input={
-                "source_operation_id": operation.id,
-                "source_operation_type": operation.operation_type,
-                "source_identity": source_identity,
-                "source_schema_fingerprint": source_schema_fingerprint,
-                "source_evidence_ids": evidence_refs,
-                "learning_mode": learning_mode,
-            },
-            metadata={
-                "owner": enqueue_capability.owner,
-                "reason": "db_memory_learning_enqueue",
-                "queue": "memory_learning",
-                "source_operation_id": operation.id,
-                "source_identity": source_identity,
-                "learning_mode": learning_mode,
-            },
-        )
-        await self.execute_task(enqueue_task, child)
 
     def _memory_learning_result_eligible(self, result: DbOperationResult) -> bool:
         if result.status is not OperationStatus.SUCCEEDED:
@@ -146,7 +131,3 @@ def _schema_fingerprint_from_result(result: DbOperationResult) -> str | None:
         if evidence.kind in {"schema.asset_profile", "catalog.source"}:
             return stable_fingerprint(evidence.payload)
     return None
-
-
-def _learner_task_id_from_operation(operation_id: str) -> str:
-    return f"{operation_id}.memory-learning-run"

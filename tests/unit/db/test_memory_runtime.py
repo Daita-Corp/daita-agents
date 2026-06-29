@@ -83,6 +83,65 @@ def _runtime_with_memory_source(*plugins) -> DbRuntime:
     )
 
 
+async def _plan_memory_update(
+    runtime: DbRuntime,
+    request: DbRequest,
+    *,
+    schema: dict | None = None,
+) -> tuple[Operation, Evidence]:
+    await runtime.setup()
+    operation = await runtime.kernel.create_operation(
+        operation_type="memory.update",
+        request={"prompt": request.prompt},
+        required_evidence=("db.memory.proposal",),
+        evaluate_governance=False,
+    )
+    task = Task(
+        id=f"{operation.id}.memory-plan-update",
+        operation_id=operation.id,
+        capability_id="db.memory.plan_update",
+        executor_id="db_runtime.memory.plan_update",
+        input={
+            "request": {
+                "prompt": request.prompt,
+                "mode": request.mode,
+                "metadata": request.metadata,
+                "constraints": request.constraints,
+                "source_scope": list(request.source_scope),
+                "requested_capabilities": list(request.requested_capabilities),
+            },
+            "schema": schema or {},
+        },
+        required_evidence=frozenset({"db.memory.proposal"}),
+        metadata={"owner": "db_runtime"},
+    )
+
+    evidence = await runtime.execute_task(task, operation)
+    proposal = next(item for item in evidence if item.kind == "db.memory.proposal")
+    return operation, proposal
+
+
+async def _commit_memory_update(
+    runtime: DbRuntime,
+    operation: Operation,
+    proposal: Evidence,
+) -> tuple[Evidence, ...]:
+    task = Task(
+        id=f"{operation.id}.memory-commit-update",
+        operation_id=operation.id,
+        capability_id="db.memory.commit_update",
+        executor_id="db_runtime.memory.commit_update",
+        input={
+            "proposal_evidence_id": proposal.id,
+            "proposal_fingerprint": proposal.payload["proposal_fingerprint"],
+            "source_identity": "test:memory-runtime-source",
+        },
+        required_evidence=frozenset({"db.memory.definition"}),
+        metadata={"owner": "db_runtime"},
+    )
+    return await runtime.execute_task(task, operation)
+
+
 def _board_revenue_schema():
     return {
         "database_type": "sqlite",
@@ -1231,23 +1290,27 @@ async def test_db_runtime_renders_memory_context_through_context_provider(tmp_pa
 async def test_db_runtime_executes_memory_update_with_typed_evidence(tmp_path):
     runtime = _runtime_with_memory_source(_memory(tmp_path))
 
-    result = await runtime.run(
+    operation, proposal = await _plan_memory_update(
+        runtime,
         DbRequest(
             "Remember that revenue excludes tax",
             mode="memory.update",
             metadata={"category": "db_semantic"},
-        )
+        ),
     )
+    evidence = await _commit_memory_update(runtime, operation, proposal)
 
-    assert result.status is OperationStatus.SUCCEEDED
-    assert result.diagnostics["verification"]["passed"] is True
-    evidence = next(
-        item for item in result.evidence if item.kind == "memory.semantic.write"
+    definition = next(item for item in evidence if item.kind == "db.memory.definition")
+    write = next(
+        item for item in evidence if item.kind == "memory.semantic.write"
     )
-    assert evidence.owner == "memory"
-    assert evidence.payload["success"] is True
-    assert evidence.payload["status"] == "created"
-    assert evidence.payload["stored"]["structured"] is True
+    assert proposal.accepted is True
+    assert definition.accepted is True
+    assert definition.payload["proposal_evidence_id"] == proposal.id
+    assert write.owner == "memory"
+    assert write.payload["success"] is True
+    assert write.payload["status"] == "created"
+    assert write.payload["stored"]["structured"] is True
 
 
 async def test_db_runtime_memory_update_stores_db_semantic_record():
@@ -1260,7 +1323,8 @@ async def test_db_runtime_memory_update_stores_db_semantic_record():
     memory.backend = backend
     runtime = _runtime_with_memory_source(memory)
 
-    result = await runtime.run(
+    operation, proposal = await _plan_memory_update(
+        runtime,
         DbRequest(
             "Remember the revenue rule",
             mode="memory.update",
@@ -1271,16 +1335,17 @@ async def test_db_runtime_memory_update_stores_db_semantic_record():
                 "metadata": {"metric": "revenue"},
                 "importance": 0.8,
             },
-        )
+        ),
     )
+    evidence = await _commit_memory_update(runtime, operation, proposal)
 
-    assert result.status is OperationStatus.SUCCEEDED
-    evidence = next(
-        item for item in result.evidence if item.kind == "memory.semantic.write"
+    write = next(
+        item for item in evidence if item.kind == "memory.semantic.write"
     )
-    assert evidence.payload["success"] is True
-    assert evidence.payload["kind"] == "business_rule"
-    assert evidence.payload["category"] == "db_semantics"
+    assert proposal.accepted is True
+    assert write.payload["success"] is True
+    assert write.payload["kind"] == "business_rule"
+    assert write.payload["category"] == "db_semantics"
     backend.remember.assert_awaited_once()
     assert backend.remember.await_args.kwargs["category"] == "db_semantics"
     assert backend.remember.await_args.kwargs["index_content"] == (
@@ -2699,7 +2764,8 @@ async def test_db_runtime_memory_update_replaces_existing_record_by_key():
     memory.backend = backend
     runtime = _runtime_with_memory_source(memory)
 
-    result = await runtime.run(
+    operation, proposal = await _plan_memory_update(
+        runtime,
         DbRequest(
             "Remember the revenue metric",
             mode="memory.update",
@@ -2708,15 +2774,16 @@ async def test_db_runtime_memory_update_replaces_existing_record_by_key():
                 "key": "metric:revenue",
                 "text": "Revenue excludes refunded orders.",
             },
-        )
+        ),
     )
+    evidence = await _commit_memory_update(runtime, operation, proposal)
 
-    assert result.status is OperationStatus.SUCCEEDED
-    evidence = next(
-        item for item in result.evidence if item.kind == "memory.semantic.write"
+    write = next(
+        item for item in evidence if item.kind == "memory.semantic.write"
     )
-    assert evidence.payload["status"] == "updated"
-    assert evidence.payload["updated"] == 1
+    assert proposal.accepted is True
+    assert write.payload["status"] == "updated"
+    assert write.payload["updated"] == 1
     assert backend.list_by_category.await_count == 2
     backend.list_by_category.assert_awaited_with(category="db_semantics", limit=1000)
     backend.delete_chunks.assert_awaited_once_with(["old-1"])
@@ -2741,7 +2808,8 @@ async def test_db_runtime_memory_update_appends_when_backend_cannot_delete_exist
     memory.backend = backend
     runtime = _runtime_with_memory_source(memory)
 
-    result = await runtime.run(
+    operation, proposal = await _plan_memory_update(
+        runtime,
         DbRequest(
             "Remember the refunds rule",
             mode="memory.update",
@@ -2750,16 +2818,17 @@ async def test_db_runtime_memory_update_appends_when_backend_cannot_delete_exist
                 "key": "business_rule:refunds",
                 "text": "Refunded orders are excluded from revenue.",
             },
-        )
+        ),
     )
+    evidence = await _commit_memory_update(runtime, operation, proposal)
 
-    assert result.status is OperationStatus.SUCCEEDED
-    evidence = next(
-        item for item in result.evidence if item.kind == "memory.semantic.write"
+    write = next(
+        item for item in evidence if item.kind == "memory.semantic.write"
     )
-    assert evidence.payload["status"] == "stored"
-    assert evidence.payload["updated"] == 0
-    assert evidence.payload["stored"]["upsert_fallback"] == "append"
+    assert proposal.accepted is True
+    assert write.payload["status"] == "stored"
+    assert write.payload["updated"] == 0
+    assert write.payload["stored"]["upsert_fallback"] == "append"
     backend.remember.assert_awaited_once()
 
 
@@ -2844,7 +2913,8 @@ async def test_db_runtime_memory_update_allows_schema_level_pii_column_mentions(
     memory.backend = backend
     runtime = _runtime_with_memory_source(memory)
 
-    result = await runtime.run(
+    operation, proposal = await _plan_memory_update(
+        runtime,
         DbRequest(
             "Remember users email schema interpretation",
             mode="memory.update",
@@ -2857,15 +2927,16 @@ async def test_db_runtime_memory_update_allows_schema_level_pii_column_mentions(
                 ),
                 "metadata": {"table": "users", "column": "email"},
             },
-        )
+        ),
     )
+    evidence = await _commit_memory_update(runtime, operation, proposal)
 
-    assert result.status is OperationStatus.SUCCEEDED
-    evidence = next(
-        item for item in result.evidence if item.kind == "memory.semantic.write"
+    write = next(
+        item for item in evidence if item.kind == "memory.semantic.write"
     )
-    assert evidence.payload["success"] is True
-    assert evidence.payload["kind"] == "schema_interpretation"
+    assert proposal.accepted is True
+    assert write.payload["success"] is True
+    assert write.payload["kind"] == "schema_interpretation"
     backend.remember.assert_awaited_once()
 
 
