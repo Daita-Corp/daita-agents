@@ -43,6 +43,7 @@ from ..models import (
 )
 from ..monitors import DbMonitorStore
 from ..planning import DbContractBuilder, build_safety_frame, classify_db_request
+from ..planner_protocol import DbAgentPlanner
 from ..session_context import db_session_context_from_request
 from ..synthesis import DbSynthesizer
 from ..verification import DbVerifier
@@ -388,31 +389,27 @@ class DbRuntime(
         if session_context is not None:
             base_diagnostics["session_context"] = session_context.to_diagnostic_dict()
 
-        planner = self.host_services.get("db_agent_planner") or self.host_services.get(
-            "db_planner"
-        )
+        planner = self._select_db_agent_planner()
         if planner is None:
-            if not self.db_llm_service.available:
-                return await self._record_operation_result(
-                    DbOperationResult(
-                        operation_id=operation_id,
-                        request=db_request,
-                        intent=intent,
-                        contract=contract,
-                        status=OperationStatus.BLOCKED,
-                        answer=(
-                            "DB LLM service is required for semantic DB planning. "
-                            "Configure a from_db model and provider to run this request."
-                        ),
-                        warnings=("db_runtime_llm_configuration_required",),
-                        diagnostics={
-                            **base_diagnostics,
-                            "configuration_required": True,
-                        },
+            return await self._record_operation_result(
+                DbOperationResult(
+                    operation_id=operation_id,
+                    request=db_request,
+                    intent=intent,
+                    contract=contract,
+                    status=OperationStatus.BLOCKED,
+                    answer=(
+                        "DB LLM service is required for semantic DB planning. "
+                        "Configure a from_db model and provider to run this request."
                     ),
-                    operation=operation,
-                )
-            planner = DbLLMAgentPlanner(self.db_llm_service)
+                    warnings=("db_runtime_llm_configuration_required",),
+                    diagnostics={
+                        **base_diagnostics,
+                        "configuration_required": True,
+                    },
+                ),
+                operation=operation,
+            )
 
         try:
             loop_result = await DbAgentLoop(self, planner).run(
@@ -479,6 +476,17 @@ class DbRuntime(
                 },
             ),
             operation=await self.store.load_operation(operation_id) or operation,
+        )
+
+    def _select_db_agent_planner(self) -> DbAgentPlanner | None:
+        return (
+            self.host_services.get("db_agent_planner")
+            or self.host_services.get("db_planner")
+            or (
+                DbLLMAgentPlanner(self.db_llm_service)
+                if self.db_llm_service.available
+                else None
+            )
         )
 
     async def _finalize_run_operation(

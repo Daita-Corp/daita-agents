@@ -15,6 +15,7 @@ from daita.runtime import (
     TaskStatus,
 )
 
+from ..agent_loop import DbAgentLoop
 from ..models import (
     DbIntent,
     DbIntentKind,
@@ -298,19 +299,7 @@ class DbRuntimeResumeMixin:
             return resumed
 
         if _operation_has_run_context(completed.operation):
-            await self._finalize_run_operation(
-                operation_id=operation_id,
-                request=_db_request_from_context(completed.operation),
-                fallback_intent=_db_intent_from_context(completed.operation),
-                fallback_contract=_db_contract_from_context(completed.operation),
-                base_diagnostics={
-                    "runtime_id": self.runtime_id,
-                    "resume": {
-                        "operation_id": operation_id,
-                        "completed_task_ids": list(completed.completed_task_ids),
-                    },
-                },
-            )
+            return await self._resume_run_operation_through_agent_loop(completed)
         elif (
             completed.tasks
             and completed.operation.status is not OperationStatus.SUCCEEDED
@@ -319,6 +308,94 @@ class DbRuntimeResumeMixin:
                 operation_id,
                 message=f"Operation {operation_id} succeeded after resume.",
             )
+        resumed = await self.inspect_operation(operation_id)
+        if resumed is None:
+            raise KeyError(operation_id)
+        return resumed
+
+    async def _resume_run_operation_through_agent_loop(
+        self,
+        snapshot: OperationSnapshot,
+    ) -> OperationSnapshot:
+        operation_id = snapshot.operation.id
+        planner = self._select_db_agent_planner()
+        if planner is None:
+            await self.kernel.block_operation(
+                operation_id,
+                message=(
+                    f"Operation {operation_id} requires semantic DB planning "
+                    "before resume can continue."
+                ),
+                payload={
+                    "warnings": ["db_runtime_llm_configuration_required"],
+                    "configuration_required": True,
+                },
+            )
+            blocked = await self.inspect_operation(operation_id)
+            if blocked is None:
+                raise KeyError(operation_id)
+            return blocked
+
+        operation = await self.kernel.update_operation(
+            operation_id,
+            OperationStatus.RUNNING,
+            message=f"Operation {operation_id} resumed DB agent loop.",
+        )
+        safety_frame = operation.metadata.get("safety_frame")
+        loop_result = await DbAgentLoop(self, planner).run(
+            operation,
+            safety_frame=safety_frame if isinstance(safety_frame, dict) else None,
+        )
+        base_diagnostics = {
+            "runtime_id": self.runtime_id,
+            "resume": {
+                "operation_id": operation_id,
+                "completed_task_ids": list(snapshot.completed_task_ids),
+            },
+        }
+        if loop_result.status == "finished":
+            await self._finalize_run_operation(
+                operation_id=operation_id,
+                request=_db_request_from_context(operation),
+                fallback_intent=_db_intent_from_context(operation),
+                fallback_contract=_db_contract_from_context(operation),
+                loop_result=loop_result,
+                base_diagnostics=base_diagnostics,
+            )
+        else:
+            payload = {
+                "loop_status": loop_result.status,
+                "warnings": list(loop_result.warnings),
+            }
+            if loop_result.status in {
+                "blocked",
+                "configuration_required",
+                "clarification_required",
+            }:
+                await self.kernel.block_operation(
+                    operation_id,
+                    message=(
+                        f"Operation {operation_id} blocked after DB agent loop resume."
+                    ),
+                    payload=payload,
+                )
+            elif loop_result.status == "budget_exhausted":
+                await self.kernel.block_operation(
+                    operation_id,
+                    message=(
+                        f"Operation {operation_id} exhausted planner turns after resume."
+                    ),
+                    payload=payload,
+                )
+            else:
+                await self.kernel.complete_operation(
+                    operation_id,
+                    status=OperationStatus.FAILED,
+                    message=(
+                        f"Operation {operation_id} failed after DB agent loop resume."
+                    ),
+                    payload=payload,
+                )
         resumed = await self.inspect_operation(operation_id)
         if resumed is None:
             raise KeyError(operation_id)
@@ -338,7 +415,9 @@ def _tasks_in_resume_order(tasks: tuple[Task, ...]) -> tuple[Task, ...]:
 
 
 def _operation_has_run_context(operation: Operation) -> bool:
-    return isinstance(operation.metadata.get("resume_context"), dict)
+    return operation.operation_type == "db.run" and isinstance(
+        operation.metadata.get("resume_context"), dict
+    )
 
 
 def _monitor_create_context(operation: Operation) -> bool:
