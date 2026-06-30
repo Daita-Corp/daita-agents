@@ -4,9 +4,9 @@ Capability-based planning for the database runtime.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 from daita.plugins import ExtensionRegistry
 from daita.runtime import AccessMode, Capability
@@ -150,6 +150,98 @@ class CapabilitySelection:
     reason: str
 
 
+@dataclass(frozen=True)
+class DbSafetyFrame:
+    """Explicit, non-semantic boundary for planner-proposed DB actions."""
+
+    max_access: AccessMode = AccessMode.ADMIN
+    source_scope: tuple[str, ...] = ()
+    explicit_mode: str | None = None
+    requested_capabilities: tuple[str, ...] = ()
+    allowed_capabilities: tuple[str, ...] = ()
+    denied_capabilities: tuple[str, ...] = ()
+    constraints: dict[str, Any] = field(default_factory=dict)
+    runtime_limits: dict[str, Any] = field(default_factory=dict)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "max_access", AccessMode(self.max_access))
+        object.__setattr__(
+            self, "source_scope", tuple(str(item) for item in self.source_scope)
+        )
+        object.__setattr__(
+            self,
+            "requested_capabilities",
+            tuple(str(item) for item in self.requested_capabilities),
+        )
+        object.__setattr__(
+            self,
+            "allowed_capabilities",
+            tuple(str(item) for item in self.allowed_capabilities),
+        )
+        object.__setattr__(
+            self,
+            "denied_capabilities",
+            tuple(str(item) for item in self.denied_capabilities),
+        )
+        object.__setattr__(self, "constraints", dict(self.constraints))
+        object.__setattr__(self, "runtime_limits", dict(self.runtime_limits))
+        object.__setattr__(self, "diagnostics", dict(self.diagnostics))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_access": self.max_access.value,
+            "source_scope": list(self.source_scope),
+            "explicit_mode": self.explicit_mode,
+            "requested_capabilities": list(self.requested_capabilities),
+            "allowed_capabilities": list(self.allowed_capabilities),
+            "denied_capabilities": list(self.denied_capabilities),
+            "constraints": self.constraints,
+            "runtime_limits": self.runtime_limits,
+            "diagnostics": self.diagnostics,
+        }
+
+
+def build_safety_frame(
+    registry: ExtensionRegistry,
+    config: DbRuntimeConfig,
+    request: DbRequest,
+) -> DbSafetyFrame:
+    """Build a planner boundary from explicit runtime facts only."""
+
+    constraints = dict(request.constraints)
+    max_access = _explicit_max_access(request, constraints)
+    allowed_capabilities = _explicit_capability_tuple(
+        constraints.get("allowed_capabilities")
+        or constraints.get("capability_allowlist")
+    )
+    denied_capabilities = _explicit_capability_tuple(
+        constraints.get("denied_capabilities") or constraints.get("capability_denylist")
+    )
+    requested_capabilities = tuple(request.requested_capabilities)
+    missing_requested = tuple(
+        capability_id
+        for capability_id in requested_capabilities
+        if not any(
+            capability.id == capability_id for capability in registry.capabilities
+        )
+    )
+    return DbSafetyFrame(
+        max_access=max_access,
+        source_scope=request.source_scope,
+        explicit_mode=request.mode,
+        requested_capabilities=requested_capabilities,
+        allowed_capabilities=allowed_capabilities,
+        denied_capabilities=denied_capabilities,
+        constraints=constraints,
+        runtime_limits=config.limits.to_dict(),
+        diagnostics={
+            "source": "explicit_runtime_facts",
+            "missing_requested_capabilities": list(missing_requested),
+        },
+    )
+
+
 class DbIntentClassifier:
     """Small deterministic classifier for initial DB runtime contracts."""
 
@@ -280,6 +372,12 @@ class DbIntentClassifier:
             evidence_mode="none",
             diagnostics={**diagnostics, "matched": "fallback"},
         )
+
+
+def classify_db_request(request: DbRequest) -> DbIntent:
+    """Compatibility helper for direct contract-building APIs."""
+
+    return DbIntentClassifier().classify(request)
 
 
 class DbContractBuilder:
@@ -513,6 +611,38 @@ def _kind_from_mode(mode: str) -> DbIntentKind | None:
         "write_execute": DbIntentKind.WRITE_EXECUTE,
     }
     return aliases.get(mode)
+
+
+def _explicit_max_access(
+    request: DbRequest,
+    constraints: dict[str, Any],
+) -> AccessMode:
+    explicit = constraints.get("max_access") or constraints.get("max_allowed_access")
+    if explicit is not None:
+        try:
+            return AccessMode(str(explicit))
+        except ValueError:
+            return AccessMode.ADMIN
+    mode = (request.mode or "").lower()
+    if mode in {"schema", "schema.query", "relationships", "relationship"}:
+        return AccessMode.METADATA_READ
+    if mode in {"data", "data.query", "query", "read"}:
+        return AccessMode.READ
+    if mode in {"write", "write.propose", "write.execute", "memory.update"}:
+        return AccessMode.WRITE
+    if mode == "admin":
+        return AccessMode.ADMIN
+    return AccessMode.ADMIN
+
+
+def _explicit_capability_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return tuple(str(item) for item in value)
+    return (str(value),)
 
 
 def _operation_type_for_intent(kind: DbIntentKind) -> str:

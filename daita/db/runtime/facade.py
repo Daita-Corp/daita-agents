@@ -10,11 +10,11 @@ from uuid import uuid4
 
 from daita.plugins import ExtensionRegistry, PluginContext, ServiceRegistry
 from daita.runtime import (
+    AccessMode,
     Capability,
     ContextAudience,
     ContextBlock,
     ApprovalStatus,
-    GovernanceResult,
     InMemoryApprovalChannel,
     InMemoryRuntimeStore,
     Operation,
@@ -23,16 +23,18 @@ from daita.runtime import (
     RuntimeEvent,
     RuntimeEventType,
     RuntimeKernel,
-    RuntimeKernelGovernanceBlocked,
     RuntimeStore,
     Task,
 )
 from daita.skills import SkillResolution, SkillResolver
 
-from ..execution import DbOperationExecutor
+from ..agent_loop import DbAgentLoop, DbLoopResult
+from ..llm_agent_planner import DbLLMAgentPlanner
 from ..llm_service import DbLLMService, db_llm_service_from_metadata
 from ..models import (
     DbIntent,
+    DbIntentKind,
+    DbLimits,
     DbOperationContract,
     DbOperationResult,
     DbRequest,
@@ -40,7 +42,7 @@ from ..models import (
     DbRuntimeInspection,
 )
 from ..monitors import DbMonitorStore
-from ..planning import DbContractBuilder, DbIntentClassifier
+from ..planning import DbContractBuilder, build_safety_frame, classify_db_request
 from ..session_context import db_session_context_from_request
 from ..synthesis import DbSynthesizer
 from ..verification import DbVerifier
@@ -113,7 +115,6 @@ class DbRuntime(
         self.monitor_store = monitor_store or _default_monitor_store(self.store)
         self.approval_channel = approval_channel or InMemoryApprovalChannel(self.store)
         self.runtime_id = runtime_id or f"db-runtime-{uuid4()}"
-        self.intent_classifier = DbIntentClassifier()
         self.verifier = DbVerifier()
         self.synthesizer = DbSynthesizer()
         self.db_llm_service = db_llm_service or db_llm_service_from_metadata(
@@ -282,7 +283,7 @@ class DbRuntime(
     def classify_request(self, request: DbRequest | str) -> DbIntent:
         """Classify a prompt into a DB intent."""
         db_request = request if isinstance(request, DbRequest) else DbRequest(request)
-        return self.intent_classifier.classify(db_request)
+        return classify_db_request(db_request)
 
     def build_contract(
         self,
@@ -318,15 +319,18 @@ class DbRuntime(
         db_request = request if isinstance(request, DbRequest) else DbRequest(request)
         if not self._is_setup:
             await self.setup()
-        intent = self.classify_request(db_request)
         skill_resolution = self._resolve_skills(db_request)
-        contract = self.build_contract(
-            db_request,
-            intent,
+        safety_frame = build_safety_frame(self.registry, self.config, db_request)
+        intent = _neutral_run_intent()
+        contract = _neutral_run_contract(
+            self.config,
+            request=db_request,
+            registry=self.registry,
+            safety_frame=safety_frame.to_dict(),
             skill_resolution=skill_resolution,
         )
         operation = await self.kernel.create_operation(
-            operation_type=contract.operation_type,
+            operation_type="db.run",
             request={
                 "prompt": db_request.prompt,
                 "user_id": db_request.user_id,
@@ -337,16 +341,31 @@ class DbRuntime(
                 "constraints": db_request.constraints,
                 "metadata": db_request.metadata,
             },
-            required_evidence=frozenset(contract.required_evidence),
+            required_evidence=frozenset(),
             metadata={
                 "intent_kind": intent.kind.value,
                 "access": contract.access.value,
+                "normalized_request": {
+                    "prompt": db_request.prompt,
+                    "source_scope": list(db_request.source_scope),
+                    "mode": db_request.mode,
+                    "requested_capabilities": list(db_request.requested_capabilities),
+                    "constraints": db_request.constraints,
+                },
+                "source_scope": list(db_request.source_scope),
+                "mode": db_request.mode,
+                "requested_capabilities": list(db_request.requested_capabilities),
+                "constraints": db_request.constraints,
                 "skills": skill_resolution.to_metadata(),
+                "runtime_limits": self.config.limits.to_dict(),
+                "safety_frame": safety_frame.to_dict(),
+                "loop_state": {"status": "bootstrap"},
                 "resume_context": {
                     "request": _db_request_context(db_request),
                     "intent": _db_intent_context(intent),
                     "contract": _db_contract_context(contract),
                     "skills": skill_resolution.to_metadata(),
+                    "safety_frame": safety_frame.to_dict(),
                 },
             },
             evaluate_governance=False,
@@ -362,38 +381,18 @@ class DbRuntime(
             "runtime_id": self.runtime_id,
             "registered_plugins": list(self.registry.plugin_ids),
             "contract": contract.metadata,
+            "safety_frame": safety_frame.to_dict(),
             "skills": skill_resolution.to_metadata(),
         }
         session_context = db_session_context_from_request(db_request)
         if session_context is not None:
             base_diagnostics["session_context"] = session_context.to_diagnostic_dict()
-        if contract.metadata.get("missing_capabilities"):
-            return await self._record_operation_result(
-                DbOperationResult(
-                    operation_id=operation_id,
-                    request=db_request,
-                    intent=intent,
-                    contract=contract,
-                    status=OperationStatus.BLOCKED,
-                    answer="Required DB capabilities are not registered.",
-                    warnings=("db_runtime_missing_capabilities",),
-                    diagnostics=base_diagnostics,
-                ),
-                operation=operation,
-            )
 
-        analysis_route = self._should_route_multi_step_analysis(db_request, intent)
-        if not analysis_route:
-            await self._persist_contract_tasks(operation, contract)
-        try:
-            governance = await self.kernel.evaluate_operation_governance(operation.id)
-        except RuntimeKernelGovernanceBlocked as exc:
-            governance = exc.governance or GovernanceResult(False, True, False)
-            base_diagnostics = {
-                **base_diagnostics,
-                "governance": governance.to_dict(),
-            }
-            if governance.blocked:
+        planner = self.host_services.get("db_agent_planner") or self.host_services.get(
+            "db_planner"
+        )
+        if planner is None:
+            if not self.db_llm_service.available:
                 return await self._record_operation_result(
                     DbOperationResult(
                         operation_id=operation_id,
@@ -401,42 +400,24 @@ class DbRuntime(
                         intent=intent,
                         contract=contract,
                         status=OperationStatus.BLOCKED,
-                        answer="This operation was denied by governance policy.",
-                        warnings=("db_runtime_governance_denied",),
-                        diagnostics=base_diagnostics,
+                        answer=(
+                            "DB LLM service is required for semantic DB planning. "
+                            "Configure a from_db model and provider to run this request."
+                        ),
+                        warnings=("db_runtime_llm_configuration_required",),
+                        diagnostics={
+                            **base_diagnostics,
+                            "configuration_required": True,
+                        },
                     ),
-                    operation=exc.operation or operation,
+                    operation=operation,
                 )
-            return await self._record_operation_result(
-                DbOperationResult(
-                    operation_id=operation_id,
-                    request=db_request,
-                    intent=intent,
-                    contract=contract,
-                    status=OperationStatus.BLOCKED,
-                    answer="This operation requires approval before execution.",
-                    warnings=("db_runtime_approval_required",),
-                    diagnostics=base_diagnostics,
-                ),
-                operation=exc.operation or operation,
-            )
-        base_diagnostics = {
-            **base_diagnostics,
-            "governance": governance.to_dict(),
-        }
-
-        if analysis_route:
-            return await self._run_multi_step_analysis(
-                db_request,
-                intent,
-                contract,
-                operation,
-                base_diagnostics=base_diagnostics,
-            )
+            planner = DbLLMAgentPlanner(self.db_llm_service)
 
         try:
-            outcome = await DbOperationExecutor(self).execute(
-                db_request, intent, contract, operation
+            loop_result = await DbAgentLoop(self, planner).run(
+                operation,
+                safety_frame=safety_frame.to_dict(),
             )
         except DbRuntimeGovernanceBlocked as exc:
             return await self._record_operation_result(
@@ -473,9 +454,51 @@ class DbRuntime(
                 operation=operation,
             )
 
-        verification = self.verifier.verify(
-            contract, intent, outcome.evidence, outcome.tasks
+        if loop_result.status in {"ran_tasks", "finished"}:
+            return await self._finalize_loop_result(
+                db_request,
+                intent,
+                contract,
+                operation_id=operation_id,
+                loop_result=loop_result,
+                base_diagnostics=base_diagnostics,
+            )
+
+        return await self._record_operation_result(
+            DbOperationResult(
+                operation_id=operation_id,
+                request=db_request,
+                intent=intent,
+                contract=contract,
+                status=_operation_status_from_loop_status(loop_result.status),
+                answer=_answer_from_loop_result(loop_result),
+                warnings=tuple(loop_result.warnings),
+                diagnostics={
+                    **base_diagnostics,
+                    "loop": loop_result.to_dict(),
+                },
+            ),
+            operation=await self.store.load_operation(operation_id) or operation,
         )
+
+    async def _finalize_loop_result(
+        self,
+        db_request: DbRequest,
+        fallback_intent: DbIntent,
+        fallback_contract: DbOperationContract,
+        *,
+        operation_id: str,
+        loop_result: DbLoopResult,
+        base_diagnostics: dict[str, Any],
+    ) -> DbOperationResult:
+        operation = await self.store.load_operation(operation_id)
+        if operation is None:
+            raise KeyError(operation_id)
+        evidence = tuple(await self.store.list_evidence(operation_id))
+        tasks = tuple(await self.store.list_tasks(operation_id))
+        contract = _contract_from_latest_loop_snapshot(operation, fallback_contract)
+        intent = _intent_from_loop_contract(contract, fallback_intent)
+        verification = self.verifier.verify(contract, intent, evidence, tasks)
         if not verification.passed:
             return await self._record_operation_result(
                 DbOperationResult(
@@ -485,15 +508,12 @@ class DbRuntime(
                     contract=contract,
                     status=OperationStatus.FAILED,
                     answer="DB operation could not be verified against required evidence.",
-                    evidence=outcome.evidence,
-                    warnings=tuple((*outcome.warnings, *verification.warnings)),
+                    evidence=evidence,
+                    warnings=tuple((*loop_result.warnings, *verification.warnings)),
                     diagnostics={
                         **base_diagnostics,
-                        "execution": {
-                            **outcome.diagnostics,
-                            "task_count": len(outcome.tasks),
-                            "tasks": [task.to_dict() for task in outcome.tasks],
-                        },
+                        "loop": loop_result.to_dict(),
+                        "execution": _execution_diagnostics(tasks),
                         "verification": verification.to_dict(),
                     },
                 ),
@@ -503,15 +523,20 @@ class DbRuntime(
         verification_evidence = await self._persist_verification_result_evidence(
             operation,
             verification,
-            outcome.evidence,
+            evidence,
         )
         synthesis_evidence, synthesis_task = await self._execute_answer_synthesis(
             operation=operation,
             intent=intent,
-            outcome_evidence=(*outcome.evidence, verification_evidence),
+            outcome_evidence=(*evidence, verification_evidence),
         )
-        final_evidence = (*outcome.evidence, verification_evidence, synthesis_evidence)
-        final_tasks = (*outcome.tasks, synthesis_task)
+        refreshed_tasks = tuple(await self.store.list_tasks(operation_id))
+        final_evidence = (*evidence, verification_evidence, synthesis_evidence)
+        final_tasks = (
+            refreshed_tasks
+            if synthesis_task in refreshed_tasks
+            else (*refreshed_tasks, synthesis_task)
+        )
         return await self._record_operation_result(
             DbOperationResult(
                 operation_id=operation_id,
@@ -523,7 +548,7 @@ class DbRuntime(
                 evidence=final_evidence,
                 warnings=tuple(
                     (
-                        *outcome.warnings,
+                        *loop_result.warnings,
                         *(
                             synthesis_evidence.payload.get("warnings")
                             if isinstance(
@@ -535,11 +560,8 @@ class DbRuntime(
                 ),
                 diagnostics={
                     **base_diagnostics,
-                    "execution": {
-                        **outcome.diagnostics,
-                        "task_count": len(final_tasks),
-                        "tasks": [task.to_dict() for task in final_tasks],
-                    },
+                    "loop": loop_result.to_dict(),
+                    "execution": _execution_diagnostics(final_tasks),
                     "verification": verification.to_dict(),
                     "synthesis": synthesis_evidence.payload,
                 },
@@ -697,6 +719,175 @@ def _inspection_counts(operation: Operation) -> bool:
     return operation.operation_type != "db.memory.learning"
 
 
+def _neutral_run_intent() -> DbIntent:
+    return DbIntent(
+        kind=DbIntentKind.CONVERSATIONAL,
+        confidence=1.0,
+        access=AccessMode.NONE,
+        evidence_mode="planner_loop",
+        diagnostics={"source": "db_run_bootstrap"},
+    )
+
+
+def _neutral_run_contract(
+    config: DbRuntimeConfig,
+    *,
+    request: DbRequest,
+    registry: ExtensionRegistry,
+    safety_frame: dict[str, Any],
+    skill_resolution: SkillResolution,
+) -> DbOperationContract:
+    skill_contract_metadata = _merge_skill_metadata(
+        effect.contract_metadata for effect in skill_resolution.effects
+    )
+    skill_verifier_metadata = _merge_skill_metadata(
+        effect.verifier_metadata for effect in skill_resolution.effects
+    )
+    skill_synthesis_metadata = _merge_skill_metadata(
+        effect.synthesis_metadata for effect in skill_resolution.effects
+    )
+    requested_capabilities = _ordered_unique(
+        (
+            *request.requested_capabilities,
+            *[
+                capability_id
+                for effect in skill_resolution.effects
+                for capability_id in effect.requested_capabilities
+            ],
+        )
+    )
+    available_capabilities = {capability.id for capability in registry.capabilities}
+    missing_capabilities = [
+        capability_id
+        for capability_id in requested_capabilities
+        if capability_id not in available_capabilities
+    ]
+    required_evidence = _ordered_unique(
+        evidence
+        for effect in skill_resolution.effects
+        for evidence in effect.required_evidence
+    )
+    policy_ids = _ordered_unique(
+        policy_id
+        for effect in skill_resolution.effects
+        for policy_id in effect.policy_ids
+    )
+    metadata = {
+        "planned_operation": {
+            "operation_type": "db.run",
+            "access": AccessMode.NONE.value,
+            "source": "db_run_bootstrap",
+        },
+        "requested_capabilities": list(requested_capabilities),
+        "required_evidence": list(required_evidence),
+        "missing_capabilities": missing_capabilities,
+        "safety_frame": safety_frame,
+        "skills": skill_resolution.to_metadata(),
+        "skill_contract_metadata": skill_contract_metadata,
+        "skill_verifier_metadata": skill_verifier_metadata,
+        "skill_synthesis_metadata": skill_synthesis_metadata,
+    }
+    metadata.update(skill_contract_metadata)
+    return DbOperationContract(
+        operation_type="db.run",
+        required_capabilities=tuple(requested_capabilities),
+        required_evidence=tuple(required_evidence),
+        access=AccessMode.NONE,
+        limits=config.limits,
+        policy_ids=tuple(policy_ids),
+        metadata=metadata,
+    )
+
+
+def _contract_from_latest_loop_snapshot(
+    operation: Operation,
+    fallback: DbOperationContract,
+) -> DbOperationContract:
+    context = operation.metadata.get("resume_context")
+    context = context if isinstance(context, dict) else {}
+    snapshot = (
+        operation.metadata.get("latest_compiled_contract_snapshot")
+        or context.get("latest_compiled_contract_snapshot")
+        or context.get("contract")
+    )
+    if not isinstance(snapshot, dict):
+        return fallback
+    limits = snapshot.get("limits")
+    limits = limits if isinstance(limits, dict) else {}
+    metadata = snapshot.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return DbOperationContract(
+        operation_type=str(snapshot.get("operation_type") or fallback.operation_type),
+        required_capabilities=tuple(snapshot.get("required_capabilities") or ()),
+        required_evidence=tuple(snapshot.get("required_evidence") or ()),
+        access=AccessMode(str(snapshot.get("access") or fallback.access.value)),
+        limits=DbLimits(**limits) if limits else fallback.limits,
+        policy_ids=tuple(snapshot.get("policy_ids") or ()),
+        metadata=metadata,
+    )
+
+
+def _intent_from_loop_contract(
+    contract: DbOperationContract,
+    fallback: DbIntent,
+) -> DbIntent:
+    intent_metadata = contract.metadata.get("planner_intent")
+    intent_metadata = intent_metadata if isinstance(intent_metadata, dict) else {}
+    operation_type = str(
+        intent_metadata.get("operation_type") or contract.operation_type
+    )
+    try:
+        kind = DbIntentKind(operation_type)
+    except ValueError:
+        kind = fallback.kind
+    return DbIntent(
+        kind=kind,
+        confidence=1.0,
+        access=contract.access,
+        evidence_mode="planner_loop",
+        diagnostics={
+            "source": "planner_compiled_contract",
+            "operation_type": operation_type,
+            "planner_intent": intent_metadata,
+        },
+    )
+
+
+def _operation_status_from_loop_status(status: str) -> OperationStatus:
+    if status in {"blocked", "configuration_required", "clarification_required"}:
+        return OperationStatus.BLOCKED
+    if status == "budget_exhausted":
+        return OperationStatus.BLOCKED
+    if status == "failed":
+        return OperationStatus.FAILED
+    return OperationStatus.FAILED
+
+
+def _answer_from_loop_result(loop_result: DbLoopResult) -> str:
+    if loop_result.status == "configuration_required":
+        return (
+            "DB LLM service is required for semantic DB planning. Configure a "
+            "from_db model and provider to run this request."
+        )
+    if loop_result.status == "clarification_required":
+        question = loop_result.diagnostics.get("clarification_question")
+        if question:
+            return str(question)
+        return "The DB planner needs clarification before it can continue."
+    if loop_result.status == "blocked":
+        return "This operation was blocked before execution completed."
+    if loop_result.status == "budget_exhausted":
+        return "The DB planner exhausted its turn budget before finishing."
+    return "DB operation failed before final synthesis."
+
+
+def _execution_diagnostics(tasks: tuple[Task, ...]) -> dict[str, Any]:
+    return {
+        "task_count": len(tasks),
+        "tasks": [task.to_dict() for task in tasks],
+    }
+
+
 def _skill_names_from_request(request: DbRequest) -> tuple[str, ...]:
     value = request.metadata.get("skills")
     if value is None:
@@ -718,6 +909,32 @@ def _effects_modify_contract(effects: tuple[Any, ...]) -> bool:
         or effect.synthesis_metadata
         for effect in effects
     )
+
+
+def _merge_skill_metadata(values: Any) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for value in values:
+        for key, item in dict(value).items():
+            if (
+                key in merged
+                and isinstance(merged[key], dict)
+                and isinstance(item, dict)
+            ):
+                merged[key] = {**merged[key], **item}
+            else:
+                merged[key] = item
+    return merged
+
+
+def _ordered_unique(values: Any) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(str(value))
+    return out
 
 
 def _current_trace_ids() -> tuple[str | None, str | None]:

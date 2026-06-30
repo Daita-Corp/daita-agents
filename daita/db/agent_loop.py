@@ -31,7 +31,6 @@ from .planner_protocol import (
 from .runtime.tasks import DbTaskSpec
 from .runtime.types import DbRuntimeGovernanceBlocked, DbRuntimeTaskNotRunnable
 
-
 _ACCESS_ORDER = {
     AccessMode.NONE.value: 0,
     AccessMode.METADATA_READ.value: 1,
@@ -791,6 +790,7 @@ class DbAgentLoop:
             "latest_compiled_contract_snapshot": compilation.compiled_contract_snapshot,
             "resume_context": {
                 **dict(operation.metadata.get("resume_context") or {}),
+                "contract": compilation.compiled_contract_snapshot,
                 "latest_compiled_contract_snapshot": (
                     compilation.compiled_contract_snapshot
                 ),
