@@ -5,8 +5,6 @@ import sqlite3
 from unittest.mock import AsyncMock, MagicMock
 
 from daita.db import (
-    DbEvidenceStore,
-    DbOperationExecutor,
     DbRequest,
     DbRuntime,
     DbRuntimeConfig,
@@ -30,6 +28,7 @@ from daita.db.memory_contracts import (
     extract_db_memory_semantic_contract,
     project_db_memory_semantic_contracts,
 )
+from daita.db.runtime.tasks import DbTaskSpec
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
@@ -47,6 +46,7 @@ from daita.runtime import (
     OperationStatus,
     RiskLevel,
     Task,
+    TaskDependency,
 )
 
 import pytest
@@ -524,23 +524,92 @@ async def test_planning_time_db_memory_recall_adds_bounded_context(tmp_path):
                 input={},
             )
         )[0]
-        evidence_store = DbEvidenceStore()
+        schema_evidence = replace(
+            schema_evidence,
+            id=schema_evidence.id or "schema-memory-runtime",
+            operation_id=operation.id,
+            task_id=None,
+        )
+        await runtime.store.save_evidence(schema_evidence)
         tasks = []
-        context = await DbOperationExecutor(runtime)._build_planning_context(
-            request,
+        recall_plan = await runtime.plan_task_specs(
             operation,
-            tasks,
-            evidence_store,
-            schema_evidence=replace(schema_evidence, id=None),
-            catalog_evidence=(),
-            relationship_evidence=(),
+            (
+                DbTaskSpec(
+                    capability_id="memory.semantic.recall",
+                    owner="memory",
+                    input={
+                        "query": request.prompt,
+                        "category": "db_semantics",
+                        "limit": 9,
+                        "score_threshold": 0.0,
+                        "retrieval_mode": "structured",
+                        "source_identity": source_identity,
+                    },
+                    reason="planning_memory_recall",
+                    metadata={"memory_recall": "planning"},
+                    deterministic_key="memory-runtime-planning-recall",
+                ),
+            ),
+            contract=contract,
+        )
+        tasks.extend(recall_plan.tasks)
+        memory_evidence = await runtime.execute_task(recall_plan.tasks[0], operation)
+        recall = next(
+            item for item in memory_evidence if item.kind == "memory.semantic.recall"
+        )
+        context_plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.planning.context.build",
+                    owner="db_runtime",
+                    input={
+                        "prompt": request.prompt,
+                        "schema_evidence_id": schema_evidence.id,
+                        "catalog_evidence_ids": [],
+                        "relationship_evidence_ids": [],
+                        "memory_recall_evidence_ids": [recall.id],
+                        "memory_recall_diagnostics": {
+                            "registered": True,
+                            "queried": True,
+                            "decision": {"recall": True},
+                            "evidence_count": len(memory_evidence),
+                        },
+                    },
+                    reason="planning_context",
+                    sequence=2,
+                    dependencies=(
+                        TaskDependency(
+                            kind="evidence",
+                            evidence_kind=schema_evidence.kind,
+                            evidence_id=schema_evidence.id,
+                            evidence_owner=schema_evidence.owner,
+                            evidence_accepted=True,
+                            operation_id=operation.id,
+                        ),
+                        TaskDependency(
+                            kind="evidence",
+                            evidence_kind=recall.kind,
+                            evidence_id=recall.id,
+                            evidence_owner=recall.owner,
+                            evidence_accepted=True,
+                            operation_id=operation.id,
+                        ),
+                    ),
+                    deterministic_key="memory-runtime-planning-context",
+                ),
+            ),
+            contract=contract,
+        )
+        tasks.extend(context_plan.tasks)
+        context_evidence = await runtime.execute_task(context_plan.tasks[0], operation)
+        context = next(
+            item for item in context_evidence if item.kind == "planning.context"
         )
     finally:
         await runtime.teardown()
 
-    recall = next(
-        item for item in evidence_store.list() if item.kind == "memory.semantic.recall"
-    )
     assert [task.capability_id for task in tasks][-2:] == [
         "memory.semantic.recall",
         "db.planning.context.build",

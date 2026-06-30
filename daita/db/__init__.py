@@ -9,7 +9,6 @@ for `from_db`.
 from .agent import DbAgent
 from .context import DbContextRenderer
 from .evidence import DbEvidenceStore, InMemoryDbEvidenceStore
-from .execution import DbExecutionOutcome, DbOperationExecutor
 from .factory import from_db
 from .catalog_prompt import (
     DBPromptReadModel,
@@ -195,8 +194,6 @@ __all__ = [
     "table_name",
     "search_tables",
     "sql_fingerprint",
-    "DbExecutionOutcome",
-    "DbOperationExecutor",
     "DbEvidenceStore",
     "InMemoryDbEvidenceStore",
     "DbVerifier",
