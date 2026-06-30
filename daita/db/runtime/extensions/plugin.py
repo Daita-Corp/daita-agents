@@ -517,6 +517,24 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 description="Evidence-backed context used by DB planners.",
             ),
             EvidenceSchema(
+                kind="planner.decision",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Persisted DB agent planner decision.",
+            ),
+            EvidenceSchema(
+                kind="planner.observation",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Compact runtime observation returned to the DB planner.",
+            ),
+            EvidenceSchema(
+                kind="planner.compilation",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Runtime compilation of planner actions to governed tasks.",
+            ),
+            EvidenceSchema(
                 kind="query.plan.proposal",
                 owner="db_runtime",
                 json_schema=object_schema,

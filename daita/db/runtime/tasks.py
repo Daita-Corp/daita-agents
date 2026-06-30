@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import json
-from typing import Any
+from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from daita.runtime import (
@@ -32,6 +32,80 @@ from .types import (
     DbRuntimeGovernanceBlocked,
     DbRuntimeTaskNotRunnable,
 )
+
+
+@dataclass(frozen=True)
+class DbTaskSpec:
+    """Runtime-owned description of DB work before a persisted task exists."""
+
+    capability_id: str
+    owner: str | None = None
+    input: dict[str, Any] = field(default_factory=dict)
+    reason: str = "planner"
+    sequence: int = 1
+    dependencies: tuple[TaskDependency, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+    deterministic_key: str | None = None
+    idempotency_key: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.capability_id:
+            raise ValueError("capability_id is required")
+        if self.sequence < 1:
+            raise ValueError("sequence must be at least 1")
+        object.__setattr__(self, "input", _json_dict(self.input))
+        object.__setattr__(
+            self,
+            "dependencies",
+            tuple(
+                (
+                    dependency
+                    if isinstance(dependency, TaskDependency)
+                    else TaskDependency.from_dict(dependency)
+                )
+                for dependency in self.dependencies
+            ),
+        )
+        object.__setattr__(self, "metadata", _json_dict(self.metadata))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "capability_id": self.capability_id,
+            "owner": self.owner,
+            "input": self.input,
+            "reason": self.reason,
+            "sequence": self.sequence,
+            "dependencies": [dependency.to_dict() for dependency in self.dependencies],
+            "metadata": self.metadata,
+            "deterministic_key": self.deterministic_key,
+            "idempotency_key": self.idempotency_key,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "DbTaskSpec":
+        values = dict(data)
+        values["dependencies"] = tuple(
+            TaskDependency.from_dict(item) for item in values.get("dependencies", ())
+        )
+        return cls(**values)
+
+
+@dataclass(frozen=True)
+class DbTaskPlan:
+    """Materialization result for one or more DB task specs."""
+
+    tasks: tuple[Task, ...]
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tasks", tuple(self.tasks))
+        object.__setattr__(self, "diagnostics", _json_dict(self.diagnostics))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tasks": [task.to_dict() for task in self.tasks],
+            "diagnostics": self.diagnostics,
+        }
 
 
 class DbRuntimeTasksMixin:
@@ -262,6 +336,152 @@ class DbRuntimeTasksMixin:
             input=task.input,
             metadata=task.metadata,
             dependencies=task.dependencies,
+        )
+
+    async def plan_task_specs(
+        self,
+        operation: Operation,
+        specs: Iterable[DbTaskSpec],
+        *,
+        contract: DbOperationContract | Mapping[str, Any] | None = None,
+    ) -> DbTaskPlan:
+        """Materialize DB task specs through the shared runtime kernel."""
+        planned: list[Task] = []
+        diagnostics: dict[str, Any] = {
+            "spec_count": 0,
+            "reused_task_count": 0,
+            "planned_task_count": 0,
+        }
+        prior_by_capability_owner: dict[tuple[str, str], Task] = {}
+        for spec in specs:
+            diagnostics["spec_count"] += 1
+            capability = self.registry.get_capability(
+                spec.capability_id,
+                owner=spec.owner,
+            )
+            validation_task = prior_by_capability_owner.get(
+                ("db.sql.validate", capability.owner)
+            )
+            task = self._task_for_spec(
+                operation,
+                capability,
+                spec,
+                contract=contract,
+                validation_task=validation_task,
+            )
+            existing = await self.store.load_task(task.id)
+            if existing is not None:
+                planned.append(existing)
+                diagnostics["reused_task_count"] += 1
+            else:
+                planned.append(await self._plan_kernel_task(task))
+                diagnostics["planned_task_count"] += 1
+            prior_by_capability_owner[(capability.id, capability.owner)] = planned[-1]
+        return DbTaskPlan(tasks=tuple(planned), diagnostics=diagnostics)
+
+    async def plan_validated_read_spec(
+        self,
+        operation: Operation,
+        *,
+        sql: str,
+        params: tuple[Any, ...] | list[Any] = (),
+        param_specs: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
+        owner: str | None = None,
+        reason: str = "validated_read",
+        sequence: int = 1,
+        focus: Any = None,
+        metadata: dict[str, Any] | None = None,
+        contract: DbOperationContract | Mapping[str, Any] | None = None,
+    ) -> DbTaskPlan:
+        """Persist SQL validation followed by a read task under one operation."""
+        read_capability = self.registry.get_capability(
+            "db.sql.execute_read",
+            owner=owner,
+        )
+        validation_capability = self._validation_capability_for_sql_execute(
+            read_capability
+        )
+        if validation_capability is None:
+            raise KeyError("db.sql.validate")
+        validation_spec = DbTaskSpec(
+            capability_id=validation_capability.id,
+            owner=validation_capability.owner,
+            input={"sql": sql, "operation": "query"},
+            reason=f"{reason}_validation",
+            sequence=sequence,
+            metadata=metadata or {},
+        )
+        execute_input: dict[str, Any] = {
+            "sql_ref": "sql.validation",
+            "params": list(params),
+        }
+        if param_specs:
+            execute_input["param_specs"] = list(param_specs)
+        if focus is not None:
+            execute_input["focus"] = focus
+        read_spec = DbTaskSpec(
+            capability_id=read_capability.id,
+            owner=read_capability.owner,
+            input=execute_input,
+            reason=reason,
+            sequence=sequence + 1,
+            metadata=metadata or {},
+        )
+        return await self.plan_task_specs(
+            operation,
+            (validation_spec, read_spec),
+            contract=contract,
+        )
+
+    async def plan_validated_write_spec(
+        self,
+        operation: Operation,
+        *,
+        sql: str,
+        params: tuple[Any, ...] | list[Any] = (),
+        param_specs: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
+        owner: str | None = None,
+        reason: str = "validated_write",
+        sequence: int = 1,
+        metadata: dict[str, Any] | None = None,
+        contract: DbOperationContract | Mapping[str, Any] | None = None,
+    ) -> DbTaskPlan:
+        """Persist SQL validation followed by an approval-gated write task."""
+        write_capability = self.registry.get_capability(
+            "db.sql.execute_write",
+            owner=owner,
+        )
+        validation_capability = self._validation_capability_for_sql_execute(
+            write_capability
+        )
+        if validation_capability is None:
+            raise KeyError("db.sql.validate")
+        validation_spec = DbTaskSpec(
+            capability_id=validation_capability.id,
+            owner=validation_capability.owner,
+            input={"sql": sql, "operation": operation.operation_type},
+            reason=f"{reason}_validation",
+            sequence=sequence,
+            metadata=metadata or {},
+        )
+        execute_input: dict[str, Any] = {
+            "sql_ref": "sql.validation",
+            "params": list(params),
+        }
+        if param_specs:
+            execute_input["param_specs"] = list(param_specs)
+        write_spec = DbTaskSpec(
+            capability_id=write_capability.id,
+            owner=write_capability.owner,
+            input=execute_input,
+            reason=reason,
+            sequence=sequence + 1,
+            metadata=metadata or {},
+        )
+        return await self.plan_task_specs(
+            operation,
+            (validation_spec, write_spec),
+            contract=contract,
         )
 
     async def _persist_contract_tasks(
@@ -681,6 +901,67 @@ class DbRuntimeTasksMixin:
                 capability,
                 validation_task=validation_task,
             ),
+        )
+
+    def _task_for_spec(
+        self,
+        operation: Operation,
+        capability: Capability,
+        spec: DbTaskSpec,
+        *,
+        contract: DbOperationContract | Mapping[str, Any] | None = None,
+        validation_task: Task | None = None,
+    ) -> Task:
+        input_hash = _stable_hash(spec.input)
+        idempotency_key = spec.idempotency_key or _stable_hash(
+            {
+                "operation_id": operation.id,
+                "capability_id": capability.id,
+                "owner": capability.owner,
+                "input_hash": input_hash,
+                "sequence": spec.sequence,
+                "deterministic_key": spec.deterministic_key,
+            }
+        )
+        task_fingerprint = _stable_hash(
+            {
+                "operation_id": operation.id,
+                "idempotency_key": idempotency_key,
+            }
+        )
+        task_id = f"db-task-{task_fingerprint[:32]}"
+        dependencies = _combine_dependencies(
+            _task_dependencies_for_capability(
+                operation,
+                capability,
+                validation_task=validation_task,
+            ),
+            spec.dependencies,
+        )
+        metadata = {
+            **spec.metadata,
+            "owner": capability.owner,
+            "reason": spec.reason,
+            "sequence": spec.sequence,
+            "input_hash": input_hash,
+            "idempotency_key": idempotency_key,
+            "deterministic_key": spec.deterministic_key,
+            "idempotent": capability.idempotent,
+            "replay_safe": capability.replay_safe,
+            "side_effecting": capability.side_effecting,
+        }
+        contract_snapshot = _contract_snapshot(contract)
+        if contract_snapshot is not None:
+            metadata["contract"] = contract_snapshot
+        return Task(
+            id=task_id,
+            operation_id=operation.id,
+            capability_id=capability.id,
+            executor_id=capability.executor,
+            input={**spec.input, "input_hash": input_hash},
+            required_evidence=capability.output_evidence,
+            dependencies=dependencies,
+            metadata=metadata,
         )
 
     async def _task_readiness(
@@ -1188,6 +1469,15 @@ def _payload_contains(payload: dict[str, Any], expected: dict[str, Any]) -> bool
     return True
 
 
+def _json_dict(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    copied = dict(value or {})
+    try:
+        json.dumps(copied)
+    except TypeError as exc:
+        raise TypeError("DB runtime task mappings must be JSON serializable") from exc
+    return copied
+
+
 def _stable_hash(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -1203,6 +1493,39 @@ def _prompt_from_direct_input(input: dict[str, Any]) -> str:
         if value:
             return str(value)
     return ""
+
+
+def _contract_snapshot(
+    contract: DbOperationContract | Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if contract is None:
+        return None
+    if isinstance(contract, Mapping):
+        return _json_dict(contract)
+    return {
+        "operation_type": contract.operation_type,
+        "required_capabilities": list(contract.required_capabilities),
+        "required_evidence": list(contract.required_evidence),
+        "access": contract.access.value,
+        "limits": contract.limits.to_dict(),
+        "policy_ids": list(contract.policy_ids),
+        "metadata": contract.metadata,
+    }
+
+
+def _combine_dependencies(
+    default_dependencies: tuple[TaskDependency, ...],
+    spec_dependencies: tuple[TaskDependency, ...],
+) -> tuple[TaskDependency, ...]:
+    combined: list[TaskDependency] = []
+    seen: set[str] = set()
+    for dependency in (*default_dependencies, *spec_dependencies):
+        fingerprint = _stable_hash(dependency.to_dict())
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        combined.append(dependency)
+    return tuple(combined)
 
 
 def _task_dependencies_for_capability(
