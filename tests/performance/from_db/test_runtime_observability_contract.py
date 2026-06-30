@@ -34,7 +34,7 @@ class _FakeResult:
                 {"capability_id": "db.sql.execute_read"},
             ],
         },
-        "planner": {"status": "ran_tasks"},
+        "planner": {"status": "finished"},
         "synthesis": {"diagnostics": {"mode": "deterministic"}},
     }
 

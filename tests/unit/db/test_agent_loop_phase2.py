@@ -225,7 +225,7 @@ async def test_agent_loop_runs_schema_and_read_flow_through_task_specs():
         max_turns=1,
     )
 
-    assert result.status == "ran_tasks"
+    assert result.status == "finished"
     tasks = await runtime.store.list_tasks(operation.id)
     assert [task.capability_id for task in tasks] == [
         "db.schema.inspect",

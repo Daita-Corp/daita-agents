@@ -454,7 +454,7 @@ class DbRuntime(
                 operation=operation,
             )
 
-        if loop_result.status in {"ran_tasks", "finished"}:
+        if loop_result.status == "finished":
             return await self._finalize_run_operation(
                 operation_id=operation_id,
                 request=db_request,

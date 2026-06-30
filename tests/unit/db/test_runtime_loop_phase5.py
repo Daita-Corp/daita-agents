@@ -250,7 +250,7 @@ async def test_final_answer_is_synthesized_from_accepted_evidence():
     assert synthesis_task.status is TaskStatus.SUCCEEDED
     assert synthesis_task.id == synthesis.task_id
     assert "loop" not in result.diagnostics
-    assert result.diagnostics["planner"]["status"] == "ran_tasks"
+    assert result.diagnostics["planner"]["status"] == "finished"
     execution = result.diagnostics["execution"]
     assert execution["task_count"] == len(snapshot.tasks)
     assert [item["id"] for item in execution["tasks"]] == [

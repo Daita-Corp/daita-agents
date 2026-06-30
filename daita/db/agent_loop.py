@@ -18,7 +18,7 @@ from daita.runtime import (
     TaskStatus,
 )
 
-from .models import DbOperationContract
+from .models import DbIntent, DbIntentKind, DbLimits, DbOperationContract
 from .planner_protocol import (
     DbAgentPlanner,
     DbLoopState,
@@ -67,6 +67,14 @@ _TERMINAL_TASK_STATUSES = {
     TaskStatus.CANCELLED,
     TaskStatus.BLOCKED,
     TaskStatus.SKIPPED,
+}
+
+_LOOP_CONTROL_EVIDENCE_KINDS = {
+    "planner.decision",
+    "planner.compilation",
+    "planner.observation",
+    "verification.result",
+    "answer.synthesis",
 }
 
 
@@ -329,15 +337,20 @@ class DbAgentLoop:
             if execution_errors:
                 warnings.extend(str(item.get("error")) for item in execution_errors)
                 continue
-            return await self._result(
-                operation,
-                "ran_tasks",
-                warnings=warnings,
-                diagnostics={
-                    "task_plan": task_plan.to_dict(),
-                    "observation": observation.to_dict(),
-                },
-            )
+            finalizable, finalization = await self._operation_finalizable(operation.id)
+            diagnostics = {
+                "task_plan": task_plan.to_dict(),
+                "observation": observation.to_dict(),
+                "finalization": finalization,
+            }
+            if finalizable:
+                return await self._result(
+                    operation,
+                    "finished",
+                    warnings=warnings,
+                    diagnostics=diagnostics,
+                )
+            continue
         diagnostics: dict[str, Any] = {"turn_budget": turn_budget}
         if last_compilation is not None:
             diagnostics["last_compilation"] = last_compilation.to_dict()
@@ -926,6 +939,33 @@ class DbAgentLoop:
             ]
         }
 
+    async def _operation_finalizable(
+        self,
+        operation_id: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        operation = await self._fresh_operation(operation_id)
+        evidence = tuple(await self.runtime.store.list_evidence(operation_id))
+        tasks = tuple(await self.runtime.store.list_tasks(operation_id))
+        fallback_contract = _fallback_contract_for_operation(
+            operation,
+            limits=self.runtime.config.limits,
+        )
+        contract = _contract_from_latest_snapshot(operation, fallback_contract)
+        fallback_intent = _fallback_intent_for_operation(operation, contract)
+        intent = _intent_from_contract(contract, fallback_intent)
+        verification = self.runtime.verifier.verify(contract, intent, evidence, tasks)
+        supporting_evidence = _accepted_synthesis_support_evidence(evidence)
+        finalizable = verification.passed and bool(supporting_evidence)
+        return finalizable, {
+            "finalizable": finalizable,
+            "verification": verification.to_dict(),
+            "intent": _intent_summary(intent),
+            "contract": _contract_snapshot(contract),
+            "synthesis_supporting_evidence": tuple(
+                _evidence_ref(item) for item in supporting_evidence
+            ),
+        }
+
     async def _fresh_operation(self, operation_id: str) -> Operation:
         loaded = await self.runtime.store.load_operation(operation_id)
         if loaded is None:
@@ -1069,6 +1109,134 @@ def _evidence_ref(evidence: Evidence) -> dict[str, Any]:
         "kind": evidence.kind,
         "accepted": evidence.accepted,
     }
+
+
+def _fallback_contract_for_operation(
+    operation: Operation,
+    *,
+    limits: DbLimits,
+) -> DbOperationContract:
+    return DbOperationContract(
+        operation_type=operation.operation_type,
+        required_evidence=tuple(sorted(operation.required_evidence)),
+        access=AccessMode.NONE,
+        limits=limits,
+        policy_ids=(),
+        metadata={"source": "operation_state"},
+    )
+
+
+def _contract_from_latest_snapshot(
+    operation: Operation,
+    fallback: DbOperationContract,
+) -> DbOperationContract:
+    context = operation.metadata.get("resume_context")
+    context = context if isinstance(context, dict) else {}
+    snapshot = (
+        operation.metadata.get("latest_compiled_contract_snapshot")
+        or context.get("latest_compiled_contract_snapshot")
+        or context.get("contract")
+    )
+    if not isinstance(snapshot, dict):
+        return fallback
+    limits = snapshot.get("limits")
+    limits = limits if isinstance(limits, dict) else {}
+    metadata = snapshot.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    try:
+        access = AccessMode(str(snapshot.get("access") or fallback.access.value))
+    except ValueError:
+        access = fallback.access
+    try:
+        db_limits = DbLimits(**limits) if limits else fallback.limits
+    except (TypeError, ValueError):
+        db_limits = fallback.limits
+    return DbOperationContract(
+        operation_type=str(snapshot.get("operation_type") or fallback.operation_type),
+        required_evidence=_string_tuple(snapshot.get("required_evidence")),
+        access=access,
+        limits=db_limits,
+        policy_ids=_string_tuple(snapshot.get("policy_ids")),
+        metadata=metadata,
+    )
+
+
+def _fallback_intent_for_operation(
+    operation: Operation,
+    contract: DbOperationContract,
+) -> DbIntent:
+    context = operation.metadata.get("resume_context")
+    context = context if isinstance(context, dict) else {}
+    intent_context = context.get("intent")
+    intent_context = intent_context if isinstance(intent_context, dict) else {}
+    kind_value = str(intent_context.get("kind") or operation.operation_type)
+    try:
+        kind = DbIntentKind(kind_value)
+    except ValueError:
+        kind = DbIntentKind.CONVERSATIONAL
+    return DbIntent(
+        kind=kind,
+        confidence=1.0,
+        access=contract.access,
+        evidence_mode="planner_loop",
+        diagnostics={
+            "source": "operation_state",
+            "operation_type": operation.operation_type,
+        },
+    )
+
+
+def _intent_from_contract(
+    contract: DbOperationContract,
+    fallback: DbIntent,
+) -> DbIntent:
+    intent_metadata = contract.metadata.get("planner_intent")
+    intent_metadata = intent_metadata if isinstance(intent_metadata, dict) else {}
+    operation_type = str(
+        intent_metadata.get("operation_type") or contract.operation_type
+    )
+    try:
+        kind = DbIntentKind(operation_type)
+    except ValueError:
+        kind = fallback.kind
+    return DbIntent(
+        kind=kind,
+        confidence=1.0,
+        access=contract.access,
+        evidence_mode="planner_loop",
+        diagnostics={
+            "source": "planner_compiled_contract",
+            "operation_type": operation_type,
+            "planner_intent": intent_metadata,
+        },
+    )
+
+
+def _intent_summary(intent: DbIntent) -> dict[str, Any]:
+    return {
+        "kind": intent.kind.value,
+        "access": intent.access.value,
+        "evidence_mode": intent.evidence_mode,
+        "diagnostics": intent.diagnostics,
+    }
+
+
+def _accepted_synthesis_support_evidence(
+    evidence: tuple[Evidence, ...],
+) -> tuple[Evidence, ...]:
+    return tuple(
+        item
+        for item in evidence
+        if item.accepted and item.kind not in _LOOP_CONTROL_EVIDENCE_KINDS
+    )
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(str(item) for item in value)
 
 
 def _governance_summary(governance: GovernanceResult | None) -> dict[str, Any]:
