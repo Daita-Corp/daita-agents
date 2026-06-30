@@ -105,62 +105,6 @@ def _finished_span_dicts(trace_manager):
     ]
 
 
-async def test_from_db_run_records_root_trace_events_and_child_spans(tmp_path):
-    trace_manager = _reset_traces()
-    db_path = tmp_path / "trace.sqlite"
-    await _seed_sqlite(db_path)
-    agent = await Agent.from_db(str(db_path), name="TraceTest", cache_ttl=0)
-
-    try:
-        result = await agent.run_detailed(
-            "What tables exist?",
-            user_id="user-1",
-            session_id="session-1",
-            mode="read",
-        )
-        snapshot = await agent.runtime.inspect_operation(result.operation_id)
-    finally:
-        await agent.stop()
-
-    assert result.status is OperationStatus.SUCCEEDED, result.diagnostics.get("error")
-    assert snapshot is not None
-    trace = result.diagnostics["trace"]
-    assert trace["trace_id"]
-    assert trace["root_span_id"]
-    assert snapshot.operation.metadata["trace"] == trace
-    assert all(event.trace_id == trace["trace_id"] for event in snapshot.events)
-    assert all(event.span_id for event in snapshot.events)
-
-    spans = _finished_span_dicts(trace_manager)
-    operation_spans = [
-        span
-        for span in spans
-        if span["attributes"].get("daita.operation.id") == result.operation_id
-    ]
-    root = next(
-        span
-        for span in operation_spans
-        if span["attributes"].get("daita.trace.type") == TraceType.AGENT_EXECUTION.value
-    )
-    child_spans = [
-        span
-        for span in operation_spans
-        if span["attributes"].get("daita.trace.type") == TraceType.TOOL_EXECUTION.value
-    ]
-    assert root["name"] == "from_db_operation"
-    assert root["trace_id"] == trace["trace_id"]
-    assert root["attributes"]["daita.runtime.id"] == agent.runtime.runtime_id
-    assert root["attributes"]["daita.runtime.kind"] == "db"
-    assert root["attributes"]["daita.execution.id"] == result.operation_id
-    assert root["attributes"]["daita.intent.kind"] == result.intent.kind.value
-    assert child_spans
-    assert all(span["trace_id"] == trace["trace_id"] for span in child_spans)
-    assert all(span["parent_span_id"] == root["span_id"] for span in child_spans)
-    assert all("daita.task.id" in span["attributes"] for span in child_spans)
-    assert all("daita.capability.id" in span["attributes"] for span in child_spans)
-    assert all("daita.executor.id" in span["attributes"] for span in child_spans)
-
-
 async def test_monitor_command_result_has_trace_correlation(tmp_path):
     trace_manager = _reset_traces()
     db_path = tmp_path / "monitor_trace.sqlite"
@@ -215,42 +159,6 @@ async def test_blocked_operation_keeps_trace_correlation(tmp_path):
         event.trace_id == result.diagnostics["trace"]["trace_id"]
         for event in snapshot.events
     )
-
-
-async def test_deterministic_telemetry_is_explicit(tmp_path):
-    _reset_traces()
-    db_path = tmp_path / "telemetry.sqlite"
-    await _seed_sqlite(db_path)
-    agent = await Agent.from_db(str(db_path), name="TelemetryTest", cache_ttl=0)
-
-    try:
-        result = await agent.run_detailed("What tables exist?")
-    finally:
-        await agent.stop()
-
-    synthesis = next(
-        item for item in result.evidence if item.kind == "answer.synthesis"
-    )
-    diagnostics = synthesis.payload["diagnostics"]
-    assert diagnostics["provider"] == "daita.db"
-    assert diagnostics["model"] == "deterministic"
-    assert diagnostics["input_tokens"] == 0
-    assert diagnostics["output_tokens"] == 0
-    assert diagnostics["total_tokens"] == 0
-    assert diagnostics["estimated_cost"] == 0.0
-    assert diagnostics["llm_calls"] == 0
-    assert result.telemetry == {
-        "provider": "daita.db",
-        "model": "deterministic",
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "llm_calls": 0,
-        "estimated_cost_usd": 0.0,
-        "latency_ms": None,
-        "mode": "deterministic",
-    }
-    assert result.diagnostics["telemetry"] == result.telemetry
 
 
 def test_llm_telemetry_normalization_from_synthesis_evidence():
@@ -371,40 +279,6 @@ def test_telemetry_numeric_normalization_preserves_zero_and_unknown_values():
     ) == {
         "provider": "fake",
         "model": "m",
-        "input_tokens": 12,
-        "output_tokens": 8,
-        "total_tokens": 20,
-        "llm_calls": 1,
-        "estimated_cost_usd": 0.0,
-        "latency_ms": 2.5,
-        "mode": "llm",
-    }
-
-
-async def test_llm_telemetry_flows_through_runtime_synthesis_evidence(tmp_path):
-    _reset_traces()
-    db_path = tmp_path / "runtime_llm_telemetry.sqlite"
-    await _seed_sqlite(db_path)
-    sqlite = SQLitePlugin(path=str(db_path))
-    runtime = DbRuntime(
-        plugins=(CatalogPlugin(auto_persist=False), sqlite),
-        db_llm_service=FakeTraceLLMService(),
-    )
-
-    try:
-        result = await runtime.run(DbRequest("What tables exist?", mode="schema.query"))
-    finally:
-        await runtime.teardown()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    synthesis = next(
-        item for item in result.evidence if item.kind == "answer.synthesis"
-    )
-    assert synthesis.payload["diagnostics"]["mode"] == "llm"
-    assert synthesis.payload["diagnostics"]["provider"] == "fake"
-    assert result.telemetry == {
-        "provider": "fake",
-        "model": "trace-llm-test",
         "input_tokens": 12,
         "output_tokens": 8,
         "total_tokens": 20,

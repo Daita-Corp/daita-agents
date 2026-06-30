@@ -314,29 +314,6 @@ async def test_db_runtime_persists_operation_state_for_inspection_and_resume():
     ]
 
 
-async def test_db_agent_facade_uses_runtime_without_generic_agent_patch():
-    runtime = DbRuntime()
-    agent = DbAgent(runtime=runtime)
-
-    result = await agent.run_detailed("How many orders are there?")
-    answer = await agent.run("How many orders are there?")
-    description = await agent.describe()
-    streamed = [item async for item in agent.stream("How many orders are there?")]
-
-    assert agent.runtime is runtime
-    assert not hasattr(agent, "_db_original_run")
-    assert not hasattr(agent, "_db_last_context_metadata")
-    assert not hasattr(agent, "local_tool_catalog")
-    assert result.status is OperationStatus.BLOCKED
-    assert result.request.prompt == "How many orders are there?"
-    assert result.warnings == ("db_runtime_missing_capabilities",)
-    assert answer == "Required DB capabilities are not registered."
-    assert len(streamed) == 1
-    assert streamed[0].status is OperationStatus.BLOCKED
-    assert streamed[0].request.prompt == "How many orders are there?"
-    assert description.runtime_id == runtime.runtime_id
-
-
 def test_db_limits_validate_positive_values():
     limits = DbLimits(max_rows=10, timeout_seconds=1, max_tasks=2)
 

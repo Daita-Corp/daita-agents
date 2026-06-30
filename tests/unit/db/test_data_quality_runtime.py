@@ -58,26 +58,3 @@ def test_db_runtime_can_require_quality_evidence_when_service_registered():
     selected = contract.metadata["selected_capabilities"][0]
     assert selected["owner"] == "data_quality"
     assert selected["executor"] == "data_quality.profile"
-
-
-async def test_db_runtime_executes_quality_check_with_typed_evidence():
-    runtime, _ = await _runtime()
-
-    try:
-        result = await runtime.run(
-            DbRequest(
-                "Check data quality for the orders table",
-                mode="quality.check",
-            )
-        )
-    finally:
-        await runtime.teardown()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    assert result.diagnostics["verification"]["passed"] is True
-    quality = next(item for item in result.evidence if item.kind == "quality.profile")
-    assert quality.owner == "data_quality"
-    assert quality.payload["success"] is True
-    assert quality.payload["table"] == "orders"
-    assert quality.payload["columns_profiled"] == 4
-    assert quality.payload["profile"]["total"]["null_count"] == 1

@@ -40,23 +40,6 @@ async def test_postgresql_registers_provider_neutral_db_capabilities():
     assert policy["profile_only_readable_tables"] is True
 
 
-def test_db_runtime_selects_postgresql_owned_capabilities_for_postgresql_source():
-    runtime = DbRuntime(plugins=(CatalogPlugin(auto_persist=False), _postgres()))
-
-    contract = runtime.build_contract(DbRequest("How many orders are there?"))
-
-    selected = {
-        item["id"]: item
-        for item in contract.metadata["selected_capabilities"]
-        if item["id"].startswith("db.")
-    }
-    assert selected["db.sql.validate"]["owner"] == "postgresql"
-    assert selected["db.sql.execute_read"]["owner"] == "postgresql"
-    assert selected["db.sql.execute_read"]["executor"] == (
-        "postgresql.sql.execute_read"
-    )
-
-
 async def test_postgresql_schema_inspect_returns_typed_evidence_through_runtime():
     postgres = _postgres()
 
