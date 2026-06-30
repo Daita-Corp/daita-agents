@@ -391,6 +391,10 @@ class DbRuntimeTasksMixin:
         sequence: int = 1,
         focus: Any = None,
         metadata: dict[str, Any] | None = None,
+        dependencies: tuple[TaskDependency, ...] = (),
+        validation_dependencies: tuple[TaskDependency, ...] = (),
+        read_dependencies: tuple[TaskDependency, ...] = (),
+        deterministic_key: str | None = None,
         contract: DbOperationContract | Mapping[str, Any] | None = None,
     ) -> DbTaskPlan:
         """Persist SQL validation followed by a read task under one operation."""
@@ -409,7 +413,11 @@ class DbRuntimeTasksMixin:
             input={"sql": sql, "operation": "query"},
             reason=f"{reason}_validation",
             sequence=sequence,
+            dependencies=(*dependencies, *validation_dependencies),
             metadata=metadata or {},
+            deterministic_key=(
+                f"{deterministic_key}:db.sql.validate" if deterministic_key else None
+            ),
         )
         execute_input: dict[str, Any] = {
             "sql_ref": "sql.validation",
@@ -425,7 +433,13 @@ class DbRuntimeTasksMixin:
             input=execute_input,
             reason=reason,
             sequence=sequence + 1,
+            dependencies=(*dependencies, *read_dependencies),
             metadata=metadata or {},
+            deterministic_key=(
+                f"{deterministic_key}:db.sql.execute_read"
+                if deterministic_key
+                else None
+            ),
         )
         return await self.plan_task_specs(
             operation,

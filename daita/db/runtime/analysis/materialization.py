@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -15,9 +16,9 @@ from daita.runtime import (
     Evidence,
     Operation,
     OperationStatus,
-    RuntimeEventType,
     Task,
     TaskDependency,
+    TaskStatus,
 )
 
 from ...analysis import (
@@ -29,7 +30,6 @@ from ...analysis import (
     with_analysis_evidence_trace,
 )
 from ...evidence import DbEvidenceStore
-from ...execution import DbOperationExecutor
 from ...models import (
     DbIntent,
     DbIntentKind,
@@ -38,6 +38,7 @@ from ...models import (
     DbRequest,
 )
 from ..cache import _from_db_options
+from ..tasks import DbTaskSpec
 from ..types import (
     DbRuntimeGovernanceBlocked,
     _governance_blocked_answer,
@@ -126,7 +127,6 @@ class DbRuntimeAnalysisMixin(
         base_diagnostics: dict[str, Any],
         reuse_existing_plan: bool = False,
     ) -> DbOperationResult:
-        executor = DbOperationExecutor(self)
         evidence_store = DbEvidenceStore()
         tasks: list[Task] = []
         warnings: list[str] = []
@@ -138,11 +138,10 @@ class DbRuntimeAnalysisMixin(
             "evidence_kinds": [],
         }
         try:
-            schema_evidence = await executor._inspect_schema_if_available(
+            schema_evidence = await self._execute_analysis_schema_inspection_task(
                 operation, tasks, evidence_store
             )
-            schema = schema_evidence.payload if schema_evidence is not None else {}
-            planning_context = await executor._build_planning_context(
+            planning_context = await self._execute_analysis_planning_context_task(
                 request,
                 operation,
                 tasks,
@@ -343,12 +342,10 @@ class DbRuntimeAnalysisMixin(
                 ):
                     parallel_results = (
                         await self._execute_parallel_analysis_query_steps(
-                            executor,
                             request,
                             intent,
                             contract,
                             operation,
-                            schema=schema,
                             schema_evidence=schema_evidence,
                             plan=plan,
                             plan_evidence=selected_plan_evidence,
@@ -398,14 +395,12 @@ class DbRuntimeAnalysisMixin(
                 )
                 if step.kind == "query":
                     produced = await self._execute_analysis_query_step(
-                        executor,
                         request,
                         intent,
                         contract,
                         operation,
                         tasks,
                         evidence_store,
-                        schema=schema,
                         schema_evidence=schema_evidence,
                         step_prompt=f"{request.prompt}\n\nAnalysis step {step.id}: {step.purpose}",
                         step_metadata=step_meta,
@@ -593,6 +588,253 @@ class DbRuntimeAnalysisMixin(
                 operation=operation,
             )
 
+    async def _execute_analysis_schema_inspection_task(
+        self,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+    ) -> Evidence | None:
+        capability = _first_capability(self, "db.schema.inspect")
+        if capability is None:
+            return None
+        metadata = analysis_metadata(
+            analysis_id=f"analysis-{operation.id}",
+            step_id="analysis_schema",
+            phase="context",
+        )
+        evidence = await self._execute_analysis_task_spec(
+            operation,
+            tasks,
+            evidence_store,
+            capability_id=capability.id,
+            owner=capability.owner,
+            input={},
+            metadata=metadata,
+            dependencies=(),
+            sequence=10,
+            reason="analysis_schema_context",
+            deterministic_key="analysis:schema",
+        )
+        schema_evidence = next(
+            (item for item in evidence if item.kind == "schema.asset_profile"),
+            None,
+        )
+        if schema_evidence is None:
+            return None
+        scoped = _with_schema_scope(schema_evidence, "database")
+        if scoped != schema_evidence:
+            await self.store.save_evidence(scoped)
+            evidence_store.discard(schema_evidence.id)
+            evidence_store.add(scoped)
+        self.remember_schema_evidence(scoped)
+        return scoped
+
+    async def _execute_analysis_planning_context_task(
+        self,
+        request: DbRequest,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        schema_evidence: Evidence | None,
+        catalog_evidence: tuple[Evidence, ...],
+        relationship_evidence: tuple[Evidence, ...],
+        analysis_metadata: dict[str, Any],
+        extra_dependencies: tuple[TaskDependency, ...] = (),
+    ) -> Evidence:
+        dependencies = (
+            *(
+                (_dependency_for_evidence(schema_evidence),)
+                if schema_evidence is not None and schema_evidence.id is not None
+                else ()
+            ),
+            *(
+                _dependency_for_evidence(item)
+                for item in (*catalog_evidence, *relationship_evidence)
+                if item.id is not None and item.accepted
+            ),
+            *extra_dependencies,
+        )
+        evidence = await self._execute_analysis_task_spec(
+            operation,
+            tasks,
+            evidence_store,
+            capability_id="db.planning.context.build",
+            owner="db_runtime",
+            input={
+                "prompt": request.prompt,
+                "schema_evidence_id": schema_evidence.id if schema_evidence else None,
+                "catalog_evidence_ids": [
+                    item.id for item in catalog_evidence if item.id is not None
+                ],
+                "relationship_evidence_ids": [
+                    item.id for item in relationship_evidence if item.id is not None
+                ],
+                "memory_recall_evidence_ids": [],
+            },
+            metadata=analysis_metadata,
+            dependencies=dependencies,
+            sequence=1000 + len(tasks),
+            reason="analysis_planning_context",
+            deterministic_key=_stable_hash(
+                {
+                    "analysis_context": analysis_metadata,
+                    "prompt": request.prompt,
+                    "schema_evidence_id": getattr(schema_evidence, "id", None),
+                    "catalog_evidence_ids": [
+                        item.id for item in catalog_evidence if item.id is not None
+                    ],
+                    "relationship_evidence_ids": [
+                        item.id for item in relationship_evidence if item.id is not None
+                    ],
+                }
+            ),
+        )
+        planning_context = next(
+            (item for item in evidence if item.kind == "planning.context"),
+            None,
+        )
+        if planning_context is None:
+            raise RuntimeError("planning.context evidence was not produced")
+        return planning_context
+
+    async def _execute_analysis_query_plan_task(
+        self,
+        request: DbRequest,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        planning_context: Evidence,
+        step_metadata: dict[str, Any],
+        context_dependencies: tuple[TaskDependency, ...],
+    ) -> Evidence:
+        evidence = await self._execute_analysis_task_spec(
+            operation,
+            tasks,
+            evidence_store,
+            capability_id="db.query.plan",
+            owner="db_runtime",
+            input={
+                "planning_context_evidence_id": planning_context.id,
+                "prompt": request.prompt,
+            },
+            metadata=step_metadata,
+            dependencies=(
+                _dependency_for_evidence(planning_context),
+                *context_dependencies,
+            ),
+            sequence=2000 + len(tasks),
+            reason="analysis_query_planning",
+            deterministic_key=_stable_hash(
+                {
+                    "analysis_query_plan": step_metadata,
+                    "prompt": request.prompt,
+                    "planning_context_evidence_id": planning_context.id,
+                }
+            ),
+        )
+        plan = next(
+            (item for item in evidence if item.kind == "query.plan.proposal"),
+            None,
+        )
+        if plan is None:
+            raise RuntimeError("query.plan.proposal evidence was not produced")
+        return plan
+
+    async def _execute_analysis_query_plan_validation_task(
+        self,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        plan_evidence: Evidence,
+        planning_context: Evidence,
+        step_metadata: dict[str, Any],
+        context_dependencies: tuple[TaskDependency, ...],
+    ) -> Evidence:
+        evidence = await self._execute_analysis_task_spec(
+            operation,
+            tasks,
+            evidence_store,
+            capability_id="db.query.plan.validate",
+            owner="db_runtime",
+            input={
+                "plan_evidence_id": plan_evidence.id,
+                "planning_context_evidence_id": planning_context.id,
+            },
+            metadata=step_metadata,
+            dependencies=(
+                _dependency_for_evidence(plan_evidence),
+                _dependency_for_evidence(planning_context),
+                *context_dependencies,
+            ),
+            sequence=2100 + len(tasks),
+            reason="analysis_query_plan_validation",
+            deterministic_key=_stable_hash(
+                {
+                    "analysis_query_plan_validation": step_metadata,
+                    "plan_evidence_id": plan_evidence.id,
+                    "planning_context_evidence_id": planning_context.id,
+                }
+            ),
+        )
+        validation = next(
+            (item for item in evidence if item.kind == "query.plan.validation"),
+            None,
+        )
+        if validation is None:
+            raise RuntimeError("query.plan.validation evidence was not produced")
+        return validation
+
+    async def _execute_analysis_task_spec(
+        self,
+        operation: Operation,
+        tasks: list[Task],
+        evidence_store: DbEvidenceStore,
+        *,
+        capability_id: str,
+        owner: str | None,
+        input: dict[str, Any],
+        metadata: dict[str, Any],
+        dependencies: tuple[TaskDependency, ...],
+        sequence: int,
+        reason: str,
+        deterministic_key: str | None = None,
+        contract: DbOperationContract | None = None,
+    ) -> tuple[Evidence, ...]:
+        spec = DbTaskSpec(
+            capability_id=capability_id,
+            owner=owner,
+            input=input,
+            reason=reason,
+            sequence=sequence,
+            dependencies=dependencies,
+            metadata=with_analysis_evidence_trace(metadata),
+            deterministic_key=deterministic_key,
+        )
+        plan = await self.plan_task_specs(operation, (spec,), contract=contract)
+        task = plan.tasks[0]
+        if not any(item.id == task.id for item in tasks):
+            tasks.append(task)
+        if task.status is TaskStatus.SUCCEEDED:
+            evidence = await self._evidence_for_task(operation.id, task.id)
+        else:
+            evidence = await self.execute_task(task, operation)
+        evidence_store.add_many(evidence)
+        return evidence
+
+    async def _evidence_for_task(
+        self,
+        operation_id: str,
+        task_id: str,
+    ) -> tuple[Evidence, ...]:
+        return tuple(
+            item
+            for item in await self.store.list_evidence(operation_id)
+            if item.task_id == task_id
+        )
+
     async def _execute_analysis_plan_task(
         self,
         operation: Operation,
@@ -684,7 +926,6 @@ class DbRuntimeAnalysisMixin(
 
     async def _execute_analysis_query_step(
         self,
-        executor: DbOperationExecutor,
         request: DbRequest,
         intent: DbIntent,
         contract: DbOperationContract,
@@ -692,7 +933,6 @@ class DbRuntimeAnalysisMixin(
         tasks: list[Task],
         evidence_store: DbEvidenceStore,
         *,
-        schema: dict[str, Any],
         schema_evidence: Evidence | None,
         step_prompt: str,
         step_metadata: dict[str, Any],
@@ -702,7 +942,7 @@ class DbRuntimeAnalysisMixin(
 
         before_ids = {item.id for item in await self.store.list_evidence(operation.id)}
         step_request = dataclass_replace(request, prompt=step_prompt)
-        planning_context = await executor._build_planning_context(
+        planning_context = await self._execute_analysis_planning_context_task(
             step_request,
             operation,
             tasks,
@@ -713,48 +953,65 @@ class DbRuntimeAnalysisMixin(
             analysis_metadata=step_metadata,
             extra_dependencies=context_dependencies,
         )
-        plan_evidence, strategy_warnings, _ = await executor._plan_query(
+        plan_evidence = await self._execute_analysis_query_plan_task(
             step_request,
-            intent,
             operation,
-            schema,
-            None,
-            planning_context,
             tasks,
             evidence_store,
-            analysis_metadata=step_metadata,
-            extra_dependencies=context_dependencies,
+            planning_context=planning_context,
+            step_metadata=step_metadata,
+            context_dependencies=context_dependencies,
         )
-        validation = await executor._validate_query_plan(
+        validation = await self._execute_analysis_query_plan_validation_task(
             operation,
             tasks,
             evidence_store,
             plan_evidence=plan_evidence,
             planning_context=planning_context,
-            analysis_metadata=step_metadata,
-            extra_dependencies=context_dependencies,
+            step_metadata=step_metadata,
+            context_dependencies=context_dependencies,
         )
         sql = validation.payload.get("accepted_sql")
         if sql:
-            sql_validation = await executor._execute_sql_validation(
-                contract,
+            read_plan = await self.plan_validated_read_spec(
                 operation,
-                tasks,
-                evidence_store,
-                sql,
-                plan_validation=validation,
-                analysis_metadata=step_metadata,
-                extra_dependencies=context_dependencies,
+                sql=str(sql),
+                owner=_contract_owner_for_capability(contract, "db.sql.execute_read"),
+                reason="analysis_validated_read",
+                sequence=3000 + len(tasks),
+                metadata=with_analysis_evidence_trace(step_metadata),
+                dependencies=context_dependencies,
+                validation_dependencies=(
+                    TaskDependency(
+                        kind="evidence",
+                        evidence_kind="query.plan.validation",
+                        evidence_id=validation.id,
+                        evidence_payload={"valid": True},
+                        evidence_accepted=True,
+                        operation_id=operation.id,
+                        payload_fingerprint=validation.metadata.get(
+                            "payload_fingerprint"
+                        )
+                        or _payload_fingerprint(validation.payload),
+                    ),
+                ),
+                deterministic_key=_stable_hash(
+                    {
+                        "analysis_validated_read": step_metadata,
+                        "query_plan_validation_id": validation.id,
+                        "sql": str(sql),
+                    }
+                ),
+                contract=contract,
             )
-            await executor._execute_validated_read(
-                contract,
-                operation,
-                tasks,
-                evidence_store,
-                sql_validation,
-                analysis_metadata=step_metadata,
-                extra_dependencies=context_dependencies,
-            )
+            for task in read_plan.tasks:
+                if not any(item.id == task.id for item in tasks):
+                    tasks.append(task)
+                if task.status is TaskStatus.SUCCEEDED:
+                    evidence = await self._evidence_for_task(operation.id, task.id)
+                else:
+                    evidence = await self.execute_task(task, operation)
+                evidence_store.add_many(evidence)
         produced = tuple(
             item
             for item in await self.store.list_evidence(operation.id)
@@ -762,27 +1019,15 @@ class DbRuntimeAnalysisMixin(
             and item.metadata.get("analysis_step_id")
             == step_metadata.get("analysis_step_id")
         )
-        if strategy_warnings:
-            await self.kernel.append_event(
-                RuntimeEventType.DIAGNOSTIC,
-                operation_id=operation.id,
-                message="Analysis query step produced planner warnings.",
-                payload={
-                    "analysis_step_id": step_metadata.get("analysis_step_id"),
-                    "warnings": list(strategy_warnings),
-                },
-            )
         return produced
 
     async def _execute_parallel_analysis_query_steps(
         self,
-        executor: DbOperationExecutor,
         request: DbRequest,
         intent: DbIntent,
         contract: DbOperationContract,
         operation: Operation,
         *,
-        schema: dict[str, Any],
         schema_evidence: Evidence | None,
         plan: DbAnalysisPlan,
         plan_evidence: Evidence,
@@ -803,14 +1048,12 @@ class DbRuntimeAnalysisMixin(
                     plan_evidence_id=plan_evidence.id,
                 )
                 produced = await self._execute_analysis_query_step(
-                    executor,
                     request,
                     intent,
                     contract,
                     operation,
                     step_tasks,
                     step_evidence_store,
-                    schema=schema,
                     schema_evidence=schema_evidence,
                     step_prompt=(
                         f"{request.prompt}\n\nAnalysis step {step.id}: {step.purpose}"
@@ -984,36 +1227,26 @@ class DbRuntimeAnalysisMixin(
         sequence: int,
     ) -> Task:
         task_input = {**input}
-        input_hash = _stable_hash(task_input)
-        return Task(
-            id=f"db-task-{uuid4()}",
-            operation_id=operation.id,
+        spec = DbTaskSpec(
             capability_id=capability.id,
-            executor_id=capability.executor,
-            input={**task_input, "input_hash": input_hash},
-            required_evidence=capability.output_evidence,
+            owner=capability.owner,
+            input=task_input,
+            reason="analysis",
+            sequence=sequence,
             dependencies=dependencies,
-            metadata=with_analysis_evidence_trace(
+            metadata=with_analysis_evidence_trace(metadata),
+            deterministic_key=_stable_hash(
                 {
-                    "owner": capability.owner,
-                    "reason": "analysis",
-                    "sequence": sequence,
-                    "input_hash": input_hash,
-                    "idempotency_key": _stable_hash(
-                        {
-                            "operation_id": operation.id,
-                            "capability_id": capability.id,
-                            "input": task_input,
-                            **metadata,
-                        }
-                    ),
-                    "idempotent": capability.idempotent,
-                    "replay_safe": capability.replay_safe,
-                    "side_effecting": capability.side_effecting,
-                    **metadata,
+                    "analysis": metadata,
+                    "capability_id": capability.id,
+                    "input": task_input,
+                    "dependencies": [
+                        dependency.to_dict() for dependency in dependencies
+                    ],
                 }
             ),
         )
+        return self._task_for_spec(operation, capability, spec)
 
     def _accepted_analysis_step_evidence_map(
         self,
@@ -1090,6 +1323,34 @@ class DbRuntimeAnalysisMixin(
             if not dependency_evidence:
                 return False
         return True
+
+
+def _first_capability(runtime: Any, capability_id: str) -> Capability | None:
+    for capability in runtime.registry.capabilities:
+        if capability.id == capability_id:
+            return capability
+    return None
+
+
+def _contract_owner_for_capability(
+    contract: DbOperationContract,
+    capability_id: str,
+) -> str | None:
+    for item in contract.metadata.get("selected_capabilities", ()):
+        if item.get("id") == capability_id and item.get("owner"):
+            return str(item["owner"])
+    return None
+
+
+def _with_schema_scope(evidence: Evidence, scope: str) -> Evidence:
+    if evidence.kind != "schema.asset_profile":
+        return evidence
+    payload = dict(evidence.payload)
+    metadata = {**evidence.metadata, "scope": scope}
+    payload_metadata = dict(payload.get("metadata") or {})
+    payload_metadata.setdefault("scope", scope)
+    payload["metadata"] = payload_metadata
+    return replace(evidence, payload=payload, metadata=metadata)
 
 
 def _analysis_replan_enabled(metadata: dict[str, Any]) -> bool:

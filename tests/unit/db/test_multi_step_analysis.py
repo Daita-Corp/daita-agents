@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from uuid import uuid4
 
 from daita.agents.agent import Agent
@@ -57,7 +58,8 @@ class FakeAnalysisLLMService:
 async def _runtime(tmp_path, llm_service, *, config=None):
     db_path = tmp_path / f"multi_step_{uuid4().hex}.sqlite"
     sqlite = SQLitePlugin(path=str(db_path), query_default_limit=20)
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             month TEXT NOT NULL,
@@ -70,7 +72,8 @@ async def _runtime(tmp_path, llm_service, *, config=None):
             (2, 'March', 'East', 40.0),
             (3, 'March', 'West', 30.0),
             (4, 'April', 'East', 90.0);
-        """)
+        """
+    )
     runtime = DbRuntime(
         config=config,
         plugins=(CatalogPlugin(auto_persist=False), sqlite),
@@ -188,6 +191,14 @@ def _analysis_synthesis_response(messages):
             "confidence": 0.87,
         }
     )
+
+
+def test_phase3_analysis_materialization_has_no_executor_dependency():
+    source = Path("daita/db/runtime/analysis/materialization.py").read_text()
+
+    assert "DbOperationExecutor" not in source
+    assert "_execute_sql_validation" not in source
+    assert "_execute_validated_read" not in source
 
 
 async def test_from_db_model_config_registers_analysis_capabilities(tmp_path):
@@ -574,14 +585,42 @@ async def test_query_steps_use_existing_validated_execute_path_and_exact_refs(tm
     read_tasks = [
         task for task in snapshot.tasks if task.capability_id == "db.sql.execute_read"
     ]
+    validation_tasks = {
+        task.id: task
+        for task in snapshot.tasks
+        if task.capability_id == "db.sql.validate"
+        and task.metadata.get("analysis_step_id") in {"step_1", "step_2"}
+    }
+    validation_evidence_by_task = {
+        item.task_id: item
+        for item in snapshot.evidence
+        if item.kind == "sql.validation"
+        and item.metadata.get("analysis_step_id") in {"step_1", "step_2"}
+    }
     assert len(read_tasks) == 2
     for task in read_tasks:
         dependency = next(
             dep for dep in task.dependencies if dep.evidence_kind == "sql.validation"
         )
-        assert task.input["validated_evidence_id"] == dependency.evidence_id
-        assert dependency.payload_fingerprint
+        validation_task = validation_tasks[dependency.producer_task_id]
+        validation = validation_evidence_by_task[validation_task.id]
+        assert task.input["validated_evidence_id"] == validation.id
+        assert dependency.input_hash == validation_task.metadata["input_hash"]
+        assert dependency.producer_capability_id == "db.sql.validate"
+        assert int(validation_task.metadata["sequence"]) < int(
+            task.metadata["sequence"]
+        )
         assert task.metadata["analysis_step_id"] in {"step_1", "step_2"}
+        assert task.metadata["deterministic_key"]
+
+    for step_id in {"step_1", "step_2"}:
+        step_evidence = [
+            item
+            for item in snapshot.evidence
+            if item.metadata.get("analysis_step_id") == step_id
+        ]
+        step_kinds = [item.kind for item in step_evidence]
+        assert step_kinds.index("sql.validation") < step_kinds.index("query.result")
 
     results = [item for item in snapshot.evidence if item.kind == "query.result"]
     assert {item.metadata["analysis_step_id"] for item in results} == {
@@ -605,6 +644,46 @@ async def test_query_steps_use_existing_validated_execute_path_and_exact_refs(tm
             dep.payload_fingerprint
             == by_id[dep.evidence_id].metadata["payload_fingerprint"]
         )
+
+
+async def test_analysis_query_steps_plan_sql_through_validated_read_specs(tmp_path):
+    llm = FakeAnalysisLLMService(
+        planner_responses=[
+            _analysis_plan(),
+            _query_plan(
+                "SELECT month, SUM(total) AS revenue FROM orders GROUP BY month LIMIT 10"
+            ),
+            _query_plan(
+                "SELECT region, SUM(total) AS revenue FROM orders WHERE month = 'March' GROUP BY region LIMIT 10"
+            ),
+        ]
+    )
+    runtime, sqlite = await _runtime(tmp_path, llm)
+    calls = []
+    original = runtime.plan_validated_read_spec
+
+    async def record_validated_read_spec(operation, **kwargs):
+        calls.append(kwargs)
+        return await original(operation, **kwargs)
+
+    runtime.plan_validated_read_spec = record_validated_read_spec
+    try:
+        result = await runtime.run(
+            "Show a multi-step analysis to investigate revenue using multiple queries"
+        )
+    finally:
+        await sqlite.disconnect()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert [call["metadata"]["analysis_step_id"] for call in calls] == [
+        "step_1",
+        "step_2",
+    ]
+    for call in calls:
+        dependency = call["validation_dependencies"][0]
+        assert dependency.evidence_kind == "query.plan.validation"
+        assert dependency.evidence_payload == {"valid": True}
+        assert call["deterministic_key"]
 
 
 async def test_query_step_context_refs_become_exact_task_dependencies(tmp_path):
@@ -1145,6 +1224,15 @@ async def test_resume_materializes_incomplete_ready_analysis_steps(tmp_path):
         )
         before = await runtime.inspect_operation(result.operation_id)
         progress_before = await runtime.inspect_analysis_operation(result.operation_id)
+        validated_read_replans = 0
+        original_validated_read = runtime.plan_validated_read_spec
+
+        async def count_validated_read_replan(operation, **kwargs):
+            nonlocal validated_read_replans
+            validated_read_replans += 1
+            return await original_validated_read(operation, **kwargs)
+
+        runtime.plan_validated_read_spec = count_validated_read_replan
         resumed = await runtime.resume_operation(result.operation_id)
     finally:
         await sqlite.disconnect()
@@ -1166,6 +1254,7 @@ async def test_resume_materializes_incomplete_ready_analysis_steps(tmp_path):
         task.id for task in resumed.tasks if task.capability_id == "db.sql.execute_read"
     ]
     assert after_sql_task_ids == before_sql_task_ids
+    assert validated_read_replans == 0
     assert resumed.operation.status is OperationStatus.SUCCEEDED
     final_synthesis = [
         item
@@ -1280,7 +1369,8 @@ async def test_analysis_tasks_and_evidence_stay_in_same_operation_with_metadata(
     assert all(
         item.metadata.get("analysis_plan_evidence_id")
         for item in analysis_evidence
-        if item.kind not in {"analysis.plan", "planning.context"}
+        if item.kind
+        not in {"analysis.plan", "planning.context", "schema.asset_profile"}
     )
 
 
