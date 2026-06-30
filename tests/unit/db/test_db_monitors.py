@@ -7,6 +7,7 @@ from daita.db import (
     DbRuntimeConfig,
     SQLiteDbMonitorStore,
 )
+from daita.db.runtime.tasks import DbTaskSpec
 from daita.runtime import (
     ApprovalStatus,
     OperationStatus,
@@ -44,6 +45,21 @@ class MonitorLifecycleApprovalPolicy:
             operation_id=operation.id,
             required_approvals=("human",),
             metadata={"operation_type": operation.operation_type},
+        )
+
+
+class SpecSpyRuntime(DbRuntime):
+    def __init__(self) -> None:
+        super().__init__(runtime_id="db-monitor-spec-spy")
+        self.spec_batches: list[tuple[DbTaskSpec, ...]] = []
+
+    async def plan_task_specs(self, operation, specs, *, contract=None):
+        materialized = tuple(specs)
+        self.spec_batches.append(materialized)
+        return await super().plan_task_specs(
+            operation,
+            materialized,
+            contract=contract,
         )
 
 
@@ -162,6 +178,52 @@ async def test_db_agent_typed_monitor_crud_records_runtime_operations():
         "monitor.proposal",
         "monitor.deleted",
     ]
+
+
+async def test_monitor_lifecycle_tasks_materialize_from_task_specs():
+    runtime = SpecSpyRuntime()
+    agent = DbAgent(runtime=runtime, name="monitor-spec-test")
+    monitor = await agent.monitor(
+        name="Spec Monitor",
+        schedule="*/10 * * * *",
+        watch="orders",
+        observation_plan={
+            "kind": "metric_sql",
+            "sql": "select 1 as value",
+            "value_path": "rows.0.value",
+        },
+        trigger="value > 0",
+        then="notify",
+    )
+
+    await agent.update_monitor(monitor.id, {"description": "updated"})
+    lifecycle_specs = [spec for batch in runtime.spec_batches for spec in batch]
+    tasks = await runtime.store.list_tasks()
+    plan_task = next(
+        task for task in tasks if task.capability_id == "db.monitor.plan_lifecycle"
+    )
+    commit_task = next(
+        task for task in tasks if task.capability_id == "db.monitor.commit_lifecycle"
+    )
+
+    assert [spec.capability_id for spec in lifecycle_specs] == [
+        "db.monitor.plan_lifecycle",
+        "db.monitor.commit_lifecycle",
+    ]
+    assert all(isinstance(spec, DbTaskSpec) for spec in lifecycle_specs)
+    assert plan_task.metadata["reason"] == "monitor_update_planning"
+    assert commit_task.metadata["reason"] == "monitor_update_commit"
+    assert (
+        commit_task.metadata["idempotency_key"]
+        == commit_task.input["proposal_fingerprint"]
+    )
+    dependency = next(
+        dependency
+        for dependency in commit_task.dependencies
+        if dependency.kind.value == "evidence"
+    )
+    assert dependency.evidence_kind == "monitor.proposal"
+    assert dependency.producer_task_id == plan_task.id
 
 
 async def test_sqlite_db_monitor_store_shares_runtime_store_database(tmp_path):

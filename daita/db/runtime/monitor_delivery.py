@@ -35,6 +35,7 @@ from ..monitors import (
 )
 from .analysis import _payload_fingerprint, _stable_hash
 from .resume import _monitor_delivery_context
+from .tasks import DbTaskSpec
 from .types import (
     _TERMINAL_TASK_STATUSES,
     DbRuntimeGovernanceBlocked,
@@ -201,7 +202,7 @@ class DbRuntimeMonitorDeliveryMixin:
                 and governance_decision.result.pending_approval
                 and governance_decision.result.approval_requests
             ):
-                task = self._monitor_plugin_task_for_capability(
+                task = await self._plan_monitor_plugin_task_for_capability(
                     operation,
                     capability,
                     input_payload=plan.input_payload,
@@ -212,7 +213,6 @@ class DbRuntimeMonitorDeliveryMixin:
                     metadata=plan.metadata,
                     approval_requests=governance_decision.result.approval_requests,
                 )
-                await self._plan_kernel_task(task)
                 task_ids = (task.id,)
             return await self._persist_monitor_delivery_result(
                 operation,
@@ -232,7 +232,7 @@ class DbRuntimeMonitorDeliveryMixin:
                 plan_evidence=plan_evidence,
             )
 
-        task = self._monitor_plugin_task_for_capability(
+        task = await self._plan_monitor_plugin_task_for_capability(
             operation,
             capability,
             input_payload=plan.input_payload,
@@ -548,7 +548,7 @@ class DbRuntimeMonitorDeliveryMixin:
             )
         return payload
 
-    def _monitor_plugin_task_for_capability(
+    async def _plan_monitor_plugin_task_for_capability(
         self,
         operation: Operation,
         capability: Capability,
@@ -569,25 +569,6 @@ class DbRuntimeMonitorDeliveryMixin:
                 "idempotency_key": idempotency_key,
             }
         )
-        task = Task(
-            id=f"monitor-plugin-task-{task_key[:32]}",
-            operation_id=operation.id,
-            capability_id=capability.id,
-            executor_id=capability.executor,
-            input={**input_payload, "input_hash": input_hash},
-            required_evidence=capability.output_evidence,
-            metadata={
-                **dict(metadata),
-                "owner": capability.owner,
-                "reason": reason,
-                "sequence": sequence,
-                "input_hash": input_hash,
-                "idempotency_key": idempotency_key,
-                "idempotent": capability.idempotent,
-                "replay_safe": capability.replay_safe,
-                "side_effecting": capability.side_effecting,
-            },
-        )
         approval_dependencies = tuple(
             TaskDependency(
                 kind="approval",
@@ -599,11 +580,30 @@ class DbRuntimeMonitorDeliveryMixin:
             )
             for request in approval_requests
         )
-        if approval_dependencies:
+        plan = await self.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id=capability.id,
+                    task_id=f"monitor-plugin-task-{task_key[:32]}",
+                    owner=capability.owner,
+                    input=dict(input_payload),
+                    reason=reason,
+                    sequence=sequence,
+                    dependencies=approval_dependencies,
+                    metadata=dict(metadata),
+                    idempotency_key=idempotency_key,
+                ),
+            ),
+        )
+        task = plan.tasks[0]
+        if task.input.get("input_hash") != input_hash:
             task = replace(
                 task,
-                dependencies=(*task.dependencies, *approval_dependencies),
+                input={**task.input, "input_hash": input_hash},
+                metadata={**task.metadata, "input_hash": input_hash},
             )
+            await self.store.save_task(task)
         return task
 
     async def _execute_or_reuse_monitor_plugin_task(
@@ -615,7 +615,7 @@ class DbRuntimeMonitorDeliveryMixin:
     ) -> tuple[Evidence, ...]:
         stored = await self.store.load_task(task.id)
         if stored is None:
-            stored = await self._plan_kernel_task(task)
+            raise RuntimeError(f"monitor plugin task {task.id} was not persisted")
         elif stored.status in _TERMINAL_TASK_STATUSES:
             return tuple(
                 item

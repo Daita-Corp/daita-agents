@@ -29,6 +29,7 @@ from ..governance import (
     _sql_validation_governance_facts,
 )
 from ..monitor_helpers import _terminal_monitor_approval_reason
+from ..tasks import DbTaskSpec
 
 
 class DbRuntimeMonitorActionWritesMixin:
@@ -85,19 +86,25 @@ class DbRuntimeMonitorActionWritesMixin:
                     else "missing_write_capability"
                 ),
             )
-        validation_task = self._task_for_capability(
+        validation_plan = await self.plan_task_specs(
             operation,
-            validation_capability,
-            input={"sql": sql, "operation": "write.execute"},
-            reason="monitor_write_validation",
-            sequence=500,
-            metadata={
-                "monitor_id": monitor_id,
-                "monitor_run_id": monitor_run_id,
-                "tick_operation_id": tick_operation_id,
-                "monitor_action_role": "write_validation",
-            },
+            (
+                DbTaskSpec(
+                    capability_id=validation_capability.id,
+                    owner=validation_capability.owner,
+                    input={"sql": sql, "operation": "write.execute"},
+                    reason="monitor_write_validation",
+                    sequence=500,
+                    metadata={
+                        "monitor_id": monitor_id,
+                        "monitor_run_id": monitor_run_id,
+                        "tick_operation_id": tick_operation_id,
+                        "monitor_action_role": "write_validation",
+                    },
+                ),
+            ),
         )
+        validation_task = validation_plan.tasks[0]
         validation_evidence_items = await self.execute_task(
             validation_task,
             operation,
@@ -155,9 +162,9 @@ class DbRuntimeMonitorActionWritesMixin:
             status="validating",
             approval_ids=(),
         )
-        write_task = self._task_for_capability(
-            operation,
-            write_capability,
+        write_spec = DbTaskSpec(
+            capability_id=write_capability.id,
+            owner=write_capability.owner,
             input={
                 "sql_ref": "sql.validation",
                 "params": list(action_plan.get("params") or ()),
@@ -167,7 +174,6 @@ class DbRuntimeMonitorActionWritesMixin:
             },
             reason="monitor_write_execution",
             sequence=510,
-            validation_task=validation_task,
             metadata={
                 "monitor_id": monitor_id,
                 "monitor_run_id": monitor_run_id,
@@ -180,6 +186,12 @@ class DbRuntimeMonitorActionWritesMixin:
                 "source_scope": list(effective_source_scope(source_scope, action_plan)),
                 "proposal_evidence_id": proposal.id,
             },
+        )
+        write_task = self._task_for_spec(
+            operation,
+            write_capability,
+            write_spec,
+            validation_task=validation_task,
         )
         authoritative = _sql_validation_governance_facts((validation_evidence,))
         operation_override = {
@@ -299,7 +311,23 @@ class DbRuntimeMonitorActionWritesMixin:
                     ),
                 ),
             )
-        await self._plan_kernel_task(write_task)
+        write_plan = await self.plan_task_specs(
+            operation,
+            (
+                replace(
+                    write_spec,
+                    dependencies=write_task.dependencies,
+                ),
+            ),
+        )
+        planned_write_task = write_plan.tasks[0]
+        if planned_write_task.dependencies != write_task.dependencies:
+            planned_write_task = replace(
+                planned_write_task,
+                dependencies=write_task.dependencies,
+            )
+            await self.store.save_task(planned_write_task)
+        write_task = planned_write_task
         status = (
             "approval_required"
             if governance_decision.result.pending_approval or approval_requests

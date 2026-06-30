@@ -129,6 +129,22 @@ async def test_explicit_remember_metric_definition_proposes_commits_and_writes()
     assert proposal.accepted is True
     assert definition.payload["proposal_evidence_id"] == proposal.id
     assert write.payload["success"] is True
+    tasks = await runtime.store.list_tasks(result.operation_id)
+    proposal_task = next(
+        task for task in tasks if task.capability_id == "db.memory.plan_update"
+    )
+    write_task = next(
+        task for task in tasks if task.capability_id == "memory.semantic.write"
+    )
+    proposal_dependency = next(
+        dependency
+        for dependency in write_task.dependencies
+        if dependency.kind.value == "evidence"
+    )
+    assert proposal_dependency.evidence_kind == "db.memory.proposal"
+    assert proposal_dependency.evidence_id == proposal.id
+    assert proposal_dependency.producer_task_id == proposal_task.id
+    assert write_task.metadata["reason"] == "db_memory_commit_update"
     stored = backend.remember.await_args.kwargs["extra_metadata"]["db_memory"]
     assert stored["metadata"]["creation_path"] == "explicit_intent"
     assert stored["metadata"]["source_identity"] == TEST_SOURCE_IDENTITY

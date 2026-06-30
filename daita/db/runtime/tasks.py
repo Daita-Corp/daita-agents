@@ -39,6 +39,7 @@ class DbTaskSpec:
     """Runtime-owned description of DB work before a persisted task exists."""
 
     capability_id: str
+    task_id: str | None = None
     owner: str | None = None
     input: dict[str, Any] = field(default_factory=dict)
     reason: str = "planner"
@@ -71,6 +72,7 @@ class DbTaskSpec:
     def to_dict(self) -> dict[str, Any]:
         return {
             "capability_id": self.capability_id,
+            "task_id": self.task_id,
             "owner": self.owner,
             "input": self.input,
             "reason": self.reason,
@@ -943,7 +945,7 @@ class DbRuntimeTasksMixin:
                 "idempotency_key": idempotency_key,
             }
         )
-        task_id = f"db-task-{task_fingerprint[:32]}"
+        task_id = spec.task_id or f"db-task-{task_fingerprint[:32]}"
         dependencies = _combine_dependencies(
             _task_dependencies_for_capability(
                 operation,

@@ -1707,10 +1707,12 @@ async def test_monitor_create_metadata_is_ready_for_worker_handoff():
     assert commit_task.metadata["idempotency_key"] == (
         proposal.payload["proposal_fingerprint"]
     )
-    assert commit_task.input == {
-        "proposal_evidence_id": proposal.id,
-        "proposal_fingerprint": proposal.payload["proposal_fingerprint"],
-    }
+    assert commit_task.input["proposal_evidence_id"] == proposal.id
+    assert (
+        commit_task.input["proposal_fingerprint"]
+        == proposal.payload["proposal_fingerprint"]
+    )
+    assert commit_task.input["input_hash"] == commit_task.metadata["input_hash"]
     proposal_dependency = next(
         dependency
         for dependency in commit_task.dependencies

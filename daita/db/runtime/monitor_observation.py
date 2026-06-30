@@ -48,7 +48,7 @@ class DbRuntimeMonitorObservationMixin:
                 "plugin_evidence_refs": [],
             }
 
-        task = self._monitor_plugin_task_for_capability(
+        task = await self._plan_monitor_plugin_task_for_capability(
             operation,
             plan.capability,
             input_payload=plan.input_payload,

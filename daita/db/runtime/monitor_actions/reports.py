@@ -362,7 +362,7 @@ class DbRuntimeMonitorActionReportsMixin:
         sequence: int,
         tasks: list[Task],
     ) -> tuple[Evidence, ...]:
-        validation_task, read_task = self.plan_validated_read_tasks(
+        plan = await self.plan_validated_read_spec(
             operation,
             sql=str(step.get("sql") or ""),
             params=list(step.get("parameters") or step.get("params") or ()),
@@ -383,8 +383,7 @@ class DbRuntimeMonitorActionReportsMixin:
                 "monitor_report_step_kind": step.get("kind"),
             },
         )
-        validation_task = await self._plan_kernel_task(validation_task)
-        read_task = await self._plan_kernel_task(read_task)
+        validation_task, read_task = plan.tasks
         tasks.extend([validation_task, read_task])
         validation_evidence = await self.execute_task(
             validation_task,

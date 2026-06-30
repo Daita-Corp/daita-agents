@@ -20,6 +20,7 @@ from daita.runtime import (
     WorkerRuntime,
     WorkerRuntimeOptions,
 )
+from daita.db.runtime.memory_learning import _learner_task_id_from_operation
 
 SOURCE_IDENTITY = "sqlite:from_db:learning-source"
 
@@ -234,7 +235,11 @@ async def test_successful_eligible_operation_enqueues_child_learning_operation()
         "db.memory.learning.enqueue",
         "db.memory.learning.run",
     ]
+    assert child_tasks[1].id == _learner_task_id_from_operation(child.id)
     assert child_tasks[1].metadata["queue"] == "memory_learning"
+    assert child_tasks[1].metadata["reason"] == "db_memory_learning_run"
+    assert child_tasks[1].metadata["source_operation_id"] == source_operation.id
+    assert child_tasks[1].metadata["idempotency_key"]
     assert child_tasks[1].status is TaskStatus.PENDING
     assert enqueue_evidence[0].kind == "db.memory.learning.enqueue"
 

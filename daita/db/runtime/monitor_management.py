@@ -40,6 +40,7 @@ from ..monitors import (
     SQLiteDbMonitorStore,
 )
 from ..monitor_scheduler.scheduler import DbMonitorScheduler
+from .tasks import DbTaskSpec
 from .types import DbRuntimeGovernanceBlocked
 
 
@@ -211,29 +212,32 @@ class DbRuntimeMonitorManagementMixin:
             operation,
             intent_kind=DbIntentKind.ADMIN.value,
         )
-        plan_task = await self.kernel.plan_task(
-            operation_id=operation.id,
-            capability_id="db.monitor.plan_lifecycle",
-            owner="db_runtime",
-            input={
-                "action": action,
-                "monitor_id": monitor_id,
-                "patch": patch,
-                "paused_until": paused_until,
-            },
-            metadata={
-                "reason": f"monitor_{action}_planning",
-                "sequence": 1,
-                "idempotency_key": _stable_monitor_lifecycle_hash(
-                    {
-                        "operation_type": operation_type,
+        plan = await self.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.monitor.plan_lifecycle",
+                    owner="db_runtime",
+                    input={
+                        "action": action,
                         "monitor_id": monitor_id,
                         "patch": patch,
                         "paused_until": paused_until,
-                    }
+                    },
+                    reason=f"monitor_{action}_planning",
+                    sequence=1,
+                    idempotency_key=_stable_monitor_lifecycle_hash(
+                        {
+                            "operation_type": operation_type,
+                            "monitor_id": monitor_id,
+                            "patch": patch,
+                            "paused_until": paused_until,
+                        }
+                    ),
                 ),
-            },
+            ),
         )
+        plan_task = plan.tasks[0]
         plan_evidence = await self.execute_task(plan_task, operation)
         proposal_evidence = next(
             (item for item in plan_evidence if item.kind == "monitor.proposal"),
@@ -265,36 +269,41 @@ class DbRuntimeMonitorManagementMixin:
                 },
             )
 
-        commit_task = await self.kernel.plan_task(
-            operation_id=operation.id,
-            capability_id="db.monitor.commit_lifecycle",
-            owner="db_runtime",
-            input={
-                "proposal_evidence_id": proposal_evidence.id,
-                "proposal_fingerprint": proposal["proposal_fingerprint"],
-            },
-            metadata={
-                "reason": f"monitor_{action}_commit",
-                "sequence": 2,
-                "idempotency_key": proposal["proposal_fingerprint"],
-            },
-            dependencies=(
-                TaskDependency(
-                    kind="evidence",
-                    evidence_kind="monitor.proposal",
-                    evidence_id=proposal_evidence.id,
-                    evidence_owner="db_runtime",
-                    producer_task_id=plan_task.id,
-                    producer_capability_id=plan_task.capability_id,
-                    producer_executor_id=plan_task.executor_id,
-                    evidence_payload={
+        commit_plan = await self.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.monitor.commit_lifecycle",
+                    owner="db_runtime",
+                    input={
+                        "proposal_evidence_id": proposal_evidence.id,
                         "proposal_fingerprint": proposal["proposal_fingerprint"],
                     },
-                    evidence_accepted=True,
-                    operation_id=operation.id,
+                    reason=f"monitor_{action}_commit",
+                    sequence=2,
+                    dependencies=(
+                        TaskDependency(
+                            kind="evidence",
+                            evidence_kind="monitor.proposal",
+                            evidence_id=proposal_evidence.id,
+                            evidence_owner="db_runtime",
+                            producer_task_id=plan_task.id,
+                            producer_capability_id=plan_task.capability_id,
+                            producer_executor_id=plan_task.executor_id,
+                            evidence_payload={
+                                "proposal_fingerprint": proposal[
+                                    "proposal_fingerprint"
+                                ],
+                            },
+                            evidence_accepted=True,
+                            operation_id=operation.id,
+                        ),
+                    ),
+                    idempotency_key=proposal["proposal_fingerprint"],
                 ),
             ),
         )
+        commit_task = commit_plan.tasks[0]
         try:
             commit_evidence = await self.execute_task(commit_task, operation)
         except DbRuntimeGovernanceBlocked as exc:

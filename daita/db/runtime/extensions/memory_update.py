@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from daita.runtime import Evidence, Operation, Task
+from daita.runtime import Evidence, Operation, Task, TaskDependency
 
 from ...analysis import stable_fingerprint, structural_schema_fingerprint
 from ...memory import (
@@ -14,6 +14,7 @@ from ...memory import (
 )
 from ...memory_commands import DbMemoryCommandService
 from ...models import DbRequest
+from ..tasks import DbTaskSpec
 
 
 @dataclass(frozen=True)
@@ -155,22 +156,42 @@ class DbMemoryCommitUpdateExecutor:
             "memory.semantic.write",
             owner="memory",
         )
-        write_task = await runtime.kernel.plan_task(
-            operation_id=operation.id,
-            capability_id=memory_capability.id,
-            owner=memory_capability.owner,
-            input={
-                "db_memory_payload": record,
-                "db_memory_prompt": str(record.get("text") or ""),
-            },
-            metadata={
-                "owner": memory_capability.owner,
-                "reason": "db_memory_commit_update",
-                "proposal_evidence_id": proposal_evidence.id,
-                "proposal_fingerprint": actual_fingerprint,
-                "source_identity": proposal_source_identity,
-            },
+        write_plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id=memory_capability.id,
+                    owner=memory_capability.owner,
+                    input={
+                        "db_memory_payload": record,
+                        "db_memory_prompt": str(record.get("text") or ""),
+                    },
+                    reason="db_memory_commit_update",
+                    sequence=1,
+                    dependencies=(
+                        TaskDependency(
+                            kind="evidence",
+                            evidence_kind="db.memory.proposal",
+                            evidence_id=proposal_evidence.id,
+                            evidence_owner="db_runtime",
+                            producer_task_id=proposal_evidence.task_id,
+                            evidence_payload={
+                                "proposal_fingerprint": actual_fingerprint,
+                            },
+                            evidence_accepted=True,
+                            operation_id=operation.id,
+                        ),
+                    ),
+                    metadata={
+                        "proposal_evidence_id": proposal_evidence.id,
+                        "proposal_fingerprint": actual_fingerprint,
+                        "source_identity": proposal_source_identity,
+                    },
+                    deterministic_key=actual_fingerprint,
+                ),
+            ),
         )
+        write_task = write_plan.tasks[0]
         write_evidence = await runtime.execute_task(
             write_task,
             operation,
