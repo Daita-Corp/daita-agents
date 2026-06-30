@@ -28,7 +28,7 @@ class _FakeResult:
     diagnostics = {
         "execution": {
             "planned_sql": "SELECT COUNT(*) FROM customers",
-            "planner_strategy": "deterministic",
+            "planning_mode": "llm",
             "task_count": 2,
             "tasks": [
                 {"capability_id": "db.sql.validate"},

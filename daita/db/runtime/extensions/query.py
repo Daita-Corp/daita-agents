@@ -7,11 +7,9 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation, Task
 
-from ...analysis import stable_fingerprint, structural_schema_fingerprint
 from ...plan_validation import DbQueryPlanValidator
 from ...planning_context import DbPlanningContextBuilder
 from ...query_plan import DbQueryPlan
-from ...query_planning import DbQueryPlanner
 
 
 @dataclass(frozen=True)
@@ -87,110 +85,6 @@ class DbPlanningContextExecutor:
 
 
 @dataclass(frozen=True)
-class DbQueryPrepareReadExecutor:
-    """Executor that prepares deterministic read evidence without full context."""
-
-    plugin: DbRuntimePlanningPlugin
-    id: str = "db_runtime.query.prepare_read"
-    owner: str = "db_runtime"
-    capability_ids: frozenset[str] = frozenset({"db.query.prepare_read"})
-
-    async def execute(
-        self,
-        task: Task,
-        operation: Operation,
-        context: Mapping[str, Any],
-    ) -> list[Evidence]:
-        runtime = self.plugin.runtime
-        base_request = runtime._db_request_from_operation(operation)
-        prompt = task.input.get("prompt")
-        if isinstance(prompt, str) and prompt.strip():
-            from dataclasses import replace
-
-            base_request = replace(base_request, prompt=prompt)
-        schema_evidence = await _load_evidence(
-            runtime,
-            operation.id,
-            task.input.get("schema_evidence_id"),
-        )
-        planning_context_evidence = await _load_evidence(
-            runtime,
-            operation.id,
-            task.input.get("planning_context_evidence_id"),
-        )
-        schema = dict(schema_evidence.payload) if schema_evidence is not None else {}
-        plan = DbQueryPlanner().plan_read_query(
-            base_request,
-            runtime._db_intent_from_operation(operation),
-            operation,
-            schema,
-            planning_context=(
-                dict(planning_context_evidence.payload)
-                if planning_context_evidence is not None
-                else None
-            ),
-        )
-        plan_payload = dict(plan.evidence.payload)
-        plan_evidence_id = _predicted_evidence_id(
-            operation,
-            task,
-            "query.plan.proposal",
-            plan_payload,
-        )
-        plan_evidence = Evidence(
-            id=plan_evidence_id,
-            kind="query.plan.proposal",
-            owner="db_runtime",
-            operation_id=operation.id,
-            task_id=task.id,
-            payload=plan_payload,
-            metadata={
-                **plan.evidence.metadata,
-                "prepare_read": True,
-                "payload_fingerprint": stable_fingerprint(plan_payload),
-            },
-        )
-        compact_context = (
-            planning_context_evidence.payload
-            if planning_context_evidence is not None
-            else _compact_prepare_context(
-                runtime=runtime,
-                operation=operation,
-                schema_evidence=schema_evidence,
-                schema=schema,
-            )
-        )
-        structured = DbQueryPlan.from_mapping(
-            plan_evidence.payload.get("structured_plan") or plan_evidence.payload
-        )
-        validation = DbQueryPlanValidator().validate(structured, compact_context)
-        validation_evidence = Evidence(
-            kind="query.plan.validation",
-            owner="db_runtime",
-            operation_id=operation.id,
-            task_id=task.id,
-            accepted=validation.valid,
-            payload={
-                **validation.to_dict(),
-                "plan_evidence_id": plan_evidence_id,
-                "planning_context_evidence_id": (
-                    planning_context_evidence.id
-                    if planning_context_evidence is not None
-                    else None
-                ),
-                "schema_fingerprint": compact_context.get("schema_fingerprint"),
-                "prepare_read": True,
-            },
-            metadata={
-                "prepare_read": True,
-                "payload_fingerprint": validation.plan_fingerprint,
-                "sql_fingerprint": validation.sql_fingerprint,
-            },
-        )
-        return [plan_evidence, validation_evidence]
-
-
-@dataclass(frozen=True)
 class DbQueryPlanValidationExecutor:
     """Executor that persists `query.plan.validation` evidence."""
 
@@ -259,56 +153,6 @@ async def _load_evidence(
     return None
 
 
-def _compact_prepare_context(
-    *,
-    runtime: Any,
-    operation: Operation,
-    schema_evidence: Evidence | None,
-    schema: dict[str, Any],
-) -> dict[str, Any]:
-    source = _runtime_source_plugin(runtime)
-    dialect = (
-        str(schema.get("database_type") or getattr(source, "sql_dialect", "")) or None
-    )
-    return {
-        "operation_id": operation.id,
-        "prompt": operation.request.get("prompt"),
-        "intent_kind": runtime._db_intent_from_operation(operation).kind.value,
-        "dialect": dialect,
-        "schema": {
-            "database_type": schema.get("database_type"),
-            "database_name": schema.get("database_name"),
-            "table_count": schema.get("table_count")
-            or len(schema.get("tables", []) or []),
-            "tables": [
-                {
-                    "name": table.get("name"),
-                    "columns": [
-                        {
-                            "name": column.get("name"),
-                            "data_type": column.get("data_type"),
-                            "is_primary_key": column.get("is_primary_key"),
-                        }
-                        for column in table.get("columns", []) or []
-                        if column.get("name")
-                    ],
-                }
-                for table in schema.get("tables", []) or []
-                if table.get("name")
-            ],
-            "foreign_keys": list(schema.get("foreign_keys", []) or []),
-        },
-        "schema_evidence_refs": [schema_evidence.id] if schema_evidence else [],
-        "catalog_evidence_refs": [],
-        "relationship_evidence_refs": [],
-        "column_value_evidence_refs": [],
-        "column_value_hints": [],
-        "included_sections": ["schema"],
-        "schema_fingerprint": structural_schema_fingerprint(schema),
-        "diagnostics": {"mode": "prepare_read_compact"},
-    }
-
-
 def _planner_capability_summaries(runtime: Any) -> tuple[dict[str, Any], ...]:
     interesting_owners = {"catalog", "memory", "lineage", "data_quality", "metrics"}
     interesting_prefixes = ("catalog.", "memory.", "lineage.", "quality.", "metric.")
@@ -338,12 +182,3 @@ def _runtime_source_plugin(runtime: Any) -> Any:
         if getattr(plugin, "sql_dialect", None) and hasattr(plugin, "query"):
             return plugin
     return getattr(runtime, "source", None)
-
-
-def _predicted_evidence_id(
-    operation: Operation,
-    task: Task,
-    kind: str,
-    payload: dict[str, Any],
-) -> str:
-    return f"evidence-{stable_fingerprint({'operation_id': operation.id, 'task_id': task.id, 'kind': kind, 'payload': payload})}"

@@ -20,7 +20,6 @@ from .models import (
     DbRequest,
     db_optional_int,
 )
-from .query_planning import DbQueryPlanner
 from .session_context import db_session_context_from_request
 from .verification import DbVerificationResult
 
@@ -478,12 +477,7 @@ def _requested_assets_from_prompt(
     )
     if explicit:
         return explicit
-    schema = {"tables": [entry[0] for entry in _all_table_entries(inventory)]}
-    planned = DbQueryPlanner.best_table_for_prompt(prompt, schema)
-    resolved = _resolve_table_name(planned or "", table_names)
-    if not resolved:
-        return ()
-    return (resolved,)
+    return ()
 
 
 def _tables_for_names(

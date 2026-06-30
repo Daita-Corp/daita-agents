@@ -32,7 +32,6 @@ from .plugin import DbRuntimePlanningPlugin
 from .query import (
     DbPlanningContextExecutor,
     DbQueryPlanValidationExecutor,
-    DbQueryPrepareReadExecutor,
 )
 
 __all__ = [
@@ -52,7 +51,6 @@ __all__ = [
     "DbMonitorPlanLifecycleExecutor",
     "DbPlanningContextExecutor",
     "DbQueryPlanValidationExecutor",
-    "DbQueryPrepareReadExecutor",
     "DbRuntimePlanningPlugin",
     "HostedInAppMonitorDeliveryExecutor",
     "HostedInAppMonitorDeliveryPlugin",

@@ -35,11 +35,10 @@ class _ExecutionCatalogMixin:
             evidence_store,
             {"store_id": store_id, "query": request.prompt, "limit": 10},
         )
-        from_table, to_table = self.query_planner.relationship_tables_for_prompt(
-            request.prompt, schema
-        )
-        if not from_table or not to_table:
+        scoped_tables = _scoped_schema_tables(request, schema)
+        if len(scoped_tables) < 2:
             return None
+        from_table, to_table = scoped_tables[:2]
         relationship_evidence = await self._execute_capability(
             "catalog.relationship_paths.find",
             contract,
@@ -207,3 +206,23 @@ def _catalog_column_value_search_exists(evidence_store: DbEvidenceStore) -> bool
         item.kind == "schema.column_value_search_result"
         for item in evidence_store.list()
     )
+
+
+def _scoped_schema_tables(
+    request: DbRequest,
+    schema: dict[str, Any],
+) -> tuple[str, ...]:
+    schema_tables = {
+        str(table.get("name"))
+        for table in schema.get("tables", []) or []
+        if table.get("name")
+    }
+    scoped = []
+    for table in request.source_scope:
+        if table in schema_tables:
+            scoped.append(table)
+            continue
+        short_name = table.split(".")[-1]
+        if short_name in schema_tables:
+            scoped.append(short_name)
+    return tuple(dict.fromkeys(scoped))

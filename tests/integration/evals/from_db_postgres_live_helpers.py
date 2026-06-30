@@ -13,7 +13,8 @@ from daita.evals.reporters import render_pretty
 load_dotenv(Path.cwd() / ".env")
 
 POSTGRES_WARM_READ_SEQUENCE = [
-    "db.query.prepare_read",
+    "db.query.plan",
+    "db.query.plan.validate",
     "db.sql.validate",
     "db.sql.execute_read",
     "db.answer.synthesize",

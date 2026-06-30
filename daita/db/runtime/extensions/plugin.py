@@ -37,7 +37,6 @@ from .monitor_lifecycle import (
 from .query import (
     DbPlanningContextExecutor,
     DbQueryPlanValidationExecutor,
-    DbQueryPrepareReadExecutor,
 )
 
 
@@ -81,24 +80,6 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 input_schema=common_schema,
                 output_evidence=frozenset({"planning.context"}),
                 executor="db_runtime.planning.context.build",
-                runtime_only=True,
-                side_effecting=False,
-                replay_safe=True,
-                idempotent=True,
-            ),
-            Capability(
-                id="db.query.prepare_read",
-                owner="db_runtime",
-                description="Prepare and compactly validate a deterministic DB read plan.",
-                domains=frozenset({"db"}),
-                operation_types=frozenset({"data.query", "query.plan"}),
-                access=AccessMode.METADATA_READ,
-                risk=RiskLevel.LOW,
-                input_schema=common_schema,
-                output_evidence=frozenset(
-                    {"query.plan.proposal", "query.plan.validation"}
-                ),
-                executor="db_runtime.query.prepare_read",
                 runtime_only=True,
                 side_effecting=False,
                 replay_safe=True,
@@ -484,7 +465,6 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
     def get_executors(self) -> tuple[Any, ...]:
         executors: list[Any] = [
             DbPlanningContextExecutor(self),
-            DbQueryPrepareReadExecutor(self),
             DbQueryPlanValidationExecutor(self),
             DbAnswerSynthesisExecutor(runtime=self),
             DbAnalysisPlanExecutor(self),

@@ -67,7 +67,7 @@ from .memory import (
     write_db_memory_record,
     write_db_memory_records,
 )
-from .planning import DbContractBuilder, DbIntentClassifier
+from .planning import DbContractBuilder
 from .query_plan import (
     DbAggregationSpec,
     DbFilterSpec,
@@ -76,7 +76,6 @@ from .query_plan import (
     DbQueryPlanCandidate,
     DbQueryPlanValidation,
 )
-from .query_planning import DbQueryPlanner
 from .query_metadata import (
     IdentityMode,
     column_name,
@@ -169,14 +168,12 @@ __all__ = [
     "InMemoryDbMonitorStore",
     "SQLiteDbMonitorStore",
     "DbContractBuilder",
-    "DbIntentClassifier",
     "DbQueryPlan",
     "DbQueryPlanCandidate",
     "DbQueryPlanValidation",
     "DbJoinSpec",
     "DbFilterSpec",
     "DbAggregationSpec",
-    "DbQueryPlanner",
     "validate_sql_against_schema",
     "catalog_schema_snapshot",
     "find_relationship_paths",

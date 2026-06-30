@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Any
 
 from daita.runtime import Evidence, Operation, Task, TaskDependency
@@ -15,9 +14,8 @@ from ..capabilities import (
     QUERY_ZERO_ROW_DIAGNOSIS_EVIDENCE,
 )
 from ..evidence import DbEvidenceStore
-from ..models import DbIntent, DbOperationContract, DbRequest
+from ..models import DbOperationContract, DbRequest
 from .helpers import _short_table_name
-from .planning import _accepted_sql
 
 
 class _ExecutionRepairMixin:
@@ -223,82 +221,6 @@ class _ExecutionRepairMixin:
         ]
         return proposals[-1] if proposals else None
 
-    async def _try_deterministic_repair_fallback(
-        self,
-        request: DbRequest,
-        intent: DbIntent,
-        operation: Operation,
-        schema: dict[str, Any],
-        relationship_payload: dict[str, Any] | None,
-        tasks: list[Task],
-        evidence_store: DbEvidenceStore,
-        *,
-        planning_context: Evidence,
-        prior_plan: Evidence,
-        failure: Evidence,
-        diagnostics: dict[str, Any],
-    ) -> tuple[Evidence, Evidence, tuple[str, ...], dict[str, Any]] | None:
-        plan = self.query_planner.plan_read_query(
-            request,
-            intent,
-            operation,
-            schema,
-            relationship_payload=relationship_payload,
-            planning_context=planning_context.payload,
-        )
-        plan_evidence = replace(
-            plan.evidence,
-            metadata={
-                **plan.evidence.metadata,
-                "repair_fallback": True,
-                "fallback_after_failure_evidence_id": failure.id,
-                "prior_plan_evidence_id": prior_plan.id,
-            },
-        )
-        persisted = await self._persist_runtime_evidence(operation, plan_evidence)
-        evidence_store.add(persisted)
-        validation = await self._validate_query_plan(
-            operation,
-            tasks,
-            evidence_store,
-            plan_evidence=persisted,
-            planning_context=planning_context,
-            analysis_metadata={
-                "repair_fallback": True,
-                "fallback_after_failure_evidence_id": failure.id,
-                "prior_plan_evidence_id": prior_plan.id,
-            },
-            extra_dependencies=(
-                TaskDependency(
-                    kind="evidence",
-                    evidence_kind=failure.kind,
-                    evidence_id=failure.id,
-                    evidence_accepted=failure.accepted,
-                    operation_id=operation.id,
-                ),
-            ),
-        )
-        fallback_diagnostics = {
-            **plan.diagnostics,
-            "repair_fallback": True,
-            "fallback_after_failure_evidence_id": failure.id,
-            "prior_plan_evidence_id": prior_plan.id,
-        }
-        if _accepted_sql(validation):
-            diagnostics["repair_fallback_used"] = True
-            return persisted, validation, plan.warnings, fallback_diagnostics
-
-        await self._record_repair_exhaustion(
-            operation,
-            evidence_store,
-            failure=failure,
-            prior_plan=prior_plan,
-            fallback_plan=persisted,
-            fallback_validation=validation,
-            diagnostics=diagnostics,
-        )
-        return None
-
     async def _record_repair_exhaustion(
         self,
         operation: Operation,
@@ -306,23 +228,17 @@ class _ExecutionRepairMixin:
         *,
         failure: Evidence,
         prior_plan: Evidence,
-        fallback_plan: Evidence,
-        fallback_validation: Evidence,
         diagnostics: dict[str, Any],
     ) -> Evidence:
         terminal_payload = {
             "valid": False,
             "failure": "repair_exhausted",
             "repair_exhausted": True,
-            "accepted_sql_missing": not bool(
-                fallback_validation.payload.get("accepted_sql")
-            ),
+            "accepted_sql_missing": not bool(failure.payload.get("accepted_sql")),
             "failure_evidence_id": failure.id,
             "failure_evidence_kind": failure.kind,
             "prior_plan_evidence_id": prior_plan.id,
-            "fallback_plan_evidence_id": fallback_plan.id,
-            "fallback_validation_evidence_id": fallback_validation.id,
-            "fallback_validation_payload": dict(fallback_validation.payload),
+            "terminal_validation_payload": dict(failure.payload),
         }
         diagnostics.update(
             {

@@ -5,7 +5,6 @@ Capability-based planning for the database runtime.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import re
 from typing import Any, Iterable
 
 from daita.plugins import ExtensionRegistry
@@ -19,128 +18,6 @@ from .models import (
     DbRequest,
     DbRuntimeConfig,
 )
-
-_SCHEMA_OBJECT_SIGNALS = (
-    ("schema", r"\bschemas?\b", 3),
-    ("database_structure", r"\bdatabase\s+(structure|schema|contain|contains)\b", 4),
-    ("available_data", r"\bavailable\s+(tables?|data|datasets?)\b", 3),
-    ("tables", r"\btables?\b", 2),
-    ("columns", r"\bcolumns?\b", 2),
-    ("fields", r"\bfields?\b", 2),
-    ("keys", r"\b(primary|foreign)\s+keys?\b", 2),
-    ("entities", r"\bentities\b", 2),
-    ("database_contains", r"\bwhat\s+(does|is)\s+this\s+database\s+contain", 4),
-    ("business_questions", r"\bbusiness\s+questions?\b", 3),
-    ("important_fields", r"\bimportant\s+fields?\b", 3),
-)
-_RELATIONSHIP_OBJECT_SIGNALS = (
-    ("relationships", r"\brelationships?\b", 4),
-    ("foreign_keys", r"\bforeign\s+keys?\b", 4),
-    ("join_path", r"\bjoin\s+paths?\b", 4),
-    ("join_relationship", r"\bjoin\b", 2),
-    ("connected", r"\bconnected\b", 3),
-    ("linked", r"\blink(?:ed|s)?\b", 3),
-    ("related_tables", r"\brelated\s+tables?\b", 3),
-    ("tables_connect", r"\bhow\s+tables?\s+connect\b", 4),
-    ("connect_to", r"\bconnect(?:ed|s)?\s+to\b", 3),
-)
-_DATA_ACCESS_SIGNALS = (
-    ("neutral_data_verb", r"\b(list|show|find)\b", 2),
-    ("count_rows", r"\b(count|how\s+many|number\s+of)\b", 4),
-    ("totals", r"\b(total|sum)\b", 3),
-    ("averages", r"\b(avg|average|mean)\b", 3),
-    ("top_n", r"\btop\s+\d+\b|\btop\b", 4),
-    (
-        "most_recent_records",
-        r"\b(most\s+recent|latest)\s+(records?|rows?|orders?|transactions?)\b",
-        4,
-    ),
-    (
-        "filter_records",
-        r"\b(where|filter|over|under|greater\s+than|less\s+than|threshold)\b",
-        3,
-    ),
-    (
-        "group_by",
-        r"\b(group\s+by|by\s+(month|week|day|period|account|customer|region|status))\b",
-        3,
-    ),
-    ("record_rows", r"\b(records?|rows?)\b", 3),
-    ("transactions", r"\btransactions?\b", 2),
-    (
-        "revenue_by_period",
-        r"\brevenue\s+by\b|\bmonthly\s+revenue\b|\brevenue\s+by\s+(month|period|account|customer)\b",
-        4,
-    ),
-    ("calculate_metric", r"\b(calculate|compute)\b", 3),
-    (
-        "analysis_request",
-        r"\b(multi-step|multiple\s+queries|deep\s+analysis|investigate|explain\s+why|why\s+did|root\s+cause|step\s+by\s+step\s+analysis)\b",
-        4,
-    ),
-)
-_DATA_RESOLUTION_SIGNALS = (
-    ("best_table", r"\b(best|right|appropriate|relevant)\s+tables?\b", 3),
-    ("best_column", r"\b(best|right|appropriate|relevant|safest)\s+columns?\b", 3),
-    (
-        "qualified_column",
-        r"\b(best|right|appropriate|relevant|safest)\s+\w+\s+columns?\b",
-        3,
-    ),
-    ("find_column", r"\bfind\s+the\s+columns?\b", 3),
-    ("which_column", r"\bwhich\s+columns?\b", 2),
-    ("which_table", r"\bwhich\s+tables?\b", 2),
-)
-_NEUTRAL_VERB_SIGNALS = (
-    ("summarize", r"\bsummarize\b"),
-    ("describe", r"\bdescribe\b"),
-    ("list", r"\blist\b"),
-    ("show", r"\bshow\b"),
-    ("find", r"\bfind\b"),
-    ("map", r"\bmap\b"),
-    ("identify", r"\bidentify\b"),
-    ("inspect", r"\binspect\b"),
-)
-_WRITE_WORDS = {
-    "insert",
-    "update",
-    "delete",
-    "drop",
-    "alter",
-    "create",
-    "truncate",
-    "write",
-    "modify",
-}
-_QUALITY_WORDS = {"quality", "profile", "null", "freshness", "anomaly"}
-_LINEAGE_WORDS = {"lineage", "upstream", "downstream", "impact"}
-_MEMORY_WORDS = {
-    "remember",
-    "note",
-    "business rule",
-    "semantic",
-    "forget",
-    "memory",
-}
-_SCHEMA_ONLY_PHRASES = {
-    "schema evidence only",
-    "schema only",
-    "metadata only",
-    "do not query rows",
-    "without querying rows",
-    "don't query rows",
-    "no row data",
-}
-_SCHEMA_SEARCH_PHRASES = {
-    "search the schema",
-    "inspect the schema",
-    "which columns",
-    "which column",
-    "which tables",
-    "which table",
-}
-_DATA_RESULT_WORDS = {"records", "rows", "values", "result", "results", "return"}
-
 
 @dataclass(frozen=True)
 class CapabilitySelection:
@@ -242,142 +119,42 @@ def build_safety_frame(
     )
 
 
-class DbIntentClassifier:
-    """Small deterministic classifier for initial DB runtime contracts."""
+def classify_db_request(request: DbRequest) -> DbIntent:
+    """Return an intent only from explicit, non-semantic runtime facts."""
 
-    def classify(self, request: DbRequest) -> DbIntent:
-        prompt = request.prompt.lower()
-        mode = (request.mode or "").lower()
-        diagnostics: dict[str, object] = {"classifier": "heuristic"}
-
-        if mode:
-            kind = _kind_from_mode(mode)
-            if kind is not None:
-                return DbIntent(
-                    kind=kind,
-                    confidence=0.95,
-                    access=_access_for_intent(kind),
-                    evidence_mode=_evidence_mode_for_intent(kind),
-                    diagnostics={**diagnostics, "matched": f"mode:{mode}"},
-                )
-
-        if _contains_any(prompt, _MEMORY_WORDS):
-            return DbIntent(
-                kind=DbIntentKind.MEMORY_UPDATE,
-                confidence=0.7,
-                access=AccessMode.WRITE,
-                evidence_mode="memory",
-                diagnostics={**diagnostics, "matched": "memory_keyword"},
-            )
-
-        if _contains_any(prompt, _WRITE_WORDS):
-            write_execute = any(
-                word in prompt for word in ("execute", "run", "apply", "commit")
-            )
-            kind = (
-                DbIntentKind.WRITE_EXECUTE
-                if write_execute
-                else DbIntentKind.WRITE_PROPOSE
-            )
-            return DbIntent(
-                kind=kind,
-                confidence=0.8,
-                access=_access_for_intent(kind),
-                evidence_mode=_evidence_mode_for_intent(kind),
-                diagnostics={**diagnostics, "matched": "write_keyword"},
-            )
-
-        if _contains_any(prompt, _LINEAGE_WORDS):
-            return DbIntent(
-                kind=DbIntentKind.LINEAGE_TRACE,
-                confidence=0.75,
-                access=AccessMode.METADATA_READ,
-                evidence_mode="lineage",
-                diagnostics={**diagnostics, "matched": "lineage_keyword"},
-            )
-
-        if _contains_any(prompt, _QUALITY_WORDS):
-            return DbIntent(
-                kind=DbIntentKind.QUALITY_CHECK,
-                confidence=0.75,
-                access=AccessMode.READ,
-                evidence_mode="quality",
-                diagnostics={**diagnostics, "matched": "quality_keyword"},
-            )
-
-        if request.metadata.get("sql") or request.metadata.get("query"):
-            return DbIntent(
-                kind=DbIntentKind.DATA_QUERY,
-                confidence=0.9,
-                access=AccessMode.READ,
-                evidence_mode="query",
-                diagnostics={
-                    **diagnostics,
-                    "matched": "explicit_sql_metadata",
-                    "schema_score": 0,
-                    "relationship_score": 0,
-                    "data_score": 4,
-                    "dominant_object_type": "data",
-                    "neutral_verbs": _matched_signal_names(
-                        prompt, _NEUTRAL_VERB_SIGNALS
-                    ),
-                    "data_access_requested": True,
-                    "tie_break_reason": "explicit_sql_metadata",
-                },
-            )
-
-        signal = _intent_signal_scores(prompt)
-        diagnostics = {**diagnostics, **signal}
-        if _is_explicit_schema_only_prompt(prompt):
-            relationship_kind = (
-                DbIntentKind.SCHEMA_RELATIONSHIP_QUERY
-                if signal["relationship_score"] > signal["schema_score"]
-                else DbIntentKind.SCHEMA_QUERY
-            )
-            return DbIntent(
-                kind=relationship_kind,
-                confidence=0.9,
-                access=_access_for_intent(relationship_kind),
-                evidence_mode=_evidence_mode_for_intent(relationship_kind),
-                diagnostics={**diagnostics, "matched": "explicit_metadata_only"},
-            )
-
-        kind, confidence, reason = _kind_from_signal_scores(signal)
-        if kind is not None:
-            return DbIntent(
-                kind=kind,
-                confidence=confidence,
-                access=_access_for_intent(kind),
-                evidence_mode=_evidence_mode_for_intent(kind),
-                diagnostics={**diagnostics, "matched": reason},
-            )
-
-        if _looks_like_question(prompt):
-            return DbIntent(
-                kind=DbIntentKind.DATA_QUERY,
-                confidence=0.55,
-                access=AccessMode.READ,
-                evidence_mode="query",
-                diagnostics={
-                    **diagnostics,
-                    "matched": "question_fallback",
-                    "tie_break_reason": "question_without_metadata_signals_defaults_to_data",
-                },
-            )
-
+    mode = (request.mode or "").lower()
+    kind = _kind_from_mode(mode) if mode else None
+    diagnostics: dict[str, object] = {"source": "explicit_runtime_facts"}
+    if kind is not None:
         return DbIntent(
-            kind=DbIntentKind.CONVERSATIONAL,
-            confidence=0.5,
-            access=AccessMode.NONE,
-            evidence_mode="none",
-            diagnostics={**diagnostics, "matched": "fallback"},
+            kind=kind,
+            confidence=0.95,
+            access=_access_for_intent(kind),
+            evidence_mode=_evidence_mode_for_intent(kind),
+            diagnostics={**diagnostics, "matched": f"mode:{mode}"},
         )
 
+    if (
+        request.metadata.get("sql")
+        or request.metadata.get("query")
+        or request.constraints.get("sql")
+        or request.constraints.get("query")
+    ):
+        return DbIntent(
+            kind=DbIntentKind.DATA_QUERY,
+            confidence=0.9,
+            access=AccessMode.READ,
+            evidence_mode="query",
+            diagnostics={**diagnostics, "matched": "explicit_sql"},
+        )
 
-def classify_db_request(request: DbRequest) -> DbIntent:
-    """Compatibility helper for direct contract-building APIs."""
-
-    return DbIntentClassifier().classify(request)
+    return DbIntent(
+        kind=DbIntentKind.CONVERSATIONAL,
+        confidence=0.0,
+        access=AccessMode.NONE,
+        evidence_mode="none",
+        diagnostics={**diagnostics, "matched": "no_explicit_intent"},
+    )
 
 
 class DbContractBuilder:
@@ -792,138 +569,3 @@ def _dedupe_selections(
         seen.add(key)
         out.append(selection)
     return tuple(out)
-
-
-def _contains_any(prompt: str, needles: set[str]) -> bool:
-    return any(needle in prompt for needle in needles)
-
-
-def _is_explicit_schema_only_prompt(prompt: str) -> bool:
-    return (
-        _contains_any(prompt, _SCHEMA_ONLY_PHRASES)
-        or _contains_any(prompt, _SCHEMA_SEARCH_PHRASES)
-    ) and (
-        _score_signal_patterns(prompt, _SCHEMA_OBJECT_SIGNALS)[0] > 0
-        or _score_signal_patterns(prompt, _RELATIONSHIP_OBJECT_SIGNALS)[0] > 0
-    )
-
-
-def _intent_signal_scores(prompt: str) -> dict[str, object]:
-    schema_score, schema_matches = _score_signal_patterns(
-        prompt, _SCHEMA_OBJECT_SIGNALS
-    )
-    relationship_score, relationship_matches = _score_signal_patterns(
-        prompt, _RELATIONSHIP_OBJECT_SIGNALS
-    )
-    data_score, data_matches = _score_signal_patterns(prompt, _DATA_ACCESS_SIGNALS)
-    resolution_score, resolution_matches = _score_signal_patterns(
-        prompt, _DATA_RESOLUTION_SIGNALS
-    )
-    neutral_verbs = _matched_signal_names(prompt, _NEUTRAL_VERB_SIGNALS)
-    if "join_relationship" in relationship_matches and _has_data_result_object(prompt):
-        data_score += 3
-        data_matches.append("join_returns_data")
-    if (
-        data_matches
-        and set(data_matches) <= {"neutral_data_verb"}
-        and (schema_score > 0 or relationship_score > 0)
-    ):
-        data_score = 0
-        data_matches = []
-    dominant = "none"
-    ranked = sorted(
-        (
-            ("schema", schema_score),
-            ("relationship", relationship_score),
-            ("data", data_score),
-        ),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    if ranked[0][1] > 0:
-        dominant = ranked[0][0]
-    return {
-        "schema_score": schema_score,
-        "relationship_score": relationship_score,
-        "data_score": data_score,
-        "resolution_score": resolution_score,
-        "dominant_object_type": dominant,
-        "neutral_verbs": neutral_verbs,
-        "schema_signals": schema_matches,
-        "relationship_signals": relationship_matches,
-        "data_signals": data_matches,
-        "resolution_signals": resolution_matches,
-        "data_access_requested": data_score > 0,
-        "tie_break_reason": "none",
-    }
-
-
-def _kind_from_signal_scores(
-    signal: dict[str, object],
-) -> tuple[DbIntentKind | None, float, str]:
-    schema_score = int(signal["schema_score"])
-    relationship_score = int(signal["relationship_score"])
-    data_score = int(signal["data_score"])
-    resolution_score = int(signal["resolution_score"])
-    weak_data_only = _weak_data_signal_only(signal)
-    metadata_score = max(schema_score, relationship_score)
-    if weak_data_only and metadata_score > 0:
-        data_score = 0
-    if data_score > 0 and (metadata_score > 0 or resolution_score > 0):
-        if relationship_score > 0 or resolution_score > 0:
-            signal["tie_break_reason"] = "data_access_with_catalog_resolution"
-            return (
-                DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
-                0.8,
-                "scored_catalog_assisted_data",
-            )
-        signal["tie_break_reason"] = "data_access_with_schema_terms"
-        return DbIntentKind.DATA_QUERY, 0.7, "scored_data"
-    if data_score > 0:
-        signal["tie_break_reason"] = "data_access_requested"
-        return DbIntentKind.DATA_QUERY, 0.75, "scored_data"
-    if relationship_score > 0:
-        signal["tie_break_reason"] = "relationship_object_without_row_access"
-        return (
-            DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
-            0.8,
-            "scored_schema_relationship",
-        )
-    if schema_score > 0:
-        signal["tie_break_reason"] = "schema_object_without_row_access"
-        return DbIntentKind.SCHEMA_QUERY, 0.8, "scored_schema"
-    return None, 0.5, "fallback"
-
-
-def _weak_data_signal_only(signal: dict[str, object]) -> bool:
-    data_signals = set(signal.get("data_signals") or [])
-    return bool(data_signals) and data_signals <= {"neutral_data_verb"}
-
-
-def _score_signal_patterns(
-    prompt: str,
-    patterns: tuple[tuple[str, str, int], ...],
-) -> tuple[int, list[str]]:
-    score = 0
-    matches: list[str] = []
-    for name, pattern, weight in patterns:
-        if re.search(pattern, prompt):
-            score += weight
-            matches.append(name)
-    return score, matches
-
-
-def _matched_signal_names(
-    prompt: str,
-    patterns: tuple[tuple[str, str], ...],
-) -> list[str]:
-    return [name for name, pattern in patterns if re.search(pattern, prompt)]
-
-
-def _has_data_result_object(prompt: str) -> bool:
-    words = set(re.findall(r"[a-z_]+", prompt))
-    return bool(words.intersection(_DATA_RESULT_WORDS))
-
-
-def _looks_like_question(prompt: str) -> bool:
-    return bool(re.match(r"\s*(what|which|who|where|when|why|how)\b", prompt))

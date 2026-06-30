@@ -171,8 +171,8 @@ def operation_record(
                 if isinstance(diagnostics.get("execution"), dict)
                 else None
             ),
-            "planner_strategy": (
-                diagnostics.get("execution", {}).get("planner_strategy")
+            "planning_mode": (
+                diagnostics.get("execution", {}).get("planning_mode")
                 if isinstance(diagnostics.get("execution"), dict)
                 else None
             ),

@@ -132,7 +132,7 @@ class DbRuntimeAnalysisMixin(
         warnings: list[str] = []
         started_at = time.monotonic()
         diagnostics: dict[str, Any] = {
-            "planner_strategy": "analysis",
+            "planning_mode": "analysis",
             "phase": "multi_step_analysis",
             "evidence_refs": [],
             "evidence_kinds": [],

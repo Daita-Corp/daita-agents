@@ -579,7 +579,8 @@ def test_exact_capability_sequence_assertion_fails_on_order_drift():
                 "expectations": {
                     "capabilities": {
                         "exact_sequence": [
-                            "db.query.prepare_read",
+                            "db.query.plan",
+                            "db.query.plan.validate",
                             "db.sql.validate",
                             "db.sql.execute_read",
                             "db.answer.synthesize",
@@ -591,9 +592,10 @@ def test_exact_capability_sequence_assertion_fails_on_order_drift():
     )
     evidence = _run_evidence(
         capabilities=[
-            "db.query.prepare_read",
             "db.sql.execute_read",
+            "db.query.plan",
             "db.sql.validate",
+            "db.query.plan.validate",
             "db.answer.synthesize",
         ]
     )
@@ -619,7 +621,8 @@ def test_allowed_capability_sequences_accept_only_declared_traces():
                     "capabilities": {
                         "allowed_sequences": [
                             [
-                                "db.query.prepare_read",
+                                "db.query.plan",
+                                "db.query.plan.validate",
                                 "db.sql.validate",
                                 "db.sql.execute_read",
                                 "db.answer.synthesize",
@@ -632,7 +635,6 @@ def test_allowed_capability_sequences_accept_only_declared_traces():
     )
     evidence = _run_evidence(
         capabilities=[
-            "db.query.prepare_read",
             "db.query.plan",
             "db.sql.validate",
             "db.sql.execute_read",
