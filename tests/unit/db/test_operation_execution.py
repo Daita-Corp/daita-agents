@@ -101,10 +101,9 @@ async def test_run_executes_simple_count_query_with_validation_and_result_eviden
     assert {"sql.validation", "query.result"} <= {item.kind for item in result.evidence}
     query_result = next(item for item in result.evidence if item.kind == "query.result")
     assert query_result.payload["rows"] == [{"count": 2}]
-    assert (
-        "SELECT COUNT(*) AS count FROM"
-        in result.diagnostics["execution"]["planned_sql"]
-    )
+    validation = next(item for item in result.evidence if item.kind == "sql.validation")
+    assert "SELECT COUNT(*) AS count FROM" in validation.payload["sql"]
+    assert result.diagnostics["execution"]["planned_sql"] == validation.payload["sql"]
     assert not [
         task
         for task in snapshot.tasks
@@ -125,7 +124,7 @@ async def test_run_simple_count_query_has_no_eager_value_profile_tasks():
     assert snapshot is not None
     reasons = {task.metadata.get("reason") for task in snapshot.tasks}
     assert "catalog_column_value_profile_search" not in reasons
-    assert "deterministic_read_prepare" in reasons
+    assert any(str(reason).startswith("planner:") for reason in reasons if reason)
     assert not [reason for reason in reasons if reason and "eager" in reason]
     assert not [
         task
@@ -260,7 +259,9 @@ async def test_run_natural_language_count_uses_catalog_value_hints_before_planni
     assert result.status is OperationStatus.SUCCEEDED
     assert result.answer == "The count is 1."
     assert snapshot is not None
-    sql = result.diagnostics["execution"]["planned_sql"]
+    validation = next(item for item in result.evidence if item.kind == "sql.validation")
+    sql = validation.payload["sql"]
+    assert result.diagnostics["execution"]["planned_sql"] == sql
     assert '"support_tickets"' in sql
     assert "\"status\" = 'open'" in sql
     assert "\"severity\" = 'high'" in sql

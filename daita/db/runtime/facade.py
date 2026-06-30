@@ -475,7 +475,7 @@ class DbRuntime(
                 warnings=tuple(loop_result.warnings),
                 diagnostics={
                     **base_diagnostics,
-                    "loop": loop_result.to_dict(),
+                    "planner": _planner_diagnostics(loop_result),
                 },
             ),
             operation=await self.store.load_operation(operation_id) or operation,
@@ -512,8 +512,12 @@ class DbRuntime(
                     warnings=tuple((*loop_result.warnings, *verification.warnings)),
                     diagnostics={
                         **base_diagnostics,
-                        "loop": loop_result.to_dict(),
-                        "execution": _execution_diagnostics(tasks),
+                        "planner": _planner_diagnostics(loop_result),
+                        "execution": _execution_diagnostics(
+                            operation=operation,
+                            tasks=tasks,
+                            evidence=evidence,
+                        ),
                         "verification": verification.to_dict(),
                     },
                 ),
@@ -560,8 +564,12 @@ class DbRuntime(
                 ),
                 diagnostics={
                     **base_diagnostics,
-                    "loop": loop_result.to_dict(),
-                    "execution": _execution_diagnostics(final_tasks),
+                    "planner": _planner_diagnostics(loop_result),
+                    "execution": _execution_diagnostics(
+                        operation=operation,
+                        tasks=final_tasks,
+                        evidence=final_evidence,
+                    ),
                     "verification": verification.to_dict(),
                     "synthesis": synthesis_evidence.payload,
                 },
@@ -881,11 +889,66 @@ def _answer_from_loop_result(loop_result: DbLoopResult) -> str:
     return "DB operation failed before final synthesis."
 
 
-def _execution_diagnostics(tasks: tuple[Task, ...]) -> dict[str, Any]:
+def _planner_diagnostics(loop_result: DbLoopResult) -> dict[str, Any]:
     return {
+        "status": loop_result.status,
+        "warnings": list(loop_result.warnings),
+        "diagnostics": dict(loop_result.diagnostics),
+    }
+
+
+def _execution_diagnostics(
+    *,
+    operation: Operation,
+    tasks: tuple[Task, ...],
+    evidence: tuple[Any, ...],
+) -> dict[str, Any]:
+    return {
+        "operation_id": operation.id,
         "task_count": len(tasks),
         "tasks": [task.to_dict() for task in tasks],
+        "evidence_refs": [_evidence_ref(item) for item in evidence],
+        "planned_sql": _planned_sql_from_persisted_state(tasks, evidence),
     }
+
+
+def _evidence_ref(evidence: Any) -> dict[str, Any]:
+    return {
+        "id": getattr(evidence, "id", None),
+        "kind": getattr(evidence, "kind", None),
+        "task_id": getattr(evidence, "task_id", None),
+        "accepted": bool(getattr(evidence, "accepted", False)),
+    }
+
+
+def _planned_sql_from_persisted_state(
+    tasks: tuple[Task, ...],
+    evidence: tuple[Any, ...],
+) -> str | None:
+    for item in reversed(evidence):
+        sql = _sql_from_payload(getattr(item, "payload", {}) or {})
+        if sql:
+            return sql
+    for task in reversed(tasks):
+        sql = task.input.get("sql")
+        if isinstance(sql, str) and sql.strip():
+            return sql
+    return None
+
+
+def _sql_from_payload(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("sql", "selected_sql"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    structured = payload.get("structured_plan")
+    if isinstance(structured, dict):
+        value = structured.get("selected_sql")
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
 
 
 def _skill_names_from_request(request: DbRequest) -> tuple[str, ...]:

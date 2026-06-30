@@ -249,6 +249,17 @@ async def test_final_answer_is_synthesized_from_accepted_evidence():
     assert verification.accepted
     assert synthesis_task.status is TaskStatus.SUCCEEDED
     assert synthesis_task.id == synthesis.task_id
+    assert "loop" not in result.diagnostics
+    assert result.diagnostics["planner"]["status"] == "ran_tasks"
+    execution = result.diagnostics["execution"]
+    assert execution["task_count"] == len(snapshot.tasks)
+    assert [item["id"] for item in execution["tasks"]] == [
+        task.id for task in snapshot.tasks
+    ]
+    assert execution["planned_sql"] == "select count(*) as count from orders"
+    assert [item["id"] for item in execution["evidence_refs"]] == [
+        item.id for item in result.evidence
+    ]
 
 
 async def test_resume_uses_persisted_tasks_without_rebuilding_completed_tasks():

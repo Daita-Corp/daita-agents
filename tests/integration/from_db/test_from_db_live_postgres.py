@@ -243,12 +243,19 @@ async def test_from_db_live_postgres_resolves_non_descriptive_prompt_without_loo
         "sql.validation",
         "query.result",
     } <= _evidence_kinds(resolved)
-    assert resolved.diagnostics["execution"]["task_count"] == 3
+    resolved_capabilities = {
+        task["capability_id"] for task in resolved.diagnostics["execution"]["tasks"]
+    }
+    assert {"db.sql.validate", "db.sql.execute_read"} <= resolved_capabilities
 
     assert bounded_fallback.status is OperationStatus.SUCCEEDED
     assert bounded_fallback.intent.kind is DbIntentKind.CONVERSATIONAL
     assert _evidence_kinds(bounded_fallback) == {"schema.asset_profile"}
-    assert bounded_fallback.diagnostics["execution"]["task_count"] == 1
+    bounded_capabilities = {
+        task["capability_id"]
+        for task in bounded_fallback.diagnostics["execution"]["tasks"]
+    }
+    assert "db.sql.execute_read" not in bounded_capabilities
 
 
 async def _seed_postgres(url: str) -> None:

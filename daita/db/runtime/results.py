@@ -190,11 +190,16 @@ def _audit_entry_from_result(result: DbOperationResult) -> dict[str, Any]:
         "operation_type": result.contract.operation_type,
         "warnings": list(result.warnings),
         "evidence": [_evidence_audit_summary(item) for item in result.evidence],
-        "evidence_refs": (
-            result.diagnostics.get("execution", {}).get("evidence_refs", [])
-            if isinstance(result.diagnostics.get("execution"), dict)
-            else []
-        ),
+        "evidence_refs": [_evidence_ref(item) for item in result.evidence],
+    }
+
+
+def _evidence_ref(evidence: Evidence) -> dict[str, Any]:
+    return {
+        "id": evidence.id,
+        "kind": evidence.kind,
+        "task_id": evidence.task_id,
+        "accepted": evidence.accepted,
     }
 
 

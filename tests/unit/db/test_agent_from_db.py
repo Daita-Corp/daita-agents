@@ -1397,7 +1397,7 @@ async def test_agent_from_db_reuses_persisted_catalog_snapshot(tmp_path, monkeyp
         item for item in result.evidence if item.kind == "schema.asset_profile"
     )
     assert schema_evidence.metadata["schema_cache"] == "persistent_hit"
-    assert result.diagnostics["execution"]["store_id"] == f"from_db:{profile_key}"
+    assert schema_evidence.payload["store_id"] == f"from_db:{profile_key}"
 
 
 async def test_agent_from_db_cache_ttl_zero_ignores_persisted_catalog_snapshot(
