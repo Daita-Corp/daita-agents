@@ -152,6 +152,101 @@ class DbLoopResult:
         }
 
 
+@dataclass(frozen=True)
+class _LoopProgressSnapshot:
+    task_statuses: dict[str, str]
+    accepted_evidence: tuple[dict[str, Any], ...] = ()
+    rejected_evidence: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class _LoopProgressDecision:
+    terminal_status: str | None = None
+    warnings: tuple[str, ...] = ()
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+    retry_facts: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass
+class _LoopProgressGuard:
+    seen_no_progress_fingerprints: set[str] = field(default_factory=set)
+    failed_action_counts: dict[str, int] = field(default_factory=dict)
+    sql_error_counts: dict[str, int] = field(default_factory=dict)
+    no_progress_count: int = 0
+
+    def evaluate(self, facts: Mapping[str, Any]) -> _LoopProgressDecision:
+        retry_facts: list[dict[str, Any]] = []
+        sql_terminal = False
+        for fingerprint in facts.get("sql_error_fingerprints") or ():
+            previous = self.sql_error_counts.get(str(fingerprint), 0)
+            count = previous + 1
+            self.sql_error_counts[str(fingerprint)] = count
+            if previous == 1:
+                retry_facts.append(
+                    {
+                        "warning": "db_agent_loop_repeated_sql_failure",
+                        "fingerprint": str(fingerprint),
+                        "count": count,
+                        "message": (
+                            "The same SQL validation or execution failure "
+                            "repeated; choose a different action or repair the SQL."
+                        ),
+                    }
+                )
+            elif previous >= 2:
+                sql_terminal = True
+
+        repeated_failed_action = False
+        if facts.get("failed_action") and not facts.get("new_accepted_evidence_refs"):
+            for fingerprint in facts.get("compiled_action_fingerprints") or ():
+                previous = self.failed_action_counts.get(str(fingerprint), 0)
+                self.failed_action_counts[str(fingerprint)] = previous + 1
+                if previous >= 1:
+                    repeated_failed_action = True
+
+        repeated_no_progress = False
+        progress_fingerprint = str(facts.get("progress_fingerprint") or "")
+        if facts.get("no_progress"):
+            self.no_progress_count += 1
+            repeated_no_progress = (
+                progress_fingerprint in self.seen_no_progress_fingerprints
+                or self.no_progress_count >= 2
+            )
+            if progress_fingerprint:
+                self.seen_no_progress_fingerprints.add(progress_fingerprint)
+        else:
+            self.no_progress_count = 0
+
+        if retry_facts and not sql_terminal:
+            return _LoopProgressDecision(retry_facts=tuple(retry_facts))
+
+        warnings: list[str] = []
+        terminal_status: str | None = None
+        if sql_terminal:
+            terminal_status = "failed"
+            warnings.append("db_agent_loop_repeated_sql_failure")
+        if repeated_failed_action:
+            terminal_status = terminal_status or "failed"
+            warnings.append("db_agent_loop_repeated_action")
+        if repeated_no_progress:
+            terminal_status = terminal_status or "blocked"
+            warnings.append("db_agent_loop_no_progress")
+
+        if terminal_status is None:
+            return _LoopProgressDecision()
+
+        return _LoopProgressDecision(
+            terminal_status=terminal_status,
+            warnings=tuple(dict.fromkeys(warnings)),
+            diagnostics={
+                "sql_terminal": sql_terminal,
+                "repeated_failed_action": repeated_failed_action,
+                "repeated_no_progress": repeated_no_progress,
+                "no_progress_count": self.no_progress_count,
+            },
+        )
+
+
 class DbAgentLoop:
     """Serial first implementation of the planner-driven DB runtime loop."""
 
@@ -174,8 +269,10 @@ class DbAgentLoop:
         )
         warnings: list[str] = []
         last_compilation: DbActionCompilation | None = None
+        progress_guard = _LoopProgressGuard()
         for turn in range(1, turn_budget + 1):
             operation = await self._fresh_operation(operation.id)
+            progress_before = await self._progress_snapshot(operation.id)
             state = await self.build_loop_state(
                 operation,
                 safety_frame=safety_frame,
@@ -251,21 +348,58 @@ class DbAgentLoop:
             await self._persist_compilation(operation, compilation, decision, turn=turn)
             operation = await self._persist_compiled_contract(operation, compilation)
             if compilation.rejected_action_summaries and not compilation.task_specs:
+                progress_after = await self._progress_snapshot(operation.id)
+                progress_facts = self._progress_facts(
+                    before=progress_before,
+                    after=progress_after,
+                    decision=decision,
+                    compilation=compilation,
+                    execution_errors=compilation.rejected_action_summaries,
+                )
+                progress_decision = progress_guard.evaluate(progress_facts)
+                terminal_warning = (
+                    progress_decision.warnings[0]
+                    if progress_decision.warnings
+                    else None
+                )
+                observation = await self._persist_observation(
+                    operation,
+                    self._observation_for_compilation(
+                        compilation,
+                        turn=turn,
+                        progress_facts=progress_facts,
+                        progress_decision=progress_decision,
+                        terminal_warning=terminal_warning,
+                    ),
+                    turn=turn,
+                )
                 warnings.extend(
                     str(item.get("error") or "planner_action_rejected")
                     for item in compilation.rejected_action_summaries
-                )
-                await self._persist_observation(
-                    operation,
-                    self._observation_for_compilation(compilation, turn=turn),
-                    turn=turn,
                 )
                 if _has_terminal_compilation_error(compilation):
                     return await self._result(
                         operation,
                         "failed",
                         warnings=warnings,
-                        diagnostics={"compilation": compilation.to_dict()},
+                        diagnostics={
+                            "compilation": compilation.to_dict(),
+                            "progress": progress_facts,
+                            "observation": observation.to_dict(),
+                        },
+                    )
+                if progress_decision.terminal_status is not None:
+                    warnings.extend(progress_decision.warnings)
+                    return await self._result(
+                        operation,
+                        progress_decision.terminal_status,
+                        warnings=warnings,
+                        diagnostics={
+                            "compilation": compilation.to_dict(),
+                            "progress": progress_facts,
+                            "progress_guard": progress_decision.diagnostics,
+                            "observation": observation.to_dict(),
+                        },
                     )
                 continue
 
@@ -330,8 +464,28 @@ class DbAgentLoop:
                         }
                     )
                 except Exception as exc:
-                    execution_errors.append({"error": str(exc)})
+                    execution_errors.append(
+                        {
+                            "task_id": task.id,
+                            "capability_id": task.capability_id,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                        }
+                    )
 
+            progress_after = await self._progress_snapshot(operation.id)
+            progress_facts = self._progress_facts(
+                before=progress_before,
+                after=progress_after,
+                decision=decision,
+                compilation=compilation,
+                task_plan=task_plan.to_dict(),
+                execution_errors=tuple(execution_errors),
+            )
+            progress_decision = progress_guard.evaluate(progress_facts)
+            terminal_warning = (
+                progress_decision.warnings[0] if progress_decision.warnings else None
+            )
             observation = await self._persist_observation(
                 operation,
                 await self._observation_after_execution(
@@ -339,9 +493,25 @@ class DbAgentLoop:
                     executed=tuple(executed),
                     execution_errors=tuple(execution_errors),
                     turn=turn,
+                    progress_facts=progress_facts,
+                    progress_decision=progress_decision,
+                    terminal_warning=terminal_warning,
                 ),
                 turn=turn,
             )
+            if progress_decision.terminal_status is not None:
+                warnings.extend(progress_decision.warnings)
+                return await self._result(
+                    operation,
+                    progress_decision.terminal_status,
+                    warnings=warnings,
+                    diagnostics={
+                        "task_plan": task_plan.to_dict(),
+                        "progress": progress_facts,
+                        "progress_guard": progress_decision.diagnostics,
+                        "observation": observation.to_dict(),
+                    },
+                )
             if execution_errors:
                 warnings.extend(str(item.get("error")) for item in execution_errors)
                 continue
@@ -986,12 +1156,125 @@ class DbAgentLoop:
         await self.runtime.store.save_evidence(evidence)
         return observation
 
+    async def _progress_snapshot(self, operation_id: str) -> _LoopProgressSnapshot:
+        tasks = await self.runtime.store.list_tasks(operation_id)
+        evidence = await self.runtime.store.list_evidence(operation_id)
+        return _LoopProgressSnapshot(
+            task_statuses={task.id: task.status.value for task in tasks},
+            accepted_evidence=tuple(
+                _evidence_ref(item) for item in evidence if item.accepted
+            ),
+            rejected_evidence=tuple(
+                _evidence_ref(item) for item in evidence if not item.accepted
+            ),
+        )
+
+    def _progress_facts(
+        self,
+        *,
+        before: _LoopProgressSnapshot,
+        after: _LoopProgressSnapshot,
+        decision: DbPlannerDecision,
+        compilation: DbActionCompilation,
+        task_plan: Mapping[str, Any] | None = None,
+        execution_errors: tuple[dict[str, Any], ...] = (),
+    ) -> dict[str, Any]:
+        before_task_ids = set(before.task_statuses)
+        after_task_ids = set(after.task_statuses)
+        new_task_ids = tuple(sorted(after_task_ids - before_task_ids))
+        changed_task_statuses = tuple(
+            {
+                "task_id": task_id,
+                "before": before.task_statuses.get(task_id),
+                "after": after.task_statuses.get(task_id),
+            }
+            for task_id in sorted(before_task_ids & after_task_ids)
+            if before.task_statuses.get(task_id) != after.task_statuses.get(task_id)
+        )
+        new_accepted = _new_evidence_refs(
+            before.accepted_evidence,
+            after.accepted_evidence,
+            include_loop_control=False,
+        )
+        new_rejected = _new_evidence_refs(
+            before.rejected_evidence,
+            after.rejected_evidence,
+            include_loop_control=False,
+        )
+        decision_fingerprint = _stable_hash(decision.to_dict())
+        compiled_action_fingerprints = _compiled_action_fingerprints(decision)
+        task_spec_fingerprints = tuple(
+            _stable_hash(spec.to_dict()) for spec in compilation.task_specs
+        )
+        execution_error_fingerprints = tuple(
+            _execution_error_fingerprint(error) for error in execution_errors
+        )
+        sql_error_fingerprints = tuple(
+            fingerprint
+            for fingerprint, error in zip(
+                execution_error_fingerprints,
+                execution_errors,
+                strict=False,
+            )
+            if _is_sql_execution_error(error)
+        )
+        has_useful_error_observation = bool(execution_errors)
+        no_progress = (
+            not new_task_ids
+            and not new_accepted
+            and not changed_task_statuses
+            and not new_rejected
+            and not has_useful_error_observation
+        )
+        progress_fingerprint = _stable_hash(
+            {
+                "decision_fingerprint": decision_fingerprint,
+                "compiled_action_fingerprints": compiled_action_fingerprints,
+                "task_spec_fingerprints": task_spec_fingerprints,
+                "execution_error_fingerprints": execution_error_fingerprints,
+                "new_task_ids": new_task_ids,
+                "new_accepted_evidence_refs": new_accepted,
+                "new_rejected_evidence_refs": new_rejected,
+                "changed_task_statuses": changed_task_statuses,
+            }
+        )
+        return {
+            "decision_fingerprint": decision_fingerprint,
+            "compiled_action_fingerprints": list(compiled_action_fingerprints),
+            "task_spec_fingerprints": list(task_spec_fingerprints),
+            "execution_error_fingerprints": list(execution_error_fingerprints),
+            "sql_error_fingerprints": list(sql_error_fingerprints),
+            "accepted_evidence_before": list(before.accepted_evidence),
+            "accepted_evidence_after": list(after.accepted_evidence),
+            "rejected_evidence_before": list(before.rejected_evidence),
+            "rejected_evidence_after": list(after.rejected_evidence),
+            "new_task_ids": list(new_task_ids),
+            "new_accepted_evidence_refs": list(new_accepted),
+            "new_rejected_evidence_refs": list(new_rejected),
+            "changed_task_statuses": list(changed_task_statuses),
+            "failed_action": bool(execution_errors),
+            "no_progress": no_progress,
+            "progress_fingerprint": progress_fingerprint,
+            "task_plan_diagnostics": dict((task_plan or {}).get("diagnostics") or {}),
+        }
+
     def _observation_for_compilation(
         self,
         compilation: DbActionCompilation,
         *,
         turn: int,
+        progress_facts: Mapping[str, Any] | None = None,
+        progress_decision: _LoopProgressDecision | None = None,
+        terminal_warning: str | None = None,
     ) -> DbPlannerObservation:
+        progress_decision = progress_decision or _LoopProgressDecision()
+        diagnostics = {
+            "status": terminal_warning or "compilation_rejected",
+            "turn": turn,
+            "compilation": compilation.to_dict(),
+        }
+        if progress_decision.diagnostics:
+            diagnostics["progress_guard"] = progress_decision.diagnostics
         return DbPlannerObservation(
             execution_errors=tuple(
                 {
@@ -1001,11 +1284,11 @@ class DbAgentLoop:
                 }
                 for item in compilation.rejected_action_summaries
             ),
-            diagnostics={
-                "status": "compilation_rejected",
-                "turn": turn,
-                "compilation": compilation.to_dict(),
-            },
+            retry_facts=progress_decision.retry_facts,
+            no_progress_facts=(
+                (dict(progress_facts),) if progress_facts is not None else ()
+            ),
+            diagnostics=diagnostics,
         )
 
     async def _observation_after_execution(
@@ -1015,7 +1298,14 @@ class DbAgentLoop:
         executed: tuple[Evidence, ...],
         execution_errors: tuple[dict[str, Any], ...],
         turn: int,
+        progress_facts: Mapping[str, Any] | None = None,
+        progress_decision: _LoopProgressDecision | None = None,
+        terminal_warning: str | None = None,
     ) -> DbPlannerObservation:
+        progress_decision = progress_decision or _LoopProgressDecision()
+        diagnostics = {"status": terminal_warning or "tasks_executed", "turn": turn}
+        if progress_decision.diagnostics:
+            diagnostics["progress_guard"] = progress_decision.diagnostics
         return DbPlannerObservation(
             accepted_evidence_summaries=tuple(
                 _evidence_summary(item) for item in executed if item.accepted
@@ -1025,7 +1315,11 @@ class DbAgentLoop:
             ),
             task_statuses=await self._task_summaries(operation_id),
             execution_errors=execution_errors,
-            diagnostics={"status": "tasks_executed", "turn": turn},
+            retry_facts=progress_decision.retry_facts,
+            no_progress_facts=(
+                (dict(progress_facts),) if progress_facts is not None else ()
+            ),
+            diagnostics=diagnostics,
         )
 
     async def _task_summaries(self, operation_id: str) -> tuple[dict[str, Any], ...]:
@@ -1222,6 +1516,60 @@ def _has_terminal_compilation_error(compilation: DbActionCompilation) -> bool:
     return any(
         str(item.get("error") or "").startswith(terminal_prefixes)
         for item in compilation.rejected_action_summaries
+    )
+
+
+def _compiled_action_fingerprints(
+    decision: DbPlannerDecision,
+) -> tuple[str, ...]:
+    return tuple(
+        _stable_hash(
+            {
+                "kind": action.kind.value,
+                "input": action.input,
+                "depends_on": list(action.depends_on),
+                "metadata": action.metadata,
+            }
+        )
+        for action in decision.actions
+    )
+
+
+def _execution_error_fingerprint(error: Mapping[str, Any]) -> str:
+    return _stable_hash(
+        {
+            "capability_id": error.get("capability_id"),
+            "error": error.get("error"),
+            "error_type": error.get("error_type"),
+            "readiness": error.get("readiness"),
+        }
+    )
+
+
+def _is_sql_execution_error(error: Mapping[str, Any]) -> bool:
+    capability_id = str(error.get("capability_id") or "")
+    if capability_id in {
+        "db.sql.validate",
+        "db.sql.execute_read",
+        "db.sql.execute_write",
+    }:
+        return True
+    text = str(error.get("error") or "").lower()
+    return "sql" in text or "validation_failed" in text
+
+
+def _new_evidence_refs(
+    before: tuple[dict[str, Any], ...],
+    after: tuple[dict[str, Any], ...],
+    *,
+    include_loop_control: bool,
+) -> tuple[dict[str, Any], ...]:
+    before_ids = {item.get("id") for item in before}
+    refs = tuple(item for item in after if item.get("id") not in before_ids)
+    if include_loop_control:
+        return refs
+    return tuple(
+        item for item in refs if item.get("kind") not in _LOOP_CONTROL_EVIDENCE_KINDS
     )
 
 

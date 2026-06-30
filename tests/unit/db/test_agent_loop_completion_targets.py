@@ -19,7 +19,6 @@ from daita.runtime import (
     TaskStatus,
 )
 
-
 OWNER = "completion_target"
 
 
@@ -513,6 +512,42 @@ async def test_reused_terminal_failed_task_is_not_counted_as_progress():
     } & set(result.warnings)
 
 
+async def test_repeated_sql_failure_stops_with_specific_warning():
+    sql = "select * from missing_table"
+    planner = ScriptedPlanner(
+        _read_decision(sql=sql, action_id="read_orders_once"),
+        _read_decision(sql=sql, action_id="read_orders_twice"),
+        _read_decision(sql=sql, action_id="read_orders_thrice"),
+        repeat_last=True,
+    )
+    runtime, _ = await _runtime_with_planner(planner)
+    operation = await _bootstrap_run_operation(runtime, "repeated-sql-target")
+
+    result = await DbAgentLoop(runtime, planner).run(
+        operation,
+        safety_frame={"max_access": "read"},
+        max_turns=6,
+    )
+    observations = [
+        evidence.payload["observation"]
+        for evidence in await runtime.store.list_evidence(operation.id)
+        if evidence.kind == "planner.observation"
+    ]
+
+    assert result.status == "failed"
+    assert len(planner.states) < 6
+    assert "db_agent_loop_repeated_sql_failure" in result.warnings
+    assert any(
+        fact.get("warning") == "db_agent_loop_repeated_sql_failure"
+        for observation in observations
+        for fact in observation["retry_facts"]
+    )
+    assert any(
+        observation["diagnostics"].get("status") == "db_agent_loop_repeated_sql_failure"
+        for observation in observations
+    )
+
+
 async def _runtime_with_planner(planner):
     plugin = CompletionTargetPlugin()
     runtime = DbRuntime(
@@ -595,13 +630,13 @@ def _catalog_search_decision():
     )
 
 
-def _read_decision(sql, operation_type="data.query"):
+def _read_decision(sql, operation_type="data.query", action_id="read_orders"):
     return DbPlannerDecision(
         status=DbPlannerDecisionStatus.CONTINUE,
         intent={"operation_type": operation_type},
         actions=(
             DbPlannerAction(
-                action_id="read_orders",
+                action_id=action_id,
                 kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
                 input={"owner": OWNER, "sql": sql},
             ),
