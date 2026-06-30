@@ -20,7 +20,6 @@ from ..models import (
     DbIntentKind,
     DbLimits,
     DbOperationContract,
-    DbOperationResult,
     DbRequest,
 )
 from .types import DbRuntimeGovernanceBlocked, DbRuntimeTaskNotRunnable
@@ -299,7 +298,19 @@ class DbRuntimeResumeMixin:
             return resumed
 
         if _operation_has_run_context(completed.operation):
-            await self._complete_resumed_run_operation(completed)
+            await self._finalize_run_operation(
+                operation_id=operation_id,
+                request=_db_request_from_context(completed.operation),
+                fallback_intent=_db_intent_from_context(completed.operation),
+                fallback_contract=_db_contract_from_context(completed.operation),
+                base_diagnostics={
+                    "runtime_id": self.runtime_id,
+                    "resume": {
+                        "operation_id": operation_id,
+                        "completed_task_ids": list(completed.completed_task_ids),
+                    },
+                },
+            )
         elif (
             completed.tasks
             and completed.operation.status is not OperationStatus.SUCCEEDED
@@ -312,66 +323,6 @@ class DbRuntimeResumeMixin:
         if resumed is None:
             raise KeyError(operation_id)
         return resumed
-
-    async def _complete_resumed_run_operation(
-        self,
-        snapshot: OperationSnapshot,
-    ) -> None:
-        request = _db_request_from_context(snapshot.operation)
-        intent = _db_intent_from_context(snapshot.operation)
-        contract = _db_contract_from_context(snapshot.operation)
-        evidence = tuple(await self.store.list_evidence(snapshot.operation.id))
-        tasks = tuple(await self.store.list_tasks(snapshot.operation.id))
-        verification = self.verifier.verify(contract, intent, evidence, tasks)
-        if not verification.passed:
-            await self._record_operation_result(
-                DbOperationResult(
-                    operation_id=snapshot.operation.id,
-                    request=request,
-                    intent=intent,
-                    contract=contract,
-                    status=OperationStatus.FAILED,
-                    answer="DB operation could not be verified against required evidence.",
-                    evidence=evidence,
-                    warnings=verification.warnings,
-                    diagnostics={"verification": verification.to_dict()},
-                ),
-                operation=snapshot.operation,
-            )
-            return
-
-        verification_evidence = await self._persist_verification_result_evidence(
-            snapshot.operation,
-            verification,
-            evidence,
-        )
-        synthesis_evidence, synthesis_task = await self._execute_answer_synthesis(
-            operation=snapshot.operation,
-            intent=intent,
-            outcome_evidence=(*evidence, verification_evidence),
-        )
-        final_evidence = (*evidence, verification_evidence, synthesis_evidence)
-        final_tasks = (*tasks, synthesis_task) if synthesis_task not in tasks else tasks
-        await self._record_operation_result(
-            DbOperationResult(
-                operation_id=snapshot.operation.id,
-                request=request,
-                intent=intent,
-                contract=contract,
-                status=OperationStatus.SUCCEEDED,
-                answer=_answer_from_synthesis_evidence(synthesis_evidence),
-                evidence=final_evidence,
-                diagnostics={
-                    "verification": verification.to_dict(),
-                    "synthesis": synthesis_evidence.payload,
-                    "execution": {
-                        "task_count": len(final_tasks),
-                        "tasks": [task.to_dict() for task in final_tasks],
-                    },
-                },
-            ),
-            operation=snapshot.operation,
-        )
 
 
 def _tasks_in_resume_order(tasks: tuple[Task, ...]) -> tuple[Task, ...]:

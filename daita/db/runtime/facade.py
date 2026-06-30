@@ -455,11 +455,11 @@ class DbRuntime(
             )
 
         if loop_result.status in {"ran_tasks", "finished"}:
-            return await self._finalize_loop_result(
-                db_request,
-                intent,
-                contract,
+            return await self._finalize_run_operation(
                 operation_id=operation_id,
+                request=db_request,
+                fallback_intent=intent,
+                fallback_contract=contract,
                 loop_result=loop_result,
                 base_diagnostics=base_diagnostics,
             )
@@ -481,15 +481,15 @@ class DbRuntime(
             operation=await self.store.load_operation(operation_id) or operation,
         )
 
-    async def _finalize_loop_result(
+    async def _finalize_run_operation(
         self,
-        db_request: DbRequest,
-        fallback_intent: DbIntent,
-        fallback_contract: DbOperationContract,
         *,
         operation_id: str,
-        loop_result: DbLoopResult,
-        base_diagnostics: dict[str, Any],
+        request: DbRequest,
+        fallback_intent: DbIntent,
+        fallback_contract: DbOperationContract,
+        loop_result: DbLoopResult | None = None,
+        base_diagnostics: dict[str, Any] | None = None,
     ) -> DbOperationResult:
         operation = await self.store.load_operation(operation_id)
         if operation is None:
@@ -498,21 +498,24 @@ class DbRuntime(
         tasks = tuple(await self.store.list_tasks(operation_id))
         contract = _contract_from_latest_loop_snapshot(operation, fallback_contract)
         intent = _intent_from_loop_contract(contract, fallback_intent)
+        diagnostics = dict(base_diagnostics or {})
+        if loop_result is not None:
+            diagnostics["planner"] = _planner_diagnostics(loop_result)
+        loop_warnings = loop_result.warnings if loop_result is not None else ()
         verification = self.verifier.verify(contract, intent, evidence, tasks)
         if not verification.passed:
             return await self._record_operation_result(
                 DbOperationResult(
                     operation_id=operation_id,
-                    request=db_request,
+                    request=request,
                     intent=intent,
                     contract=contract,
                     status=OperationStatus.FAILED,
                     answer="DB operation could not be verified against required evidence.",
                     evidence=evidence,
-                    warnings=tuple((*loop_result.warnings, *verification.warnings)),
+                    warnings=tuple((*loop_warnings, *verification.warnings)),
                     diagnostics={
-                        **base_diagnostics,
-                        "planner": _planner_diagnostics(loop_result),
+                        **diagnostics,
                         "execution": _execution_diagnostics(
                             operation=operation,
                             tasks=tasks,
@@ -535,16 +538,16 @@ class DbRuntime(
             outcome_evidence=(*evidence, verification_evidence),
         )
         refreshed_tasks = tuple(await self.store.list_tasks(operation_id))
-        final_evidence = (*evidence, verification_evidence, synthesis_evidence)
-        final_tasks = (
-            refreshed_tasks
-            if synthesis_task in refreshed_tasks
-            else (*refreshed_tasks, synthesis_task)
-        )
+        final_evidence = tuple(await self.store.list_evidence(operation_id))
+        final_tasks = refreshed_tasks
+        if synthesis_task not in final_tasks:
+            final_tasks = (*final_tasks, synthesis_task)
+        if synthesis_evidence not in final_evidence:
+            final_evidence = (*final_evidence, synthesis_evidence)
         return await self._record_operation_result(
             DbOperationResult(
                 operation_id=operation_id,
-                request=db_request,
+                request=request,
                 intent=intent,
                 contract=contract,
                 status=OperationStatus.SUCCEEDED,
@@ -552,7 +555,7 @@ class DbRuntime(
                 evidence=final_evidence,
                 warnings=tuple(
                     (
-                        *loop_result.warnings,
+                        *loop_warnings,
                         *(
                             synthesis_evidence.payload.get("warnings")
                             if isinstance(
@@ -563,8 +566,7 @@ class DbRuntime(
                     )
                 ),
                 diagnostics={
-                    **base_diagnostics,
-                    "planner": _planner_diagnostics(loop_result),
+                    **diagnostics,
                     "execution": _execution_diagnostics(
                         operation=operation,
                         tasks=final_tasks,
