@@ -15,6 +15,7 @@ from daita.runtime import (
     Operation,
     RuntimeKernelGovernanceBlocked,
     Task,
+    TaskDependency,
     TaskStatus,
 )
 
@@ -259,6 +260,13 @@ class DbAgentLoop:
                     self._observation_for_compilation(compilation, turn=turn),
                     turn=turn,
                 )
+                if _has_terminal_compilation_error(compilation):
+                    return await self._result(
+                        operation,
+                        "failed",
+                        warnings=warnings,
+                        diagnostics={"compilation": compilation.to_dict()},
+                    )
                 continue
 
             try:
@@ -344,6 +352,15 @@ class DbAgentLoop:
                 "finalization": finalization,
             }
             if finalizable:
+                return await self._result(
+                    operation,
+                    "finished",
+                    warnings=warnings,
+                    diagnostics=diagnostics,
+                )
+            if turn == turn_budget and _compiled_contract_evidence_satisfied(
+                finalization
+            ):
                 return await self._result(
                     operation,
                     "finished",
@@ -451,11 +468,28 @@ class DbAgentLoop:
         specs: list[DbTaskSpec] = []
         selected_capabilities: list[dict[str, Any]] = []
         decision_fingerprint = _stable_hash(decision.to_dict())
+        actions: list[DbPlannerAction] = []
 
         for raw_action in decision.actions:
             action, error = _coerce_action(raw_action)
             if error is not None or action is None:
                 rejected.append(error or {"error": "invalid_action"})
+                continue
+            actions.append(action)
+
+        ordered_actions, dag_errors = _ordered_actions_or_errors(tuple(actions))
+        if dag_errors:
+            rejected.extend(dag_errors)
+
+        prior_action_specs: dict[str, tuple[DbTaskSpec, ...]] = {}
+        for action in ordered_actions:
+            planner_dependencies, dependency_errors = self._planner_dependency_specs(
+                action,
+                prior_action_specs=prior_action_specs,
+                operation_id=state.operation_id,
+            )
+            if dependency_errors:
+                rejected.extend(dependency_errors)
                 continue
             action_specs, action_capabilities, action_errors = self._compile_one_action(
                 action,
@@ -466,7 +500,12 @@ class DbAgentLoop:
             if action_errors:
                 rejected.extend(action_errors)
                 continue
+            if planner_dependencies:
+                action_specs = _with_spec_dependencies(
+                    action_specs, planner_dependencies
+                )
             specs.extend(action_specs)
+            prior_action_specs[action.action_id] = tuple(action_specs)
             selected_capabilities.extend(action_capabilities)
             accepted.append(
                 {
@@ -494,6 +533,74 @@ class DbAgentLoop:
                 "task_spec_count": len(specs),
             },
         )
+
+    def _planner_dependency_specs(
+        self,
+        action: DbPlannerAction,
+        *,
+        prior_action_specs: Mapping[str, tuple[DbTaskSpec, ...]],
+        operation_id: str,
+    ) -> tuple[tuple[TaskDependency, ...], tuple[dict[str, Any], ...]]:
+        dependencies: list[TaskDependency] = []
+        errors: list[dict[str, Any]] = []
+        for dependency_action_id in dict.fromkeys(action.depends_on):
+            producer_specs = prior_action_specs.get(dependency_action_id)
+            if not producer_specs:
+                errors.append(
+                    _action_error(
+                        action, f"dependency_not_durable:{dependency_action_id}"
+                    )
+                )
+                continue
+            dependency = self._dependency_for_producer_specs(
+                action,
+                dependency_action_id=dependency_action_id,
+                producer_specs=producer_specs,
+                operation_id=operation_id,
+            )
+            if dependency is None:
+                errors.append(
+                    _action_error(
+                        action, f"dependency_not_durable:{dependency_action_id}"
+                    )
+                )
+                continue
+            dependencies.append(dependency)
+        return tuple(dependencies), tuple(errors)
+
+    def _dependency_for_producer_specs(
+        self,
+        action: DbPlannerAction,
+        *,
+        dependency_action_id: str,
+        producer_specs: tuple[DbTaskSpec, ...],
+        operation_id: str,
+    ) -> TaskDependency | None:
+        for spec in reversed(producer_specs):
+            resolved = self._resolve_capability(spec.capability_id, owner=spec.owner)
+            capability = resolved.get("capability")
+            if capability is None:
+                continue
+            evidence_kind = next(iter(sorted(capability.output_evidence)), None)
+            if evidence_kind is None:
+                continue
+            return TaskDependency(
+                kind="evidence",
+                evidence_kind=evidence_kind,
+                evidence_owner=capability.owner,
+                producer_task_id=spec.task_id,
+                producer_capability_id=capability.id,
+                producer_executor_id=capability.executor,
+                evidence_accepted=True,
+                input_hash=_stable_hash(spec.input),
+                operation_id=operation_id,
+                metadata={
+                    "planner_dependency": True,
+                    "producer_action_id": dependency_action_id,
+                    "consumer_action_id": action.action_id,
+                },
+            )
+        return None
 
     def _compile_one_action(
         self,
@@ -1006,6 +1113,124 @@ def _coerce_action(
                 "error": f"invalid_action:{exc}",
             }
     return None, {"action_id": "", "kind": "", "error": "invalid_action_shape"}
+
+
+def _ordered_actions_or_errors(
+    actions: tuple[DbPlannerAction, ...],
+) -> tuple[tuple[DbPlannerAction, ...], tuple[dict[str, Any], ...]]:
+    by_id: dict[str, DbPlannerAction] = {}
+    duplicate_ids: set[str] = set()
+    for action in actions:
+        if action.action_id in by_id:
+            duplicate_ids.add(action.action_id)
+            continue
+        by_id[action.action_id] = action
+    if duplicate_ids:
+        return (), tuple(
+            _action_error(action, "duplicate_action_id")
+            for action in actions
+            if action.action_id in duplicate_ids
+        )
+
+    missing_errors: list[dict[str, Any]] = []
+    dependency_sets: dict[str, tuple[str, ...]] = {}
+    for action in actions:
+        dependencies = tuple(dict.fromkeys(action.depends_on))
+        dependency_sets[action.action_id] = dependencies
+        for dependency in dependencies:
+            if dependency not in by_id:
+                missing_errors.append(
+                    _action_error(action, f"missing_dependency:{dependency}")
+                )
+    if missing_errors:
+        return (), tuple(missing_errors)
+
+    dependents: dict[str, list[str]] = {action.action_id: [] for action in actions}
+    remaining_dependencies: dict[str, int] = {}
+    for action in actions:
+        dependencies = dependency_sets[action.action_id]
+        remaining_dependencies[action.action_id] = len(dependencies)
+        for dependency in dependencies:
+            dependents[dependency].append(action.action_id)
+
+    ready = [
+        action.action_id
+        for action in actions
+        if remaining_dependencies[action.action_id] == 0
+    ]
+    ordered: list[DbPlannerAction] = []
+    while ready:
+        action_id = ready.pop(0)
+        ordered.append(by_id[action_id])
+        for dependent_id in dependents[action_id]:
+            remaining_dependencies[dependent_id] -= 1
+            if remaining_dependencies[dependent_id] == 0:
+                ready.append(dependent_id)
+
+    if len(ordered) != len(actions):
+        cyclic_ids = tuple(
+            action.action_id
+            for action in actions
+            if remaining_dependencies[action.action_id] > 0
+        )
+        cycle_label = "->".join(cyclic_ids) if cyclic_ids else "unknown"
+        return (), tuple(
+            _action_error(action, f"dependency_cycle:{cycle_label}")
+            for action in actions
+            if action.action_id in cyclic_ids
+        )
+    return tuple(ordered), ()
+
+
+def _with_spec_dependencies(
+    specs: list[DbTaskSpec],
+    dependencies: tuple[TaskDependency, ...],
+) -> list[DbTaskSpec]:
+    if not dependencies:
+        return specs
+    return [
+        replace(
+            spec,
+            dependencies=_merge_dependencies(spec.dependencies, dependencies),
+        )
+        for spec in specs
+    ]
+
+
+def _merge_dependencies(
+    left: tuple[TaskDependency, ...],
+    right: tuple[TaskDependency, ...],
+) -> tuple[TaskDependency, ...]:
+    merged: list[TaskDependency] = []
+    seen: set[str] = set()
+    for dependency in (*left, *right):
+        fingerprint = _stable_hash(dependency.to_dict())
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        merged.append(dependency)
+    return tuple(merged)
+
+
+def _has_terminal_compilation_error(compilation: DbActionCompilation) -> bool:
+    terminal_prefixes = (
+        "duplicate_action_id",
+        "missing_dependency:",
+        "dependency_cycle:",
+        "dependency_not_durable:",
+    )
+    return any(
+        str(item.get("error") or "").startswith(terminal_prefixes)
+        for item in compilation.rejected_action_summaries
+    )
+
+
+def _compiled_contract_evidence_satisfied(finalization: Mapping[str, Any]) -> bool:
+    verification = finalization.get("verification")
+    verification = verification if isinstance(verification, Mapping) else {}
+    missing = verification.get("missing_evidence")
+    supporting = finalization.get("synthesis_supporting_evidence")
+    return not tuple(missing or ()) and bool(tuple(supporting or ()))
 
 
 def _action_owner(action: DbPlannerAction) -> str | None:
