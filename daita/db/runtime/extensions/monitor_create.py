@@ -14,6 +14,7 @@ from ...monitor_commands.extractor import DeterministicMonitorIntentExtractor
 from ...monitor_commands.planner import DbMonitorPlanner, _monitor_from_proposal
 from ...monitor_commands.types import DbMonitorCommand, DbMonitorValidation
 from ...monitors import DbMonitorMutation, DbMonitorState
+from ..tasks import DbTaskSpec
 
 
 @dataclass(frozen=True)
@@ -207,18 +208,20 @@ async def _inspect_monitor_target_schema(
     capability = _first_capability(runtime, "db.schema.inspect")
     if capability is None:
         return None
-    schema_task = await runtime.kernel.plan_task(
-        operation_id=operation.id,
-        capability_id=capability.id,
-        owner=capability.owner,
-        input={"tables": [target] if target else []},
-        metadata={
-            "reason": "monitor_create_schema_context",
-            "sequence": 0,
-            "target_table": target,
-        },
+    plan = await runtime.plan_task_specs(
+        operation,
+        (
+            DbTaskSpec(
+                capability_id=capability.id,
+                owner=capability.owner,
+                input={"tables": [target] if target else []},
+                reason="monitor_create_schema_context",
+                sequence=0,
+                metadata={"target_table": target},
+            ),
+        ),
     )
-    evidence = await runtime.execute_task(schema_task, operation)
+    evidence = await runtime.execute_task(plan.tasks[0], operation)
     schema_evidence = next(
         (item for item in evidence if item.kind == "schema.asset_profile"),
         None,

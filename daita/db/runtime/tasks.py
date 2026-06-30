@@ -52,8 +52,8 @@ class DbTaskSpec:
     def __post_init__(self) -> None:
         if not self.capability_id:
             raise ValueError("capability_id is required")
-        if self.sequence < 1:
-            raise ValueError("sequence must be at least 1")
+        if self.sequence < 0:
+            raise ValueError("sequence must be non-negative")
         object.__setattr__(self, "input", _json_dict(self.input))
         object.__setattr__(
             self,

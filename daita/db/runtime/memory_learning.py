@@ -9,6 +9,7 @@ from daita.runtime import Operation, OperationStatus
 from ..analysis import stable_fingerprint
 from ..memory import db_memory_options_from_runtime_metadata
 from ..models import DbOperationResult
+from .tasks import DbTaskSpec
 
 _ELIGIBLE_OPERATION_TYPES = frozenset(
     {
@@ -73,28 +74,33 @@ class DbRuntimeMemoryLearningMixin:
             "db.memory.learning.enqueue",
             owner="db_runtime",
         )
-        enqueue_task = await self.kernel.plan_task(
-            operation_id=child.id,
-            capability_id=enqueue_capability.id,
-            owner=enqueue_capability.owner,
-            input={
-                "source_operation_id": operation.id,
-                "source_operation_type": operation.operation_type,
-                "source_identity": source_identity,
-                "source_schema_fingerprint": source_schema_fingerprint,
-                "source_evidence_ids": evidence_refs,
-                "learning_mode": learning_mode,
-            },
-            metadata={
-                "owner": enqueue_capability.owner,
-                "reason": "db_memory_learning_enqueue",
-                "queue": "memory_learning",
-                "source_operation_id": operation.id,
-                "source_identity": source_identity,
-                "learning_mode": learning_mode,
-            },
+        plan = await self.plan_task_specs(
+            child,
+            (
+                DbTaskSpec(
+                    capability_id=enqueue_capability.id,
+                    owner=enqueue_capability.owner,
+                    input={
+                        "source_operation_id": operation.id,
+                        "source_operation_type": operation.operation_type,
+                        "source_identity": source_identity,
+                        "source_schema_fingerprint": source_schema_fingerprint,
+                        "source_evidence_ids": evidence_refs,
+                        "learning_mode": learning_mode,
+                    },
+                    reason="db_memory_learning_enqueue",
+                    sequence=1,
+                    metadata={
+                        "queue": "memory_learning",
+                        "source_operation_id": operation.id,
+                        "source_identity": source_identity,
+                        "learning_mode": learning_mode,
+                    },
+                    deterministic_key=f"{operation.id}:db.memory.learning.enqueue",
+                ),
+            ),
         )
-        await self.execute_task(enqueue_task, child)
+        await self.execute_task(plan.tasks[0], child)
 
     def _memory_learning_result_eligible(self, result: DbOperationResult) -> bool:
         if result.status is not OperationStatus.SUCCEEDED:
