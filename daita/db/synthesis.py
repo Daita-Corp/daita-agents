@@ -139,6 +139,11 @@ class DbSynthesizer:
         }:
             scope = None
             answer = _data_answer(evidence)
+        elif _has_monitor_evidence(evidence) or contract.operation_type.startswith(
+            "monitor."
+        ):
+            scope = None
+            answer = _monitor_answer(evidence)
         else:
             scope = None
             answer = "The DB operation completed with verified evidence."
@@ -651,6 +656,170 @@ def _data_answer(evidence: tuple[Evidence, ...]) -> str:
     if not rows:
         return "The query returned no rows."
     return f"Returned {len(rows)} row{'s' if len(rows) != 1 else ''}."
+
+
+def _has_monitor_evidence(evidence: tuple[Evidence, ...]) -> bool:
+    return any(item.kind.startswith("monitor.") for item in evidence if item.accepted)
+
+
+def _monitor_answer(evidence: tuple[Evidence, ...]) -> str:
+    accepted = tuple(item for item in evidence if item.accepted)
+    for kind in (
+        "monitor.definition",
+        "monitor.deleted",
+        "monitor.disabled",
+        "monitor.paused",
+        "monitor.resumed",
+        "monitor.state_update",
+        "monitor.listing",
+        "monitor.inspection",
+        "monitor.run_summary",
+        "monitor.approval_state",
+        "monitor.approval_resolution",
+        "monitor.proposal",
+    ):
+        item = next(
+            (candidate for candidate in reversed(accepted) if candidate.kind == kind),
+            None,
+        )
+        if item is not None:
+            return _monitor_answer_from_evidence(item)
+    return "The monitor operation completed with verified evidence."
+
+
+def _monitor_answer_from_evidence(evidence: Evidence) -> str:
+    payload = evidence.payload
+    if evidence.kind == "monitor.listing":
+        monitors = [
+            item for item in payload.get("monitors") or () if isinstance(item, dict)
+        ]
+        if not monitors:
+            return "No monitors are currently defined."
+        lines = ["Monitors:"]
+        for monitor in monitors:
+            lines.append(
+                f"- {monitor.get('id')}: {monitor.get('name')} [{monitor.get('status')}]"
+            )
+        return "\n".join(lines)
+    if evidence.kind in {"monitor.inspection", "monitor.run_summary"}:
+        inspection = payload.get("inspection")
+        if not isinstance(inspection, dict):
+            return "The monitor could not be inspected from the accepted evidence."
+        monitor = dict(inspection.get("monitor") or {})
+        monitor_id = monitor.get("id")
+        name = monitor.get("name") or monitor_id
+        if evidence.kind == "monitor.run_summary":
+            runs = inspection.get("runs") or ()
+            if not runs:
+                return f"Monitor {name} ({monitor_id}) has no recorded runs yet."
+            last_run = dict(runs[-1])
+            return (
+                f"Monitor {name} ({monitor_id}) last run "
+                f"{last_run.get('status')}; operation {last_run.get('operation_id')}."
+            )
+        schedule = monitor.get("schedule")
+        schedule_text = ""
+        if isinstance(schedule, dict):
+            schedule_text = _monitor_schedule_text(schedule)
+        suffix = f", schedule {schedule_text}" if schedule_text else ""
+        return f"Monitor {name} ({monitor_id}) is {monitor.get('status')}{suffix}."
+    if evidence.kind == "monitor.approval_state":
+        approvals = [
+            item for item in payload.get("approvals") or () if isinstance(item, dict)
+        ]
+        if not approvals:
+            return "No pending monitor approvals were found."
+        lines = ["Pending monitor approvals:"]
+        for approval in approvals:
+            context = dict(approval.get("context") or {})
+            monitor_id = context.get("monitor_id") or payload.get("monitor_id")
+            lines.append(
+                f"- {approval.get('approval_id')}: {approval.get('status')}"
+                + (f" for {monitor_id}" if monitor_id else "")
+            )
+        return "\n".join(lines)
+    if evidence.kind == "monitor.approval_resolution":
+        status = str(payload.get("status") or "")
+        if status == "not_found":
+            return "No matching pending monitor approval was found."
+        if status == "ambiguous":
+            return "Multiple pending monitor approvals matched; specify an approval id."
+        action = str(payload.get("approval_action") or "approve").lower()
+        verb = {
+            "approve": "Approved",
+            "reject": "Rejected",
+            "cancel": "Cancelled",
+        }.get(action, "Updated")
+        return (
+            f"{verb} monitor approval {payload.get('approval_id')}; "
+            f"approval is {payload.get('approval_status')}."
+        )
+    if evidence.kind == "monitor.definition":
+        monitor = dict(payload.get("monitor") or {})
+        schedule = monitor.get("schedule")
+        suffix = ""
+        if isinstance(schedule, dict):
+            schedule_text = _monitor_schedule_text(schedule)
+            suffix = f" on {schedule_text}" if schedule_text else ""
+        return f"Created monitor {monitor.get('name')} ({monitor.get('id')}){suffix}."
+    if evidence.kind in {
+        "monitor.deleted",
+        "monitor.disabled",
+        "monitor.paused",
+        "monitor.resumed",
+        "monitor.state_update",
+    }:
+        action = str(payload.get("action") or evidence.kind.removeprefix("monitor."))
+        monitor = dict(
+            payload.get("monitor")
+            or payload.get("after")
+            or payload.get("before")
+            or {}
+        )
+        monitor_id = monitor.get("id") or payload.get("monitor_id")
+        name = monitor.get("name") or monitor_id
+        verb = {
+            "delete": "Deleted",
+            "deleted": "Deleted",
+            "disable": "Disabled",
+            "disabled": "Disabled",
+            "pause": "Paused",
+            "paused": "Paused",
+            "resume": "Resumed",
+            "resumed": "Resumed",
+            "update": "Updated",
+            "state_update": "Updated",
+        }.get(action, "Updated")
+        return f"{verb} monitor {name} ({monitor_id})."
+    if evidence.kind == "monitor.proposal":
+        validation = dict(payload.get("validation") or {})
+        if validation.get("accepted") is False:
+            missing = ", ".join(
+                str(item) for item in validation.get("missing_capabilities") or ()
+            )
+            if missing:
+                return (
+                    "Monitor was not created because required capabilities are missing: "
+                    f"{missing}."
+                )
+            return "Monitor was not created because its definition did not pass validation."
+        return f"Prepared monitor proposal {payload.get('name')} ({payload.get('monitor_id')})."
+    return "The monitor operation completed with verified evidence."
+
+
+def _monitor_schedule_text(schedule: dict[str, Any]) -> str:
+    interval_seconds = schedule.get("interval_seconds") or schedule.get("every_seconds")
+    if isinstance(interval_seconds, (int, float)) and interval_seconds > 0:
+        if interval_seconds % 3600 == 0:
+            hours = int(interval_seconds // 3600)
+            return "hourly" if hours == 1 else f"every {hours} hours"
+        if interval_seconds % 60 == 0:
+            minutes = int(interval_seconds // 60)
+            return "every minute" if minutes == 1 else f"every {minutes} minutes"
+        seconds = int(interval_seconds)
+        return "every second" if seconds == 1 else f"every {seconds} seconds"
+    expression = str(schedule.get("expression") or "").strip()
+    return expression
 
 
 def _tables_from_schema_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:

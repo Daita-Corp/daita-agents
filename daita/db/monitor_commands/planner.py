@@ -16,18 +16,26 @@ from ..monitor_plugin_planning import (
     MonitorPluginPlanner,
     MonitorPluginPlanningBlocked,
 )
-from ..models import DbRequest
 from ..monitors import DbMonitor
 from ..query_metadata import column_name, is_numeric_type, matching_tables
 from ...core.db_type_metadata import column_type_metadata
-from .extractor import DeterministicMonitorIntentExtractor
-from .intent import MonitorConditionIntent, MonitorCreateIntent
+from .intent import (
+    MonitorActionIntent,
+    MonitorBudgetIntent,
+    MonitorConditionIntent,
+    MonitorCreateIntent,
+    MonitorDeliveryRequest,
+    MonitorDisplayIntent,
+    MonitorPolicyIntent,
+    MonitorScheduleIntent,
+    MonitorTargetIntent,
+)
 from .naming import monitor_display_name, monitor_id as monitor_id_from_intent
 from .types import DbMonitorCommand, DbMonitorValidation
 
 
 class DbMonitorPlanner:
-    """Parse a monitor-management prompt into a narrow `DbMonitor` spec."""
+    """Build and validate monitor proposals from structured planner input."""
 
     def __init__(
         self,
@@ -76,12 +84,10 @@ class DbMonitorPlanner:
             raise ValueError("DbMonitorPlanner can only create monitor proposals")
         prompt = command.prompt
         if intent is None:
-            intent = DeterministicMonitorIntentExtractor().extract(
-                command,
-                DbRequest(prompt=prompt, source_scope=source_scope),
-                schema=schema,
-                host_defaults={"delivery_default": self.delivery_default},
-            )
+            raw_intent = command.diagnostics.get("intent")
+            if not isinstance(raw_intent, dict):
+                raise ValueError("structured monitor create intent is required")
+            intent = monitor_create_intent_from_dict(raw_intent)
         target = intent.target.name or ""
         schedule = (
             intent.schedule.to_schedule_dict()
@@ -155,6 +161,110 @@ class DbMonitorPlanner:
                 "command": command.diagnostics,
                 "intent": intent.to_dict(),
                 "extraction": intent.diagnostics,
+                "validation": validation.to_dict(),
+                "schema_evidence_id": schema_evidence_id,
+            },
+        }
+        proposal["proposal_fingerprint"] = _stable_monitor_payload_hash(proposal)
+        proposal["metadata"]["proposal_fingerprint"] = proposal["proposal_fingerprint"]
+        return proposal, validation
+
+    def create_structured_proposal(
+        self,
+        data: dict[str, Any],
+        *,
+        source_scope: tuple[str, ...] = (),
+        owner: dict[str, Any] | None = None,
+        schema_evidence_id: str | None = None,
+    ) -> tuple[dict[str, Any], DbMonitorValidation]:
+        """Validate a fully structured monitor proposal payload."""
+        proposal_input = dict(data)
+        monitor_id = str(
+            proposal_input.get("monitor_id") or proposal_input.get("id") or ""
+        ).strip()
+        name = str(
+            proposal_input.get("name")
+            or proposal_input.get("display_name")
+            or monitor_id
+            or "DB Monitor"
+        ).strip()
+        target_name = str(
+            proposal_input.get("target_name") or proposal_input.get("target") or ""
+        ).strip()
+        effective_scope = tuple(
+            str(item)
+            for item in (
+                proposal_input.get("source_scope")
+                or source_scope
+                or ((target_name,) if target_name else ())
+            )
+        )
+        if not monitor_id:
+            monitor_id = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+            monitor_id = monitor_id or "db_monitor"
+        schedule = _dict_or_none(proposal_input.get("schedule"))
+        stream = _dict_or_none(proposal_input.get("stream"))
+        trigger = dict(proposal_input.get("trigger") or {})
+        observation_plan = dict(proposal_input.get("observation_plan") or {})
+        action_plan = dict(
+            proposal_input.get("action_plan") or {"kind": "none", "steps": []}
+        )
+        policy = dict(proposal_input.get("policy") or {})
+        budgets = dict(proposal_input.get("budgets") or {})
+        action_steps = tuple(
+            dict(step)
+            for step in action_plan.get("steps") or ()
+            if isinstance(step, dict)
+        )
+        actions = tuple(
+            str(step.get("kind") or step.get("instruction") or "")
+            for step in action_steps
+            if step.get("kind") or step.get("instruction")
+        )
+        validation = self.validate(
+            action_steps=action_steps,
+            actions=actions,
+            source_scope=effective_scope,
+            policy=policy,
+            budgets=budgets,
+            observation_plan=observation_plan,
+            schedule=schedule,
+            stream=stream,
+            trigger=trigger,
+            action_plan=action_plan,
+        )
+        proposal: dict[str, Any] = {
+            "kind": "monitor.proposal",
+            "monitor_id": monitor_id,
+            "name": name,
+            "description": str(proposal_input.get("description") or ""),
+            "status": str(proposal_input.get("status") or "active"),
+            "target_type": str(proposal_input.get("target_type") or "table"),
+            "target_name": target_name,
+            "source_scope": list(effective_scope),
+            "schedule": schedule,
+            "stream": stream,
+            "trigger": trigger,
+            "observation_plan": observation_plan,
+            "action_plan": action_plan,
+            "initial_state": dict(proposal_input.get("initial_state") or {}),
+            "policy": policy,
+            "budgets": budgets,
+            "owner": dict(owner or proposal_input.get("owner") or {}),
+            "runtime_limits": dict(self.limits),
+            "governance": dict(
+                proposal_input.get("governance")
+                or {
+                    "approval_required": False,
+                    "risk": "medium",
+                    "side_effect_summary": (
+                        "Creates runtime monitor configuration; observation is read-only."
+                    ),
+                }
+            ),
+            "metadata": {
+                **dict(proposal_input.get("metadata") or {}),
+                "created_from_structured_planner_action": True,
                 "validation": validation.to_dict(),
                 "schema_evidence_id": schema_evidence_id,
             },
@@ -286,6 +396,107 @@ class DbMonitorPlanner:
                 "delivery_validation": delivery_diagnostics,
             },
         )
+
+
+def monitor_create_intent_from_dict(data: dict[str, Any]) -> MonitorCreateIntent:
+    """Rehydrate structured planner JSON into a monitor create intent."""
+    target = dict(data.get("target") or {})
+    condition = dict(data.get("condition") or {})
+    schedule = data.get("schedule")
+    delivery = data.get("delivery")
+    action = dict(data.get("action") or {})
+    display = dict(data.get("display") or {})
+    return MonitorCreateIntent(
+        target=MonitorTargetIntent(
+            target_type=str(target.get("target_type") or "table"),
+            name=_optional_string(target.get("name")),
+            source_scope=tuple(str(item) for item in target.get("source_scope") or ()),
+            confidence=_confidence(target.get("confidence")),
+            evidence=tuple(str(item) for item in target.get("evidence") or ()),
+        ),
+        condition=MonitorConditionIntent(
+            kind=str(condition.get("kind") or "rows_present"),
+            expression=_optional_string(condition.get("expression")),
+            operator=_optional_string(condition.get("operator")),
+            value=condition.get("value"),
+            path=_optional_string(condition.get("path")),
+        ),
+        schedule=(
+            None
+            if schedule is None
+            else MonitorScheduleIntent(
+                kind=str(dict(schedule).get("kind") or "interval"),
+                interval_seconds=_optional_int(dict(schedule).get("interval_seconds")),
+                expression=_optional_string(dict(schedule).get("expression")),
+                timezone=_optional_string(dict(schedule).get("timezone")),
+            )
+        ),
+        delivery=(
+            None
+            if delivery is None
+            else MonitorDeliveryRequest(
+                delivery_kind=str(dict(delivery).get("delivery_kind") or "local"),
+                target=dict(dict(delivery).get("target") or {}),
+                explicit=bool(dict(delivery).get("explicit", True)),
+                payload_source=dict(
+                    dict(delivery).get("payload_source") or {"type": "monitor.report"}
+                ),
+                template=_optional_string(dict(delivery).get("template")),
+                include_observed_rows=bool(
+                    dict(delivery).get("include_observed_rows", True)
+                ),
+            )
+        ),
+        action=MonitorActionIntent(
+            actions=tuple(str(item) for item in action.get("actions") or ()),
+            steps=tuple(
+                dict(step)
+                for step in action.get("steps") or ()
+                if isinstance(step, dict)
+            ),
+        ),
+        display=MonitorDisplayIntent(
+            explicit_name=_optional_string(display.get("explicit_name")),
+            suggested_name=_optional_string(display.get("suggested_name")),
+            description=_optional_string(display.get("description")),
+        ),
+        policy=MonitorPolicyIntent(dict(data.get("policy") or {})),
+        budget=MonitorBudgetIntent(
+            dict(data.get("budget") or data.get("budgets") or {})
+        ),
+        confidence=_confidence(data.get("confidence")),
+        diagnostics=dict(data.get("diagnostics") or {}),
+    )
+
+
+def _dict_or_none(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return dict(value)
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, confidence))
 
 
 def _planned_read_observation_plan(

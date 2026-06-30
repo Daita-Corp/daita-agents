@@ -34,6 +34,10 @@ from .monitor_lifecycle import (
     DbMonitorLocalDeliveryExecutor,
     DbMonitorPlanLifecycleExecutor,
 )
+from .monitor_read import (
+    DbMonitorReadExecutor,
+    DbMonitorResolveApprovalExecutor,
+)
 from .query import (
     DbPlanningContextExecutor,
     DbQueryPlanValidationExecutor,
@@ -293,6 +297,8 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                         "monitor.definition",
                         "monitor.deleted",
                         "monitor.disabled",
+                        "monitor.paused",
+                        "monitor.resumed",
                     }
                 ),
                 executor="db_runtime.monitor.commit_lifecycle",
@@ -300,6 +306,52 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 side_effecting=True,
                 replay_safe=True,
                 idempotent=True,
+            ),
+            Capability(
+                id="db.monitor.read",
+                owner="db_runtime",
+                description="Read DB monitor definitions, inspections, run summaries, or approvals.",
+                domains=frozenset({"db", "monitor"}),
+                operation_types=frozenset(
+                    {
+                        "monitor.list",
+                        "monitor.inspect",
+                        "monitor.explain_run",
+                        "monitor.approvals",
+                    }
+                ),
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.LOW,
+                input_schema=common_schema,
+                output_evidence=frozenset(
+                    {
+                        "monitor.listing",
+                        "monitor.inspection",
+                        "monitor.run_summary",
+                        "monitor.approval_state",
+                    }
+                ),
+                executor="db_runtime.monitor.read",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
+                id="db.monitor.resolve_approval",
+                owner="db_runtime",
+                description="Resolve a pending monitor approval through the runtime approval channel.",
+                domains=frozenset({"db", "monitor"}),
+                operation_types=frozenset({"monitor.approval"}),
+                access=AccessMode.WRITE,
+                risk=RiskLevel.MEDIUM,
+                input_schema=common_schema,
+                output_evidence=frozenset({"monitor.approval_resolution"}),
+                executor="db_runtime.monitor.resolve_approval",
+                runtime_only=True,
+                side_effecting=True,
+                replay_safe=False,
+                idempotent=False,
             ),
             Capability(
                 id="monitor.delivery.local",
@@ -480,6 +532,8 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
             DbMemoryLearningRunExecutor(self),
             DbMonitorPlanLifecycleExecutor(self),
             DbMonitorCommitLifecycleExecutor(self),
+            DbMonitorReadExecutor(self),
+            DbMonitorResolveApprovalExecutor(self),
             DbMonitorLocalDeliveryExecutor(self),
         ]
         if self.llm_capable:
@@ -591,6 +645,66 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 json_schema=object_schema,
                 description="Accepted DB monitor definition committed from a proposal.",
+            ),
+            EvidenceSchema(
+                kind="monitor.listing",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor listing produced by monitor read.",
+            ),
+            EvidenceSchema(
+                kind="monitor.inspection",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor inspection produced by monitor read.",
+            ),
+            EvidenceSchema(
+                kind="monitor.run_summary",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor run summary produced by monitor read.",
+            ),
+            EvidenceSchema(
+                kind="monitor.approval_state",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted monitor approval state produced by monitor read.",
+            ),
+            EvidenceSchema(
+                kind="monitor.approval_resolution",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Monitor approval resolution evidence.",
+            ),
+            EvidenceSchema(
+                kind="monitor.state_update",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor lifecycle update evidence.",
+            ),
+            EvidenceSchema(
+                kind="monitor.deleted",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor delete evidence.",
+            ),
+            EvidenceSchema(
+                kind="monitor.disabled",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor disable evidence.",
+            ),
+            EvidenceSchema(
+                kind="monitor.paused",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor pause evidence.",
+            ),
+            EvidenceSchema(
+                kind="monitor.resumed",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor resume evidence.",
             ),
             EvidenceSchema(
                 kind="db.memory.proposal",

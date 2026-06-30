@@ -1346,6 +1346,16 @@ def _synthesis_dependencies(
             _append_dependency_for_kind(dependencies, accepted, kind)
         _append_dependency_for_kind(dependencies, accepted, "verification.result")
     else:
+        for item in accepted:
+            if item.kind in {
+                "planner.decision",
+                "planner.compilation",
+                "planner.observation",
+                "verification.result",
+                "answer.synthesis",
+            }:
+                continue
+            dependencies.append(_dependency_for_evidence(item))
         _append_dependency_for_kind(dependencies, accepted, "verification.result")
     seen: set[tuple[str | None, str | None]] = set()
     unique: list[TaskDependency] = []

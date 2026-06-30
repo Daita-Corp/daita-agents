@@ -62,6 +62,15 @@ _SIMPLE_ACTION_CAPABILITIES: dict[DbPlannerActionKind, tuple[str, ...]] = {
     DbPlannerActionKind.SYNTHESIZE: ("db.answer.synthesize",),
 }
 
+_MONITOR_ACTION_CAPABILITIES: dict[DbPlannerActionKind, str] = {
+    DbPlannerActionKind.PLAN_MONITOR_CREATE: "db.monitor.plan_create",
+    DbPlannerActionKind.COMMIT_MONITOR_CREATE: "db.monitor.commit_create",
+    DbPlannerActionKind.PLAN_MONITOR_LIFECYCLE: "db.monitor.plan_lifecycle",
+    DbPlannerActionKind.COMMIT_MONITOR_LIFECYCLE: "db.monitor.commit_lifecycle",
+    DbPlannerActionKind.READ_MONITOR_STATE: "db.monitor.read",
+    DbPlannerActionKind.RESOLVE_MONITOR_APPROVAL: "db.monitor.resolve_approval",
+}
+
 _TERMINAL_TASK_STATUSES = {
     TaskStatus.SUCCEEDED,
     TaskStatus.FAILED,
@@ -807,6 +816,13 @@ class DbAgentLoop:
                 sequence_start=sequence_start,
                 decision_fingerprint=decision_fingerprint,
             )
+        if action.kind in _MONITOR_ACTION_CAPABILITIES:
+            return self._compile_monitor_action(
+                action,
+                state=state,
+                sequence_start=sequence_start,
+                decision_fingerprint=decision_fingerprint,
+            )
         capability_ids = _SIMPLE_ACTION_CAPABILITIES.get(action.kind)
         if capability_ids is None:
             return [], [], [_action_error(action, "unsupported_action_kind")]
@@ -858,6 +874,10 @@ class DbAgentLoop:
             metadata=metadata,
             deterministic_key=f"{action.action_id}:db.sql.validate",
         )
+        validation_spec = _with_deterministic_task_id(
+            state.operation_id,
+            validation_spec,
+        )
         execute_input: dict[str, Any] = {
             "sql_ref": "sql.validation",
             "params": list(action.input.get("params") or ()),
@@ -874,6 +894,10 @@ class DbAgentLoop:
             sequence=sequence_start + 1,
             metadata=metadata,
             deterministic_key=f"{action.action_id}:{execute_capability_id}",
+        )
+        execute_spec = _with_deterministic_task_id(
+            state.operation_id,
+            execute_spec,
         )
         return (
             [validation_spec, execute_spec],
@@ -910,7 +934,52 @@ class DbAgentLoop:
             metadata=_action_metadata(action, decision_fingerprint),
             deterministic_key=f"{action.action_id}:{capability.id}",
         )
+        spec = _with_deterministic_task_id(state.operation_id, spec)
         return [spec], [_capability_selection(capability, action)], []
+
+    def _compile_monitor_action(
+        self,
+        action: DbPlannerAction,
+        *,
+        state: DbLoopState,
+        sequence_start: int,
+        decision_fingerprint: str,
+    ) -> tuple[list[DbTaskSpec], list[dict[str, Any]], list[dict[str, Any]]]:
+        capability_id = _MONITOR_ACTION_CAPABILITIES[action.kind]
+        owner = _action_owner(action)
+        resolved = self._resolve_capability(capability_id, owner=owner)
+        error = self._capability_error(action, resolved)
+        if error is not None:
+            return [], [], [error]
+        capability = resolved["capability"]
+        access_errors = self._access_errors(action, [capability], state)
+        if access_errors:
+            return [], [], access_errors
+        expected_evidence, evidence_error = _monitor_action_output_evidence(action)
+        if evidence_error is not None:
+            return [], [], [_action_error(action, evidence_error)]
+        task_input = _task_input_for_action(action)
+        spec = DbTaskSpec(
+            capability_id=capability.id,
+            owner=capability.owner,
+            input=task_input,
+            reason=f"planner:{action.kind.value}",
+            sequence=sequence_start,
+            metadata=_action_metadata(action, decision_fingerprint),
+            deterministic_key=f"{action.action_id}:{capability.id}",
+        )
+        spec = _with_deterministic_task_id(state.operation_id, spec)
+        return (
+            [spec],
+            [
+                _capability_selection(
+                    capability,
+                    action,
+                    output_evidence=(expected_evidence,),
+                )
+            ],
+            [],
+        )
 
     def _compile_capability_specs(
         self,
@@ -938,16 +1007,20 @@ class DbAgentLoop:
         if access_errors:
             return [], [], access_errors
         specs: list[DbTaskSpec] = []
+        task_input = _task_input_for_action(action)
         for offset, capability in enumerate(capabilities):
             specs.append(
-                DbTaskSpec(
-                    capability_id=capability.id,
-                    owner=capability.owner,
-                    input=_task_input_for_action(action),
-                    reason=f"planner:{action.kind.value}",
-                    sequence=sequence_start + offset,
-                    metadata=_action_metadata(action, decision_fingerprint),
-                    deterministic_key=f"{action.action_id}:{capability.id}",
+                _with_deterministic_task_id(
+                    state.operation_id,
+                    DbTaskSpec(
+                        capability_id=capability.id,
+                        owner=capability.owner,
+                        input=task_input,
+                        reason=f"planner:{action.kind.value}",
+                        sequence=sequence_start + offset,
+                        metadata=_action_metadata(action, decision_fingerprint),
+                        deterministic_key=f"{action.action_id}:{capability.id}",
+                    ),
                 )
             )
         return specs, [_capability_selection(item, action) for item in capabilities], []
@@ -1491,6 +1564,32 @@ def _with_spec_dependencies(
     ]
 
 
+def _with_deterministic_task_id(
+    operation_id: str,
+    spec: DbTaskSpec,
+) -> DbTaskSpec:
+    if spec.task_id:
+        return spec
+    input_hash = _stable_hash(spec.input)
+    idempotency_key = spec.idempotency_key or _stable_hash(
+        {
+            "operation_id": operation_id,
+            "capability_id": spec.capability_id,
+            "owner": spec.owner,
+            "input_hash": input_hash,
+            "sequence": spec.sequence,
+            "deterministic_key": spec.deterministic_key,
+        }
+    )
+    task_fingerprint = _stable_hash(
+        {
+            "operation_id": operation_id,
+            "idempotency_key": idempotency_key,
+        }
+    )
+    return replace(spec, task_id=f"db-task-{task_fingerprint[:32]}")
+
+
 def _merge_dependencies(
     left: tuple[TaskDependency, ...],
     right: tuple[TaskDependency, ...],
@@ -1594,6 +1693,59 @@ def _task_input_for_action(action: DbPlannerAction) -> dict[str, Any]:
     }
 
 
+def _monitor_action_output_evidence(
+    action: DbPlannerAction,
+) -> tuple[str, str | None]:
+    if action.kind is DbPlannerActionKind.PLAN_MONITOR_CREATE:
+        return "monitor.proposal", None
+    if action.kind is DbPlannerActionKind.COMMIT_MONITOR_CREATE:
+        return "monitor.definition", None
+    if action.kind is DbPlannerActionKind.PLAN_MONITOR_LIFECYCLE:
+        return "monitor.proposal", None
+    if action.kind is DbPlannerActionKind.COMMIT_MONITOR_LIFECYCLE:
+        lifecycle_action = _monitor_lifecycle_action_label(
+            action.input.get("action") or action.input.get("operation_type")
+        )
+        if lifecycle_action is None:
+            return "", "missing_monitor_lifecycle_action"
+        return _monitor_lifecycle_evidence_kind(lifecycle_action), None
+    if action.kind is DbPlannerActionKind.READ_MONITOR_STATE:
+        read_kind = str(action.input.get("read_kind") or "list").lower()
+        evidence_kind = {
+            "list": "monitor.listing",
+            "inspect": "monitor.inspection",
+            "explain_run": "monitor.run_summary",
+            "approvals": "monitor.approval_state",
+        }.get(read_kind)
+        if evidence_kind is None:
+            return "", f"unsupported_monitor_read_kind:{read_kind}"
+        return evidence_kind, None
+    if action.kind is DbPlannerActionKind.RESOLVE_MONITOR_APPROVAL:
+        return "monitor.approval_resolution", None
+    return "", "unsupported_monitor_action_kind"
+
+
+def _monitor_lifecycle_action_label(value: Any) -> str | None:
+    normalized = str(value or "").removeprefix("monitor.").replace("_", ".").lower()
+    if normalized in {"update", "pause", "resume", "delete", "disable"}:
+        return normalized
+    if normalized == "disabled":
+        return "disable"
+    return None
+
+
+def _monitor_lifecycle_evidence_kind(action: str) -> str:
+    if action == "delete":
+        return "monitor.deleted"
+    if action == "disable":
+        return "monitor.disabled"
+    if action == "pause":
+        return "monitor.paused"
+    if action == "resume":
+        return "monitor.resumed"
+    return "monitor.state_update"
+
+
 def _action_metadata(
     action: DbPlannerAction,
     decision_fingerprint: str,
@@ -1614,13 +1766,22 @@ def _action_error(action: DbPlannerAction, error: str) -> dict[str, Any]:
     }
 
 
-def _capability_selection(capability: Any, action: DbPlannerAction) -> dict[str, Any]:
+def _capability_selection(
+    capability: Any,
+    action: DbPlannerAction,
+    *,
+    output_evidence: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     return {
         "id": capability.id,
         "owner": capability.owner,
         "access": capability.access.value,
         "risk": capability.risk.value,
-        "output_evidence": sorted(capability.output_evidence),
+        "output_evidence": (
+            sorted(output_evidence)
+            if output_evidence is not None
+            else sorted(capability.output_evidence)
+        ),
         "action_id": action.action_id,
         "reason": action.kind.value,
     }

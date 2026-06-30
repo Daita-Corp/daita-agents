@@ -126,9 +126,10 @@ class DbMonitorCommitLifecycleExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        proposal_evidence = await _load_evidence(
+        proposal_evidence = await _load_monitor_proposal_evidence(
             runtime,
-            operation.id,
+            operation,
+            task,
             task.input.get("proposal_evidence_id"),
         )
         if proposal_evidence is None:
@@ -315,6 +316,53 @@ async def _load_evidence(
         if evidence.id == evidence_id:
             return evidence
     return None
+
+
+async def _load_monitor_proposal_evidence(
+    runtime: Any,
+    operation: Operation,
+    task: Task,
+    evidence_id: Any,
+) -> Evidence | None:
+    explicit = await _load_evidence(runtime, operation.id, evidence_id)
+    if explicit is not None:
+        return explicit
+    evidence = await runtime.store.list_evidence(operation.id)
+    for dependency in task.dependencies:
+        if dependency.kind.value != "evidence":
+            continue
+        if dependency.evidence_kind != "monitor.proposal":
+            continue
+        for item in reversed(evidence):
+            if _evidence_matches_dependency(item, dependency):
+                return item
+    for item in reversed(evidence):
+        if item.kind == "monitor.proposal" and item.accepted:
+            return item
+    return None
+
+
+def _evidence_matches_dependency(evidence: Evidence, dependency: Any) -> bool:
+    if evidence.kind != dependency.evidence_kind:
+        return False
+    if dependency.evidence_id is not None and evidence.id != dependency.evidence_id:
+        return False
+    if (
+        dependency.evidence_owner is not None
+        and evidence.owner != dependency.evidence_owner
+    ):
+        return False
+    if (
+        dependency.producer_task_id is not None
+        and evidence.task_id != dependency.producer_task_id
+    ):
+        return False
+    if evidence.accepted is not dependency.evidence_accepted:
+        return False
+    for key, value in dependency.evidence_payload.items():
+        if evidence.payload.get(key) != value:
+            return False
+    return True
 
 
 def _monitor_lifecycle_action(value: str) -> str:

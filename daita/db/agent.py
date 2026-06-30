@@ -11,7 +11,6 @@ from typing import Any
 from daita.agents.conversation import ConversationHistory
 from daita.core.tracing import TraceType, get_trace_manager
 
-from .monitor_commands.service import DbMonitorCommandService
 from .models import DbOperationResult, DbRequest, DbRuntimeInspection
 from .monitors import DbMonitor, DbMonitorInspection
 from .runtime import DbRuntime
@@ -31,7 +30,6 @@ class DbAgent:
         self.runtime = runtime
         self.name = name
         self._default_history = default_history
-        self._monitor_commands = DbMonitorCommandService(runtime)
 
     @property
     def operations(self) -> tuple[DbOperationResult, ...]:
@@ -83,12 +81,7 @@ class DbAgent:
             mode=request.mode,
             stateful_history=active_history is not None,
         ):
-            monitor_result = await self._monitor_commands.run(request)
-            result = (
-                monitor_result
-                if monitor_result is not None
-                else await self.runtime.run(request)
-            )
+            result = await self.runtime.run(request)
             if active_history is not None:
                 await active_history.add_turn(prompt, result.answer or "")
             return result

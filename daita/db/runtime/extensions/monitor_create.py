@@ -9,9 +9,11 @@ from uuid import uuid4
 from daita.runtime import Evidence, Operation, Task
 
 from ...analysis import stable_fingerprint
-from ...models import DbRequest
-from ...monitor_commands.extractor import DeterministicMonitorIntentExtractor
-from ...monitor_commands.planner import DbMonitorPlanner, _monitor_from_proposal
+from ...monitor_commands.planner import (
+    DbMonitorPlanner,
+    _monitor_from_proposal,
+    monitor_create_intent_from_dict,
+)
 from ...monitor_commands.types import DbMonitorCommand, DbMonitorValidation
 from ...monitors import DbMonitorMutation, DbMonitorState
 from ..tasks import DbTaskSpec
@@ -33,34 +35,67 @@ class DbMonitorPlanCreateExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        command = DbMonitorCommand(
-            **dict(task.input.get("command") or operation.request.get("command") or {})
+        task_input = dict(task.input)
+        source_scope = tuple(
+            str(item)
+            for item in (
+                task.input.get("source_scope")
+                or operation.request.get("source_scope")
+                or ()
+            )
         )
-        source_scope = tuple(str(item) for item in task.input.get("source_scope") or ())
-        preliminary_intent = DeterministicMonitorIntentExtractor().extract(
-            command,
-            DbRequest(prompt=command.prompt, source_scope=source_scope),
-            host_defaults={"delivery_default": _hosted_delivery_default(runtime)},
+        planner = DbMonitorPlanner(
+            registry=runtime.registry,
+            limits=runtime.config.limits.to_dict(),
+            delivery_default=_hosted_delivery_default(runtime),
         )
-        target = preliminary_intent.target.name or ""
+        proposal_input = _structured_proposal_input(task_input)
+        intent = None
+        if proposal_input is None and isinstance(task_input.get("intent"), dict):
+            intent = monitor_create_intent_from_dict(dict(task_input["intent"]))
+        target = (
+            str(proposal_input.get("target_name") or proposal_input.get("target") or "")
+            if proposal_input is not None
+            else (intent.target.name if intent is not None else "")
+        )
         schema_evidence = await _inspect_monitor_target_schema(
             runtime,
             operation,
             target=target,
         )
-        proposal, validation = DbMonitorPlanner(
-            registry=runtime.registry,
-            limits=runtime.config.limits.to_dict(),
-            delivery_default=_hosted_delivery_default(runtime),
-        ).create_proposal(
-            command,
-            source_scope=source_scope,
-            owner=dict(task.input.get("owner") or {}),
-            schema=(schema_evidence.payload if schema_evidence is not None else None),
-            schema_evidence_id=(
-                schema_evidence.id if schema_evidence is not None else None
-            ),
-        )
+        if proposal_input is not None:
+            proposal, validation = planner.create_structured_proposal(
+                proposal_input,
+                source_scope=source_scope,
+                owner=dict(task.input.get("owner") or {}),
+                schema_evidence_id=(
+                    schema_evidence.id if schema_evidence is not None else None
+                ),
+            )
+        elif intent is not None:
+            command = DbMonitorCommand(
+                kind="create",
+                monitor_id=_optional_string(task_input.get("monitor_id")),
+                prompt=str(
+                    task_input.get("prompt") or operation.request.get("prompt") or ""
+                ),
+                confidence=float(task_input.get("confidence") or 1.0),
+                diagnostics={"intent": intent.to_dict()},
+            )
+            proposal, validation = planner.create_proposal(
+                command,
+                source_scope=source_scope,
+                owner=dict(task.input.get("owner") or {}),
+                schema=(
+                    schema_evidence.payload if schema_evidence is not None else None
+                ),
+                schema_evidence_id=(
+                    schema_evidence.id if schema_evidence is not None else None
+                ),
+                intent=intent,
+            )
+        else:
+            proposal, validation = _blocked_structured_input_required(task_input)
         fingerprint = str(
             proposal.get("proposal_fingerprint") or stable_fingerprint(proposal)
         )
@@ -82,6 +117,89 @@ class DbMonitorPlanCreateExecutor:
                 },
             )
         ]
+
+
+def _structured_proposal_input(data: dict[str, Any]) -> dict[str, Any] | None:
+    for key in ("proposal", "monitor"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            return dict(value)
+    if isinstance(data.get("observation_plan"), dict):
+        return {
+            key: value
+            for key, value in data.items()
+            if key
+            in {
+                "monitor_id",
+                "id",
+                "name",
+                "display_name",
+                "description",
+                "status",
+                "target_type",
+                "target_name",
+                "target",
+                "source_scope",
+                "schedule",
+                "stream",
+                "trigger",
+                "observation_plan",
+                "action_plan",
+                "initial_state",
+                "policy",
+                "budgets",
+                "owner",
+                "governance",
+                "metadata",
+            }
+        }
+    return None
+
+
+def _blocked_structured_input_required(
+    data: dict[str, Any],
+) -> tuple[dict[str, Any], DbMonitorValidation]:
+    validation = DbMonitorValidation(
+        accepted=False,
+        errors=("monitor.proposal_incomplete:structured_input",),
+        diagnostics={"input_keys": sorted(str(key) for key in data)},
+    )
+    proposal: dict[str, Any] = {
+        "kind": "monitor.proposal",
+        "monitor_id": _optional_string(data.get("monitor_id")) or "db_monitor",
+        "name": _optional_string(data.get("name")) or "DB Monitor",
+        "description": "",
+        "status": "blocked",
+        "target_type": "table",
+        "target_name": _optional_string(data.get("target_name")) or "",
+        "source_scope": list(data.get("source_scope") or ()),
+        "schedule": None,
+        "stream": None,
+        "trigger": {},
+        "observation_plan": {},
+        "action_plan": {"kind": "none", "steps": []},
+        "initial_state": {},
+        "policy": {},
+        "budgets": {},
+        "owner": dict(data.get("owner") or {}),
+        "runtime_limits": {},
+        "governance": {"approval_required": False, "risk": "low"},
+        "metadata": {
+            "created_from_structured_planner_action": True,
+            "validation": validation.to_dict(),
+        },
+        "validation": validation.to_dict(),
+    }
+    proposal["proposal_fingerprint"] = stable_fingerprint(proposal)
+    proposal["metadata"]["proposal_fingerprint"] = proposal["proposal_fingerprint"]
+    return proposal, validation
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _hosted_delivery_default(runtime: Any) -> str | None:
@@ -111,9 +229,10 @@ class DbMonitorCommitCreateExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        proposal_evidence = await _load_evidence(
+        proposal_evidence = await _load_monitor_proposal_evidence(
             runtime,
-            operation.id,
+            operation,
+            task,
             task.input.get("proposal_evidence_id"),
         )
         if proposal_evidence is None:
@@ -191,6 +310,53 @@ async def _load_evidence(
         if evidence.id == evidence_id:
             return evidence
     return None
+
+
+async def _load_monitor_proposal_evidence(
+    runtime: Any,
+    operation: Operation,
+    task: Task,
+    evidence_id: Any,
+) -> Evidence | None:
+    explicit = await _load_evidence(runtime, operation.id, evidence_id)
+    if explicit is not None:
+        return explicit
+    evidence = await runtime.store.list_evidence(operation.id)
+    for dependency in task.dependencies:
+        if dependency.kind.value != "evidence":
+            continue
+        if dependency.evidence_kind != "monitor.proposal":
+            continue
+        for item in reversed(evidence):
+            if _evidence_matches_dependency(item, dependency):
+                return item
+    for item in reversed(evidence):
+        if item.kind == "monitor.proposal" and item.accepted:
+            return item
+    return None
+
+
+def _evidence_matches_dependency(evidence: Evidence, dependency: Any) -> bool:
+    if evidence.kind != dependency.evidence_kind:
+        return False
+    if dependency.evidence_id is not None and evidence.id != dependency.evidence_id:
+        return False
+    if (
+        dependency.evidence_owner is not None
+        and evidence.owner != dependency.evidence_owner
+    ):
+        return False
+    if (
+        dependency.producer_task_id is not None
+        and evidence.task_id != dependency.producer_task_id
+    ):
+        return False
+    if evidence.accepted is not dependency.evidence_accepted:
+        return False
+    for key, value in dependency.evidence_payload.items():
+        if evidence.payload.get(key) != value:
+            return False
+    return True
 
 
 async def _inspect_monitor_target_schema(

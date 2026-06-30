@@ -12,9 +12,21 @@ from daita.db.models import (
     DbRequest,
     normalize_db_telemetry_diagnostics,
 )
+from daita.db.planner_protocol import (
+    DbPlannerAction,
+    DbPlannerActionKind,
+    DbPlannerDecision,
+    DbPlannerDecisionStatus,
+)
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import AccessMode, Evidence, OperationStatus
+from daita.runtime import (
+    AccessMode,
+    Evidence,
+    HostRuntimeContext,
+    OperationStatus,
+    host_runtime_context,
+)
 
 
 async def _seed_sqlite(path):
@@ -82,6 +94,25 @@ class FakeTraceLLMService:
         )
 
 
+class FakeTraceMonitorPlanner:
+    def __init__(self):
+        self.states = []
+
+    async def plan(self, state):
+        self.states.append(state)
+        return DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "monitor.list"},
+            actions=(
+                DbPlannerAction(
+                    action_id="list_monitors",
+                    kind=DbPlannerActionKind.READ_MONITOR_STATE,
+                    input={"read_kind": "list"},
+                ),
+            ),
+        )
+
+
 def _reset_traces():
     trace_manager = get_trace_manager()
     trace_manager.flush(timeout_millis=2000)
@@ -105,11 +136,14 @@ def _finished_span_dicts(trace_manager):
     ]
 
 
-async def test_monitor_command_result_has_trace_correlation(tmp_path):
+async def test_prompt_monitor_loop_result_has_trace_correlation(tmp_path):
     trace_manager = _reset_traces()
     db_path = tmp_path / "monitor_trace.sqlite"
     await _seed_sqlite(db_path)
-    agent = await Agent.from_db(str(db_path), name="MonitorTraceTest", cache_ttl=0)
+    planner = FakeTraceMonitorPlanner()
+    host_context = HostRuntimeContext(services={"db_agent_planner": planner})
+    with host_runtime_context(host_context):
+        agent = await Agent.from_db(str(db_path), name="MonitorTraceTest", cache_ttl=0)
 
     try:
         result = await agent.run_detailed("List monitors", session_id="monitor-session")
@@ -119,10 +153,12 @@ async def test_monitor_command_result_has_trace_correlation(tmp_path):
 
     assert result.status is OperationStatus.SUCCEEDED
     assert snapshot is not None
+    assert len(planner.states) == 1
     trace = result.diagnostics["trace"]
     assert snapshot.operation.metadata["trace"] == trace
-    assert snapshot.operation.metadata["control_plane"] == "db.monitor"
-    assert snapshot.operation.metadata["command_kind"] == "list"
+    assert snapshot.operation.operation_type == "db.run"
+    assert any(item.kind == "monitor.listing" for item in snapshot.evidence)
+    assert any(item.kind == "answer.synthesis" for item in snapshot.evidence)
     assert all(event.trace_id == trace["trace_id"] for event in snapshot.events)
 
     spans = _finished_span_dicts(trace_manager)
@@ -133,8 +169,7 @@ async def test_monitor_command_result_has_trace_correlation(tmp_path):
         and span["attributes"].get("daita.trace.type")
         == TraceType.AGENT_EXECUTION.value
     )
-    assert root["attributes"]["daita.control_plane"] == "db.monitor"
-    assert root["attributes"]["daita.command.kind"] == "list"
+    assert root["attributes"]["daita.operation.type"] == "db.run"
 
 
 async def test_blocked_operation_keeps_trace_correlation(tmp_path):

@@ -130,6 +130,63 @@ def _decision_schema_hint() -> dict[str, Any]:
         "clarification_question": None,
         "rationale": "optional",
         "metadata": {},
+        "monitor_action_inputs": {
+            "plan_monitor_create": {
+                "intent": {
+                    "target": {
+                        "target_type": "table",
+                        "name": "table_or_asset_name",
+                        "source_scope": [],
+                    },
+                    "condition": {
+                        "kind": "new_rows | rows_present | threshold | freshness | report",
+                        "operator": "optional comparison operator",
+                        "value": "optional threshold",
+                        "path": "optional value path",
+                    },
+                    "schedule": {
+                        "kind": "interval",
+                        "interval_seconds": 300,
+                    },
+                    "delivery": {
+                        "delivery_kind": "local | in_app | email | slack",
+                        "target": {},
+                    },
+                    "display": {
+                        "explicit_name": "optional name",
+                        "description": "optional description",
+                    },
+                    "policy": {},
+                    "budget": {},
+                },
+                "owner": {},
+            },
+            "commit_monitor_create": {
+                "depends_on": ["plan_monitor_create_action_id"],
+                "input": {},
+            },
+            "plan_monitor_lifecycle": {
+                "action": "update | pause | resume | delete | disable",
+                "monitor_id": "structured monitor id or reference",
+                "patch": {},
+                "paused_until": "optional ISO timestamp",
+            },
+            "commit_monitor_lifecycle": {
+                "action": "update | pause | resume | delete | disable",
+                "depends_on": ["plan_monitor_lifecycle_action_id"],
+            },
+            "read_monitor_state": {
+                "read_kind": "list | inspect | explain_run | approvals",
+                "monitor_id": "optional structured monitor id or reference",
+                "status": "optional status filter for list",
+                "pending_only": True,
+            },
+            "resolve_monitor_approval": {
+                "approval_action": "approve | reject | cancel",
+                "approval_id": "optional approval id",
+                "monitor_id": "optional structured monitor id or reference",
+            },
+        },
     }
 
 
