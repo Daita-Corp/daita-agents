@@ -155,9 +155,9 @@ class DbSessionContext:
             user_id=str(value["user_id"]) if value.get("user_id") is not None else None,
             current_prompt=str(value.get("current_prompt") or ""),
             conversation_messages=tuple(
-                _message_dict(item)
+                message
                 for item in value.get("conversation_messages", ()) or ()
-                if _message_dict(item) is not None
+                if (message := _message_dict(item)) is not None
             ),
             recent_operations=tuple(
                 DbSessionOperationRef.from_dict(item)

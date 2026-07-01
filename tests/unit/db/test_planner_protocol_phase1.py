@@ -183,6 +183,40 @@ def test_planner_protocol_records_serialize_cleanly():
     assert DbLoopState.from_dict(state.to_dict()) == state
 
 
+def test_planner_protocol_from_dict_rejects_unknown_keys():
+    action_payload = {
+        "action_id": "a1",
+        "kind": "execute_validated_read",
+        "input": {"sql": "select 1"},
+        "unexpected_action_key": True,
+    }
+    decision_payload = {
+        "status": "continue",
+        "actions": [],
+        "unexpected_decision_key": True,
+    }
+
+    with pytest.raises(TypeError, match="unexpected.*unexpected_action_key"):
+        DbPlannerAction.from_dict(action_payload)
+    with pytest.raises(TypeError, match="unexpected.*unexpected_decision_key"):
+        DbPlannerDecision.from_dict(decision_payload)
+
+
+def test_planner_protocol_string_collections_are_strict():
+    with pytest.raises(TypeError, match="string collections"):
+        DbPlannerAction(
+            action_id="a1",
+            kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+            depends_on=({"action_id": "a0"},),
+        )
+
+    with pytest.raises(TypeError, match="string collections"):
+        DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            stop_conditions=({"name": "verified"},),
+        )
+
+
 def test_db_agent_planner_requires_plan_implementation():
     class MissingPlan(DbAgentPlanner):
         pass

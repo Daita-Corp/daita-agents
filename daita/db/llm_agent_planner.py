@@ -10,9 +10,18 @@ from .llm_service import DbLLMService
 from .planner_protocol import (
     DbAgentPlanner,
     DbLoopState,
+    DbPlannerAction,
     DbPlannerActionKind,
     DbPlannerDecision,
     DbPlannerDecisionStatus,
+)
+
+_PLANNER_DECISION_KEYS = frozenset(DbPlannerDecision.__dataclass_fields__)
+_PLANNER_ACTION_KEYS = frozenset(DbPlannerAction.__dataclass_fields__)
+_PLANNER_DECISION_ENVELOPES = (
+    "decision",
+    "planner_decision",
+    "DbPlannerDecision",
 )
 
 
@@ -65,12 +74,14 @@ class DbLLMAgentPlanner(DbAgentPlanner):
                 metadata={
                     "failure": "planner_decision_invalid",
                     "error": str(exc),
+                    "planner_json_normalization": diagnostics,
                     "llm": response.diagnostics,
                 },
             )
         metadata = {
             **decision.metadata,
             "llm": response.diagnostics,
+            "planner_json_normalization": diagnostics,
         }
         return DbPlannerDecision(
             status=decision.status,
@@ -204,15 +215,19 @@ def _decision_schema_hint() -> dict[str, Any]:
 
 
 def _parse_planner_json(content: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    diagnostics: dict[str, Any] = {"normalization_steps": []}
     raw = _strip_json_fence(content)
+    if raw != content.strip():
+        _add_normalization_step(diagnostics, "json_fence_stripped")
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        return None, {"error": "planner_json_decode_error", "message": str(exc)}
+        diagnostics.update({"error": "planner_json_decode_error", "message": str(exc)})
+        return None, diagnostics
     if not isinstance(parsed, dict):
-        return None, {"error": "planner_json_not_object"}
-    parsed = _unwrap_planner_decision(parsed)
-    return parsed, {}
+        diagnostics["error"] = "planner_json_not_object"
+        return None, diagnostics
+    return _normalize_planner_decision_payload(parsed, diagnostics)
 
 
 def _strip_json_fence(content: str) -> str:
@@ -221,11 +236,132 @@ def _strip_json_fence(content: str) -> str:
     return match.group(1).strip() if match else stripped
 
 
-def _unwrap_planner_decision(parsed: dict[str, Any]) -> dict[str, Any]:
+def _normalize_planner_decision_payload(
+    parsed: dict[str, Any],
+    diagnostics: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    diagnostics = diagnostics or {"normalization_steps": []}
+    payload = _unwrap_planner_decision(parsed, diagnostics)
+    normalized = {
+        key: value for key, value in payload.items() if key in _PLANNER_DECISION_KEYS
+    }
+    dropped_decision_keys = sorted(set(payload) - _PLANNER_DECISION_KEYS)
+    if dropped_decision_keys:
+        diagnostics["dropped_decision_keys"] = dropped_decision_keys
+        _add_normalization_step(
+            diagnostics,
+            "dropped_decision_keys",
+            keys=dropped_decision_keys,
+        )
+
+    if "stop_conditions" in normalized:
+        normalized["stop_conditions"] = _coerce_boundary_string_list(
+            normalized["stop_conditions"],
+            diagnostics=diagnostics,
+            path="stop_conditions",
+        )
+
+    actions = normalized.get("actions")
+    if isinstance(actions, list):
+        normalized["actions"] = [
+            _normalize_planner_action_payload(action, index, diagnostics)
+            for index, action in enumerate(actions)
+        ]
+    return normalized, diagnostics
+
+
+def _unwrap_planner_decision(
+    parsed: dict[str, Any], diagnostics: dict[str, Any]
+) -> dict[str, Any]:
     if "status" in parsed:
         return parsed
-    for key in ("decision", "planner_decision", "DbPlannerDecision"):
+    for key in _PLANNER_DECISION_ENVELOPES:
         value = parsed.get(key)
         if isinstance(value, dict):
+            diagnostics["unwrapped_envelope"] = key
+            _add_normalization_step(diagnostics, "unwrapped_envelope", key=key)
+            dropped_envelope_keys = sorted(set(parsed) - {key})
+            if dropped_envelope_keys:
+                diagnostics["dropped_envelope_keys"] = dropped_envelope_keys
+                _add_normalization_step(
+                    diagnostics,
+                    "dropped_envelope_keys",
+                    keys=dropped_envelope_keys,
+                )
             return value
     return parsed
+
+
+def _normalize_planner_action_payload(
+    action: Any, index: int, diagnostics: dict[str, Any]
+) -> Any:
+    if not isinstance(action, dict):
+        return action
+    normalized = {
+        key: value for key, value in action.items() if key in _PLANNER_ACTION_KEYS
+    }
+    dropped_keys = sorted(set(action) - _PLANNER_ACTION_KEYS)
+    if dropped_keys:
+        diagnostics.setdefault("dropped_action_keys", []).append(
+            {
+                "index": index,
+                "action_id": str(action.get("action_id") or ""),
+                "keys": dropped_keys,
+            }
+        )
+        _add_normalization_step(
+            diagnostics,
+            "dropped_action_keys",
+            index=index,
+            keys=dropped_keys,
+        )
+    if "depends_on" in normalized:
+        normalized["depends_on"] = _coerce_boundary_string_list(
+            normalized["depends_on"],
+            diagnostics=diagnostics,
+            path=f"actions[{index}].depends_on",
+        )
+    return normalized
+
+
+def _coerce_boundary_string_list(
+    value: Any,
+    *,
+    diagnostics: dict[str, Any],
+    path: str,
+) -> list[str]:
+    if value is None:
+        coerced: list[str] = []
+    elif isinstance(value, str):
+        coerced = [value]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        coerced = [_coerce_boundary_string_item(item) for item in value]
+    else:
+        coerced = [_coerce_boundary_string_item(value)]
+    if coerced != value:
+        diagnostics.setdefault("coerced_fields", []).append(
+            {"path": path, "before": value, "after": coerced}
+        )
+        _add_normalization_step(
+            diagnostics,
+            "coerced_field",
+            path=path,
+        )
+    return coerced
+
+
+def _coerce_boundary_string_item(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("action_id", "id", "kind", "name"):
+            item = value.get(key)
+            if isinstance(item, str) and item:
+                return item
+    return str(value)
+
+
+def _add_normalization_step(
+    diagnostics: dict[str, Any], step: str, **details: Any
+) -> None:
+    diagnostics.setdefault("normalization_steps", []).append({"step": step, **details})

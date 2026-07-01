@@ -82,21 +82,7 @@ class DbPlannerAction:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DbPlannerAction":
-        values = {
-            key: data[key]
-            for key in (
-                "action_id",
-                "kind",
-                "input",
-                "depends_on",
-                "rationale",
-                "metadata",
-            )
-            if key in data
-        }
-        values["kind"] = DbPlannerActionKind(values["kind"])
-        values["depends_on"] = _coerce_string_tuple(values.get("depends_on"))
-        return cls(**values)
+        return cls(**dict(data))
 
 
 @dataclass(frozen=True)
@@ -144,25 +130,7 @@ class DbPlannerDecision:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DbPlannerDecision":
-        values = {
-            key: data[key]
-            for key in (
-                "status",
-                "intent",
-                "actions",
-                "stop_conditions",
-                "clarification_question",
-                "rationale",
-                "metadata",
-            )
-            if key in data
-        }
-        values["status"] = DbPlannerDecisionStatus(values["status"])
-        values["actions"] = tuple(
-            DbPlannerAction.from_dict(item) for item in values.get("actions", ())
-        )
-        values["stop_conditions"] = _coerce_string_tuple(values.get("stop_conditions"))
-        return cls(**values)
+        return cls(**dict(data))
 
 
 @dataclass(frozen=True)
@@ -380,25 +348,8 @@ def _tuple_json_dicts(
 
 
 def _tuple_strings(values: tuple[str, ...] | list[str] | set[str]) -> tuple[str, ...]:
-    return _coerce_string_tuple(values)
-
-
-def _coerce_string_tuple(value: Any) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, str):
-        return (value,)
-    if not isinstance(value, (tuple, list, set, frozenset)):
-        return (str(value),)
-    return tuple(_coerce_string_item(item) for item in value)
-
-
-def _coerce_string_item(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, Mapping):
-        for key in ("action_id", "id", "kind", "name"):
-            item = value.get(key)
-            if isinstance(item, str) and item:
-                return item
-    return str(value)
+    if isinstance(values, str) or not isinstance(values, (tuple, list, set, frozenset)):
+        raise TypeError("DB planner protocol values must be string collections")
+    if not all(isinstance(value, str) for value in values):
+        raise TypeError("DB planner protocol string collections must contain strings")
+    return tuple(values)

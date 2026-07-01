@@ -14,6 +14,12 @@ from daita.db import (
     SQLiteDbMonitorStore,
 )
 from daita.db.monitor_commands import DbMonitorValidation
+from daita.db.monitor_scheduler.observation import (
+    _cursor_updates_from_plan as _observation_cursor_updates_from_plan,
+)
+from daita.db.monitor_scheduler.state import (
+    _cursor_updates_from_plan as _state_cursor_updates_from_plan,
+)
 from daita.db.runtime.tasks import DbTaskSpec
 from daita.plugins import RuntimeExtensionPlugin, PluginKind, PluginManifest
 from daita.runtime import (
@@ -38,6 +44,21 @@ NOW = datetime(2026, 6, 12, 12, 0, tzinfo=timezone.utc)
 
 def _validation(accepted=True, **kwargs):
     return DbMonitorValidation(accepted=accepted, **kwargs).to_dict()
+
+
+def test_cursor_updates_capture_non_null_values_once_before_max():
+    class PopOnceRow(dict):
+        def get(self, key, default=None):
+            if key == "id":
+                return self.pop(key, default)
+            return super().get(key, default)
+
+    plan = {"cursor_update": {"last_id": "max(rows.id)"}}
+    def payload():
+        return {"rows": [PopOnceRow(id=41), {"id": None}, {"id": 42}]}
+
+    assert _observation_cursor_updates_from_plan(plan, payload()) == {"last_id": 42}
+    assert _state_cursor_updates_from_plan(plan, payload()) == {"last_id": 42}
 
 
 class MonitorReadProbeExecutor:

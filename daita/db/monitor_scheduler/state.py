@@ -30,9 +30,10 @@ def _cursor_updates_from_plan(
             continue
         field = match.group(1)
         values = [
-            row.get(field)
+            value
             for row in rows
-            if isinstance(row, Mapping) and row.get(field) is not None
+            if isinstance(row, Mapping)
+            if (value := row.get(field)) is not None
         ]
         if values:
             updates[cursor_key] = max(values)

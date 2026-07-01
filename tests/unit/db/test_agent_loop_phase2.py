@@ -293,26 +293,7 @@ async def test_agent_loop_rejects_action_outside_contract_before_task_creation()
 
 
 async def test_llm_agent_planner_emits_typed_decision_from_mocked_response():
-    content = json.dumps(
-        {
-            "status": "continue",
-            "intent": {"operation_type": "db.run"},
-            "actions": [
-                {
-                    "action_id": "read",
-                    "kind": "execute_validated_read",
-                    "input": {"owner": "phase_two", "sql": "select 1"},
-                    "depends_on": [],
-                    "rationale": "Need one row.",
-                    "metadata": {"source": "test"},
-                }
-            ],
-            "stop_conditions": ["verified"],
-            "clarification_question": None,
-            "rationale": "Read from the database.",
-            "metadata": {"planner": "fake"},
-        }
-    )
+    content = json.dumps(_llm_planner_payload())
     service = FakeLLMService(content)
     state = _loop_state()
 
@@ -325,6 +306,62 @@ async def test_llm_agent_planner_emits_typed_decision_from_mocked_response():
     assert service.messages is not None
     request_payload = json.loads(service.messages[-1]["content"])
     assert request_payload["state"]["operation_id"] == "op-loop"
+
+
+async def test_llm_agent_planner_parses_fenced_json_at_boundary():
+    content = f"```json\n{json.dumps(_llm_planner_payload())}\n```"
+
+    decision = await DbLLMAgentPlanner(FakeLLMService(content)).plan(_loop_state())
+
+    assert decision.status is DbPlannerDecisionStatus.CONTINUE
+    diagnostics = decision.metadata["planner_json_normalization"]
+    assert any(
+        step["step"] == "json_fence_stripped"
+        for step in diagnostics["normalization_steps"]
+    )
+
+
+async def test_llm_agent_planner_unwraps_common_decision_envelopes():
+    for envelope_key in ("decision", "planner_decision", "DbPlannerDecision"):
+        content = json.dumps({envelope_key: _llm_planner_payload()})
+
+        decision = await DbLLMAgentPlanner(FakeLLMService(content)).plan(_loop_state())
+
+        assert decision.status is DbPlannerDecisionStatus.CONTINUE
+        diagnostics = decision.metadata["planner_json_normalization"]
+        assert diagnostics["unwrapped_envelope"] == envelope_key
+
+
+async def test_llm_agent_planner_normalizes_unknown_keys_and_tuple_fields():
+    payload = _llm_planner_payload(
+        stop_conditions={"name": "verified"},
+        unexpected_decision_key="drop me",
+    )
+    payload["actions"][0]["depends_on"] = [{"action_id": "schema"}]
+    payload["actions"][0]["unexpected_action_key"] = "drop me too"
+    content = json.dumps({"planner_decision": payload, "wrapper_note": "ignored"})
+
+    decision = await DbLLMAgentPlanner(FakeLLMService(content)).plan(_loop_state())
+
+    assert decision.status is DbPlannerDecisionStatus.CONTINUE
+    assert decision.actions[0].depends_on == ("schema",)
+    assert decision.stop_conditions == ("verified",)
+    assert decision.metadata["planner"] == "fake"
+
+    diagnostics = decision.metadata["planner_json_normalization"]
+    assert diagnostics["dropped_envelope_keys"] == ["wrapper_note"]
+    assert "unexpected_decision_key" in diagnostics["dropped_decision_keys"]
+    assert diagnostics["dropped_action_keys"] == [
+        {
+            "index": 0,
+            "action_id": "read",
+            "keys": ["unexpected_action_key"],
+        }
+    ]
+    assert {item["path"] for item in diagnostics["coerced_fields"]} == {
+        "actions[0].depends_on",
+        "stop_conditions",
+    }
 
 
 async def test_llm_agent_planner_rejects_invalid_action_kind_without_tasks():
@@ -429,3 +466,26 @@ def _loop_state():
         runtime_limits={"max_tasks": 3},
         remaining_budget={"planner_turns": 1},
     )
+
+
+def _llm_planner_payload(**overrides):
+    payload = {
+        "status": "continue",
+        "intent": {"operation_type": "db.run"},
+        "actions": [
+            {
+                "action_id": "read",
+                "kind": "execute_validated_read",
+                "input": {"owner": "phase_two", "sql": "select 1"},
+                "depends_on": [],
+                "rationale": "Need one row.",
+                "metadata": {"source": "test"},
+            }
+        ],
+        "stop_conditions": ["verified"],
+        "clarification_question": None,
+        "rationale": "Read from the database.",
+        "metadata": {"planner": "fake"},
+    }
+    payload.update(overrides)
+    return payload

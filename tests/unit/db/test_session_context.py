@@ -107,6 +107,33 @@ async def test_session_context_builder_collects_runtime_referents_and_diagnostic
     assert "conversation_history" in context.diagnostics["sources"]
 
 
+def test_session_context_from_dict_filters_invalid_conversation_messages():
+    context = db_session_context_from_request(
+        DbRequest(
+            "continue",
+            session_context={
+                "session_id": "s1",
+                "user_id": "u1",
+                "current_prompt": "continue",
+                "conversation_messages": [
+                    {"role": "user", "content": "show customers"},
+                    None,
+                    {"role": "invalid", "content": "ignored"},
+                    {"role": "assistant", "content": ""},
+                    "ignored",
+                    {"role": "assistant", "content": "customers: id, name"},
+                ],
+            },
+        )
+    )
+
+    assert context is not None
+    assert context.conversation_messages == (
+        {"role": "user", "content": "show customers"},
+        {"role": "assistant", "content": "customers: id, name"},
+    )
+
+
 async def test_db_agent_history_session_id_flows_and_turn_is_appended():
     history = ConversationHistory(session_id="history-session", workspace="db-test")
     runtime = SpyRuntime()
