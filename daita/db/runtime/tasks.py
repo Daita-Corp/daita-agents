@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from daita.runtime import (
+    AccessMode,
     ApprovalStatus,
     Capability,
     Evidence,
@@ -906,6 +907,13 @@ class DbRuntimeTasksMixin:
         task: Task,
         operation: Operation,
     ) -> dict[str, Any]:
+        if task.capability_id in {
+            "catalog.schema.search",
+            "catalog.asset.inspect",
+            "catalog.relationship_paths.find",
+            "catalog.column_values.search",
+        }:
+            return await self._catalog_executable_input_for_task(task, operation)
         if task.capability_id not in {
             "db.sql.execute_read",
             "db.sql.execute_write",
@@ -980,6 +988,358 @@ class DbRuntimeTasksMixin:
             "validated_evidence_id": validation.id,
             "validated_task_id": validation.task_id,
         }
+
+    async def _catalog_executable_input_for_task(
+        self,
+        task: Task,
+        operation: Operation,
+    ) -> dict[str, Any]:
+        task_input = _catalog_task_input_from_metadata(task, operation)
+        store_id = _catalog_store_id(task_input, self.config.metadata)
+        if not store_id:
+            return task_input
+        schema_evidence = await self._latest_evidence(
+            operation.id,
+            "schema.asset_profile",
+            accepted=True,
+        )
+        if schema_evidence is None:
+            schema_evidence = await self._ensure_schema_profile_evidence(operation)
+        if schema_evidence is not None:
+            await self._ensure_catalog_source_registered(
+                operation,
+                store_id=store_id,
+                schema_evidence=schema_evidence,
+            )
+        if task.capability_id == "catalog.column_values.search":
+            await self._ensure_catalog_column_values_profiled(
+                operation,
+                store_id=store_id,
+                task_input=task_input,
+            )
+        return {**task_input, "store_id": store_id}
+
+    async def _ensure_schema_profile_evidence(
+        self,
+        operation: Operation,
+    ) -> Evidence | None:
+        existing = await self._latest_evidence(
+            operation.id,
+            "schema.asset_profile",
+            accepted=True,
+        )
+        if existing is not None:
+            return existing
+        try:
+            capability = self.registry.get_capability("db.schema.inspect")
+        except (KeyError, ValueError):
+            return None
+
+        task_input: dict[str, Any] = {}
+        input_hash = _stable_hash(task_input)
+        idempotency_key = _stable_hash(
+            {
+                "operation_id": operation.id,
+                "capability_id": capability.id,
+                "owner": capability.owner,
+                "reason": "runtime:schema_profile_prepare",
+            }
+        )
+        task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
+        existing_task = await self.store.load_task(task_id)
+        if existing_task is not None:
+            schema_task = existing_task
+        else:
+            schema_task = await self._plan_kernel_task(
+                Task(
+                    id=task_id,
+                    operation_id=operation.id,
+                    capability_id=capability.id,
+                    executor_id=capability.executor,
+                    input={**task_input, "input_hash": input_hash},
+                    required_evidence=capability.output_evidence,
+                    metadata={
+                        "owner": capability.owner,
+                        "reason": "runtime:schema_profile_prepare",
+                        "sequence": 0,
+                        "input_hash": input_hash,
+                        "idempotency_key": idempotency_key,
+                        "deterministic_key": "runtime:db.schema.inspect",
+                        "idempotent": capability.idempotent,
+                        "replay_safe": capability.replay_safe,
+                        "side_effecting": capability.side_effecting,
+                    },
+                )
+            )
+        if schema_task.status is not TaskStatus.SUCCEEDED:
+            await self.execute_task(schema_task, operation)
+        return await self._latest_evidence(
+            operation.id,
+            "schema.asset_profile",
+            accepted=True,
+        )
+
+    async def _ensure_catalog_source_registered(
+        self,
+        operation: Operation,
+        *,
+        store_id: str,
+        schema_evidence: Evidence,
+    ) -> None:
+        registered = await self._latest_evidence(
+            operation.id,
+            "catalog.source_registered",
+            payload={"store_id": store_id},
+            accepted=True,
+        )
+        if registered is not None:
+            return
+        capability = self.registry.get_capability(
+            "catalog.source.register",
+            owner="catalog",
+        )
+        schema = dict(schema_evidence.payload)
+        task_input = {
+            "schema": schema,
+            "store_type": schema.get("database_type"),
+            "store_id": store_id,
+            "persist": False,
+        }
+        input_hash = _stable_hash(task_input)
+        schema_fingerprint = schema_evidence.metadata.get(
+            "payload_fingerprint"
+        ) or _payload_fingerprint(schema)
+        idempotency_key = _stable_hash(
+            {
+                "operation_id": operation.id,
+                "capability_id": capability.id,
+                "owner": capability.owner,
+                "store_id": store_id,
+                "schema_fingerprint": schema_fingerprint,
+            }
+        )
+        task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
+        existing = await self.store.load_task(task_id)
+        if existing is not None:
+            if existing.status is TaskStatus.SUCCEEDED:
+                return
+            register_task = existing
+        else:
+            register_task = await self._plan_kernel_task(
+                Task(
+                    id=task_id,
+                    operation_id=operation.id,
+                    capability_id=capability.id,
+                    executor_id=capability.executor,
+                    input={**task_input, "input_hash": input_hash},
+                    required_evidence=capability.output_evidence,
+                    metadata={
+                        "owner": capability.owner,
+                        "reason": "runtime:catalog_source_prepare",
+                        "sequence": 0,
+                        "input_hash": input_hash,
+                        "idempotency_key": idempotency_key,
+                        "deterministic_key": (
+                            f"runtime:catalog.source.register:{store_id}"
+                        ),
+                        "idempotent": capability.idempotent,
+                        "replay_safe": capability.replay_safe,
+                        "side_effecting": capability.side_effecting,
+                        "schema_evidence_id": schema_evidence.id,
+                        "schema_fingerprint": schema_fingerprint,
+                    },
+                )
+            )
+        await self.execute_task(register_task, operation)
+
+    async def _ensure_catalog_column_values_profiled(
+        self,
+        operation: Operation,
+        *,
+        store_id: str,
+        task_input: dict[str, Any],
+    ) -> None:
+        pairs = _column_value_profile_pairs(task_input)
+        if not pairs or not _operation_allows_read_profile(operation):
+            return
+        try:
+            profile_capability = self.registry.get_capability(
+                "db.column_values.profile"
+            )
+            register_capability = self.registry.get_capability(
+                "catalog.column_values.register",
+                owner="catalog",
+            )
+        except (KeyError, ValueError):
+            return
+        for table, column in pairs[:4]:
+            if await self._catalog_profile_registered(
+                operation.id,
+                store_id=store_id,
+                table=table,
+                column=column,
+            ):
+                continue
+            profile = await self._ensure_column_value_profile(
+                operation,
+                capability=profile_capability,
+                table=table,
+                column=column,
+            )
+            if profile is None or not profile.accepted:
+                continue
+            await self._ensure_catalog_column_value_profile_registered(
+                operation,
+                capability=register_capability,
+                store_id=store_id,
+                profile=profile,
+            )
+
+    async def _ensure_column_value_profile(
+        self,
+        operation: Operation,
+        *,
+        capability: Capability,
+        table: str,
+        column: str,
+    ) -> Evidence | None:
+        task_input = {"table": table, "column": column, "max_values": 25}
+        input_hash = _stable_hash(task_input)
+        idempotency_key = _stable_hash(
+            {
+                "operation_id": operation.id,
+                "capability_id": capability.id,
+                "owner": capability.owner,
+                "table": table,
+                "column": column,
+            }
+        )
+        task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
+        existing = await self.store.load_task(task_id)
+        if existing is not None:
+            task = existing
+        else:
+            task = await self._plan_kernel_task(
+                Task(
+                    id=task_id,
+                    operation_id=operation.id,
+                    capability_id=capability.id,
+                    executor_id=capability.executor,
+                    input={**task_input, "input_hash": input_hash},
+                    required_evidence=capability.output_evidence,
+                    metadata={
+                        "owner": capability.owner,
+                        "reason": "runtime:column_values_profile_prepare",
+                        "sequence": 0,
+                        "input_hash": input_hash,
+                        "idempotency_key": idempotency_key,
+                        "deterministic_key": (
+                            f"runtime:db.column_values.profile:{table}.{column}"
+                        ),
+                        "idempotent": capability.idempotent,
+                        "replay_safe": capability.replay_safe,
+                        "side_effecting": capability.side_effecting,
+                    },
+                )
+            )
+        if task.status is not TaskStatus.SUCCEEDED:
+            await self.execute_task(task, operation)
+        return await self._latest_evidence(
+            operation.id,
+            "column_values.profile",
+            payload={"table": table, "column": column},
+            accepted=True,
+        )
+
+    async def _ensure_catalog_column_value_profile_registered(
+        self,
+        operation: Operation,
+        *,
+        capability: Capability,
+        store_id: str,
+        profile: Evidence,
+    ) -> None:
+        table = str(profile.payload.get("table") or "")
+        column = str(profile.payload.get("column") or "")
+        if not table or not column:
+            return
+        if await self._catalog_profile_registered(
+            operation.id,
+            store_id=store_id,
+            table=table,
+            column=column,
+        ):
+            return
+        task_input = {
+            "store_id": store_id,
+            "profiles": [dict(profile.payload)],
+            "source_evidence_id": profile.id,
+            "persist": False,
+        }
+        input_hash = _stable_hash(task_input)
+        idempotency_key = _stable_hash(
+            {
+                "operation_id": operation.id,
+                "capability_id": capability.id,
+                "owner": capability.owner,
+                "store_id": store_id,
+                "table": table,
+                "column": column,
+                "profile_evidence_id": profile.id,
+            }
+        )
+        task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
+        existing = await self.store.load_task(task_id)
+        if existing is not None:
+            task = existing
+        else:
+            task = await self._plan_kernel_task(
+                Task(
+                    id=task_id,
+                    operation_id=operation.id,
+                    capability_id=capability.id,
+                    executor_id=capability.executor,
+                    input={**task_input, "input_hash": input_hash},
+                    required_evidence=capability.output_evidence,
+                    metadata={
+                        "owner": capability.owner,
+                        "reason": "runtime:catalog_column_values_register",
+                        "sequence": 0,
+                        "input_hash": input_hash,
+                        "idempotency_key": idempotency_key,
+                        "deterministic_key": (
+                            "runtime:catalog.column_values.register:"
+                            f"{store_id}:{table}.{column}"
+                        ),
+                        "idempotent": capability.idempotent,
+                        "replay_safe": capability.replay_safe,
+                        "side_effecting": capability.side_effecting,
+                        "profile_evidence_id": profile.id,
+                    },
+                )
+            )
+        if task.status is not TaskStatus.SUCCEEDED:
+            await self.execute_task(task, operation)
+
+    async def _catalog_profile_registered(
+        self,
+        operation_id: str,
+        *,
+        store_id: str,
+        table: str,
+        column: str,
+    ) -> bool:
+        for evidence in await self.store.list_evidence(operation_id):
+            if evidence.kind != "schema.column_value_profile" or not evidence.accepted:
+                continue
+            if evidence.payload.get("store_id") != store_id:
+                continue
+            for profile in evidence.payload.get("profiles", []) or []:
+                if not isinstance(profile, dict):
+                    continue
+                if profile.get("table") == table and profile.get("column") == column:
+                    return True
+        return False
 
     async def _accepted_evidence_for_dependency(
         self,
@@ -1128,6 +1488,165 @@ def _planned_task_input(operation: Operation, capability: Capability) -> dict[st
     if capability.id == "db.sql.validate":
         return {"sql": prompt, "operation": operation.operation_type}
     return {"prompt": prompt}
+
+
+def _catalog_task_input_from_metadata(
+    task: Task, operation: Operation
+) -> dict[str, Any]:
+    task_input = dict(task.input)
+    metadata = dict(task.metadata or {})
+    prompt = str(operation.request.get("prompt") or "")
+
+    if task.capability_id == "catalog.schema.search":
+        task_input.setdefault(
+            "query",
+            _first_metadata_string(metadata, "query", "target", "goal") or prompt,
+        )
+    elif task.capability_id == "catalog.asset.inspect":
+        asset_ref = _first_metadata_string(
+            metadata,
+            "asset_ref",
+            "asset",
+            "table",
+            "target",
+        )
+        if asset_ref:
+            task_input.setdefault("asset_ref", asset_ref)
+    elif task.capability_id == "catalog.relationship_paths.find":
+        from_assets = _metadata_string_list(
+            metadata,
+            "from_assets",
+            "from",
+            "source_assets",
+            "source",
+        )
+        to_assets = _metadata_string_list(
+            metadata,
+            "to_assets",
+            "to",
+            "target_assets",
+            "target",
+        )
+        if from_assets:
+            task_input.setdefault("from_assets", from_assets)
+        if to_assets:
+            task_input.setdefault("to_assets", to_assets)
+    elif task.capability_id == "catalog.column_values.search":
+        task_input.setdefault(
+            "query",
+            _first_metadata_string(metadata, "query", "value", "literal", "goal")
+            or prompt,
+        )
+        tables = _metadata_string_list(metadata, "tables", "table", "target")
+        columns = _metadata_string_list(metadata, "columns", "column", "field")
+        tables, columns = _normalize_column_value_scope(tables, columns)
+        if tables:
+            task_input.setdefault("tables", tables)
+        if columns:
+            task_input.setdefault("columns", columns)
+    return task_input
+
+
+def _normalize_column_value_scope(
+    tables: list[str],
+    columns: list[str],
+) -> tuple[list[str], list[str]]:
+    normalized_tables: list[str] = []
+    normalized_columns: list[str] = list(columns)
+    for table in tables:
+        if "." in table:
+            table_name, column_name = table.split(".", 1)
+            if table_name.strip():
+                normalized_tables.append(table_name.strip())
+            if column_name.strip() and not normalized_columns:
+                normalized_columns.append(column_name.strip())
+            continue
+        normalized_tables.append(table)
+    return _ordered_unique_strings(normalized_tables), _ordered_unique_strings(
+        normalized_columns
+    )
+
+
+def _column_value_profile_pairs(task_input: dict[str, Any]) -> list[tuple[str, str]]:
+    tables = _safe_string_list(task_input.get("tables"))
+    columns = _safe_string_list(task_input.get("columns"))
+    tables, columns = _normalize_column_value_scope(tables, columns)
+    if not tables or not columns:
+        return []
+    return [(table, column) for table in tables for column in columns]
+
+
+def _operation_allows_read_profile(operation: Operation) -> bool:
+    safety_frame = operation.metadata.get("safety_frame")
+    if not isinstance(safety_frame, dict):
+        return True
+    max_access = str(
+        safety_frame.get("max_access")
+        or safety_frame.get("max_allowed_access")
+        or AccessMode.ADMIN.value
+    )
+    access_order = {
+        AccessMode.NONE.value: 0,
+        AccessMode.METADATA_READ.value: 1,
+        AccessMode.READ.value: 2,
+        AccessMode.WRITE.value: 3,
+        AccessMode.ADMIN.value: 4,
+    }
+    return access_order.get(max_access, 4) >= access_order[AccessMode.READ.value]
+
+
+def _safe_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _ordered_unique_strings(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _catalog_store_id(task_input: dict[str, Any], metadata: dict[str, Any]) -> str:
+    explicit = task_input.get("store_id")
+    if explicit:
+        return str(explicit)
+    options = metadata.get("from_db_options")
+    if isinstance(options, dict) and options.get("catalog_store_id"):
+        return str(options["catalog_store_id"])
+    if metadata.get("catalog_store_id"):
+        return str(metadata["catalog_store_id"])
+    return ""
+
+
+def _first_metadata_string(metadata: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _metadata_string_list(metadata: dict[str, Any], *keys: str) -> list[str]:
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return [value.strip()]
+        if isinstance(value, (list, tuple)):
+            values = [str(item).strip() for item in value if str(item).strip()]
+            if values:
+                return values
+    return []
 
 
 def _synthesis_dependencies(

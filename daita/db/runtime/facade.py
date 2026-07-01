@@ -310,10 +310,13 @@ class DbRuntime(
         return _db_request_from_context(operation)
 
     def _db_intent_from_operation(self, operation: Operation) -> DbIntent:
-        return _db_intent_from_context(operation)
+        fallback = _db_intent_from_context(operation)
+        contract = self._db_contract_from_context(operation)
+        return _intent_from_loop_contract(contract, fallback)
 
     def _db_contract_from_context(self, operation: Operation) -> DbOperationContract:
-        return _db_contract_from_context(operation)
+        fallback = _db_contract_from_context(operation)
+        return _contract_from_latest_loop_snapshot(operation, fallback)
 
     async def run(self, request: DbRequest | str) -> DbOperationResult:
         """Plan and execute a DB operation through typed runtime capabilities."""

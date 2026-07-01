@@ -40,21 +40,29 @@ class DbPlanningContextExecutor:
             operation.id,
             task.input.get("schema_evidence_id"),
         )
-        catalog_evidence = tuple(
-            item
-            for item in [
-                await _load_evidence(runtime, operation.id, evidence_id)
-                for evidence_id in task.input.get("catalog_evidence_ids", ())
-            ]
-            if item is not None
+        if schema_evidence is None:
+            schema_evidence = await _latest_accepted_evidence(
+                runtime,
+                operation.id,
+                "schema.asset_profile",
+            )
+        catalog_evidence = await _load_evidence_refs_or_latest(
+            runtime,
+            operation.id,
+            task.input.get("catalog_evidence_ids", ()),
+            kinds=(
+                "catalog.source_registered",
+                "schema.search_result",
+                "schema.column_value_profile",
+                "schema.column_value_search_result",
+                "schema.column_value_hint",
+            ),
         )
-        relationship_evidence = tuple(
-            item
-            for item in [
-                await _load_evidence(runtime, operation.id, evidence_id)
-                for evidence_id in task.input.get("relationship_evidence_ids", ())
-            ]
-            if item is not None
+        relationship_evidence = await _load_evidence_refs_or_latest(
+            runtime,
+            operation.id,
+            task.input.get("relationship_evidence_ids", ()),
+            kinds=("schema.relationship_path",),
         )
         memory_recall_evidence = tuple(
             item
@@ -151,6 +159,40 @@ async def _load_evidence(
         if evidence.id == evidence_id:
             return evidence
     return None
+
+
+async def _latest_accepted_evidence(
+    runtime: Any,
+    operation_id: str,
+    kind: str,
+) -> Evidence | None:
+    matches = [
+        evidence
+        for evidence in await runtime.store.list_evidence(operation_id)
+        if evidence.kind == kind and evidence.accepted
+    ]
+    return matches[-1] if matches else None
+
+
+async def _load_evidence_refs_or_latest(
+    runtime: Any,
+    operation_id: str,
+    evidence_ids: Any,
+    *,
+    kinds: tuple[str, ...],
+) -> tuple[Evidence, ...]:
+    loaded = tuple(
+        item
+        for item in [
+            await _load_evidence(runtime, operation_id, evidence_id)
+            for evidence_id in evidence_ids or ()
+        ]
+        if item is not None
+    )
+    if loaded:
+        return loaded
+    evidence = await runtime.store.list_evidence(operation_id)
+    return tuple(item for item in evidence if item.kind in kinds and item.accepted)
 
 
 def _planner_capability_summaries(runtime: Any) -> tuple[dict[str, Any], ...]:

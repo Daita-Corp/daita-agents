@@ -401,6 +401,49 @@ async def test_multi_turn_catalog_search_to_sql_loop_uses_persisted_search_evide
     }
 
 
+async def test_explicit_schema_mode_keeps_loop_contract_schema_only():
+    planner = ScriptedPlanner(
+        _inspect_schema_decision(),
+        _read_decision(sql="select status, count(*) as count from orders"),
+    )
+    runtime, _ = await _runtime_with_planner(planner)
+
+    result = await runtime.run(
+        DbRequest("Tell me about the orders table.", mode="schema.query")
+    )
+    snapshot = await runtime.inspect_operation(result.operation_id)
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert result.intent.kind is DbIntentKind.SCHEMA_QUERY
+    assert result.contract.operation_type == "schema.query"
+    assert len(planner.states) == 1
+    assert "query.result" not in _evidence_kinds(snapshot)
+    assert not any(
+        task.capability_id == "db.sql.execute_read" for task in snapshot.tasks
+    )
+
+
+async def test_explicit_schema_mode_rejects_sql_read_actions():
+    runtime, _ = await _runtime_with_planner(ScriptedPlanner())
+    loop = DbAgentLoop(runtime, ScriptedPlanner())
+    state = DbLoopState(
+        operation_id="schema-mode-compile-target",
+        normalized_user_request={"prompt": "Tell me about the orders table."},
+        explicit_mode="schema.query",
+        safety_frame={"max_access": AccessMode.METADATA_READ.value},
+    )
+
+    compilation = loop.compile_actions(
+        _read_decision(sql="select * from orders"),
+        state,
+    )
+
+    assert compilation.task_specs == ()
+    assert {item["error"] for item in compilation.rejected_action_summaries} == {
+        "action_outside_explicit_mode:execute_validated_read:schema.query"
+    }
+
+
 async def test_resume_reenters_agent_loop_after_first_turn_evidence():
     first_turn = ScriptedPlanner(_inspect_schema_decision())
     runtime, _ = await _runtime_with_planner(first_turn)

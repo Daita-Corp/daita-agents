@@ -66,6 +66,12 @@ _SIMPLE_ACTION_CAPABILITIES: dict[DbPlannerActionKind, tuple[str, ...]] = {
     DbPlannerActionKind.SYNTHESIZE: ("db.answer.synthesize",),
 }
 
+_SQL_QUERY_ACTIONS = {
+    DbPlannerActionKind.PROPOSE_SQL_READ,
+    DbPlannerActionKind.REPAIR_QUERY_PLAN,
+    DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+}
+
 _MONITOR_ACTION_CAPABILITIES: dict[DbPlannerActionKind, str] = {
     DbPlannerActionKind.PLAN_MONITOR_CREATE: "db.monitor.plan_create",
     DbPlannerActionKind.COMMIT_MONITOR_CREATE: "db.monitor.commit_create",
@@ -680,6 +686,10 @@ class DbAgentLoop:
             if dependency_errors:
                 rejected.extend(dependency_errors)
                 continue
+            mode_errors = _mode_action_errors(action, state)
+            if mode_errors:
+                rejected.extend(mode_errors)
+                continue
             action_specs, action_capabilities, action_errors = self._compile_one_action(
                 action,
                 state=state,
@@ -706,6 +716,7 @@ class DbAgentLoop:
 
         contract = self._compiled_contract_snapshot(
             decision=decision,
+            state=state,
             decision_fingerprint=decision_fingerprint,
             selected_capabilities=tuple(selected_capabilities),
             compiled_action_ids=tuple(item["action_id"] for item in accepted),
@@ -1129,6 +1140,7 @@ class DbAgentLoop:
         self,
         *,
         decision: DbPlannerDecision,
+        state: DbLoopState,
         decision_fingerprint: str,
         selected_capabilities: tuple[dict[str, Any], ...],
         compiled_action_ids: tuple[str, ...],
@@ -1140,11 +1152,13 @@ class DbAgentLoop:
             if _access_rank(access.value) > _access_rank(max_access.value):
                 max_access = access
             required_evidence.update(str(item) for item in selected["output_evidence"])
-        operation_type = str(
+        raw_planner_intent = dict(decision.intent)
+        operation_type = _explicit_mode_operation_type(state.explicit_mode) or str(
             decision.intent.get("operation_type")
             or decision.intent.get("label")
             or "db.run"
         )
+        planner_intent = {**raw_planner_intent, "operation_type": operation_type}
         contract = DbOperationContract(
             operation_type=operation_type,
             required_capabilities=tuple(
@@ -1157,7 +1171,8 @@ class DbAgentLoop:
                 str(item) for item in decision.intent.get("policy_ids") or ()
             ),
             metadata={
-                "planner_intent": decision.intent,
+                "planner_intent": planner_intent,
+                "planner_raw_intent": raw_planner_intent,
                 "planner_decision_fingerprint": decision_fingerprint,
                 "compiled_action_ids": list(compiled_action_ids),
                 "selected_capabilities": list(selected_capabilities),
@@ -1596,6 +1611,38 @@ def _with_spec_dependencies(
         )
         for spec in specs
     ]
+
+
+def _mode_action_errors(
+    action: DbPlannerAction,
+    state: DbLoopState,
+) -> tuple[dict[str, Any], ...]:
+    if (
+        _explicit_mode_operation_type(state.explicit_mode)
+        == DbIntentKind.SCHEMA_QUERY.value
+        and action.kind in _SQL_QUERY_ACTIONS
+    ):
+        return (
+            _action_error(
+                action,
+                f"action_outside_explicit_mode:{action.kind.value}:schema.query",
+            ),
+        )
+    return ()
+
+
+def _explicit_mode_operation_type(mode: str | None) -> str | None:
+    normalized = (mode or "").strip().lower()
+    if normalized in {"schema", "schema.query"}:
+        return DbIntentKind.SCHEMA_QUERY.value
+    if normalized in {
+        "relationships",
+        "relationship",
+        "schema_relationship",
+        "schema.relationship_query",
+    }:
+        return DbIntentKind.SCHEMA_RELATIONSHIP_QUERY.value
+    return None
 
 
 def _with_deterministic_task_id(

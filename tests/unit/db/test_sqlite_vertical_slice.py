@@ -1,4 +1,5 @@
-from daita.db import DbRuntime
+from daita.db import DbRuntime, DbRuntimeConfig
+from daita.db.runtime.tasks import DbTaskSpec
 from daita.db.runtime import DbRuntimeGovernanceBlocked
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
@@ -149,6 +150,158 @@ async def test_sqlite_and_catalog_vertical_slice_through_db_runtime():
     assert search[0].payload["tables"][0]["name"] == "customers"
     query_result = next(item for item in query if item.kind == "query.result")
     assert query_result.payload["rows"] == [{"email": "ada@example.com"}]
+
+
+async def test_catalog_relationship_task_prepares_source_from_schema_evidence():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await _seed(sqlite)
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Join orders to customers using their relationship",
+            },
+            evaluate_governance=False,
+        )
+        schema_plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.schema.inspect",
+                    owner="sqlite",
+                    reason="test:schema",
+                ),
+            ),
+        )
+        await runtime.execute_task(schema_plan.tasks[0], operation)
+
+        context_plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.planning.context.build",
+                    owner="db_runtime",
+                    input={},
+                    reason="test:planning_context",
+                ),
+            ),
+        )
+        context = await runtime.execute_task(context_plan.tasks[0], operation)
+
+        relationship_plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="catalog.relationship_paths.find",
+                    owner="catalog",
+                    input={},
+                    metadata={"from": "orders", "to": "customers"},
+                    reason="test:relationship",
+                ),
+            ),
+        )
+        relationship = await runtime.execute_task(
+            relationship_plan.tasks[0],
+            operation,
+        )
+    finally:
+        await runtime.teardown()
+
+    registered = [
+        item
+        for item in await runtime.store.list_evidence(operation.id)
+        if item.kind == "catalog.source_registered"
+    ]
+    hydrated_task = await runtime.store.load_task(relationship_plan.tasks[0].id)
+
+    assert registered[-1].payload["store_id"] == "store:sqlite"
+    assert {table["name"] for table in context[0].payload["schema"]["tables"]} == {
+        "customers",
+        "orders",
+    }
+    assert relationship[0].kind == "schema.relationship_path"
+    assert relationship[0].payload["reachable"] is True
+    assert hydrated_task.input["store_id"] == "store:sqlite"
+    assert hydrated_task.input["from_assets"] == ["orders"]
+    assert hydrated_task.input["to_assets"] == ["customers"]
+
+
+async def test_catalog_column_value_search_profiles_dotted_target_before_search():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO orders (id, status)
+        VALUES (1, 'complete'), (2, 'complete'), (3, 'pending');
+        """)
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Search observed status values for completed orders",
+            },
+            evaluate_governance=False,
+        )
+        search_plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="catalog.column_values.search",
+                    owner="catalog",
+                    input={},
+                    metadata={"target": "orders.status", "query": "complete orders"},
+                    reason="test:column_values_search",
+                ),
+            ),
+        )
+        search = await runtime.execute_task(search_plan.tasks[0], operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+        hydrated_task = await runtime.store.load_task(search_plan.tasks[0].id)
+    finally:
+        await runtime.teardown()
+
+    kinds = {item.kind for item in evidence}
+    assert {
+        "schema.asset_profile",
+        "catalog.source_registered",
+        "column_values.profile",
+        "schema.column_value_profile",
+        "schema.column_value_search_result",
+    } <= kinds
+    assert hydrated_task.input["store_id"] == "store:sqlite"
+    assert hydrated_task.input["tables"] == ["orders"]
+    assert hydrated_task.input["columns"] == ["status"]
+    assert search[0].kind == "schema.column_value_search_result"
+    assert search[0].payload["profiles"][0]["profile_ref"] == "orders.status"
+    assert search[0].payload["profiles"][0]["top_values"][0]["value"] == "complete"
 
 
 async def test_sqlite_column_value_profile_registers_with_catalog():

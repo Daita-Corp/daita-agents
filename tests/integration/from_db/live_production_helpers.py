@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +53,162 @@ PLANNER_ARTIFACTS = {
     "planner.decision": "planner_decisions.json",
     "planner.compilation": "planner_compilations.json",
 }
+RICH_POSTGRES_SEED_SQL = """
+DROP TABLE IF EXISTS monitor_actions;
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS runtime_monitors;
+DROP TABLE IF EXISTS runtime_operations;
+DROP TABLE IF EXISTS operations;
+DROP TABLE IF EXISTS support_tickets;
+DROP TABLE IF EXISTS refunds;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS products;
+DROP TABLE IF EXISTS customers;
+DROP TABLE IF EXISTS regions;
+
+CREATE TABLE regions (
+    region_id INTEGER PRIMARY KEY,
+    region_code TEXT NOT NULL UNIQUE,
+    region_name TEXT NOT NULL
+);
+
+CREATE TABLE customers (
+    customer_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    region_id INTEGER NOT NULL REFERENCES regions(region_id),
+    tier TEXT NOT NULL,
+    email TEXT NOT NULL,
+    phone TEXT NOT NULL
+);
+
+CREATE TABLE products (
+    product_id INTEGER PRIMARY KEY,
+    category TEXT NOT NULL,
+    sku TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE orders (
+    order_id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES customers(customer_id),
+    status TEXT NOT NULL,
+    total NUMERIC(10, 2) NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE refunds (
+    refund_id INTEGER PRIMARY KEY,
+    order_id INTEGER NOT NULL REFERENCES orders(order_id),
+    amount NUMERIC(10, 2) NOT NULL,
+    reason TEXT NOT NULL
+);
+
+CREATE TABLE support_tickets (
+    ticket_id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES customers(customer_id),
+    status TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    product_id INTEGER NOT NULL REFERENCES products(product_id)
+);
+
+CREATE TABLE operations (
+    operation_id TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL,
+    api_key_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    timestamp TEXT NOT NULL
+);
+
+CREATE TABLE runtime_operations (
+    runtime_operation_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+    worker_id TEXT NOT NULL,
+    started_at TEXT NOT NULL
+);
+
+CREATE TABLE runtime_monitors (
+    monitor_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL
+);
+
+CREATE TABLE audit_logs (
+    audit_id INTEGER PRIMARY KEY,
+    actor_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE monitor_actions (
+    id INTEGER PRIMARY KEY,
+    status TEXT NOT NULL,
+    note TEXT NOT NULL
+);
+
+INSERT INTO regions (region_id, region_code, region_name) VALUES
+    (1, 'NA', 'North America'),
+    (2, 'EU', 'Europe'),
+    (3, 'APAC', 'Asia Pacific');
+
+INSERT INTO customers (
+    customer_id, name, region_id, tier, email, phone
+) VALUES
+    (1, 'Ada Lovelace', 1, 'enterprise', 'ada@example.com', '+1-555-0101'),
+    (2, 'Linus Torvalds', 2, 'startup', 'linus@example.com', '+358-555-0102'),
+    (3, 'Grace Hopper', 1, 'enterprise', 'grace@example.com', '+1-555-0103'),
+    (4, 'Katherine Johnson', 3, 'midmarket', 'katherine@example.com', '+61-555-0104');
+
+INSERT INTO products (product_id, category, sku) VALUES
+    (10, 'analytics', 'AN-100'),
+    (11, 'automation', 'AU-200'),
+    (12, 'governance', 'GV-300');
+
+INSERT INTO orders (
+    order_id, customer_id, status, total, created_at, updated_at
+) VALUES
+    (100, 1, 'complete', 120.00, '2026-01-02T10:00:00Z', '2026-01-02T10:00:00Z'),
+    (101, 1, 'pending', 80.00, '2026-01-03T11:00:00Z', '2026-01-03T11:30:00Z'),
+    (102, 2, 'complete', 50.00, '2026-01-04T09:00:00Z', '2026-01-04T09:05:00Z'),
+    (103, 3, 'complete', 175.00, '2026-01-05T13:00:00Z', '2026-01-05T13:00:00Z'),
+    (104, 4, 'pending', 210.00, '2026-01-06T15:00:00Z', '2026-01-06T15:20:00Z');
+
+INSERT INTO refunds (refund_id, order_id, amount, reason) VALUES
+    (1000, 102, 10.00, 'courtesy_credit'),
+    (1001, 103, 25.00, 'late_delivery');
+
+INSERT INTO support_tickets (
+    ticket_id, customer_id, status, severity, product_id
+) VALUES
+    (2000, 1, 'open', 'high', 10),
+    (2001, 2, 'closed', 'low', 11),
+    (2002, 3, 'open', 'low', 12),
+    (2003, 4, 'closed', 'critical', 10);
+
+INSERT INTO operations (
+    operation_id, organization_id, api_key_id, status, timestamp
+) VALUES
+    ('op_live_1', 'org_001', 'key_redacted_1', 'succeeded', '2026-01-07T10:00:00Z'),
+    ('op_live_2', 'org_001', 'key_redacted_2', 'running', '2026-01-07T10:05:00Z');
+
+INSERT INTO runtime_operations (
+    runtime_operation_id, operation_id, worker_id, started_at
+) VALUES
+    ('rt_op_1', 'op_live_1', 'worker_alpha', '2026-01-07T10:00:01Z'),
+    ('rt_op_2', 'op_live_2', 'worker_beta', '2026-01-07T10:05:01Z');
+
+INSERT INTO runtime_monitors (
+    monitor_id, operation_id, name, enabled
+) VALUES
+    ('mon_pending_orders', 'op_live_2', 'pending orders monitor', 1);
+
+INSERT INTO audit_logs (audit_id, actor_id, event_type, created_at) VALUES
+    (3000, 'user_001', 'operation.created', '2026-01-07T09:59:59Z'),
+    (3001, 'worker_alpha', 'operation.completed', '2026-01-07T10:00:30Z');
+
+INSERT INTO monitor_actions (id, status, note) VALUES
+    (1, 'pending', 'fixture row for approval and resume tests');
+"""
 
 
 def require_live_openai_kwargs() -> dict[str, object]:
@@ -233,6 +391,35 @@ async def seed_rich_sqlite_schema(db_path: Path) -> Path:
     return db_path
 
 
+def require_live_postgres_enabled() -> None:
+    """Skip unless the release Postgres gate is explicitly enabled."""
+    if os.environ.get("DAITA_EVAL_POSTGRES") != "1":
+        pytest.skip("Set DAITA_EVAL_POSTGRES=1 to run live Postgres from_db tests")
+
+
+async def seed_rich_postgres_schema(url: str) -> str:
+    """Create the shared rich Postgres fixture used by live from_db tests."""
+    asyncpg = pytest.importorskip(
+        "asyncpg",
+        reason="asyncpg required: pip install 'daita-agents[postgresql]'",
+    )
+    deadline = time.time() + 30
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        connection = None
+        try:
+            connection = await asyncpg.connect(url, ssl=False)
+            await connection.execute(RICH_POSTGRES_SEED_SQL)
+            return url
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            await asyncio.sleep(0.5)
+        finally:
+            if connection is not None:
+                await connection.close()
+    raise RuntimeError(f"Could not seed Postgres test database: {last_error}")
+
+
 async def create_live_sqlite_from_db_agent(
     db_path: Path,
     *,
@@ -242,6 +429,22 @@ async def create_live_sqlite_from_db_agent(
     """Build a live OpenAI ``Agent.from_db`` over SQLite with persisted state."""
     return await Agent.from_db(
         str(db_path),
+        name=name,
+        cache_ttl=0,
+        runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
+        **require_live_openai_kwargs(),
+    )
+
+
+async def create_live_postgres_from_db_agent(
+    url: str,
+    *,
+    runtime_path: Path,
+    name: str = "LiveFromDbPostgresProductionContract",
+):
+    """Build a live OpenAI ``Agent.from_db`` over Postgres with persisted state."""
+    return await Agent.from_db(
+        url,
         name=name,
         cache_ttl=0,
         runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
@@ -284,6 +487,23 @@ def latest_evidence(
             continue
         return item
     return None
+
+
+def query_rows(result_or_snapshot: Any) -> list[dict[str, Any]]:
+    """Return rows from latest accepted ``query.result`` evidence."""
+    query_result = latest_evidence(result_or_snapshot, "query.result")
+    assert query_result is not None, "Expected query.result evidence"
+    rows = query_result.payload.get("rows") or []
+    assert isinstance(rows, list), rows
+    return [dict(row) for row in rows if isinstance(row, dict)]
+
+
+def row_values(result_or_snapshot: Any) -> set[Any]:
+    """Return scalar values from latest accepted ``query.result`` rows."""
+    values: set[Any] = set()
+    for row in query_rows(result_or_snapshot):
+        values.update(row.values())
+    return values
 
 
 def sql_from_result(result_or_snapshot: Any) -> str:
