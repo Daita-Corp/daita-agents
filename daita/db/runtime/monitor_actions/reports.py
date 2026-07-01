@@ -19,6 +19,7 @@ from ..resume import (
     _db_intent_from_context,
     _db_request_from_context,
 )
+from ..tasks import DbTaskSpec
 from ..types import DbRuntimeGovernanceBlocked
 
 
@@ -362,26 +363,59 @@ class DbRuntimeMonitorActionReportsMixin:
         sequence: int,
         tasks: list[Task],
     ) -> tuple[Evidence, ...]:
-        plan = await self.plan_validated_read_spec(
+        owner = (
+            str(step.get("capability_owner")) if step.get("capability_owner") else None
+        )
+        read_capability = self.registry.get_capability(
+            "db.sql.execute_read",
+            owner=owner,
+        )
+        validation_capability = self._validation_capability_for_sql_execute(
+            read_capability
+        )
+        if validation_capability is None:
+            raise KeyError("db.sql.validate")
+        plan = await self.plan_task_specs(
             operation,
-            sql=str(step.get("sql") or ""),
-            params=list(step.get("parameters") or step.get("params") or ()),
-            owner=(
-                str(step.get("capability_owner"))
-                if step.get("capability_owner")
-                else None
+            (
+                DbTaskSpec(
+                    capability_id=validation_capability.id,
+                    owner=validation_capability.owner,
+                    input={"sql": str(step.get("sql") or ""), "operation": "query"},
+                    reason="monitor_report_read_validation",
+                    sequence=sequence,
+                    metadata={
+                        "monitor_id": monitor_id,
+                        "monitor_run_id": monitor_run_id,
+                        "tick_operation_id": tick_operation_id,
+                        "monitor_action_kind": "scheduled_report",
+                        "monitor_action_fingerprint": action_plan_fingerprint,
+                        "monitor_report_step_id": step.get("id"),
+                        "monitor_report_step_kind": step.get("kind"),
+                    },
+                ),
+                DbTaskSpec(
+                    capability_id=read_capability.id,
+                    owner=read_capability.owner,
+                    input={
+                        "sql_ref": "sql.validation",
+                        "params": list(
+                            step.get("parameters") or step.get("params") or ()
+                        ),
+                    },
+                    reason="monitor_report_read",
+                    sequence=sequence + 1,
+                    metadata={
+                        "monitor_id": monitor_id,
+                        "monitor_run_id": monitor_run_id,
+                        "tick_operation_id": tick_operation_id,
+                        "monitor_action_kind": "scheduled_report",
+                        "monitor_action_fingerprint": action_plan_fingerprint,
+                        "monitor_report_step_id": step.get("id"),
+                        "monitor_report_step_kind": step.get("kind"),
+                    },
+                ),
             ),
-            reason="monitor_report_read",
-            sequence=sequence,
-            metadata={
-                "monitor_id": monitor_id,
-                "monitor_run_id": monitor_run_id,
-                "tick_operation_id": tick_operation_id,
-                "monitor_action_kind": "scheduled_report",
-                "monitor_action_fingerprint": action_plan_fingerprint,
-                "monitor_report_step_id": step.get("id"),
-                "monitor_report_step_kind": step.get("kind"),
-            },
         )
         validation_task, read_task = plan.tasks
         tasks.extend([validation_task, read_task])

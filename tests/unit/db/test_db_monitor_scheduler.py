@@ -14,6 +14,7 @@ from daita.db import (
     SQLiteDbMonitorStore,
 )
 from daita.db.monitor_commands import DbMonitorValidation
+from daita.db.runtime.tasks import DbTaskSpec
 from daita.plugins import RuntimeExtensionPlugin, PluginKind, PluginManifest
 from daita.runtime import (
     AccessMode,
@@ -376,6 +377,48 @@ class MonitorDeliveryApprovalPolicy:
         )
 
 
+class TaskSpecSpyRuntime(DbRuntime):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.spec_batches: list[tuple[DbTaskSpec, ...]] = []
+        self.planned_task_batches: list[tuple[Task, ...]] = []
+        self.write_governance_task_ids: list[str] = []
+
+    async def plan_task_specs(self, operation, specs, *, contract=None):
+        materialized = tuple(specs)
+        self.spec_batches.append(materialized)
+        plan = await super().plan_task_specs(
+            operation,
+            materialized,
+            contract=contract,
+        )
+        self.planned_task_batches.append(plan.tasks)
+        return plan
+
+    async def evaluate_monitor_effect_governance(
+        self,
+        operation,
+        *,
+        capability,
+        task=None,
+        intent,
+        phase,
+        mutate_approvals=False,
+        operation_override=None,
+    ):
+        if phase == "write_execution" and task is not None:
+            self.write_governance_task_ids.append(task.id)
+        return await super().evaluate_monitor_effect_governance(
+            operation,
+            capability=capability,
+            task=task,
+            intent=intent,
+            phase=phase,
+            mutate_approvals=mutate_approvals,
+            operation_override=operation_override,
+        )
+
+
 class MonitorCapabilityProbePlugin(RuntimeExtensionPlugin):
     def __init__(
         self,
@@ -568,6 +611,83 @@ async def _create_monitor(runtime, monitor_id, **kwargs):
         **values,
     )
     return await runtime.create_monitor(monitor)
+
+
+async def test_observation_materializes_validation_and_read_via_task_specs():
+    plugin = MonitorReadProbePlugin(rows=[{"pending_count": 4}])
+    runtime = TaskSpecSpyRuntime(
+        runtime_id="db-monitor-observation-specs",
+        plugins=(plugin,),
+    )
+    await _create_monitor(
+        runtime,
+        "observation_specs_monitor",
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+    )
+
+    run = (await runtime.tick_monitors(now=NOW))[0]
+    observation_batches = [
+        batch
+        for batch in runtime.spec_batches
+        if [spec.reason for spec in batch]
+        == ["monitor_observation_read_validation", "monitor_observation_read"]
+    ]
+    tasks = await runtime.store.list_tasks(run.operation_id)
+    validation_task, read_task = tasks
+    validation_dependency = next(
+        dependency
+        for dependency in read_task.dependencies
+        if dependency.evidence_kind == "sql.validation"
+    )
+
+    assert observation_batches
+    assert all(isinstance(spec, DbTaskSpec) for spec in observation_batches[0])
+    assert [spec.capability_id for spec in observation_batches[0]] == [
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    assert validation_dependency.producer_task_id == validation_task.id
+    assert read_task.input["validated_task_id"] == validation_task.id
+
+
+async def test_monitor_write_governance_uses_task_from_plan_task_specs():
+    read_plugin = MonitorReadProbePlugin(rows=[{"pending_count": 12}])
+    write_plugin = MonitorWriteProbePlugin()
+    runtime = TaskSpecSpyRuntime(
+        runtime_id="db-monitor-write-governance-specs",
+        plugins=(read_plugin, write_plugin),
+    )
+    await _create_monitor(
+        runtime,
+        "write_governance_specs_monitor",
+        schedule={"interval_seconds": 0},
+        source_scope=("orders",),
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+        action_plan=_write_proposal_action(),
+    )
+
+    run = (await runtime.tick_monitors(now=NOW))[0]
+    snapshot = await runtime.inspect_operation(run.summary["triggered_operation_id"])
+    write_task = next(
+        task for task in snapshot.tasks if task.capability_id == "db.sql.execute_write"
+    )
+    planned_write_task_ids = {
+        task.id
+        for batch in runtime.planned_task_batches
+        for task in batch
+        if task.capability_id == "db.sql.execute_write"
+    }
+
+    assert write_task.id in planned_write_task_ids
+    assert runtime.write_governance_task_ids == [write_task.id]
+    assert any(
+        batch
+        and batch[-1].capability_id == "db.sql.execute_write"
+        and batch[-1].reason == "monitor_write_execution"
+        for batch in runtime.spec_batches
+    )
 
 
 async def test_scheduler_records_due_observation_and_not_due_decisions():
@@ -2763,9 +2883,13 @@ async def test_write_proposal_blocks_missing_ambiguous_or_scope_drift(
 
     assert action_result.payload["status"] == "blocked"
     assert action_result.payload["block_reason"] == reason
-    assert not any(
+    has_write_task = any(
         task.capability_id == "db.sql.execute_write" for task in snapshot.tasks
     )
+    if reason == "write_source_scope_blocked":
+        assert has_write_task
+    else:
+        assert not has_write_task
 
 
 def test_phase7_monitor_runtime_boundaries_do_not_add_direct_paths():

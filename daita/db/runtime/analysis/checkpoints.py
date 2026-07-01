@@ -59,7 +59,7 @@ class DbRuntimeAnalysisCheckpointMixin:
             "progress": progress,
             **dict(diagnostics or {}),
         }
-        task = self._analysis_task(
+        task = await self._analysis_task(
             operation,
             capability,
             input={

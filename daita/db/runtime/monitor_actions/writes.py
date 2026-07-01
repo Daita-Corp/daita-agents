@@ -86,23 +86,22 @@ class DbRuntimeMonitorActionWritesMixin:
                     else "missing_write_capability"
                 ),
             )
+        validation_spec = DbTaskSpec(
+            capability_id=validation_capability.id,
+            owner=validation_capability.owner,
+            input={"sql": sql, "operation": "write.execute"},
+            reason="monitor_write_validation",
+            sequence=500,
+            metadata={
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "tick_operation_id": tick_operation_id,
+                "monitor_action_role": "write_validation",
+            },
+        )
         validation_plan = await self.plan_task_specs(
             operation,
-            (
-                DbTaskSpec(
-                    capability_id=validation_capability.id,
-                    owner=validation_capability.owner,
-                    input={"sql": sql, "operation": "write.execute"},
-                    reason="monitor_write_validation",
-                    sequence=500,
-                    metadata={
-                        "monitor_id": monitor_id,
-                        "monitor_run_id": monitor_run_id,
-                        "tick_operation_id": tick_operation_id,
-                        "monitor_action_role": "write_validation",
-                    },
-                ),
-            ),
+            (validation_spec,),
         )
         validation_task = validation_plan.tasks[0]
         validation_evidence_items = await self.execute_task(
@@ -187,12 +186,11 @@ class DbRuntimeMonitorActionWritesMixin:
                 "proposal_evidence_id": proposal.id,
             },
         )
-        write_task = self._task_for_spec(
+        write_plan = await self.plan_task_specs(
             operation,
-            write_capability,
-            write_spec,
-            validation_task=validation_task,
+            (validation_spec, write_spec),
         )
+        write_task = write_plan.tasks[-1]
         authoritative = _sql_validation_governance_facts((validation_evidence,))
         operation_override = {
             "operation_type": "write.execute",
@@ -314,13 +312,14 @@ class DbRuntimeMonitorActionWritesMixin:
         write_plan = await self.plan_task_specs(
             operation,
             (
+                validation_spec,
                 replace(
                     write_spec,
                     dependencies=write_task.dependencies,
                 ),
             ),
         )
-        planned_write_task = write_plan.tasks[0]
+        planned_write_task = write_plan.tasks[-1]
         if planned_write_task.dependencies != write_task.dependencies:
             planned_write_task = replace(
                 planned_write_task,

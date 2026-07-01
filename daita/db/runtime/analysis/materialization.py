@@ -847,7 +847,7 @@ class DbRuntimeAnalysisMixin(
         capability = self.registry.get_capability(
             "db.analysis.plan", owner="db_runtime"
         )
-        task = self._analysis_task(
+        task = await self._analysis_task(
             operation,
             capability,
             input={
@@ -886,7 +886,7 @@ class DbRuntimeAnalysisMixin(
         capability = self.registry.get_capability(
             "db.analysis.plan.validate", owner="db_runtime"
         )
-        task = self._analysis_task(
+        task = await self._analysis_task(
             operation,
             capability,
             input={"analysis_plan_evidence_id": plan_evidence.id},
@@ -973,34 +973,60 @@ class DbRuntimeAnalysisMixin(
         )
         sql = validation.payload.get("accepted_sql")
         if sql:
-            read_plan = await self.plan_validated_read_spec(
+            owner = _contract_owner_for_capability(contract, "db.sql.execute_read")
+            read_capability = self.registry.get_capability(
+                "db.sql.execute_read",
+                owner=owner,
+            )
+            validation_capability = self._validation_capability_for_sql_execute(
+                read_capability
+            )
+            if validation_capability is None:
+                raise KeyError("db.sql.validate")
+            deterministic_key = _stable_hash(
+                {
+                    "analysis_validated_read": step_metadata,
+                    "query_plan_validation_id": validation.id,
+                    "sql": str(sql),
+                }
+            )
+            read_plan = await self.plan_task_specs(
                 operation,
-                sql=str(sql),
-                owner=_contract_owner_for_capability(contract, "db.sql.execute_read"),
-                reason="analysis_validated_read",
-                sequence=3000 + len(tasks),
-                metadata=with_analysis_evidence_trace(step_metadata),
-                dependencies=context_dependencies,
-                validation_dependencies=(
-                    TaskDependency(
-                        kind="evidence",
-                        evidence_kind="query.plan.validation",
-                        evidence_id=validation.id,
-                        evidence_payload={"valid": True},
-                        evidence_accepted=True,
-                        operation_id=operation.id,
-                        payload_fingerprint=validation.metadata.get(
-                            "payload_fingerprint"
-                        )
-                        or _payload_fingerprint(validation.payload),
+                (
+                    DbTaskSpec(
+                        capability_id=validation_capability.id,
+                        owner=validation_capability.owner,
+                        input={"sql": str(sql), "operation": "query"},
+                        reason="analysis_validated_read_validation",
+                        sequence=3000 + len(tasks),
+                        dependencies=(
+                            *context_dependencies,
+                            TaskDependency(
+                                kind="evidence",
+                                evidence_kind="query.plan.validation",
+                                evidence_id=validation.id,
+                                evidence_payload={"valid": True},
+                                evidence_accepted=True,
+                                operation_id=operation.id,
+                                payload_fingerprint=validation.metadata.get(
+                                    "payload_fingerprint"
+                                )
+                                or _payload_fingerprint(validation.payload),
+                            ),
+                        ),
+                        metadata=with_analysis_evidence_trace(step_metadata),
+                        deterministic_key=(f"{deterministic_key}:db.sql.validate"),
                     ),
-                ),
-                deterministic_key=_stable_hash(
-                    {
-                        "analysis_validated_read": step_metadata,
-                        "query_plan_validation_id": validation.id,
-                        "sql": str(sql),
-                    }
+                    DbTaskSpec(
+                        capability_id=read_capability.id,
+                        owner=read_capability.owner,
+                        input={"sql_ref": "sql.validation", "params": []},
+                        reason="analysis_validated_read",
+                        sequence=3001 + len(tasks),
+                        dependencies=context_dependencies,
+                        metadata=with_analysis_evidence_trace(step_metadata),
+                        deterministic_key=(f"{deterministic_key}:db.sql.execute_read"),
+                    ),
                 ),
                 contract=contract,
             )
@@ -1164,7 +1190,7 @@ class DbRuntimeAnalysisMixin(
             ),
             *context_dependencies,
         )
-        task = self._analysis_task(
+        task = await self._analysis_task(
             operation,
             capability,
             input={
@@ -1216,7 +1242,7 @@ class DbRuntimeAnalysisMixin(
             dependencies.append(_dependency_for_evidence(item))
         return tuple(dependencies)
 
-    def _analysis_task(
+    async def _analysis_task(
         self,
         operation: Operation,
         capability: Capability,
@@ -1246,7 +1272,8 @@ class DbRuntimeAnalysisMixin(
                 }
             ),
         )
-        return self._task_for_spec(operation, capability, spec)
+        plan = await self.plan_task_specs(operation, (spec,))
+        return plan.tasks[0]
 
     def _accepted_analysis_step_evidence_map(
         self,

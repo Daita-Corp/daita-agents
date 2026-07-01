@@ -39,7 +39,7 @@ class DbRuntimeAnalysisSynthesisMixin:
             step_kind="synthesis",
             plan_evidence_id=plan_evidence.id,
         )
-        task = self._analysis_task(
+        task = await self._analysis_task(
             operation,
             capability,
             input={

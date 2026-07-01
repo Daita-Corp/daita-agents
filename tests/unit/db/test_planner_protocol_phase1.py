@@ -248,13 +248,26 @@ async def test_task_specs_materialize_generic_tasks():
     assert await runtime.store.load_task(task.id) == task
 
 
-async def test_validated_read_spec_creates_validation_before_execute_read():
+async def test_task_specs_create_validation_before_execute_read():
     runtime, operation = await _runtime_and_operation("op-read")
-    plan = await runtime.plan_validated_read_spec(
+    plan = await runtime.plan_task_specs(
         operation,
-        sql="select * from orders",
-        params=[1],
-        owner="phase_one",
+        (
+            DbTaskSpec(
+                capability_id="db.sql.validate",
+                owner="phase_one",
+                input={"sql": "select * from orders", "operation": "query"},
+                reason="phase_1_read_validation",
+                sequence=1,
+            ),
+            DbTaskSpec(
+                capability_id="db.sql.execute_read",
+                owner="phase_one",
+                input={"sql_ref": "sql.validation", "params": [1]},
+                reason="phase_1_read",
+                sequence=2,
+            ),
+        ),
     )
 
     validation_task, read_task = plan.tasks
@@ -267,12 +280,29 @@ async def test_validated_read_spec_creates_validation_before_execute_read():
     assert read_task.input["sql_ref"] == "sql.validation"
 
 
-async def test_validated_write_spec_creates_validation_and_approval_dependencies():
+async def test_task_specs_create_validation_and_approval_dependencies_for_write():
     runtime, operation = await _runtime_and_operation("op-write")
-    plan = await runtime.plan_validated_write_spec(
+    plan = await runtime.plan_task_specs(
         operation,
-        sql="update orders set status = 'paid'",
-        owner="phase_one",
+        (
+            DbTaskSpec(
+                capability_id="db.sql.validate",
+                owner="phase_one",
+                input={
+                    "sql": "update orders set status = 'paid'",
+                    "operation": operation.operation_type,
+                },
+                reason="phase_1_write_validation",
+                sequence=1,
+            ),
+            DbTaskSpec(
+                capability_id="db.sql.execute_write",
+                owner="phase_one",
+                input={"sql_ref": "sql.validation", "params": []},
+                reason="phase_1_write",
+                sequence=2,
+            ),
+        ),
     )
 
     validation_task, write_task = plan.tasks

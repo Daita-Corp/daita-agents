@@ -16,6 +16,7 @@ from ..sql_evidence import (
     effective_source_scope,
     sql_validation_facts_from_evidence,
 )
+from ..runtime.tasks import DbTaskSpec
 from .params import resolve_observation_params, resolve_monitor_state_ref
 from .state import _iso, _parse_iso
 from .types import (
@@ -138,21 +139,52 @@ class DbMonitorObservationRunner:
         owner = _observation_capability_owner(plan)
         params, param_specs = resolve_observation_params(plan, state)
         try:
-            validation_task, read_task = self.runtime.plan_validated_read_tasks(
-                operation,
-                sql=sql,
-                params=params,
-                param_specs=param_specs,
+            read_capability = self.runtime.registry.get_capability(
+                "db.sql.execute_read",
                 owner=owner,
-                reason="monitor_observation_read",
-                sequence=1,
-                metadata={
-                    "monitor_id": monitor.id,
-                    "monitor_run_id": run_id,
-                    "tick_operation_id": operation.id,
-                    "observation_plan_kind": kind,
-                },
             )
+            validation_capability = self.runtime.registry.get_capability(
+                "db.sql.validate",
+                owner=read_capability.owner,
+            )
+            execute_input: dict[str, Any] = {
+                "sql_ref": "sql.validation",
+                "params": list(params),
+            }
+            if param_specs:
+                execute_input["param_specs"] = list(param_specs)
+            task_plan = await self.runtime.plan_task_specs(
+                operation,
+                (
+                    DbTaskSpec(
+                        capability_id=validation_capability.id,
+                        owner=validation_capability.owner,
+                        input={"sql": sql, "operation": "query"},
+                        reason="monitor_observation_read_validation",
+                        sequence=1,
+                        metadata={
+                            "monitor_id": monitor.id,
+                            "monitor_run_id": run_id,
+                            "tick_operation_id": operation.id,
+                            "observation_plan_kind": kind,
+                        },
+                    ),
+                    DbTaskSpec(
+                        capability_id=read_capability.id,
+                        owner=read_capability.owner,
+                        input=execute_input,
+                        reason="monitor_observation_read",
+                        sequence=2,
+                        metadata={
+                            "monitor_id": monitor.id,
+                            "monitor_run_id": run_id,
+                            "tick_operation_id": operation.id,
+                            "observation_plan_kind": kind,
+                        },
+                    ),
+                ),
+            )
+            validation_task, read_task = task_plan.tasks
         except (KeyError, ValueError) as exc:
             raise DbMonitorObservationBlocked(
                 "missing_observation_capability",
