@@ -1,6 +1,6 @@
 from daita.db import DbRuntime, DbRuntimeConfig
 from daita.db.agent_loop import DbAgentLoop
-from daita.db.models import DbIntentKind
+from daita.db.models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
 from daita.db.planner_protocol import (
     DbLoopState,
     DbPlannerAction,
@@ -14,10 +14,13 @@ from daita.runtime import (
     Capability,
     Evidence,
     EvidenceSchema,
+    Operation,
     OperationStatus,
     RiskLevel,
+    Task,
     TaskStatus,
 )
+from daita.db.verification import DbVerifier, db_run_finalization_check
 
 OWNER = "completion_target"
 
@@ -131,7 +134,7 @@ class CompletionTargetPlugin(RuntimeExtensionPlugin):
         common = {
             "domains": frozenset({"db"}),
             "operation_types": frozenset(
-                {"db.run", "data.query", "data.query.catalog_assisted"}
+                {"db.run", "schema.query", "data.query", "data.query.catalog_assisted"}
             ),
             "risk": RiskLevel.LOW,
             "input_schema": {"type": "object"},
@@ -205,6 +208,114 @@ class CompletionTargetPlugin(RuntimeExtensionPlugin):
                 json_schema={"type": "object"},
             ),
         ]
+
+
+def test_finalization_policy_blocks_data_query_with_schema_evidence_only():
+    check = _finalization_check(
+        intent_kind=DbIntentKind.DATA_QUERY,
+        required_evidence=("database.schema",),
+        evidence=(
+            Evidence(
+                kind="database.schema",
+                owner=OWNER,
+                accepted=True,
+                payload={"tables": [{"name": "orders"}]},
+            ),
+        ),
+    )
+
+    assert check.finalizable is False
+    assert check.query_result_required is True
+    assert check.query_result_present is False
+    assert "query_result_missing" in check.verification.warnings
+
+
+def test_finalization_policy_blocks_data_query_with_query_plan_only():
+    check = _finalization_check(
+        intent_kind=DbIntentKind.DATA_QUERY,
+        required_evidence=("query.plan.proposal",),
+        evidence=(
+            Evidence(
+                kind="query.plan.proposal",
+                owner=OWNER,
+                accepted=True,
+                payload={"sql": "select count(*) as count from orders"},
+            ),
+        ),
+    )
+
+    assert check.finalizable is False
+    assert check.query_result_required is True
+    assert check.query_result_present is False
+    assert "query_result_missing" in check.verification.warnings
+
+
+def test_finalization_policy_accepts_data_query_with_query_result():
+    sql = "select count(*) as count from orders"
+    check = _finalization_check(
+        intent_kind=DbIntentKind.DATA_QUERY,
+        required_evidence=("query.result",),
+        evidence=(
+            Evidence(
+                kind="sql.validation",
+                owner=OWNER,
+                task_id="validate",
+                accepted=True,
+                payload={"valid": True, "sql": sql, "operation": "query"},
+            ),
+            Evidence(
+                kind="query.result",
+                owner=OWNER,
+                task_id="read",
+                accepted=True,
+                payload={"rows": [{"count": 3}], "total_rows": 1, "sql": sql},
+            ),
+        ),
+        tasks=_validated_read_tasks(),
+    )
+
+    assert check.finalizable is True
+    assert check.query_result_required is True
+    assert check.query_result_present is True
+
+
+def test_finalization_policy_accepts_schema_query_without_query_result():
+    check = _finalization_check(
+        intent_kind=DbIntentKind.SCHEMA_QUERY,
+        operation_type="schema.query",
+        required_evidence=("database.schema",),
+        evidence=(
+            Evidence(
+                kind="database.schema",
+                owner=OWNER,
+                accepted=True,
+                payload={"tables": [{"name": "orders"}]},
+            ),
+        ),
+    )
+
+    assert check.finalizable is True
+    assert check.query_result_required is False
+    assert check.query_result_present is False
+
+
+def test_finalization_policy_ignores_answer_synthesis_as_supporting_evidence():
+    check = _finalization_check(
+        intent_kind=DbIntentKind.SCHEMA_QUERY,
+        operation_type="schema.query",
+        evidence=(
+            Evidence(
+                kind="answer.synthesis",
+                owner=OWNER,
+                accepted=True,
+                payload={"answer": "There is an orders table."},
+            ),
+        ),
+    )
+
+    assert check.finalizable is False
+    assert check.verification.passed is True
+    assert check.supporting_evidence == ()
 
 
 class ScriptedPlanner:
@@ -372,6 +483,39 @@ async def test_resume_finalizes_sufficient_evidence_without_planner_or_llm():
     assert runtime.operation_results[-1].answer == synthesis.payload["answer"]
 
 
+async def test_resume_finalization_does_not_finalize_schema_only_data_query():
+    first_turn = ScriptedPlanner(_inspect_schema_decision())
+    runtime, _ = await _runtime_with_planner(first_turn)
+    operation = await _bootstrap_run_operation(runtime, "resume-schema-only-target")
+    loop_result = await DbAgentLoop(runtime, first_turn).run(
+        operation,
+        safety_frame={"max_access": "read"},
+        max_turns=1,
+    )
+    snapshot = await runtime.inspect_operation(operation.id)
+
+    finalized = await runtime._try_finalize_run_operation_from_snapshot(
+        snapshot,
+        request=DbRequest("completion target"),
+        fallback_intent=DbIntent(
+            kind=DbIntentKind.DATA_QUERY,
+            access=AccessMode.READ,
+            evidence_mode="test",
+        ),
+        fallback_contract=DbOperationContract(
+            operation_type="data.query",
+            required_evidence=("database.schema",),
+            access=AccessMode.READ,
+        ),
+    )
+
+    assert loop_result.status == "budget_exhausted"
+    assert finalized is None
+    assert "database.schema" in _evidence_kinds(snapshot)
+    assert "query.result" not in _evidence_kinds(snapshot)
+    assert "answer.synthesis" not in _evidence_kinds(snapshot)
+
+
 async def test_resume_executes_persisted_runnable_tasks_then_finalizes():
     runtime, _ = await _runtime_with_planner(ScriptedPlanner())
     operation = await _bootstrap_run_operation(runtime, "resume-pending-tasks-target")
@@ -464,7 +608,7 @@ async def test_planner_dag_dependencies_become_durable_task_dependencies():
     operation = await _bootstrap_run_operation(runtime, "dag-valid-target")
     decision = DbPlannerDecision(
         status=DbPlannerDecisionStatus.CONTINUE,
-        intent={"operation_type": "data.query"},
+        intent={"operation_type": "schema.query"},
         actions=(
             DbPlannerAction(
                 action_id="schema",
@@ -748,6 +892,63 @@ async def _plan_read_tasks_without_execution(runtime, operation, *, sql):
 
 def _fail_planner_selection():
     raise AssertionError("planner selection should not be required")
+
+
+def _finalization_check(
+    *,
+    intent_kind,
+    evidence,
+    tasks=(),
+    operation_type="db.run",
+    required_evidence=(),
+):
+    operation = Operation(
+        id="finalization-policy-target",
+        operation_type=operation_type,
+        request={"prompt": "completion target"},
+    )
+    intent = DbIntent(
+        kind=intent_kind,
+        access=(
+            AccessMode.METADATA_READ
+            if intent_kind
+            in {DbIntentKind.SCHEMA_QUERY, DbIntentKind.SCHEMA_RELATIONSHIP_QUERY}
+            else AccessMode.READ
+        ),
+        evidence_mode="test",
+    )
+    contract = DbOperationContract(
+        operation_type=operation_type,
+        required_evidence=required_evidence,
+        access=intent.access,
+    )
+    return db_run_finalization_check(
+        operation=operation,
+        verifier=DbVerifier(),
+        contract=contract,
+        intent=intent,
+        evidence=tuple(evidence),
+        tasks=tuple(tasks),
+    )
+
+
+def _validated_read_tasks():
+    return (
+        Task(
+            id="validate",
+            operation_id="finalization-policy-target",
+            capability_id="db.sql.validate",
+            executor_id=f"{OWNER}.sql.validate",
+            status=TaskStatus.SUCCEEDED,
+        ),
+        Task(
+            id="read",
+            operation_id="finalization-policy-target",
+            capability_id="db.sql.execute_read",
+            executor_id=f"{OWNER}.sql.execute_read",
+            status=TaskStatus.SUCCEEDED,
+        ),
+    )
 
 
 def _inspect_schema_decision():

@@ -31,6 +31,10 @@ from .planner_protocol import (
 )
 from .runtime.tasks import DbTaskSpec
 from .runtime.types import DbRuntimeGovernanceBlocked, DbRuntimeTaskNotRunnable
+from .verification import (
+    DB_FINALIZATION_CONTROL_EVIDENCE_KINDS,
+    db_run_finalization_check,
+)
 
 _ACCESS_ORDER = {
     AccessMode.NONE.value: 0,
@@ -77,14 +81,6 @@ _TERMINAL_TASK_STATUSES = {
     TaskStatus.CANCELLED,
     TaskStatus.BLOCKED,
     TaskStatus.SKIPPED,
-}
-
-_LOOP_CONTROL_EVIDENCE_KINDS = {
-    "planner.decision",
-    "planner.compilation",
-    "planner.observation",
-    "verification.result",
-    "answer.synthesis",
 }
 
 
@@ -548,15 +544,6 @@ class DbAgentLoop:
                     warnings=warnings,
                     diagnostics=diagnostics,
                 )
-            if turn == turn_budget and _compiled_contract_evidence_satisfied(
-                finalization
-            ):
-                return await self._result(
-                    operation,
-                    "finished",
-                    warnings=warnings,
-                    diagnostics=diagnostics,
-                )
             continue
         diagnostics: dict[str, Any] = {"turn_budget": turn_budget}
         if last_compilation is not None:
@@ -677,6 +664,7 @@ class DbAgentLoop:
                 action,
                 prior_action_specs=prior_action_specs,
                 operation_id=state.operation_id,
+                state=state,
             )
             if dependency_errors:
                 rejected.extend(dependency_errors)
@@ -730,12 +718,15 @@ class DbAgentLoop:
         *,
         prior_action_specs: Mapping[str, tuple[DbTaskSpec, ...]],
         operation_id: str,
+        state: DbLoopState,
     ) -> tuple[tuple[TaskDependency, ...], tuple[dict[str, Any], ...]]:
         dependencies: list[TaskDependency] = []
         errors: list[dict[str, Any]] = []
         for dependency_action_id in dict.fromkeys(action.depends_on):
             producer_specs = prior_action_specs.get(dependency_action_id)
             if not producer_specs:
+                if _prior_evidence_satisfies_action(action, state):
+                    continue
                 errors.append(
                     _action_error(
                         action, f"dependency_not_durable:{dependency_action_id}"
@@ -856,6 +847,8 @@ class DbAgentLoop:
         decision_fingerprint: str,
     ) -> tuple[list[DbTaskSpec], list[dict[str, Any]], list[dict[str, Any]]]:
         sql = action.input.get("sql")
+        if not isinstance(sql, str) or not sql.strip():
+            sql = _latest_planned_sql(state) if sql_operation == "query" else None
         if not isinstance(sql, str) or not sql.strip():
             return [], [], [_action_error(action, "missing_sql")]
         owner = _action_owner(action)
@@ -1449,17 +1442,18 @@ class DbAgentLoop:
         evidence = tuple(await self.runtime.store.list_evidence(operation_id))
         tasks = tuple(await self.runtime.store.list_tasks(operation_id))
         intent = _intent_from_contract(contract, fallback_intent)
-        verification = self.runtime.verifier.verify(contract, intent, evidence, tasks)
-        supporting_evidence = _accepted_synthesis_support_evidence(evidence)
-        finalizable = verification.passed and bool(supporting_evidence)
-        return finalizable, {
-            "finalizable": finalizable,
-            "verification": verification.to_dict(),
+        check = db_run_finalization_check(
+            operation=operation,
+            verifier=self.runtime.verifier,
+            contract=contract,
+            intent=intent,
+            evidence=evidence,
+            tasks=tasks,
+        )
+        return check.finalizable, {
+            **check.to_dict(),
             "intent": _intent_summary(intent),
             "contract": _contract_snapshot(contract),
-            "synthesis_supporting_evidence": tuple(
-                _evidence_ref(item) for item in supporting_evidence
-            ),
         }
 
     async def _fresh_operation(self, operation_id: str) -> Operation:
@@ -1690,16 +1684,10 @@ def _new_evidence_refs(
     if include_loop_control:
         return refs
     return tuple(
-        item for item in refs if item.get("kind") not in _LOOP_CONTROL_EVIDENCE_KINDS
+        item
+        for item in refs
+        if item.get("kind") not in DB_FINALIZATION_CONTROL_EVIDENCE_KINDS
     )
-
-
-def _compiled_contract_evidence_satisfied(finalization: Mapping[str, Any]) -> bool:
-    verification = finalization.get("verification")
-    verification = verification if isinstance(verification, Mapping) else {}
-    missing = verification.get("missing_evidence")
-    supporting = finalization.get("synthesis_supporting_evidence")
-    return not tuple(missing or ()) and bool(tuple(supporting or ()))
 
 
 def _action_owner(action: DbPlannerAction) -> str | None:
@@ -1850,13 +1838,17 @@ def _task_ref(task: Task) -> dict[str, Any]:
 
 
 def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
-    return {
+    summary = {
         "id": evidence.id,
         "kind": evidence.kind,
         "owner": evidence.owner,
         "accepted": evidence.accepted,
         "task_id": evidence.task_id,
     }
+    sql = _sql_from_evidence_payload(evidence.payload)
+    if sql:
+        summary["sql"] = sql
+    return summary
 
 
 def _evidence_ref(evidence: Evidence) -> dict[str, Any]:
@@ -1865,6 +1857,44 @@ def _evidence_ref(evidence: Evidence) -> dict[str, Any]:
         "kind": evidence.kind,
         "accepted": evidence.accepted,
     }
+
+
+def _prior_evidence_satisfies_action(
+    action: DbPlannerAction,
+    state: DbLoopState,
+) -> bool:
+    if action.kind is DbPlannerActionKind.EXECUTE_VALIDATED_READ:
+        return bool(_latest_planned_sql(state))
+    return False
+
+
+def _latest_planned_sql(state: DbLoopState) -> str | None:
+    for summary in reversed(state.accepted_evidence_summaries):
+        if summary.get("kind") not in {
+            "query.plan.proposal",
+            "query.plan.validation",
+            "sql.validation",
+        }:
+            continue
+        sql = summary.get("sql")
+        if isinstance(sql, str) and sql.strip():
+            return sql.strip()
+    return None
+
+
+def _sql_from_evidence_payload(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("sql", "selected_sql"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    structured_plan = payload.get("structured_plan")
+    if isinstance(structured_plan, dict):
+        selected_sql = structured_plan.get("selected_sql")
+        if isinstance(selected_sql, str) and selected_sql.strip():
+            return selected_sql.strip()
+    return None
 
 
 def _fallback_contract_for_operation(
@@ -1975,16 +2005,6 @@ def _intent_summary(intent: DbIntent) -> dict[str, Any]:
         "evidence_mode": intent.evidence_mode,
         "diagnostics": intent.diagnostics,
     }
-
-
-def _accepted_synthesis_support_evidence(
-    evidence: tuple[Evidence, ...],
-) -> tuple[Evidence, ...]:
-    return tuple(
-        item
-        for item in evidence
-        if item.accepted and item.kind not in _LOOP_CONTROL_EVIDENCE_KINDS
-    )
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:

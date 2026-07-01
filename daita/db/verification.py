@@ -11,6 +11,16 @@ from daita.runtime import Evidence, Task
 
 from .models import DbIntent, DbIntentKind, DbOperationContract
 
+DB_FINALIZATION_CONTROL_EVIDENCE_KINDS = frozenset(
+    {
+        "planner.decision",
+        "planner.compilation",
+        "planner.observation",
+        "verification.result",
+        "answer.synthesis",
+    }
+)
+
 
 @dataclass(frozen=True)
 class DbVerificationResult:
@@ -29,6 +39,28 @@ class DbVerificationResult:
             "warnings": list(self.warnings),
             "diagnostics": self.diagnostics,
             "evidence_refs": list(self.evidence_refs),
+        }
+
+
+@dataclass(frozen=True)
+class DbFinalizationCheck:
+    """Final DB run readiness using shared verification and support evidence."""
+
+    finalizable: bool
+    verification: DbVerificationResult
+    query_result_required: bool
+    query_result_present: bool
+    supporting_evidence: tuple[Evidence, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "finalizable": self.finalizable,
+            "verification": self.verification.to_dict(),
+            "query_result_required": self.query_result_required,
+            "query_result_present": self.query_result_present,
+            "synthesis_supporting_evidence": tuple(
+                _evidence_refs(self.supporting_evidence)
+            ),
         }
 
 
@@ -79,6 +111,64 @@ class DbVerifier:
             diagnostics=diagnostics,
             evidence_refs=_evidence_refs(evidence),
         )
+
+
+def db_accepted_synthesis_support_evidence(
+    evidence: tuple[Evidence, ...],
+) -> tuple[Evidence, ...]:
+    """Return accepted evidence that can support final answer synthesis."""
+    return tuple(
+        item
+        for item in evidence
+        if item.accepted and item.kind not in DB_FINALIZATION_CONTROL_EVIDENCE_KINDS
+    )
+
+
+def db_operation_requires_query_result(operation: Any, intent: DbIntent) -> bool:
+    """Return whether a DB operation needs data evidence before finalization."""
+    mode = str(getattr(operation, "request", {}).get("mode") or "").lower()
+    operation_type = str(getattr(operation, "operation_type", "") or "").lower()
+    return (
+        intent.kind
+        in {
+            DbIntentKind.DATA_QUERY,
+            DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
+            DbIntentKind.METRIC_QUERY,
+        }
+        or mode in {"data", "data.query", "query", "read"}
+        or operation_type
+        in {"data.query", "data.query.catalog_assisted", "metric.query"}
+    )
+
+
+def db_run_finalization_check(
+    *,
+    operation: Any,
+    verifier: DbVerifier,
+    contract: DbOperationContract,
+    intent: DbIntent,
+    evidence: tuple[Evidence, ...],
+    tasks: tuple[Task, ...],
+) -> DbFinalizationCheck:
+    """Check whether accepted evidence is sufficient to finalize a DB run."""
+    verification = verifier.verify(contract, intent, evidence, tasks)
+    supporting_evidence = db_accepted_synthesis_support_evidence(evidence)
+    query_result_required = db_operation_requires_query_result(operation, intent)
+    query_result_present = any(
+        item.accepted and item.kind == "query.result" for item in evidence
+    )
+    finalizable = (
+        verification.passed
+        and bool(supporting_evidence)
+        and (not query_result_required or query_result_present)
+    )
+    return DbFinalizationCheck(
+        finalizable=finalizable,
+        verification=verification,
+        query_result_required=query_result_required,
+        query_result_present=query_result_present,
+        supporting_evidence=supporting_evidence,
+    )
 
 
 def _verify_data_query(

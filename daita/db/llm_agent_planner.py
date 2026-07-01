@@ -92,7 +92,20 @@ def _planner_messages(state: DbLoopState) -> list[dict[str, str]]:
                 "for a DbPlannerDecision. You choose semantic intent and typed "
                 "planner actions; you never execute database work. Use only the "
                 "provided action vocabulary. SQL execution actions must depend on "
-                "runtime validation and must not bypass governance."
+                "runtime validation and must not bypass governance. For user "
+                "requests that ask for rows, counts, aggregates, metrics, or "
+                "other database values, set intent.operation_type to "
+                "'data.query'. If schema evidence is missing, plan schema "
+                "inspection or schema search first; do not clarify only because "
+                "schema has not been inspected. Continue data queries through "
+                "query planning and validated read execution until query.result "
+                "evidence exists, unless the request is genuinely ambiguous after "
+                "available runtime facts have been gathered. Use depends_on only "
+                "for actions in the same decision. When prior accepted "
+                "query.plan.proposal evidence already contains SQL, an "
+                "execute_validated_read action should provide that SQL in input.sql "
+                "or otherwise rely on that accepted evidence; do not depend on a "
+                "previous-turn action id."
             ),
         },
         {
@@ -198,6 +211,7 @@ def _parse_planner_json(content: str) -> tuple[dict[str, Any] | None, dict[str, 
         return None, {"error": "planner_json_decode_error", "message": str(exc)}
     if not isinstance(parsed, dict):
         return None, {"error": "planner_json_not_object"}
+    parsed = _unwrap_planner_decision(parsed)
     return parsed, {}
 
 
@@ -205,3 +219,13 @@ def _strip_json_fence(content: str) -> str:
     stripped = content.strip()
     match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, flags=re.DOTALL)
     return match.group(1).strip() if match else stripped
+
+
+def _unwrap_planner_decision(parsed: dict[str, Any]) -> dict[str, Any]:
+    if "status" in parsed:
+        return parsed
+    for key in ("decision", "planner_decision", "DbPlannerDecision"):
+        value = parsed.get(key)
+        if isinstance(value, dict):
+            return value
+    return parsed

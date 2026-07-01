@@ -46,7 +46,7 @@ from ..planning import DbContractBuilder, build_safety_frame, classify_db_reques
 from ..planner_protocol import DbAgentPlanner
 from ..session_context import db_session_context_from_request
 from ..synthesis import DbSynthesizer
-from ..verification import DbVerifier
+from ..verification import DbVerifier, db_run_finalization_check
 from .analysis import DbRuntimeAnalysisMixin
 from .cache import DbRuntimeCacheMixin
 from .extensions import DbRuntimePlanningPlugin
@@ -510,8 +510,16 @@ class DbRuntime(
         if loop_result is not None:
             diagnostics["planner"] = _planner_diagnostics(loop_result)
         loop_warnings = loop_result.warnings if loop_result is not None else ()
-        verification = self.verifier.verify(contract, intent, evidence, tasks)
-        if not verification.passed:
+        finalization = db_run_finalization_check(
+            operation=operation,
+            verifier=self.verifier,
+            contract=contract,
+            intent=intent,
+            evidence=evidence,
+            tasks=tasks,
+        )
+        verification = finalization.verification
+        if not finalization.finalizable:
             return await self._record_operation_result(
                 DbOperationResult(
                     operation_id=operation_id,
@@ -530,6 +538,11 @@ class DbRuntime(
                             evidence=evidence,
                         ),
                         "verification": verification.to_dict(),
+                        "finalization": {
+                            **finalization.to_dict(),
+                            "intent": _intent_diagnostics(intent),
+                            "contract": _contract_diagnostics(contract),
+                        },
                     },
                 ),
                 operation=operation,
@@ -605,17 +618,18 @@ class DbRuntime(
         fallback_intent = fallback_intent or self._db_intent_from_operation(operation)
         contract = _contract_from_latest_loop_snapshot(operation, fallback_contract)
         intent = _intent_from_loop_contract(contract, fallback_intent)
-        verification = self.verifier.verify(contract, intent, evidence, tasks)
-        supporting_evidence = _accepted_run_synthesis_support_evidence(evidence)
-        finalizable = verification.passed and bool(supporting_evidence)
-        return finalizable, {
-            "finalizable": finalizable,
-            "verification": verification.to_dict(),
+        check = db_run_finalization_check(
+            operation=operation,
+            verifier=self.verifier,
+            contract=contract,
+            intent=intent,
+            evidence=evidence,
+            tasks=tasks,
+        )
+        return check.finalizable, {
+            **check.to_dict(),
             "intent": _intent_diagnostics(intent),
             "contract": _contract_diagnostics(contract),
-            "synthesis_supporting_evidence": tuple(
-                _evidence_ref(item) for item in supporting_evidence
-            ),
         }
 
     async def _try_finalize_run_operation_from_snapshot(
@@ -960,26 +974,6 @@ def _answer_from_loop_result(loop_result: DbLoopResult) -> str:
     if loop_result.status == "budget_exhausted":
         return "The DB planner exhausted its turn budget before finishing."
     return "DB operation failed before final synthesis."
-
-
-_RUN_FINALIZATION_CONTROL_EVIDENCE_KINDS = {
-    "planner.decision",
-    "planner.compilation",
-    "planner.observation",
-    "verification.result",
-    "answer.synthesis",
-}
-
-
-def _accepted_run_synthesis_support_evidence(
-    evidence: tuple[Any, ...],
-) -> tuple[Any, ...]:
-    return tuple(
-        item
-        for item in evidence
-        if bool(getattr(item, "accepted", False))
-        and getattr(item, "kind", None) not in _RUN_FINALIZATION_CONTROL_EVIDENCE_KINDS
-    )
 
 
 def _intent_diagnostics(intent: DbIntent) -> dict[str, Any]:

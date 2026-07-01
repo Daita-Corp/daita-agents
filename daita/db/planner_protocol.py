@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from abc import abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 import json
@@ -81,9 +82,20 @@ class DbPlannerAction:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DbPlannerAction":
-        values = dict(data)
+        values = {
+            key: data[key]
+            for key in (
+                "action_id",
+                "kind",
+                "input",
+                "depends_on",
+                "rationale",
+                "metadata",
+            )
+            if key in data
+        }
         values["kind"] = DbPlannerActionKind(values["kind"])
-        values["depends_on"] = tuple(values.get("depends_on") or ())
+        values["depends_on"] = _coerce_string_tuple(values.get("depends_on"))
         return cls(**values)
 
 
@@ -132,12 +144,24 @@ class DbPlannerDecision:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DbPlannerDecision":
-        values = dict(data)
+        values = {
+            key: data[key]
+            for key in (
+                "status",
+                "intent",
+                "actions",
+                "stop_conditions",
+                "clarification_question",
+                "rationale",
+                "metadata",
+            )
+            if key in data
+        }
         values["status"] = DbPlannerDecisionStatus(values["status"])
         values["actions"] = tuple(
             DbPlannerAction.from_dict(item) for item in values.get("actions", ())
         )
-        values["stop_conditions"] = tuple(values.get("stop_conditions") or ())
+        values["stop_conditions"] = _coerce_string_tuple(values.get("stop_conditions"))
         return cls(**values)
 
 
@@ -332,8 +356,10 @@ class DbLoopState:
 class DbAgentPlanner(Protocol):
     """Protocol implemented by DB agent planners."""
 
+    @abstractmethod
     async def plan(self, state: DbLoopState) -> DbPlannerDecision:
         """Return the next planner decision for a persisted DB loop state."""
+        raise NotImplementedError
 
 
 def _json_dict(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -354,8 +380,25 @@ def _tuple_json_dicts(
 
 
 def _tuple_strings(values: tuple[str, ...] | list[str] | set[str]) -> tuple[str, ...]:
-    items = tuple(values)
-    for value in items:
-        if not isinstance(value, str):
-            raise TypeError("values must be strings")
-    return items
+    return _coerce_string_tuple(values)
+
+
+def _coerce_string_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if not isinstance(value, (tuple, list, set, frozenset)):
+        return (str(value),)
+    return tuple(_coerce_string_item(item) for item in value)
+
+
+def _coerce_string_item(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        for key in ("action_id", "id", "kind", "name"):
+            item = value.get(key)
+            if isinstance(item, str) and item:
+                return item
+    return str(value)

@@ -1,8 +1,11 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from daita.db import DbRuntime, DbRuntimeConfig
 from daita.db.planner_protocol import (
+    DbAgentPlanner,
     DbLoopState,
     DbPlannerAction,
     DbPlannerActionKind,
@@ -178,6 +181,14 @@ def test_planner_protocol_records_serialize_cleanly():
 
     assert DbPlannerDecision.from_dict(decision.to_dict()) == decision
     assert DbLoopState.from_dict(state.to_dict()) == state
+
+
+def test_db_agent_planner_requires_plan_implementation():
+    class MissingPlan(DbAgentPlanner):
+        pass
+
+    with pytest.raises(TypeError, match="abstract class"):
+        MissingPlan()
 
 
 def test_planner_decision_status_and_action_kind_values_are_stable():
