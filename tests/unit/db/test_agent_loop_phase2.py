@@ -366,6 +366,31 @@ async def test_latest_accepted_query_plan_ref_ignores_rejected_plan_evidence():
     assert validation.dependencies[0].evidence_id == "plan-accepted"
 
 
+async def test_latest_accepted_query_plan_ref_skips_accepted_plans_without_sql():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-latest-plan-skips-nosql",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-with-sql", "sql": "select 1 as answer"},
+            {"evidence_id": "plan-without-sql", "sql": None},
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-with-sql"
+
+
 async def test_rejected_plan_evidence_id_is_rejected_clearly():
     action = DbPlannerAction(
         action_id="read",
@@ -388,6 +413,77 @@ async def test_rejected_plan_evidence_id_is_rejected_clearly():
     assert compilation.task_specs == ()
     assert compilation.rejected_action_summaries[0]["error"] == (
         "rejected_plan_evidence:plan-rejected"
+    )
+
+
+async def test_ambiguous_sql_inputs_are_rejected_clearly():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "sql": "select 1 as answer",
+            "plan_evidence_id": "plan-explicit",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-ambiguous-sql-input",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-explicit", "sql": "select 2 as answer"},
+        ),
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "ambiguous_sql_input"
+    )
+
+
+async def test_ambiguous_plan_evidence_id_is_rejected_clearly():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two", "plan_evidence_id": "plan-ambiguous"},
+    )
+    runtime, operation = await _runtime_and_operation("phase-four-ambiguous-plan")
+    state = DbLoopState(
+        operation_id=operation.id,
+        normalized_user_request={"prompt": "phase four"},
+        safety_frame={"max_access": "read"},
+        available_action_kinds=tuple(DbPlannerActionKind),
+        accepted_evidence_summaries=(
+            {
+                "id": "plan-ambiguous",
+                "kind": "query.plan.proposal",
+                "owner": "phase_two",
+                "accepted": True,
+                "sql": "select 1 as answer",
+            },
+            {
+                "id": "plan-ambiguous",
+                "kind": "query.plan.proposal",
+                "owner": "phase_two",
+                "accepted": True,
+                "sql": "select 2 as answer",
+            },
+        ),
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=(action,),
+    )
+
+    compilation = DbAgentLoop(runtime, FakePlanner()).compile_actions(
+        decision,
+        state,
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "ambiguous_plan_evidence:plan-ambiguous"
     )
 
 

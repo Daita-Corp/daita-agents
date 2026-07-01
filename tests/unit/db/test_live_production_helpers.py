@@ -30,6 +30,15 @@ class FakeEvidence:
         }
 
 
+@dataclass(frozen=True)
+class FakeTask:
+    capability_id: str
+    input: dict[str, Any]
+    id: str = "task-test"
+    executor_id: str = "executor-test"
+    status: Any = "pending"
+
+
 class FakeSnapshot(SimpleNamespace):
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +54,28 @@ def _snapshot(*evidence: FakeEvidence) -> FakeSnapshot:
         evidence=evidence,
         tasks=(),
     )
+
+
+def test_sql_from_result_reads_query_result_sql():
+    snapshot = _snapshot(
+        FakeEvidence(
+            kind="query.result",
+            payload={"rows": [{"count": 4}], "sql": "select count(*) from customers"},
+        )
+    )
+
+    assert sql_from_result(snapshot) == "select count(*) from customers"
+
+
+def test_sql_from_result_reads_query_plan_validation_sql():
+    snapshot = _snapshot(
+        FakeEvidence(
+            kind="query.plan.validation",
+            payload={"valid": True, "query": "select customer_id from customers"},
+        )
+    )
+
+    assert sql_from_result(snapshot) == "select customer_id from customers"
 
 
 def test_sql_from_result_falls_back_to_accepted_query_plan_proposal():
@@ -91,6 +122,61 @@ def test_sql_from_result_ignores_rejected_query_plan_proposal():
     )
 
     assert sql_from_result(snapshot) == ""
+
+
+def test_sql_from_result_falls_back_to_planner_compilation_sql():
+    snapshot = _snapshot(
+        FakeEvidence(
+            kind="planner.compilation",
+            payload={
+                "compilation": {
+                    "task_specs": [
+                        {
+                            "capability_id": "db.sql.validate",
+                            "input": {
+                                "sql": "select count(*) from compiled_customers"
+                            },
+                        }
+                    ]
+                }
+            },
+        )
+    )
+
+    assert sql_from_result(snapshot) == "select count(*) from compiled_customers"
+
+
+def test_sql_from_result_falls_back_to_snapshot_task_input():
+    snapshot = FakeSnapshot(
+        operation=SimpleNamespace(id="op-test"),
+        evidence=(),
+        tasks=(
+            FakeTask(
+                capability_id="db.sql.validate",
+                input={"sql": "select count(*) from task_customers"},
+            ),
+        ),
+    )
+
+    assert sql_from_result(snapshot) == "select count(*) from task_customers"
+
+
+def test_sql_from_result_falls_back_to_diagnostics_task_input():
+    result = SimpleNamespace(
+        evidence=(),
+        diagnostics={
+            "execution": {
+                "tasks": [
+                    {
+                        "capability_id": "db.sql.validate",
+                        "input": {"sql": "select count(*) from diagnostics_customers"},
+                    }
+                ]
+            }
+        },
+    )
+
+    assert sql_from_result(result) == "select count(*) from diagnostics_customers"
 
 
 def test_assert_sql_is_read_only_catches_destructive_verbs():

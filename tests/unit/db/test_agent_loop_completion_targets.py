@@ -516,6 +516,39 @@ async def test_resume_finalization_does_not_finalize_schema_only_data_query():
     assert "answer.synthesis" not in _evidence_kinds(snapshot)
 
 
+async def test_runtime_finalization_state_uses_shared_policy_for_query_plan_only_data_query():
+    runtime, _ = await _runtime_with_planner(ScriptedPlanner())
+    operation = await _bootstrap_run_operation(runtime, "facade-query-plan-only-target")
+    await runtime.store.save_evidence(
+        Evidence(
+            kind="query.plan.proposal",
+            owner=OWNER,
+            operation_id=operation.id,
+            accepted=True,
+            payload={"sql": "select count(*) as count from orders"},
+        )
+    )
+
+    finalizable, diagnostics = await runtime._run_operation_finalization_state(
+        operation.id,
+        fallback_intent=DbIntent(
+            kind=DbIntentKind.DATA_QUERY,
+            access=AccessMode.READ,
+            evidence_mode="test",
+        ),
+        fallback_contract=DbOperationContract(
+            operation_type="data.query",
+            required_evidence=("query.plan.proposal",),
+            access=AccessMode.READ,
+        ),
+    )
+
+    assert finalizable is False
+    assert diagnostics["query_result_required"] is True
+    assert diagnostics["query_result_present"] is False
+    assert "query_result_missing" in diagnostics["verification"]["warnings"]
+
+
 async def test_resume_executes_persisted_runnable_tasks_then_finalizes():
     runtime, _ = await _runtime_with_planner(ScriptedPlanner())
     operation = await _bootstrap_run_operation(runtime, "resume-pending-tasks-target")

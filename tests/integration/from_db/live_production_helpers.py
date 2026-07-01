@@ -310,6 +310,16 @@ def sql_from_result(result_or_snapshot: Any) -> str:
         sql = _first_sql_value(evidence.payload)
         if sql:
             return sql
+    for kind in ("planner.compilation",):
+        evidence = latest_evidence(result_or_snapshot, kind)
+        if evidence is None:
+            continue
+        sql = _first_sql_value(evidence.payload)
+        if sql:
+            return sql
+    sql = _sql_from_task_inputs(result_or_snapshot)
+    if sql:
+        return sql
     return ""
 
 
@@ -437,6 +447,26 @@ def _first_sql_value(payload: Any) -> str:
             nested = _first_sql_value(value)
             if nested:
                 return nested
+    return ""
+
+
+def _sql_from_task_inputs(result_or_snapshot: Any) -> str:
+    tasks = getattr(result_or_snapshot, "tasks", None)
+    if tasks is not None:
+        for task in tasks:
+            sql = _first_sql_value(getattr(task, "input", None))
+            if sql:
+                return sql
+
+    diagnostics = getattr(result_or_snapshot, "diagnostics", {}) or {}
+    execution = diagnostics.get("execution") if isinstance(diagnostics, dict) else {}
+    task_payloads = execution.get("tasks", []) if isinstance(execution, dict) else []
+    for task in task_payloads:
+        if not isinstance(task, dict):
+            continue
+        sql = _first_sql_value(task.get("input"))
+        if sql:
+            return sql
     return ""
 
 

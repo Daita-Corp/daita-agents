@@ -217,6 +217,27 @@ def test_planner_protocol_string_collections_are_strict():
         )
 
 
+def test_planner_protocol_from_dict_rejects_boundary_only_tuple_coercion():
+    with pytest.raises(TypeError, match="string collections"):
+        DbPlannerAction.from_dict(
+            {
+                "action_id": "a1",
+                "kind": "execute_validated_read",
+                "input": {"sql": "select 1"},
+                "depends_on": [{"action_id": "schema"}],
+            }
+        )
+
+    with pytest.raises(TypeError, match="string collections"):
+        DbPlannerDecision.from_dict(
+            {
+                "status": "continue",
+                "actions": [],
+                "stop_conditions": [{"name": "verified"}],
+            }
+        )
+
+
 def test_db_agent_planner_requires_plan_implementation():
     class MissingPlan(DbAgentPlanner):
         pass
