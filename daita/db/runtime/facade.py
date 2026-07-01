@@ -587,6 +587,69 @@ class DbRuntime(
             operation=operation,
         )
 
+    async def _run_operation_finalization_state(
+        self,
+        operation_id: str,
+        *,
+        fallback_intent: DbIntent | None = None,
+        fallback_contract: DbOperationContract | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        operation = await self.store.load_operation(operation_id)
+        if operation is None:
+            raise KeyError(operation_id)
+        evidence = tuple(await self.store.list_evidence(operation_id))
+        tasks = tuple(await self.store.list_tasks(operation_id))
+        fallback_contract = fallback_contract or self._db_contract_from_context(
+            operation
+        )
+        fallback_intent = fallback_intent or self._db_intent_from_operation(operation)
+        contract = _contract_from_latest_loop_snapshot(operation, fallback_contract)
+        intent = _intent_from_loop_contract(contract, fallback_intent)
+        verification = self.verifier.verify(contract, intent, evidence, tasks)
+        supporting_evidence = _accepted_run_synthesis_support_evidence(evidence)
+        finalizable = verification.passed and bool(supporting_evidence)
+        return finalizable, {
+            "finalizable": finalizable,
+            "verification": verification.to_dict(),
+            "intent": _intent_diagnostics(intent),
+            "contract": _contract_diagnostics(contract),
+            "synthesis_supporting_evidence": tuple(
+                _evidence_ref(item) for item in supporting_evidence
+            ),
+        }
+
+    async def _try_finalize_run_operation_from_snapshot(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        request: DbRequest,
+        fallback_intent: DbIntent,
+        fallback_contract: DbOperationContract,
+        base_diagnostics: dict[str, Any] | None = None,
+    ) -> OperationSnapshot | None:
+        finalizable, finalization = await self._run_operation_finalization_state(
+            snapshot.operation.id,
+            fallback_intent=fallback_intent,
+            fallback_contract=fallback_contract,
+        )
+        if not finalizable:
+            return None
+        await self._finalize_run_operation(
+            operation_id=snapshot.operation.id,
+            request=request,
+            fallback_intent=fallback_intent,
+            fallback_contract=fallback_contract,
+            base_diagnostics={
+                **dict(base_diagnostics or {}),
+                "pre_planner_finalization": True,
+                "finalization": finalization,
+            },
+        )
+        finalized = await self.inspect_operation(snapshot.operation.id)
+        if finalized is None:
+            raise KeyError(snapshot.operation.id)
+        return finalized
+
     def _resolve_skills(self, request: DbRequest) -> SkillResolution:
         return SkillResolver(self.registry).resolve(
             runtime_kind=self.runtime_kind,
@@ -897,6 +960,47 @@ def _answer_from_loop_result(loop_result: DbLoopResult) -> str:
     if loop_result.status == "budget_exhausted":
         return "The DB planner exhausted its turn budget before finishing."
     return "DB operation failed before final synthesis."
+
+
+_RUN_FINALIZATION_CONTROL_EVIDENCE_KINDS = {
+    "planner.decision",
+    "planner.compilation",
+    "planner.observation",
+    "verification.result",
+    "answer.synthesis",
+}
+
+
+def _accepted_run_synthesis_support_evidence(
+    evidence: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    return tuple(
+        item
+        for item in evidence
+        if bool(getattr(item, "accepted", False))
+        and getattr(item, "kind", None) not in _RUN_FINALIZATION_CONTROL_EVIDENCE_KINDS
+    )
+
+
+def _intent_diagnostics(intent: DbIntent) -> dict[str, Any]:
+    return {
+        "kind": intent.kind.value,
+        "access": intent.access.value,
+        "evidence_mode": intent.evidence_mode,
+        "diagnostics": intent.diagnostics,
+    }
+
+
+def _contract_diagnostics(contract: DbOperationContract) -> dict[str, Any]:
+    return {
+        "operation_type": contract.operation_type,
+        "required_capabilities": list(contract.required_capabilities),
+        "required_evidence": list(contract.required_evidence),
+        "access": contract.access.value,
+        "limits": contract.limits.to_dict(),
+        "policy_ids": list(contract.policy_ids),
+        "metadata": contract.metadata,
+    }
 
 
 def _planner_diagnostics(loop_result: DbLoopResult) -> dict[str, Any]:

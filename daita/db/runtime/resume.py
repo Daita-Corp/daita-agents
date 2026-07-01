@@ -318,6 +318,39 @@ class DbRuntimeResumeMixin:
         snapshot: OperationSnapshot,
     ) -> OperationSnapshot:
         operation_id = snapshot.operation.id
+        base_diagnostics = {
+            "runtime_id": self.runtime_id,
+            "resume": {
+                "operation_id": operation_id,
+                "completed_task_ids": list(snapshot.completed_task_ids),
+            },
+        }
+        request = _db_request_from_context(snapshot.operation)
+        intent = _db_intent_from_context(snapshot.operation)
+        contract = _db_contract_from_context(snapshot.operation)
+        finalized = await self._try_finalize_run_operation_from_snapshot(
+            snapshot,
+            request=request,
+            fallback_intent=intent,
+            fallback_contract=contract,
+            base_diagnostics=base_diagnostics,
+        )
+        if finalized is not None:
+            return finalized
+
+        refreshed = await self.inspect_operation(operation_id)
+        if refreshed is None:
+            raise KeyError(operation_id)
+        if self._has_pending_approvals(refreshed):
+            await self.kernel.block_operation(operation_id)
+            blocked = await self.inspect_operation(operation_id)
+            if blocked is None:
+                raise KeyError(operation_id)
+            return blocked
+        if refreshed.resumable_task_ids:
+            return refreshed
+        snapshot = refreshed
+
         planner = self._select_db_agent_planner()
         if planner is None:
             await self.kernel.block_operation(
@@ -346,19 +379,12 @@ class DbRuntimeResumeMixin:
             operation,
             safety_frame=safety_frame if isinstance(safety_frame, dict) else None,
         )
-        base_diagnostics = {
-            "runtime_id": self.runtime_id,
-            "resume": {
-                "operation_id": operation_id,
-                "completed_task_ids": list(snapshot.completed_task_ids),
-            },
-        }
         if loop_result.status == "finished":
             await self._finalize_run_operation(
                 operation_id=operation_id,
-                request=_db_request_from_context(operation),
-                fallback_intent=_db_intent_from_context(operation),
-                fallback_contract=_db_contract_from_context(operation),
+                request=request,
+                fallback_intent=intent,
+                fallback_contract=contract,
                 loop_result=loop_result,
                 base_diagnostics=base_diagnostics,
             )

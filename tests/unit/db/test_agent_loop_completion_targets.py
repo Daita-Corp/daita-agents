@@ -303,10 +303,18 @@ async def test_resume_reenters_agent_loop_after_first_turn_evidence():
     resume_planner = ScriptedPlanner(
         _read_decision(sql="select status, count(*) as count from orders")
     )
-    runtime.host_services["db_agent_planner"] = resume_planner
+    select_calls = 0
+
+    def select_planner():
+        nonlocal select_calls
+        select_calls += 1
+        return resume_planner
+
+    runtime._select_db_agent_planner = select_planner
 
     resumed = await runtime.resume_operation(operation.id)
 
+    assert select_calls == 1
     assert len(resume_planner.states) == 1
     assert _state_has_evidence(resume_planner.states[0], "database.schema")
     assert resumed.operation.status is OperationStatus.SUCCEEDED
@@ -333,6 +341,122 @@ async def test_resume_finalization_uses_latest_compiled_contract_intent():
     await runtime.resume_operation(operation.id)
 
     assert runtime.operation_results[-1].intent.kind is DbIntentKind.DATA_QUERY
+
+
+async def test_resume_finalizes_sufficient_evidence_without_planner_or_llm():
+    first_turn = ScriptedPlanner(
+        _read_decision(sql="select status, count(*) as count from orders")
+    )
+    runtime, _ = await _runtime_with_planner(first_turn)
+    operation = await _bootstrap_run_operation(runtime, "resume-finalizable-target")
+    loop_result = await DbAgentLoop(runtime, first_turn).run(
+        operation,
+        safety_frame={"max_access": "read"},
+        max_turns=1,
+    )
+    before = await runtime.inspect_operation(operation.id)
+    runtime.host_services.clear()
+    runtime._select_db_agent_planner = _fail_planner_selection
+
+    resumed = await runtime.resume_operation(operation.id)
+
+    assert loop_result.status == "finished"
+    assert before.operation.status is not OperationStatus.SUCCEEDED
+    assert "query.result" in _evidence_kinds(before)
+    assert "answer.synthesis" not in _evidence_kinds(before)
+    assert resumed.operation.status is OperationStatus.SUCCEEDED
+    assert {"verification.result", "answer.synthesis"} <= _evidence_kinds(resumed)
+    synthesis = next(
+        evidence for evidence in resumed.evidence if evidence.kind == "answer.synthesis"
+    )
+    assert runtime.operation_results[-1].answer == synthesis.payload["answer"]
+
+
+async def test_resume_executes_persisted_runnable_tasks_then_finalizes():
+    runtime, _ = await _runtime_with_planner(ScriptedPlanner())
+    operation = await _bootstrap_run_operation(runtime, "resume-pending-tasks-target")
+    operation, tasks = await _plan_read_tasks_without_execution(
+        runtime,
+        operation,
+        sql="select status, count(*) as count from orders",
+    )
+    executed = []
+    original_execute_task = runtime.execute_task
+
+    async def execute_task_spy(task, operation, context=None):
+        executed.append(task.capability_id)
+        return await original_execute_task(task, operation, context)
+
+    runtime.execute_task = execute_task_spy
+    runtime._select_db_agent_planner = _fail_planner_selection
+
+    resumed = await runtime.resume_operation(operation.id)
+
+    assert [task.status for task in tasks] == [TaskStatus.PENDING, TaskStatus.PENDING]
+    assert executed == [
+        "db.sql.validate",
+        "db.sql.execute_read",
+        "db.answer.synthesize",
+    ]
+    assert resumed.operation.status is OperationStatus.SUCCEEDED
+    assert {"sql.validation", "query.result", "answer.synthesis"} <= _evidence_kinds(
+        resumed
+    )
+
+
+async def test_resume_skips_completed_tasks_and_does_not_replay_them():
+    runtime, _ = await _runtime_with_planner(ScriptedPlanner())
+    operation = await _bootstrap_run_operation(runtime, "resume-skip-completed-target")
+    operation, tasks = await _plan_read_tasks_without_execution(
+        runtime,
+        operation,
+        sql="select status, count(*) as count from orders",
+    )
+    validation_task, read_task = tasks
+    await runtime.execute_task(validation_task, operation)
+    executed = []
+    original_execute_task = runtime.execute_task
+
+    async def execute_task_spy(task, operation, context=None):
+        executed.append(task.id)
+        return await original_execute_task(task, operation, context)
+
+    runtime.execute_task = execute_task_spy
+    runtime._select_db_agent_planner = _fail_planner_selection
+
+    resumed = await runtime.resume_operation(operation.id)
+
+    assert validation_task.id not in executed
+    assert read_task.id in executed
+    assert resumed.operation.status is OperationStatus.SUCCEEDED
+    assert [
+        task.status
+        for task in resumed.tasks
+        if task.id in {validation_task.id, read_task.id}
+    ] == [TaskStatus.SUCCEEDED, TaskStatus.SUCCEEDED]
+
+
+async def test_agent_loop_finishes_without_planner_when_operation_is_finalizable():
+    first_turn = ScriptedPlanner(
+        _read_decision(sql="select status, count(*) as count from orders")
+    )
+    runtime, _ = await _runtime_with_planner(first_turn)
+    operation = await _bootstrap_run_operation(runtime, "loop-finalizable-target")
+    await DbAgentLoop(runtime, first_turn).run(
+        operation,
+        safety_frame={"max_access": "read"},
+        max_turns=1,
+    )
+    no_planner = ScriptedPlanner()
+
+    result = await DbAgentLoop(runtime, no_planner).run(
+        operation,
+        safety_frame={"max_access": "read"},
+    )
+
+    assert result.status == "finished"
+    assert result.diagnostics["pre_planner_finalization"] is True
+    assert no_planner.states == []
 
 
 async def test_planner_dag_dependencies_become_durable_task_dependencies():
@@ -600,6 +724,30 @@ async def _bootstrap_run_operation(runtime, operation_id):
         },
         evaluate_governance=False,
     )
+
+
+async def _plan_read_tasks_without_execution(runtime, operation, *, sql):
+    loop = DbAgentLoop(runtime, ScriptedPlanner())
+    decision = _read_decision(sql=sql)
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "read"},
+        turn=1,
+        remaining_turns=1,
+    )
+    compilation = loop.compile_actions(decision, state)
+    await loop._persist_compilation(operation, compilation, decision, turn=1)
+    operation = await loop._persist_compiled_contract(operation, compilation)
+    task_plan = await runtime.plan_task_specs(
+        operation,
+        compilation.task_specs,
+        contract=compilation.compiled_contract_snapshot,
+    )
+    return operation, task_plan.tasks
+
+
+def _fail_planner_selection():
+    raise AssertionError("planner selection should not be required")
 
 
 def _inspect_schema_decision():

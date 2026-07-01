@@ -276,6 +276,17 @@ class DbAgentLoop:
         turn_budget = max_turns or int(
             getattr(self.runtime.config.limits, "max_tasks", 20)
         )
+        finalizable, finalization = await self._operation_finalizable(operation.id)
+        if finalizable:
+            return await self._result(
+                operation,
+                "finished",
+                warnings=(),
+                diagnostics={
+                    "pre_planner_finalization": True,
+                    "finalization": finalization,
+                },
+            )
         warnings: list[str] = []
         last_compilation: DbActionCompilation | None = None
         progress_guard = _LoopProgressGuard()
@@ -1418,14 +1429,25 @@ class DbAgentLoop:
         operation_id: str,
     ) -> tuple[bool, dict[str, Any]]:
         operation = await self._fresh_operation(operation_id)
-        evidence = tuple(await self.runtime.store.list_evidence(operation_id))
-        tasks = tuple(await self.runtime.store.list_tasks(operation_id))
         fallback_contract = _fallback_contract_for_operation(
             operation,
             limits=self.runtime.config.limits,
         )
         contract = _contract_from_latest_snapshot(operation, fallback_contract)
         fallback_intent = _fallback_intent_for_operation(operation, contract)
+        finalization_state = getattr(
+            self.runtime,
+            "_run_operation_finalization_state",
+            None,
+        )
+        if finalization_state is not None:
+            return await finalization_state(
+                operation_id,
+                fallback_intent=fallback_intent,
+                fallback_contract=fallback_contract,
+            )
+        evidence = tuple(await self.runtime.store.list_evidence(operation_id))
+        tasks = tuple(await self.runtime.store.list_tasks(operation_id))
         intent = _intent_from_contract(contract, fallback_intent)
         verification = self.runtime.verifier.verify(contract, intent, evidence, tasks)
         supporting_evidence = _accepted_synthesis_support_evidence(evidence)
