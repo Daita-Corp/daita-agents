@@ -112,11 +112,11 @@ def _planner_messages(state: DbLoopState) -> list[dict[str, str]]:
                 "query planning and validated read execution until query.result "
                 "evidence exists, unless the request is genuinely ambiguous after "
                 "available runtime facts have been gathered. Use depends_on only "
-                "for actions in the same decision. When prior accepted "
-                "query.plan.proposal evidence already contains SQL, an "
-                "execute_validated_read action should provide that SQL in input.sql "
-                "or otherwise rely on that accepted evidence; do not depend on a "
-                "previous-turn action id."
+                "for actions in the same decision. To use SQL from prior accepted "
+                "query.plan.proposal evidence, set input.plan_evidence_id to that "
+                "evidence id or set "
+                'input.query_plan_ref="latest_accepted_query_plan"; do not depend '
+                "on a previous-turn action id."
             ),
         },
         {
@@ -144,8 +144,17 @@ def _decision_schema_hint() -> dict[str, Any]:
             {
                 "action_id": "stable id unique within this decision",
                 "kind": "one available action kind",
-                "input": {},
-                "depends_on": [],
+                "input": {
+                    "sql": "optional direct SQL for execute_validated_read",
+                    "plan_evidence_id": (
+                        "optional accepted query.plan.proposal evidence id "
+                        "for prior SQL"
+                    ),
+                    "query_plan_ref": (
+                        "optional latest_accepted_query_plan for prior accepted SQL"
+                    ),
+                },
+                "depends_on": ["same-decision action ids only"],
                 "rationale": "optional",
                 "metadata": {},
             }

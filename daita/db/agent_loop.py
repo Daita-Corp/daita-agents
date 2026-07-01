@@ -172,6 +172,18 @@ class _LoopProgressDecision:
     retry_facts: tuple[dict[str, Any], ...] = ()
 
 
+@dataclass(frozen=True)
+class _ResolvedSqlInput:
+    sql: str
+    provenance: str
+    query_plan_dependency: TaskDependency | None = None
+    source_evidence_id: str | None = None
+    source_evidence_kind: str | None = None
+    source_evidence_owner: str | None = None
+    source_task_id: str | None = None
+    source_payload_fingerprint: str | None = None
+
+
 @dataclass
 class _LoopProgressGuard:
     seen_no_progress_fingerprints: set[str] = field(default_factory=set)
@@ -664,7 +676,6 @@ class DbAgentLoop:
                 action,
                 prior_action_specs=prior_action_specs,
                 operation_id=state.operation_id,
-                state=state,
             )
             if dependency_errors:
                 rejected.extend(dependency_errors)
@@ -718,15 +729,12 @@ class DbAgentLoop:
         *,
         prior_action_specs: Mapping[str, tuple[DbTaskSpec, ...]],
         operation_id: str,
-        state: DbLoopState,
     ) -> tuple[tuple[TaskDependency, ...], tuple[dict[str, Any], ...]]:
         dependencies: list[TaskDependency] = []
         errors: list[dict[str, Any]] = []
         for dependency_action_id in dict.fromkeys(action.depends_on):
             producer_specs = prior_action_specs.get(dependency_action_id)
             if not producer_specs:
-                if _prior_evidence_satisfies_action(action, state):
-                    continue
                 errors.append(
                     _action_error(
                         action, f"dependency_not_durable:{dependency_action_id}"
@@ -846,11 +854,13 @@ class DbAgentLoop:
         sequence_start: int,
         decision_fingerprint: str,
     ) -> tuple[list[DbTaskSpec], list[dict[str, Any]], list[dict[str, Any]]]:
-        sql = action.input.get("sql")
-        if not isinstance(sql, str) or not sql.strip():
-            sql = _latest_planned_sql(state) if sql_operation == "query" else None
-        if not isinstance(sql, str) or not sql.strip():
-            return [], [], [_action_error(action, "missing_sql")]
+        resolved_sql, sql_error = _resolve_sql_input_for_action(
+            action,
+            state,
+            sql_operation=sql_operation,
+        )
+        if sql_error is not None or resolved_sql is None:
+            return [], [], [_action_error(action, sql_error or "missing_sql")]
         owner = _action_owner(action)
         validation = self._resolve_capability("db.sql.validate", owner=owner)
         execute = self._resolve_capability(execute_capability_id, owner=owner)
@@ -868,13 +878,21 @@ class DbAgentLoop:
         access_error = self._access_errors(action, capabilities, state)
         if access_error:
             return [], [], access_error
-        metadata = _action_metadata(action, decision_fingerprint)
+        metadata = {
+            **_action_metadata(action, decision_fingerprint),
+            "sql_provenance": _sql_provenance_metadata(resolved_sql),
+        }
         validation_spec = DbTaskSpec(
             capability_id="db.sql.validate",
             owner=capabilities[0].owner,
-            input={"sql": sql, "operation": sql_operation},
+            input={"sql": resolved_sql.sql, "operation": sql_operation},
             reason=f"planner:{action.kind.value}:validation",
             sequence=sequence_start,
+            dependencies=(
+                (resolved_sql.query_plan_dependency,)
+                if resolved_sql.query_plan_dependency is not None
+                else ()
+            ),
             metadata=metadata,
             deterministic_key=f"{action.action_id}:db.sql.validate",
         )
@@ -1703,6 +1721,161 @@ def _task_input_for_action(action: DbPlannerAction) -> dict[str, Any]:
     }
 
 
+def _resolve_sql_input_for_action(
+    action: DbPlannerAction,
+    state: DbLoopState,
+    *,
+    sql_operation: str,
+) -> tuple[_ResolvedSqlInput | None, str | None]:
+    direct_sql = action.input.get("sql")
+    has_direct_sql = isinstance(direct_sql, str) and bool(direct_sql.strip())
+    has_plan_evidence_id = "plan_evidence_id" in action.input
+    has_query_plan_ref = "query_plan_ref" in action.input
+
+    if has_direct_sql and (has_plan_evidence_id or has_query_plan_ref):
+        return None, "ambiguous_sql_input"
+    if has_plan_evidence_id and has_query_plan_ref:
+        return None, "ambiguous_sql_input"
+
+    if has_direct_sql:
+        return (
+            _ResolvedSqlInput(
+                sql=direct_sql.strip(),
+                provenance="direct",
+            ),
+            None,
+        )
+
+    if has_plan_evidence_id:
+        plan_evidence_id = action.input.get("plan_evidence_id")
+        if not isinstance(plan_evidence_id, str) or not plan_evidence_id.strip():
+            return None, "missing_plan_evidence_id"
+        return _resolve_sql_from_plan_evidence_id(
+            plan_evidence_id.strip(),
+            state,
+        )
+
+    if has_query_plan_ref:
+        query_plan_ref = action.input.get("query_plan_ref")
+        if query_plan_ref != "latest_accepted_query_plan":
+            return None, f"unsupported_query_plan_ref:{query_plan_ref}"
+        return _resolve_sql_from_latest_accepted_query_plan(state)
+
+    return None, "missing_sql"
+
+
+def _resolve_sql_from_plan_evidence_id(
+    plan_evidence_id: str,
+    state: DbLoopState,
+) -> tuple[_ResolvedSqlInput | None, str | None]:
+    accepted_matches = tuple(
+        summary
+        for summary in state.accepted_evidence_summaries
+        if summary.get("kind") == "query.plan.proposal"
+        and summary.get("accepted") is True
+        and summary.get("id") == plan_evidence_id
+    )
+    rejected_matches = tuple(
+        summary
+        for summary in state.rejected_evidence_summaries
+        if summary.get("kind") == "query.plan.proposal"
+        and summary.get("id") == plan_evidence_id
+    )
+    if rejected_matches and not accepted_matches:
+        return None, f"rejected_plan_evidence:{plan_evidence_id}"
+    if rejected_matches or len(accepted_matches) > 1:
+        return None, f"ambiguous_plan_evidence:{plan_evidence_id}"
+    if not accepted_matches:
+        return None, f"plan_evidence_not_found:{plan_evidence_id}"
+    return _resolved_sql_from_plan_summary(
+        accepted_matches[0],
+        state,
+        provenance="plan_evidence_id",
+    )
+
+
+def _resolve_sql_from_latest_accepted_query_plan(
+    state: DbLoopState,
+) -> tuple[_ResolvedSqlInput | None, str | None]:
+    summaries = tuple(
+        summary
+        for summary in state.accepted_evidence_summaries
+        if summary.get("kind") == "query.plan.proposal"
+        and summary.get("accepted") is True
+    )
+    for summary in reversed(summaries):
+        sql = summary.get("sql")
+        if isinstance(sql, str) and sql.strip():
+            return _resolved_sql_from_plan_summary(
+                summary,
+                state,
+                provenance="latest_accepted_query_plan",
+            )
+    if summaries:
+        return None, "query_plan_evidence_without_sql"
+    return None, "missing_accepted_query_plan"
+
+
+def _resolved_sql_from_plan_summary(
+    summary: Mapping[str, Any],
+    state: DbLoopState,
+    *,
+    provenance: str,
+) -> tuple[_ResolvedSqlInput | None, str | None]:
+    sql = summary.get("sql")
+    evidence_id = _optional_string(summary.get("id"))
+    if not isinstance(sql, str) or not sql.strip():
+        return None, f"plan_evidence_without_sql:{evidence_id or 'unknown'}"
+    evidence_owner = _optional_string(summary.get("owner"))
+    task_id = _optional_string(summary.get("task_id"))
+    payload_fingerprint = _optional_string(summary.get("payload_fingerprint"))
+    dependency = TaskDependency(
+        kind="evidence",
+        evidence_kind="query.plan.proposal",
+        evidence_id=evidence_id,
+        evidence_owner=evidence_owner,
+        producer_task_id=task_id,
+        evidence_accepted=True,
+        operation_id=state.operation_id,
+        payload_fingerprint=payload_fingerprint,
+        metadata={
+            "sql_resolution": True,
+            "provenance": provenance,
+        },
+    )
+    return (
+        _ResolvedSqlInput(
+            sql=sql.strip(),
+            provenance=provenance,
+            query_plan_dependency=dependency,
+            source_evidence_id=evidence_id,
+            source_evidence_kind="query.plan.proposal",
+            source_evidence_owner=evidence_owner,
+            source_task_id=task_id,
+            source_payload_fingerprint=payload_fingerprint,
+        ),
+        None,
+    )
+
+
+def _sql_provenance_metadata(resolved: _ResolvedSqlInput) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "provenance": resolved.provenance,
+        "sql_fingerprint": _stable_hash({"sql": resolved.sql}),
+    }
+    if resolved.source_evidence_id is not None:
+        metadata["source_evidence_id"] = resolved.source_evidence_id
+    if resolved.source_evidence_kind is not None:
+        metadata["source_evidence_kind"] = resolved.source_evidence_kind
+    if resolved.source_evidence_owner is not None:
+        metadata["source_evidence_owner"] = resolved.source_evidence_owner
+    if resolved.source_task_id is not None:
+        metadata["source_task_id"] = resolved.source_task_id
+    if resolved.source_payload_fingerprint is not None:
+        metadata["source_payload_fingerprint"] = resolved.source_payload_fingerprint
+    return metadata
+
+
 def _monitor_action_output_evidence(
     action: DbPlannerAction,
 ) -> tuple[str, str | None]:
@@ -1848,6 +2021,9 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
     sql = _sql_from_evidence_payload(evidence.payload)
     if sql:
         summary["sql"] = sql
+    payload_fingerprint = evidence.metadata.get("payload_fingerprint")
+    if payload_fingerprint:
+        summary["payload_fingerprint"] = str(payload_fingerprint)
     return summary
 
 
@@ -1857,29 +2033,6 @@ def _evidence_ref(evidence: Evidence) -> dict[str, Any]:
         "kind": evidence.kind,
         "accepted": evidence.accepted,
     }
-
-
-def _prior_evidence_satisfies_action(
-    action: DbPlannerAction,
-    state: DbLoopState,
-) -> bool:
-    if action.kind is DbPlannerActionKind.EXECUTE_VALIDATED_READ:
-        return bool(_latest_planned_sql(state))
-    return False
-
-
-def _latest_planned_sql(state: DbLoopState) -> str | None:
-    for summary in reversed(state.accepted_evidence_summaries):
-        if summary.get("kind") not in {
-            "query.plan.proposal",
-            "query.plan.validation",
-            "sql.validation",
-        }:
-            continue
-        sql = summary.get("sql")
-        if isinstance(sql, str) and sql.strip():
-            return sql.strip()
-    return None
 
 
 def _sql_from_evidence_payload(payload: Any) -> str | None:

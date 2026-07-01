@@ -249,6 +249,226 @@ async def test_agent_loop_runs_schema_and_read_flow_through_task_specs():
     assert query_result.payload["sql"] == "select 1 as answer"
 
 
+async def test_direct_sql_compiles_validation_and_read_task_specs():
+    sql = "select 1 as answer"
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two", "sql": sql},
+    )
+
+    compilation, _, _ = await _compile_single_action("phase-four-direct", action)
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    validation, read = compilation.task_specs
+    assert validation.input == {"sql": sql, "operation": "query"}
+    assert validation.dependencies == ()
+    assert validation.metadata["sql_provenance"]["provenance"] == "direct"
+    assert read.input["sql_ref"] == "sql.validation"
+
+
+async def test_explicit_plan_evidence_id_attaches_dependency_to_validation():
+    sql = "select count(*) as count from orders"
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two", "plan_evidence_id": "plan-explicit"},
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-explicit-plan",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-explicit", "sql": sql, "task_id": "plan-task"},
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation, read = compilation.task_specs
+    assert validation.input == {"sql": sql, "operation": "query"}
+    assert read.input["sql_ref"] == "sql.validation"
+    assert len(validation.dependencies) == 1
+    dependency = validation.dependencies[0]
+    assert dependency.evidence_kind == "query.plan.proposal"
+    assert dependency.evidence_id == "plan-explicit"
+    assert dependency.evidence_owner == "phase_two"
+    assert dependency.producer_task_id == "plan-task"
+    assert dependency.payload_fingerprint == "fp-plan-explicit"
+    provenance = validation.metadata["sql_provenance"]
+    assert provenance["provenance"] == "plan_evidence_id"
+    assert provenance["source_evidence_id"] == "plan-explicit"
+    assert provenance["source_evidence_kind"] == "query.plan.proposal"
+    assert provenance["source_evidence_owner"] == "phase_two"
+    assert provenance["source_task_id"] == "plan-task"
+    assert provenance["source_payload_fingerprint"] == "fp-plan-explicit"
+    assert provenance["sql_fingerprint"]
+
+
+async def test_latest_accepted_query_plan_ref_selects_latest_accepted_plan():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-latest-plan",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-old", "sql": "select 1 as answer"},
+            {"evidence_id": "plan-new", "sql": "select 2 as answer"},
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 2 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-new"
+    assert (
+        validation.metadata["sql_provenance"]["provenance"]
+        == "latest_accepted_query_plan"
+    )
+
+
+async def test_latest_accepted_query_plan_ref_ignores_rejected_plan_evidence():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-rejected-ignored",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-accepted", "sql": "select 1 as answer"},
+            {
+                "evidence_id": "plan-rejected",
+                "sql": "select 999 as answer",
+                "accepted": False,
+            },
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-accepted"
+
+
+async def test_rejected_plan_evidence_id_is_rejected_clearly():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two", "plan_evidence_id": "plan-rejected"},
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-rejected-explicit",
+        action,
+        plan_evidence=(
+            {
+                "evidence_id": "plan-rejected",
+                "sql": "select 999 as answer",
+                "accepted": False,
+            },
+        ),
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "rejected_plan_evidence:plan-rejected"
+    )
+
+
+async def test_invalid_sql_reference_inputs_are_rejected_clearly():
+    cases = (
+        (
+            "missing-plan-id",
+            {"owner": "phase_two", "plan_evidence_id": ""},
+            (),
+            "missing_plan_evidence_id",
+        ),
+        (
+            "unsupported-ref",
+            {"owner": "phase_two", "query_plan_ref": "latest_sql"},
+            (),
+            "unsupported_query_plan_ref:latest_sql",
+        ),
+        (
+            "plan-without-sql",
+            {"owner": "phase_two", "plan_evidence_id": "plan-nosql"},
+            ({"evidence_id": "plan-nosql", "sql": None},),
+            "plan_evidence_without_sql:plan-nosql",
+        ),
+    )
+    for suffix, action_input, plan_evidence, expected_error in cases:
+        action = DbPlannerAction(
+            action_id="read",
+            kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+            input=action_input,
+        )
+
+        compilation, _, _ = await _compile_single_action(
+            f"phase-four-{suffix}",
+            action,
+            plan_evidence=plan_evidence,
+        )
+
+        assert compilation.task_specs == ()
+        assert compilation.rejected_action_summaries[0]["error"] == expected_error
+
+
+async def test_prior_turn_depends_on_remains_missing_dependency_error():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+        depends_on=("prior_turn_plan",),
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-prior-depends-on",
+        action,
+        plan_evidence=({"evidence_id": "plan-accepted", "sql": "select 1 as answer"},),
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "missing_dependency:prior_turn_plan"
+    )
+
+
+async def test_missing_sql_no_longer_falls_back_to_latest_plan_silently():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two"},
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-missing-sql",
+        action,
+        plan_evidence=({"evidence_id": "plan-accepted", "sql": "select 1 as answer"},),
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == "missing_sql"
+
+
 async def test_agent_loop_rejects_action_outside_contract_before_task_creation():
     runtime, operation = await _runtime_and_operation("phase-two-reject")
     decision = DbPlannerDecision(
@@ -448,6 +668,50 @@ async def _runtime_and_operation(operation_id):
         evaluate_governance=False,
     )
     return runtime, operation
+
+
+async def _compile_single_action(operation_id, action, *, plan_evidence=()):
+    runtime, operation = await _runtime_and_operation(operation_id)
+    for item in plan_evidence:
+        await runtime.store.save_evidence(
+            _query_plan_evidence(operation.id, **dict(item))
+        )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "read"},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=(action,),
+    )
+    return loop.compile_actions(decision, state), runtime, operation
+
+
+def _query_plan_evidence(
+    operation_id,
+    *,
+    evidence_id,
+    sql,
+    accepted=True,
+    task_id=None,
+):
+    payload = {"valid": bool(sql)}
+    if sql is not None:
+        payload["sql"] = sql
+    return Evidence(
+        id=evidence_id,
+        kind="query.plan.proposal",
+        owner="phase_two",
+        operation_id=operation_id,
+        task_id=task_id or f"task-{evidence_id}",
+        accepted=accepted,
+        payload=payload,
+        metadata={"payload_fingerprint": f"fp-{evidence_id}"},
+    )
 
 
 def _loop_state():
