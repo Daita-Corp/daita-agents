@@ -34,6 +34,8 @@ from .types import (
     DbRuntimeTaskNotRunnable,
 )
 
+_CATALOG_COLUMN_VALUE_GROUNDING_REASON = "catalog_column_value_grounding"
+
 
 @dataclass(frozen=True)
 class DbTaskSpec:
@@ -1004,24 +1006,37 @@ class DbRuntimeTasksMixin:
             accepted=True,
         )
         if schema_evidence is None:
-            schema_evidence = await self._ensure_schema_profile_evidence(operation)
+            schema_evidence = await self._ensure_schema_profile_evidence(
+                operation,
+                parent_task=task,
+                prerequisite_for=task.capability_id,
+                prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
+            )
         if schema_evidence is not None:
             await self._ensure_catalog_source_registered(
                 operation,
                 store_id=store_id,
                 schema_evidence=schema_evidence,
+                parent_task=task,
+                prerequisite_for=task.capability_id,
+                prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
             )
         if task.capability_id == "catalog.column_values.search":
             await self._ensure_catalog_column_values_profiled(
                 operation,
                 store_id=store_id,
                 task_input=task_input,
+                parent_task=task,
             )
         return {**task_input, "store_id": store_id}
 
     async def _ensure_schema_profile_evidence(
         self,
         operation: Operation,
+        *,
+        parent_task: Task | None = None,
+        prerequisite_for: str | None = None,
+        prerequisite_reason: str = _CATALOG_COLUMN_VALUE_GROUNDING_REASON,
     ) -> Evidence | None:
         existing = await self._latest_evidence(
             operation.id,
@@ -1034,6 +1049,13 @@ class DbRuntimeTasksMixin:
             capability = self.registry.get_capability("db.schema.inspect")
         except (KeyError, ValueError):
             return None
+        prerequisite_metadata = _runtime_prerequisite_task_metadata(
+            operation,
+            parent_task=parent_task,
+            capability=capability,
+            prerequisite_for=prerequisite_for,
+            prerequisite_reason=prerequisite_reason,
+        )
 
         task_input: dict[str, Any] = {}
         input_hash = _stable_hash(task_input)
@@ -1048,7 +1070,10 @@ class DbRuntimeTasksMixin:
         task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
         existing_task = await self.store.load_task(task_id)
         if existing_task is not None:
-            schema_task = existing_task
+            schema_task = await self._merge_runtime_prerequisite_metadata(
+                existing_task,
+                prerequisite_metadata,
+            )
         else:
             schema_task = await self._plan_kernel_task(
                 Task(
@@ -1059,6 +1084,7 @@ class DbRuntimeTasksMixin:
                     input={**task_input, "input_hash": input_hash},
                     required_evidence=capability.output_evidence,
                     metadata={
+                        **prerequisite_metadata,
                         "owner": capability.owner,
                         "reason": "runtime:schema_profile_prepare",
                         "sequence": 0,
@@ -1085,6 +1111,9 @@ class DbRuntimeTasksMixin:
         *,
         store_id: str,
         schema_evidence: Evidence,
+        parent_task: Task | None = None,
+        prerequisite_for: str | None = None,
+        prerequisite_reason: str = _CATALOG_COLUMN_VALUE_GROUNDING_REASON,
     ) -> None:
         registered = await self._latest_evidence(
             operation.id,
@@ -1097,6 +1126,13 @@ class DbRuntimeTasksMixin:
         capability = self.registry.get_capability(
             "catalog.source.register",
             owner="catalog",
+        )
+        prerequisite_metadata = _runtime_prerequisite_task_metadata(
+            operation,
+            parent_task=parent_task,
+            capability=capability,
+            prerequisite_for=prerequisite_for,
+            prerequisite_reason=prerequisite_reason,
         )
         schema = dict(schema_evidence.payload)
         task_input = {
@@ -1123,7 +1159,10 @@ class DbRuntimeTasksMixin:
         if existing is not None:
             if existing.status is TaskStatus.SUCCEEDED:
                 return
-            register_task = existing
+            register_task = await self._merge_runtime_prerequisite_metadata(
+                existing,
+                prerequisite_metadata,
+            )
         else:
             register_task = await self._plan_kernel_task(
                 Task(
@@ -1134,6 +1173,7 @@ class DbRuntimeTasksMixin:
                     input={**task_input, "input_hash": input_hash},
                     required_evidence=capability.output_evidence,
                     metadata={
+                        **prerequisite_metadata,
                         "owner": capability.owner,
                         "reason": "runtime:catalog_source_prepare",
                         "sequence": 0,
@@ -1158,6 +1198,7 @@ class DbRuntimeTasksMixin:
         *,
         store_id: str,
         task_input: dict[str, Any],
+        parent_task: Task,
     ) -> None:
         pairs = _column_value_profile_pairs(task_input)
         if not pairs or not _operation_allows_read_profile(operation):
@@ -1172,6 +1213,20 @@ class DbRuntimeTasksMixin:
             )
         except (KeyError, ValueError):
             return
+        profile_declaration = await self._require_declared_runtime_prerequisite(
+            operation,
+            parent_task=parent_task,
+            capability=profile_capability,
+            prerequisite_for=parent_task.capability_id,
+            prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
+        )
+        register_declaration = await self._require_declared_runtime_prerequisite(
+            operation,
+            parent_task=parent_task,
+            capability=register_capability,
+            prerequisite_for=parent_task.capability_id,
+            prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
+        )
         for table, column in pairs[:4]:
             if await self._catalog_profile_registered(
                 operation.id,
@@ -1185,6 +1240,10 @@ class DbRuntimeTasksMixin:
                 capability=profile_capability,
                 table=table,
                 column=column,
+                parent_task=parent_task,
+                prerequisite_for=parent_task.capability_id,
+                prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
+                prerequisite_declaration=profile_declaration,
             )
             if profile is None or not profile.accepted:
                 continue
@@ -1193,6 +1252,10 @@ class DbRuntimeTasksMixin:
                 capability=register_capability,
                 store_id=store_id,
                 profile=profile,
+                parent_task=parent_task,
+                prerequisite_for=parent_task.capability_id,
+                prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
+                prerequisite_declaration=register_declaration,
             )
 
     async def _ensure_column_value_profile(
@@ -1202,9 +1265,21 @@ class DbRuntimeTasksMixin:
         capability: Capability,
         table: str,
         column: str,
+        parent_task: Task | None = None,
+        prerequisite_for: str | None = None,
+        prerequisite_reason: str = _CATALOG_COLUMN_VALUE_GROUNDING_REASON,
+        prerequisite_declaration: dict[str, Any] | None = None,
     ) -> Evidence | None:
         task_input = {"table": table, "column": column, "max_values": 25}
         input_hash = _stable_hash(task_input)
+        prerequisite_metadata = _runtime_prerequisite_task_metadata(
+            operation,
+            parent_task=parent_task,
+            capability=capability,
+            prerequisite_for=prerequisite_for,
+            prerequisite_reason=prerequisite_reason,
+            prerequisite_declaration=prerequisite_declaration,
+        )
         idempotency_key = _stable_hash(
             {
                 "operation_id": operation.id,
@@ -1217,7 +1292,10 @@ class DbRuntimeTasksMixin:
         task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
         existing = await self.store.load_task(task_id)
         if existing is not None:
-            task = existing
+            task = await self._merge_runtime_prerequisite_metadata(
+                existing,
+                prerequisite_metadata,
+            )
         else:
             task = await self._plan_kernel_task(
                 Task(
@@ -1228,6 +1306,7 @@ class DbRuntimeTasksMixin:
                     input={**task_input, "input_hash": input_hash},
                     required_evidence=capability.output_evidence,
                     metadata={
+                        **prerequisite_metadata,
                         "owner": capability.owner,
                         "reason": "runtime:column_values_profile_prepare",
                         "sequence": 0,
@@ -1258,6 +1337,10 @@ class DbRuntimeTasksMixin:
         capability: Capability,
         store_id: str,
         profile: Evidence,
+        parent_task: Task | None = None,
+        prerequisite_for: str | None = None,
+        prerequisite_reason: str = _CATALOG_COLUMN_VALUE_GROUNDING_REASON,
+        prerequisite_declaration: dict[str, Any] | None = None,
     ) -> None:
         table = str(profile.payload.get("table") or "")
         column = str(profile.payload.get("column") or "")
@@ -1277,6 +1360,14 @@ class DbRuntimeTasksMixin:
             "persist": False,
         }
         input_hash = _stable_hash(task_input)
+        prerequisite_metadata = _runtime_prerequisite_task_metadata(
+            operation,
+            parent_task=parent_task,
+            capability=capability,
+            prerequisite_for=prerequisite_for,
+            prerequisite_reason=prerequisite_reason,
+            prerequisite_declaration=prerequisite_declaration,
+        )
         idempotency_key = _stable_hash(
             {
                 "operation_id": operation.id,
@@ -1291,7 +1382,10 @@ class DbRuntimeTasksMixin:
         task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
         existing = await self.store.load_task(task_id)
         if existing is not None:
-            task = existing
+            task = await self._merge_runtime_prerequisite_metadata(
+                existing,
+                prerequisite_metadata,
+            )
         else:
             task = await self._plan_kernel_task(
                 Task(
@@ -1302,6 +1396,7 @@ class DbRuntimeTasksMixin:
                     input={**task_input, "input_hash": input_hash},
                     required_evidence=capability.output_evidence,
                     metadata={
+                        **prerequisite_metadata,
                         "owner": capability.owner,
                         "reason": "runtime:catalog_column_values_register",
                         "sequence": 0,
@@ -1320,6 +1415,54 @@ class DbRuntimeTasksMixin:
             )
         if task.status is not TaskStatus.SUCCEEDED:
             await self.execute_task(task, operation)
+
+    async def _merge_runtime_prerequisite_metadata(
+        self,
+        task: Task,
+        metadata: dict[str, Any],
+    ) -> Task:
+        if not metadata:
+            return task
+        merged = {**task.metadata, **metadata}
+        if merged == task.metadata:
+            return task
+        updated = replace(task, metadata=merged)
+        await self.store.save_task(updated)
+        return updated
+
+    async def _require_declared_runtime_prerequisite(
+        self,
+        operation: Operation,
+        *,
+        parent_task: Task,
+        capability: Capability,
+        prerequisite_for: str,
+        prerequisite_reason: str,
+    ) -> dict[str, Any]:
+        declaration = _runtime_prerequisite_declaration(
+            operation,
+            parent_task=parent_task,
+            capability=capability,
+            prerequisite_for=prerequisite_for,
+        )
+        if declaration is not None:
+            return declaration
+        error = f"undeclared_runtime_prerequisite:{capability.id}"
+        details = {
+            "error": error,
+            "capability_id": capability.id,
+            "owner": capability.owner,
+            "prerequisite_for": prerequisite_for,
+            "prerequisite_for_task_id": parent_task.id,
+            "prerequisite_reason": prerequisite_reason,
+        }
+        await self.kernel.block_task(
+            parent_task.id,
+            message=error,
+            payload={"runtime_prerequisite": details},
+            metadata={"runtime_prerequisite_blocked": details},
+        )
+        raise RuntimeError(error)
 
     async def _catalog_profile_registered(
         self,
@@ -1593,6 +1736,97 @@ def _operation_allows_read_profile(operation: Operation) -> bool:
         AccessMode.ADMIN.value: 4,
     }
     return access_order.get(max_access, 4) >= access_order[AccessMode.READ.value]
+
+
+def _runtime_prerequisite_task_metadata(
+    operation: Operation,
+    *,
+    parent_task: Task | None,
+    capability: Capability,
+    prerequisite_for: str | None,
+    prerequisite_reason: str,
+    prerequisite_declaration: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    prerequisite_for = prerequisite_for or (
+        parent_task.capability_id if parent_task is not None else ""
+    )
+    declaration = prerequisite_declaration
+    if declaration is None:
+        declaration = _runtime_prerequisite_declaration(
+            operation,
+            parent_task=parent_task,
+            capability=capability,
+            prerequisite_for=prerequisite_for,
+        )
+    metadata: dict[str, Any] = {
+        "runtime_prerequisite": True,
+        "declared_by_contract": declaration is not None,
+        "prerequisite_for": prerequisite_for,
+        "prerequisite_reason": prerequisite_reason,
+    }
+    if parent_task is not None:
+        metadata["prerequisite_for_task_id"] = parent_task.id
+        if parent_task.metadata.get("planner_action_id"):
+            metadata["prerequisite_for_action_id"] = parent_task.metadata[
+                "planner_action_id"
+            ]
+        if parent_task.metadata.get("planner_action_kind"):
+            metadata["prerequisite_for_action_kind"] = parent_task.metadata[
+                "planner_action_kind"
+            ]
+    if declaration is not None:
+        metadata["contract_prerequisite"] = declaration
+    return metadata
+
+
+def _runtime_prerequisite_declaration(
+    operation: Operation,
+    *,
+    parent_task: Task | None,
+    capability: Capability,
+    prerequisite_for: str | None,
+) -> dict[str, Any] | None:
+    contract = _latest_compiled_contract_snapshot(operation, parent_task=parent_task)
+    if contract is None:
+        return None
+    required = {str(item) for item in contract.get("required_capabilities") or ()}
+    if capability.id not in required:
+        return None
+    metadata = contract.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    for raw in metadata.get("runtime_prerequisites") or ():
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("capability_id") != capability.id:
+            continue
+        if raw.get("owner") not in {None, capability.owner}:
+            continue
+        expected_for = prerequisite_for or (
+            parent_task.capability_id if parent_task is not None else None
+        )
+        if expected_for and raw.get("for_capability_id") != expected_for:
+            continue
+        return dict(raw)
+    return None
+
+
+def _latest_compiled_contract_snapshot(
+    operation: Operation,
+    *,
+    parent_task: Task | None,
+) -> dict[str, Any] | None:
+    context = operation.metadata.get("resume_context")
+    context = context if isinstance(context, dict) else {}
+    parent_metadata = parent_task.metadata if parent_task is not None else {}
+    for candidate in (
+        operation.metadata.get("latest_compiled_contract_snapshot"),
+        context.get("latest_compiled_contract_snapshot"),
+        context.get("contract"),
+        parent_metadata.get("contract"),
+    ):
+        if isinstance(candidate, Mapping):
+            return dict(candidate)
+    return None
 
 
 def _safe_string_list(value: Any) -> list[str]:

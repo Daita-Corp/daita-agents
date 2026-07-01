@@ -1,12 +1,54 @@
 from daita.db import DbRuntime, DbRuntimeConfig
+from daita.db.agent_loop import DbAgentLoop
+from daita.db.planner_protocol import (
+    DbPlannerAction,
+    DbPlannerActionKind,
+    DbPlannerDecision,
+    DbPlannerDecisionStatus,
+)
 from daita.db.runtime.tasks import DbTaskSpec
 from daita.db.runtime import DbRuntimeGovernanceBlocked
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
+from daita.runtime import TaskStatus
+import pytest
+
+
+async def _compile_column_value_search(
+    runtime: DbRuntime,
+    operation,
+    *,
+    target: str,
+    query: str,
+):
+    loop = DbAgentLoop(runtime, object())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "read"},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query.catalog_assisted"},
+        actions=(
+            DbPlannerAction(
+                action_id="search_values",
+                kind=DbPlannerActionKind.SEARCH_COLUMN_VALUES,
+                input={"owner": "catalog"},
+                metadata={"target": target, "query": query},
+            ),
+        ),
+    )
+    compilation = loop.compile_actions(decision, state)
+    assert compilation.rejected_action_summaries == ()
+    operation = await loop._persist_compiled_contract(operation, compilation)
+    return operation, compilation.task_specs, compilation.compiled_contract_snapshot
 
 
 async def _seed(plugin: SQLitePlugin) -> None:
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             email TEXT NOT NULL
@@ -18,7 +60,8 @@ async def _seed(plugin: SQLitePlugin) -> None:
         );
         INSERT INTO customers (id, email) VALUES (1, 'ada@example.com');
         INSERT INTO orders (id, customer_id, total) VALUES (10, 1, 42.5);
-        """)
+        """
+    )
 
 
 async def test_sqlite_registers_provider_neutral_db_capabilities():
@@ -253,14 +296,99 @@ async def test_catalog_column_value_search_profiles_dotted_target_before_search(
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status)
         VALUES (1, 'complete'), (2, 'complete'), (3, 'pending');
-        """)
+        """
+    )
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Search observed status values for completed orders",
+            },
+            evaluate_governance=False,
+        )
+        operation, search_specs, contract = await _compile_column_value_search(
+            runtime,
+            operation,
+            target="orders.status",
+            query="complete orders",
+        )
+        search_plan = await runtime.plan_task_specs(
+            operation,
+            search_specs,
+            contract=contract,
+        )
+        search = await runtime.execute_task(search_plan.tasks[0], operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+        hydrated_task = await runtime.store.load_task(search_plan.tasks[0].id)
+    finally:
+        await runtime.teardown()
+
+    prerequisite_tasks = {
+        task.capability_id: task
+        for task in tasks
+        if task.metadata.get("prerequisite_for") == "catalog.column_values.search"
+    }
+    kinds = {item.kind for item in evidence}
+    assert {
+        "schema.asset_profile",
+        "catalog.source_registered",
+        "column_values.profile",
+        "schema.column_value_profile",
+        "schema.column_value_search_result",
+    } <= kinds
+    assert hydrated_task.input["store_id"] == "store:sqlite"
+    assert hydrated_task.input["tables"] == ["orders"]
+    assert hydrated_task.input["columns"] == ["status"]
+    assert {
+        "db.schema.inspect",
+        "catalog.source.register",
+        "db.column_values.profile",
+        "catalog.column_values.register",
+    } <= set(prerequisite_tasks)
+    for capability_id, task in prerequisite_tasks.items():
+        assert task.metadata["declared_by_contract"] is True
+        assert task.metadata["prerequisite_for"] == "catalog.column_values.search"
+        assert task.metadata["prerequisite_reason"] == "catalog_column_value_grounding"
+        assert task.metadata["contract_prerequisite"]["capability_id"] == capability_id
+    assert search[0].kind == "schema.column_value_search_result"
+    assert search[0].payload["profiles"][0]["profile_ref"] == "orders.status"
+    assert search[0].payload["profiles"][0]["top_values"][0]["value"] == "complete"
+
+
+async def test_catalog_column_value_profile_prerequisite_requires_contract_declaration():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO orders (id, status)
+        VALUES (1, 'complete'), (2, 'pending');
+        """
+    )
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -282,26 +410,26 @@ async def test_catalog_column_value_search_profiles_dotted_target_before_search(
                 ),
             ),
         )
-        search = await runtime.execute_task(search_plan.tasks[0], operation)
+        with pytest.raises(
+            RuntimeError,
+            match="undeclared_runtime_prerequisite:db\\.column_values\\.profile",
+        ):
+            await runtime.execute_task(search_plan.tasks[0], operation)
         evidence = await runtime.store.list_evidence(operation.id)
-        hydrated_task = await runtime.store.load_task(search_plan.tasks[0].id)
+        tasks = await runtime.store.list_tasks(operation.id)
     finally:
         await runtime.teardown()
 
-    kinds = {item.kind for item in evidence}
-    assert {
-        "schema.asset_profile",
-        "catalog.source_registered",
-        "column_values.profile",
-        "schema.column_value_profile",
-        "schema.column_value_search_result",
-    } <= kinds
-    assert hydrated_task.input["store_id"] == "store:sqlite"
-    assert hydrated_task.input["tables"] == ["orders"]
-    assert hydrated_task.input["columns"] == ["status"]
-    assert search[0].kind == "schema.column_value_search_result"
-    assert search[0].payload["profiles"][0]["profile_ref"] == "orders.status"
-    assert search[0].payload["profiles"][0]["top_values"][0]["value"] == "complete"
+    assert "column_values.profile" not in {item.kind for item in evidence}
+    assert not any(task.capability_id == "db.column_values.profile" for task in tasks)
+    blocked_search = next(
+        task for task in tasks if task.capability_id == "catalog.column_values.search"
+    )
+    assert blocked_search.status is TaskStatus.BLOCKED
+    assert (
+        blocked_search.metadata["runtime_prerequisite_blocked"]["error"]
+        == "undeclared_runtime_prerequisite:db.column_values.profile"
+    )
 
 
 async def test_sqlite_column_value_profile_registers_with_catalog():
@@ -309,14 +437,16 @@ async def test_sqlite_column_value_profile_registers_with_catalog():
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(catalog, sqlite))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (status)
         VALUES ('complete'), ('complete'), ('pending');
-        """)
+        """
+    )
 
     try:
         schema_evidence = await runtime.execute_capability(
@@ -376,13 +506,15 @@ async def test_sqlite_column_value_profile_fingerprint_only_uses_live_revision()
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(sqlite,))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (status) VALUES ('complete'), ('pending');
-        """)
+        """
+    )
 
     try:
         fingerprint = await runtime.execute_capability(
@@ -492,14 +624,16 @@ async def test_sqlite_column_value_profile_skips_when_row_count_exceeds_limit():
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(sqlite,))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (status)
         VALUES ('complete'), ('complete'), ('pending');
-        """)
+        """
+    )
 
     try:
         raw_profile = await runtime.execute_capability(

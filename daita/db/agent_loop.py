@@ -89,6 +89,8 @@ _TERMINAL_TASK_STATUSES = {
     TaskStatus.SKIPPED,
 }
 
+_CATALOG_COLUMN_VALUE_GROUNDING_REASON = "catalog_column_value_grounding"
+
 
 @dataclass(frozen=True)
 class DbActionCompilation:
@@ -662,6 +664,8 @@ class DbAgentLoop:
         rejected: list[dict[str, Any]] = []
         specs: list[DbTaskSpec] = []
         selected_capabilities: list[dict[str, Any]] = []
+        runtime_prerequisites: list[dict[str, Any]] = []
+        runtime_prerequisite_capabilities: list[dict[str, Any]] = []
         decision_fingerprint = _stable_hash(decision.to_dict())
         actions: list[DbPlannerAction] = []
 
@@ -703,9 +707,19 @@ class DbAgentLoop:
                 action_specs = _with_spec_dependencies(
                     action_specs, planner_dependencies
                 )
+            (
+                prerequisite_capabilities,
+                prerequisite_metadata,
+                prerequisite_errors,
+            ) = self._catalog_prerequisite_capabilities(action, state=state)
+            if prerequisite_errors:
+                rejected.extend(prerequisite_errors)
+                continue
             specs.extend(action_specs)
             prior_action_specs[action.action_id] = tuple(action_specs)
             selected_capabilities.extend(action_capabilities)
+            runtime_prerequisite_capabilities.extend(prerequisite_capabilities)
+            runtime_prerequisites.extend(prerequisite_metadata)
             accepted.append(
                 {
                     "action_id": action.action_id,
@@ -719,6 +733,8 @@ class DbAgentLoop:
             state=state,
             decision_fingerprint=decision_fingerprint,
             selected_capabilities=tuple(selected_capabilities),
+            runtime_prerequisite_capabilities=tuple(runtime_prerequisite_capabilities),
+            runtime_prerequisites=tuple(runtime_prerequisites),
             compiled_action_ids=tuple(item["action_id"] for item in accepted),
         )
         return DbActionCompilation(
@@ -1058,6 +1074,81 @@ class DbAgentLoop:
             )
         return specs, [_capability_selection(item, action) for item in capabilities], []
 
+    def _catalog_prerequisite_capabilities(
+        self,
+        action: DbPlannerAction,
+        *,
+        state: DbLoopState,
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        if action.kind is not DbPlannerActionKind.SEARCH_COLUMN_VALUES:
+            return [], [], []
+
+        tables, columns = _column_value_scope_for_action(action)
+        if not tables or not columns or not _state_allows_read_profile(state):
+            return [], [], []
+
+        selected: list[dict[str, Any]] = []
+        prerequisites: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        target_capability_id = "catalog.column_values.search"
+        source_owner = _source_capability_owner(action)
+
+        def add_prerequisite(
+            capability_id: str,
+            *,
+            owner: str | None,
+        ) -> Any | None:
+            resolved = self._resolve_capability(capability_id, owner=owner)
+            error = resolved.get("error")
+            if error is not None:
+                return None
+            capability = resolved["capability"]
+            access_errors = self._access_errors(action, (capability,), state)
+            if access_errors:
+                errors.extend(access_errors)
+                return None
+            selected.append(
+                _capability_selection(
+                    capability,
+                    action,
+                    reason=f"runtime_prerequisite:{action.kind.value}",
+                )
+            )
+            prerequisites.append(
+                {
+                    "for_action_id": action.action_id,
+                    "for_action_kind": action.kind.value,
+                    "for_capability_id": target_capability_id,
+                    "capability_id": capability.id,
+                    "owner": capability.owner,
+                    "access": capability.access.value,
+                    "output_evidence": sorted(capability.output_evidence),
+                    "reason": _CATALOG_COLUMN_VALUE_GROUNDING_REASON,
+                    "tables": list(tables),
+                    "columns": list(columns),
+                }
+            )
+            return capability
+
+        if not _state_has_accepted_evidence(state, "schema.asset_profile"):
+            add_prerequisite("db.schema.inspect", owner=source_owner)
+        if not _state_has_accepted_evidence(state, "catalog.source_registered"):
+            add_prerequisite("catalog.source.register", owner=_action_owner(action))
+        profile_capability = add_prerequisite(
+            "db.column_values.profile",
+            owner=source_owner,
+        )
+        if profile_capability is not None:
+            add_prerequisite(
+                "catalog.column_values.register",
+                owner=_action_owner(action),
+            )
+        return selected, prerequisites, errors
+
     def _resolve_capability(
         self,
         capability_id: str,
@@ -1144,10 +1235,16 @@ class DbAgentLoop:
         decision_fingerprint: str,
         selected_capabilities: tuple[dict[str, Any], ...],
         compiled_action_ids: tuple[str, ...],
+        runtime_prerequisite_capabilities: tuple[dict[str, Any], ...] = (),
+        runtime_prerequisites: tuple[dict[str, Any], ...] = (),
     ) -> dict[str, Any]:
         max_access = AccessMode.NONE
         required_evidence: set[str] = set()
-        for selected in selected_capabilities:
+        contract_capabilities = (
+            *selected_capabilities,
+            *runtime_prerequisite_capabilities,
+        )
+        for selected in contract_capabilities:
             access = AccessMode(selected["access"])
             if _access_rank(access.value) > _access_rank(max_access.value):
                 max_access = access
@@ -1162,7 +1259,7 @@ class DbAgentLoop:
         contract = DbOperationContract(
             operation_type=operation_type,
             required_capabilities=tuple(
-                dict.fromkeys(str(item["id"]) for item in selected_capabilities)
+                dict.fromkeys(str(item["id"]) for item in contract_capabilities)
             ),
             required_evidence=tuple(sorted(required_evidence)),
             access=max_access,
@@ -1176,6 +1273,10 @@ class DbAgentLoop:
                 "planner_decision_fingerprint": decision_fingerprint,
                 "compiled_action_ids": list(compiled_action_ids),
                 "selected_capabilities": list(selected_capabilities),
+                "runtime_prerequisite_capabilities": list(
+                    runtime_prerequisite_capabilities
+                ),
+                "runtime_prerequisites": list(runtime_prerequisites),
             },
         )
         return _contract_snapshot(contract)
@@ -1760,6 +1861,19 @@ def _action_owner(action: DbPlannerAction) -> str | None:
     return str(owner) if owner else None
 
 
+def _source_capability_owner(action: DbPlannerAction) -> str | None:
+    for source in (action.input, action.metadata):
+        owner = (
+            source.get("source_owner")
+            or source.get("db_owner")
+            or source.get("connector_owner")
+            or source.get("source_capability_owner")
+        )
+        if owner:
+            return str(owner)
+    return None
+
+
 def _task_input_for_action(action: DbPlannerAction) -> dict[str, Any]:
     return {
         key: value
@@ -2001,6 +2115,7 @@ def _capability_selection(
     action: DbPlannerAction,
     *,
     output_evidence: tuple[str, ...] | None = None,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": capability.id,
@@ -2013,7 +2128,7 @@ def _capability_selection(
             else sorted(capability.output_evidence)
         ),
         "action_id": action.action_id,
-        "reason": action.kind.value,
+        "reason": reason or action.kind.value,
     }
 
 
@@ -2213,6 +2328,79 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
         return (value,)
     return tuple(str(item) for item in value)
+
+
+def _column_value_scope_for_action(
+    action: DbPlannerAction,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    tables = _first_action_string_list(action, "tables", "table", "target")
+    columns = _first_action_string_list(action, "columns", "column", "field")
+    normalized_tables: list[str] = []
+    normalized_columns: list[str] = list(columns)
+    for table in tables:
+        if "." in table:
+            table_name, column_name = table.split(".", 1)
+            if table_name.strip():
+                normalized_tables.append(table_name.strip())
+            if column_name.strip() and not normalized_columns:
+                normalized_columns.append(column_name.strip())
+            continue
+        normalized_tables.append(table)
+    return (
+        tuple(_ordered_unique_strings(normalized_tables)),
+        tuple(_ordered_unique_strings(normalized_columns)),
+    )
+
+
+def _first_action_string_list(
+    action: DbPlannerAction,
+    *keys: str,
+) -> list[str]:
+    for source in (action.input, action.metadata):
+        for key in keys:
+            values = _safe_string_list(source.get(key))
+            if values:
+                return values
+    return []
+
+
+def _safe_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _ordered_unique_strings(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _state_has_accepted_evidence(state: DbLoopState, kind: str) -> bool:
+    return any(
+        item.get("kind") == kind and item.get("accepted", True) is True
+        for item in state.accepted_evidence_summaries
+    )
+
+
+def _state_allows_read_profile(state: DbLoopState) -> bool:
+    safety_frame = state.safety_frame or {}
+    max_access = str(
+        safety_frame.get("max_access")
+        or safety_frame.get("max_allowed_access")
+        or AccessMode.ADMIN.value
+    )
+    return _access_rank(max_access) >= _access_rank(AccessMode.READ.value)
 
 
 def _governance_summary(governance: GovernanceResult | None) -> dict[str, Any]:

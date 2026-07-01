@@ -121,6 +121,22 @@ class CompletionTargetPlugin(RuntimeExtensionPlugin):
             f"{OWNER}.schema.search",
             {"catalog.schema.search"},
         )
+        self.source_register = CompletionTargetExecutor(
+            f"{OWNER}.source.register",
+            {"catalog.source.register"},
+        )
+        self.column_search = CompletionTargetExecutor(
+            f"{OWNER}.column_values.search",
+            {"catalog.column_values.search"},
+        )
+        self.column_profile = CompletionTargetExecutor(
+            f"{OWNER}.column_values.profile",
+            {"db.column_values.profile"},
+        )
+        self.column_register = CompletionTargetExecutor(
+            f"{OWNER}.column_values.register",
+            {"catalog.column_values.register"},
+        )
         self.validation = CompletionTargetExecutor(
             f"{OWNER}.sql.validate",
             {"db.sql.validate"},
@@ -163,6 +179,44 @@ class CompletionTargetPlugin(RuntimeExtensionPlugin):
                 **common,
             ),
             Capability(
+                id="catalog.source.register",
+                owner=OWNER,
+                description="Register catalog source.",
+                access=AccessMode.METADATA_READ,
+                output_evidence=frozenset({"catalog.source_registered"}),
+                executor=self.source_register.id,
+                **common,
+            ),
+            Capability(
+                id="catalog.column_values.search",
+                owner=OWNER,
+                description="Search catalog column values.",
+                access=AccessMode.METADATA_READ,
+                output_evidence=frozenset({"schema.column_value_search_result"}),
+                executor=self.column_search.id,
+                **common,
+            ),
+            Capability(
+                id="db.column_values.profile",
+                owner=OWNER,
+                description="Profile source column values.",
+                access=AccessMode.READ,
+                risk=RiskLevel.MEDIUM,
+                output_evidence=frozenset({"column_values.profile"}),
+                executor=self.column_profile.id,
+                **{key: value for key, value in common.items() if key != "risk"},
+            ),
+            Capability(
+                id="catalog.column_values.register",
+                owner=OWNER,
+                description="Register catalog column values.",
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.MEDIUM,
+                output_evidence=frozenset({"schema.column_value_profile"}),
+                executor=self.column_register.id,
+                **{key: value for key, value in common.items() if key != "risk"},
+            ),
+            Capability(
                 id="db.sql.validate",
                 owner=OWNER,
                 description="Validate SQL.",
@@ -183,7 +237,16 @@ class CompletionTargetPlugin(RuntimeExtensionPlugin):
         ]
 
     def get_executors(self):
-        return [self.schema, self.catalog, self.validation, self.read]
+        return [
+            self.schema,
+            self.catalog,
+            self.source_register,
+            self.column_search,
+            self.column_profile,
+            self.column_register,
+            self.validation,
+            self.read,
+        ]
 
     def declare_evidence_schemas(self):
         return [
@@ -194,6 +257,26 @@ class CompletionTargetPlugin(RuntimeExtensionPlugin):
             ),
             EvidenceSchema(
                 kind="schema.search_result",
+                owner=OWNER,
+                json_schema={"type": "object"},
+            ),
+            EvidenceSchema(
+                kind="catalog.source_registered",
+                owner=OWNER,
+                json_schema={"type": "object"},
+            ),
+            EvidenceSchema(
+                kind="schema.column_value_search_result",
+                owner=OWNER,
+                json_schema={"type": "object"},
+            ),
+            EvidenceSchema(
+                kind="column_values.profile",
+                owner=OWNER,
+                json_schema={"type": "object"},
+            ),
+            EvidenceSchema(
+                kind="schema.column_value_profile",
                 owner=OWNER,
                 json_schema={"type": "object"},
             ),
@@ -442,6 +525,65 @@ async def test_explicit_schema_mode_rejects_sql_read_actions():
     assert {item["error"] for item in compilation.rejected_action_summaries} == {
         "action_outside_explicit_mode:execute_validated_read:schema.query"
     }
+
+
+async def test_column_value_search_contract_declares_profile_prerequisites():
+    runtime, _ = await _runtime_with_planner(ScriptedPlanner())
+    operation = await _bootstrap_run_operation(
+        runtime,
+        "column-value-contract-target",
+    )
+    loop = DbAgentLoop(runtime, ScriptedPlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "read"},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query.catalog_assisted"},
+        actions=(
+            DbPlannerAction(
+                action_id="search_values",
+                kind=DbPlannerActionKind.SEARCH_COLUMN_VALUES,
+                input={"owner": OWNER},
+                metadata={"target": "orders.status", "query": "completed orders"},
+            ),
+        ),
+    )
+
+    compilation = loop.compile_actions(decision, state)
+    contract = compilation.compiled_contract_snapshot
+
+    assert compilation.rejected_action_summaries == ()
+    assert {
+        "catalog.column_values.search",
+        "db.schema.inspect",
+        "catalog.source.register",
+        "db.column_values.profile",
+        "catalog.column_values.register",
+    } <= set(contract["required_capabilities"])
+    assert "column_values.profile" in contract["required_evidence"]
+    assert contract["access"] == "read"
+    prerequisites = contract["metadata"]["runtime_prerequisites"]
+    prerequisite_ids = {item["capability_id"] for item in prerequisites}
+    assert {
+        "db.schema.inspect",
+        "catalog.source.register",
+        "db.column_values.profile",
+        "catalog.column_values.register",
+    } <= prerequisite_ids
+    assert all(item["for_action_id"] == "search_values" for item in prerequisites)
+    assert all(
+        item["for_capability_id"] == "catalog.column_values.search"
+        for item in prerequisites
+    )
+    assert {
+        item["capability_id"]
+        for item in prerequisites
+        if item["reason"] == "catalog_column_value_grounding"
+    } == prerequisite_ids
 
 
 async def test_resume_reenters_agent_loop_after_first_turn_evidence():
