@@ -527,6 +527,30 @@ async def test_explicit_schema_mode_rejects_sql_read_actions():
     }
 
 
+async def test_explicit_relationship_mode_rejects_sql_read_actions():
+    runtime, _ = await _runtime_with_planner(ScriptedPlanner())
+    loop = DbAgentLoop(runtime, ScriptedPlanner())
+    state = DbLoopState(
+        operation_id="relationship-mode-compile-target",
+        normalized_user_request={"prompt": "Tell me how orders relate to customers."},
+        explicit_mode="schema.relationship_query",
+        safety_frame={"max_access": AccessMode.METADATA_READ.value},
+    )
+
+    compilation = loop.compile_actions(
+        _read_decision(sql="select * from orders"),
+        state,
+    )
+
+    assert compilation.task_specs == ()
+    assert {item["error"] for item in compilation.rejected_action_summaries} == {
+        (
+            "action_outside_explicit_mode:"
+            "execute_validated_read:schema.relationship_query"
+        )
+    }
+
+
 async def test_column_value_search_contract_declares_profile_prerequisites():
     runtime, _ = await _runtime_with_planner(ScriptedPlanner())
     operation = await _bootstrap_run_operation(

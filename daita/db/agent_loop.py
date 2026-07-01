@@ -1718,15 +1718,16 @@ def _mode_action_errors(
     action: DbPlannerAction,
     state: DbLoopState,
 ) -> tuple[dict[str, Any], ...]:
-    if (
-        _explicit_mode_operation_type(state.explicit_mode)
-        == DbIntentKind.SCHEMA_QUERY.value
-        and action.kind in _SQL_QUERY_ACTIONS
-    ):
+    metadata_only_modes = {
+        DbIntentKind.SCHEMA_QUERY.value,
+        DbIntentKind.SCHEMA_RELATIONSHIP_QUERY.value,
+    }
+    effective_mode = _explicit_mode_operation_type(state.explicit_mode)
+    if effective_mode in metadata_only_modes and action.kind in _SQL_QUERY_ACTIONS:
         return (
             _action_error(
                 action,
-                f"action_outside_explicit_mode:{action.kind.value}:schema.query",
+                f"action_outside_explicit_mode:{action.kind.value}:{effective_mode}",
             ),
         )
     return ()
