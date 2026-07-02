@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
+import re
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
@@ -218,6 +219,7 @@ class _LoopProgressGuard:
                         ),
                     }
                 )
+                sql_terminal = True
             elif previous >= 2:
                 sql_terminal = True
 
@@ -269,6 +271,7 @@ class _LoopProgressGuard:
                 "repeated_no_progress": repeated_no_progress,
                 "no_progress_count": self.no_progress_count,
             },
+            retry_facts=tuple(retry_facts),
         )
 
 
@@ -860,6 +863,13 @@ class DbAgentLoop:
                 sequence_start=sequence_start,
                 decision_fingerprint=decision_fingerprint,
             )
+        if action.kind is DbPlannerActionKind.FIND_RELATIONSHIP_PATHS:
+            return self._compile_relationship_paths_action(
+                action,
+                state=state,
+                sequence_start=sequence_start,
+                decision_fingerprint=decision_fingerprint,
+            )
         capability_ids = _SIMPLE_ACTION_CAPABILITIES.get(action.kind)
         if capability_ids is None:
             return [], [], [_action_error(action, "unsupported_action_kind")]
@@ -979,6 +989,41 @@ class DbAgentLoop:
             owner=capability.owner,
             input={"sql": sql, "operation": "write"},
             reason=f"planner:{action.kind.value}:validation",
+            sequence=sequence_start,
+            metadata=_action_metadata(action, decision_fingerprint),
+            deterministic_key=f"{action.action_id}:{capability.id}",
+        )
+        spec = _with_deterministic_task_id(state.operation_id, spec)
+        return [spec], [_capability_selection(capability, action)], []
+
+    def _compile_relationship_paths_action(
+        self,
+        action: DbPlannerAction,
+        *,
+        state: DbLoopState,
+        sequence_start: int,
+        decision_fingerprint: str,
+    ) -> tuple[list[DbTaskSpec], list[dict[str, Any]], list[dict[str, Any]]]:
+        owner = _action_owner(action)
+        resolved = self._resolve_capability(
+            "catalog.relationship_paths.find",
+            owner=owner,
+        )
+        error = self._capability_error(action, resolved)
+        if error is not None:
+            return [], [], [error]
+        capability = resolved["capability"]
+        access_errors = self._access_errors(action, [capability], state)
+        if access_errors:
+            return [], [], access_errors
+        task_input, input_errors = _relationship_paths_task_input(action, state)
+        if input_errors:
+            return [], [], [_action_error(action, item) for item in input_errors]
+        spec = DbTaskSpec(
+            capability_id=capability.id,
+            owner=capability.owner,
+            input=task_input,
+            reason=f"planner:{action.kind.value}",
             sequence=sequence_start,
             metadata=_action_metadata(action, decision_fingerprint),
             deterministic_key=f"{action.action_id}:{capability.id}",
@@ -1881,6 +1926,142 @@ def _task_input_for_action(action: DbPlannerAction) -> dict[str, Any]:
         for key, value in action.input.items()
         if key not in {"owner", "capability_owner"}
     }
+
+
+def _relationship_paths_task_input(
+    action: DbPlannerAction,
+    state: DbLoopState,
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    base_input = {
+        key: value
+        for key, value in _task_input_for_action(action).items()
+        if key
+        not in {
+            "from",
+            "from_assets",
+            "source",
+            "source_assets",
+            "to",
+            "to_assets",
+            "target",
+            "target_assets",
+            "assets",
+            "tables",
+        }
+    }
+    from_assets = _first_string_list_from_mappings(
+        (action.input, action.metadata),
+        "from_assets",
+        "from",
+        "source_assets",
+        "source",
+    )
+    to_assets = _first_string_list_from_mappings(
+        (action.input, action.metadata),
+        "to_assets",
+        "to",
+        "target_assets",
+        "target",
+    )
+    if not from_assets and not to_assets:
+        paired_assets = _first_string_list_from_mappings(
+            (action.input, action.metadata),
+            "assets",
+            "tables",
+        )
+        if len(paired_assets) >= 2:
+            from_assets = paired_assets[:1]
+            to_assets = paired_assets[1:]
+    if from_assets and not to_assets and len(from_assets) >= 2:
+        to_assets = from_assets[1:]
+        from_assets = from_assets[:1]
+    fallback_from, fallback_to = _relationship_assets_from_state(state)
+    if not from_assets:
+        from_assets = fallback_from
+    if not to_assets:
+        to_assets = fallback_to
+    errors: list[str] = []
+    if not from_assets:
+        errors.append("missing_from_assets")
+    if not to_assets:
+        errors.append("missing_to_assets")
+    if errors:
+        return {}, tuple(errors)
+    return {
+        **base_input,
+        "from_assets": from_assets,
+        "to_assets": to_assets,
+    }, ()
+
+
+def _relationship_assets_from_state(
+    state: DbLoopState,
+) -> tuple[list[str], list[str]]:
+    scoped = _string_list(state.source_scope) or _string_list(
+        state.normalized_user_request.get("source_scope")
+    )
+    if len(scoped) >= 2:
+        return scoped[:1], scoped[1:]
+    session_tables = _session_context_tables(
+        state.normalized_user_request.get("session_context")
+    )
+    if len(session_tables) >= 2:
+        return session_tables[:1], session_tables[1:]
+    return _relationship_assets_from_text(
+        str(state.normalized_user_request.get("prompt") or "")
+    )
+
+
+def _session_context_tables(value: Any) -> list[str]:
+    if not isinstance(value, Mapping):
+        return []
+    referents = value.get("referents")
+    if not isinstance(referents, Mapping):
+        return []
+    return _string_list(referents.get("tables"))
+
+
+def _relationship_assets_from_text(text: str) -> tuple[list[str], list[str]]:
+    identifier = r"([A-Za-z_][A-Za-z0-9_]*)"
+    patterns = (
+        rf"\bjoin\s+(?:the\s+)?{identifier}\s+(?:table\s+)?"
+        rf"(?:to|with|and)\s+(?:the\s+)?{identifier}\b",
+        rf"\b(?:relationship|relationships|path|paths)\s+"
+        rf"(?:between|from)\s+(?:the\s+)?{identifier}\s+"
+        rf"(?:and|to)\s+(?:the\s+)?{identifier}\b",
+        rf"\b{identifier}\s+(?:to|and)\s+{identifier}\s+"
+        rf"(?:relationship|relationships|join|joins|path|paths)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match is not None:
+            left, right = match.group(1).strip(), match.group(2).strip()
+            if left and right:
+                return [left], [right]
+    return [], []
+
+
+def _first_string_list_from_mappings(
+    mappings: Iterable[Mapping[str, Any]],
+    *keys: str,
+) -> list[str]:
+    for mapping in mappings:
+        for key in keys:
+            values = _string_list(mapping.get(key))
+            if values:
+                return values
+    return []
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
 
 
 def _resolve_sql_input_for_action(

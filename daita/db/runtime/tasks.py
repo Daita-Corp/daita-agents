@@ -35,6 +35,17 @@ from .types import (
 )
 
 _CATALOG_COLUMN_VALUE_GROUNDING_REASON = "catalog_column_value_grounding"
+_SOURCE_OWNER_KEYS = (
+    "source_owner",
+    "db_owner",
+    "connector_owner",
+    "source_capability_owner",
+)
+_SOURCE_OWNER_OPTION_KEYS = (
+    *_SOURCE_OWNER_KEYS,
+    "source_plugin_id",
+    "source_plugin",
+)
 
 
 @dataclass(frozen=True)
@@ -1045,9 +1056,15 @@ class DbRuntimeTasksMixin:
         )
         if existing is not None:
             return existing
-        try:
-            capability = self.registry.get_capability("db.schema.inspect")
-        except (KeyError, ValueError):
+        capability = await self._source_prerequisite_capability(
+            "db.schema.inspect",
+            operation,
+            parent_task=parent_task,
+            task_input=None,
+            prerequisite_for=prerequisite_for,
+            prerequisite_reason=prerequisite_reason,
+        )
+        if capability is None:
             return None
         prerequisite_metadata = _runtime_prerequisite_task_metadata(
             operation,
@@ -1203,15 +1220,22 @@ class DbRuntimeTasksMixin:
         pairs = _column_value_profile_pairs(task_input)
         if not pairs or not _operation_allows_read_profile(operation):
             return
+        profile_capability = await self._source_prerequisite_capability(
+            "db.column_values.profile",
+            operation,
+            parent_task=parent_task,
+            task_input=task_input,
+            prerequisite_for=parent_task.capability_id,
+            prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
+        )
+        if profile_capability is None:
+            return
         try:
-            profile_capability = self.registry.get_capability(
-                "db.column_values.profile"
-            )
             register_capability = self.registry.get_capability(
                 "catalog.column_values.register",
                 owner="catalog",
             )
-        except (KeyError, ValueError):
+        except KeyError:
             return
         profile_declaration = await self._require_declared_runtime_prerequisite(
             operation,
@@ -1429,6 +1453,65 @@ class DbRuntimeTasksMixin:
         updated = replace(task, metadata=merged)
         await self.store.save_task(updated)
         return updated
+
+    async def _source_prerequisite_capability(
+        self,
+        capability_id: str,
+        operation: Operation,
+        *,
+        parent_task: Task | None,
+        task_input: dict[str, Any] | None,
+        prerequisite_for: str | None,
+        prerequisite_reason: str,
+    ) -> Capability | None:
+        owners = _capability_owners(self.registry.capabilities, capability_id)
+        owner = _source_owner_for_prerequisite(
+            operation,
+            metadata=self.config.metadata,
+            owners=owners,
+            parent_task=parent_task,
+            task_input=task_input,
+        )
+        if owner is None:
+            if len(owners) > 1 and parent_task is not None:
+                await self._block_ambiguous_source_owner(
+                    parent_task,
+                    capability_id=capability_id,
+                    owners=owners,
+                    prerequisite_for=prerequisite_for,
+                    prerequisite_reason=prerequisite_reason,
+                )
+            return None
+        try:
+            return self.registry.get_capability(capability_id, owner=owner)
+        except KeyError:
+            return None
+
+    async def _block_ambiguous_source_owner(
+        self,
+        parent_task: Task,
+        *,
+        capability_id: str,
+        owners: tuple[str, ...],
+        prerequisite_for: str | None,
+        prerequisite_reason: str,
+    ) -> None:
+        error = f"ambiguous_source_owner:{capability_id}"
+        details = {
+            "error": "ambiguous_source_owner",
+            "capability_id": capability_id,
+            "candidate_owners": list(owners),
+            "prerequisite_for": prerequisite_for or parent_task.capability_id,
+            "prerequisite_for_task_id": parent_task.id,
+            "prerequisite_reason": prerequisite_reason,
+        }
+        await self.kernel.block_task(
+            parent_task.id,
+            message=error,
+            payload={"runtime_prerequisite": details},
+            metadata={"runtime_prerequisite_blocked": details},
+        )
+        raise RuntimeError(error)
 
     async def _require_declared_runtime_prerequisite(
         self,
@@ -1680,13 +1763,50 @@ def _catalog_task_input_from_metadata(
             _first_metadata_string(metadata, "query", "value", "literal", "goal")
             or prompt,
         )
-        tables = _metadata_string_list(metadata, "tables", "table", "target")
-        columns = _metadata_string_list(metadata, "columns", "column", "field")
+        input_tables = _safe_string_list(task_input.get("tables"))
+        if not input_tables:
+            input_tables = _safe_string_list(task_input.get("table"))
+        input_columns = _safe_string_list(task_input.get("columns"))
+        if not input_columns:
+            input_columns = _safe_string_list(task_input.get("column"))
+        target_tables, target_columns = _normalize_column_value_scope(
+            _safe_string_list(task_input.get("target")),
+            [],
+        )
+        if not input_tables:
+            input_tables = target_tables
+        if not input_columns:
+            input_columns = target_columns
+
+        tables, columns = _normalize_column_value_scope(input_tables, input_columns)
+
+        metadata_tables = _metadata_string_list(metadata, "tables", "table")
+        metadata_columns = _metadata_string_list(
+            metadata, "columns", "column", "field"
+        )
+        metadata_target_tables, metadata_target_columns = _normalize_column_value_scope(
+            _metadata_string_list(metadata, "target"),
+            [],
+        )
+        if not metadata_tables:
+            metadata_tables = metadata_target_tables
+        if not metadata_columns:
+            metadata_columns = metadata_target_columns
+        metadata_tables, metadata_columns = _normalize_column_value_scope(
+            metadata_tables,
+            metadata_columns,
+        )
+        if not tables:
+            tables = metadata_tables
+        if not columns:
+            columns = metadata_columns
         tables, columns = _normalize_column_value_scope(tables, columns)
         if tables:
-            task_input.setdefault("tables", tables)
+            task_input["tables"] = tables
         if columns:
-            task_input.setdefault("columns", columns)
+            task_input["columns"] = columns
+        if tables and columns:
+            task_input.pop("target", None)
     return task_input
 
 
@@ -1861,6 +1981,113 @@ def _catalog_store_id(task_input: dict[str, Any], metadata: dict[str, Any]) -> s
     if metadata.get("catalog_store_id"):
         return str(metadata["catalog_store_id"])
     return ""
+
+
+def _source_owner_for_prerequisite(
+    operation: Operation,
+    *,
+    metadata: dict[str, Any],
+    owners: tuple[str, ...],
+    parent_task: Task | None,
+    task_input: dict[str, Any] | None,
+) -> str | None:
+    for candidate in (
+        parent_task.metadata if parent_task is not None else None,
+        parent_task.input if parent_task is not None else None,
+        task_input,
+    ):
+        owner = _source_owner_from_mapping(candidate, owners=owners)
+        if owner:
+            return owner
+
+    owner = _source_owner_from_source_scope(
+        operation.request.get("source_scope"),
+        owners=owners,
+    )
+    if owner:
+        return owner
+
+    options = metadata.get("from_db_options")
+    owner = _source_owner_from_mapping(
+        options if isinstance(options, dict) else None,
+        owners=owners,
+        option_keys=True,
+    )
+    if owner:
+        return owner
+
+    if len(owners) == 1:
+        return owners[0]
+    return None
+
+
+def _capability_owners(
+    capabilities: Iterable[Capability],
+    capability_id: str,
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            capability.owner
+            for capability in capabilities
+            if capability.id == capability_id
+        )
+    )
+
+
+def _source_owner_from_mapping(
+    value: Any,
+    *,
+    owners: tuple[str, ...],
+    option_keys: bool = False,
+) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    keys = _SOURCE_OWNER_OPTION_KEYS if option_keys else _SOURCE_OWNER_KEYS
+    for key in keys:
+        owner = _normalized_source_owner(value.get(key))
+        if owner:
+            return owner
+    owner = _normalized_source_owner(value.get("owner"))
+    if owner and owner != "catalog" and (not owners or owner in owners):
+        return owner
+    return None
+
+
+def _source_owner_from_source_scope(
+    value: Any,
+    *,
+    owners: tuple[str, ...],
+) -> str | None:
+    if not owners:
+        return None
+    items = _source_scope_items(value)
+    if len(items) != 1:
+        return None
+    item = items[0]
+    if isinstance(item, Mapping):
+        owner = _source_owner_from_mapping(item, owners=owners)
+        return owner if owner in owners else None
+    owner = _normalized_source_owner(item)
+    return owner if owner in owners else None
+
+
+def _source_scope_items(value: Any) -> tuple[Any, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,) if value.strip() else ()
+    if isinstance(value, Mapping):
+        return (value,)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return tuple(value)
+    return (value,)
+
+
+def _normalized_source_owner(value: Any) -> str | None:
+    if value is None:
+        return None
+    owner = str(value).strip()
+    return owner or None
 
 
 def _first_metadata_string(metadata: dict[str, Any], *keys: str) -> str:

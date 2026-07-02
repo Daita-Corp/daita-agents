@@ -8,10 +8,56 @@ from daita.db.planner_protocol import (
 )
 from daita.db.runtime.tasks import DbTaskSpec
 from daita.db.runtime import DbRuntimeGovernanceBlocked
+from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import TaskStatus
+from daita.runtime import AccessMode, Capability, RiskLevel, TaskStatus
 import pytest
+
+
+class _ProfileOnlyExecutor:
+    def __init__(self, owner: str) -> None:
+        self.id = f"{owner}.column_values.profile"
+        self.owner = owner
+        self.capability_ids = frozenset({"db.column_values.profile"})
+
+    async def execute(self, task, operation, context):
+        raise AssertionError("ambiguous source-owned profile task should not execute")
+
+
+class _ProfileOnlySourcePlugin(RuntimeExtensionPlugin):
+    def __init__(self, owner: str) -> None:
+        self.manifest = PluginManifest(
+            id=owner,
+            display_name=owner,
+            version="1.0.0",
+            kind=PluginKind.RUNTIME_EXTENSION,
+            domains=frozenset({"db"}),
+        )
+
+    def declare_capabilities(self):
+        owner = self.manifest.id
+        return (
+            Capability(
+                id="db.column_values.profile",
+                owner=owner,
+                description="Profile source column values.",
+                domains=frozenset({"db"}),
+                operation_types=frozenset({"source.profile", "data.query"}),
+                access=AccessMode.READ,
+                risk=RiskLevel.LOW,
+                input_schema={"type": "object"},
+                output_evidence=frozenset({"column_values.profile"}),
+                executor=f"{owner}.column_values.profile",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
+        )
+
+    def get_executors(self):
+        return (_ProfileOnlyExecutor(self.manifest.id),)
 
 
 async def _compile_column_value_search(
@@ -365,6 +411,75 @@ async def test_catalog_column_value_search_profiles_dotted_target_before_search(
     assert search[0].payload["profiles"][0]["top_values"][0]["value"] == "complete"
 
 
+async def test_catalog_column_value_search_profiles_dotted_input_target_before_search():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO orders (id, status)
+        VALUES (1, 'complete'), (2, 'complete'), (3, 'pending');
+        """
+    )
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Search observed status values for completed orders",
+            },
+            evaluate_governance=False,
+        )
+        operation, _search_specs, contract = await _compile_column_value_search(
+            runtime,
+            operation,
+            target="orders.status",
+            query="complete orders",
+        )
+        search_plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="catalog.column_values.search",
+                    owner="catalog",
+                    input={"target": "orders.status", "query": "complete orders"},
+                    metadata={},
+                    reason="test:column_values_search",
+                ),
+            ),
+            contract=contract,
+        )
+        search = await runtime.execute_task(search_plan.tasks[0], operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+        hydrated_task = await runtime.store.load_task(search_plan.tasks[0].id)
+    finally:
+        await runtime.teardown()
+
+    kinds = {item.kind for item in evidence}
+    assert "column_values.profile" in kinds
+    assert "schema.column_value_profile" in kinds
+    assert hydrated_task.input["tables"] == ["orders"]
+    assert hydrated_task.input["columns"] == ["status"]
+    assert "target" not in hydrated_task.input
+    assert search[0].kind == "schema.column_value_search_result"
+    assert search[0].payload["profiles"][0]["profile_ref"] == "orders.status"
+    assert search[0].payload["profiles"][0]["top_values"][0]["value"] == "complete"
+
+
 async def test_catalog_column_value_profile_prerequisite_requires_contract_declaration():
     catalog = CatalogPlugin(auto_persist=False)
     sqlite = SQLitePlugin(path=":memory:")
@@ -430,6 +545,65 @@ async def test_catalog_column_value_profile_prerequisite_requires_contract_decla
         blocked_search.metadata["runtime_prerequisite_blocked"]["error"]
         == "undeclared_runtime_prerequisite:db.column_values.profile"
     )
+
+
+async def test_catalog_column_value_profile_ambiguous_source_owner_blocks_prepare():
+    catalog = CatalogPlugin(auto_persist=False)
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:test",
+                }
+            },
+        ),
+        plugins=(
+            catalog,
+            _ProfileOnlySourcePlugin("source_alpha"),
+            _ProfileOnlySourcePlugin("source_beta"),
+        ),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Search observed status values for completed orders",
+            },
+            evaluate_governance=False,
+        )
+        operation, search_specs, contract = await _compile_column_value_search(
+            runtime,
+            operation,
+            target="orders.status",
+            query="complete orders",
+        )
+        search_plan = await runtime.plan_task_specs(
+            operation,
+            search_specs,
+            contract=contract,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="ambiguous_source_owner:db\\.column_values\\.profile",
+        ):
+            await runtime.execute_task(search_plan.tasks[0], operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert "column_values.profile" not in {item.kind for item in evidence}
+    assert not any(task.capability_id == "db.column_values.profile" for task in tasks)
+    blocked_search = next(
+        task for task in tasks if task.capability_id == "catalog.column_values.search"
+    )
+    diagnostic = blocked_search.metadata["runtime_prerequisite_blocked"]
+    assert blocked_search.status is TaskStatus.BLOCKED
+    assert diagnostic["error"] == "ambiguous_source_owner"
+    assert diagnostic["capability_id"] == "db.column_values.profile"
+    assert diagnostic["candidate_owners"] == ["source_alpha", "source_beta"]
 
 
 async def test_sqlite_column_value_profile_registers_with_catalog():
