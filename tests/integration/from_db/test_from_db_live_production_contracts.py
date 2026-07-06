@@ -17,6 +17,7 @@ import pytest
 from tests.integration.from_db.live_production_helpers import (
     assert_loop_evidence,
     assert_no_unexpected_write_execution,
+    assert_scalar_answer_fact,
     assert_sql_is_read_only,
     assert_successful_prompt_run,
     assert_synthesized_answer,
@@ -84,6 +85,8 @@ async def test_live_sqlite_simple_query_full_loop_contract(tmp_path):
         assert_loop_evidence(result)
         assert_loop_evidence(snapshot)
         assert_synthesized_answer(result)
+        assert_scalar_answer_fact(result, value=4, aggregate_kind="count")
+        assert_scalar_answer_fact(snapshot, value=4, aggregate_kind="count")
         assert "db.answer.synthesize" in task_capabilities(result)
         assert "db.answer.synthesize" in task_capabilities(snapshot)
 
@@ -138,6 +141,8 @@ async def test_live_postgres_simple_query_full_loop_contract(
         assert_loop_evidence(result)
         assert_loop_evidence(snapshot)
         assert_synthesized_answer(result)
+        assert_scalar_answer_fact(result, value=4, aggregate_kind="count")
+        assert_scalar_answer_fact(snapshot, value=4, aggregate_kind="count")
         assert "db.answer.synthesize" in task_capabilities(result)
         assert "db.answer.synthesize" in task_capabilities(snapshot)
 

@@ -116,7 +116,15 @@ def _planner_messages(state: DbLoopState) -> list[dict[str, str]]:
                 "query.plan.proposal evidence, set input.plan_evidence_id to that "
                 "evidence id or set "
                 'input.query_plan_ref="latest_accepted_query_plan"; do not depend '
-                "on a previous-turn action id."
+                "on a previous-turn action id. If the user explicitly asks for "
+                "catalog column values, gather them with search_column_values "
+                "before SQL; set input.tables and input.columns to the targets. "
+                "If validation reports unobserved_filter_literal, repair to "
+                "observed values when intent is clear; otherwise block or "
+                "clarify. For explicit SQL writes, put the concrete SQL in "
+                "input.sql: use propose_sql_write for write.propose, "
+                "execute_validated_write for write.execute, and propose_sql_write "
+                "for destructive SQL so policy can deny it before execution."
             ),
         },
         {
@@ -145,7 +153,10 @@ def _decision_schema_hint() -> dict[str, Any]:
                 "action_id": "stable id unique within this decision",
                 "kind": "one available action kind",
                 "input": {
-                    "sql": "optional direct SQL for execute_validated_read",
+                    "sql": (
+                        "optional direct SQL for execute_validated_read, "
+                        "propose_sql_write, or execute_validated_write"
+                    ),
                     "plan_evidence_id": (
                         "optional accepted query.plan.proposal evidence id "
                         "for prior SQL"

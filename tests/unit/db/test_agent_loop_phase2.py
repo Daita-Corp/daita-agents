@@ -12,7 +12,15 @@ from daita.db.planner_protocol import (
     DbPlannerDecisionStatus,
 )
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
-from daita.runtime import AccessMode, Capability, Evidence, EvidenceSchema, RiskLevel
+from daita.runtime import (
+    AccessMode,
+    ApprovalRequest,
+    ApprovalStatus,
+    Capability,
+    Evidence,
+    EvidenceSchema,
+    RiskLevel,
+)
 
 
 class PhaseTwoExecutor:
@@ -337,6 +345,258 @@ async def test_latest_accepted_query_plan_ref_selects_latest_accepted_plan():
     )
 
 
+async def test_direct_sql_matching_latest_plan_ref_uses_plan_provenance():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "sql": "select 1 as answer;",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-direct-sql-matching-latest-plan",
+        action,
+        plan_evidence=({"evidence_id": "plan-accepted", "sql": "select 1 as answer"},),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-accepted"
+    assert (
+        validation.metadata["sql_provenance"]["provenance"]
+        == "latest_accepted_query_plan"
+    )
+
+
+async def test_direct_sql_mismatching_latest_plan_ref_is_ambiguous():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "sql": "select 2 as answer",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-direct-sql-mismatching-latest-plan",
+        action,
+        plan_evidence=({"evidence_id": "plan-accepted", "sql": "select 1 as answer"},),
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == "ambiguous_sql_input"
+
+
+async def test_write_execute_with_direct_sql_and_plan_ref_uses_matching_validation():
+    sql = "UPDATE orders SET status = 'approved' WHERE order_id = 101"
+    action = DbPlannerAction(
+        action_id="write",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_WRITE,
+        input={
+            "owner": "phase_two",
+            "sql": f"{sql};",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-write-from-validation",
+        action,
+        sql_validation_evidence=(
+            {
+                "evidence_id": "validation-write",
+                "sql": sql,
+                "operation": "write",
+                "task_id": "validation-task",
+            },
+        ),
+        explicit_mode="write.execute",
+        max_access="write",
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.sql.validate",
+        "db.sql.execute_write",
+    ]
+    validation, write = compilation.task_specs
+    assert validation.input == {"sql": f"{sql};", "operation": "write"}
+    assert validation.dependencies == ()
+    assert write.input["sql_ref"] == "sql.validation"
+    provenance = validation.metadata["sql_provenance"]
+    assert provenance["provenance"] == "latest_accepted_sql_validation"
+    assert provenance["source_evidence_id"] == "validation-write"
+    assert provenance["source_evidence_kind"] == "sql.validation"
+    assert provenance["source_task_id"] == "validation-task"
+
+
+async def test_write_execute_plan_evidence_id_can_reference_sql_validation():
+    sql = "UPDATE orders SET status = 'approved' WHERE order_id = 101"
+    action = DbPlannerAction(
+        action_id="write",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_WRITE,
+        input={
+            "owner": "phase_two",
+            "sql": sql,
+            "plan_evidence_id": "validation-write",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-write-validation-id",
+        action,
+        sql_validation_evidence=(
+            {
+                "evidence_id": "validation-write",
+                "sql": sql,
+                "operation": "write",
+                "task_id": "validation-task",
+            },
+        ),
+        explicit_mode="write.execute",
+        max_access="write",
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation, write = compilation.task_specs
+    assert validation.input == {"sql": sql, "operation": "write"}
+    assert write.input["sql_ref"] == "sql.validation"
+    provenance = validation.metadata["sql_provenance"]
+    assert provenance["provenance"] == "validation_evidence_id"
+    assert provenance["source_evidence_id"] == "validation-write"
+    assert provenance["source_evidence_kind"] == "sql.validation"
+
+
+async def test_write_execute_ignores_invalid_matching_validation():
+    sql = "UPDATE orders SET status = 'approved' WHERE order_id = 101"
+    action = DbPlannerAction(
+        action_id="write",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_WRITE,
+        input={
+            "owner": "phase_two",
+            "sql": sql,
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-write-invalid-validation",
+        action,
+        sql_validation_evidence=(
+            {
+                "evidence_id": "validation-invalid",
+                "sql": sql,
+                "operation": "write",
+                "valid": False,
+            },
+        ),
+        explicit_mode="write.execute",
+        max_access="write",
+    )
+
+    assert compilation.task_specs == ()
+    assert (
+        compilation.rejected_action_summaries[0]["error"]
+        == "missing_valid_sql_validation"
+    )
+
+
+async def test_plan_evidence_with_context_validates_plan_before_sql():
+    sql = "select count(*) as count from orders"
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two", "plan_evidence_id": "plan-explicit"},
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-plan-validation",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-explicit", "sql": sql, "task_id": "plan-task"},
+        ),
+        planning_context=True,
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.query.plan.validate",
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    plan_validation, validation, read = compilation.task_specs
+    assert plan_validation.input == {
+        "plan_evidence_id": "plan-explicit",
+        "planning_context_evidence_id": "planning-context",
+    }
+    assert validation.input == {"sql": sql, "operation": "query"}
+    assert validation.dependencies[0].evidence_kind == "query.plan.validation"
+    assert validation.dependencies[0].producer_task_id == plan_validation.task_id
+    assert read.input["sql_ref"] == "sql.validation"
+
+
+async def test_explicit_write_execute_mode_overrides_planner_data_query_intent():
+    action = DbPlannerAction(
+        action_id="write",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_WRITE,
+        input={"owner": "phase_two", "sql": "update orders set status = 'approved'"},
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-write-mode-contract",
+        action,
+        explicit_mode="write.execute",
+        max_access="write",
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    assert compilation.compiled_contract_snapshot["operation_type"] == "write.execute"
+    assert compilation.compiled_contract_snapshot["access"] == "write"
+    assert (
+        compilation.compiled_contract_snapshot["metadata"]["planner_intent"][
+            "operation_type"
+        ]
+        == "write.execute"
+    )
+    assert (
+        compilation.compiled_contract_snapshot["metadata"]["planner_raw_intent"][
+            "operation_type"
+        ]
+        == "data.query"
+    )
+
+
+async def test_approval_state_uses_requested_policy_id():
+    runtime, operation = await _runtime_and_operation("phase-two-approval-state")
+    approval = ApprovalRequest(
+        approval_id="approval-1",
+        operation_id=operation.id,
+        reason="Approve write execution.",
+        risk=RiskLevel.HIGH,
+        requested_by_policy_id="approval_required_for_writes",
+        proposed_action={"approval": "human"},
+        status=ApprovalStatus.PENDING,
+    )
+    await runtime.store.save_approval_request(approval)
+
+    state = await DbAgentLoop(runtime, FakePlanner())._approval_state(operation.id)
+
+    assert state["requests"] == [
+        {
+            "approval_id": "approval-1",
+            "status": "pending",
+            "policy_id": "approval_required_for_writes",
+            "task_id": None,
+        }
+    ]
+
+
 async def test_latest_accepted_query_plan_ref_ignores_rejected_plan_evidence():
     action = DbPlannerAction(
         action_id="read",
@@ -430,15 +690,11 @@ async def test_ambiguous_sql_inputs_are_rejected_clearly():
     compilation, _, _ = await _compile_single_action(
         "phase-four-ambiguous-sql-input",
         action,
-        plan_evidence=(
-            {"evidence_id": "plan-explicit", "sql": "select 2 as answer"},
-        ),
+        plan_evidence=({"evidence_id": "plan-explicit", "sql": "select 2 as answer"},),
     )
 
     assert compilation.task_specs == ()
-    assert compilation.rejected_action_summaries[0]["error"] == (
-        "ambiguous_sql_input"
-    )
+    assert compilation.rejected_action_summaries[0]["error"] == ("ambiguous_sql_input")
 
 
 async def test_ambiguous_plan_evidence_id_is_rejected_clearly():
@@ -749,7 +1005,7 @@ async def test_missing_db_llm_configuration_returns_no_planner_actions():
     assert persisted["metadata"]["configuration_required"] is True
 
 
-async def _runtime_and_operation(operation_id):
+async def _runtime_and_operation(operation_id, *, mode=None):
     runtime = DbRuntime(
         config=DbRuntimeConfig(plugins=(PhaseTwoPlugin(),)),
         runtime_id="phase-two-runtime",
@@ -758,24 +1014,46 @@ async def _runtime_and_operation(operation_id):
     operation = await runtime.kernel.create_operation(
         operation_id=operation_id,
         operation_type="db.run",
-        request={"prompt": "phase two", "source_scope": ["orders"]},
+        request={
+            "prompt": "phase two",
+            "source_scope": ["orders"],
+            **({"mode": mode} if mode else {}),
+        },
         required_evidence=frozenset(),
-        metadata={},
+        metadata=({"mode": mode} if mode else {}),
         evaluate_governance=False,
     )
     return runtime, operation
 
 
-async def _compile_single_action(operation_id, action, *, plan_evidence=()):
-    runtime, operation = await _runtime_and_operation(operation_id)
+async def _compile_single_action(
+    operation_id,
+    action,
+    *,
+    plan_evidence=(),
+    sql_validation_evidence=(),
+    planning_context=False,
+    explicit_mode=None,
+    max_access="read",
+):
+    runtime, operation = await _runtime_and_operation(
+        operation_id,
+        mode=explicit_mode,
+    )
     for item in plan_evidence:
         await runtime.store.save_evidence(
             _query_plan_evidence(operation.id, **dict(item))
         )
+    for item in sql_validation_evidence:
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(operation.id, **dict(item))
+        )
+    if planning_context:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
     loop = DbAgentLoop(runtime, FakePlanner())
     state = await loop.build_loop_state(
         operation,
-        safety_frame={"max_access": "read"},
+        safety_frame={"max_access": max_access},
         turn=1,
         remaining_turns=1,
     )
@@ -807,6 +1085,46 @@ def _query_plan_evidence(
         accepted=accepted,
         payload=payload,
         metadata={"payload_fingerprint": f"fp-{evidence_id}"},
+    )
+
+
+def _sql_validation_evidence(
+    operation_id,
+    *,
+    evidence_id,
+    sql,
+    operation="query",
+    valid=True,
+    accepted=True,
+    task_id=None,
+):
+    return Evidence(
+        id=evidence_id,
+        kind="sql.validation",
+        owner="phase_two",
+        operation_id=operation_id,
+        task_id=task_id or f"task-{evidence_id}",
+        accepted=accepted,
+        payload={"valid": valid, "sql": sql, "operation": operation},
+        metadata={"payload_fingerprint": f"fp-{evidence_id}"},
+    )
+
+
+def _planning_context_evidence(operation_id):
+    return Evidence(
+        id="planning-context",
+        kind="planning.context",
+        owner="db_runtime",
+        operation_id=operation_id,
+        accepted=True,
+        payload={
+            "schema": {
+                "database_type": "sqlite",
+                "tables": [{"name": "orders", "columns": [{"name": "status"}]}],
+            },
+            "column_value_hints": [],
+        },
+        metadata={"payload_fingerprint": "fp-planning-context"},
     )
 
 

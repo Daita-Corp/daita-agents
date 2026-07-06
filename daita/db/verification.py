@@ -93,6 +93,10 @@ class DbVerifier:
             DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
         }:
             warnings.extend(_verify_data_query(evidence, tasks, diagnostics))
+        elif intent.kind is DbIntentKind.WRITE_EXECUTE:
+            warnings.extend(_verify_write_execute(evidence, tasks))
+        elif intent.kind is DbIntentKind.WRITE_PROPOSE:
+            warnings.extend(_verify_write_proposal(evidence))
         elif intent.kind in {
             DbIntentKind.SCHEMA_QUERY,
             DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
@@ -205,7 +209,7 @@ def _verify_data_query(
             warnings.append("query_result_sql_missing")
 
     if validation is not None and query_result is not None:
-        if not _validation_precedes_query_result(validation, query_result, tasks):
+        if not _validation_precedes_evidence(validation, query_result, tasks):
             warnings.append("sql_validation_did_not_precede_query_result")
 
     return tuple(warnings)
@@ -232,15 +236,51 @@ def _verify_memory_update(evidence: tuple[Evidence, ...]) -> tuple[str, ...]:
     return ()
 
 
-def _validation_precedes_query_result(
-    validation: Evidence, query_result: Evidence, tasks: tuple[Task, ...]
+def _verify_write_proposal(evidence: tuple[Evidence, ...]) -> tuple[str, ...]:
+    validation = next(
+        (item for item in evidence if item.kind == "sql.validation" and item.accepted),
+        None,
+    )
+    if validation is None:
+        return ("sql_validation_missing_for_write_proposal",)
+    if validation.payload.get("valid") is not True:
+        return ("sql_validation_not_valid",)
+    return ()
+
+
+def _verify_write_execute(
+    evidence: tuple[Evidence, ...],
+    tasks: tuple[Task, ...],
+) -> tuple[str, ...]:
+    warnings = list(_verify_write_proposal(evidence))
+    validation = next(
+        (item for item in evidence if item.kind == "sql.validation" and item.accepted),
+        None,
+    )
+    write_execution = next(
+        (item for item in evidence if item.kind == "write.execution" and item.accepted),
+        None,
+    )
+    if write_execution is None:
+        warnings.append("write_execution_missing")
+    elif validation is not None and not _validation_precedes_evidence(
+        validation,
+        write_execution,
+        tasks,
+    ):
+        warnings.append("sql_validation_did_not_precede_write_execution")
+    return tuple(warnings)
+
+
+def _validation_precedes_evidence(
+    validation: Evidence, evidence: Evidence, tasks: tuple[Task, ...]
 ) -> bool:
     order = {task.id: index for index, task in enumerate(tasks)}
     validation_index = order.get(str(validation.task_id))
-    query_index = order.get(str(query_result.task_id))
-    if validation_index is None or query_index is None:
+    evidence_index = order.get(str(evidence.task_id))
+    if validation_index is None or evidence_index is None:
         return False
-    return validation_index < query_index
+    return validation_index < evidence_index
 
 
 def _evidence_refs(evidence: tuple[Evidence, ...]) -> tuple[dict[str, str | None], ...]:

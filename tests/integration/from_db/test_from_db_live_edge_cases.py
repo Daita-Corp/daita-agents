@@ -8,6 +8,7 @@ Run:
 
 from __future__ import annotations
 
+from collections import Counter
 import re
 import sys
 
@@ -15,12 +16,14 @@ import pytest
 
 from daita.runtime import OperationStatus
 from tests.integration.from_db.live_production_helpers import (
+    all_sql_strings,
     assert_loop_evidence,
     assert_no_unexpected_write_execution,
     assert_sql_is_read_only,
     assert_successful_prompt_run,
     assert_synthesized_answer,
     create_live_sqlite_from_db_agent,
+    diagnostic_text,
     evidence_kinds,
     latest_evidence,
     query_rows,
@@ -99,7 +102,8 @@ async def test_live_zero_row_result_is_truthful(tmp_path):
 
     try:
         result = await agent.run_detailed(
-            "Return order_id and status for orders whose status is canceled."
+            "Return order_id and status for orders whose status is pending "
+            "and total is greater than 1000."
         )
         snapshot = await agent.runtime.inspect_operation(result.operation_id)
 
@@ -116,6 +120,7 @@ async def test_live_zero_row_result_is_truthful(tmp_path):
         assert_sql_is_read_only(sql)
         assert re.search(r"(?i)\borders\b", sql), sql
         assert re.search(r"(?i)\bstatus\b", sql), sql
+        assert re.search(r"(?i)\btotal\b", sql), sql
 
         answer = (result.answer or "").lower()
         assert any(
@@ -126,6 +131,7 @@ async def test_live_zero_row_result_is_truthful(tmp_path):
                 "no canceled",
                 "no cancelled",
                 "no orders",
+                "no pending",
                 "no data",
                 "0 rows",
                 "zero rows",
@@ -133,6 +139,103 @@ async def test_live_zero_row_result_is_truthful(tmp_path):
         ), result.answer
 
         assert_no_unexpected_write_execution(result)
+        assert_no_unexpected_write_execution(snapshot)
+    except AssertionError:
+        artifact_dir = write_failure_artifacts(
+            tmp_path / "from_db_failure_artifacts",
+            result=result,
+            snapshot=snapshot,
+        )
+        print(f"[from_db artifacts] {artifact_dir}", file=sys.stderr)
+        raise
+    finally:
+        await agent.stop()
+
+
+async def test_live_sql_repair_loop_recovers_from_bad_literal_or_column(tmp_path):
+    db_path = await seed_rich_sqlite_schema(tmp_path / "rich.sqlite")
+    agent = await create_live_sqlite_from_db_agent(
+        db_path,
+        runtime_path=tmp_path / "runtime.sqlite",
+        name="LiveFromDbRepairBadLiteral",
+    )
+    result = None
+    snapshot = None
+
+    try:
+        warmup = await agent.run_detailed(
+            "Search catalog column values for support_tickets.status and "
+            "support_tickets.severity."
+        )
+        warmup_snapshot = await agent.runtime.inspect_operation(warmup.operation_id)
+        assert warmup_snapshot is not None
+        assert "schema.column_value_search_result" in evidence_kinds(warmup_snapshot)
+        result = await agent.run_detailed(
+            "Using observed catalog column values, answer: how many support tickets "
+            "have status='unresolved' and severity='urgent'?"
+        )
+        snapshot = await agent.runtime.inspect_operation(result.operation_id)
+
+        assert snapshot is not None
+        assert result.status in {
+            OperationStatus.SUCCEEDED,
+            OperationStatus.BLOCKED,
+            OperationStatus.FAILED,
+        }
+
+        capabilities = task_capabilities(snapshot)
+        assert capabilities.count("db.query.repair") <= 2
+
+        sql_values = all_sql_strings(snapshot)
+        for sql in sql_values:
+            assert_sql_is_read_only(sql)
+
+        failing_sql = [
+            item.payload.get("sql")
+            for item in snapshot.evidence
+            if item.kind in {"sql.validation", "query.plan.validation"}
+            and item.accepted is False
+            and isinstance(item.payload.get("sql"), str)
+        ]
+        repeated = [
+            sql for sql, count in Counter(failing_sql).items() if sql and count > 2
+        ]
+        assert not repeated, f"Repeated identical failing SQL: {repeated}"
+
+        repair_attempts = [
+            item
+            for item in snapshot.evidence
+            if item.kind in {"query.plan.repair", "query.plan.proposal"}
+            and item.payload.get("repair_attempt") is not None
+        ]
+        if result.status is OperationStatus.SUCCEEDED:
+            assert_successful_prompt_run(result, snapshot=snapshot)
+            assert_loop_evidence(result)
+            assert_synthesized_answer(result)
+
+            sql = sql_from_result(result) or sql_from_result(snapshot)
+            assert re.search(r"(?i)\bsupport_tickets\b", sql), sql
+            assert not re.search(r"(?i)['\"]unresolved['\"]", sql), sql
+            assert not re.search(r"(?i)['\"]urgent['\"]", sql), sql
+            assert re.search(r"(?i)['\"](open|closed)['\"]", sql), sql
+            assert re.search(r"(?i)['\"](high|low)['\"]", sql), sql
+            assert (
+                repair_attempts
+                or "schema.column_value_search_result" in evidence_kinds(snapshot)
+            )
+        else:
+            text = diagnostic_text(snapshot).lower()
+            assert any(
+                token in text
+                for token in (
+                    "unobserved_filter_literal",
+                    "repair",
+                    "validation",
+                    "unresolved",
+                    "urgent",
+                )
+            ), text
+
         assert_no_unexpected_write_execution(snapshot)
     except AssertionError:
         artifact_dir = write_failure_artifacts(

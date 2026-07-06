@@ -245,6 +245,10 @@ async def test_final_answer_is_synthesized_from_accepted_evidence():
         task for task in snapshot.tasks if task.capability_id == "db.answer.synthesize"
     )
     assert result.answer == synthesis.payload["answer"]
+    assert synthesis.payload["answer_facts"]["primary_scalar"]["value"] == 2
+    assert (
+        synthesis.payload["answer_facts"]["primary_scalar"]["aggregate_kind"] == "count"
+    )
     assert synthesis.accepted
     assert verification.accepted
     assert synthesis_task.status is TaskStatus.SUCCEEDED

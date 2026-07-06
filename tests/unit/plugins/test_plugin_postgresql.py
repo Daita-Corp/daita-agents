@@ -136,6 +136,18 @@ class TestSqlGuardrails:
         with pytest.raises(ValidationError, match="blocked column"):
             plugin._prepare_tool_query_sql("SELECT email FROM users")
 
+    def test_rejects_qualified_blocked_column(self):
+        plugin = make_plugin(blocked_columns=["customers.email"])
+        with pytest.raises(ValidationError, match="customers.email"):
+            plugin._prepare_tool_query_sql(
+                "SELECT c.email FROM customers c JOIN orders o ON o.customer_id = c.id"
+            )
+
+    def test_rejects_unqualified_column_matching_single_qualified_table(self):
+        plugin = make_plugin(blocked_columns=["customers.email"])
+        with pytest.raises(ValidationError, match="customers.email"):
+            plugin._prepare_tool_query_sql("SELECT email FROM customers")
+
     async def test_tool_query_returns_sql_and_uses_configured_caps(self):
         plugin = make_plugin(query_default_limit=7, query_max_rows=1)
         seen = {}

@@ -10,11 +10,17 @@ from daita.db import (
     DbSynthesizer,
     DbVerificationResult,
 )
-from daita.db.synthesis import _apply_schema_db_memory_annotation
+from daita.db.synthesis import (
+    _apply_schema_db_memory_annotation,
+    build_synthesis_context,
+    deterministic_synthesis_payload,
+)
 from daita.runtime import AccessMode, Evidence
 
 
-def _verification(passed: bool = True) -> DbVerificationResult:
+def _verification(
+    passed: bool = True, evidence_id: str | None = None
+) -> DbVerificationResult:
     return DbVerificationResult(
         passed=passed,
         missing_evidence=(),
@@ -22,7 +28,7 @@ def _verification(passed: bool = True) -> DbVerificationResult:
         diagnostics={},
         evidence_refs=(
             {
-                "id": None,
+                "id": evidence_id,
                 "kind": "query.result",
                 "owner": None,
                 "task_id": "task-2",
@@ -31,17 +37,45 @@ def _verification(passed: bool = True) -> DbVerificationResult:
     )
 
 
+def _data_intent() -> DbIntent:
+    return DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ)
+
+
+def _data_contract() -> DbOperationContract:
+    return DbOperationContract(
+        operation_type="data.query",
+        required_evidence=("sql.validation", "query.result"),
+    )
+
+
+def _query_result(
+    rows,
+    *,
+    sql: str = "SELECT COUNT(*) AS count FROM orders",
+    total_rows: int | None = None,
+    truncated: bool = False,
+) -> Evidence:
+    payload = {"rows": rows, "sql": sql, "truncated": truncated}
+    if total_rows is not None:
+        payload["total_rows"] = total_rows
+    return Evidence(
+        id="query-result-1",
+        kind="query.result",
+        accepted=True,
+        task_id="task-2",
+        payload=payload,
+    )
+
+
 def test_synthesizer_answers_count_from_query_result_evidence_only():
     result = DbSynthesizer().synthesize(
         request=DbRequest("How many orders are there?"),
-        intent=DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
-        contract=DbOperationContract(
-            operation_type="data.query",
-            required_evidence=("sql.validation", "query.result"),
-        ),
+        intent=_data_intent(),
+        contract=_data_contract(),
         evidence=(
             Evidence(
                 kind="query.result",
+                accepted=True,
                 task_id="task-2",
                 payload={"rows": [{"count": 2}], "sql": "SELECT COUNT(*)"},
             ),
@@ -53,6 +87,58 @@ def test_synthesizer_answers_count_from_query_result_evidence_only():
     assert result.evidence_refs[0]["kind"] == "query.result"
 
 
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    (
+        ("count", "The count is 4."),
+        ("customer_count", "customer_count is 4."),
+        ("total_orders", "total_orders is 4."),
+        ("completed_orders", "completed_orders is 4."),
+    ),
+)
+def test_synthesizer_answers_single_column_count_aliases(label, expected):
+    result = DbSynthesizer().synthesize(
+        request=DbRequest("How many customers are there?"),
+        intent=_data_intent(),
+        contract=_data_contract(),
+        evidence=(
+            _query_result(
+                [{label: 4}],
+                sql=f"SELECT COUNT(*) AS {label} FROM customers",
+            ),
+        ),
+        verification=_verification(evidence_id="query-result-1"),
+    )
+
+    assert result.answer == expected
+    assert result.diagnostics["answer_facts"]["primary_scalar"]["value"] == 4
+    assert (
+        result.diagnostics["answer_facts"]["primary_scalar"]["aggregate_kind"]
+        == "count"
+    )
+
+
+def test_synthesizer_preserves_sensitive_named_count_alias_value():
+    result = DbSynthesizer().synthesize(
+        request=DbRequest("How many customer emails are there?"),
+        intent=_data_intent(),
+        contract=_data_contract(),
+        evidence=(
+            _query_result(
+                [{"email_count": 4}],
+                sql="SELECT COUNT(email) AS email_count FROM customers",
+            ),
+        ),
+        verification=_verification(evidence_id="query-result-1"),
+    )
+
+    primary = result.diagnostics["answer_facts"]["primary_scalar"]
+    assert result.answer == "email_count is 4."
+    assert primary["value"] == 4
+    assert primary["aggregate_kind"] == "count"
+    assert primary["redacted"] is False
+
+
 def test_synthesizer_refuses_to_answer_before_verification_passes():
     with pytest.raises(ValueError, match="verification passes"):
         DbSynthesizer().synthesize(
@@ -62,6 +148,101 @@ def test_synthesizer_refuses_to_answer_before_verification_passes():
             evidence=(),
             verification=_verification(passed=False),
         )
+
+
+def test_synthesis_context_derives_answer_facts_for_result_shapes():
+    request = DbRequest("Summarize the query result.")
+    record_context = build_synthesis_context(
+        request=request,
+        intent=_data_intent(),
+        contract=_data_contract(),
+        evidence=(
+            _query_result(
+                [
+                    {
+                        "refunded_orders": 1,
+                        "total_orders": 5,
+                        "refund_rate_percent": 20,
+                    }
+                ],
+                sql=(
+                    "SELECT COUNT(*) AS refunded_orders, "
+                    "COUNT(*) AS total_orders, "
+                    "20 AS refund_rate_percent FROM orders"
+                ),
+            ),
+        ),
+    )
+    record_facts = record_context.metadata["answer_facts"]
+    assert record_facts["result_shape"] == "record"
+    assert [item["value"] for item in record_facts["scalars"]] == [1, 5, 20]
+    assert [item["aggregate_kind"] for item in record_facts["scalars"][:2]] == [
+        "count",
+        "count",
+    ]
+
+    table_context = build_synthesis_context(
+        request=request,
+        intent=_data_intent(),
+        contract=_data_contract(),
+        evidence=(_query_result([{"id": 1}, {"id": 2}], total_rows=2),),
+    )
+    table_facts = table_context.metadata["answer_facts"]
+    assert table_facts["result_shape"] == "table"
+    assert table_facts["row_count"] == 2
+    assert table_facts["scalars"] == []
+
+    empty_context = build_synthesis_context(
+        request=request,
+        intent=_data_intent(),
+        contract=_data_contract(),
+        evidence=(_query_result([], total_rows=0),),
+    )
+    assert empty_context.metadata["answer_facts"]["result_shape"] == "empty"
+
+    truncated_context = build_synthesis_context(
+        request=request,
+        intent=_data_intent(),
+        contract=_data_contract(),
+        evidence=(
+            _query_result([{"id": 1}, {"id": 2}], total_rows=10, truncated=True),
+        ),
+    )
+    truncated_facts = truncated_context.metadata["answer_facts"]
+    assert truncated_facts["result_shape"] == "table"
+    assert truncated_facts["row_count"] == 10
+    assert truncated_facts["truncated"] is True
+
+
+def test_deterministic_fallback_uses_answer_facts_when_context_is_truncated():
+    query_result = _query_result(
+        [{"customer_count": 4}],
+        sql="SELECT COUNT(*) AS customer_count FROM customers",
+    )
+    context = build_synthesis_context(
+        request=DbRequest("How many customers are there?"),
+        intent=_data_intent(),
+        contract=_data_contract(),
+        evidence=(query_result,),
+        char_budget=1,
+    )
+
+    payload = deterministic_synthesis_payload(
+        request=DbRequest("How many customers are there?"),
+        intent=_data_intent(),
+        contract=_data_contract(),
+        evidence=(query_result,),
+        verification=_verification(evidence_id="query-result-1"),
+        context_metadata=context.metadata,
+        fallback_reason="test",
+    )
+
+    assert context.metadata["truncation"]["context_chars_truncated"] is True
+    assert payload.answer == "customer_count is 4."
+    assert payload.sufficiency == "answered"
+    assert "synthesis_context_truncated" not in payload.limitations
+    assert "synthesis_context_truncated" not in payload.warnings
+    assert payload.answer_facts["primary_scalar"]["value"] == 4
 
 
 def test_schema_synthesis_uses_database_scope_for_database_wide_prompts():

@@ -229,7 +229,17 @@ class BaseDatabasePlugin(ConnectorPlugin):
                     field="sql",
                 )
 
-        referenced_columns = analysis.referenced_column_names
+        referenced_columns = set(analysis.referenced_column_names)
+        non_cte_tables = [table for table in analysis.tables if not table.is_cte]
+        for column in analysis.columns:
+            qualifier = column.qualifier_key
+            if qualifier:
+                referenced_columns.add(f"{qualifier}.{column.key}")
+                referenced_columns.add(f"{qualifier.split('.')[-1]}.{column.key}")
+            elif len(non_cte_tables) == 1:
+                table = non_cte_tables[0]
+                referenced_columns.add(f"{table.key}.{column.key}")
+                referenced_columns.add(f"{table.short_key}.{column.key}")
         blocked_columns = sorted(
             col
             for col in getattr(self, "blocked_columns", set())

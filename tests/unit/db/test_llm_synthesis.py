@@ -1,12 +1,15 @@
 import json
 from uuid import uuid4
 
+import pytest
+
 from daita.agents.agent import Agent
-from daita.db import DbRequest, DbRuntime
+from daita.db import DbIntent, DbIntentKind, DbOperationContract, DbRequest, DbRuntime
 from daita.db.llm_service import DbLLMResponse
+from daita.db.synthesis import build_synthesis_context, validate_synthesis_payload
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import Evidence, OperationStatus, TaskStatus
+from daita.runtime import AccessMode, Evidence, OperationStatus, TaskStatus
 
 
 class FakeSynthesisLLMService:
@@ -82,6 +85,82 @@ def _citations(context, *kinds):
     return citations
 
 
+def _data_intent():
+    return DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ)
+
+
+def _data_contract():
+    return DbOperationContract(
+        operation_type="data.query",
+        required_evidence=("sql.validation", "query.result"),
+    )
+
+
+def _query_result(rows, *, sql="SELECT COUNT(*) AS customer_count FROM customers"):
+    return Evidence(
+        id="query-result-1",
+        kind="query.result",
+        accepted=True,
+        task_id="task-2",
+        payload={"rows": rows, "sql": sql, "truncated": False},
+    )
+
+
+def _verification_result():
+    return Evidence(
+        id="verification-1",
+        kind="verification.result",
+        accepted=True,
+        task_id="task-3",
+        payload={
+            "passed": True,
+            "warnings": [],
+            "evidence_details": [
+                {
+                    "id": "query-result-1",
+                    "kind": "query.result",
+                    "owner": None,
+                    "task_id": "task-2",
+                }
+            ],
+        },
+    )
+
+
+def _data_synthesis_context(*, char_budget=16000):
+    evidence = (
+        _query_result([{"customer_count": 4}]),
+        _verification_result(),
+    )
+    context = build_synthesis_context(
+        request=DbRequest("How many customers are there?"),
+        intent=_data_intent(),
+        contract=_data_contract(),
+        evidence=evidence,
+        char_budget=char_budget,
+    )
+    return context, evidence
+
+
+def _parsed_synthesis_response(context, answer, *, sufficiency="answered"):
+    return {
+        "answer": answer,
+        "reasoning_summary": "Used the verified query result.",
+        "cited_evidence_refs": _citations(
+            context, "query.result", "verification.result"
+        ),
+        "assumptions": [],
+        "limitations": [],
+        "warnings": [],
+        "follow_up_questions": [],
+        "sufficiency": sufficiency,
+        "confidence": 0.91,
+        "truncation": context["truncation"],
+        "grounding": {"all_claims_from_evidence": True},
+        "answer_facts": context["answer_facts"],
+    }
+
+
 def _valid_response(answer):
     def responder(messages):
         context = _context_from_messages(messages)
@@ -147,3 +226,41 @@ async def test_from_db_model_registers_answer_synthesis_capability(tmp_path):
     assert "db_runtime:db.answer.synthesize" in inspection.capability_ids
     assert "db_runtime:answer.synthesis" in inspection.evidence_schema_kinds
     assert "db_runtime:verification.result" in inspection.evidence_schema_kinds
+
+
+def test_llm_synthesis_validation_rejects_answer_missing_scalar_fact():
+    context, evidence = _data_synthesis_context()
+    parsed = _parsed_synthesis_response(context.payload, "Returned 1 row.")
+
+    with pytest.raises(
+        ValueError,
+        match="synthesis_missing_answer_fact:customer_count",
+    ):
+        validate_synthesis_payload(
+            parsed,
+            dependency_evidence=evidence,
+            context_metadata=context.metadata,
+            llm_diagnostics={"provider": "fake", "model": "synthesis-test"},
+        )
+
+
+def test_llm_synthesis_validation_accepts_scalar_with_context_only_truncation():
+    context, evidence = _data_synthesis_context(char_budget=1)
+    parsed = _parsed_synthesis_response(
+        context.payload,
+        "customer_count is 4.",
+        sufficiency="partial",
+    )
+
+    payload = validate_synthesis_payload(
+        parsed,
+        dependency_evidence=evidence,
+        context_metadata=context.metadata,
+        llm_diagnostics={"provider": "fake", "model": "synthesis-test"},
+    )
+
+    assert context.metadata["truncation"]["context_chars_truncated"] is True
+    assert payload.sufficiency == "answered"
+    assert payload.answer_facts["primary_scalar"]["value"] == 4
+    assert "synthesis_context_truncated" not in payload.limitations
+    assert "synthesis_context_truncated" not in payload.warnings

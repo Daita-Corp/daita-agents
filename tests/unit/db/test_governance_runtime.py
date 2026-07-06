@@ -17,6 +17,7 @@ from daita.runtime import (
     PolicyDecision,
     PolicyEffect,
     RiskLevel,
+    RuntimeKernelGovernanceBlocked,
     RuntimeEventType,
     SQLiteRuntimeStore,
     Task,
@@ -334,6 +335,50 @@ async def test_read_prompt_destructive_terms_do_not_trigger_destructive_policy()
     assert evidence_event.executor_id == "read_probe.sql.execute_read"
     assert evidence_event.plugin_id == "read_probe"
     assert evidence_event.evidence_id == evidence[0].id
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ("write.propose", "write", "write_execute"),
+)
+async def test_explicit_write_mode_destructive_prompt_records_policy_denial(mode):
+    runtime = DbRuntime()
+    await runtime.setup()
+    operation = await runtime.kernel.create_operation(
+        operation_id=f"write-delete-proposal-{mode.replace('.', '-').replace('_', '-')}",
+        operation_type="db.run",
+        request={
+            "prompt": "Delete pending orders.",
+            "mode": mode,
+            "source_scope": ["orders"],
+            "metadata": {},
+        },
+        required_evidence=frozenset(),
+        metadata={
+            "access": "none",
+            "mode": mode,
+            "source_scope": ["orders"],
+            "safety_frame": {
+                "explicit_mode": mode,
+                "max_access": "write",
+                "source_scope": ["orders"],
+            },
+        },
+        evaluate_governance=False,
+    )
+
+    with pytest.raises(RuntimeKernelGovernanceBlocked):
+        await runtime.kernel.evaluate_operation_governance(operation.id)
+    snapshot = await runtime.inspect_operation(operation.id)
+
+    assert snapshot.operation.status is OperationStatus.BLOCKED
+    assert [decision.policy_id for decision in snapshot.policy_decisions] == [
+        "deny_destructive_operations"
+    ]
+    decision = snapshot.policy_decisions[0]
+    assert decision.metadata["decision_source"] == "narrow_prompt_fallback"
+    assert decision.metadata["access"] == "write"
+    assert "delete" in decision.metadata["matched_terms"]
 
 
 async def test_direct_capability_execution_requires_governance_approval():

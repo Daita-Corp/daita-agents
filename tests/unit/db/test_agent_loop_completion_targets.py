@@ -382,6 +382,118 @@ def test_finalization_policy_accepts_schema_query_without_query_result():
     assert check.query_result_present is False
 
 
+def test_finalization_policy_accepts_write_execution_without_query_result():
+    tasks = (
+        Task(
+            id="validate",
+            operation_id="finalization-policy-target",
+            capability_id="db.sql.validate",
+            executor_id=f"{OWNER}.sql.validate",
+            status=TaskStatus.SUCCEEDED,
+        ),
+        Task(
+            id="write",
+            operation_id="finalization-policy-target",
+            capability_id="db.sql.execute_write",
+            executor_id=f"{OWNER}.sql.execute_write",
+            status=TaskStatus.SUCCEEDED,
+        ),
+    )
+    check = _finalization_check(
+        intent_kind=DbIntentKind.WRITE_EXECUTE,
+        operation_type="write.execute",
+        required_evidence=("sql.validation", "write.execution"),
+        tasks=tasks,
+        evidence=(
+            Evidence(
+                kind="sql.validation",
+                owner=OWNER,
+                task_id="validate",
+                accepted=True,
+                payload={
+                    "valid": True,
+                    "sql": "update orders set status = 'approved'",
+                    "operation": "write",
+                },
+            ),
+            Evidence(
+                kind="write.execution",
+                owner=OWNER,
+                task_id="write",
+                accepted=True,
+                payload={
+                    "affected_rows": 1,
+                    "sql": "update orders set status = 'approved'",
+                },
+            ),
+        ),
+    )
+
+    assert check.finalizable is True
+    assert check.query_result_required is False
+    assert check.query_result_present is False
+
+
+def test_finalization_policy_blocks_write_execute_without_write_execution():
+    check = _finalization_check(
+        intent_kind=DbIntentKind.WRITE_EXECUTE,
+        operation_type="write.execute",
+        required_evidence=("sql.validation",),
+        evidence=(
+            Evidence(
+                kind="sql.validation",
+                owner=OWNER,
+                task_id="validate",
+                accepted=True,
+                payload={
+                    "valid": True,
+                    "sql": "update orders set status = 'approved'",
+                    "operation": "write",
+                },
+            ),
+        ),
+    )
+
+    assert check.finalizable is False
+    assert check.query_result_required is False
+    assert "write_execution_missing" in check.verification.warnings
+
+
+def test_finalization_policy_rejects_unaccepted_write_validation():
+    check = _finalization_check(
+        intent_kind=DbIntentKind.WRITE_EXECUTE,
+        operation_type="write.execute",
+        required_evidence=("sql.validation", "write.execution"),
+        evidence=(
+            Evidence(
+                kind="sql.validation",
+                owner=OWNER,
+                task_id="validate",
+                accepted=False,
+                payload={
+                    "valid": True,
+                    "sql": "update orders set status = 'approved'",
+                    "operation": "write",
+                },
+            ),
+            Evidence(
+                kind="write.execution",
+                owner=OWNER,
+                task_id="write",
+                accepted=True,
+                payload={
+                    "affected_rows": 1,
+                    "sql": "update orders set status = 'approved'",
+                },
+            ),
+        ),
+    )
+
+    assert check.finalizable is False
+    assert "sql.validation" in check.verification.missing_evidence
+    assert "sql_validation_missing_for_write_proposal" in check.verification.warnings
+
+
 def test_finalization_policy_ignores_answer_synthesis_as_supporting_evidence():
     check = _finalization_check(
         intent_kind=DbIntentKind.SCHEMA_QUERY,
@@ -608,6 +720,52 @@ async def test_column_value_search_contract_declares_profile_prerequisites():
         for item in prerequisites
         if item["reason"] == "catalog_column_value_grounding"
     } == prerequisite_ids
+
+
+async def test_column_value_search_contract_infers_scope_from_simple_sql_input():
+    runtime, _ = await _runtime_with_planner(ScriptedPlanner())
+    operation = await _bootstrap_run_operation(
+        runtime,
+        "column-value-sql-scope-target",
+    )
+    loop = DbAgentLoop(runtime, ScriptedPlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "read"},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query.catalog_assisted"},
+        actions=(
+            DbPlannerAction(
+                action_id="search_values",
+                kind=DbPlannerActionKind.SEARCH_COLUMN_VALUES,
+                input={
+                    "owner": OWNER,
+                    "sql": (
+                        "SELECT DISTINCT status FROM support_tickets "
+                        "WHERE status IS NOT NULL"
+                    ),
+                },
+            ),
+        ),
+    )
+
+    compilation = loop.compile_actions(decision, state)
+    prerequisites = compilation.compiled_contract_snapshot["metadata"][
+        "runtime_prerequisites"
+    ]
+
+    assert compilation.rejected_action_summaries == ()
+    profile = next(
+        item
+        for item in prerequisites
+        if item["capability_id"] == "db.column_values.profile"
+    )
+    assert profile["tables"] == ["support_tickets"]
+    assert profile["columns"] == ["status"]
 
 
 async def test_resume_reenters_agent_loop_after_first_turn_evidence():
@@ -843,6 +1001,43 @@ async def test_agent_loop_finishes_without_planner_when_operation_is_finalizable
     assert result.status == "finished"
     assert result.diagnostics["pre_planner_finalization"] is True
     assert no_planner.states == []
+
+
+async def test_agent_loop_compiles_finish_decision_when_actions_present():
+    finish_with_read = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.FINISH,
+        intent={"operation_type": "data.query"},
+        actions=(
+            DbPlannerAction(
+                action_id="read_orders",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": OWNER,
+                    "sql": "select status, count(*) as count from orders",
+                },
+            ),
+        ),
+        stop_conditions=("query.result evidence exists",),
+    )
+    planner = ScriptedPlanner(_inspect_schema_decision(), finish_with_read)
+    runtime, plugin = await _runtime_with_planner(planner)
+    operation = await _bootstrap_run_operation(runtime, "finish-with-actions-target")
+
+    result = await DbAgentLoop(runtime, planner).run(
+        operation,
+        safety_frame={"max_access": "read"},
+        max_turns=2,
+    )
+    tasks = await runtime.store.list_tasks(operation.id)
+    evidence = await runtime.store.list_evidence(operation.id)
+
+    assert result.status == "finished"
+    assert len(planner.states) == 2
+    assert [call["capability_id"] for call in plugin.read.calls] == [
+        "db.sql.execute_read"
+    ]
+    assert "db.sql.validate" in {task.capability_id for task in tasks}
+    assert "query.result" in {item.kind for item in evidence}
 
 
 async def test_planner_dag_dependencies_become_durable_task_dependencies():

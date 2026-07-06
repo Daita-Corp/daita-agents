@@ -183,7 +183,7 @@ INSERT INTO support_tickets (
     (2000, 1, 'open', 'high', 10),
     (2001, 2, 'closed', 'low', 11),
     (2002, 3, 'open', 'low', 12),
-    (2003, 4, 'closed', 'critical', 10);
+    (2003, 4, 'closed', 'high', 10);
 
 INSERT INTO operations (
     operation_id, organization_id, api_key_id, status, timestamp
@@ -361,7 +361,7 @@ async def seed_rich_sqlite_schema(db_path: Path) -> Path:
             (2000, 1, 'open', 'high', 10),
             (2001, 2, 'closed', 'low', 11),
             (2002, 3, 'open', 'low', 12),
-            (2003, 4, 'closed', 'critical', 10);
+            (2003, 4, 'closed', 'high', 10);
 
         INSERT INTO operations (
             operation_id, organization_id, api_key_id, status, timestamp
@@ -425,6 +425,10 @@ async def create_live_sqlite_from_db_agent(
     *,
     runtime_path: Path,
     name: str = "LiveFromDbProductionContract",
+    read_only: bool | None = None,
+    allowed_tables: tuple[str, ...] | list[str] | None = None,
+    blocked_tables: tuple[str, ...] | list[str] | None = None,
+    blocked_columns: tuple[str, ...] | list[str] | None = None,
 ):
     """Build a live OpenAI ``Agent.from_db`` over SQLite with persisted state."""
     return await Agent.from_db(
@@ -432,6 +436,10 @@ async def create_live_sqlite_from_db_agent(
         name=name,
         cache_ttl=0,
         runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
+        read_only=read_only,
+        allowed_tables=allowed_tables,
+        blocked_tables=blocked_tables,
+        blocked_columns=blocked_columns,
         **require_live_openai_kwargs(),
     )
 
@@ -441,6 +449,10 @@ async def create_live_postgres_from_db_agent(
     *,
     runtime_path: Path,
     name: str = "LiveFromDbPostgresProductionContract",
+    read_only: bool | None = None,
+    allowed_tables: tuple[str, ...] | list[str] | None = None,
+    blocked_tables: tuple[str, ...] | list[str] | None = None,
+    blocked_columns: tuple[str, ...] | list[str] | None = None,
 ):
     """Build a live OpenAI ``Agent.from_db`` over Postgres with persisted state."""
     return await Agent.from_db(
@@ -448,6 +460,10 @@ async def create_live_postgres_from_db_agent(
         name=name,
         cache_ttl=0,
         runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
+        read_only=read_only,
+        allowed_tables=allowed_tables,
+        blocked_tables=blocked_tables,
+        blocked_columns=blocked_columns,
         **require_live_openai_kwargs(),
     )
 
@@ -543,6 +559,80 @@ def sql_from_result(result_or_snapshot: Any) -> str:
     return ""
 
 
+def all_sql_strings(result_or_snapshot: Any) -> list[str]:
+    """Extract all planned, validated, and executed SQL strings."""
+    values: list[str] = []
+
+    diagnostics = getattr(result_or_snapshot, "diagnostics", {}) or {}
+    values.extend(_all_sql_values(diagnostics))
+
+    for evidence in _evidence_items(result_or_snapshot):
+        values.extend(_all_sql_values(evidence.payload))
+
+    tasks = getattr(result_or_snapshot, "tasks", None)
+    if tasks is not None:
+        for task in tasks:
+            values.extend(_all_sql_values(getattr(task, "input", None)))
+
+    if isinstance(diagnostics, dict):
+        execution = diagnostics.get("execution")
+        task_payloads = (
+            execution.get("tasks", []) if isinstance(execution, dict) else []
+        )
+        for task in task_payloads:
+            if isinstance(task, dict):
+                values.extend(_all_sql_values(task.get("input")))
+
+    return _ordered_unique_nonempty(values)
+
+
+def diagnostic_text(result_or_snapshot: Any) -> str:
+    """Return searchable JSON text for diagnostics, evidence, tasks, and policy."""
+    payload: dict[str, Any] = {
+        "diagnostics": getattr(result_or_snapshot, "diagnostics", {}) or {},
+        "evidence": [
+            (
+                item.to_dict()
+                if hasattr(item, "to_dict")
+                else getattr(item, "__dict__", {})
+            )
+            for item in _evidence_items(result_or_snapshot)
+        ],
+        "task_statuses": _task_statuses(result_or_snapshot),
+    }
+    policy_decisions = getattr(result_or_snapshot, "policy_decisions", None)
+    if policy_decisions is not None:
+        payload["policy_decisions"] = [
+            (
+                item.to_dict()
+                if hasattr(item, "to_dict")
+                else getattr(item, "__dict__", {})
+            )
+            for item in policy_decisions
+        ]
+    events = getattr(result_or_snapshot, "events", None)
+    if events is not None:
+        payload["events"] = [
+            (
+                item.to_dict()
+                if hasattr(item, "to_dict")
+                else getattr(item, "__dict__", {})
+            )
+            for item in events
+        ]
+    governance_audits = getattr(result_or_snapshot, "governance_audit_records", None)
+    if governance_audits is not None:
+        payload["governance_audit_records"] = [
+            (
+                item.to_dict()
+                if hasattr(item, "to_dict")
+                else getattr(item, "__dict__", {})
+            )
+            for item in governance_audits
+        ]
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
 def assert_successful_prompt_run(result: Any, *, snapshot: Any | None = None) -> None:
     """Assert the normal successful prompt-run contract."""
     assert result.status is OperationStatus.SUCCEEDED
@@ -571,6 +661,40 @@ def assert_synthesized_answer(result_or_snapshot: Any) -> None:
     assert isinstance(answer, str) and answer.strip()
     if hasattr(result_or_snapshot, "answer"):
         assert result_or_snapshot.answer == answer
+
+
+def assert_scalar_answer_fact(
+    result_or_snapshot: Any,
+    *,
+    value: Any,
+    label: str | None = None,
+    aggregate_kind: str | None = None,
+) -> None:
+    """Assert synthesized answer evidence preserves a primary scalar fact."""
+    synthesis = latest_evidence(result_or_snapshot, "answer.synthesis")
+    assert synthesis is not None
+    facts = synthesis.payload.get("answer_facts") or {}
+    assert isinstance(facts, dict)
+    primary = facts.get("primary_scalar") or {}
+    assert isinstance(primary, dict)
+    assert _same_scalar_value(primary.get("value"), value)
+    if label is not None:
+        assert primary.get("label") == label
+    if aggregate_kind is not None:
+        assert primary.get("aggregate_kind") == aggregate_kind
+    answer = str(synthesis.payload.get("answer") or "")
+    assert re.search(rf"\b{re.escape(str(value))}\b", answer), answer
+
+
+def _same_scalar_value(actual: Any, expected: Any) -> bool:
+    if actual == expected:
+        return True
+    try:
+        return float(str(actual).replace(",", "")) == float(
+            str(expected).replace(",", "")
+        )
+    except (TypeError, ValueError):
+        return str(actual) == str(expected)
 
 
 def assert_no_unexpected_write_execution(
@@ -668,6 +792,45 @@ def _first_sql_value(payload: Any) -> str:
             if nested:
                 return nested
     return ""
+
+
+def _all_sql_values(payload: Any) -> list[str]:
+    values: list[str] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if (
+                key in {"sql", "planned_sql", "selected_sql", "query", "statement"}
+                and isinstance(value, str)
+                and _looks_like_sql(value)
+            ):
+                values.append(value.strip())
+            else:
+                values.extend(_all_sql_values(value))
+    elif isinstance(payload, (list, tuple)):
+        for value in payload:
+            values.extend(_all_sql_values(value))
+    return values
+
+
+def _looks_like_sql(value: str) -> bool:
+    return bool(
+        re.match(
+            r"(?is)^\s*(select|with|update|delete|insert|drop|alter|truncate|create|explain)\b",
+            value,
+        )
+    )
+
+
+def _ordered_unique_nonempty(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        stripped = value.strip()
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        unique.append(stripped)
+    return unique
 
 
 def _sql_from_task_inputs(result_or_snapshot: Any) -> str:
