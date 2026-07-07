@@ -583,7 +583,7 @@ async def test_catalog_column_value_search_profiles_dotted_input_target_before_s
     assert search[0].payload["profiles"][0]["top_values"][0]["value"] == "complete"
 
 
-async def test_planning_context_value_hints_profile_prompt_scope_before_context():
+async def test_planning_context_value_hints_profile_catalog_target_before_context():
     catalog = CatalogPlugin(auto_persist=False)
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(
@@ -641,7 +641,10 @@ async def test_planning_context_value_hints_profile_prompt_scope_before_context(
                 DbPlannerAction(
                     action_id="context",
                     kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
-                    input={"source_owner": "sqlite"},
+                    input={
+                        "source_owner": "sqlite",
+                        "targets": [{"table": "orders", "column": "status"}],
+                    },
                 ),
             ),
         )
@@ -677,10 +680,10 @@ async def test_planning_context_value_hints_profile_prompt_scope_before_context(
         {
             "table": "orders",
             "column": "status",
-            "reason": "explicit_profile_pair",
-            "confidence": 0.92,
+            "reason": "explicit_target",
+            "confidence": 1.0,
             "requires_profile_read": True,
-            "source": {"kind": "profile_pair"},
+            "source": {"kind": "explicit_target"},
         }
     ]
     hint_task = next(
@@ -710,13 +713,6 @@ async def test_planning_context_value_hints_profile_prompt_scope_before_context(
     assert hint.payload["hints"][0]["observed_values"][0]["value"] == "complete"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Phase 0 characterization for catalog-owned value grounding; "
-        "expected to pass after Phase 1/2."
-    ),
-    strict=True,
-)
 async def test_planning_context_value_grounding_does_not_require_known_prompt_keywords():
     catalog = CatalogPlugin(auto_persist=False)
     sqlite = SQLitePlugin(path=":memory:")
@@ -744,6 +740,36 @@ async def test_planning_context_value_grounding_does_not_require_known_prompt_ke
     )
 
     try:
+        schema = await runtime.execute_capability(
+            "db.schema.inspect",
+            owner="sqlite",
+            operation_type="source.profile",
+        )
+        await runtime.execute_capability(
+            "catalog.source.register",
+            owner="catalog",
+            operation_type="schema.register",
+            input={
+                "schema": schema[0].payload,
+                "store_type": "sqlite",
+                "store_id": "store:sqlite",
+                "persist": False,
+            },
+        )
+        await catalog.register_column_value_profiles(
+            "store:sqlite",
+            [
+                {
+                    "table": "account_revenue",
+                    "column": "loyalty_band",
+                    "distinct_count": 2,
+                    "top_values": [
+                        {"value": "platinum", "count": 1},
+                        {"value": "gold", "count": 1},
+                    ],
+                }
+            ],
+        )
         operation = await runtime.kernel.create_operation(
             operation_type="data.query",
             request={
@@ -781,22 +807,23 @@ async def test_planning_context_value_grounding_does_not_require_known_prompt_ke
         for task in plan.tasks:
             await runtime.execute_task(task, operation)
         evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
     finally:
         await runtime.teardown()
 
+    grounding_plan = next(
+        item for item in evidence if item.kind == "catalog.value_grounding.plan"
+    )
+    assert [
+        (target["table"], target["column"], target["reason"])
+        for target in grounding_plan.payload["targets"]
+    ] == [("account_revenue", "loyalty_band", "catalog_profile")]
+    assert not any(task.capability_id == "db.column_values.profile" for task in tasks)
     contexts = [item for item in evidence if item.kind == "planning.context"]
     assert contexts
     hints = contexts[-1].payload["column_value_hints"]
-    assert {
-        "table": "account_revenue",
-        "column": "loyalty_band",
-        "value": "platinum",
-    } in {
-        {
-            "table": hint["table"],
-            "column": hint["column"],
-            "value": observed["value"],
-        }
+    assert ("account_revenue", "loyalty_band", "platinum") in {
+        (hint["table"], hint["column"], observed["value"])
         for hint in hints
         for observed in hint.get("observed_values", [])
     }

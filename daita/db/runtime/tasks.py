@@ -6,7 +6,6 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import json
-import re
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
@@ -1086,32 +1085,6 @@ class DbRuntimeTasksMixin:
             enriched.get("warnings") or enriched.get("validation_warnings")
         ):
             enriched["validation_warnings"] = validation_warnings
-        if (
-            schema_evidence is not None
-            and not _value_grounding_has_structured_targets(enriched)
-            and _legacy_value_grounding_fallback_allowed(enriched)
-        ):
-            pairs = _derive_column_value_profile_pairs(
-                schema_evidence.payload,
-                prompt=" ".join(
-                    str(value or "")
-                    for value in (
-                        enriched.get("prompt"),
-                        enriched.get("query"),
-                        operation.request.get("prompt"),
-                    )
-                ),
-                session_context=operation.request.get("session_context"),
-            )
-            if pairs:
-                enriched = {
-                    **enriched,
-                    "profile_pairs": [
-                        {"table": table, "column": column}
-                        for table, column in pairs
-                    ],
-                    "legacy_value_grounding_fallback": True,
-                }
         return enriched
 
     async def _accepted_validation_inputs_for_value_grounding(
@@ -1134,9 +1107,7 @@ class DbRuntimeTasksMixin:
                 )
             )
             warnings.extend(
-                _validation_items_for_value_grounding(
-                    evidence.payload.get("warnings")
-                )
+                _validation_items_for_value_grounding(evidence.payload.get("warnings"))
             )
             warnings.extend(
                 _validation_items_for_value_grounding(
@@ -2143,33 +2114,6 @@ def _value_grounding_iterable(value: Any) -> list[Any]:
     return [value]
 
 
-def _value_grounding_has_structured_targets(task_input: Mapping[str, Any]) -> bool:
-    for key in (
-        "targets",
-        "profile_pairs",
-        "validation_facts",
-        "warnings",
-        "validation_warnings",
-        "session_query_scopes",
-    ):
-        if task_input.get(key):
-            return True
-    return False
-
-
-def _legacy_value_grounding_fallback_allowed(task_input: Mapping[str, Any]) -> bool:
-    prompt = " ".join(
-        str(value or "")
-        for value in (task_input.get("prompt"), task_input.get("query"))
-        if str(value or "").strip()
-    )
-    if not prompt:
-        return False
-    if re.search(r"['\"][^'\"]{1,80}['\"]", prompt):
-        return True
-    return bool(_identifier_tokens(prompt) & _COLUMN_VALUE_SCOPE_TOKENS)
-
-
 def _dedupe_json_values(values: Iterable[Any]) -> list[Any]:
     seen: set[str] = set()
     out: list[Any] = []
@@ -2200,40 +2144,6 @@ def _normalize_column_value_scope(
     return _ordered_unique_strings(normalized_tables), _ordered_unique_strings(
         normalized_columns
     )
-
-
-_COLUMN_VALUE_SCOPE_TOKENS = frozenset(
-    {
-        "active",
-        "apac",
-        "closed",
-        "complete",
-        "completed",
-        "enterprise",
-        "eu",
-        "high",
-        "inactive",
-        "low",
-        "midmarket",
-        "na",
-        "open",
-        "pending",
-        "startup",
-        "urgent",
-    }
-)
-_CATEGORICAL_COLUMN_NAMES = frozenset(
-    {
-        "category",
-        "code",
-        "region_code",
-        "severity",
-        "state",
-        "status",
-        "tier",
-        "type",
-    }
-)
 
 
 def _column_value_task_input_with_grounding_plan(
@@ -2283,7 +2193,9 @@ def _column_value_task_input_with_grounding_plan(
     }
 
 
-def _ordered_target_pairs(targets: Iterable[Mapping[str, Any]]) -> list[tuple[str, str]]:
+def _ordered_target_pairs(
+    targets: Iterable[Mapping[str, Any]],
+) -> list[tuple[str, str]]:
     pairs: list[tuple[str, str]] = []
     for target in targets:
         table = str(target.get("table") or "").strip()
@@ -2297,9 +2209,7 @@ def _query_with_grounding_terms(
     task_input: Mapping[str, Any],
     targets: list[Mapping[str, Any]],
 ) -> str:
-    values = [
-        str(task_input.get("query") or task_input.get("prompt") or "").strip()
-    ]
+    values = [str(task_input.get("query") or task_input.get("prompt") or "").strip()]
     for target in targets:
         values.append(str(target.get("table") or ""))
         values.append(str(target.get("column") or ""))
@@ -2311,112 +2221,6 @@ def _query_with_grounding_terms(
             for value in source.get("values") or ():
                 values.append(str(value))
     return " ".join(value for value in values if value.strip())
-
-
-def _derive_column_value_profile_pairs(
-    schema: Any,
-    *,
-    prompt: str,
-    session_context: Any,
-) -> list[tuple[str, str]]:
-    if not isinstance(schema, Mapping):
-        return []
-    prompt_tokens = _identifier_tokens(prompt)
-    if not prompt_tokens:
-        return []
-    session_tables = _session_context_tables(session_context)
-    value_cue = bool(prompt_tokens & _COLUMN_VALUE_SCOPE_TOKENS)
-    candidates: list[tuple[int, str, str]] = []
-    for table in schema.get("tables", []) or []:
-        if not isinstance(table, Mapping):
-            continue
-        table_name = str(table.get("name") or "").strip()
-        if not table_name:
-            continue
-        table_tokens = _identifier_tokens(table_name)
-        table_matched = bool(prompt_tokens & table_tokens) or (
-            table_name.lower() in session_tables
-        )
-        for column in table.get("columns", []) or []:
-            if not isinstance(column, Mapping):
-                continue
-            column_name = str(column.get("name") or "").strip()
-            if not column_name or _looks_sensitive_column_name(column_name):
-                continue
-            column_tokens = _identifier_tokens(column_name)
-            column_matched = bool(prompt_tokens & column_tokens)
-            categorical = _is_categorical_value_column(column)
-            if not categorical:
-                continue
-            score = 0
-            if table_matched:
-                score += 4
-            if column_matched:
-                score += 3
-            if value_cue and categorical:
-                score += 2
-            if column_name.lower() == "status":
-                score += 1
-            if score <= 0:
-                continue
-            candidates.append((score, table_name, column_name))
-    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
-    return list(dict.fromkeys((table, column) for _score, table, column in candidates))[
-        :4
-    ]
-
-
-def _is_categorical_value_column(column: Mapping[str, Any]) -> bool:
-    name = str(column.get("name") or "").lower()
-    if name in _CATEGORICAL_COLUMN_NAMES or name.endswith("_code"):
-        return True
-    return bool(_identifier_tokens(name) & _CATEGORICAL_COLUMN_NAMES)
-
-
-def _session_context_tables(value: Any) -> set[str]:
-    tables: set[str] = set()
-    if not isinstance(value, Mapping):
-        return tables
-    referents = value.get("referents")
-    if isinstance(referents, Mapping):
-        tables.update(str(item).lower() for item in referents.get("tables") or ())
-    for scope in value.get("query_scopes") or ():
-        if isinstance(scope, Mapping):
-            tables.update(str(item).lower() for item in scope.get("tables") or ())
-    return tables
-
-
-def _identifier_tokens(value: str) -> set[str]:
-    tokens = {
-        item.lower()
-        for item in re.findall(r"[A-Za-z0-9]+", str(value).replace("_", " "))
-        if item
-    }
-    expanded = set(tokens)
-    for token in tokens:
-        if token.endswith("ies") and len(token) > 3:
-            expanded.add(token[:-3] + "y")
-        elif token.endswith("s") and len(token) > 3:
-            expanded.add(token[:-1])
-    return expanded
-
-
-def _looks_sensitive_column_name(column: str) -> bool:
-    lowered = column.lower()
-    sensitive = {
-        "api_key",
-        "birth",
-        "credential",
-        "email",
-        "key",
-        "name",
-        "password",
-        "phone",
-        "secret",
-        "ssn",
-        "token",
-    }
-    return any(term in lowered for term in sensitive)
 
 
 def _column_value_profile_pairs(task_input: dict[str, Any]) -> list[tuple[str, str]]:
