@@ -10,6 +10,16 @@ from typing import Any
 from daita.runtime import Evidence, Operation
 
 from .analysis import structural_schema_fingerprint
+from .context_projection import (
+    ProjectionContext,
+    ProjectionMode,
+    policy_summary_from_source,
+    project_catalog_hints,
+    project_memory_refs,
+    project_memory_semantics,
+    project_policy_summary,
+    project_session_context,
+)
 from .memory import (
     db_memory_options_from_from_db_options,
     db_memory_refs_from_recall_evidence,
@@ -138,14 +148,28 @@ class DbPlanningContextBuilder:
             included_sections.append("catalog")
         if relationship_evidence:
             included_sections.append("relationships")
-        column_value_hints = _column_value_hints(
-            catalog_evidence,
-            schema,
-            profiles_stale=bool(
-                schema_evidence is not None
-                and schema_evidence.metadata.get("schema_cache")
-                == "persistent_stale_fallback"
+        policy_summary = policy_summary_from_source(source)
+        projection = ProjectionContext(
+            mode=ProjectionMode.PLANNER,
+            operation_intent=intent.kind.value,
+            safety_frame=operation.metadata.get("safety_frame"),
+            policy_summary=policy_summary,
+            source_identity=None,
+            schema_fingerprint=schema_fingerprint,
+            session_id=request.session_id,
+            user_id=request.user_id,
+        )
+        column_value_hints = project_catalog_hints(
+            _column_value_hints(
+                catalog_evidence,
+                schema,
+                profiles_stale=bool(
+                    schema_evidence is not None
+                    and schema_evidence.metadata.get("schema_cache")
+                    == "persistent_stale_fallback"
+                ),
             ),
+            projection,
         )
         column_value_evidence = tuple(
             item
@@ -160,7 +184,17 @@ class DbPlanningContextBuilder:
         if column_value_hints:
             included_sections.append("column_value_hints")
         memory_options = db_memory_options_from_from_db_options(options)
-        db_memory_refs, db_memory_evidence_refs, db_memory_diagnostics = (
+        projection = ProjectionContext(
+            mode=ProjectionMode.PLANNER,
+            operation_intent=intent.kind.value,
+            safety_frame=operation.metadata.get("safety_frame"),
+            policy_summary=policy_summary,
+            source_identity=memory_options.get("source_identity"),
+            schema_fingerprint=schema_fingerprint,
+            session_id=request.session_id,
+            user_id=request.user_id,
+        )
+        raw_db_memory_refs, db_memory_evidence_refs, db_memory_diagnostics = (
             db_memory_refs_from_recall_evidence(
                 tuple(item for item in memory_recall_evidence if item.accepted),
                 prompt=request.prompt,
@@ -176,24 +210,23 @@ class DbPlanningContextBuilder:
                 ),
             )
         )
+        db_memory_refs = project_memory_refs(raw_db_memory_refs, projection)
         db_memory_diagnostics = {
             **db_memory_diagnostics,
             **dict(memory_recall_diagnostics or {}),
         }
-        policy_summary = {
-            "read_only": getattr(source, "read_only", None),
-            "allowed_tables": sorted(getattr(source, "allowed_tables", set()) or []),
-            "blocked_tables": sorted(getattr(source, "blocked_tables", set()) or []),
-            "blocked_columns": sorted(getattr(source, "blocked_columns", set()) or []),
-        }
-        db_memory_semantics, db_memory_contract_diagnostics = (
+        raw_db_memory_semantics, db_memory_contract_diagnostics = (
             project_db_memory_semantic_contracts(
-                db_memory_refs,
+                raw_db_memory_refs,
                 prompt=request.prompt,
                 schema=schema,
                 policy_summary=policy_summary,
                 source_identity=memory_options.get("source_identity"),
             )
+        )
+        db_memory_semantics = project_memory_semantics(
+            raw_db_memory_semantics,
+            projection,
         )
         if db_memory_refs:
             included_sections.append("db_memory")
@@ -210,7 +243,10 @@ class DbPlanningContextBuilder:
             "db_memory_ref_count": len(db_memory_refs),
             "db_memory_contract_count": len(db_memory_semantics),
         }
-        session_context = _compact_session_context(request)
+        session_context = project_session_context(
+            _compact_session_context(request),
+            projection,
+        )
         if session_context:
             included_sections.append("session_context")
         context = DbPlanningContext(
@@ -251,7 +287,7 @@ class DbPlanningContextBuilder:
                     }
                 ),
             },
-            policy_summary=policy_summary,
+            policy_summary=project_policy_summary(policy_summary, projection),
             limit_summary={
                 "max_rows": self.config.limits.max_rows,
                 "timeout_seconds": self.config.limits.timeout_seconds,

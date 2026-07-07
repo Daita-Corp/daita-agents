@@ -5,6 +5,8 @@ import sqlite3
 from unittest.mock import AsyncMock, MagicMock
 
 from daita.db import (
+    DbIntent,
+    DbIntentKind,
     DbRequest,
     DbRuntime,
     DbRuntimeConfig,
@@ -29,6 +31,7 @@ from daita.db.memory_contracts import (
     extract_db_memory_semantic_contract,
     project_db_memory_semantic_contracts,
 )
+from daita.db.planning_context import DbPlanningContextBuilder
 from daita.db.planner_protocol import (
     DbLoopState,
     DbPlannerAction,
@@ -405,15 +408,13 @@ async def test_memory_executors_return_typed_evidence(tmp_path):
 async def test_planning_time_db_memory_recall_adds_bounded_context(tmp_path):
     db_path = tmp_path / "planning_memory.sqlite"
     sqlite = SQLitePlugin(path=str(db_path))
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             total REAL NOT NULL
         );
         INSERT INTO orders (total) VALUES (10.0), (20.0);
-        """
-    )
+        """)
     source_identity = "sqlite:from_db:memory-test-source"
     memory = MemoryPlugin()
     backend = MagicMock()
@@ -1395,8 +1396,7 @@ async def test_structured_db_memory_backfills_phase31_rows(tmp_path):
     db_path = tmp_path / "db_semantics.db"
     conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE db_memory_records (
             record_id TEXT PRIMARY KEY,
             source_identity_key TEXT NOT NULL,
@@ -1418,8 +1418,7 @@ async def test_structured_db_memory_backfills_phase31_rows(tmp_path):
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
-        """
-    )
+        """)
     cursor.execute(
         """
         INSERT INTO db_memory_records VALUES (
@@ -1491,8 +1490,7 @@ async def test_local_backend_migrates_legacy_db_memory_chunks(tmp_path):
     vector_db = workspace_dir / "vectors.db"
     conn = sqlite3.connect(str(vector_db))
     cursor = conn.cursor()
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE chunks (
             chunk_id TEXT PRIMARY KEY,
             file_path TEXT NOT NULL,
@@ -1502,8 +1500,7 @@ async def test_local_backend_migrates_legacy_db_memory_chunks(tmp_path):
             metadata TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        """
-    )
+        """)
     cursor.execute(
         "CREATE TABLE embeddings (chunk_id TEXT PRIMARY KEY, embedding TEXT NOT NULL)"
     )
@@ -2034,6 +2031,136 @@ def test_contract_projection_blocks_policy_denied_refs():
     assert semantics[0]["enforceable"] is False
     assert diagnostics["enforced_count"] == 0
     assert diagnostics["omitted_reasons"]["blocked_by_policy"] == 1
+
+
+def test_planning_context_projects_blocked_memory_refs_before_rendering():
+    class BlockedSource:
+        read_only = True
+        allowed_tables = set()
+        blocked_tables = set()
+        blocked_columns = {"customers.loyalty_band"}
+
+    source_identity = "sqlite:from_db:source-a"
+    schema = {
+        "database_type": "sqlite",
+        "tables": [
+            {
+                "name": "customers",
+                "columns": [
+                    {"name": "loyalty_band", "data_type": "TEXT"},
+                    {"name": "revenue", "data_type": "REAL"},
+                ],
+            }
+        ],
+    }
+    semantic_contract = {
+        "version": 1,
+        "contract_kind": "metric_definition",
+        "subject": {
+            "type": "metric",
+            "key": "metric:loyalty_revenue",
+            "aliases": ["loyalty revenue"],
+        },
+        "requirements": {
+            "refs": [{"kind": "column", "ref": "customers.loyalty_band"}],
+            "filters": [
+                {
+                    "ref": "customers.loyalty_band",
+                    "operator": "=",
+                    "value": "platinum",
+                }
+            ],
+        },
+        "grounding": {
+            "source_identity": source_identity,
+            "schema_fingerprint": "schema-a",
+            "evidence_refs": [],
+            "catalog_refs": [],
+        },
+        "enforcement": {
+            "mode": "required_when_recalled",
+            "min_confidence": 0.8,
+        },
+    }
+    memory_evidence = Evidence(
+        id="evidence-memory",
+        kind="memory.semantic.recall",
+        owner="memory",
+        accepted=True,
+        payload={
+            "results": [
+                {
+                    "chunk_id": "mem-loyalty",
+                    "metadata": {
+                        "db_memory": {
+                            "kind": "metric_definition",
+                            "key": "metric:loyalty_revenue",
+                            "text": (
+                                "Loyalty revenue filters customers.loyalty_band "
+                                "to platinum."
+                            ),
+                            "metadata": {
+                                "source_identity": source_identity,
+                                "workspace_scope": "source",
+                                "active": True,
+                                "confidence": 0.95,
+                                "semantic_contract_status": "validated",
+                                DB_MEMORY_SEMANTIC_CONTRACT_KEY: semantic_contract,
+                                "schema_refs": ["customers.loyalty_band"],
+                            },
+                            "importance": 0.8,
+                            "category": "db_semantics",
+                        }
+                    },
+                    "score": 0.99,
+                }
+            ]
+        },
+    )
+
+    context = DbPlanningContextBuilder(
+        DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "memory": {
+                        "enabled": True,
+                        "source_identity": source_identity,
+                        "score_threshold": 0.0,
+                    }
+                }
+            }
+        )
+    ).build(
+        request=DbRequest("Summarize loyalty revenue."),
+        intent=DbIntent(
+            kind=DbIntentKind.DATA_QUERY,
+            confidence=1.0,
+            access=AccessMode.READ,
+        ),
+        operation=Operation(id="op-memory-projection", operation_type="data.query"),
+        schema_evidence=Evidence(
+            id="schema-memory-projection",
+            kind="schema.asset_profile",
+            owner="sqlite",
+            accepted=True,
+            payload=schema,
+        ),
+        memory_recall_evidence=(memory_evidence,),
+        source=BlockedSource(),
+    )
+
+    dumped = json.dumps(
+        {
+            "db_memory_refs": context.db_memory_refs,
+            "db_memory_semantics": context.db_memory_semantics,
+            "rendered_context": context.rendered_context,
+        },
+        sort_keys=True,
+    )
+    assert "customers.loyalty_band" not in dumped
+    assert "platinum" not in dumped
+    assert context.db_memory_refs[0]["projection"]["reason"] == "blocked_by_policy"
+    assert context.db_memory_semantics[0]["enforceable"] is False
 
 
 def test_mixed_contract_projection_keeps_enforceable_and_advisory_separate():

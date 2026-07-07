@@ -17,8 +17,6 @@ from daita.db.session_context import (
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import AccessMode, Evidence, Operation, OperationStatus
 
-import pytest
-
 
 class SpyRuntime(DbRuntime):
     def __init__(self) -> None:
@@ -51,8 +49,7 @@ class _BlockedColumnSource:
 
 async def _seed_agent_schema(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script(
-        """
+    await plugin.execute_script("""
         CREATE TABLE agent_profiles (
             id INTEGER PRIMARY KEY,
             agent_name TEXT NOT NULL
@@ -69,8 +66,7 @@ async def _seed_agent_schema(path):
         INSERT INTO agent_profiles (agent_name) VALUES ('alpha');
         INSERT INTO agent_runs (profile_id, status) VALUES (1, 'ok');
         INSERT INTO billing_events (amount_cents) VALUES (100);
-        """
-    )
+        """)
     await plugin.disconnect()
 
 
@@ -176,13 +172,6 @@ async def test_session_context_builder_collects_runtime_referents_and_diagnostic
     assert "conversation_history" in context.diagnostics["sources"]
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Phase 0 characterization for governed planner context projection; "
-        "expected to pass after Phase 4."
-    ),
-    strict=True,
-)
 def test_planner_visible_session_context_redacts_blocked_columns():
     request = DbRequest(
         "Continue summarizing customer revenue.",
@@ -253,6 +242,8 @@ def test_planner_visible_session_context_redacts_blocked_columns():
     assert "customers.loyalty_band" not in planner_visible
     assert "platinum" not in planner_visible
     assert "blocked_columns" in context.policy_summary
+    assert context.policy_summary["blocked_columns"] == ["<redacted>"]
+    assert "customers.loyalty_band" not in json.dumps(context.policy_summary)
 
 
 def test_session_context_from_dict_filters_invalid_conversation_messages():
