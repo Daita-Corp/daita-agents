@@ -1,5 +1,8 @@
+import json
+
 from daita.db import DbRuntime, DbRuntimeConfig
 from daita.db.agent_loop import DbAgentLoop
+from daita.db.llm_service import DbLLMResponse
 from daita.db.planner_protocol import (
     DbPlannerAction,
     DbPlannerActionKind,
@@ -60,6 +63,99 @@ class _ProfileOnlySourcePlugin(RuntimeExtensionPlugin):
         return (_ProfileOnlyExecutor(self.manifest.id),)
 
 
+class _SequentialLLMService:
+    available = True
+    safe_metadata = {"provider": "test", "model": "sequential"}
+
+    def __init__(self, *payloads: dict) -> None:
+        self.payloads = [json.dumps(payload) for payload in payloads]
+        self.messages = []
+
+    async def generate_json(self, messages):
+        self.messages.append(messages)
+        return DbLLMResponse(
+            content=self.payloads.pop(0),
+            diagnostics={"provider": "test", "model": "sequential"},
+        )
+
+
+class _ValidationRepairPlanner:
+    def __init__(self) -> None:
+        self.states = []
+
+    async def plan(self, state):
+        self.states.append(state)
+        plans = [
+            item
+            for item in state.accepted_evidence_summaries
+            if item.get("kind") == "query.plan.proposal"
+        ]
+        has_context = any(
+            item.get("kind") == "planning.context"
+            for item in state.accepted_evidence_summaries
+        )
+        has_value_hint = any(
+            item.get("kind") == "schema.column_value_hint"
+            for item in state.accepted_evidence_summaries
+        )
+        failed_value_validation = next(
+            (
+                item
+                for item in state.validation_summaries
+                if item.get("kind") == "query.plan.validation"
+                and item.get("valid") is False
+                and item.get("validation_facts")
+            ),
+            None,
+        )
+        if not has_context:
+            return _planner_decision(
+                DbPlannerAction(
+                    action_id="context_initial",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={"source_owner": "sqlite"},
+                )
+            )
+        if failed_value_validation is not None and not has_value_hint:
+            return _planner_decision(
+                DbPlannerAction(
+                    action_id="context_validation_repair",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={"source_owner": "sqlite"},
+                )
+            )
+        if failed_value_validation is not None and has_value_hint and len(plans) < 2:
+            return _planner_decision(
+                DbPlannerAction(
+                    action_id="repair_plan",
+                    kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+                    input={
+                        "owner": "db_runtime",
+                        "prior_plan_evidence_id": plans[-1]["id"],
+                        "failure_evidence_id": failed_value_validation["id"],
+                    },
+                )
+            )
+        if not plans:
+            return _planner_decision(
+                DbPlannerAction(
+                    action_id="plan_initial",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={"owner": "db_runtime"},
+                )
+            )
+        return _planner_decision(
+            DbPlannerAction(
+                action_id=f"execute_plan_{len(plans)}",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "sqlite",
+                    "query_plan_ref": "latest_accepted_query_plan",
+                },
+            )
+        )
+
+
 async def _compile_column_value_search(
     runtime: DbRuntime,
     operation,
@@ -90,6 +186,14 @@ async def _compile_column_value_search(
     assert compilation.rejected_action_summaries == ()
     operation = await loop._persist_compiled_contract(operation, compilation)
     return operation, compilation.task_specs, compilation.compiled_contract_snapshot
+
+
+def _planner_decision(*actions):
+    return DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=actions,
+    )
 
 
 async def _seed(plugin: SQLitePlugin) -> None:
@@ -898,9 +1002,7 @@ async def test_validation_fact_value_grounding_profiles_only_target_column():
         ("orders", "status")
     ]
     register_tasks = [
-        task
-        for task in tasks
-        if task.capability_id == "catalog.column_values.register"
+        task for task in tasks if task.capability_id == "catalog.column_values.register"
     ]
     assert len(register_tasks) == 1
     hint = next(item for item in evidence if item.kind == "schema.column_value_hint")
@@ -908,6 +1010,189 @@ async def test_validation_fact_value_grounding_profiles_only_target_column():
         ("orders", "status")
     ]
     assert hint.payload["hints"][0]["observed_values"][0]["value"] == "complete"
+    assert hint.payload["hints"][0]["candidate_mapping"]["prompt_term"] == "completed"
+    assert hint.payload["hints"][0]["candidate_mapping"]["closest_value"] == "complete"
+    contexts = [item for item in evidence if item.kind == "planning.context"]
+    assert contexts
+    latest_context = contexts[-1]
+    assert (
+        latest_context.payload["diagnostics"]["validation_grounding_repair_attempted"]
+        is True
+    )
+    assert latest_context.payload["diagnostics"]["validation_grounding_repair"][
+        "target_refs"
+    ] == ["orders.status"]
+    context_hint = latest_context.payload["column_value_hints"][0]
+    assert context_hint["table"] == "orders"
+    assert context_hint["column"] == "status"
+    assert context_hint["candidate_mapping"]["closest_value"] == "complete"
+
+
+async def test_validation_grounding_repair_replans_with_refreshed_context():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    llm_service = _SequentialLLMService(
+        {
+            "operation": "read",
+            "selected_sql": (
+                "SELECT COUNT(*) AS order_count FROM orders "
+                "WHERE orders.status = 'completed'"
+            ),
+            "selected_tables": ["orders"],
+            "filters": [
+                {
+                    "column": "orders.status",
+                    "operator": "=",
+                    "value": "completed",
+                }
+            ],
+            "confidence": 0.91,
+        },
+        {
+            "operation": "read",
+            "selected_sql": (
+                "SELECT COUNT(*) AS order_count FROM orders "
+                "WHERE orders.status = 'complete'"
+            ),
+            "selected_tables": ["orders"],
+            "filters": [
+                {
+                    "column": "orders.status",
+                    "operator": "=",
+                    "value": "complete",
+                }
+            ],
+            "confidence": 0.93,
+        },
+    )
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+        db_llm_service=llm_service,
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            channel TEXT NOT NULL
+        );
+        INSERT INTO orders (id, status, channel)
+        VALUES (1, 'complete', 'web'), (2, 'pending', 'store');
+        """
+    )
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Show the requested order count.",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="initial-context-with-known-status-values",
+                kind="planning.context",
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "schema": {
+                        "database_type": "sqlite",
+                        "tables": [
+                            {
+                                "name": "orders",
+                                "columns": [
+                                    {"name": "id", "data_type": "INTEGER"},
+                                    {"name": "status", "data_type": "TEXT"},
+                                    {"name": "channel", "data_type": "TEXT"},
+                                ],
+                            }
+                        ],
+                    },
+                    "column_value_hints": [
+                        {
+                            "table": "orders",
+                            "column": "status",
+                            "profile_status": "profiled",
+                            "observed_values": [
+                                {"value": "complete", "count": 1},
+                                {"value": "pending", "count": 1},
+                            ],
+                        }
+                    ],
+                },
+                metadata={"payload_fingerprint": "initial-context-fp"},
+            )
+        )
+        planner = _ValidationRepairPlanner()
+        result = await DbAgentLoop(runtime, planner).run(
+            operation,
+            safety_frame={"max_access": "read"},
+            max_turns=8,
+        )
+        evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "finished"
+    validations = [item for item in evidence if item.kind == "query.plan.validation"]
+    assert [item.accepted for item in validations] == [False, True]
+    assert validations[0].payload["validation_facts"] == [
+        {
+            "kind": "unobserved_filter_literal",
+            "table": "orders",
+            "column": "status",
+            "literal": "completed",
+            "candidates": ["complete", "pending"],
+        }
+    ]
+    repaired_plan = [item for item in evidence if item.kind == "query.plan.proposal"][
+        -1
+    ]
+    assert "orders.status = 'complete'" in repaired_plan.payload["sql"]
+    query_result = next(item for item in evidence if item.kind == "query.result")
+    assert query_result.payload["rows"] == [{"order_count": 1}]
+    contexts = [item for item in evidence if item.kind == "planning.context"]
+    assert (
+        contexts[-1].payload["column_value_hints"][0]["candidate_mapping"][
+            "closest_value"
+        ]
+        == "complete"
+    )
+    profile_tasks = [
+        task for task in tasks if task.capability_id == "db.column_values.profile"
+    ]
+    assert [(task.input["table"], task.input["column"]) for task in profile_tasks] == [
+        ("orders", "status")
+    ]
+    assert not any(
+        task.capability_id == "db.column_values.profile"
+        and task.input["column"] == "channel"
+        for task in tasks
+    )
+    register_tasks = [
+        task for task in tasks if task.capability_id == "catalog.column_values.register"
+    ]
+    hint_tasks = [
+        task
+        for task in tasks
+        if task.capability_id == "catalog.column_value_hints.resolve"
+    ]
+    assert len(register_tasks) == 1
+    assert len(hint_tasks) == 1
+    assert sum(1 for item in evidence if item.kind == "schema.column_value_hint") == 1
 
 
 async def test_session_scope_value_grounding_profiles_non_keyword_value():

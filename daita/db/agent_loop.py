@@ -25,6 +25,7 @@ from .memory import (
     db_memory_options_from_runtime_metadata,
     db_memory_planning_recall_decision,
 )
+from .planning_context import planner_eligible_column_value_hint
 from .planner_protocol import (
     DbAgentPlanner,
     DbLoopState,
@@ -95,6 +96,8 @@ _TERMINAL_TASK_STATUSES = {
 }
 
 _CATALOG_COLUMN_VALUE_GROUNDING_REASON = "catalog_column_value_grounding"
+
+
 @dataclass(frozen=True)
 class DbActionCompilation:
     """Runtime compilation of planner actions to governed DB task specs."""
@@ -653,7 +656,7 @@ class DbAgentLoop:
             approval_state=await self._approval_state(operation.id),
             validation_summaries=tuple(
                 _evidence_summary(item)
-                for item in accepted
+                for item in evidence
                 if item.kind in {"sql.validation", "query.plan.validation"}
             ),
             execution_error_summaries=tuple(
@@ -958,6 +961,12 @@ class DbAgentLoop:
         selected = [_capability_selection(context_capability, action)]
         context_dependencies: list[TaskDependency] = []
         context_input = _task_input_for_action(action)
+        validation_repair_context = _validation_grounding_repair_context(state)
+        if validation_repair_context:
+            context_input.setdefault(
+                "validation_grounding_repair",
+                validation_repair_context,
+            )
         memory_decision = state.memory_context.get("recall_decision") or {}
         prerequisite_capabilities = [context_capability]
         schema_dependency: TaskDependency | None = None
@@ -1212,6 +1221,19 @@ class DbAgentLoop:
             if access_errors:
                 return [], [], access_errors
 
+        context_metadata = _action_metadata(action, decision_fingerprint)
+        if validation_repair_context:
+            context_metadata.update(
+                {
+                    "validation_grounding_repair_attempted": True,
+                    "validation_grounding_targets": validation_repair_context[
+                        "targets"
+                    ],
+                    "validation_grounding_fingerprint": validation_repair_context[
+                        "fingerprint"
+                    ],
+                }
+            )
         context_spec = _with_deterministic_task_id(
             state.operation_id,
             DbTaskSpec(
@@ -1221,7 +1243,7 @@ class DbAgentLoop:
                 reason=f"planner:{action.kind.value}",
                 sequence=sequence_start + len(specs),
                 dependencies=tuple(context_dependencies),
-                metadata=_action_metadata(action, decision_fingerprint),
+                metadata=context_metadata,
                 deterministic_key=f"{action.action_id}:db.planning.context.build",
             ),
         )
@@ -3168,16 +3190,26 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
     if sql:
         summary["sql"] = sql
     if isinstance(evidence.payload, dict):
-        if evidence.kind == "sql.validation" and "valid" in evidence.payload:
-            summary["valid"] = evidence.payload.get("valid") is True
+        if evidence.kind in {"sql.validation", "query.plan.validation"}:
+            if "valid" in evidence.payload:
+                summary["valid"] = evidence.payload.get("valid") is True
             validation_facts = _safe_validation_items(
                 evidence.payload.get("validation_facts")
             )
-            validation_warnings = _safe_validation_items(evidence.payload.get("warnings"))
+            validation_warnings = _safe_validation_items(
+                evidence.payload.get("warnings")
+            )
+            validation_errors = _safe_validation_items(evidence.payload.get("errors"))
             if validation_facts:
                 summary["validation_facts"] = validation_facts
             if validation_warnings:
                 summary["warnings"] = validation_warnings
+            if validation_errors:
+                summary["validation_warnings"] = validation_errors
+        if evidence.kind == "schema.column_value_hint":
+            hints = _safe_column_value_hint_summaries(evidence.payload.get("hints"))
+            if hints:
+                summary["hints"] = hints
         if evidence.kind == "db.memory.proposal":
             proposal_fingerprint = evidence.payload.get("proposal_fingerprint")
             if isinstance(proposal_fingerprint, str) and proposal_fingerprint.strip():
@@ -3215,6 +3247,37 @@ def _safe_validation_items(value: Any) -> list[Any]:
         elif isinstance(item, str) and item.strip():
             items.append(item.strip())
     return _dedupe_json_values(items)
+
+
+def _safe_column_value_hint_summaries(value: Any) -> list[dict[str, Any]]:
+    hints: list[dict[str, Any]] = []
+    for item in _safe_iterable(value):
+        if not isinstance(item, Mapping):
+            continue
+        if not planner_eligible_column_value_hint(dict(item)):
+            continue
+        table = str(item.get("table") or "").strip()
+        column = str(item.get("column") or "").strip()
+        if not table or not column:
+            continue
+        hint: dict[str, Any] = {
+            "table": table,
+            "column": column,
+        }
+        observed_values = []
+        for observed in _safe_iterable(item.get("observed_values")):
+            if isinstance(observed, Mapping):
+                if observed.get("value") is not None:
+                    observed_values.append({"value": observed.get("value")})
+            elif observed is not None:
+                observed_values.append({"value": observed})
+        if observed_values:
+            hint["observed_values"] = observed_values[:25]
+        candidate_mapping = item.get("candidate_mapping")
+        if isinstance(candidate_mapping, Mapping):
+            hint["candidate_mapping"] = dict(candidate_mapping)
+        hints.append(hint)
+    return _dedupe_dicts(hints, keys=("table", "column"))
 
 
 def _evidence_ref(evidence: Evidence) -> dict[str, Any]:
@@ -3567,6 +3630,13 @@ def _column_value_hint_task_input(
         task_input["tables"] = list(tables)
     if columns:
         task_input["columns"] = list(columns)
+    validation_facts, validation_warnings = _state_value_grounding_validation_inputs(
+        state
+    )
+    if validation_facts:
+        task_input["validation_facts"] = validation_facts
+    if validation_warnings:
+        task_input["validation_warnings"] = validation_warnings
     return task_input
 
 
@@ -3638,9 +3708,7 @@ def _action_profile_pairs(
         return explicit
     if tables and columns:
         return [
-            {"table": table, "column": column}
-            for table in tables
-            for column in columns
+            {"table": table, "column": column} for table in tables for column in columns
         ]
     return []
 
@@ -3710,6 +3778,113 @@ def _state_value_grounding_validation_inputs(
         warnings.extend(_safe_iterable(summary.get("warnings")))
         warnings.extend(_safe_iterable(summary.get("validation_warnings")))
     return _dedupe_json_values(facts), _dedupe_json_values(warnings)
+
+
+def _validation_grounding_repair_context(
+    state: DbLoopState,
+) -> dict[str, Any]:
+    validation_facts, validation_warnings = _state_value_grounding_validation_inputs(
+        state
+    )
+    targets = _validation_value_grounding_targets(
+        (*validation_facts, *validation_warnings)
+    )
+    if not targets:
+        return {}
+    target_refs = [f"{target['table']}.{target['column']}" for target in targets]
+    satisfied_refs = _state_column_value_hint_refs(state)
+    missing_refs = [ref for ref in target_refs if ref.lower() not in satisfied_refs]
+    fingerprint = _stable_hash(
+        {
+            "operation_id": state.operation_id,
+            "targets": targets,
+        }
+    )
+    return {
+        "attempted": True,
+        "fingerprint": fingerprint,
+        "target_refs": target_refs,
+        "targets": targets,
+        "missing_target_refs": missing_refs,
+        "satisfied_target_refs": [
+            ref for ref in target_refs if ref.lower() in satisfied_refs
+        ],
+    }
+
+
+def _validation_value_grounding_targets(values: Iterable[Any]) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    for item in values:
+        if isinstance(item, Mapping):
+            kind = str(item.get("kind") or "")
+            if kind and kind not in {
+                "unobserved_filter_literal",
+                "ambiguous_literal_column",
+            }:
+                continue
+            table = str(item.get("table") or item.get("table_name") or "").strip()
+            column = str(item.get("column") or item.get("column_name") or "").strip()
+            ref = str(item.get("target") or item.get("ref") or "").strip()
+            if ref and (not table or not column):
+                ref_table, ref_column = _split_column_ref(ref)
+                table = table or ref_table
+                column = column or ref_column
+            literal = item.get("literal")
+            if literal is None:
+                literal = item.get("value", item.get("filter_literal"))
+            if table and column:
+                target = {
+                    "table": table,
+                    "column": column,
+                }
+                if literal is not None:
+                    target["literal"] = str(literal)
+                if kind:
+                    target["kind"] = kind
+                targets.append(target)
+            continue
+        if isinstance(item, str):
+            parsed = _validation_value_grounding_target_from_warning(item)
+            if parsed:
+                targets.append(parsed)
+    return _dedupe_dicts(targets, keys=("table", "column", "literal"))
+
+
+def _validation_value_grounding_target_from_warning(
+    value: str,
+) -> dict[str, Any] | None:
+    match = re.search(
+        r"(?:unobserved_filter_literal|ambiguous_literal_column):"
+        r"\s*([^=\s;]+)\s*=\s*([^;]+)",
+        str(value),
+    )
+    if match is None:
+        return None
+    table, column = _split_column_ref(match.group(1))
+    literal = match.group(2).strip().strip("'\"")
+    if not table or not column or not literal:
+        return None
+    return {
+        "kind": "unobserved_filter_literal",
+        "table": table,
+        "column": column,
+        "literal": literal,
+    }
+
+
+def _state_column_value_hint_refs(state: DbLoopState) -> set[str]:
+    refs: set[str] = set()
+    for summary in state.accepted_evidence_summaries:
+        if summary.get("kind") != "schema.column_value_hint":
+            continue
+        for hint in _safe_iterable(summary.get("hints")):
+            if not isinstance(hint, Mapping):
+                continue
+            table = str(hint.get("table") or "").strip()
+            column = str(hint.get("column") or "").strip()
+            if table and column:
+                refs.add(f"{table}.{column}".lower())
+    return refs
 
 
 def _state_session_query_scopes(state: DbLoopState) -> list[dict[str, Any]]:
@@ -3805,14 +3980,23 @@ def _state_should_plan_value_grounding_for_planning(
 ) -> bool:
     if not _state_allows_read_profile(state):
         return False
+    validation_facts, validation_warnings = _state_value_grounding_validation_inputs(
+        state
+    )
+    validation_targets = _validation_value_grounding_targets(
+        (*validation_facts, *validation_warnings)
+    )
+    if validation_targets:
+        satisfied_refs = _state_column_value_hint_refs(state)
+        return any(
+            f"{target['table']}.{target['column']}".lower() not in satisfied_refs
+            for target in validation_targets
+        )
     if _state_has_accepted_evidence(state, "schema.column_value_hint"):
         return False
     prompt = _planning_value_hint_prompt(action, state)
     if prompt:
         return True
-    validation_facts, validation_warnings = _state_value_grounding_validation_inputs(
-        state
-    )
     return bool(
         validation_facts
         or validation_warnings

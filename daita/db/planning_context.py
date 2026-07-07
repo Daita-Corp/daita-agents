@@ -504,14 +504,21 @@ def _column_value_hints(
     deduped: dict[tuple[str, str], dict[str, Any]] = {}
     for hint in hints:
         key = (str(hint.get("table") or ""), str(hint.get("column") or ""))
-        if (
-            key[0]
-            and key[1]
-            and key not in deduped
-            and planner_eligible_column_value_hint(hint)
-        ):
+        if not key[0] or not key[1] or not planner_eligible_column_value_hint(hint):
+            continue
+        existing = deduped.get(key)
+        if existing is None or _prefer_column_value_hint(hint, existing):
             deduped[key] = hint
     return tuple(deduped.values())
+
+
+def _prefer_column_value_hint(
+    candidate: dict[str, Any],
+    existing: dict[str, Any],
+) -> bool:
+    if candidate.get("candidate_mapping") and not existing.get("candidate_mapping"):
+        return True
+    return False
 
 
 def _hint_from_profile(

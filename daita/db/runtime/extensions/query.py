@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation, Task
@@ -32,8 +32,6 @@ class DbPlanningContextExecutor:
         base_request = runtime._db_request_from_operation(operation)
         prompt = task.input.get("prompt")
         if isinstance(prompt, str) and prompt.strip():
-            from dataclasses import replace
-
             base_request = replace(base_request, prompt=prompt)
         schema_evidence = await _load_evidence(
             runtime,
@@ -88,6 +86,16 @@ class DbPlanningContextExecutor:
             capability_summaries=_planner_capability_summaries(runtime),
             source=_runtime_source_plugin(runtime),
         )
+        validation_repair = task.input.get("validation_grounding_repair")
+        if isinstance(validation_repair, Mapping):
+            planning_context = replace(
+                planning_context,
+                diagnostics={
+                    **planning_context.diagnostics,
+                    "validation_grounding_repair_attempted": True,
+                    "validation_grounding_repair": dict(validation_repair),
+                },
+            )
         return [builder.evidence_for(planning_context)]
 
 

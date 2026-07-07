@@ -23,6 +23,7 @@ class DbQueryPlanValidator:
     ) -> DbQueryPlanValidation:
         errors: list[str] = []
         warnings: list[str] = []
+        validation_facts: list[dict[str, Any]] = []
         schema = dict(planning_context.get("schema") or {})
         dialect = str(
             planning_context.get("dialect") or schema.get("database_type") or ""
@@ -78,6 +79,7 @@ class DbQueryPlanValidator:
                 filter_spec.operator,
                 filter_spec.value,
                 errors,
+                validation_facts,
             )
 
         if sql:
@@ -139,6 +141,7 @@ class DbQueryPlanValidator:
                             else predicate.values[0]
                         ),
                         errors,
+                        validation_facts,
                     )
                 memory_errors = _validate_db_memory_semantics(
                     plan,
@@ -162,6 +165,7 @@ class DbQueryPlanValidator:
             sql_fingerprint=sql_fingerprint(sql) if sql else None,
             errors=tuple(errors),
             warnings=tuple(warnings),
+            validation_facts=tuple(_dedupe_validation_facts(validation_facts)),
             plan_fingerprint=fingerprint,
             metadata={
                 "validator": "deterministic",
@@ -226,6 +230,7 @@ def _validate_filter_literal(
     operator: str,
     value: Any,
     errors: list[str],
+    validation_facts: list[dict[str, Any]],
 ) -> None:
     normalized_operator = str(operator or "").strip().lower()
     if normalized_operator not in {"=", "==", "eq", "in"}:
@@ -241,6 +246,7 @@ def _validate_filter_literal(
                 "=",
                 item,
                 errors,
+                validation_facts,
             )
         return
     literal = str(value)
@@ -248,10 +254,20 @@ def _validate_filter_literal(
     if not candidates or literal.lower() in candidates:
         return
     table_label = table or _single_table_for_column(value_profiles, column) or "unknown"
+    sorted_candidates = sorted(candidates)
     errors.append(
         "unobserved_filter_literal:"
         f"{table_label}.{column}={literal};"
-        f"candidates={','.join(sorted(candidates))}"
+        f"candidates={','.join(sorted_candidates)}"
+    )
+    validation_facts.append(
+        {
+            "kind": "unobserved_filter_literal",
+            "table": table_label,
+            "column": column,
+            "literal": literal,
+            "candidates": sorted_candidates,
+        }
     )
 
 
@@ -666,3 +682,17 @@ def _memory_key(contract: dict[str, Any]) -> str:
 def _fingerprint(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _dedupe_validation_facts(
+    facts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for fact in facts:
+        key = json.dumps(fact, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(fact)
+    return deduped

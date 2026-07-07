@@ -180,6 +180,24 @@ def test_validator_rejects_unobserved_filter_literal_from_known_values():
         "unobserved_filter_literal:orders.status=completed;"
         "candidates=complete,pending"
     ) in validation.errors
+    assert validation.validation_facts == (
+        {
+            "kind": "unobserved_filter_literal",
+            "table": "orders",
+            "column": "status",
+            "literal": "completed",
+            "candidates": ["complete", "pending"],
+        },
+    )
+    assert validation.to_dict()["validation_facts"] == [
+        {
+            "kind": "unobserved_filter_literal",
+            "table": "orders",
+            "column": "status",
+            "literal": "completed",
+            "candidates": ["complete", "pending"],
+        }
+    ]
 
 
 def test_validator_accepts_observed_filter_literal_from_known_values():
