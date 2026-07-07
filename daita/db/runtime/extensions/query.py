@@ -56,6 +56,7 @@ class DbPlanningContextExecutor:
                 "schema.column_value_profile",
                 "schema.column_value_search_result",
                 "schema.column_value_hint",
+                "catalog.value_grounding.plan",
             ),
         )
         relationship_evidence = await _load_evidence_refs_or_latest(

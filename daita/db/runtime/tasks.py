@@ -927,6 +927,7 @@ class DbRuntimeTasksMixin:
             "catalog.relationship_paths.find",
             "catalog.column_values.search",
             "catalog.column_value_hints.resolve",
+            "catalog.value_grounding.plan",
         }:
             return await self._catalog_executable_input_for_task(task, operation)
         if task.capability_id not in {
@@ -1034,14 +1035,27 @@ class DbRuntimeTasksMixin:
                 prerequisite_for=task.capability_id,
                 prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
             )
-        if task.capability_id in {
-            "catalog.column_values.search",
-            "catalog.column_value_hints.resolve",
-        }:
-            task_input = _column_value_task_input_with_schema_scope(
+        if task.capability_id == "catalog.value_grounding.plan":
+            task_input = await self._value_grounding_plan_executable_input(
                 task_input,
                 operation=operation,
                 schema_evidence=schema_evidence,
+                parent_task=task,
+            )
+        elif task.capability_id in {
+            "catalog.column_values.search",
+            "catalog.column_value_hints.resolve",
+        }:
+            grounding_plan = await self._ensure_catalog_value_grounding_plan(
+                operation,
+                store_id=store_id,
+                task_input=task_input,
+                schema_evidence=schema_evidence,
+                parent_task=task,
+            )
+            task_input = _column_value_task_input_with_grounding_plan(
+                task_input,
+                grounding_plan=grounding_plan,
             )
             await self._ensure_catalog_column_values_profiled(
                 operation,
@@ -1050,6 +1064,190 @@ class DbRuntimeTasksMixin:
                 parent_task=task,
             )
         return {**task_input, "store_id": store_id}
+
+    async def _value_grounding_plan_executable_input(
+        self,
+        task_input: dict[str, Any],
+        *,
+        operation: Operation,
+        schema_evidence: Evidence | None,
+        parent_task: Task,
+    ) -> dict[str, Any]:
+        enriched = _value_grounding_plan_input_with_operation_context(
+            task_input,
+            operation=operation,
+        )
+        validation_facts, validation_warnings = (
+            await self._accepted_validation_inputs_for_value_grounding(operation.id)
+        )
+        if validation_facts and not enriched.get("validation_facts"):
+            enriched["validation_facts"] = validation_facts
+        if validation_warnings and not (
+            enriched.get("warnings") or enriched.get("validation_warnings")
+        ):
+            enriched["validation_warnings"] = validation_warnings
+        if (
+            schema_evidence is not None
+            and not _value_grounding_has_structured_targets(enriched)
+            and _legacy_value_grounding_fallback_allowed(enriched)
+        ):
+            pairs = _derive_column_value_profile_pairs(
+                schema_evidence.payload,
+                prompt=" ".join(
+                    str(value or "")
+                    for value in (
+                        enriched.get("prompt"),
+                        enriched.get("query"),
+                        operation.request.get("prompt"),
+                    )
+                ),
+                session_context=operation.request.get("session_context"),
+            )
+            if pairs:
+                enriched = {
+                    **enriched,
+                    "profile_pairs": [
+                        {"table": table, "column": column}
+                        for table, column in pairs
+                    ],
+                    "legacy_value_grounding_fallback": True,
+                }
+        return enriched
+
+    async def _accepted_validation_inputs_for_value_grounding(
+        self,
+        operation_id: str,
+    ) -> tuple[list[Any], list[Any]]:
+        facts: list[Any] = []
+        warnings: list[Any] = []
+        for evidence in await self.store.list_evidence(operation_id):
+            if not evidence.accepted or evidence.kind not in {
+                "sql.validation",
+                "query.plan.validation",
+            }:
+                continue
+            if not isinstance(evidence.payload, Mapping):
+                continue
+            facts.extend(
+                _validation_items_for_value_grounding(
+                    evidence.payload.get("validation_facts")
+                )
+            )
+            warnings.extend(
+                _validation_items_for_value_grounding(
+                    evidence.payload.get("warnings")
+                )
+            )
+            warnings.extend(
+                _validation_items_for_value_grounding(
+                    evidence.payload.get("validation_warnings")
+                )
+            )
+        return _dedupe_json_values(facts), _dedupe_json_values(warnings)
+
+    async def _ensure_catalog_value_grounding_plan(
+        self,
+        operation: Operation,
+        *,
+        store_id: str,
+        task_input: dict[str, Any],
+        schema_evidence: Evidence | None,
+        parent_task: Task,
+    ) -> Evidence | None:
+        for dependency in parent_task.dependencies:
+            if (
+                dependency.kind.value == "evidence"
+                and dependency.evidence_kind == "catalog.value_grounding.plan"
+            ):
+                evidence = await self._accepted_evidence_for_dependency(
+                    operation.id,
+                    dependency,
+                )
+                if evidence is not None:
+                    return evidence
+
+        capability = self.registry.get_capability(
+            "catalog.value_grounding.plan",
+            owner="catalog",
+        )
+        prerequisite_declaration = await self._require_declared_runtime_prerequisite(
+            operation,
+            parent_task=parent_task,
+            capability=capability,
+            prerequisite_for=parent_task.capability_id,
+            prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
+        )
+        plan_input = {
+            **task_input,
+            "store_id": store_id,
+        }
+        plan_input = await self._value_grounding_plan_executable_input(
+            plan_input,
+            operation=operation,
+            schema_evidence=schema_evidence,
+            parent_task=parent_task,
+        )
+        input_hash = _stable_hash(plan_input)
+        prerequisite_metadata = _runtime_prerequisite_task_metadata(
+            operation,
+            parent_task=parent_task,
+            capability=capability,
+            prerequisite_for=parent_task.capability_id,
+            prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
+            prerequisite_declaration=prerequisite_declaration,
+        )
+        idempotency_key = _stable_hash(
+            {
+                "operation_id": operation.id,
+                "capability_id": capability.id,
+                "owner": capability.owner,
+                "parent_task_id": parent_task.id,
+                "input_hash": input_hash,
+            }
+        )
+        task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
+        existing = await self.store.load_task(task_id)
+        if existing is not None:
+            plan_task = await self._merge_runtime_prerequisite_metadata(
+                existing,
+                prerequisite_metadata,
+            )
+        else:
+            plan_task = await self._plan_kernel_task(
+                Task(
+                    id=task_id,
+                    operation_id=operation.id,
+                    capability_id=capability.id,
+                    executor_id=capability.executor,
+                    input={**plan_input, "input_hash": input_hash},
+                    required_evidence=capability.output_evidence,
+                    metadata={
+                        **prerequisite_metadata,
+                        "owner": capability.owner,
+                        "reason": "runtime:catalog_value_grounding_plan_prepare",
+                        "sequence": 0,
+                        "input_hash": input_hash,
+                        "idempotency_key": idempotency_key,
+                        "deterministic_key": (
+                            "runtime:catalog.value_grounding.plan:"
+                            f"{parent_task.capability_id}"
+                        ),
+                        "idempotent": capability.idempotent,
+                        "replay_safe": capability.replay_safe,
+                        "side_effecting": capability.side_effecting,
+                    },
+                )
+            )
+        if plan_task.status is not TaskStatus.SUCCEEDED:
+            await self.execute_task(plan_task, operation)
+        matches = [
+            evidence
+            for evidence in await self.store.list_evidence(operation.id)
+            if evidence.kind == "catalog.value_grounding.plan"
+            and evidence.accepted
+            and evidence.task_id == plan_task.id
+        ]
+        return matches[-1] if matches else None
 
     async def _ensure_schema_profile_evidence(
         self,
@@ -1227,7 +1425,7 @@ class DbRuntimeTasksMixin:
         task_input: dict[str, Any],
         parent_task: Task,
     ) -> None:
-        pairs = _column_value_profile_pairs(task_input)
+        pairs = _column_value_profile_read_pairs(task_input)
         if not pairs or not _operation_allows_read_profile(operation):
             return
         profile_capability = await self._source_prerequisite_capability(
@@ -1819,7 +2017,169 @@ def _catalog_task_input_from_metadata(
             task_input["columns"] = columns
         if tables and columns:
             task_input.pop("target", None)
+    elif task.capability_id == "catalog.value_grounding.plan":
+        task_input.setdefault(
+            "query",
+            _first_metadata_string(metadata, "query", "value", "literal", "goal")
+            or prompt,
+        )
+        task_input.setdefault("prompt", task_input.get("query") or prompt)
+        input_tables = _safe_string_list(task_input.get("tables"))
+        if not input_tables:
+            input_tables = _safe_string_list(task_input.get("table"))
+        input_columns = _safe_string_list(task_input.get("columns"))
+        if not input_columns:
+            input_columns = _safe_string_list(task_input.get("column"))
+        target_tables, target_columns = _normalize_column_value_scope(
+            _safe_string_list(task_input.get("target")),
+            [],
+        )
+        if not input_tables:
+            input_tables = target_tables
+        if not input_columns:
+            input_columns = target_columns
+        tables, columns = _normalize_column_value_scope(input_tables, input_columns)
+        if tables:
+            task_input["tables"] = tables
+        if columns:
+            task_input["columns"] = columns
     return task_input
+
+
+def _value_grounding_plan_input_with_operation_context(
+    task_input: dict[str, Any],
+    *,
+    operation: Operation,
+) -> dict[str, Any]:
+    enriched = dict(task_input)
+    prompt = str(operation.request.get("prompt") or "")
+    enriched.setdefault("prompt", prompt)
+    enriched.setdefault("query", enriched.get("prompt") or prompt)
+    if enriched.get("max_profile_budget") is not None and not enriched.get(
+        "profile_budget"
+    ):
+        enriched["profile_budget"] = enriched["max_profile_budget"]
+    session_scopes = _session_query_scopes_for_value_grounding(
+        operation.request.get("session_context")
+    )
+    if session_scopes and not enriched.get("session_query_scopes"):
+        enriched["session_query_scopes"] = session_scopes
+    validation_facts, validation_warnings = _operation_validation_inputs_for_grounding(
+        operation
+    )
+    if validation_facts and not enriched.get("validation_facts"):
+        enriched["validation_facts"] = validation_facts
+    if validation_warnings and not (
+        enriched.get("warnings") or enriched.get("validation_warnings")
+    ):
+        enriched["validation_warnings"] = validation_warnings
+    safety_frame = operation.metadata.get("safety_frame")
+    if isinstance(safety_frame, Mapping) and not enriched.get("policy_frame"):
+        enriched["policy_frame"] = dict(safety_frame)
+    if not enriched.get("profile_pairs"):
+        pairs = _column_value_profile_pairs(enriched)
+        if pairs:
+            enriched["profile_pairs"] = [
+                {"table": table, "column": column} for table, column in pairs
+            ]
+    return enriched
+
+
+def _session_query_scopes_for_value_grounding(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return []
+    scopes: list[dict[str, Any]] = []
+    for item in value.get("query_scopes") or ():
+        if isinstance(item, Mapping):
+            scopes.append(dict(item))
+    return _dedupe_json_values(scopes)
+
+
+def _operation_validation_inputs_for_grounding(
+    operation: Operation,
+) -> tuple[list[Any], list[Any]]:
+    facts: list[Any] = []
+    warnings: list[Any] = []
+    for item in operation.metadata.get("validation_facts") or ():
+        if isinstance(item, (Mapping, str)):
+            facts.append(dict(item) if isinstance(item, Mapping) else str(item))
+    for item in operation.metadata.get("validation_warnings") or ():
+        if isinstance(item, (Mapping, str)):
+            warnings.append(dict(item) if isinstance(item, Mapping) else str(item))
+    return _dedupe_json_values(facts), _dedupe_json_values(warnings)
+
+
+def _validation_items_for_value_grounding(value: Any) -> list[Any]:
+    items: list[Any] = []
+    for item in _value_grounding_iterable(value):
+        if isinstance(item, Mapping):
+            safe = {
+                key: item[key]
+                for key in (
+                    "kind",
+                    "table",
+                    "table_name",
+                    "column",
+                    "column_name",
+                    "literal",
+                    "value",
+                    "filter_literal",
+                    "candidates",
+                )
+                if key in item
+            }
+            if safe:
+                items.append(safe)
+        elif isinstance(item, str) and item.strip():
+            items.append(item.strip())
+    return items
+
+
+def _value_grounding_iterable(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return list(value)
+    return [value]
+
+
+def _value_grounding_has_structured_targets(task_input: Mapping[str, Any]) -> bool:
+    for key in (
+        "targets",
+        "profile_pairs",
+        "validation_facts",
+        "warnings",
+        "validation_warnings",
+        "session_query_scopes",
+    ):
+        if task_input.get(key):
+            return True
+    return False
+
+
+def _legacy_value_grounding_fallback_allowed(task_input: Mapping[str, Any]) -> bool:
+    prompt = " ".join(
+        str(value or "")
+        for value in (task_input.get("prompt"), task_input.get("query"))
+        if str(value or "").strip()
+    )
+    if not prompt:
+        return False
+    if re.search(r"['\"][^'\"]{1,80}['\"]", prompt):
+        return True
+    return bool(_identifier_tokens(prompt) & _COLUMN_VALUE_SCOPE_TOKENS)
+
+
+def _dedupe_json_values(values: Iterable[Any]) -> list[Any]:
+    seen: set[str] = set()
+    out: list[Any] = []
+    for value in values:
+        key = json.dumps(value, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
 
 
 def _normalize_column_value_scope(
@@ -1876,38 +2236,81 @@ _CATEGORICAL_COLUMN_NAMES = frozenset(
 )
 
 
-def _column_value_task_input_with_schema_scope(
+def _column_value_task_input_with_grounding_plan(
     task_input: dict[str, Any],
     *,
-    operation: Operation,
-    schema_evidence: Evidence | None,
+    grounding_plan: Evidence | None,
 ) -> dict[str, Any]:
-    if _column_value_profile_pairs(task_input) or schema_evidence is None:
+    if grounding_plan is None or not isinstance(grounding_plan.payload, Mapping):
         return task_input
-    pairs = _derive_column_value_profile_pairs(
-        schema_evidence.payload,
-        prompt=" ".join(
-            str(value or "")
-            for value in (
-                task_input.get("prompt"),
-                task_input.get("query"),
-                operation.request.get("prompt"),
-            )
-        ),
-        session_context=operation.request.get("session_context"),
+    targets = [
+        target
+        for target in grounding_plan.payload.get("targets", []) or []
+        if isinstance(target, Mapping)
+    ]
+    if not targets:
+        return {
+            **task_input,
+            "value_grounding_plan_evidence_id": grounding_plan.id,
+            "value_grounding_profile_pairs": [],
+        }
+    all_pairs = _ordered_target_pairs(targets)
+    profile_pairs = _ordered_target_pairs(
+        target for target in targets if target.get("requires_profile_read") is True
     )
-    if not pairs:
-        return task_input
-    tables = _ordered_unique_strings([table for table, _column in pairs])
-    columns = _ordered_unique_strings([column for _table, column in pairs])
+    if not all_pairs:
+        return {
+            **task_input,
+            "value_grounding_plan_evidence_id": grounding_plan.id,
+            "value_grounding_profile_pairs": [],
+        }
+    tables = _ordered_unique_strings([table for table, _column in all_pairs])
+    columns = _ordered_unique_strings([column for _table, column in all_pairs])
+    query = _query_with_grounding_terms(task_input, targets)
     return {
         **task_input,
+        "query": query,
+        "prompt": query,
         "profile_pairs": [
-            {"table": table, "column": column} for table, column in pairs
+            {"table": table, "column": column} for table, column in all_pairs
         ],
+        "value_grounding_profile_pairs": [
+            {"table": table, "column": column} for table, column in profile_pairs
+        ],
+        "value_grounding_plan_evidence_id": grounding_plan.id,
         "tables": tables,
         "columns": columns,
     }
+
+
+def _ordered_target_pairs(targets: Iterable[Mapping[str, Any]]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for target in targets:
+        table = str(target.get("table") or "").strip()
+        column = str(target.get("column") or "").strip()
+        if table and column:
+            pairs.append((table, column))
+    return list(dict.fromkeys(pairs))
+
+
+def _query_with_grounding_terms(
+    task_input: Mapping[str, Any],
+    targets: list[Mapping[str, Any]],
+) -> str:
+    values = [
+        str(task_input.get("query") or task_input.get("prompt") or "").strip()
+    ]
+    for target in targets:
+        values.append(str(target.get("table") or ""))
+        values.append(str(target.get("column") or ""))
+        source = target.get("source")
+        if isinstance(source, Mapping):
+            literal = source.get("literal")
+            if literal is not None:
+                values.append(str(literal))
+            for value in source.get("values") or ():
+                values.append(str(value))
+    return " ".join(value for value in values if value.strip())
 
 
 def _derive_column_value_profile_pairs(
@@ -2026,6 +2429,16 @@ def _column_value_profile_pairs(task_input: dict[str, Any]) -> list[tuple[str, s
     if not tables or not columns:
         return []
     return [(table, column) for table in tables for column in columns]
+
+
+def _column_value_profile_read_pairs(
+    task_input: dict[str, Any],
+) -> list[tuple[str, str]]:
+    if "value_grounding_profile_pairs" in task_input:
+        return _safe_column_value_profile_pairs(
+            task_input.get("value_grounding_profile_pairs")
+        )
+    return _column_value_profile_pairs(task_input)
 
 
 def _safe_column_value_profile_pairs(value: Any) -> list[tuple[str, str]]:

@@ -876,13 +876,6 @@ async def test_missing_sql_no_longer_falls_back_to_latest_plan_silently():
     assert compilation.rejected_action_summaries[0]["error"] == "missing_sql"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Phase 0 characterization for validation-driven value grounding repair; "
-        "expected to pass after Phase 3."
-    ),
-    strict=True,
-)
 async def test_validation_grounding_repair_targets_only_validation_column():
     catalog = CatalogPlugin(auto_persist=False)
     sqlite = SQLitePlugin(path=":memory:")

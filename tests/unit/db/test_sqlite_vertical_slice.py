@@ -11,7 +11,7 @@ from daita.db.runtime import DbRuntimeGovernanceBlocked
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import AccessMode, Capability, RiskLevel, TaskStatus
+from daita.runtime import AccessMode, Capability, Evidence, RiskLevel, TaskStatus
 import pytest
 
 
@@ -352,7 +352,6 @@ async def test_catalog_column_value_search_profiles_dotted_target_before_search(
         VALUES (1, 'complete'), (2, 'complete'), (3, 'pending');
         """
     )
-
     try:
         operation = await runtime.kernel.create_operation(
             operation_type="data.query",
@@ -505,6 +504,14 @@ async def test_planning_context_value_hints_profile_prompt_scope_before_context(
         VALUES (1, 'complete', 120.0), (2, 'pending', 80.0);
         """
     )
+    executed_capabilities = []
+    original_execute_task = runtime.execute_task
+
+    async def execute_task_spy(task, operation, context=None):
+        executed_capabilities.append(task.capability_id)
+        return await original_execute_task(task, operation, context)
+
+    runtime.execute_task = execute_task_spy
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -541,7 +548,7 @@ async def test_planning_context_value_hints_profile_prompt_scope_before_context(
             compilation.task_specs,
             contract=compilation.compiled_contract_snapshot,
         )
-        for task in plan.tasks[:2]:
+        for task in plan.tasks[:3]:
             await runtime.execute_task(task, operation)
         evidence = await runtime.store.list_evidence(operation.id)
         tasks = await runtime.store.list_tasks(operation.id)
@@ -551,8 +558,26 @@ async def test_planning_context_value_hints_profile_prompt_scope_before_context(
     assert compilation.rejected_action_summaries == ()
     assert [spec.capability_id for spec in compilation.task_specs] == [
         "db.schema.inspect",
+        "catalog.value_grounding.plan",
         "catalog.column_value_hints.resolve",
         "db.planning.context.build",
+    ]
+    assert "catalog.value_grounding.plan" in executed_capabilities
+    assert executed_capabilities.index("catalog.value_grounding.plan") < (
+        executed_capabilities.index("db.column_values.profile")
+    )
+    grounding_plan = next(
+        item for item in evidence if item.kind == "catalog.value_grounding.plan"
+    )
+    assert grounding_plan.payload["targets"] == [
+        {
+            "table": "orders",
+            "column": "status",
+            "reason": "explicit_profile_pair",
+            "confidence": 0.92,
+            "requires_profile_read": True,
+            "source": {"kind": "profile_pair"},
+        }
     ]
     hint_task = next(
         task
@@ -749,6 +774,436 @@ async def test_planning_context_general_prompt_does_not_profile_values_without_f
     )
 
 
+async def test_validation_fact_value_grounding_profiles_only_target_column():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            channel TEXT NOT NULL
+        );
+        CREATE TABLE customers (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO orders (id, status, channel)
+        VALUES (1, 'complete', 'web'), (2, 'pending', 'store');
+        INSERT INTO customers (id, status)
+        VALUES (1, 'active'), (2, 'inactive');
+        """
+    )
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Repair the draft SQL using validation facts.",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="validation-unobserved-status",
+                kind="sql.validation",
+                owner="sqlite",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "valid": False,
+                    "sql": (
+                        "SELECT COUNT(*) FROM orders "
+                        "WHERE orders.status = 'completed'"
+                    ),
+                    "operation": "query",
+                    "warnings": [
+                        {
+                            "kind": "unobserved_filter_literal",
+                            "table": "orders",
+                            "column": "status",
+                            "literal": "completed",
+                            "candidates": ["complete", "pending"],
+                        }
+                    ],
+                    "validation_facts": [
+                        {
+                            "kind": "unobserved_filter_literal",
+                            "table": "orders",
+                            "column": "status",
+                            "literal": "completed",
+                            "candidates": ["complete", "pending"],
+                        }
+                    ],
+                },
+            )
+        )
+        loop = DbAgentLoop(runtime, object())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="context",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={"source_owner": "sqlite"},
+                ),
+            ),
+        )
+        compilation = loop.compile_actions(decision, state)
+        operation = await loop._persist_compiled_contract(operation, compilation)
+        plan = await runtime.plan_task_specs(
+            operation,
+            compilation.task_specs,
+            contract=compilation.compiled_contract_snapshot,
+        )
+        for task in plan.tasks:
+            await runtime.execute_task(task, operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    grounding_plan = next(
+        item for item in evidence if item.kind == "catalog.value_grounding.plan"
+    )
+    assert [
+        (target["table"], target["column"], target["requires_profile_read"])
+        for target in grounding_plan.payload["targets"]
+    ] == [("orders", "status", True)]
+    profile_tasks = [
+        task for task in tasks if task.capability_id == "db.column_values.profile"
+    ]
+    assert [(task.input["table"], task.input["column"]) for task in profile_tasks] == [
+        ("orders", "status")
+    ]
+    register_tasks = [
+        task
+        for task in tasks
+        if task.capability_id == "catalog.column_values.register"
+    ]
+    assert len(register_tasks) == 1
+    hint = next(item for item in evidence if item.kind == "schema.column_value_hint")
+    assert [(item["table"], item["column"]) for item in hint.payload["hints"]] == [
+        ("orders", "status")
+    ]
+    assert hint.payload["hints"][0]["observed_values"][0]["value"] == "complete"
+
+
+async def test_session_scope_value_grounding_profiles_non_keyword_value():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            fulfillment_status TEXT NOT NULL,
+            channel TEXT NOT NULL
+        );
+        INSERT INTO orders (id, fulfillment_status, channel)
+        VALUES (1, 'fulfilled', 'web'), (2, 'queued', 'store');
+        """
+    )
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Summarize the same orders.",
+                "source_scope": ["sqlite"],
+                "session_context": {
+                    "query_scopes": [
+                        {
+                            "operation_id": "op-prior",
+                            "tables": ["orders"],
+                            "filters": [
+                                {
+                                    "column": "fulfillment_status",
+                                    "operator": "=",
+                                    "values": ["fulfilled"],
+                                }
+                            ],
+                        }
+                    ]
+                },
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        loop = DbAgentLoop(runtime, object())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="context",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={"source_owner": "sqlite"},
+                ),
+            ),
+        )
+        compilation = loop.compile_actions(decision, state)
+        operation = await loop._persist_compiled_contract(operation, compilation)
+        plan = await runtime.plan_task_specs(
+            operation,
+            compilation.task_specs,
+            contract=compilation.compiled_contract_snapshot,
+        )
+        for task in plan.tasks:
+            await runtime.execute_task(task, operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    grounding_plan = next(
+        item for item in evidence if item.kind == "catalog.value_grounding.plan"
+    )
+    assert [
+        (target["table"], target["column"], target["reason"])
+        for target in grounding_plan.payload["targets"]
+    ] == [("orders", "fulfillment_status", "session_query_scope_filter")]
+    profile_tasks = [
+        task for task in tasks if task.capability_id == "db.column_values.profile"
+    ]
+    assert [(task.input["table"], task.input["column"]) for task in profile_tasks] == [
+        ("orders", "fulfillment_status")
+    ]
+    hint = next(item for item in evidence if item.kind == "schema.column_value_hint")
+    assert hint.payload["hints"][0]["observed_values"][0]["value"] == "fulfilled"
+
+
+async def test_existing_catalog_profile_grounding_does_not_profile_again():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO orders (id, status)
+        VALUES (1, 'complete'), (2, 'pending');
+        """
+    )
+
+    try:
+        schema = await runtime.execute_capability(
+            "db.schema.inspect",
+            owner="sqlite",
+            operation_type="schema.query",
+        )
+        await runtime.execute_capability(
+            "catalog.source.register",
+            owner="catalog",
+            operation_type="schema.register",
+            input={
+                "schema": schema[0].payload,
+                "store_type": "sqlite",
+                "store_id": "store:sqlite",
+                "persist": False,
+            },
+        )
+        await catalog.register_column_value_profiles(
+            "store:sqlite",
+            [
+                {
+                    "table": "orders",
+                    "column": "status",
+                    "distinct_count": 2,
+                    "top_values": [
+                        {"value": "complete", "count": 1},
+                        {"value": "pending", "count": 1},
+                    ],
+                }
+            ],
+        )
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "What are completed order totals?",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        loop = DbAgentLoop(runtime, object())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="context",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={"source_owner": "sqlite"},
+                ),
+            ),
+        )
+        compilation = loop.compile_actions(decision, state)
+        operation = await loop._persist_compiled_contract(operation, compilation)
+        plan = await runtime.plan_task_specs(
+            operation,
+            compilation.task_specs,
+            contract=compilation.compiled_contract_snapshot,
+        )
+        for task in plan.tasks:
+            await runtime.execute_task(task, operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    grounding_plan = next(
+        item for item in evidence if item.kind == "catalog.value_grounding.plan"
+    )
+    assert [
+        (target["table"], target["column"], target["requires_profile_read"])
+        for target in grounding_plan.payload["targets"]
+    ] == [("orders", "status", False)]
+    assert not any(task.capability_id == "db.column_values.profile" for task in tasks)
+    hint = next(item for item in evidence if item.kind == "schema.column_value_hint")
+    assert hint.payload["hints"][0]["observed_values"][0]["value"] == "complete"
+
+
+async def test_value_grounding_skipped_budget_target_does_not_profile():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO orders (id, status)
+        VALUES (1, 'complete'), (2, 'pending');
+        """
+    )
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Resolve status values.",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        loop = DbAgentLoop(runtime, object())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="context",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={
+                        "source_owner": "sqlite",
+                        "targets": [{"table": "orders", "column": "status"}],
+                        "profile_budget": 0,
+                    },
+                ),
+            ),
+        )
+        compilation = loop.compile_actions(decision, state)
+        operation = await loop._persist_compiled_contract(operation, compilation)
+        plan = await runtime.plan_task_specs(
+            operation,
+            compilation.task_specs,
+            contract=compilation.compiled_contract_snapshot,
+        )
+        for task in plan.tasks:
+            await runtime.execute_task(task, operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    grounding_plan = next(
+        item for item in evidence if item.kind == "catalog.value_grounding.plan"
+    )
+    assert grounding_plan.payload["targets"] == []
+    assert grounding_plan.payload["skipped"] == [
+        {
+            "table": "orders",
+            "column": "status",
+            "reason": "profile_budget_exhausted",
+        }
+    ]
+    assert not any(task.capability_id == "db.column_values.profile" for task in tasks)
+
+
 async def test_catalog_column_value_profile_prerequisite_requires_contract_declaration():
     catalog = CatalogPlugin(auto_persist=False)
     sqlite = SQLitePlugin(path=":memory:")
@@ -796,7 +1251,7 @@ async def test_catalog_column_value_profile_prerequisite_requires_contract_decla
         )
         with pytest.raises(
             RuntimeError,
-            match="undeclared_runtime_prerequisite:db\\.column_values\\.profile",
+            match="undeclared_runtime_prerequisite:catalog\\.value_grounding\\.plan",
         ):
             await runtime.execute_task(search_plan.tasks[0], operation)
         evidence = await runtime.store.list_evidence(operation.id)
@@ -812,7 +1267,7 @@ async def test_catalog_column_value_profile_prerequisite_requires_contract_decla
     assert blocked_search.status is TaskStatus.BLOCKED
     assert (
         blocked_search.metadata["runtime_prerequisite_blocked"]["error"]
-        == "undeclared_runtime_prerequisite:db.column_values.profile"
+        == "undeclared_runtime_prerequisite:catalog.value_grounding.plan"
     )
 
 
@@ -841,6 +1296,27 @@ async def test_catalog_column_value_profile_ambiguous_source_owner_blocks_prepar
                 "prompt": "Search observed status values for completed orders",
             },
             evaluate_governance=False,
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="schema-for-ambiguous-profile-owner",
+                kind="schema.asset_profile",
+                owner="source_alpha",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "database_type": "sqlite",
+                    "tables": [
+                        {
+                            "name": "orders",
+                            "columns": [
+                                {"name": "id", "data_type": "INTEGER"},
+                                {"name": "status", "data_type": "TEXT"},
+                            ],
+                        }
+                    ],
+                },
+            )
         )
         operation, search_specs, contract = await _compile_column_value_search(
             runtime,

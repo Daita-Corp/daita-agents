@@ -95,36 +95,6 @@ _TERMINAL_TASK_STATUSES = {
 }
 
 _CATALOG_COLUMN_VALUE_GROUNDING_REASON = "catalog_column_value_grounding"
-_PLANNING_VALUE_HINT_TOKENS = frozenset(
-    {
-        "active",
-        "apac",
-        "category",
-        "closed",
-        "code",
-        "complete",
-        "completed",
-        "enterprise",
-        "eu",
-        "high",
-        "inactive",
-        "low",
-        "midmarket",
-        "na",
-        "open",
-        "pending",
-        "region",
-        "severity",
-        "startup",
-        "state",
-        "status",
-        "tier",
-        "type",
-        "urgent",
-    }
-)
-
-
 @dataclass(frozen=True)
 class DbActionCompilation:
     """Runtime compilation of planner actions to governed DB task specs."""
@@ -1050,15 +1020,23 @@ class DbAgentLoop:
                 )
                 context_dependencies.append(schema_dependency)
 
-        if _state_should_resolve_column_value_hints_for_planning(state, action):
+        if _state_should_plan_value_grounding_for_planning(state, action):
+            grounding_resolved = self._resolve_capability(
+                "catalog.value_grounding.plan",
+                owner=None,
+            )
             hints_resolved = self._resolve_capability(
                 "catalog.column_value_hints.resolve",
                 owner=None,
             )
+            grounding_error = self._capability_error(action, grounding_resolved)
             hints_error = self._capability_error(action, hints_resolved)
-            if hints_error is None:
+            if grounding_error is None and hints_error is None:
+                grounding_capability = grounding_resolved["capability"]
                 hints_capability = hints_resolved["capability"]
-                prerequisite_capabilities.append(hints_capability)
+                prerequisite_capabilities.extend(
+                    (grounding_capability, hints_capability)
+                )
                 access_errors = self._access_errors(
                     action,
                     prerequisite_capabilities,
@@ -1066,6 +1044,54 @@ class DbAgentLoop:
                 )
                 if access_errors:
                     return [], [], access_errors
+                grounding_input = _value_grounding_plan_task_input(action, state)
+                grounding_spec = _with_deterministic_task_id(
+                    state.operation_id,
+                    DbTaskSpec(
+                        capability_id=grounding_capability.id,
+                        owner=grounding_capability.owner,
+                        input=grounding_input,
+                        reason="runtime_prerequisite:planning_value_grounding_plan",
+                        sequence=sequence_start + len(specs),
+                        dependencies=(
+                            (schema_dependency,)
+                            if schema_dependency is not None
+                            else ()
+                        ),
+                        metadata={
+                            **_action_metadata(action, decision_fingerprint),
+                            "runtime_prerequisite": True,
+                            "value_grounding_plan": "planning",
+                        },
+                        deterministic_key=(
+                            f"{action.action_id}:catalog.value_grounding.plan"
+                        ),
+                    ),
+                )
+                specs.append(grounding_spec)
+                selected.append(
+                    _capability_selection(
+                        grounding_capability,
+                        action,
+                        reason="runtime_prerequisite:planning_value_grounding_plan",
+                    )
+                )
+                grounding_dependency = TaskDependency(
+                    kind="evidence",
+                    evidence_kind="catalog.value_grounding.plan",
+                    evidence_owner=grounding_capability.owner,
+                    producer_task_id=grounding_spec.task_id,
+                    producer_capability_id=grounding_capability.id,
+                    producer_executor_id=grounding_capability.executor,
+                    evidence_accepted=True,
+                    input_hash=_stable_hash(grounding_input),
+                    operation_id=state.operation_id,
+                    metadata={
+                        "runtime_prerequisite": True,
+                        "producer_action_id": action.action_id,
+                        "consumer_action_id": action.action_id,
+                    },
+                )
                 hints_input = _column_value_hint_task_input(action, state)
                 hints_spec = _with_deterministic_task_id(
                     state.operation_id,
@@ -1075,11 +1101,7 @@ class DbAgentLoop:
                         input=hints_input,
                         reason="runtime_prerequisite:planning_column_value_hints",
                         sequence=sequence_start + len(specs),
-                        dependencies=(
-                            (schema_dependency,)
-                            if schema_dependency is not None
-                            else ()
-                        ),
+                        dependencies=(grounding_dependency,),
                         metadata={
                             **_action_metadata(action, decision_fingerprint),
                             "runtime_prerequisite": True,
@@ -1599,10 +1621,7 @@ class DbAgentLoop:
         elif action.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT:
             target_capability_id = "catalog.column_value_hints.resolve"
             tables, columns = _column_value_scope_for_action(action)
-            if not _state_should_resolve_column_value_hints_for_planning(
-                state,
-                action,
-            ):
+            if not _state_should_plan_value_grounding_for_planning(state, action):
                 return [], [], []
         else:
             return [], [], []
@@ -1658,6 +1677,10 @@ class DbAgentLoop:
             add_prerequisite("db.schema.inspect", owner=source_owner)
         if not _state_has_accepted_evidence(state, "catalog.source_registered"):
             add_prerequisite("catalog.source.register", owner=catalog_owner)
+        add_prerequisite(
+            "catalog.value_grounding.plan",
+            owner=catalog_owner,
+        )
         profile_capability = add_prerequisite(
             "db.column_values.profile",
             owner=source_owner,
@@ -3147,6 +3170,14 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
     if isinstance(evidence.payload, dict):
         if evidence.kind == "sql.validation" and "valid" in evidence.payload:
             summary["valid"] = evidence.payload.get("valid") is True
+            validation_facts = _safe_validation_items(
+                evidence.payload.get("validation_facts")
+            )
+            validation_warnings = _safe_validation_items(evidence.payload.get("warnings"))
+            if validation_facts:
+                summary["validation_facts"] = validation_facts
+            if validation_warnings:
+                summary["warnings"] = validation_warnings
         if evidence.kind == "db.memory.proposal":
             proposal_fingerprint = evidence.payload.get("proposal_fingerprint")
             if isinstance(proposal_fingerprint, str) and proposal_fingerprint.strip():
@@ -3158,6 +3189,32 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
     if payload_fingerprint:
         summary["payload_fingerprint"] = str(payload_fingerprint)
     return summary
+
+
+def _safe_validation_items(value: Any) -> list[Any]:
+    items: list[Any] = []
+    for item in _safe_iterable(value):
+        if isinstance(item, Mapping):
+            safe = {
+                key: item[key]
+                for key in (
+                    "kind",
+                    "table",
+                    "table_name",
+                    "column",
+                    "column_name",
+                    "literal",
+                    "value",
+                    "filter_literal",
+                    "candidates",
+                )
+                if key in item
+            }
+            if safe:
+                items.append(safe)
+        elif isinstance(item, str) and item.strip():
+            items.append(item.strip())
+    return _dedupe_json_values(items)
 
 
 def _evidence_ref(evidence: Evidence) -> dict[str, Any]:
@@ -3513,6 +3570,218 @@ def _column_value_hint_task_input(
     return task_input
 
 
+def _value_grounding_plan_task_input(
+    action: DbPlannerAction,
+    state: DbLoopState,
+) -> dict[str, Any]:
+    prompt = _planning_value_hint_prompt(action, state)
+    profile_budget = int(
+        _first_present(
+            action.input,
+            action.metadata,
+            keys=("profile_budget", "max_profile_budget"),
+            default=4,
+        )
+    )
+    task_input: dict[str, Any] = {
+        "prompt": prompt,
+        "query": prompt,
+        "profile_budget": profile_budget,
+        "max_profile_budget": profile_budget,
+    }
+    for key in (
+        "source_owner",
+        "db_owner",
+        "connector_owner",
+        "source_capability_owner",
+    ):
+        value = action.input.get(key) or action.metadata.get(key)
+        if value:
+            task_input[key] = str(value)
+            break
+    tables, columns = _column_value_scope_for_action(action)
+    if tables:
+        task_input["tables"] = list(tables)
+    if columns:
+        task_input["columns"] = list(columns)
+    profile_pairs = _action_profile_pairs(action, tables=tables, columns=columns)
+    if profile_pairs:
+        task_input["profile_pairs"] = profile_pairs
+    targets = _action_value_grounding_targets(action)
+    if targets:
+        task_input["targets"] = targets
+    validation_facts, validation_warnings = _state_value_grounding_validation_inputs(
+        state
+    )
+    if validation_facts:
+        task_input["validation_facts"] = validation_facts
+    if validation_warnings:
+        task_input["validation_warnings"] = validation_warnings
+    session_query_scopes = _state_session_query_scopes(state)
+    if session_query_scopes:
+        task_input["session_query_scopes"] = session_query_scopes
+    if state.safety_frame:
+        task_input["policy_frame"] = dict(state.safety_frame)
+    return task_input
+
+
+def _action_profile_pairs(
+    action: DbPlannerAction,
+    *,
+    tables: tuple[str, ...],
+    columns: tuple[str, ...],
+) -> list[dict[str, str]]:
+    explicit = _safe_profile_pair_list(
+        action.input.get("profile_pairs") or action.metadata.get("profile_pairs")
+    )
+    if explicit:
+        return explicit
+    if tables and columns:
+        return [
+            {"table": table, "column": column}
+            for table in tables
+            for column in columns
+        ]
+    return []
+
+
+def _action_value_grounding_targets(action: DbPlannerAction) -> list[dict[str, Any]]:
+    targets = _safe_target_list(
+        action.input.get("targets") or action.metadata.get("targets")
+    )
+    if targets:
+        return targets
+    target = action.input.get("target") or action.metadata.get("target")
+    if isinstance(target, str) and target.strip():
+        table, column = _split_column_ref(target)
+        if table and column:
+            return [{"table": table, "column": column}]
+    return []
+
+
+def _safe_profile_pair_list(value: Any) -> list[dict[str, str]]:
+    pairs: list[dict[str, str]] = []
+    for item in _safe_iterable(value):
+        table = ""
+        column = ""
+        if isinstance(item, Mapping):
+            table = str(item.get("table") or "").strip()
+            column = str(item.get("column") or "").strip()
+        elif isinstance(item, str):
+            table, column = _split_column_ref(item)
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            table = str(item[0]).strip()
+            column = str(item[1]).strip()
+        if table and column:
+            pairs.append({"table": table, "column": column})
+    return _dedupe_dicts(pairs, keys=("table", "column"))
+
+
+def _safe_target_list(value: Any) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    for item in _safe_iterable(value):
+        if isinstance(item, Mapping):
+            table = str(item.get("table") or item.get("table_name") or "").strip()
+            column = str(item.get("column") or item.get("column_name") or "").strip()
+            ref = str(item.get("target") or item.get("ref") or "").strip()
+            if ref and (not table or not column):
+                ref_table, ref_column = _split_column_ref(ref)
+                table = table or ref_table
+                column = column or ref_column
+            if table and column:
+                target = dict(item)
+                target["table"] = table
+                target["column"] = column
+                targets.append(target)
+        elif isinstance(item, str):
+            table, column = _split_column_ref(item)
+            if table and column:
+                targets.append({"table": table, "column": column})
+    return _dedupe_dicts(targets, keys=("table", "column"))
+
+
+def _state_value_grounding_validation_inputs(
+    state: DbLoopState,
+) -> tuple[list[Any], list[Any]]:
+    facts: list[Any] = []
+    warnings: list[Any] = []
+    for summary in state.validation_summaries:
+        facts.extend(_safe_iterable(summary.get("validation_facts")))
+        warnings.extend(_safe_iterable(summary.get("warnings")))
+        warnings.extend(_safe_iterable(summary.get("validation_warnings")))
+    return _dedupe_json_values(facts), _dedupe_json_values(warnings)
+
+
+def _state_session_query_scopes(state: DbLoopState) -> list[dict[str, Any]]:
+    session_context = state.normalized_user_request.get("session_context")
+    if not isinstance(session_context, Mapping):
+        return []
+    scopes = []
+    for scope in _safe_iterable(session_context.get("query_scopes")):
+        if isinstance(scope, Mapping):
+            scopes.append(dict(scope))
+    return _dedupe_json_values(scopes)
+
+
+def _safe_iterable(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return list(value)
+    return [value]
+
+
+def _first_present(
+    *sources: Mapping[str, Any],
+    keys: tuple[str, ...],
+    default: Any,
+) -> Any:
+    for source in sources:
+        for key in keys:
+            if key in source and source.get(key) is not None:
+                return source[key]
+    return default
+
+
+def _split_column_ref(value: Any) -> tuple[str, str]:
+    parts = [
+        part.strip().strip('"`[]')
+        for part in str(value or "").split(".")
+        if part.strip().strip('"`[]')
+    ]
+    if len(parts) >= 2:
+        return ".".join(parts[:-1]), parts[-1]
+    return "", ""
+
+
+def _dedupe_dicts(
+    values: list[dict[str, Any]],
+    *,
+    keys: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    seen: set[tuple[str, ...]] = set()
+    out: list[dict[str, Any]] = []
+    for value in values:
+        key = tuple(str(value.get(item) or "") for item in keys)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
+
+
+def _dedupe_json_values(values: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    out: list[Any] = []
+    for value in values:
+        key = json.dumps(value, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
+
+
 def _float_option(value: Mapping[str, Any], key: str, default: float) -> float:
     raw = value.get(key)
     if raw is None:
@@ -3530,7 +3799,7 @@ def _state_has_accepted_evidence(state: DbLoopState, kind: str) -> bool:
     )
 
 
-def _state_should_resolve_column_value_hints_for_planning(
+def _state_should_plan_value_grounding_for_planning(
     state: DbLoopState,
     action: DbPlannerAction,
 ) -> bool:
@@ -3539,12 +3808,17 @@ def _state_should_resolve_column_value_hints_for_planning(
     if _state_has_accepted_evidence(state, "schema.column_value_hint"):
         return False
     prompt = _planning_value_hint_prompt(action, state)
-    if not prompt:
-        return False
-    if re.search(r"['\"][^'\"]{1,80}['\"]", prompt):
+    if prompt:
         return True
-    tokens = _planning_value_hint_tokens(prompt)
-    return bool(tokens & _PLANNING_VALUE_HINT_TOKENS)
+    validation_facts, validation_warnings = _state_value_grounding_validation_inputs(
+        state
+    )
+    return bool(
+        validation_facts
+        or validation_warnings
+        or _state_session_query_scopes(state)
+        or _action_value_grounding_targets(action)
+    )
 
 
 def _planning_value_hint_prompt(
@@ -3559,10 +3833,6 @@ def _planning_value_hint_prompt(
         state.normalized_user_request.get("query"),
     )
     return " ".join(str(value).strip() for value in values if str(value or "").strip())
-
-
-def _planning_value_hint_tokens(value: str) -> set[str]:
-    return {item.lower() for item in re.findall(r"[A-Za-z0-9_]+", value)}
 
 
 def _latest_accepted_evidence_summary(
