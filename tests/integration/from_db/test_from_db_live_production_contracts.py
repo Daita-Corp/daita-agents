@@ -23,6 +23,7 @@ from tests.integration.from_db.live_production_helpers import (
     assert_synthesized_answer,
     create_live_postgres_from_db_agent,
     create_live_sqlite_from_db_agent,
+    diagnostic_text,
     evidence_kinds,
     latest_evidence,
     query_rows,
@@ -36,6 +37,9 @@ from tests.integration.from_db.live_production_helpers import (
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_llm]
+
+SESSION_FIRST_PROMPT = "Show enterprise customers in NA."
+SESSION_FOLLOWUP_PROMPT = "What are their completed order totals?"
 
 
 @pytest.fixture(scope="module")
@@ -287,3 +291,149 @@ async def test_live_literal_value_grounding_completed_vs_complete(tmp_path):
         raise
     finally:
         await agent.stop()
+
+
+async def test_live_stateful_followup_uses_session_context(tmp_path):
+    db_path = await seed_rich_sqlite_schema(tmp_path / "rich-stateful.sqlite")
+    agent = await create_live_sqlite_from_db_agent(
+        db_path,
+        runtime_path=tmp_path / "runtime.sqlite",
+        name="LiveFromDbStatefulFollowup",
+        stateful=True,
+    )
+    first = None
+    second = None
+    snapshot = None
+
+    try:
+        first = await agent.run_detailed(SESSION_FIRST_PROMPT)
+        second = await agent.run_detailed(SESSION_FOLLOWUP_PROMPT)
+        snapshot = await agent.runtime.inspect_operation(second.operation_id)
+
+        assert snapshot is not None
+        assert_successful_prompt_run(first)
+        assert_successful_prompt_run(second, snapshot=snapshot)
+        assert_loop_evidence(second)
+        assert_loop_evidence(snapshot)
+        assert_synthesized_answer(second)
+        assert first.request.session_id
+        assert second.request.session_id == first.request.session_id
+
+        session = second.diagnostics.get("session_context") or {}
+        assert session.get("session_id") == second.request.session_id
+        assert session.get("recent_operation_count", 0) >= 1
+        assert session.get("query_scope_count", 0) >= 1
+
+        planning = latest_evidence(second, "planning.context")
+        assert planning is not None
+        planning_session = planning.payload.get("session_context") or {}
+        assert planning_session.get("query_scopes") or []
+        rendered = str(planning.payload.get("rendered_context") or "").lower()
+        assert "session query scopes" in rendered
+        assert "enterprise" in rendered
+        assert "na" in rendered
+
+        sql = sql_from_result(second) or sql_from_result(snapshot)
+        assert_sql_is_read_only(sql)
+        lowered_sql = sql.lower()
+        assert "orders" in lowered_sql
+        assert "complete" in lowered_sql
+        assert "enterprise" in lowered_sql
+        assert re.search(r"(?i)\bNA\b|north america", sql), sql
+
+        rows = query_rows(second)
+        assert rows
+        values = row_values(second)
+        assert "Linus Torvalds" not in values
+        assert "Katherine Johnson" not in values
+        numeric_values = _numeric_values(rows)
+        assert 50.0 not in numeric_values
+        assert 210.0 not in numeric_values
+        assert (
+            120.0 in numeric_values
+            or 175.0 in numeric_values
+            or 295.0 in numeric_values
+        )
+
+        assert_no_unexpected_write_execution(second)
+        assert_no_unexpected_write_execution(snapshot)
+    except AssertionError:
+        artifact_dir = write_failure_artifacts(
+            tmp_path / "from_db_failure_artifacts",
+            result=second,
+            snapshot=snapshot,
+        )
+        print(f"[from_db artifacts] {artifact_dir}", file=sys.stderr)
+        raise
+    finally:
+        await agent.stop()
+
+
+async def test_live_stateless_followup_does_not_leak_context(tmp_path):
+    db_path = await seed_rich_sqlite_schema(tmp_path / "rich-stateless.sqlite")
+    agent = await create_live_sqlite_from_db_agent(
+        db_path,
+        runtime_path=tmp_path / "runtime.sqlite",
+        name="LiveFromDbStatelessFollowup",
+    )
+    first = None
+    second = None
+    snapshot = None
+
+    try:
+        first = await agent.run_detailed(SESSION_FIRST_PROMPT)
+        second = await agent.run_detailed(SESSION_FOLLOWUP_PROMPT)
+        snapshot = await agent.runtime.inspect_operation(second.operation_id)
+
+        assert first.request.session_id is None
+        assert second.request.session_id is None
+        assert getattr(agent, "_default_history", None) is None
+
+        session = second.diagnostics.get("session_context") or {}
+        assert session.get("session_id") is None
+        assert session.get("recent_operation_count", 0) == 0
+        assert session.get("query_scope_count", 0) == 0
+        session_sources = set((session.get("diagnostics") or {}).get("sources") or [])
+        assert "runtime.operations" not in session_sources
+        assert "conversation_history" not in session_sources
+
+        planning = latest_evidence(second, "planning.context", accepted_only=False)
+        if planning is not None:
+            planning_session = planning.payload.get("session_context") or {}
+            assert not (planning_session.get("query_scopes") or [])
+
+        text = diagnostic_text(second)
+        assert SESSION_FIRST_PROMPT not in text
+
+        sql = sql_from_result(second) or (sql_from_result(snapshot) if snapshot else "")
+        if sql:
+            lowered_sql = sql.lower()
+            assert not (
+                "enterprise" in lowered_sql
+                and re.search(r"(?i)\bNA\b|north america", sql)
+            ), sql
+
+        assert_no_unexpected_write_execution(second)
+        if snapshot is not None:
+            assert_no_unexpected_write_execution(snapshot)
+    except AssertionError:
+        artifact_dir = write_failure_artifacts(
+            tmp_path / "from_db_failure_artifacts",
+            result=second,
+            snapshot=snapshot,
+        )
+        print(f"[from_db artifacts] {artifact_dir}", file=sys.stderr)
+        raise
+    finally:
+        await agent.stop()
+
+
+def _numeric_values(rows: list[dict[str, object]]) -> set[float]:
+    values = set()
+    for row in rows:
+        for value in row.values():
+            try:
+                values.add(float(str(value).replace(",", "")))
+            except (TypeError, ValueError):
+                continue
+    return values

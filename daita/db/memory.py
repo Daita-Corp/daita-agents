@@ -1471,10 +1471,22 @@ def _planner_memory_omit_reason(
     if db_memory_pii_error(key=key, text=text, metadata=metadata):
         return "unsafe"
     if not _record_refs_known_schema(metadata, schema):
+        if _has_valid_semantic_contract(metadata):
+            return None
         return "schema_scope_mismatch"
     if not _memory_relevant_to_prompt(prompt, record):
         return "irrelevant"
     return None
+
+
+def _has_valid_semantic_contract(metadata: dict[str, Any]) -> bool:
+    try:
+        return (
+            _normalize_contract(metadata.get(DB_MEMORY_SEMANTIC_CONTRACT_KEY))
+            is not None
+        )
+    except Exception:
+        return False
 
 
 def _score_is_high_enough(result: dict[str, Any], threshold: float) -> bool:

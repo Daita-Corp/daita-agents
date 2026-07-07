@@ -480,6 +480,107 @@ async def test_catalog_column_value_search_profiles_dotted_input_target_before_s
     assert search[0].payload["profiles"][0]["top_values"][0]["value"] == "complete"
 
 
+async def test_planning_context_value_hints_profile_prompt_scope_before_context():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            total REAL NOT NULL
+        );
+        INSERT INTO orders (id, status, total)
+        VALUES (1, 'complete', 120.0), (2, 'pending', 80.0);
+        """
+    )
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "What are completed order totals?",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        loop = DbAgentLoop(runtime, object())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="context",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={"source_owner": "sqlite"},
+                ),
+            ),
+        )
+        compilation = loop.compile_actions(decision, state)
+        operation = await loop._persist_compiled_contract(operation, compilation)
+        plan = await runtime.plan_task_specs(
+            operation,
+            compilation.task_specs,
+            contract=compilation.compiled_contract_snapshot,
+        )
+        for task in plan.tasks[:2]:
+            await runtime.execute_task(task, operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.schema.inspect",
+        "catalog.column_value_hints.resolve",
+        "db.planning.context.build",
+    ]
+    hint_task = next(
+        task
+        for task in tasks
+        if task.capability_id == "catalog.column_value_hints.resolve"
+    )
+    assert hint_task.input["profile_pairs"] == [{"table": "orders", "column": "status"}]
+    prerequisite_tasks = {
+        task.capability_id: task
+        for task in tasks
+        if task.metadata.get("prerequisite_for") == "catalog.column_value_hints.resolve"
+    }
+    assert {
+        "db.column_values.profile",
+        "catalog.column_values.register",
+    } <= set(prerequisite_tasks)
+    assert (
+        next(item for item in evidence if item.kind == "column_values.profile").payload[
+            "top_values"
+        ][0]["value"]
+        == "complete"
+    )
+    hint = next(item for item in evidence if item.kind == "schema.column_value_hint")
+    assert hint.payload["hints"][0]["table"] == "orders"
+    assert hint.payload["hints"][0]["column"] == "status"
+    assert hint.payload["hints"][0]["observed_values"][0]["value"] == "complete"
+
+
 async def test_catalog_column_value_profile_prerequisite_requires_contract_declaration():
     catalog = CatalogPlugin(auto_persist=False)
     sqlite = SQLitePlugin(path=":memory:")

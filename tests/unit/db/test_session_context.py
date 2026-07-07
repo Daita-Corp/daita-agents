@@ -41,7 +41,8 @@ class SpyRuntime(DbRuntime):
 
 async def _seed_agent_schema(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE agent_profiles (
             id INTEGER PRIMARY KEY,
             agent_name TEXT NOT NULL
@@ -58,7 +59,8 @@ async def _seed_agent_schema(path):
         INSERT INTO agent_profiles (agent_name) VALUES ('alpha');
         INSERT INTO agent_runs (profile_id, status) VALUES (1, 'ok');
         INSERT INTO billing_events (amount_cents) VALUES (100);
-        """)
+        """
+    )
     await plugin.disconnect()
 
 
@@ -88,9 +90,53 @@ async def test_session_context_builder_collects_runtime_referents_and_diagnostic
             },
         )
     )
+    await runtime.store.save_evidence(
+        Evidence(
+            kind="query.plan.proposal",
+            owner="db_runtime",
+            operation_id="op-1",
+            payload={
+                "sql": (
+                    "SELECT c.customer_id, c.name FROM customers c "
+                    "JOIN regions r ON r.region_id = c.region_id "
+                    "WHERE c.tier = 'enterprise' "
+                    "AND r.region_code = 'NA' "
+                    "AND c.email = 'ada@example.com'"
+                ),
+                "structured_plan": {
+                    "selected_tables": ["customers", "regions"],
+                    "filters": [
+                        {
+                            "column": "customers.tier",
+                            "operator": "=",
+                            "value": "enterprise",
+                        },
+                        {
+                            "column": "regions.region_code",
+                            "operator": "=",
+                            "value": "NA",
+                        },
+                        {
+                            "column": "customers.email",
+                            "operator": "=",
+                            "value": "ada@example.com",
+                        },
+                    ],
+                },
+            },
+        )
+    )
+    await runtime.store.save_evidence(
+        Evidence(
+            kind="query.result",
+            owner="sqlite",
+            operation_id="op-1",
+            payload={"rows": [{"customer_id": 1}, {"customer_id": 3}]},
+        )
+    )
 
     context = await DbSessionContextBuilder(runtime).build(
-        DbRequest("What columns do those tables have?", session_id="s1"),
+        DbRequest("What are their completed order totals?", session_id="s1"),
         conversation_messages=[
             {"role": "user", "content": "What columns are in customers?"},
             {"role": "assistant", "content": "customers: id, name"},
@@ -98,9 +144,22 @@ async def test_session_context_builder_collects_runtime_referents_and_diagnostic
     )
 
     assert context.session_id == "s1"
-    assert context.referents.tables == ("customers",)
+    assert "customers" in context.referents.tables
     assert {"id", "name"} <= set(context.referents.columns)
     assert context.referents.operations == ("op-1",)
+    assert len(context.query_scopes) == 1
+    scope = context.query_scopes[0].to_dict()
+    assert {"customers", "regions"} <= set(scope["tables"])
+    assert {
+        (item["column"], item["operator"], tuple(item["values"]))
+        for item in scope["filters"]
+    } >= {
+        ("customers.tier", "=", ("enterprise",)),
+        ("regions.region_code", "=", ("NA",)),
+    }
+    assert "ada@example.com" not in json.dumps(scope)
+    assert scope["result_row_count"] == 2
+    assert context.diagnostics["query_scope_count"] == 1
     assert (
         "runtime.evidence" in context.diagnostics["referent_sources"]["tables"].values()
     )

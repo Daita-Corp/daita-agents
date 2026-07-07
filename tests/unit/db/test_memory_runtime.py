@@ -10,6 +10,7 @@ from daita.db import (
     DbRuntimeConfig,
 )
 from daita.db.analysis import structural_schema_fingerprint
+from daita.db.agent_loop import DbAgentLoop
 from daita.db.llm_planner import _planner_messages
 from daita.db.memory import (
     DBMemoryRecord,
@@ -27,6 +28,13 @@ from daita.db.memory_contracts import (
     DB_MEMORY_SEMANTIC_CONTRACT_KEY,
     extract_db_memory_semantic_contract,
     project_db_memory_semantic_contracts,
+)
+from daita.db.planner_protocol import (
+    DbLoopState,
+    DbPlannerAction,
+    DbPlannerActionKind,
+    DbPlannerDecision,
+    DbPlannerDecisionStatus,
 )
 from daita.db.runtime.tasks import DbTaskSpec
 from daita.embeddings.mock import MockEmbeddingProvider
@@ -397,13 +405,15 @@ async def test_memory_executors_return_typed_evidence(tmp_path):
 async def test_planning_time_db_memory_recall_adds_bounded_context(tmp_path):
     db_path = tmp_path / "planning_memory.sqlite"
     sqlite = SQLitePlugin(path=str(db_path))
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             total REAL NOT NULL
         );
         INSERT INTO orders (total) VALUES (10.0), (20.0);
-        """)
+        """
+    )
     source_identity = "sqlite:from_db:memory-test-source"
     memory = MemoryPlugin()
     backend = MagicMock()
@@ -642,6 +652,144 @@ def test_llm_planner_includes_db_memory_advisory_contract():
     assert "DB memory is semantic business context" in system_message
     assert "must satisfy the memory contract" in system_message
     assert "Schema, catalog, policy, SQL validation" in system_message
+
+
+async def test_agent_loop_build_planning_context_adds_memory_recall_prerequisite(
+    tmp_path,
+):
+    memory = _memory(tmp_path)
+    runtime = DbRuntime(
+        plugins=(memory,),
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "memory": {
+                        "enabled": True,
+                        "recall": "auto",
+                        "learning": "safe",
+                        "limit": 3,
+                        "char_budget": 800,
+                        "score_threshold": 0.0,
+                        "retrieval_mode": "structured",
+                        "source_identity": "sqlite:from_db:loop-memory",
+                    }
+                }
+            }
+        ),
+    )
+    await runtime.setup()
+    try:
+        state = DbLoopState(
+            operation_id="op-memory-context",
+            normalized_user_request={
+                "prompt": "Calculate recognized revenue from orders.total."
+            },
+            safety_frame={"max_access": "read"},
+            available_action_kinds=tuple(DbPlannerActionKind),
+            memory_context={
+                "enabled": True,
+                "source_identity": "sqlite:from_db:loop-memory",
+                "retrieval_mode": "structured",
+                "limit": 3,
+                "score_threshold": 0.0,
+                "recall_decision": {
+                    "recall": True,
+                    "reason": "semantic_prompt",
+                    "query": "recognized revenue orders.total complete",
+                },
+            },
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            actions=(
+                DbPlannerAction(
+                    action_id="context",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={},
+                ),
+            ),
+        )
+
+        compilation = DbAgentLoop(runtime, object()).compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "memory.semantic.recall",
+        "db.planning.context.build",
+    ]
+    recall, context = compilation.task_specs
+    assert recall.input == {
+        "query": "recognized revenue orders.total complete",
+        "category": "db_semantics",
+        "limit": 9,
+        "score_threshold": 0.0,
+        "retrieval_mode": "structured",
+        "source_identity": "sqlite:from_db:loop-memory",
+    }
+    assert context.dependencies[0].evidence_kind == "memory.semantic.recall"
+    assert context.dependencies[0].producer_task_id == recall.task_id
+    assert context.input["memory_recall_diagnostics"]["queried"] is True
+
+
+async def test_prior_turn_memory_proposal_dependency_recovers_to_latest_proposal(
+    tmp_path,
+):
+    runtime = _runtime_with_memory_source(_memory(tmp_path))
+    await runtime.setup()
+    try:
+        state = DbLoopState(
+            operation_id="op-memory-commit",
+            normalized_user_request={
+                "prompt": "Remember the board revenue metric definition",
+                "mode": "memory.update",
+            },
+            explicit_mode="memory.update",
+            safety_frame={"max_access": "write"},
+            available_action_kinds=tuple(DbPlannerActionKind),
+            accepted_evidence_summaries=(
+                {
+                    "id": "proposal-accepted",
+                    "kind": "db.memory.proposal",
+                    "owner": "db_runtime",
+                    "accepted": True,
+                    "task_id": "plan-task",
+                    "payload_fingerprint": "payload-fingerprint",
+                    "proposal_fingerprint": "proposal-fingerprint",
+                },
+            ),
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "memory.update"},
+            actions=(
+                DbPlannerAction(
+                    action_id="commit",
+                    kind=DbPlannerActionKind.COMMIT_MEMORY_UPDATE,
+                    input={},
+                    depends_on=("plan_previous_turn",),
+                ),
+            ),
+        )
+
+        compilation = DbAgentLoop(runtime, object()).compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.memory.commit_update"
+    ]
+    commit = compilation.task_specs[0]
+    assert commit.input == {
+        "proposal_evidence_id": "proposal-accepted",
+        "proposal_fingerprint": "proposal-fingerprint",
+    }
+    assert commit.dependencies[0].evidence_kind == "db.memory.proposal"
+    assert commit.dependencies[0].evidence_id == "proposal-accepted"
+    assert commit.dependencies[0].payload_fingerprint == "payload-fingerprint"
+    assert commit.metadata["dependency_recovery"] == "latest_accepted_memory_proposal"
 
 
 @pytest.mark.parametrize(
@@ -1247,7 +1395,8 @@ async def test_structured_db_memory_backfills_phase31_rows(tmp_path):
     db_path = tmp_path / "db_semantics.db"
     conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
-    cursor.execute("""
+    cursor.execute(
+        """
         CREATE TABLE db_memory_records (
             record_id TEXT PRIMARY KEY,
             source_identity_key TEXT NOT NULL,
@@ -1269,7 +1418,8 @@ async def test_structured_db_memory_backfills_phase31_rows(tmp_path):
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
-        """)
+        """
+    )
     cursor.execute(
         """
         INSERT INTO db_memory_records VALUES (
@@ -1341,7 +1491,8 @@ async def test_local_backend_migrates_legacy_db_memory_chunks(tmp_path):
     vector_db = workspace_dir / "vectors.db"
     conn = sqlite3.connect(str(vector_db))
     cursor = conn.cursor()
-    cursor.execute("""
+    cursor.execute(
+        """
         CREATE TABLE chunks (
             chunk_id TEXT PRIMARY KEY,
             file_path TEXT NOT NULL,
@@ -1351,7 +1502,8 @@ async def test_local_backend_migrates_legacy_db_memory_chunks(tmp_path):
             metadata TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        """)
+        """
+    )
     cursor.execute(
         "CREATE TABLE embeddings (chunk_id TEXT PRIMARY KEY, embedding TEXT NOT NULL)"
     )
@@ -1688,6 +1840,69 @@ def test_board_revenue_metric_memory_projects_semantic_contract():
     assert semantics[0]["enforceable"] is True
     assert contract_diagnostics["candidate_count"] == 1
     assert contract_diagnostics["enforced_count"] == 1
+
+
+def test_valid_contract_memory_ref_survives_schema_scope_mismatch_for_projection():
+    source_identity = "sqlite:from_db:source-a"
+    full_schema = _board_revenue_schema()
+    narrowed_schema = {
+        "tables": [
+            {
+                "name": "orders",
+                "columns": [{"name": "id"}, {"name": "status"}, {"name": "total"}],
+            },
+            {"name": "refunds", "columns": [{"name": "order_id"}]},
+        ]
+    }
+    record = DBMemoryRecord(
+        kind="metric_definition",
+        key="metric:board_revenue",
+        text="Board revenue is complete order total minus refunds.",
+        metadata=_board_revenue_contract_metadata(source_identity),
+    )
+    contract = extract_db_memory_semantic_contract(
+        record,
+        schema=full_schema,
+        source_identity=source_identity,
+        schema_fingerprint="schema-a",
+    )
+    record = normalize_db_memory_record(
+        {
+            **record.to_dict(),
+            "metadata": {
+                **record.metadata,
+                DB_MEMORY_SEMANTIC_CONTRACT_KEY: contract,
+            },
+        }
+    )
+    evidence = Evidence(
+        id="evidence-memory",
+        kind="memory.semantic.recall",
+        owner="memory",
+        payload={
+            "results": [
+                {
+                    "chunk_id": "mem-board-revenue",
+                    "metadata": {"db_memory": record.to_dict()},
+                    "score": 0.99,
+                }
+            ]
+        },
+    )
+
+    refs, _evidence_refs, diagnostics = db_memory_refs_from_recall_evidence(
+        (evidence,),
+        prompt="Calculate board revenue",
+        schema=narrowed_schema,
+        source_identity=source_identity,
+        schema_fingerprint="schema-a",
+        limit=3,
+        char_budget=800,
+        score_threshold=0.0,
+    )
+
+    assert [ref["key"] for ref in refs] == ["metric:board_revenue"]
+    assert diagnostics["omitted_reasons"] == {}
 
 
 def test_contract_projection_downgrades_cross_source_stale_and_low_confidence():

@@ -226,6 +226,22 @@ def _verify_memory_update(evidence: tuple[Evidence, ...]) -> tuple[str, ...]:
             else []
         )
         return tuple(["memory_proposal_not_accepted", *[str(item) for item in reasons]])
+    if proposal is not None and proposal.accepted:
+        definition = next(
+            (item for item in evidence if item.kind == "db.memory.definition"),
+            None,
+        )
+        memory_write = next(
+            (item for item in evidence if item.kind == "memory.semantic.write"),
+            None,
+        )
+        if (
+            definition is None
+            or not definition.accepted
+            or memory_write is None
+            or not memory_write.accepted
+        ):
+            return ("memory_update_not_committed",)
     memory_write = next(
         (item for item in evidence if item.kind == "memory.semantic.write"), None
     )

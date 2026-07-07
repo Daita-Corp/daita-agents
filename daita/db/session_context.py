@@ -10,13 +10,23 @@ from typing import Any, Iterable, Mapping
 from daita.runtime import Evidence, Operation, OperationStatus
 
 from .models import DbRequest
+from .sql_analysis import SqlAnalysisError, analyze_sql
 
 _MAX_MESSAGES = 12
 _MAX_OPERATIONS = 8
 _MAX_REFERENTS = 24
+_MAX_QUERY_SCOPES = 4
+_MAX_QUERY_FILTERS = 12
+_MAX_FILTER_VALUES = 8
+_MAX_FILTER_VALUE_CHARS = 80
 _MAX_IDENTIFIER_CHARS = 160
 _IDENTIFIER_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_.]*)`")
 _SCHEMA_LINE_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_.]*)\s*:\s*([^.;\n]+)")
+_SENSITIVE_FILTER_COLUMN_RE = re.compile(
+    r"(?i)(password|passwd|secret|token|api_?key|email|phone|mobile|ssn|"
+    r"social_security|credit_card|card_number|cvv|pin|dob|date_of_birth|"
+    r"birth_date|address|street|zip|postal|passport|national_id)"
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +65,61 @@ class DbSessionOperationRef:
                 if value.get("monitor_id") is not None
                 else None
             ),
+        )
+
+
+@dataclass(frozen=True)
+class DbSessionQueryScope:
+    """Compact predicate scope from a prior same-session query."""
+
+    operation_id: str
+    tables: tuple[str, ...] = ()
+    filters: tuple[dict[str, Any], ...] = ()
+    selected_columns: tuple[str, ...] = ()
+    result_row_count: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        result = {
+            "operation_id": _clip(self.operation_id, _MAX_IDENTIFIER_CHARS),
+            "tables": [
+                _clip(item, _MAX_IDENTIFIER_CHARS)
+                for item in self.tables[:_MAX_REFERENTS]
+            ],
+            "filters": [
+                item
+                for item in (
+                    _compact_query_filter(filter_item)
+                    for filter_item in self.filters[:_MAX_QUERY_FILTERS]
+                )
+                if item is not None
+            ],
+            "selected_columns": [
+                _clip(item, _MAX_IDENTIFIER_CHARS)
+                for item in self.selected_columns[:_MAX_REFERENTS]
+            ],
+        }
+        if self.result_row_count is not None:
+            result["result_row_count"] = max(0, int(self.result_row_count))
+        return result
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "DbSessionQueryScope":
+        filters = tuple(
+            item
+            for item in (
+                _compact_query_filter(filter_item)
+                for filter_item in value.get("filters", ()) or ()
+                if isinstance(filter_item, Mapping)
+            )
+            if item is not None
+        )
+        row_count = value.get("result_row_count")
+        return cls(
+            operation_id=str(value.get("operation_id") or ""),
+            tables=_strings(value.get("tables")),
+            filters=filters,
+            selected_columns=_strings(value.get("selected_columns")),
+            result_row_count=int(row_count) if isinstance(row_count, int) else None,
         )
 
 
@@ -104,6 +169,7 @@ class DbSessionContext:
     current_prompt: str
     conversation_messages: tuple[dict[str, str], ...] = ()
     recent_operations: tuple[DbSessionOperationRef, ...] = ()
+    query_scopes: tuple[DbSessionQueryScope, ...] = ()
     referents: DbSessionReferents = field(default_factory=DbSessionReferents)
     durable_ids: dict[str, str] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
@@ -118,6 +184,7 @@ class DbSessionContext:
             "session_id": _optional_clip(self.session_id),
             "user_id": _optional_clip(self.user_id),
             "recent_operations": [item.to_dict() for item in self.recent_operations],
+            "query_scopes": [item.to_dict() for item in self.query_scopes],
             "referents": _compact_referents(self.referents),
             "durable_ids": _compact_string_mapping(self.durable_ids),
             "diagnostics": _compact_diagnostics(
@@ -125,6 +192,7 @@ class DbSessionContext:
                     **self.diagnostics,
                     "conversation_message_count": len(self.conversation_messages),
                     "recent_operation_count": len(self.recent_operations),
+                    "query_scope_count": len(self.query_scopes),
                 }
             ),
         }
@@ -137,6 +205,7 @@ class DbSessionContext:
             "user_id": _optional_clip(self.user_id),
             "conversation_message_count": len(self.conversation_messages),
             "recent_operation_count": len(self.recent_operations),
+            "query_scope_count": len(self.query_scopes),
             "referents": _compact_referents(self.referents),
             "durable_ids": _compact_string_mapping(self.durable_ids),
             "diagnostics": _compact_diagnostics(self.diagnostics),
@@ -162,6 +231,11 @@ class DbSessionContext:
             recent_operations=tuple(
                 DbSessionOperationRef.from_dict(item)
                 for item in value.get("recent_operations", ()) or ()
+                if isinstance(item, Mapping)
+            ),
+            query_scopes=tuple(
+                DbSessionQueryScope.from_dict(item)
+                for item in value.get("query_scopes", ()) or ()
                 if isinstance(item, Mapping)
             ),
             referents=DbSessionReferents.from_dict(value.get("referents")),
@@ -214,6 +288,7 @@ class DbSessionContextBuilder:
             for operation in operations
         }
         approvals = await self._approval_ids(operations)
+        query_scopes: list[DbSessionQueryScope] = []
 
         tables = _OrderedStrings()
         columns = _OrderedStrings()
@@ -246,6 +321,12 @@ class DbSessionContextBuilder:
             monitors.extend(extracted["monitors"], source="runtime.evidence")
             schemas.extend(extracted["schemas"], source="runtime.evidence")
             metrics.extend(extracted["metrics"], source="runtime.evidence")
+            query_scope = _query_scope_from_evidence(
+                operation.id,
+                evidence_by_operation[operation.id],
+            )
+            if query_scope is not None:
+                query_scopes.append(query_scope)
 
         approval_ids.extend(approvals, source="runtime.approvals")
 
@@ -266,6 +347,7 @@ class DbSessionContextBuilder:
         }
         diagnostics["recent_operation_count"] = len(operations)
         diagnostics["evidence_operation_count"] = len(evidence_by_operation)
+        diagnostics["query_scope_count"] = len(query_scopes)
 
         return DbSessionContext(
             session_id=request.session_id,
@@ -273,6 +355,7 @@ class DbSessionContextBuilder:
             current_prompt=request.prompt,
             conversation_messages=messages,
             recent_operations=tuple(_operation_ref(item) for item in operations),
+            query_scopes=tuple(query_scopes[:_MAX_QUERY_SCOPES]),
             referents=DbSessionReferents(
                 tables=tables.values,
                 columns=columns.values,
@@ -469,6 +552,180 @@ def _extract_evidence_referents(
         "schemas": schemas.values,
         "metrics": metrics.values,
     }
+
+
+def _query_scope_from_evidence(
+    operation_id: str,
+    evidence: tuple[Evidence, ...],
+) -> DbSessionQueryScope | None:
+    tables = _OrderedStrings()
+    selected_columns = _OrderedStrings()
+    filters: list[dict[str, Any]] = []
+    result_row_count: int | None = None
+
+    for item in evidence:
+        if not item.accepted:
+            continue
+        payload = item.payload
+        if item.kind == "query.plan.proposal":
+            structured = payload.get("structured_plan")
+            if isinstance(structured, Mapping):
+                tables.extend(
+                    structured.get("selected_tables", ()) or (),
+                    source="query.plan",
+                )
+                for table in structured.get("tables", ()) or ():
+                    tables.add(table, source="query.plan")
+                for column in structured.get("selected_columns", ()) or ():
+                    selected_columns.add(column, source="query.plan")
+                for filter_item in structured.get("filters", ()) or ():
+                    _append_query_filter(filters, filter_item)
+            _add_sql_scope(
+                _first_sql_value(payload),
+                tables=tables,
+                selected_columns=selected_columns,
+                filters=filters,
+            )
+        elif item.kind == "sql.validation":
+            for table in payload.get("referenced_tables", ()) or ():
+                tables.add(table, source="sql.validation")
+            for table in payload.get("tables", ()) or ():
+                tables.add(table, source="sql.validation")
+            for column in payload.get("selected_columns", ()) or ():
+                selected_columns.add(column, source="sql.validation")
+            _add_sql_scope(
+                _first_sql_value(payload),
+                tables=tables,
+                selected_columns=selected_columns,
+                filters=filters,
+            )
+        elif item.kind == "query.result":
+            rows = payload.get("rows")
+            if isinstance(rows, list):
+                result_row_count = len(rows)
+
+    if not tables.values and not filters and not selected_columns.values:
+        return None
+    return DbSessionQueryScope(
+        operation_id=operation_id,
+        tables=tables.values,
+        filters=tuple(filters[:_MAX_QUERY_FILTERS]),
+        selected_columns=selected_columns.values,
+        result_row_count=result_row_count,
+    )
+
+
+def _add_sql_scope(
+    sql: str,
+    *,
+    tables: _OrderedStrings,
+    selected_columns: _OrderedStrings,
+    filters: list[dict[str, Any]],
+) -> None:
+    if not sql.strip():
+        return
+    try:
+        analysis = analyze_sql(sql)
+    except (ImportError, SqlAnalysisError, ValueError):
+        return
+    for table in analysis.tables:
+        if not table.is_cte:
+            tables.add(table.short_key, source="sql.analysis")
+    for item in analysis.select_items:
+        selected = item.alias or item.expression_sql
+        selected_columns.add(selected, source="sql.analysis")
+    for predicate in analysis.literal_predicates:
+        column = predicate.column.name
+        if predicate.column.table:
+            column = f"{predicate.column.table}.{predicate.column.name}"
+        _append_query_filter(
+            filters,
+            {
+                "column": column,
+                "operator": predicate.operator,
+                "values": list(predicate.values),
+            },
+        )
+
+
+def _append_query_filter(filters: list[dict[str, Any]], raw: Any) -> None:
+    if len(filters) >= _MAX_QUERY_FILTERS:
+        return
+    compact = _compact_query_filter(raw)
+    if compact is None:
+        return
+    key = (
+        compact["column"].lower(),
+        compact["operator"].lower(),
+        tuple(str(item).lower() for item in compact.get("values", ())),
+    )
+    existing = {
+        (
+            item["column"].lower(),
+            item["operator"].lower(),
+            tuple(str(value).lower() for value in item.get("values", ())),
+        )
+        for item in filters
+    }
+    if key not in existing:
+        filters.append(compact)
+
+
+def _compact_query_filter(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    column = str(raw.get("column") or raw.get("ref") or "").strip()
+    operator = str(raw.get("operator") or raw.get("op") or "").strip()
+    values = _filter_value_strings(
+        raw.get("values") if "values" in raw else raw.get("value")
+    )
+    if not column or not operator or not values:
+        return None
+    if _SENSITIVE_FILTER_COLUMN_RE.search(column):
+        return None
+    return {
+        "column": _clip(column, _MAX_IDENTIFIER_CHARS),
+        "operator": _clip(operator, _MAX_IDENTIFIER_CHARS),
+        "values": [
+            _clip(value, _MAX_FILTER_VALUE_CHARS)
+            for value in values[:_MAX_FILTER_VALUES]
+        ],
+    }
+
+
+def _filter_value_strings(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = (value,)
+    result = []
+    for item in values:
+        if item is None or isinstance(item, Mapping):
+            continue
+        text = str(item).strip()
+        if text:
+            result.append(text)
+    return tuple(result)
+
+
+def _first_sql_value(payload: Any) -> str:
+    if isinstance(payload, Mapping):
+        for key in ("sql", "planned_sql", "selected_sql", "query", "statement"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in payload.values():
+            nested = _first_sql_value(value)
+            if nested:
+                return nested
+    if isinstance(payload, (list, tuple)):
+        for value in payload:
+            nested = _first_sql_value(value)
+            if nested:
+                return nested
+    return ""
 
 
 def _schema_search_table_matched(table: Any) -> bool:

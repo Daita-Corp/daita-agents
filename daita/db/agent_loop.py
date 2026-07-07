@@ -21,6 +21,10 @@ from daita.runtime import (
 )
 
 from .models import DbIntent, DbIntentKind, DbLimits, DbOperationContract
+from .memory import (
+    db_memory_options_from_runtime_metadata,
+    db_memory_planning_recall_decision,
+)
 from .planner_protocol import (
     DbAgentPlanner,
     DbLoopState,
@@ -91,6 +95,34 @@ _TERMINAL_TASK_STATUSES = {
 }
 
 _CATALOG_COLUMN_VALUE_GROUNDING_REASON = "catalog_column_value_grounding"
+_PLANNING_VALUE_HINT_TOKENS = frozenset(
+    {
+        "active",
+        "apac",
+        "category",
+        "closed",
+        "code",
+        "complete",
+        "completed",
+        "enterprise",
+        "eu",
+        "high",
+        "inactive",
+        "low",
+        "midmarket",
+        "na",
+        "open",
+        "pending",
+        "region",
+        "severity",
+        "startup",
+        "state",
+        "status",
+        "tier",
+        "type",
+        "urgent",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -636,6 +668,11 @@ class DbAgentLoop:
                 _capability_summary(capability)
                 for capability in self.runtime.registry.capabilities
             ),
+            memory_context=_memory_context_for_state(
+                self.runtime,
+                operation,
+                accepted,
+            ),
             task_summaries=await self._task_summaries(operation.id),
             accepted_evidence_summaries=tuple(
                 _evidence_summary(item) for item in accepted
@@ -682,6 +719,20 @@ class DbAgentLoop:
                 continue
             actions.append(action)
 
+        current_action_ids = {action.action_id for action in actions}
+        actions = [
+            _recover_prior_turn_memory_proposal_action(
+                _recover_prior_turn_query_plan_action(
+                    action,
+                    state,
+                    current_action_ids=current_action_ids,
+                ),
+                state,
+                current_action_ids=current_action_ids,
+            )
+            for action in actions
+        ]
+
         ordered_actions, dag_errors = _ordered_actions_or_errors(tuple(actions))
         if dag_errors:
             rejected.extend(dag_errors)
@@ -693,6 +744,22 @@ class DbAgentLoop:
                 prior_action_specs=prior_action_specs,
                 operation_id=state.operation_id,
             )
+            if dependency_errors:
+                recovered_action = _recover_prior_turn_query_plan_dependency(
+                    action,
+                    state,
+                    dependency_errors,
+                )
+                if recovered_action is action:
+                    recovered_action = _recover_prior_turn_memory_proposal_dependency(
+                        action,
+                        state,
+                        dependency_errors,
+                    )
+                if recovered_action is not action:
+                    action = recovered_action
+                    planner_dependencies = ()
+                    dependency_errors = ()
             if dependency_errors:
                 rejected.extend(dependency_errors)
                 continue
@@ -834,6 +901,13 @@ class DbAgentLoop:
     ) -> tuple[list[DbTaskSpec], list[dict[str, Any]], list[dict[str, Any]]]:
         if action.kind in {DbPlannerActionKind.CLARIFY, DbPlannerActionKind.FINISH}:
             return [], [], []
+        if action.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT:
+            return self._compile_planning_context_action(
+                action,
+                state=state,
+                sequence_start=sequence_start,
+                decision_fingerprint=decision_fingerprint,
+            )
         if action.kind is DbPlannerActionKind.EXECUTE_VALIDATED_READ:
             return self._compile_validated_sql_action(
                 action,
@@ -873,6 +947,13 @@ class DbAgentLoop:
                 sequence_start=sequence_start,
                 decision_fingerprint=decision_fingerprint,
             )
+        if action.kind is DbPlannerActionKind.COMMIT_MEMORY_UPDATE:
+            return self._compile_memory_commit_action(
+                action,
+                state=state,
+                sequence_start=sequence_start,
+                decision_fingerprint=decision_fingerprint,
+            )
         capability_ids = _SIMPLE_ACTION_CAPABILITIES.get(action.kind)
         if capability_ids is None:
             return [], [], [_action_error(action, "unsupported_action_kind")]
@@ -883,6 +964,247 @@ class DbAgentLoop:
             sequence_start=sequence_start,
             decision_fingerprint=decision_fingerprint,
         )
+
+    def _compile_planning_context_action(
+        self,
+        action: DbPlannerAction,
+        *,
+        state: DbLoopState,
+        sequence_start: int,
+        decision_fingerprint: str,
+    ) -> tuple[list[DbTaskSpec], list[dict[str, Any]], list[dict[str, Any]]]:
+        owner = _action_owner(action)
+        context_resolved = self._resolve_capability(
+            "db.planning.context.build",
+            owner=owner,
+        )
+        context_error = self._capability_error(action, context_resolved)
+        if context_error is not None:
+            return [], [], [context_error]
+
+        context_capability = context_resolved["capability"]
+        capabilities = [context_capability]
+        specs: list[DbTaskSpec] = []
+        selected = [_capability_selection(context_capability, action)]
+        context_dependencies: list[TaskDependency] = []
+        context_input = _task_input_for_action(action)
+        memory_decision = state.memory_context.get("recall_decision") or {}
+        prerequisite_capabilities = [context_capability]
+        schema_dependency: TaskDependency | None = None
+
+        if not _state_has_accepted_evidence(state, "schema.asset_profile"):
+            schema_resolved = self._resolve_capability(
+                "db.schema.inspect",
+                owner=_source_capability_owner(action),
+            )
+            schema_error = self._capability_error(action, schema_resolved)
+            if schema_error is None:
+                schema_capability = schema_resolved["capability"]
+                prerequisite_capabilities.append(schema_capability)
+                access_errors = self._access_errors(
+                    action,
+                    prerequisite_capabilities,
+                    state,
+                )
+                if access_errors:
+                    return [], [], access_errors
+                schema_spec = _with_deterministic_task_id(
+                    state.operation_id,
+                    DbTaskSpec(
+                        capability_id=schema_capability.id,
+                        owner=schema_capability.owner,
+                        input={},
+                        reason="runtime_prerequisite:planning_schema_inspect",
+                        sequence=sequence_start,
+                        metadata={
+                            **_action_metadata(action, decision_fingerprint),
+                            "runtime_prerequisite": True,
+                            "schema_inspect": "planning",
+                        },
+                        deterministic_key=f"{action.action_id}:db.schema.inspect",
+                    ),
+                )
+                specs.append(schema_spec)
+                selected.append(
+                    _capability_selection(
+                        schema_capability,
+                        action,
+                        reason="runtime_prerequisite:planning_schema_inspect",
+                    )
+                )
+                schema_dependency = TaskDependency(
+                    kind="evidence",
+                    evidence_kind="schema.asset_profile",
+                    evidence_owner=schema_capability.owner,
+                    producer_task_id=schema_spec.task_id,
+                    producer_capability_id=schema_capability.id,
+                    producer_executor_id=schema_capability.executor,
+                    evidence_accepted=True,
+                    input_hash=_stable_hash({}),
+                    operation_id=state.operation_id,
+                    metadata={
+                        "runtime_prerequisite": True,
+                        "producer_action_id": action.action_id,
+                        "consumer_action_id": action.action_id,
+                    },
+                )
+                context_dependencies.append(schema_dependency)
+
+        if _state_should_resolve_column_value_hints_for_planning(state, action):
+            hints_resolved = self._resolve_capability(
+                "catalog.column_value_hints.resolve",
+                owner=None,
+            )
+            hints_error = self._capability_error(action, hints_resolved)
+            if hints_error is None:
+                hints_capability = hints_resolved["capability"]
+                prerequisite_capabilities.append(hints_capability)
+                access_errors = self._access_errors(
+                    action,
+                    prerequisite_capabilities,
+                    state,
+                )
+                if access_errors:
+                    return [], [], access_errors
+                hints_input = _column_value_hint_task_input(action, state)
+                hints_spec = _with_deterministic_task_id(
+                    state.operation_id,
+                    DbTaskSpec(
+                        capability_id=hints_capability.id,
+                        owner=hints_capability.owner,
+                        input=hints_input,
+                        reason="runtime_prerequisite:planning_column_value_hints",
+                        sequence=sequence_start + len(specs),
+                        dependencies=(
+                            (schema_dependency,)
+                            if schema_dependency is not None
+                            else ()
+                        ),
+                        metadata={
+                            **_action_metadata(action, decision_fingerprint),
+                            "runtime_prerequisite": True,
+                            "column_value_hints": "planning",
+                        },
+                        deterministic_key=(
+                            f"{action.action_id}:" "catalog.column_value_hints.resolve"
+                        ),
+                    ),
+                )
+                specs.append(hints_spec)
+                selected.append(
+                    _capability_selection(
+                        hints_capability,
+                        action,
+                        reason="runtime_prerequisite:planning_column_value_hints",
+                    )
+                )
+                context_dependencies.append(
+                    TaskDependency(
+                        kind="evidence",
+                        evidence_kind="schema.column_value_hint",
+                        evidence_owner=hints_capability.owner,
+                        producer_task_id=hints_spec.task_id,
+                        producer_capability_id=hints_capability.id,
+                        producer_executor_id=hints_capability.executor,
+                        evidence_accepted=True,
+                        input_hash=_stable_hash(hints_input),
+                        operation_id=state.operation_id,
+                        metadata={
+                            "runtime_prerequisite": True,
+                            "producer_action_id": action.action_id,
+                            "consumer_action_id": action.action_id,
+                        },
+                    )
+                )
+
+        if _state_should_recall_memory_for_planning(state):
+            recall_resolved = self._resolve_capability(
+                "memory.semantic.recall",
+                owner="memory",
+            )
+            recall_error = self._capability_error(action, recall_resolved)
+            if recall_error is None:
+                recall_capability = recall_resolved["capability"]
+                prerequisite_capabilities.append(recall_capability)
+                access_errors = self._access_errors(
+                    action,
+                    prerequisite_capabilities,
+                    state,
+                )
+                if access_errors:
+                    return [], [], access_errors
+                recall_input = _memory_recall_task_input(state)
+                recall_spec = _with_deterministic_task_id(
+                    state.operation_id,
+                    DbTaskSpec(
+                        capability_id=recall_capability.id,
+                        owner=recall_capability.owner,
+                        input=recall_input,
+                        reason="runtime_prerequisite:planning_memory_recall",
+                        sequence=sequence_start + len(specs),
+                        metadata={
+                            **_action_metadata(action, decision_fingerprint),
+                            "runtime_prerequisite": True,
+                            "memory_recall": "planning",
+                        },
+                        deterministic_key=f"{action.action_id}:memory.semantic.recall",
+                    ),
+                )
+                specs.append(recall_spec)
+                selected.append(
+                    _capability_selection(
+                        recall_capability,
+                        action,
+                        reason="runtime_prerequisite:planning_memory_recall",
+                    )
+                )
+                context_dependencies.append(
+                    TaskDependency(
+                        kind="evidence",
+                        evidence_kind="memory.semantic.recall",
+                        evidence_owner=recall_capability.owner,
+                        producer_task_id=recall_spec.task_id,
+                        producer_capability_id=recall_capability.id,
+                        producer_executor_id=recall_capability.executor,
+                        evidence_accepted=True,
+                        input_hash=_stable_hash(recall_input),
+                        operation_id=state.operation_id,
+                        metadata={
+                            "runtime_prerequisite": True,
+                            "producer_action_id": action.action_id,
+                            "consumer_action_id": action.action_id,
+                        },
+                    )
+                )
+                context_input.setdefault(
+                    "memory_recall_diagnostics",
+                    {
+                        "registered": True,
+                        "queried": True,
+                        "decision": memory_decision,
+                    },
+                )
+
+        if not specs:
+            access_errors = self._access_errors(action, capabilities, state)
+            if access_errors:
+                return [], [], access_errors
+
+        context_spec = _with_deterministic_task_id(
+            state.operation_id,
+            DbTaskSpec(
+                capability_id=context_capability.id,
+                owner=context_capability.owner,
+                input=context_input,
+                reason=f"planner:{action.kind.value}",
+                sequence=sequence_start + len(specs),
+                dependencies=tuple(context_dependencies),
+                metadata=_action_metadata(action, decision_fingerprint),
+                deterministic_key=f"{action.action_id}:db.planning.context.build",
+            ),
+        )
+        specs.append(context_spec)
+        return specs, selected, []
 
     def _compile_validated_sql_action(
         self,
@@ -1143,6 +1465,78 @@ class DbAgentLoop:
             [],
         )
 
+    def _compile_memory_commit_action(
+        self,
+        action: DbPlannerAction,
+        *,
+        state: DbLoopState,
+        sequence_start: int,
+        decision_fingerprint: str,
+    ) -> tuple[list[DbTaskSpec], list[dict[str, Any]], list[dict[str, Any]]]:
+        owner = _action_owner(action)
+        resolved = self._resolve_capability("db.memory.commit_update", owner=owner)
+        error = self._capability_error(action, resolved)
+        if error is not None:
+            return [], [], [error]
+        capability = resolved["capability"]
+        access_errors = self._access_errors(action, [capability], state)
+        if access_errors:
+            return [], [], access_errors
+        proposal, proposal_error = _resolve_memory_proposal_for_action(action, state)
+        if proposal_error is not None or proposal is None:
+            return (
+                [],
+                [],
+                [
+                    _action_error(
+                        action, proposal_error or "missing_accepted_memory_proposal"
+                    )
+                ],
+            )
+        proposal_id = str(proposal.get("id") or "")
+        payload_fingerprint = str(proposal.get("payload_fingerprint") or "")
+        proposal_fingerprint = str(
+            proposal.get("proposal_fingerprint") or payload_fingerprint
+        )
+        task_input = _task_input_for_action(action)
+        task_input.setdefault("proposal_evidence_id", proposal_id)
+        if proposal_fingerprint:
+            task_input.setdefault("proposal_fingerprint", proposal_fingerprint)
+        metadata = {
+            **_action_metadata(action, decision_fingerprint),
+            "proposal_evidence_id": proposal_id,
+        }
+        if proposal_fingerprint:
+            metadata["proposal_fingerprint"] = proposal_fingerprint
+        dependency = TaskDependency(
+            kind="evidence",
+            evidence_kind="db.memory.proposal",
+            evidence_id=proposal_id,
+            evidence_owner=str(proposal.get("owner") or "db_runtime"),
+            producer_task_id=proposal.get("task_id"),
+            producer_capability_id="db.memory.plan_update",
+            producer_executor_id="db_runtime.memory.plan_update",
+            evidence_accepted=True,
+            payload_fingerprint=payload_fingerprint or None,
+            operation_id=state.operation_id,
+            metadata={"memory_update_commit": True},
+        )
+        spec = DbTaskSpec(
+            capability_id=capability.id,
+            owner=capability.owner,
+            input=task_input,
+            reason=f"planner:{action.kind.value}",
+            sequence=sequence_start,
+            dependencies=(dependency,),
+            metadata=metadata,
+            deterministic_key=(
+                f"{action.action_id}:{capability.id}:"
+                f"{proposal_fingerprint or proposal_id}"
+            ),
+        )
+        spec = _with_deterministic_task_id(state.operation_id, spec)
+        return [spec], [_capability_selection(capability, action)], []
+
     def _compile_capability_specs(
         self,
         action: DbPlannerAction,
@@ -1197,18 +1591,31 @@ class DbAgentLoop:
         list[dict[str, Any]],
         list[dict[str, Any]],
     ]:
-        if action.kind is not DbPlannerActionKind.SEARCH_COLUMN_VALUES:
-            return [], [], []
-
-        tables, columns = _column_value_scope_for_action(action)
-        if not tables or not columns or not _state_allows_read_profile(state):
+        if action.kind is DbPlannerActionKind.SEARCH_COLUMN_VALUES:
+            target_capability_id = "catalog.column_values.search"
+            tables, columns = _column_value_scope_for_action(action)
+            if not tables or not columns or not _state_allows_read_profile(state):
+                return [], [], []
+        elif action.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT:
+            target_capability_id = "catalog.column_value_hints.resolve"
+            tables, columns = _column_value_scope_for_action(action)
+            if not _state_should_resolve_column_value_hints_for_planning(
+                state,
+                action,
+            ):
+                return [], [], []
+        else:
             return [], [], []
 
         selected: list[dict[str, Any]] = []
         prerequisites: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
-        target_capability_id = "catalog.column_values.search"
         source_owner = _source_capability_owner(action)
+        catalog_owner = (
+            _action_owner(action)
+            if action.kind is DbPlannerActionKind.SEARCH_COLUMN_VALUES
+            else None
+        )
 
         def add_prerequisite(
             capability_id: str,
@@ -1250,7 +1657,7 @@ class DbAgentLoop:
         if not _state_has_accepted_evidence(state, "schema.asset_profile"):
             add_prerequisite("db.schema.inspect", owner=source_owner)
         if not _state_has_accepted_evidence(state, "catalog.source_registered"):
-            add_prerequisite("catalog.source.register", owner=_action_owner(action))
+            add_prerequisite("catalog.source.register", owner=catalog_owner)
         profile_capability = add_prerequisite(
             "db.column_values.profile",
             owner=source_owner,
@@ -1258,7 +1665,7 @@ class DbAgentLoop:
         if profile_capability is not None:
             add_prerequisite(
                 "catalog.column_values.register",
-                owner=_action_owner(action),
+                owner=catalog_owner,
             )
         return selected, prerequisites, errors
 
@@ -2004,6 +2411,143 @@ def _task_input_for_action(action: DbPlannerAction) -> dict[str, Any]:
     }
 
 
+def _recover_prior_turn_query_plan_dependency(
+    action: DbPlannerAction,
+    state: DbLoopState,
+    dependency_errors: tuple[dict[str, Any], ...],
+) -> DbPlannerAction:
+    if action.kind is not DbPlannerActionKind.EXECUTE_VALIDATED_READ:
+        return action
+    if not dependency_errors or any(
+        not str(item.get("error") or "").startswith("missing_dependency:")
+        for item in dependency_errors
+    ):
+        return action
+    if _latest_accepted_evidence_summary(state, "query.plan.proposal") is None:
+        return action
+    query_plan_ref = action.input.get("query_plan_ref")
+    if "query_plan_ref" in action.input:
+        if query_plan_ref != "latest_accepted_query_plan":
+            return action
+        recovered_input = dict(action.input)
+    elif any(key in action.input for key in ("sql", "plan_evidence_id")):
+        return action
+    else:
+        recovered_input = {
+            **action.input,
+            "query_plan_ref": "latest_accepted_query_plan",
+        }
+    return replace(
+        action,
+        input=recovered_input,
+        depends_on=(),
+        metadata={
+            **action.metadata,
+            "recovered_prior_turn_dependency": True,
+            "dependency_recovery": "latest_accepted_query_plan",
+        },
+    )
+
+
+def _recover_prior_turn_query_plan_action(
+    action: DbPlannerAction,
+    state: DbLoopState,
+    *,
+    current_action_ids: set[str],
+) -> DbPlannerAction:
+    if action.kind is not DbPlannerActionKind.EXECUTE_VALIDATED_READ:
+        return action
+    if not action.depends_on or all(
+        dependency in current_action_ids for dependency in action.depends_on
+    ):
+        return action
+    return _recover_prior_turn_query_plan_dependency(
+        action,
+        state,
+        tuple(
+            _action_error(action, f"missing_dependency:{dependency}")
+            for dependency in action.depends_on
+            if dependency not in current_action_ids
+        ),
+    )
+
+
+def _recover_prior_turn_memory_proposal_dependency(
+    action: DbPlannerAction,
+    state: DbLoopState,
+    dependency_errors: tuple[dict[str, Any], ...],
+) -> DbPlannerAction:
+    if action.kind is not DbPlannerActionKind.COMMIT_MEMORY_UPDATE:
+        return action
+    if not dependency_errors or any(
+        not str(item.get("error") or "").startswith("missing_dependency:")
+        for item in dependency_errors
+    ):
+        return action
+    if _latest_accepted_evidence_summary(state, "db.memory.proposal") is None:
+        return action
+    return replace(
+        action,
+        depends_on=(),
+        metadata={
+            **action.metadata,
+            "recovered_prior_turn_dependency": True,
+            "dependency_recovery": "latest_accepted_memory_proposal",
+        },
+    )
+
+
+def _recover_prior_turn_memory_proposal_action(
+    action: DbPlannerAction,
+    state: DbLoopState,
+    *,
+    current_action_ids: set[str],
+) -> DbPlannerAction:
+    if action.kind is not DbPlannerActionKind.COMMIT_MEMORY_UPDATE:
+        return action
+    if not action.depends_on or all(
+        dependency in current_action_ids for dependency in action.depends_on
+    ):
+        return action
+    return _recover_prior_turn_memory_proposal_dependency(
+        action,
+        state,
+        tuple(
+            _action_error(action, f"missing_dependency:{dependency}")
+            for dependency in action.depends_on
+            if dependency not in current_action_ids
+        ),
+    )
+
+
+def _resolve_memory_proposal_for_action(
+    action: DbPlannerAction,
+    state: DbLoopState,
+) -> tuple[dict[str, Any] | None, str | None]:
+    proposal_id = action.input.get("proposal_evidence_id")
+    summaries = tuple(
+        summary
+        for summary in state.accepted_evidence_summaries
+        if summary.get("kind") == "db.memory.proposal"
+        and summary.get("accepted") is True
+    )
+    if proposal_id is not None:
+        proposal_id = str(proposal_id).strip()
+        if not proposal_id:
+            return None, "missing_proposal_evidence_id"
+        matches = tuple(
+            summary for summary in summaries if summary.get("id") == proposal_id
+        )
+        if len(matches) > 1:
+            return None, f"ambiguous_memory_proposal:{proposal_id}"
+        if not matches:
+            return None, f"memory_proposal_not_found:{proposal_id}"
+        return dict(matches[0]), None
+    if not summaries:
+        return None, "missing_accepted_memory_proposal"
+    return dict(summaries[-1]), None
+
+
 def _relationship_paths_task_input(
     action: DbPlannerAction,
     state: DbLoopState,
@@ -2603,6 +3147,10 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
     if isinstance(evidence.payload, dict):
         if evidence.kind == "sql.validation" and "valid" in evidence.payload:
             summary["valid"] = evidence.payload.get("valid") is True
+        if evidence.kind == "db.memory.proposal":
+            proposal_fingerprint = evidence.payload.get("proposal_fingerprint")
+            if isinstance(proposal_fingerprint, str) and proposal_fingerprint.strip():
+                summary["proposal_fingerprint"] = proposal_fingerprint.strip()
         operation = _optional_string(evidence.payload.get("operation"))
         if operation is not None:
             summary["operation"] = operation
@@ -2863,11 +3411,158 @@ def _ordered_unique_strings(values: Iterable[str]) -> list[str]:
     return out
 
 
+def _memory_context_for_state(
+    runtime: Any,
+    operation: Operation,
+    accepted: tuple[Evidence, ...],
+) -> dict[str, Any]:
+    memory_config = db_memory_options_from_runtime_metadata(runtime.config.metadata)
+    if not memory_config:
+        return {"enabled": False}
+    prompt = str(operation.request.get("prompt") or "")
+    schema = _latest_schema_payload(accepted)
+    decision = db_memory_planning_recall_decision(
+        prompt=prompt,
+        intent_kind=_memory_recall_intent_kind(operation),
+        schema=schema,
+        memory_config=memory_config,
+    )
+    return {
+        "enabled": bool(memory_config.get("enabled")),
+        "source_identity": memory_config.get("source_identity"),
+        "retrieval_mode": memory_config.get("retrieval_mode") or "structured",
+        "limit": int(memory_config.get("limit") or 3),
+        "char_budget": int(memory_config.get("char_budget") or 800),
+        "score_threshold": _float_option(memory_config, "score_threshold", 0.45),
+        "recall": memory_config.get("recall") or "auto",
+        "recall_decision": decision,
+        "has_recall_evidence": any(
+            item.kind == "memory.semantic.recall" and item.accepted for item in accepted
+        ),
+    }
+
+
+def _latest_schema_payload(accepted: tuple[Evidence, ...]) -> dict[str, Any]:
+    for evidence in reversed(accepted):
+        if evidence.kind == "schema.asset_profile" and isinstance(
+            evidence.payload, dict
+        ):
+            return dict(evidence.payload)
+    return {}
+
+
+def _memory_recall_intent_kind(operation: Operation) -> str:
+    mode = operation.request.get("mode")
+    if isinstance(mode, str) and mode.strip() == "memory.update":
+        return "memory.update"
+    return "data.query"
+
+
+def _state_should_recall_memory_for_planning(state: DbLoopState) -> bool:
+    memory_context = state.memory_context or {}
+    decision = memory_context.get("recall_decision")
+    if not isinstance(decision, Mapping) or decision.get("recall") is not True:
+        return False
+    if memory_context.get("has_recall_evidence") is True:
+        return False
+    return not _state_has_accepted_evidence(state, "memory.semantic.recall")
+
+
+def _memory_recall_task_input(state: DbLoopState) -> dict[str, Any]:
+    memory_context = state.memory_context or {}
+    decision = memory_context.get("recall_decision")
+    decision = decision if isinstance(decision, Mapping) else {}
+    limit = int(memory_context.get("limit") or 3)
+    return {
+        "query": str(
+            decision.get("query") or state.normalized_user_request.get("prompt") or ""
+        ),
+        "category": "db_semantics",
+        "limit": max(limit * 3, limit),
+        "score_threshold": _float_option(memory_context, "score_threshold", 0.45),
+        "retrieval_mode": str(memory_context.get("retrieval_mode") or "structured"),
+        "source_identity": memory_context.get("source_identity"),
+    }
+
+
+def _column_value_hint_task_input(
+    action: DbPlannerAction,
+    state: DbLoopState,
+) -> dict[str, Any]:
+    prompt = _planning_value_hint_prompt(action, state)
+    task_input: dict[str, Any] = {
+        "prompt": prompt,
+        "query": prompt,
+        "limit": 8,
+    }
+    for key in (
+        "source_owner",
+        "db_owner",
+        "connector_owner",
+        "source_capability_owner",
+    ):
+        value = action.input.get(key) or action.metadata.get(key)
+        if value:
+            task_input[key] = str(value)
+            break
+    tables, columns = _column_value_scope_for_action(action)
+    if tables:
+        task_input["tables"] = list(tables)
+    if columns:
+        task_input["columns"] = list(columns)
+    return task_input
+
+
+def _float_option(value: Mapping[str, Any], key: str, default: float) -> float:
+    raw = value.get(key)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def _state_has_accepted_evidence(state: DbLoopState, kind: str) -> bool:
     return any(
         item.get("kind") == kind and item.get("accepted", True) is True
         for item in state.accepted_evidence_summaries
     )
+
+
+def _state_should_resolve_column_value_hints_for_planning(
+    state: DbLoopState,
+    action: DbPlannerAction,
+) -> bool:
+    if not _state_allows_read_profile(state):
+        return False
+    if _state_has_accepted_evidence(state, "schema.column_value_hint"):
+        return False
+    prompt = _planning_value_hint_prompt(action, state)
+    if not prompt:
+        return False
+    if re.search(r"['\"][^'\"]{1,80}['\"]", prompt):
+        return True
+    tokens = _planning_value_hint_tokens(prompt)
+    return bool(tokens & _PLANNING_VALUE_HINT_TOKENS)
+
+
+def _planning_value_hint_prompt(
+    action: DbPlannerAction,
+    state: DbLoopState,
+) -> str:
+    values = (
+        action.input.get("prompt"),
+        action.input.get("query"),
+        action.input.get("goal"),
+        state.normalized_user_request.get("prompt"),
+        state.normalized_user_request.get("query"),
+    )
+    return " ".join(str(value).strip() for value in values if str(value or "").strip())
+
+
+def _planning_value_hint_tokens(value: str) -> set[str]:
+    return {item.lower() for item in re.findall(r"[A-Za-z0-9_]+", value)}
 
 
 def _latest_accepted_evidence_summary(

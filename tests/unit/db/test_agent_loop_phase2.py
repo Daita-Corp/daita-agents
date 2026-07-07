@@ -345,6 +345,57 @@ async def test_latest_accepted_query_plan_ref_selects_latest_accepted_plan():
     )
 
 
+async def test_prior_turn_query_plan_dependency_recovers_to_latest_plan():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two"},
+        depends_on=("plan_previous_turn",),
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-prior-turn-plan-dependency",
+        action,
+        plan_evidence=({"evidence_id": "plan-accepted", "sql": "select 1 as answer"},),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-accepted"
+    assert (
+        validation.metadata["sql_provenance"]["provenance"]
+        == "latest_accepted_query_plan"
+    )
+
+
+async def test_prior_turn_latest_plan_ref_dependency_recovers_to_latest_plan():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+        depends_on=("plan_previous_turn",),
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-prior-turn-plan-ref-dependency",
+        action,
+        plan_evidence=({"evidence_id": "plan-accepted", "sql": "select 1 as answer"},),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-accepted"
+    assert (
+        validation.metadata["sql_provenance"]["provenance"]
+        == "latest_accepted_query_plan"
+    )
+
+
 async def test_direct_sql_matching_latest_plan_ref_uses_plan_provenance():
     action = DbPlannerAction(
         action_id="read",
@@ -781,13 +832,13 @@ async def test_invalid_sql_reference_inputs_are_rejected_clearly():
         assert compilation.rejected_action_summaries[0]["error"] == expected_error
 
 
-async def test_prior_turn_depends_on_remains_missing_dependency_error():
+async def test_prior_turn_depends_on_with_unsupported_ref_remains_missing_dependency_error():
     action = DbPlannerAction(
         action_id="read",
         kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
         input={
             "owner": "phase_two",
-            "query_plan_ref": "latest_accepted_query_plan",
+            "query_plan_ref": "latest_sql",
         },
         depends_on=("prior_turn_plan",),
     )

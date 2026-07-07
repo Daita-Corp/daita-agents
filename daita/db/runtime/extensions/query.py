@@ -64,13 +64,11 @@ class DbPlanningContextExecutor:
             task.input.get("relationship_evidence_ids", ()),
             kinds=("schema.relationship_path",),
         )
-        memory_recall_evidence = tuple(
-            item
-            for item in [
-                await _load_evidence(runtime, operation.id, evidence_id)
-                for evidence_id in task.input.get("memory_recall_evidence_ids", ())
-            ]
-            if item is not None
+        memory_recall_evidence = await _load_evidence_refs_or_latest(
+            runtime,
+            operation.id,
+            task.input.get("memory_recall_evidence_ids", ()),
+            kinds=("memory.semantic.recall",),
         )
         memory_recall_diagnostics = task.input.get("memory_recall_diagnostics")
         planning_context = builder.build(

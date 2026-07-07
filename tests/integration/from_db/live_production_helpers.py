@@ -229,7 +229,8 @@ def require_live_openai_kwargs() -> dict[str, object]:
 async def seed_rich_sqlite_schema(db_path: Path) -> Path:
     """Create the shared rich SQLite fixture used by live from_db tests."""
     plugin = SQLitePlugin(path=str(db_path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         PRAGMA foreign_keys = ON;
 
         DROP TABLE IF EXISTS monitor_actions;
@@ -386,7 +387,8 @@ async def seed_rich_sqlite_schema(db_path: Path) -> Path:
 
         INSERT INTO monitor_actions (id, status, note) VALUES
             (1, 'pending', 'fixture row for approval and resume tests');
-    """)
+    """
+    )
     await plugin.disconnect()
     return db_path
 
@@ -429,6 +431,7 @@ async def create_live_sqlite_from_db_agent(
     allowed_tables: tuple[str, ...] | list[str] | None = None,
     blocked_tables: tuple[str, ...] | list[str] | None = None,
     blocked_columns: tuple[str, ...] | list[str] | None = None,
+    stateful: bool = False,
 ):
     """Build a live OpenAI ``Agent.from_db`` over SQLite with persisted state."""
     return await Agent.from_db(
@@ -440,6 +443,7 @@ async def create_live_sqlite_from_db_agent(
         allowed_tables=allowed_tables,
         blocked_tables=blocked_tables,
         blocked_columns=blocked_columns,
+        stateful=stateful,
         **require_live_openai_kwargs(),
     )
 

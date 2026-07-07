@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
@@ -925,6 +926,7 @@ class DbRuntimeTasksMixin:
             "catalog.asset.inspect",
             "catalog.relationship_paths.find",
             "catalog.column_values.search",
+            "catalog.column_value_hints.resolve",
         }:
             return await self._catalog_executable_input_for_task(task, operation)
         if task.capability_id not in {
@@ -1032,7 +1034,15 @@ class DbRuntimeTasksMixin:
                 prerequisite_for=task.capability_id,
                 prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
             )
-        if task.capability_id == "catalog.column_values.search":
+        if task.capability_id in {
+            "catalog.column_values.search",
+            "catalog.column_value_hints.resolve",
+        }:
+            task_input = _column_value_task_input_with_schema_scope(
+                task_input,
+                operation=operation,
+                schema_evidence=schema_evidence,
+            )
             await self._ensure_catalog_column_values_profiled(
                 operation,
                 store_id=store_id,
@@ -1757,12 +1767,16 @@ def _catalog_task_input_from_metadata(
             task_input.setdefault("from_assets", from_assets)
         if to_assets:
             task_input.setdefault("to_assets", to_assets)
-    elif task.capability_id == "catalog.column_values.search":
+    elif task.capability_id in {
+        "catalog.column_values.search",
+        "catalog.column_value_hints.resolve",
+    }:
         task_input.setdefault(
             "query",
             _first_metadata_string(metadata, "query", "value", "literal", "goal")
             or prompt,
         )
+        task_input.setdefault("prompt", task_input.get("query") or prompt)
         input_tables = _safe_string_list(task_input.get("tables"))
         if not input_tables:
             input_tables = _safe_string_list(task_input.get("table"))
@@ -1781,9 +1795,7 @@ def _catalog_task_input_from_metadata(
         tables, columns = _normalize_column_value_scope(input_tables, input_columns)
 
         metadata_tables = _metadata_string_list(metadata, "tables", "table")
-        metadata_columns = _metadata_string_list(
-            metadata, "columns", "column", "field"
-        )
+        metadata_columns = _metadata_string_list(metadata, "columns", "column", "field")
         metadata_target_tables, metadata_target_columns = _normalize_column_value_scope(
             _metadata_string_list(metadata, "target"),
             [],
@@ -1830,13 +1842,207 @@ def _normalize_column_value_scope(
     )
 
 
+_COLUMN_VALUE_SCOPE_TOKENS = frozenset(
+    {
+        "active",
+        "apac",
+        "closed",
+        "complete",
+        "completed",
+        "enterprise",
+        "eu",
+        "high",
+        "inactive",
+        "low",
+        "midmarket",
+        "na",
+        "open",
+        "pending",
+        "startup",
+        "urgent",
+    }
+)
+_CATEGORICAL_COLUMN_NAMES = frozenset(
+    {
+        "category",
+        "code",
+        "region_code",
+        "severity",
+        "state",
+        "status",
+        "tier",
+        "type",
+    }
+)
+
+
+def _column_value_task_input_with_schema_scope(
+    task_input: dict[str, Any],
+    *,
+    operation: Operation,
+    schema_evidence: Evidence | None,
+) -> dict[str, Any]:
+    if _column_value_profile_pairs(task_input) or schema_evidence is None:
+        return task_input
+    pairs = _derive_column_value_profile_pairs(
+        schema_evidence.payload,
+        prompt=" ".join(
+            str(value or "")
+            for value in (
+                task_input.get("prompt"),
+                task_input.get("query"),
+                operation.request.get("prompt"),
+            )
+        ),
+        session_context=operation.request.get("session_context"),
+    )
+    if not pairs:
+        return task_input
+    tables = _ordered_unique_strings([table for table, _column in pairs])
+    columns = _ordered_unique_strings([column for _table, column in pairs])
+    return {
+        **task_input,
+        "profile_pairs": [
+            {"table": table, "column": column} for table, column in pairs
+        ],
+        "tables": tables,
+        "columns": columns,
+    }
+
+
+def _derive_column_value_profile_pairs(
+    schema: Any,
+    *,
+    prompt: str,
+    session_context: Any,
+) -> list[tuple[str, str]]:
+    if not isinstance(schema, Mapping):
+        return []
+    prompt_tokens = _identifier_tokens(prompt)
+    if not prompt_tokens:
+        return []
+    session_tables = _session_context_tables(session_context)
+    value_cue = bool(prompt_tokens & _COLUMN_VALUE_SCOPE_TOKENS)
+    candidates: list[tuple[int, str, str]] = []
+    for table in schema.get("tables", []) or []:
+        if not isinstance(table, Mapping):
+            continue
+        table_name = str(table.get("name") or "").strip()
+        if not table_name:
+            continue
+        table_tokens = _identifier_tokens(table_name)
+        table_matched = bool(prompt_tokens & table_tokens) or (
+            table_name.lower() in session_tables
+        )
+        for column in table.get("columns", []) or []:
+            if not isinstance(column, Mapping):
+                continue
+            column_name = str(column.get("name") or "").strip()
+            if not column_name or _looks_sensitive_column_name(column_name):
+                continue
+            column_tokens = _identifier_tokens(column_name)
+            column_matched = bool(prompt_tokens & column_tokens)
+            categorical = _is_categorical_value_column(column)
+            if not categorical:
+                continue
+            score = 0
+            if table_matched:
+                score += 4
+            if column_matched:
+                score += 3
+            if value_cue and categorical:
+                score += 2
+            if column_name.lower() == "status":
+                score += 1
+            if score <= 0:
+                continue
+            candidates.append((score, table_name, column_name))
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return list(dict.fromkeys((table, column) for _score, table, column in candidates))[
+        :4
+    ]
+
+
+def _is_categorical_value_column(column: Mapping[str, Any]) -> bool:
+    name = str(column.get("name") or "").lower()
+    if name in _CATEGORICAL_COLUMN_NAMES or name.endswith("_code"):
+        return True
+    return bool(_identifier_tokens(name) & _CATEGORICAL_COLUMN_NAMES)
+
+
+def _session_context_tables(value: Any) -> set[str]:
+    tables: set[str] = set()
+    if not isinstance(value, Mapping):
+        return tables
+    referents = value.get("referents")
+    if isinstance(referents, Mapping):
+        tables.update(str(item).lower() for item in referents.get("tables") or ())
+    for scope in value.get("query_scopes") or ():
+        if isinstance(scope, Mapping):
+            tables.update(str(item).lower() for item in scope.get("tables") or ())
+    return tables
+
+
+def _identifier_tokens(value: str) -> set[str]:
+    tokens = {
+        item.lower()
+        for item in re.findall(r"[A-Za-z0-9]+", str(value).replace("_", " "))
+        if item
+    }
+    expanded = set(tokens)
+    for token in tokens:
+        if token.endswith("ies") and len(token) > 3:
+            expanded.add(token[:-3] + "y")
+        elif token.endswith("s") and len(token) > 3:
+            expanded.add(token[:-1])
+    return expanded
+
+
+def _looks_sensitive_column_name(column: str) -> bool:
+    lowered = column.lower()
+    sensitive = {
+        "api_key",
+        "birth",
+        "credential",
+        "email",
+        "key",
+        "name",
+        "password",
+        "phone",
+        "secret",
+        "ssn",
+        "token",
+    }
+    return any(term in lowered for term in sensitive)
+
+
 def _column_value_profile_pairs(task_input: dict[str, Any]) -> list[tuple[str, str]]:
+    explicit_pairs = _safe_column_value_profile_pairs(task_input.get("profile_pairs"))
+    if explicit_pairs:
+        return explicit_pairs
     tables = _safe_string_list(task_input.get("tables"))
     columns = _safe_string_list(task_input.get("columns"))
     tables, columns = _normalize_column_value_scope(tables, columns)
     if not tables or not columns:
         return []
     return [(table, column) for table in tables for column in columns]
+
+
+def _safe_column_value_profile_pairs(value: Any) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return pairs
+    for item in value:
+        table = ""
+        column = ""
+        if isinstance(item, Mapping):
+            table = str(item.get("table") or "").strip()
+            column = str(item.get("column") or "").strip()
+        elif isinstance(item, str) and "." in item:
+            table, column = (part.strip() for part in item.split(".", 1))
+        if table and column:
+            pairs.append((table, column))
+    return list(dict.fromkeys(pairs))
 
 
 def _operation_allows_read_profile(operation: Operation) -> bool:

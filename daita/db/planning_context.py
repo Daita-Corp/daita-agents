@@ -379,7 +379,41 @@ def _render_context_summary(context: DbPlanningContext) -> str:
             lines.append("Session monitor referents:")
             for monitor in monitors[:10]:
                 lines.append(f"- {monitor}")
+    query_scopes = context.session_context.get("query_scopes")
+    if isinstance(query_scopes, list) and query_scopes:
+        lines.append("Session query scopes:")
+        for scope in query_scopes[:4]:
+            if not isinstance(scope, dict):
+                continue
+            parts = []
+            tables = scope.get("tables") or []
+            if tables:
+                parts.append("tables " + ", ".join(str(item) for item in tables[:8]))
+            filter_text = _session_filter_text(scope.get("filters"))
+            if filter_text:
+                parts.append("filters " + filter_text)
+            row_count = scope.get("result_row_count")
+            if isinstance(row_count, int):
+                parts.append(f"result rows {row_count}")
+            if parts:
+                lines.append("- " + "; ".join(parts))
     return "\n".join(lines)
+
+
+def _session_filter_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    filters = []
+    for item in value[:12]:
+        if not isinstance(item, dict):
+            continue
+        column = str(item.get("column") or "").strip()
+        operator = str(item.get("operator") or "").strip()
+        values = item.get("values")
+        if not column or not operator or not isinstance(values, list) or not values:
+            continue
+        filters.append(f"{column} {operator} {', '.join(str(v) for v in values[:8])}")
+    return "; ".join(filters)
 
 
 def _compact_session_context(request: DbRequest) -> dict[str, Any]:
@@ -394,6 +428,7 @@ def _compact_session_context(request: DbRequest) -> dict[str, Any]:
         return {}
     referents = context.get("referents")
     recent_operations = context.get("recent_operations")
+    query_scopes = context.get("query_scopes")
     durable_ids = context.get("durable_ids")
     diagnostics = context.get("diagnostics")
     compact: dict[str, Any] = {}
@@ -412,6 +447,10 @@ def _compact_session_context(request: DbRequest) -> dict[str, Any]:
         }
     if isinstance(recent_operations, list):
         compact["recent_operations"] = recent_operations[:8]
+    if isinstance(query_scopes, list):
+        compact["query_scopes"] = [
+            dict(item) for item in query_scopes[:4] if isinstance(item, dict)
+        ]
     if isinstance(durable_ids, dict):
         compact["durable_ids"] = dict(durable_ids)
     if isinstance(diagnostics, dict):
@@ -424,6 +463,7 @@ def _compact_session_context(request: DbRequest) -> dict[str, Any]:
             "conversation_message_count",
             "recent_operation_count",
             "evidence_operation_count",
+            "query_scope_count",
         ):
             if key in diagnostics:
                 compact["diagnostics"][key] = diagnostics[key]

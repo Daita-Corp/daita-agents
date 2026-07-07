@@ -117,3 +117,26 @@ def test_verifier_rejects_relationship_operation_with_query_result():
 
     assert result.passed is False
     assert "metadata_operation_includes_query_result" in result.warnings
+
+
+def test_verifier_rejects_memory_update_after_proposal_before_commit():
+    result = DbVerifier().verify(
+        DbOperationContract(
+            operation_type="memory.update",
+            required_evidence=("db.memory.proposal",),
+            access=AccessMode.METADATA_READ,
+        ),
+        DbIntent(kind=DbIntentKind.MEMORY_UPDATE, access=AccessMode.WRITE),
+        (
+            Evidence(
+                kind="db.memory.proposal",
+                accepted=True,
+                payload={"validation": {"accepted": True, "reasons": []}},
+            ),
+        ),
+        (),
+    )
+
+    assert result.passed is False
+    assert result.missing_evidence == ()
+    assert "memory_update_not_committed" in result.warnings

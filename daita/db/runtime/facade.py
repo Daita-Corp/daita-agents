@@ -344,6 +344,7 @@ class DbRuntime(
                 "requested_capabilities": list(db_request.requested_capabilities),
                 "constraints": db_request.constraints,
                 "metadata": db_request.metadata,
+                "session_context": db_request.session_context,
             },
             required_evidence=frozenset(),
             metadata={
@@ -464,6 +465,8 @@ class DbRuntime(
                 base_diagnostics=base_diagnostics,
             )
 
+        current_operation = await self.store.load_operation(operation_id) or operation
+        evidence = tuple(await self.store.list_evidence(operation_id))
         return await self._record_operation_result(
             DbOperationResult(
                 operation_id=operation_id,
@@ -472,13 +475,14 @@ class DbRuntime(
                 contract=contract,
                 status=_operation_status_from_loop_status(loop_result.status),
                 answer=_answer_from_loop_result(loop_result),
+                evidence=evidence,
                 warnings=tuple(loop_result.warnings),
                 diagnostics={
                     **base_diagnostics,
                     "planner": _planner_diagnostics(loop_result),
                 },
             ),
-            operation=await self.store.load_operation(operation_id) or operation,
+            operation=current_operation,
         )
 
     def _select_db_agent_planner(self) -> DbAgentPlanner | None:

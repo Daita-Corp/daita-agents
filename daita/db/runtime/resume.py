@@ -547,6 +547,11 @@ def _db_request_from_context(operation: Operation) -> DbRequest:
         requested_capabilities=tuple(context.get("requested_capabilities") or ()),
         constraints=dict(context.get("constraints") or {}),
         metadata=dict(context.get("metadata") or {}),
+        session_context=(
+            dict(context.get("session_context"))
+            if isinstance(context.get("session_context"), dict)
+            else None
+        ),
     )
 
 
@@ -589,6 +594,7 @@ def _db_request_context(request: DbRequest) -> dict[str, Any]:
         "requested_capabilities": list(request.requested_capabilities),
         "constraints": request.constraints,
         "metadata": request.metadata,
+        "session_context": request.session_context,
     }
 
 
