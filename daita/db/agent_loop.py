@@ -325,7 +325,25 @@ class DbAgentLoop:
                 turn=turn,
                 remaining_turns=turn_budget - turn + 1,
             )
-            decision = await self.planner.plan(state)
+            runtime_continuation = _memory_update_runtime_continuation_action(
+                state,
+                current_action_ids=set(),
+            )
+            if runtime_continuation is None:
+                decision = await self.planner.plan(state)
+            else:
+                decision = DbPlannerDecision(
+                    status=DbPlannerDecisionStatus.CONTINUE,
+                    intent={"operation_type": DbIntentKind.MEMORY_UPDATE.value},
+                    actions=(runtime_continuation,),
+                    rationale=(
+                        "Runtime continuation for an accepted DB memory proposal."
+                    ),
+                    metadata={
+                        "runtime_continuation": True,
+                        "continuation": "memory.update.commit",
+                    },
+                )
             await self._persist_planner_decision(operation, decision, turn=turn)
 
             if decision.status is DbPlannerDecisionStatus.CLARIFY:
@@ -378,13 +396,42 @@ class DbAgentLoop:
                 decision.status is DbPlannerDecisionStatus.FINISH
                 and not decision.actions
             ):
+                finalizable, finalization = await self._operation_finalizable(
+                    operation.id
+                )
                 observation = await self._persist_observation(
                     operation,
                     DbPlannerObservation(
-                        diagnostics={"status": "finish_requested", "turn": turn}
+                        diagnostics={
+                            "status": (
+                                "finish_requested"
+                                if finalizable
+                                else "finish_requested_not_finalizable"
+                            ),
+                            "turn": turn,
+                            "finalization": finalization,
+                        }
                     ),
                     turn=turn,
                 )
+                if not finalizable and _state_is_memory_update_operation(state):
+                    verification = finalization.get("verification")
+                    verification_warnings = (
+                        verification.get("warnings")
+                        if isinstance(verification, Mapping)
+                        else ()
+                    )
+                    return await self._result(
+                        operation,
+                        "blocked",
+                        warnings=tuple(
+                            str(item) for item in (verification_warnings or ())
+                        ),
+                        diagnostics={
+                            "observation": observation.to_dict(),
+                            "finalization": finalization,
+                        },
+                    )
                 return await self._result(
                     operation,
                     "finished",
@@ -426,6 +473,17 @@ class DbAgentLoop:
                     str(item.get("error") or "planner_action_rejected")
                     for item in compilation.rejected_action_summaries
                 )
+                if _has_runtime_continuation_block(compilation):
+                    return await self._result(
+                        operation,
+                        "blocked",
+                        warnings=warnings,
+                        diagnostics={
+                            "compilation": compilation.to_dict(),
+                            "progress": progress_facts,
+                            "observation": observation.to_dict(),
+                        },
+                    )
                 if _has_terminal_compilation_error(compilation):
                     return await self._result(
                         operation,
@@ -694,9 +752,24 @@ class DbAgentLoop:
                 continue
             actions.append(action)
 
+        if not any(
+            action.kind is DbPlannerActionKind.COMMIT_MEMORY_UPDATE
+            for action in actions
+        ):
+            runtime_continuation = _memory_update_runtime_continuation_action(
+                state,
+                current_action_ids={action.action_id for action in actions},
+            )
+            if runtime_continuation is not None:
+                actions.insert(0, runtime_continuation)
+
         current_action_ids = {action.action_id for action in actions}
         resolved_actions: list[DbPlannerAction] = []
         for action in actions:
+            continuation_error = self.continuation_resolver.blocked_diagnostic(action)
+            if continuation_error is not None:
+                rejected.append(_continuation_action_error(action, continuation_error))
+                continue
             resolved_action = self.continuation_resolver.resolve(
                 action,
                 state,
@@ -1568,6 +1641,15 @@ class DbAgentLoop:
                 f"{action.action_id}:{capability.id}:"
                 f"{proposal_fingerprint or proposal_id}"
             ),
+            idempotency_key=_stable_hash(
+                {
+                    "operation_id": state.operation_id,
+                    "capability_id": capability.id,
+                    "owner": capability.owner,
+                    "proposal_evidence_id": proposal_id,
+                    "proposal_fingerprint": proposal_fingerprint,
+                }
+            ),
         )
         spec = _with_deterministic_task_id(state.operation_id, spec)
         return [spec], [_capability_selection(capability, action)], []
@@ -2367,6 +2449,15 @@ def _has_terminal_compilation_error(compilation: DbActionCompilation) -> bool:
     )
 
 
+def _has_runtime_continuation_block(compilation: DbActionCompilation) -> bool:
+    return any(
+        isinstance(item.get("continuation"), Mapping)
+        and item["continuation"].get("status") == "blocked"
+        and item["continuation"].get("source") == "runtime_continuation"
+        for item in compilation.rejected_action_summaries
+    )
+
+
 def _compiled_action_fingerprints(
     decision: DbPlannerDecision,
 ) -> tuple[str, ...]:
@@ -2447,6 +2538,206 @@ def _task_input_for_action(action: DbPlannerAction) -> dict[str, Any]:
         for key, value in action.input.items()
         if key not in {"owner", "capability_owner"}
     }
+
+
+def _summary_id(summary: Mapping[str, Any]) -> str:
+    return str(summary.get("id") or "").strip()
+
+
+def _memory_update_runtime_continuation_action(
+    state: DbLoopState,
+    *,
+    current_action_ids: set[str],
+) -> DbPlannerAction | None:
+    if not _state_is_memory_update_operation(state):
+        return None
+    proposals = _uncommitted_memory_proposal_summaries(state)
+    if not proposals:
+        return None
+    owner = _memory_commit_capability_owner_for_state(state, proposals)
+    action_id = _runtime_memory_commit_action_id(proposals, current_action_ids)
+    action_input: dict[str, Any] = {}
+    if owner:
+        action_input["owner"] = owner
+    if len(proposals) > 1:
+        diagnostic = {
+            "status": "blocked",
+            "source": "runtime_continuation",
+            "error": "ambiguous_continuation:latest_uncommitted_memory_proposal",
+            "role": "latest_uncommitted_memory_proposal",
+            "evidence_kind": "db.memory.proposal",
+            "candidate_count": len(proposals),
+            "candidate_ids": [_summary_id(item) for item in proposals],
+        }
+        return DbPlannerAction(
+            action_id=action_id,
+            kind=DbPlannerActionKind.COMMIT_MEMORY_UPDATE,
+            input=action_input,
+            rationale=("Runtime found multiple accepted uncommitted memory proposals."),
+            metadata={
+                "runtime_continuation": True,
+                "continuation_resolution": diagnostic,
+            },
+        )
+
+    proposal = proposals[0]
+    proposal_id = _summary_id(proposal)
+    proposal_fingerprint = str(
+        proposal.get("proposal_fingerprint")
+        or proposal.get("payload_fingerprint")
+        or ""
+    ).strip()
+    action_input["proposal_evidence_id"] = proposal_id
+    if proposal_fingerprint:
+        action_input["proposal_fingerprint"] = proposal_fingerprint
+    diagnostic = {
+        "status": "resolved",
+        "source": "runtime_continuation",
+        "role": "latest_uncommitted_memory_proposal",
+        "evidence_kind": "db.memory.proposal",
+        "evidence_id": proposal_id,
+        "candidate_count": 1,
+    }
+    return DbPlannerAction(
+        action_id=action_id,
+        kind=DbPlannerActionKind.COMMIT_MEMORY_UPDATE,
+        input=action_input,
+        rationale="Runtime continuation for accepted DB memory proposal.",
+        metadata={
+            "runtime_continuation": True,
+            "continuation_resolution": diagnostic,
+        },
+    )
+
+
+def _state_is_memory_update_operation(state: DbLoopState) -> bool:
+    candidates: list[Any] = [
+        state.explicit_mode,
+        state.normalized_user_request.get("mode"),
+        state.normalized_user_request.get("operation_type"),
+    ]
+    snapshot = state.latest_compiled_contract_snapshot
+    if isinstance(snapshot, Mapping):
+        candidates.append(snapshot.get("operation_type"))
+        metadata = snapshot.get("metadata")
+        if isinstance(metadata, Mapping):
+            planner_intent = metadata.get("planner_intent")
+            if isinstance(planner_intent, Mapping):
+                candidates.append(planner_intent.get("operation_type"))
+    for candidate in candidates:
+        normalized = str(candidate or "").strip().lower().replace("_", ".")
+        if normalized == DbIntentKind.MEMORY_UPDATE.value:
+            return True
+    return False
+
+
+def _uncommitted_memory_proposal_summaries(
+    state: DbLoopState,
+) -> tuple[dict[str, Any], ...]:
+    proposals = tuple(
+        dict(summary)
+        for summary in state.accepted_evidence_summaries
+        if summary.get("kind") == "db.memory.proposal"
+        and summary.get("accepted", True) is True
+        and _summary_id(summary)
+    )
+    if not proposals:
+        return ()
+    committed = _accepted_memory_definition_refs(state)
+    uncommitted: list[dict[str, Any]] = []
+    for proposal in proposals:
+        proposal_id = _summary_id(proposal)
+        proposal_fingerprint = str(
+            proposal.get("proposal_fingerprint")
+            or proposal.get("payload_fingerprint")
+            or ""
+        ).strip()
+        if proposal_id in committed["ids"]:
+            continue
+        if proposal_fingerprint and proposal_fingerprint in committed["fingerprints"]:
+            continue
+        uncommitted.append(proposal)
+    return tuple(uncommitted)
+
+
+def _accepted_memory_definition_refs(
+    state: DbLoopState,
+) -> dict[str, set[str]]:
+    proposal_ids: set[str] = set()
+    proposal_fingerprints: set[str] = set()
+    for summary in state.accepted_evidence_summaries:
+        if summary.get("kind") != "db.memory.definition":
+            continue
+        if summary.get("accepted", True) is not True:
+            continue
+        proposal_id = str(summary.get("proposal_evidence_id") or "").strip()
+        if proposal_id:
+            proposal_ids.add(proposal_id)
+        proposal_fingerprint = str(summary.get("proposal_fingerprint") or "").strip()
+        if proposal_fingerprint:
+            proposal_fingerprints.add(proposal_fingerprint)
+    return {"ids": proposal_ids, "fingerprints": proposal_fingerprints}
+
+
+def _single_capability_owner_for_state(
+    state: DbLoopState,
+    capability_id: str,
+) -> str | None:
+    owners = tuple(
+        str(summary.get("owner") or "").strip()
+        for summary in state.capability_summaries
+        if summary.get("id") == capability_id
+        and str(summary.get("owner") or "").strip()
+    )
+    unique = tuple(dict.fromkeys(owners))
+    if len(unique) == 1:
+        return unique[0]
+    return None
+
+
+def _memory_commit_capability_owner_for_state(
+    state: DbLoopState,
+    proposals: tuple[dict[str, Any], ...],
+) -> str | None:
+    proposal_owners = tuple(
+        str(proposal.get("owner") or "").strip()
+        for proposal in proposals
+        if str(proposal.get("owner") or "").strip()
+    )
+    unique_proposal_owners = tuple(dict.fromkeys(proposal_owners))
+    capability_owners = {
+        str(summary.get("owner") or "").strip()
+        for summary in state.capability_summaries
+        if summary.get("id") == "db.memory.commit_update"
+        and str(summary.get("owner") or "").strip()
+    }
+    if (
+        len(unique_proposal_owners) == 1
+        and unique_proposal_owners[0] in capability_owners
+    ):
+        return unique_proposal_owners[0]
+    return _single_capability_owner_for_state(state, "db.memory.commit_update")
+
+
+def _runtime_memory_commit_action_id(
+    proposals: tuple[dict[str, Any], ...],
+    current_action_ids: set[str],
+) -> str:
+    if len(proposals) == 1:
+        seed: Mapping[str, Any] = {
+            "proposal_evidence_id": _summary_id(proposals[0]),
+            "proposal_fingerprint": proposals[0].get("proposal_fingerprint"),
+        }
+    else:
+        seed = {
+            "candidate_ids": [_summary_id(proposal) for proposal in proposals],
+        }
+    action_id = f"runtime_memory_commit_{_stable_hash(seed)[:12]}"
+    if action_id not in current_action_ids:
+        return action_id
+    return (
+        f"{action_id}_{_stable_hash({'existing_ids': sorted(current_action_ids)})[:8]}"
+    )
 
 
 def _resolve_memory_proposal_for_action(
@@ -3111,6 +3402,17 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
                 summary["hints"] = hints
         if evidence.kind == "db.memory.proposal":
             proposal_fingerprint = evidence.payload.get("proposal_fingerprint")
+            if isinstance(proposal_fingerprint, str) and proposal_fingerprint.strip():
+                summary["proposal_fingerprint"] = proposal_fingerprint.strip()
+        if evidence.kind == "db.memory.definition":
+            proposal_evidence_id = evidence.payload.get(
+                "proposal_evidence_id"
+            ) or evidence.metadata.get("proposal_evidence_id")
+            if proposal_evidence_id:
+                summary["proposal_evidence_id"] = str(proposal_evidence_id)
+            proposal_fingerprint = evidence.payload.get(
+                "proposal_fingerprint"
+            ) or evidence.metadata.get("proposal_fingerprint")
             if isinstance(proposal_fingerprint, str) and proposal_fingerprint.strip():
                 summary["proposal_fingerprint"] = proposal_fingerprint.strip()
         operation = _optional_string(evidence.payload.get("operation"))

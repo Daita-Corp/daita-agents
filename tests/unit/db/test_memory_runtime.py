@@ -92,6 +92,18 @@ def _runtime_with_memory_source(*plugins) -> DbRuntime:
     )
 
 
+class _ScriptedPlanner:
+    def __init__(self, *decisions):
+        self.decisions = list(decisions)
+        self.states = []
+
+    async def plan(self, state):
+        self.states.append(state)
+        if not self.decisions:
+            raise AssertionError("planner was called after scripted decisions ended")
+        return self.decisions.pop(0)
+
+
 def _board_revenue_schema():
     return {
         "database_type": "sqlite",
@@ -791,6 +803,381 @@ async def test_prior_turn_memory_proposal_dependency_recovers_to_latest_proposal
     assert commit.dependencies[0].evidence_id == "proposal-accepted"
     assert commit.dependencies[0].payload_fingerprint == "payload-fingerprint"
     assert commit.metadata["dependency_recovery"] == "latest_accepted_memory_proposal"
+
+
+async def test_memory_update_runtime_continuation_commits_without_planner_action(
+    tmp_path,
+):
+    runtime = _runtime_with_memory_source(_memory(tmp_path))
+    await runtime.setup()
+    executed_capabilities = []
+    original_execute_task = runtime.execute_task
+
+    async def tracked_execute_task(task, operation, context=None):
+        executed_capabilities.append(task.capability_id)
+        return await original_execute_task(task, operation, context=context)
+
+    runtime.execute_task = tracked_execute_task
+    try:
+        request = DbRequest(
+            "Remember that revenue excludes tax.",
+            mode="memory.update",
+        )
+        intent = runtime.classify_request(request)
+        contract = runtime.build_contract(request, intent)
+        operation = await runtime.kernel.create_operation(
+            operation_type="db.run",
+            request={
+                "prompt": request.prompt,
+                "mode": request.mode,
+                "source_scope": list(request.source_scope),
+                "requested_capabilities": list(request.requested_capabilities),
+                "constraints": request.constraints,
+                "metadata": request.metadata,
+            },
+            required_evidence=frozenset(),
+            metadata={
+                "mode": "memory.update",
+                "resume_context": {
+                    "request": {
+                        "prompt": request.prompt,
+                        "user_id": request.user_id,
+                        "session_id": request.session_id,
+                        "source_scope": list(request.source_scope),
+                        "mode": request.mode,
+                        "requested_capabilities": list(request.requested_capabilities),
+                        "constraints": request.constraints,
+                        "metadata": request.metadata,
+                    },
+                    "intent": {
+                        "kind": intent.kind.value,
+                        "confidence": intent.confidence,
+                        "access": intent.access.value,
+                        "evidence_mode": intent.evidence_mode,
+                        "requested_outputs": list(intent.requested_outputs),
+                        "constraints": intent.constraints,
+                        "diagnostics": intent.diagnostics,
+                    },
+                    "contract": {
+                        "operation_type": contract.operation_type,
+                        "required_capabilities": list(contract.required_capabilities),
+                        "required_evidence": list(contract.required_evidence),
+                        "access": contract.access.value,
+                        "limits": contract.limits.to_dict(),
+                        "policy_ids": list(contract.policy_ids),
+                        "metadata": contract.metadata,
+                    },
+                },
+            },
+            evaluate_governance=False,
+        )
+        planner = _ScriptedPlanner(
+            DbPlannerDecision(
+                status=DbPlannerDecisionStatus.CONTINUE,
+                intent={"operation_type": "memory.update"},
+                actions=(
+                    DbPlannerAction(
+                        action_id="plan_memory",
+                        kind=DbPlannerActionKind.PLAN_MEMORY_UPDATE,
+                        input={},
+                    ),
+                ),
+            )
+        )
+
+        result = await DbAgentLoop(runtime, planner).run(
+            operation,
+            safety_frame={"max_access": "write"},
+            max_turns=4,
+        )
+        executed_once = list(executed_capabilities)
+        second_result = await DbAgentLoop(runtime, _ScriptedPlanner()).run(
+            operation,
+            safety_frame={"max_access": "write"},
+            max_turns=2,
+        )
+        resumed = await runtime.resume_operation(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+        evidence = await runtime.store.list_evidence(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "finished"
+    assert second_result.status == "finished"
+    assert executed_capabilities[: len(executed_once)] == executed_once
+    assert executed_capabilities.count("db.memory.commit_update") == 1
+    assert executed_capabilities.count("memory.semantic.write") == 1
+    assert resumed.completed_task_ids
+    assert len(planner.states) == 1
+    assert "db.memory.plan_update" in executed_capabilities
+    assert "db.memory.commit_update" in executed_capabilities
+    assert "memory.semantic.write" in executed_capabilities
+    memory_task_ids = [
+        task.capability_id
+        for task in tasks
+        if task.capability_id
+        in {
+            "db.memory.plan_update",
+            "db.memory.commit_update",
+            "memory.semantic.write",
+        }
+    ]
+    assert memory_task_ids == [
+        "db.memory.plan_update",
+        "db.memory.commit_update",
+        "memory.semantic.write",
+    ]
+    assert {item.kind for item in evidence if item.accepted} >= {
+        "db.memory.proposal",
+        "db.memory.definition",
+        "memory.semantic.write",
+    }
+    commit = next(
+        task for task in tasks if task.capability_id == "db.memory.commit_update"
+    )
+    assert commit.metadata["runtime_continuation"] is True
+    assert commit.metadata["continuation_resolution"]["source"] == (
+        "runtime_continuation"
+    )
+
+
+async def test_memory_commit_reuses_completed_write_task_without_replay(tmp_path):
+    runtime = _runtime_with_memory_source(_memory(tmp_path))
+    await runtime.setup()
+    try:
+        request = DbRequest(
+            "Remember that revenue excludes tax.",
+            mode="memory.update",
+        )
+        operation = await runtime.kernel.create_operation(
+            operation_type="db.run",
+            request={
+                "prompt": request.prompt,
+                "mode": request.mode,
+                "source_scope": list(request.source_scope),
+                "requested_capabilities": list(request.requested_capabilities),
+                "constraints": request.constraints,
+                "metadata": request.metadata,
+            },
+            required_evidence=frozenset(),
+            metadata={"mode": "memory.update"},
+            evaluate_governance=False,
+        )
+        proposal_plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.memory.plan_update",
+                    owner="db_runtime",
+                    input={
+                        "request": {
+                            "prompt": request.prompt,
+                            "mode": request.mode,
+                            "source_scope": list(request.source_scope),
+                            "requested_capabilities": list(
+                                request.requested_capabilities
+                            ),
+                            "constraints": request.constraints,
+                            "metadata": request.metadata,
+                        }
+                    },
+                    reason="test_memory_plan_update",
+                    deterministic_key="partial-resume-plan",
+                ),
+            ),
+        )
+        proposal_evidence = await runtime.execute_task(
+            proposal_plan.tasks[0],
+            operation,
+        )
+        proposal = next(
+            item for item in proposal_evidence if item.kind == "db.memory.proposal"
+        )
+        proposal_fingerprint = proposal.payload["proposal_fingerprint"]
+        record = dict(proposal.payload["record"])
+        write_plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="memory.semantic.write",
+                    owner="memory",
+                    input={
+                        "db_memory_payload": record,
+                        "db_memory_prompt": str(record.get("text") or ""),
+                    },
+                    reason="db_memory_commit_update",
+                    sequence=1,
+                    dependencies=(
+                        TaskDependency(
+                            kind="evidence",
+                            evidence_kind="db.memory.proposal",
+                            evidence_id=proposal.id,
+                            evidence_owner="db_runtime",
+                            producer_task_id=proposal.task_id,
+                            evidence_payload={
+                                "proposal_fingerprint": proposal_fingerprint,
+                            },
+                            evidence_accepted=True,
+                            operation_id=operation.id,
+                        ),
+                    ),
+                    metadata={
+                        "proposal_evidence_id": proposal.id,
+                        "proposal_fingerprint": proposal_fingerprint,
+                        "source_identity": proposal.payload["source_identity"],
+                    },
+                    deterministic_key=proposal_fingerprint,
+                ),
+            ),
+        )
+        await runtime.execute_task(write_plan.tasks[0], operation)
+        commit_plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.memory.commit_update",
+                    owner="db_runtime",
+                    input={
+                        "proposal_evidence_id": proposal.id,
+                        "proposal_fingerprint": proposal_fingerprint,
+                    },
+                    reason="test_partial_resume_commit",
+                    dependencies=(
+                        TaskDependency(
+                            kind="evidence",
+                            evidence_kind="db.memory.proposal",
+                            evidence_id=proposal.id,
+                            evidence_owner="db_runtime",
+                            producer_task_id=proposal.task_id,
+                            evidence_accepted=True,
+                            operation_id=operation.id,
+                        ),
+                    ),
+                    deterministic_key=proposal_fingerprint,
+                ),
+            ),
+        )
+        original_execute_task = runtime.execute_task
+
+        async def reject_write_replay(task, operation, context=None):
+            if task.capability_id == "memory.semantic.write":
+                raise AssertionError("completed memory write task was replayed")
+            return await original_execute_task(task, operation, context=context)
+
+        runtime.execute_task = reject_write_replay
+        commit_evidence = await original_execute_task(commit_plan.tasks[0], operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert [item.kind for item in commit_evidence] == ["db.memory.definition"]
+    assert sum(item.kind == "memory.semantic.write" for item in evidence) == 1
+    definition = commit_evidence[0]
+    assert definition.accepted is True
+    assert definition.payload["write_evidence_ids"]
+
+
+async def test_memory_update_finish_without_write_remains_blocked(tmp_path):
+    runtime = _runtime_with_memory_source(_memory(tmp_path))
+    await runtime.setup()
+    try:
+        request = DbRequest(
+            "Remember that revenue excludes tax.",
+            mode="memory.update",
+        )
+        intent = runtime.classify_request(request)
+        contract = runtime.build_contract(request, intent)
+        operation = await runtime.kernel.create_operation(
+            operation_type="db.run",
+            request={
+                "prompt": request.prompt,
+                "mode": request.mode,
+                "source_scope": list(request.source_scope),
+                "requested_capabilities": list(request.requested_capabilities),
+                "constraints": request.constraints,
+                "metadata": request.metadata,
+            },
+            required_evidence=frozenset(contract.required_evidence),
+            metadata={
+                "mode": "memory.update",
+                "resume_context": {
+                    "request": {
+                        "prompt": request.prompt,
+                        "mode": request.mode,
+                        "source_scope": list(request.source_scope),
+                        "requested_capabilities": list(request.requested_capabilities),
+                        "constraints": request.constraints,
+                        "metadata": request.metadata,
+                    },
+                    "intent": {
+                        "kind": intent.kind.value,
+                        "confidence": intent.confidence,
+                        "access": intent.access.value,
+                        "evidence_mode": intent.evidence_mode,
+                        "requested_outputs": list(intent.requested_outputs),
+                        "constraints": intent.constraints,
+                        "diagnostics": intent.diagnostics,
+                    },
+                    "contract": {
+                        "operation_type": contract.operation_type,
+                        "required_capabilities": list(contract.required_capabilities),
+                        "required_evidence": list(contract.required_evidence),
+                        "access": contract.access.value,
+                        "limits": contract.limits.to_dict(),
+                        "policy_ids": list(contract.policy_ids),
+                        "metadata": contract.metadata,
+                    },
+                },
+            },
+            evaluate_governance=False,
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="proposal-with-definition",
+                kind="db.memory.proposal",
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=True,
+                payload={"proposal_fingerprint": "proposal-fp"},
+                metadata={"proposal_fingerprint": "proposal-fp"},
+            )
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="definition-without-write",
+                kind="db.memory.definition",
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "proposal_evidence_id": "proposal-with-definition",
+                    "proposal_fingerprint": "proposal-fp",
+                    "committed": True,
+                },
+                metadata={
+                    "proposal_evidence_id": "proposal-with-definition",
+                    "proposal_fingerprint": "proposal-fp",
+                },
+            )
+        )
+        planner = _ScriptedPlanner(
+            DbPlannerDecision(
+                status=DbPlannerDecisionStatus.FINISH,
+                intent={"operation_type": "memory.update"},
+                actions=(),
+            )
+        )
+
+        result = await DbAgentLoop(runtime, planner).run(
+            operation,
+            safety_frame={"max_access": "write"},
+            max_turns=1,
+        )
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "blocked"
+    assert "memory_update_not_committed" in result.warnings
 
 
 @pytest.mark.parametrize(

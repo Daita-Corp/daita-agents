@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from daita.runtime import Evidence, Operation, Task, TaskDependency
+from daita.runtime import Evidence, Operation, Task, TaskDependency, TaskStatus
 
 from ...analysis import stable_fingerprint, structural_schema_fingerprint
 from ...memory import (
@@ -15,6 +15,13 @@ from ...memory import (
 from ...memory_commands import DbMemoryCommandService
 from ...models import DbRequest
 from ..tasks import DbTaskSpec
+
+_COMPLETED_TASK_STATUSES = {
+    TaskStatus.SUCCEEDED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+    TaskStatus.SKIPPED,
+}
 
 
 @dataclass(frozen=True)
@@ -192,13 +199,23 @@ class DbMemoryCommitUpdateExecutor:
             ),
         )
         write_task = write_plan.tasks[0]
-        write_evidence = await runtime.execute_task(
-            write_task,
-            operation,
-            context={"capability_owner": memory_capability.owner},
-        )
+        write_evidence_reused = write_task.status in _COMPLETED_TASK_STATUSES
+        if write_evidence_reused:
+            write_evidence = await _task_evidence(
+                runtime,
+                operation.id,
+                write_task.id,
+                evidence_kind="memory.semantic.write",
+            )
+        else:
+            write_evidence = await runtime.execute_task(
+                write_task,
+                operation,
+                context={"capability_owner": memory_capability.owner},
+            )
         write_success = bool(write_evidence) and all(
-            item.payload.get("success") is not False for item in write_evidence
+            item.accepted and item.payload.get("success") is not False
+            for item in write_evidence
         )
         definition_payload = {
             "action": proposal.get("action"),
@@ -223,6 +240,8 @@ class DbMemoryCommitUpdateExecutor:
                 "source_identity": proposal_source_identity,
             },
         )
+        if write_evidence_reused:
+            return [definition]
         return [definition, *write_evidence]
 
 
@@ -251,6 +270,20 @@ async def _load_evidence(
         if evidence.id == evidence_id:
             return evidence
     return None
+
+
+async def _task_evidence(
+    runtime: Any,
+    operation_id: str,
+    task_id: str,
+    *,
+    evidence_kind: str,
+) -> tuple[Evidence, ...]:
+    return tuple(
+        evidence
+        for evidence in await runtime.store.list_evidence(operation_id)
+        if evidence.task_id == task_id and evidence.kind == evidence_kind
+    )
 
 
 def _first_capability(runtime: Any, capability_id: str, *, owner: str | None = None):

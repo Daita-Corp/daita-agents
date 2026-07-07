@@ -496,9 +496,7 @@ async def test_prior_turn_query_plan_dependency_blocks_ambiguous_candidates():
     assert rejected["error"] == "ambiguous_continuation:latest_accepted_query_plan"
     assert rejected["continuation"]["status"] == "blocked"
     assert rejected["continuation"]["candidate_ids"] == ["plan-one", "plan-two"]
-    assert rejected["continuation"]["stale_dependency_ids"] == [
-        "plan_previous_turn"
-    ]
+    assert rejected["continuation"]["stale_dependency_ids"] == ["plan_previous_turn"]
 
 
 async def test_memory_proposal_role_ref_resolves_to_latest_accepted_proposal():
@@ -561,10 +559,127 @@ async def test_memory_commit_without_role_blocks_ambiguous_proposals():
 
     assert compilation.task_specs == ()
     rejected = compilation.rejected_action_summaries[0]
-    assert (
-        rejected["error"]
-        == "ambiguous_continuation:latest_accepted_memory_proposal"
+    assert rejected["error"] == "ambiguous_continuation:latest_accepted_memory_proposal"
+    assert rejected["continuation"]["candidate_ids"] == [
+        "proposal-one",
+        "proposal-two",
+    ]
+
+
+async def test_memory_update_runtime_continuation_compiles_commit_without_action():
+    runtime, operation = await _runtime_and_operation(
+        "phase-six-memory-runtime-continuation",
+        mode="memory.update",
     )
+    await runtime.store.save_evidence(
+        _memory_proposal_evidence(
+            operation.id,
+            evidence_id="proposal-runtime",
+            proposal_fingerprint="proposal-fp-runtime",
+        )
+    )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "write"},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "memory.update"},
+        actions=(),
+    )
+
+    compilation = loop.compile_actions(decision, state)
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.memory.commit_update"
+    ]
+    commit = compilation.task_specs[0]
+    assert commit.input == {
+        "proposal_evidence_id": "proposal-runtime",
+        "proposal_fingerprint": "proposal-fp-runtime",
+    }
+    assert commit.dependencies[0].evidence_id == "proposal-runtime"
+    assert commit.metadata["runtime_continuation"] is True
+    continuation = commit.metadata["continuation_resolution"]
+    assert continuation["source"] == "runtime_continuation"
+    assert continuation["role"] == "latest_uncommitted_memory_proposal"
+    assert continuation["evidence_id"] == "proposal-runtime"
+
+
+async def test_memory_update_runtime_continuation_skips_committed_proposal():
+    runtime, operation = await _runtime_and_operation(
+        "phase-six-memory-runtime-committed",
+        mode="memory.update",
+    )
+    await runtime.store.save_evidence(
+        _memory_proposal_evidence(
+            operation.id,
+            evidence_id="proposal-committed",
+            proposal_fingerprint="proposal-fp-committed",
+        )
+    )
+    await runtime.store.save_evidence(
+        _memory_definition_evidence(
+            operation.id,
+            evidence_id="definition-committed",
+            proposal_evidence_id="proposal-committed",
+            proposal_fingerprint="proposal-fp-committed",
+        )
+    )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "write"},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "memory.update"},
+        actions=(),
+    )
+
+    compilation = loop.compile_actions(decision, state)
+
+    assert compilation.rejected_action_summaries == ()
+    assert compilation.task_specs == ()
+
+
+async def test_memory_update_runtime_continuation_blocks_multiple_proposals():
+    runtime, operation = await _runtime_and_operation(
+        "phase-six-memory-runtime-ambiguous",
+        mode="memory.update",
+    )
+    for evidence_id in ("proposal-one", "proposal-two"):
+        await runtime.store.save_evidence(
+            _memory_proposal_evidence(operation.id, evidence_id=evidence_id)
+        )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "write"},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "memory.update"},
+        actions=(),
+    )
+
+    compilation = loop.compile_actions(decision, state)
+
+    assert compilation.task_specs == ()
+    rejected = compilation.rejected_action_summaries[0]
+    assert (
+        rejected["error"] == "ambiguous_continuation:latest_uncommitted_memory_proposal"
+    )
+    assert rejected["continuation"]["source"] == "runtime_continuation"
+    assert rejected["continuation"]["status"] == "blocked"
     assert rejected["continuation"]["candidate_ids"] == [
         "proposal-one",
         "proposal-two",
@@ -1491,6 +1606,32 @@ def _memory_proposal_evidence(
         payload={"proposal_fingerprint": proposal_fingerprint},
         metadata={
             "payload_fingerprint": f"payload-fp-{evidence_id}",
+            "proposal_fingerprint": proposal_fingerprint,
+        },
+    )
+
+
+def _memory_definition_evidence(
+    operation_id,
+    *,
+    evidence_id,
+    proposal_evidence_id,
+    proposal_fingerprint,
+):
+    return Evidence(
+        id=evidence_id,
+        kind="db.memory.definition",
+        owner="db_runtime",
+        operation_id=operation_id,
+        task_id=f"task-{evidence_id}",
+        accepted=True,
+        payload={
+            "proposal_evidence_id": proposal_evidence_id,
+            "proposal_fingerprint": proposal_fingerprint,
+            "committed": True,
+        },
+        metadata={
+            "proposal_evidence_id": proposal_evidence_id,
             "proposal_fingerprint": proposal_fingerprint,
         },
     )
