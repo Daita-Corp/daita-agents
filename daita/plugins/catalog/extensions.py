@@ -164,6 +164,20 @@ def catalog_capabilities() -> tuple[Capability, ...]:
             side_effecting=False,
         ),
         Capability(
+            id="catalog.value_grounding.plan",
+            owner="catalog",
+            description="Plan catalog-owned value grounding targets without connector reads.",
+            domains=frozenset({"db"}),
+            operation_types=frozenset({"data.query", "query.plan", "schema.query"}),
+            access=AccessMode.METADATA_READ,
+            risk=RiskLevel.MEDIUM,
+            input_schema=common_schema,
+            output_evidence=frozenset({"catalog.value_grounding.plan"}),
+            executor="catalog.plan_value_grounding",
+            runtime_only=True,
+            side_effecting=False,
+        ),
+        Capability(
             id="catalog.infrastructure.discover",
             owner="catalog",
             description="Discover infrastructure sources known to catalog discoverers.",
@@ -211,6 +225,66 @@ def catalog_capabilities() -> tuple[Capability, ...]:
 def catalog_evidence_schemas() -> tuple[EvidenceSchema, ...]:
     """Return catalog evidence schemas."""
     object_schema = {"type": "object"}
+    value_grounding_plan_schema = {
+        "type": "object",
+        "properties": {
+            "store_id": {"type": "string"},
+            "prompt": {"type": "string"},
+            "targets": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "table": {"type": "string"},
+                        "column": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "requires_profile_read": {"type": "boolean"},
+                        "source": {
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "object"},
+                            ]
+                        },
+                    },
+                    "required": [
+                        "table",
+                        "column",
+                        "reason",
+                        "confidence",
+                        "requires_profile_read",
+                        "source",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "skipped": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "table": {"type": "string"},
+                        "column": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["table", "column", "reason"],
+                    "additionalProperties": False,
+                },
+            },
+            "diagnostics": {
+                "type": "object",
+                "properties": {
+                    "profile_budget": {"type": "integer"},
+                    "target_count": {"type": "integer"},
+                    "skipped_count": {"type": "integer"},
+                },
+                "required": ["profile_budget", "target_count", "skipped_count"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["store_id", "prompt", "targets", "skipped", "diagnostics"],
+        "additionalProperties": False,
+    }
     return (
         EvidenceSchema(
             kind="catalog.source_registered",
@@ -265,6 +339,12 @@ def catalog_evidence_schemas() -> tuple[EvidenceSchema, ...]:
             owner="catalog",
             json_schema=object_schema,
             description="Prompt-scoped column value hints derived from catalog profiles.",
+        ),
+        EvidenceSchema(
+            kind="catalog.value_grounding.plan",
+            owner="catalog",
+            json_schema=value_grounding_plan_schema,
+            description="Catalog-owned value grounding target plan.",
         ),
         EvidenceSchema(
             kind="catalog.infrastructure_inventory",

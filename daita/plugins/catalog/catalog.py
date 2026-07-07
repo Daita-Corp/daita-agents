@@ -58,6 +58,7 @@ MAX_RELATIONSHIP_HOPS = 6
 MAX_RELATIONSHIP_PATHS = 8
 MATCHED_FIELDS_LIMIT = 12
 MAX_COLUMN_VALUE_HINTS = 12
+MAX_VALUE_GROUNDING_PROFILE_BUDGET = 4
 
 # Module-level registry. Set once at startup via register_catalog_backend_factory().
 # None means persist to .daita/catalog.json (local default).
@@ -241,6 +242,12 @@ class CatalogPlugin(DomainServicePlugin):
                 handler=self._execute_resolve_column_value_hints,
             ),
             CatalogExecutor(
+                id="catalog.plan_value_grounding",
+                capability_ids=frozenset({"catalog.value_grounding.plan"}),
+                evidence_kind="catalog.value_grounding.plan",
+                handler=self._execute_plan_value_grounding,
+            ),
+            CatalogExecutor(
                 id="catalog.discover_infrastructure",
                 capability_ids=frozenset({"catalog.infrastructure.discover"}),
                 evidence_kind="catalog.infrastructure_inventory",
@@ -377,6 +384,29 @@ class CatalogPlugin(DomainServicePlugin):
             tables=args.get("tables"),
             columns=args.get("columns"),
             limit=int(args.get("limit") or MAX_COLUMN_VALUE_HINTS),
+        )
+
+    async def _execute_plan_value_grounding(self, payload: Any) -> Dict[str, Any]:
+        args = dict(payload or {})
+        return self.plan_value_grounding(
+            _required_arg(args, "store_id"),
+            str(args.get("prompt") or args.get("query") or ""),
+            validation_facts=args.get("validation_facts"),
+            warnings=args.get("warnings") or args.get("validation_warnings"),
+            session_query_scopes=(
+                args.get("session_query_scopes") or args.get("query_scopes")
+            ),
+            targets=args.get("targets"),
+            profile_pairs=args.get("profile_pairs"),
+            profile_budget=_value_grounding_profile_budget(
+                args.get(
+                    "profile_budget",
+                    args.get("max_profile_budget", args.get("max_profile_targets")),
+                )
+            ),
+            policy_frame=args.get("policy_frame") or args.get("policy"),
+            blocked_tables=args.get("blocked_tables"),
+            blocked_columns=args.get("blocked_columns") or args.get("blocked_fields"),
         )
 
     async def _execute_discover_infrastructure(self, payload: Any) -> Dict[str, Any]:
@@ -1097,6 +1127,163 @@ class CatalogPlugin(DomainServicePlugin):
             "truncated": result.get("truncated", False),
         }
 
+    def plan_value_grounding(
+        self,
+        store_id: str,
+        prompt: str,
+        *,
+        validation_facts: Any = None,
+        warnings: Any = None,
+        session_query_scopes: Any = None,
+        targets: Any = None,
+        profile_pairs: Any = None,
+        profile_budget: int = MAX_VALUE_GROUNDING_PROFILE_BUDGET,
+        policy_frame: Any = None,
+        blocked_tables: Any = None,
+        blocked_columns: Any = None,
+    ) -> Dict[str, Any]:
+        """Plan value-grounding targets from catalog facts and structured input."""
+        schema = self._schema_dict_for_store(store_id)
+        profile_budget = max(0, int(profile_budget))
+        if schema is None:
+            return _value_grounding_plan_response(
+                store_id,
+                prompt,
+                targets=[],
+                skipped=[
+                    {"table": "", "column": "", "reason": "schema_not_registered"}
+                ],
+                profile_budget=profile_budget,
+            )
+
+        candidates: list[dict[str, Any]] = []
+        candidates.extend(
+            _value_grounding_candidates_from_validation(
+                validation_facts,
+                source_kind="validation_fact",
+            )
+        )
+        candidates.extend(
+            _value_grounding_candidates_from_validation(
+                warnings,
+                source_kind="validation_warning",
+            )
+        )
+        candidates.extend(
+            _value_grounding_candidates_from_session_scopes(session_query_scopes)
+        )
+        candidates.extend(
+            _value_grounding_candidates_from_explicit_targets(
+                targets,
+                reason="explicit_target",
+                source_kind="explicit_target",
+                confidence=1.0,
+            )
+        )
+        candidates.extend(
+            _value_grounding_candidates_from_explicit_targets(
+                profile_pairs,
+                reason="explicit_profile_pair",
+                source_kind="profile_pair",
+                confidence=0.92,
+            )
+        )
+        for ref, profile in sorted(_column_value_profiles(schema).items()):
+            fresh_profile = _profile_with_freshness(profile, schema)
+            if (
+                fresh_profile.get("profile_status", "profiled") != "profiled"
+                or fresh_profile.get("redacted")
+                or fresh_profile.get("stale")
+            ):
+                continue
+            candidates.append(
+                {
+                    "table": fresh_profile.get("table") or ref.rsplit(".", 1)[0],
+                    "column": fresh_profile.get("column") or ref.rsplit(".", 1)[-1],
+                    "reason": "catalog_profile",
+                    "confidence": 0.9,
+                    "requires_profile_read": False,
+                    "source": {
+                        "kind": "catalog_profile",
+                        "profile_ref": ref,
+                    },
+                }
+            )
+
+        blocked_table_names, blocked_column_names = _blocked_value_grounding_refs(
+            policy_frame,
+            blocked_tables=blocked_tables,
+            blocked_columns=blocked_columns,
+        )
+        ordered_keys: list[tuple[str, str]] = []
+        target_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        skipped: list[dict[str, str]] = []
+        for candidate in candidates:
+            resolved, reason = _resolve_value_grounding_target(schema, candidate)
+            if resolved is None:
+                skipped.append(
+                    {
+                        "table": str(candidate.get("table") or ""),
+                        "column": str(candidate.get("column") or ""),
+                        "reason": reason,
+                    }
+                )
+                continue
+            table, column = resolved
+            blocked_reason = _value_grounding_blocked_reason(
+                table,
+                column,
+                blocked_tables=blocked_table_names,
+                blocked_columns=blocked_column_names,
+            )
+            if blocked_reason:
+                skipped.append(
+                    {"table": table, "column": column, "reason": blocked_reason}
+                )
+                continue
+            key = (table.lower(), column.lower())
+            target = {
+                "table": table,
+                "column": column,
+                "reason": str(candidate.get("reason") or "structured_input"),
+                "confidence": _confidence(candidate.get("confidence")),
+                "requires_profile_read": bool(
+                    candidate.get("requires_profile_read", True)
+                ),
+                "source": candidate.get("source") or {"kind": "structured_input"},
+            }
+            existing = target_by_key.get(key)
+            if existing is None:
+                target_by_key[key] = target
+                ordered_keys.append(key)
+            else:
+                _merge_value_grounding_target(existing, target)
+
+        selected: list[dict[str, Any]] = []
+        read_target_count = 0
+        for key in ordered_keys:
+            target = target_by_key[key]
+            if target["requires_profile_read"]:
+                if read_target_count >= profile_budget:
+                    skipped.append(
+                        {
+                            "table": target["table"],
+                            "column": target["column"],
+                            "reason": "profile_budget_exhausted",
+                        }
+                    )
+                    continue
+                read_target_count += 1
+            selected.append(target)
+
+        return _value_grounding_plan_response(
+            store_id,
+            prompt,
+            targets=selected,
+            skipped=skipped,
+            profile_budget=profile_budget,
+        )
+
     def collect_evidence(
         self,
         store_id: str,
@@ -1671,6 +1858,424 @@ def _catalog_inline_value_profile_eligible(profile: Dict[str, Any]) -> bool:
         if not isinstance(item, dict) or item.get("value") is None:
             return False
     return True
+
+
+def _value_grounding_plan_response(
+    store_id: str,
+    prompt: str,
+    *,
+    targets: list[dict[str, Any]],
+    skipped: list[dict[str, str]],
+    profile_budget: int,
+) -> Dict[str, Any]:
+    return {
+        "store_id": str(store_id),
+        "prompt": str(prompt or ""),
+        "targets": targets,
+        "skipped": skipped,
+        "diagnostics": {
+            "profile_budget": int(profile_budget),
+            "target_count": len(targets),
+            "skipped_count": len(skipped),
+        },
+    }
+
+
+def _value_grounding_profile_budget(value: Any) -> int:
+    if value is None:
+        return MAX_VALUE_GROUNDING_PROFILE_BUDGET
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = MAX_VALUE_GROUNDING_PROFILE_BUDGET
+    return max(0, min(50, parsed))
+
+
+def _value_grounding_candidates_from_validation(
+    value: Any,
+    *,
+    source_kind: str,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for item in _value_grounding_items(value):
+        if isinstance(item, dict):
+            table, column = _table_column_from_mapping(item)
+            literal = (
+                item.get("literal")
+                if "literal" in item
+                else item.get("value", item.get("filter_literal"))
+            )
+            if not table or not column or literal is None:
+                continue
+            source = {"kind": source_kind, "literal": literal}
+            if item.get("kind"):
+                source["fact_kind"] = str(item["kind"])
+            candidates.append(
+                {
+                    "table": table,
+                    "column": column,
+                    "reason": "validation_literal",
+                    "confidence": 0.95,
+                    "requires_profile_read": True,
+                    "source": source,
+                }
+            )
+            continue
+        parsed = _parse_value_grounding_warning(str(item))
+        if parsed is None:
+            continue
+        table, column, literal = parsed
+        candidates.append(
+            {
+                "table": table,
+                "column": column,
+                "reason": "validation_literal",
+                "confidence": 0.9,
+                "requires_profile_read": True,
+                "source": {
+                    "kind": source_kind,
+                    "literal": literal,
+                },
+            }
+        )
+    return candidates
+
+
+def _value_grounding_candidates_from_session_scopes(value: Any) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for scope in _value_grounding_items(value):
+        if not isinstance(scope, dict):
+            continue
+        tables = _value_grounding_string_list(scope.get("tables"))
+        for filter_item in _value_grounding_items(scope.get("filters")):
+            if not isinstance(filter_item, dict):
+                continue
+            table, column = _table_column_from_mapping(filter_item)
+            if not table and len(tables) == 1:
+                table = tables[0]
+            values = _value_grounding_string_list(
+                filter_item.get("values")
+                if "values" in filter_item
+                else filter_item.get("value")
+            )
+            if not column or not values:
+                continue
+            source: dict[str, Any] = {
+                "kind": "session_query_scope",
+                "values": values[:8],
+            }
+            if scope.get("operation_id"):
+                source["operation_id"] = str(scope["operation_id"])
+            candidates.append(
+                {
+                    "table": table,
+                    "column": column,
+                    "reason": "session_query_scope_filter",
+                    "confidence": 0.88,
+                    "requires_profile_read": True,
+                    "source": source,
+                }
+            )
+    return candidates
+
+
+def _value_grounding_candidates_from_explicit_targets(
+    value: Any,
+    *,
+    reason: str,
+    source_kind: str,
+    confidence: float,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for item in _value_grounding_items(value):
+        table = ""
+        column = ""
+        requires_profile_read = True
+        candidate_reason = reason
+        candidate_confidence = confidence
+        source: dict[str, Any] = {"kind": source_kind}
+
+        if isinstance(item, dict):
+            table, column = _table_column_from_mapping(item)
+            requires_profile_read = bool(item.get("requires_profile_read", True))
+            candidate_reason = str(item.get("reason") or reason)
+            candidate_confidence = _confidence(item.get("confidence", confidence))
+            if item.get("source") is not None:
+                source["input_source"] = item.get("source")
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            table = str(item[0])
+            column = str(item[1])
+        else:
+            table, column = _split_table_column_ref(str(item))
+
+        if not column:
+            continue
+        candidates.append(
+            {
+                "table": table,
+                "column": column,
+                "reason": candidate_reason,
+                "confidence": candidate_confidence,
+                "requires_profile_read": requires_profile_read,
+                "source": source,
+            }
+        )
+    return candidates
+
+
+def _value_grounding_items(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return list(value)
+    return [value]
+
+
+def _value_grounding_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _table_column_from_mapping(value: dict[str, Any]) -> tuple[str, str]:
+    table = _first_value_grounding_string(
+        value,
+        "table",
+        "table_name",
+        "target_table",
+        "asset",
+        "asset_ref",
+    )
+    column = _first_value_grounding_string(
+        value,
+        "column",
+        "column_name",
+        "target_column",
+        "field",
+        "field_name",
+    )
+    ref = _first_value_grounding_string(
+        value,
+        "ref",
+        "column_ref",
+        "target",
+        "target_ref",
+    )
+    if ref and (not table or not column):
+        ref_table, ref_column = _split_table_column_ref(ref)
+        if not table:
+            table = ref_table
+        if not column:
+            column = ref_column
+    if column and "." in column:
+        ref_table, ref_column = _split_table_column_ref(column)
+        if not table:
+            table = ref_table
+        column = ref_column
+    return table, column
+
+
+def _first_value_grounding_string(value: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        raw = value.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text:
+            return text
+    return ""
+
+
+def _parse_value_grounding_warning(value: str) -> tuple[str, str, str] | None:
+    match = re.search(
+        r"(?:unobserved_filter_literal|ambiguous_literal_column):"
+        r"\s*([^=\s;]+)\s*=\s*([^;]+)",
+        value,
+    )
+    if match is None:
+        return None
+    table, column = _split_table_column_ref(match.group(1))
+    literal = _unquote_value(match.group(2).strip())
+    if not table or not column or not literal:
+        return None
+    return table, column, literal
+
+
+def _split_table_column_ref(value: str) -> tuple[str, str]:
+    parts = [
+        part.strip().strip('"`[]')
+        for part in str(value or "").split(".")
+        if part.strip().strip('"`[]')
+    ]
+    if len(parts) >= 2:
+        return ".".join(parts[:-1]), parts[-1]
+    return "", parts[0] if parts else ""
+
+
+def _unquote_value(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 2 and (
+        (text[0] == text[-1] == "'")
+        or (text[0] == text[-1] == '"')
+        or (text[0] == "`" and text[-1] == "`")
+    ):
+        return text[1:-1]
+    return text
+
+
+def _blocked_value_grounding_refs(
+    policy_frame: Any,
+    *,
+    blocked_tables: Any,
+    blocked_columns: Any,
+) -> tuple[set[str], set[str]]:
+    tables = {item.lower() for item in _value_grounding_string_list(blocked_tables)}
+    columns = {item.lower() for item in _value_grounding_string_list(blocked_columns)}
+    if isinstance(policy_frame, dict):
+        for key in ("blocked_tables", "deny_tables", "restricted_tables"):
+            tables.update(
+                item.lower()
+                for item in _value_grounding_string_list(policy_frame.get(key))
+            )
+        for key in (
+            "blocked_columns",
+            "blocked_fields",
+            "deny_columns",
+            "restricted_columns",
+            "sensitive_columns",
+        ):
+            columns.update(
+                item.lower()
+                for item in _value_grounding_string_list(policy_frame.get(key))
+            )
+    return tables, columns
+
+
+def _resolve_value_grounding_target(
+    schema: Dict[str, Any],
+    candidate: dict[str, Any],
+) -> tuple[tuple[str, str] | None, str]:
+    raw_table = str(candidate.get("table") or "").strip()
+    raw_column = str(candidate.get("column") or "").strip()
+    ref_table, ref_column = _split_table_column_ref(raw_column)
+    if ref_table and ref_column:
+        if not raw_table:
+            raw_table = ref_table
+        raw_column = ref_column
+    if not raw_column:
+        return None, "missing_column"
+
+    tables = [
+        table
+        for table in schema.get("tables", []) or []
+        if isinstance(table, dict) and str(table.get("name") or "").strip()
+    ]
+    if raw_table:
+        table = _find_value_grounding_table(tables, raw_table)
+        if table is None:
+            return None, "unknown_table"
+        column = _find_value_grounding_column(table, raw_column)
+        if column is None:
+            return None, "unknown_column"
+        return (str(table["name"]), str(column["name"])), ""
+
+    column_matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for table in tables:
+        column = _find_value_grounding_column(table, raw_column)
+        if column is not None:
+            column_matches.append((table, column))
+    if not column_matches:
+        return None, "unknown_column"
+    if len(column_matches) > 1:
+        return None, "ambiguous_column"
+    table, column = column_matches[0]
+    return (str(table["name"]), str(column["name"])), ""
+
+
+def _find_value_grounding_table(
+    tables: list[dict[str, Any]],
+    raw_table: str,
+) -> dict[str, Any] | None:
+    wanted = raw_table.strip().lower()
+    if not wanted:
+        return None
+    direct = [table for table in tables if str(table.get("name", "")).lower() == wanted]
+    if len(direct) == 1:
+        return direct[0]
+    short = [
+        table
+        for table in tables
+        if _short_name(str(table.get("name", "")).lower()) == wanted
+        or str(table.get("name", "")).lower().endswith(f".{wanted}")
+        or wanted.endswith(f'.{str(table.get("name", "")).lower()}')
+    ]
+    return short[0] if len(short) == 1 else None
+
+
+def _find_value_grounding_column(
+    table: dict[str, Any],
+    raw_column: str,
+) -> dict[str, Any] | None:
+    wanted = raw_column.strip().lower()
+    matches = [
+        column
+        for column in table.get("columns", []) or []
+        if isinstance(column, dict) and str(column.get("name", "")).lower() == wanted
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _value_grounding_blocked_reason(
+    table: str,
+    column: str,
+    *,
+    blocked_tables: set[str],
+    blocked_columns: set[str],
+) -> str | None:
+    table_key = table.lower()
+    short_table = _short_name(table_key)
+    column_key = column.lower()
+    if table_key in blocked_tables or short_table in blocked_tables:
+        return "blocked_by_policy"
+    refs = {
+        column_key,
+        f"{table_key}.{column_key}",
+        f"{short_table}.{column_key}",
+    }
+    if refs & blocked_columns:
+        return "blocked_by_policy"
+    return None
+
+
+def _merge_value_grounding_target(
+    existing: dict[str, Any],
+    candidate: dict[str, Any],
+) -> None:
+    candidate_confidence = _confidence(candidate.get("confidence"))
+    if candidate_confidence > _confidence(existing.get("confidence")):
+        existing["confidence"] = candidate_confidence
+        existing["reason"] = candidate["reason"]
+        existing["source"] = candidate["source"]
+    if existing.get("requires_profile_read") and not candidate.get(
+        "requires_profile_read"
+    ):
+        existing["requires_profile_read"] = False
+        existing["reason"] = candidate["reason"]
+        existing["source"] = candidate["source"]
+
+
+def _confidence(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = 0.5
+    return round(max(0.0, min(1.0, parsed)), 3)
 
 
 def _normalize_column_value_profile(

@@ -4,7 +4,14 @@ from daita.db import DbRuntime
 from daita.plugins import ExtensionRegistry, PluginKind
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.base_profiler import NormalizedColumn
-from daita.runtime import ContextAudience, Evidence, Operation, Task
+from daita.runtime import (
+    AccessMode,
+    ContextAudience,
+    Evidence,
+    Operation,
+    RiskLevel,
+    Task,
+)
 
 
 def _reference_schema():
@@ -39,10 +46,57 @@ def _reference_schema():
     }
 
 
+def _value_grounding_schema():
+    return {
+        "database_type": "sqlite",
+        "database_name": "shop",
+        "tables": [
+            {
+                "name": "customers",
+                "columns": [
+                    {"name": "id", "data_type": "INTEGER"},
+                    {"name": "email", "data_type": "TEXT"},
+                    {"name": "tier", "data_type": "TEXT"},
+                ],
+            },
+            {
+                "name": "orders",
+                "columns": [
+                    {"name": "id", "data_type": "INTEGER"},
+                    {"name": "customer_id", "data_type": "INTEGER"},
+                    {"name": "status", "data_type": "TEXT"},
+                    {"name": "total", "data_type": "REAL"},
+                ],
+            },
+        ],
+        "foreign_keys": [
+            {
+                "source_table": "orders",
+                "source_column": "customer_id",
+                "target_table": "customers",
+                "target_column": "id",
+            }
+        ],
+    }
+
+
 def _executor(registry, executor_id):
     return next(
         executor for executor in registry.executors if executor.id == executor_id
     )
+
+
+async def _value_grounding_catalog():
+    catalog = CatalogPlugin(auto_persist=False)
+    await catalog.register_schema(
+        _value_grounding_schema(),
+        store_type="sqlite",
+        store_id="store:shop",
+        persist=False,
+    )
+    registry = ExtensionRegistry()
+    registry.register(catalog)
+    return catalog, registry
 
 
 def test_catalog_plugin_declares_domain_service_manifest():
@@ -72,6 +126,7 @@ def test_catalog_capabilities_are_visible_in_extension_registry():
         "catalog.column_values.register",
         "catalog.column_values.search",
         "catalog.column_value_hints.resolve",
+        "catalog.value_grounding.plan",
         "catalog.infrastructure.discover",
         "catalog.schema.compare",
         "catalog.diagram.export",
@@ -85,6 +140,7 @@ def test_catalog_capabilities_are_visible_in_extension_registry():
         "catalog.register_column_values",
         "catalog.search_column_values",
         "catalog.resolve_column_value_hints",
+        "catalog.plan_value_grounding",
         "catalog.discover_infrastructure",
         "catalog.compare_schema",
         "catalog.export_diagram",
@@ -98,6 +154,7 @@ def test_catalog_capabilities_are_visible_in_extension_registry():
         "schema.column_value_profile",
         "schema.column_value_search_result",
         "schema.column_value_hint",
+        "catalog.value_grounding.plan",
         "catalog.infrastructure_inventory",
         "schema.comparison",
     } <= evidence_kinds
@@ -106,6 +163,24 @@ def test_catalog_capabilities_are_visible_in_extension_registry():
         "catalog_inspect_asset",
         "catalog_find_relationship_paths",
     } <= tool_view_names
+
+    plan_capability = next(
+        capability
+        for capability in registry.capabilities
+        if capability.id == "catalog.value_grounding.plan"
+    )
+    assert plan_capability.owner == "catalog"
+    assert plan_capability.executor == "catalog.plan_value_grounding"
+    assert plan_capability.output_evidence == frozenset(
+        {"catalog.value_grounding.plan"}
+    )
+    assert plan_capability.access is AccessMode.METADATA_READ
+    assert plan_capability.risk is RiskLevel.MEDIUM
+    assert plan_capability.runtime_only is True
+    assert plan_capability.side_effecting is False
+    assert plan_capability.operation_types == frozenset(
+        {"data.query", "query.plan", "schema.query"}
+    )
 
 
 def test_catalog_tool_views_expose_strict_required_schemas():
@@ -331,6 +406,209 @@ async def test_catalog_registers_searches_and_resolves_column_value_profiles():
     )
     status = next(field for field in inspected["fields"] if field["name"] == "status")
     assert status["column_value_hint"]["top_values"] == ["complete", "pending"]
+
+
+async def test_catalog_value_grounding_plan_targets_validation_fact():
+    _, registry = await _value_grounding_catalog()
+    operation = Operation(id="op-value-grounding", operation_type="query.plan")
+
+    evidence = await _executor(registry, "catalog.plan_value_grounding").execute(
+        Task(
+            id="task-value-grounding",
+            operation_id=operation.id,
+            capability_id="catalog.value_grounding.plan",
+            executor_id="catalog.plan_value_grounding",
+            input={
+                "store_id": "store:shop",
+                "prompt": "completed orders",
+                "validation_facts": [
+                    {
+                        "kind": "unobserved_filter_literal",
+                        "table": "orders",
+                        "column": "status",
+                        "literal": "completed",
+                    }
+                ],
+            },
+        ),
+        operation,
+        {},
+    )
+
+    assert evidence[0].kind == "catalog.value_grounding.plan"
+    payload = evidence[0].payload
+    assert payload["targets"] == [
+        {
+            "table": "orders",
+            "column": "status",
+            "reason": "validation_literal",
+            "confidence": 0.95,
+            "requires_profile_read": True,
+            "source": {
+                "kind": "validation_fact",
+                "literal": "completed",
+                "fact_kind": "unobserved_filter_literal",
+            },
+        }
+    ]
+    assert payload["skipped"] == []
+    assert payload["diagnostics"] == {
+        "profile_budget": 4,
+        "target_count": 1,
+        "skipped_count": 0,
+    }
+
+
+async def test_catalog_value_grounding_plan_targets_session_query_scope_filters():
+    _, registry = await _value_grounding_catalog()
+    operation = Operation(id="op-value-grounding-session", operation_type="query.plan")
+
+    evidence = await _executor(registry, "catalog.plan_value_grounding").execute(
+        Task(
+            id="task-value-grounding-session",
+            operation_id=operation.id,
+            capability_id="catalog.value_grounding.plan",
+            executor_id="catalog.plan_value_grounding",
+            input={
+                "store_id": "store:shop",
+                "prompt": "same completed orders",
+                "session_query_scopes": [
+                    {
+                        "operation_id": "op-prior",
+                        "tables": ["orders"],
+                        "filters": [
+                            {
+                                "column": "status",
+                                "operator": "=",
+                                "values": ["complete"],
+                            }
+                        ],
+                    }
+                ],
+            },
+        ),
+        operation,
+        {},
+    )
+
+    assert evidence[0].payload["targets"] == [
+        {
+            "table": "orders",
+            "column": "status",
+            "reason": "session_query_scope_filter",
+            "confidence": 0.88,
+            "requires_profile_read": True,
+            "source": {
+                "kind": "session_query_scope",
+                "values": ["complete"],
+                "operation_id": "op-prior",
+            },
+        }
+    ]
+
+
+async def test_catalog_value_grounding_plan_surfaces_existing_profiles_without_read():
+    catalog, registry = await _value_grounding_catalog()
+    await catalog.register_column_value_profiles(
+        "store:shop",
+        [
+            {
+                "table": "orders",
+                "column": "status",
+                "distinct_count": 2,
+                "top_values": [
+                    {"value": "complete", "count": 4},
+                    {"value": "pending", "count": 1},
+                ],
+            }
+        ],
+    )
+    operation = Operation(id="op-value-grounding-profile", operation_type="query.plan")
+
+    evidence = await _executor(registry, "catalog.plan_value_grounding").execute(
+        Task(
+            id="task-value-grounding-profile",
+            operation_id=operation.id,
+            capability_id="catalog.value_grounding.plan",
+            executor_id="catalog.plan_value_grounding",
+            input={
+                "store_id": "store:shop",
+                "prompt": "completed orders",
+                "profile_budget": 0,
+            },
+        ),
+        operation,
+        {},
+    )
+
+    assert evidence[0].payload["targets"] == [
+        {
+            "table": "orders",
+            "column": "status",
+            "reason": "catalog_profile",
+            "confidence": 0.9,
+            "requires_profile_read": False,
+            "source": {
+                "kind": "catalog_profile",
+                "profile_ref": "orders.status",
+            },
+        }
+    ]
+    assert evidence[0].payload["skipped"] == []
+    assert evidence[0].payload["diagnostics"] == {
+        "profile_budget": 0,
+        "target_count": 1,
+        "skipped_count": 0,
+    }
+
+
+async def test_catalog_value_grounding_plan_skips_targets_over_profile_budget():
+    _, registry = await _value_grounding_catalog()
+    operation = Operation(id="op-value-grounding-budget", operation_type="query.plan")
+
+    evidence = await _executor(registry, "catalog.plan_value_grounding").execute(
+        Task(
+            id="task-value-grounding-budget",
+            operation_id=operation.id,
+            capability_id="catalog.value_grounding.plan",
+            executor_id="catalog.plan_value_grounding",
+            input={
+                "store_id": "store:shop",
+                "prompt": "orders and customer email values",
+                "profile_budget": 1,
+                "targets": [
+                    {"table": "orders", "column": "status"},
+                    {"table": "customers", "column": "email"},
+                ],
+            },
+        ),
+        operation,
+        {},
+    )
+
+    payload = evidence[0].payload
+    assert payload["targets"] == [
+        {
+            "table": "orders",
+            "column": "status",
+            "reason": "explicit_target",
+            "confidence": 1.0,
+            "requires_profile_read": True,
+            "source": {"kind": "explicit_target"},
+        }
+    ]
+    assert payload["skipped"] == [
+        {
+            "table": "customers",
+            "column": "email",
+            "reason": "profile_budget_exhausted",
+        }
+    ]
+    assert payload["diagnostics"] == {
+        "profile_budget": 1,
+        "target_count": 1,
+        "skipped_count": 1,
+    }
 
 
 async def test_catalog_inspect_asset_omits_inline_values_for_stale_profiles():
