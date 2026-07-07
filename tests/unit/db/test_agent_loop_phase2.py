@@ -21,6 +21,10 @@ from daita.runtime import (
     EvidenceSchema,
     RiskLevel,
 )
+from daita.plugins.catalog import CatalogPlugin
+from daita.plugins.sqlite import SQLitePlugin
+
+import pytest
 
 
 class PhaseTwoExecutor:
@@ -872,6 +876,144 @@ async def test_missing_sql_no_longer_falls_back_to_latest_plan_silently():
     assert compilation.rejected_action_summaries[0]["error"] == "missing_sql"
 
 
+@pytest.mark.xfail(
+    reason=(
+        "Phase 0 characterization for validation-driven value grounding repair; "
+        "expected to pass after Phase 3."
+    ),
+    strict=True,
+)
+async def test_validation_grounding_repair_targets_only_validation_column():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="agent-phase-two")
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Repair the draft SQL using validation facts.",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="schema-targeted-repair",
+                kind="schema.asset_profile",
+                owner="sqlite",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "database_type": "sqlite",
+                    "tables": [
+                        {
+                            "name": "orders",
+                            "columns": [
+                                {"name": "id", "data_type": "INTEGER"},
+                                {"name": "status", "data_type": "TEXT"},
+                                {"name": "channel", "data_type": "TEXT"},
+                            ],
+                        },
+                        {
+                            "name": "customers",
+                            "columns": [
+                                {"name": "id", "data_type": "INTEGER"},
+                                {"name": "status", "data_type": "TEXT"},
+                            ],
+                        },
+                    ],
+                },
+            )
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="validation-unobserved-status",
+                kind="sql.validation",
+                owner="sqlite",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "valid": False,
+                    "sql": (
+                        "SELECT COUNT(*) FROM orders "
+                        "WHERE orders.status = 'completed'"
+                    ),
+                    "operation": "query",
+                    "warnings": [
+                        {
+                            "kind": "unobserved_filter_literal",
+                            "table": "orders",
+                            "column": "status",
+                            "literal": "completed",
+                            "candidates": ["complete", "pending"],
+                        }
+                    ],
+                    "validation_facts": [
+                        {
+                            "kind": "unobserved_filter_literal",
+                            "table": "orders",
+                            "column": "status",
+                            "literal": "completed",
+                            "candidates": ["complete", "pending"],
+                        }
+                    ],
+                },
+            )
+        )
+        loop = DbAgentLoop(runtime, object())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="context",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={"source_owner": "sqlite"},
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    grounding_specs = [
+        spec
+        for spec in compilation.task_specs
+        if spec.capability_id
+        in {
+            "catalog.value_grounding.plan",
+            "catalog.column_value_hints.resolve",
+        }
+    ]
+    assert grounding_specs
+    targets = {
+        (target["table"], target["column"])
+        for spec in grounding_specs
+        for target in _phase0_value_grounding_targets(spec.input)
+    }
+    assert ("orders", "status") in targets
+    assert ("orders", "channel") not in targets
+    assert ("customers", "status") not in targets
+
+
 async def test_agent_loop_rejects_action_outside_contract_before_task_creation():
     runtime, operation = await _runtime_and_operation("phase-two-reject")
     decision = DbPlannerDecision(
@@ -1177,6 +1319,19 @@ def _planning_context_evidence(operation_id):
         },
         metadata={"payload_fingerprint": "fp-planning-context"},
     )
+
+
+def _phase0_value_grounding_targets(task_input):
+    targets = []
+    for key in ("targets", "profile_pairs"):
+        for item in task_input.get(key) or []:
+            if isinstance(item, dict) and item.get("table") and item.get("column"):
+                targets.append({"table": item["table"], "column": item["column"]})
+    for key in ("validation_facts", "warnings", "validation_warnings"):
+        for item in task_input.get(key) or []:
+            if isinstance(item, dict) and item.get("table") and item.get("column"):
+                targets.append({"table": item["table"], "column": item["column"]})
+    return targets
 
 
 def _loop_state():

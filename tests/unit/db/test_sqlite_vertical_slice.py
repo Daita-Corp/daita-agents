@@ -581,6 +581,174 @@ async def test_planning_context_value_hints_profile_prompt_scope_before_context(
     assert hint.payload["hints"][0]["observed_values"][0]["value"] == "complete"
 
 
+@pytest.mark.xfail(
+    reason=(
+        "Phase 0 characterization for catalog-owned value grounding; "
+        "expected to pass after Phase 1/2."
+    ),
+    strict=True,
+)
+async def test_planning_context_value_grounding_does_not_require_known_prompt_keywords():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script(
+        """
+        CREATE TABLE account_revenue (
+            id INTEGER PRIMARY KEY,
+            loyalty_band TEXT NOT NULL,
+            amount REAL NOT NULL
+        );
+        INSERT INTO account_revenue (id, loyalty_band, amount)
+        VALUES (1, 'platinum', 1200.0), (2, 'gold', 800.0);
+        """
+    )
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Summarize revenue for platinum accounts.",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        loop = DbAgentLoop(runtime, object())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="context",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={"source_owner": "sqlite"},
+                ),
+            ),
+        )
+        compilation = loop.compile_actions(decision, state)
+        operation = await loop._persist_compiled_contract(operation, compilation)
+        plan = await runtime.plan_task_specs(
+            operation,
+            compilation.task_specs,
+            contract=compilation.compiled_contract_snapshot,
+        )
+        for task in plan.tasks:
+            await runtime.execute_task(task, operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+    finally:
+        await runtime.teardown()
+
+    contexts = [item for item in evidence if item.kind == "planning.context"]
+    assert contexts
+    hints = contexts[-1].payload["column_value_hints"]
+    assert {
+        "table": "account_revenue",
+        "column": "loyalty_band",
+        "value": "platinum",
+    } in {
+        {
+            "table": hint["table"],
+            "column": hint["column"],
+            "value": observed["value"],
+        }
+        for hint in hints
+        for observed in hint.get("observed_values", [])
+    }
+
+
+async def test_planning_context_general_prompt_does_not_profile_values_without_filter_literal():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script(
+        """
+        CREATE TABLE customers (
+            id INTEGER PRIMARY KEY,
+            lifecycle_state TEXT NOT NULL,
+            customer_segment TEXT NOT NULL,
+            revenue REAL NOT NULL
+        );
+        INSERT INTO customers (id, lifecycle_state, customer_segment, revenue)
+        VALUES (1, 'active', 'enterprise', 1200.0), (2, 'active', 'startup', 800.0);
+        """
+    )
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "summarize customer revenue",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        loop = DbAgentLoop(runtime, object())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="context",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={"source_owner": "sqlite"},
+                ),
+            ),
+        )
+        compilation = loop.compile_actions(decision, state)
+        operation = await loop._persist_compiled_contract(operation, compilation)
+        plan = await runtime.plan_task_specs(
+            operation,
+            compilation.task_specs,
+            contract=compilation.compiled_contract_snapshot,
+        )
+        for task in plan.tasks:
+            await runtime.execute_task(task, operation)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert not any(task.capability_id == "db.column_values.profile" for task in tasks)
+    assert not any(
+        task.metadata.get("prerequisite_for") == "catalog.column_value_hints.resolve"
+        and task.capability_id == "db.column_values.profile"
+        for task in tasks
+    )
+
+
 async def test_catalog_column_value_profile_prerequisite_requires_contract_declaration():
     catalog = CatalogPlugin(auto_persist=False)
     sqlite = SQLitePlugin(path=":memory:")

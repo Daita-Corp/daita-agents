@@ -2,19 +2,22 @@ import json
 
 from daita.agents.agent import Agent
 from daita.agents.conversation import ConversationHistory
-from daita.db import DbAgent, DbRequest, DbRuntime
+from daita.db import DbAgent, DbRequest, DbRuntime, DbRuntimeConfig
 from daita.db.models import (
     DbIntent,
     DbIntentKind,
     DbOperationContract,
     DbOperationResult,
 )
+from daita.db.planning_context import DbPlanningContextBuilder
 from daita.db.session_context import (
     DbSessionContextBuilder,
     db_session_context_from_request,
 )
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import AccessMode, Evidence, Operation, OperationStatus
+
+import pytest
 
 
 class SpyRuntime(DbRuntime):
@@ -37,6 +40,13 @@ class SpyRuntime(DbRuntime):
             status=OperationStatus.SUCCEEDED,
             answer="spy answer",
         )
+
+
+class _BlockedColumnSource:
+    read_only = True
+    allowed_tables = set()
+    blocked_tables = set()
+    blocked_columns = {"customers.loyalty_band"}
 
 
 async def _seed_agent_schema(path):
@@ -164,6 +174,85 @@ async def test_session_context_builder_collects_runtime_referents_and_diagnostic
         "runtime.evidence" in context.diagnostics["referent_sources"]["tables"].values()
     )
     assert "conversation_history" in context.diagnostics["sources"]
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Phase 0 characterization for governed planner context projection; "
+        "expected to pass after Phase 4."
+    ),
+    strict=True,
+)
+def test_planner_visible_session_context_redacts_blocked_columns():
+    request = DbRequest(
+        "Continue summarizing customer revenue.",
+        session_id="s-blocked",
+        session_context={
+            "session_id": "s-blocked",
+            "referents": {
+                "tables": ["customers"],
+                "columns": ["customers.loyalty_band"],
+                "schemas": [],
+                "metrics": [],
+                "monitors": [],
+                "approvals": [],
+                "operations": ["op-prior"],
+            },
+            "query_scopes": [
+                {
+                    "tables": ["customers"],
+                    "filters": [
+                        {
+                            "column": "customers.loyalty_band",
+                            "operator": "=",
+                            "values": ["platinum"],
+                        }
+                    ],
+                    "result_row_count": 3,
+                }
+            ],
+        },
+    )
+    context = DbPlanningContextBuilder(DbRuntimeConfig()).build(
+        request=request,
+        intent=DbIntent(
+            kind=DbIntentKind.DATA_QUERY,
+            confidence=1.0,
+            access=AccessMode.READ,
+        ),
+        operation=Operation(id="op-current", operation_type="data.query"),
+        schema_evidence=Evidence(
+            id="schema-blocked-context",
+            kind="schema.asset_profile",
+            owner="sqlite",
+            accepted=True,
+            payload={
+                "database_type": "sqlite",
+                "tables": [
+                    {
+                        "name": "customers",
+                        "columns": [
+                            {"name": "id", "data_type": "INTEGER"},
+                            {"name": "loyalty_band", "data_type": "TEXT"},
+                            {"name": "revenue", "data_type": "REAL"},
+                        ],
+                    }
+                ],
+            },
+        ),
+        source=_BlockedColumnSource(),
+    )
+
+    planner_visible = json.dumps(
+        {
+            "session_context": context.session_context,
+            "rendered_context": context.rendered_context,
+        },
+        sort_keys=True,
+    )
+    assert "customers.loyalty_band" not in planner_visible
+    assert "platinum" not in planner_visible
+    assert "blocked_columns" in context.policy_summary
 
 
 def test_session_context_from_dict_filters_invalid_conversation_messages():
