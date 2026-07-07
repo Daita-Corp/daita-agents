@@ -20,6 +20,7 @@ from daita.runtime import (
     TaskStatus,
 )
 
+from .continuation import DbContinuationResolver
 from .models import DbIntent, DbIntentKind, DbLimits, DbOperationContract
 from .memory import (
     db_memory_options_from_runtime_metadata,
@@ -286,6 +287,7 @@ class DbAgentLoop:
     def __init__(self, runtime: Any, planner: DbAgentPlanner) -> None:
         self.runtime = runtime
         self.planner = planner
+        self.continuation_resolver = DbContinuationResolver()
 
     async def run(
         self,
@@ -693,18 +695,23 @@ class DbAgentLoop:
             actions.append(action)
 
         current_action_ids = {action.action_id for action in actions}
-        actions = [
-            _recover_prior_turn_memory_proposal_action(
-                _recover_prior_turn_query_plan_action(
-                    action,
-                    state,
-                    current_action_ids=current_action_ids,
-                ),
+        resolved_actions: list[DbPlannerAction] = []
+        for action in actions:
+            resolved_action = self.continuation_resolver.resolve(
+                action,
                 state,
                 current_action_ids=current_action_ids,
             )
-            for action in actions
-        ]
+            continuation_error = self.continuation_resolver.blocked_diagnostic(
+                resolved_action
+            )
+            if continuation_error is not None:
+                rejected.append(
+                    _continuation_action_error(resolved_action, continuation_error)
+                )
+                continue
+            resolved_actions.append(resolved_action)
+        actions = resolved_actions
 
         ordered_actions, dag_errors = _ordered_actions_or_errors(tuple(actions))
         if dag_errors:
@@ -717,22 +724,6 @@ class DbAgentLoop:
                 prior_action_specs=prior_action_specs,
                 operation_id=state.operation_id,
             )
-            if dependency_errors:
-                recovered_action = _recover_prior_turn_query_plan_dependency(
-                    action,
-                    state,
-                    dependency_errors,
-                )
-                if recovered_action is action:
-                    recovered_action = _recover_prior_turn_memory_proposal_dependency(
-                        action,
-                        state,
-                        dependency_errors,
-                    )
-                if recovered_action is not action:
-                    action = recovered_action
-                    planner_dependencies = ()
-                    dependency_errors = ()
             if dependency_errors:
                 rejected.extend(dependency_errors)
                 continue
@@ -2367,6 +2358,8 @@ def _has_terminal_compilation_error(compilation: DbActionCompilation) -> bool:
         "missing_dependency:",
         "dependency_cycle:",
         "dependency_not_durable:",
+        "ambiguous_continuation:",
+        "ambiguous_continuation_evidence:",
     )
     return any(
         str(item.get("error") or "").startswith(terminal_prefixes)
@@ -2456,115 +2449,6 @@ def _task_input_for_action(action: DbPlannerAction) -> dict[str, Any]:
     }
 
 
-def _recover_prior_turn_query_plan_dependency(
-    action: DbPlannerAction,
-    state: DbLoopState,
-    dependency_errors: tuple[dict[str, Any], ...],
-) -> DbPlannerAction:
-    if action.kind is not DbPlannerActionKind.EXECUTE_VALIDATED_READ:
-        return action
-    if not dependency_errors or any(
-        not str(item.get("error") or "").startswith("missing_dependency:")
-        for item in dependency_errors
-    ):
-        return action
-    if _latest_accepted_evidence_summary(state, "query.plan.proposal") is None:
-        return action
-    query_plan_ref = action.input.get("query_plan_ref")
-    if "query_plan_ref" in action.input:
-        if query_plan_ref != "latest_accepted_query_plan":
-            return action
-        recovered_input = dict(action.input)
-    elif any(key in action.input for key in ("sql", "plan_evidence_id")):
-        return action
-    else:
-        recovered_input = {
-            **action.input,
-            "query_plan_ref": "latest_accepted_query_plan",
-        }
-    return replace(
-        action,
-        input=recovered_input,
-        depends_on=(),
-        metadata={
-            **action.metadata,
-            "recovered_prior_turn_dependency": True,
-            "dependency_recovery": "latest_accepted_query_plan",
-        },
-    )
-
-
-def _recover_prior_turn_query_plan_action(
-    action: DbPlannerAction,
-    state: DbLoopState,
-    *,
-    current_action_ids: set[str],
-) -> DbPlannerAction:
-    if action.kind is not DbPlannerActionKind.EXECUTE_VALIDATED_READ:
-        return action
-    if not action.depends_on or all(
-        dependency in current_action_ids for dependency in action.depends_on
-    ):
-        return action
-    return _recover_prior_turn_query_plan_dependency(
-        action,
-        state,
-        tuple(
-            _action_error(action, f"missing_dependency:{dependency}")
-            for dependency in action.depends_on
-            if dependency not in current_action_ids
-        ),
-    )
-
-
-def _recover_prior_turn_memory_proposal_dependency(
-    action: DbPlannerAction,
-    state: DbLoopState,
-    dependency_errors: tuple[dict[str, Any], ...],
-) -> DbPlannerAction:
-    if action.kind is not DbPlannerActionKind.COMMIT_MEMORY_UPDATE:
-        return action
-    if not dependency_errors or any(
-        not str(item.get("error") or "").startswith("missing_dependency:")
-        for item in dependency_errors
-    ):
-        return action
-    if _latest_accepted_evidence_summary(state, "db.memory.proposal") is None:
-        return action
-    return replace(
-        action,
-        depends_on=(),
-        metadata={
-            **action.metadata,
-            "recovered_prior_turn_dependency": True,
-            "dependency_recovery": "latest_accepted_memory_proposal",
-        },
-    )
-
-
-def _recover_prior_turn_memory_proposal_action(
-    action: DbPlannerAction,
-    state: DbLoopState,
-    *,
-    current_action_ids: set[str],
-) -> DbPlannerAction:
-    if action.kind is not DbPlannerActionKind.COMMIT_MEMORY_UPDATE:
-        return action
-    if not action.depends_on or all(
-        dependency in current_action_ids for dependency in action.depends_on
-    ):
-        return action
-    return _recover_prior_turn_memory_proposal_dependency(
-        action,
-        state,
-        tuple(
-            _action_error(action, f"missing_dependency:{dependency}")
-            for dependency in action.depends_on
-            if dependency not in current_action_ids
-        ),
-    )
-
-
 def _resolve_memory_proposal_for_action(
     action: DbPlannerAction,
     state: DbLoopState,
@@ -2590,6 +2474,8 @@ def _resolve_memory_proposal_for_action(
         return dict(matches[0]), None
     if not summaries:
         return None, "missing_accepted_memory_proposal"
+    if len(summaries) > 1:
+        return None, "ambiguous_memory_proposal"
     return dict(summaries[-1]), None
 
 
@@ -3100,6 +2986,19 @@ def _action_error(action: DbPlannerAction, error: str) -> dict[str, Any]:
         "action_id": action.action_id,
         "kind": action.kind.value,
         "error": error,
+    }
+
+
+def _continuation_action_error(
+    action: DbPlannerAction,
+    diagnostic: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        **_action_error(
+            action,
+            str(diagnostic.get("error") or "continuation_resolution_blocked"),
+        ),
+        "continuation": dict(diagnostic),
     }
 
 

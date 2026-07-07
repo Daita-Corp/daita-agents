@@ -74,6 +74,14 @@ class PhaseTwoExecutor:
                     payload={"status": "executed"},
                 )
             ]
+        if task.capability_id == "db.memory.commit_update":
+            return [
+                Evidence(
+                    kind="db.memory.definition",
+                    owner="phase_two",
+                    payload={"status": "committed"},
+                )
+            ]
         raise AssertionError(f"unexpected capability: {task.capability_id}")
 
 
@@ -152,6 +160,22 @@ class PhaseTwoPlugin(RuntimeExtensionPlugin):
                 replay_safe=False,
                 idempotent=False,
             ),
+            Capability(
+                id="db.memory.commit_update",
+                owner="phase_two",
+                description="Commit a memory update.",
+                domains=frozenset({"db"}),
+                operation_types=frozenset({"memory.update"}),
+                access=AccessMode.WRITE,
+                risk=RiskLevel.MEDIUM,
+                input_schema={"type": "object"},
+                output_evidence=frozenset({"db.memory.definition"}),
+                executor="phase_two.memory.commit_update",
+                runtime_only=True,
+                side_effecting=True,
+                replay_safe=False,
+                idempotent=False,
+            ),
         ]
 
     def get_executors(self):
@@ -160,6 +184,10 @@ class PhaseTwoPlugin(RuntimeExtensionPlugin):
             PhaseTwoExecutor("phase_two.sql.validate", {"db.sql.validate"}),
             PhaseTwoExecutor("phase_two.sql.execute_read", {"db.sql.execute_read"}),
             PhaseTwoExecutor("phase_two.sql.execute_write", {"db.sql.execute_write"}),
+            PhaseTwoExecutor(
+                "phase_two.memory.commit_update",
+                {"db.memory.commit_update"},
+            ),
         ]
 
     def declare_evidence_schemas(self):
@@ -181,6 +209,11 @@ class PhaseTwoPlugin(RuntimeExtensionPlugin):
             ),
             EvidenceSchema(
                 kind="write.execution",
+                owner="phase_two",
+                json_schema={"type": "object"},
+            ),
+            EvidenceSchema(
+                kind="db.memory.definition",
                 owner="phase_two",
                 json_schema={"type": "object"},
             ),
@@ -347,6 +380,10 @@ async def test_latest_accepted_query_plan_ref_selects_latest_accepted_plan():
         validation.metadata["sql_provenance"]["provenance"]
         == "latest_accepted_query_plan"
     )
+    continuation = validation.metadata["continuation_resolution"]
+    assert continuation["source"] == "explicit_role"
+    assert continuation["role"] == "latest_accepted_query_plan"
+    assert continuation["evidence_id"] == "plan-new"
 
 
 async def test_prior_turn_query_plan_dependency_recovers_to_latest_plan():
@@ -398,6 +435,140 @@ async def test_prior_turn_latest_plan_ref_dependency_recovers_to_latest_plan():
         validation.metadata["sql_provenance"]["provenance"]
         == "latest_accepted_query_plan"
     )
+    assert validation.metadata["dependency_recovery"] == "latest_accepted_query_plan"
+    continuation = validation.metadata["continuation_resolution"]
+    assert continuation["source"] == "explicit_role"
+    assert continuation["stale_dependency_ids"] == ["plan_previous_turn"]
+
+
+async def test_prior_turn_dependency_with_explicit_plan_evidence_id_preserves_id():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two", "plan_evidence_id": "plan-explicit"},
+        depends_on=("plan_previous_turn",),
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-five-explicit-id-continuation",
+        action,
+        plan_evidence=(
+            {
+                "evidence_id": "plan-explicit",
+                "sql": "select 1 as answer",
+                "task_id": "plan-task",
+            },
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-explicit"
+    provenance = validation.metadata["sql_provenance"]
+    assert provenance["provenance"] == "plan_evidence_id"
+    assert provenance["source_evidence_id"] == "plan-explicit"
+    continuation = validation.metadata["continuation_resolution"]
+    assert continuation["source"] == "explicit_evidence_id"
+    assert continuation["evidence_id"] == "plan-explicit"
+    assert continuation["stale_dependency_ids"] == ["plan_previous_turn"]
+
+
+async def test_prior_turn_query_plan_dependency_blocks_ambiguous_candidates():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two"},
+        depends_on=("plan_previous_turn",),
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-five-ambiguous-plan-continuation",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-one", "sql": "select 1 as answer"},
+            {"evidence_id": "plan-two", "sql": "select 2 as answer"},
+        ),
+    )
+
+    assert compilation.task_specs == ()
+    rejected = compilation.rejected_action_summaries[0]
+    assert rejected["error"] == "ambiguous_continuation:latest_accepted_query_plan"
+    assert rejected["continuation"]["status"] == "blocked"
+    assert rejected["continuation"]["candidate_ids"] == ["plan-one", "plan-two"]
+    assert rejected["continuation"]["stale_dependency_ids"] == [
+        "plan_previous_turn"
+    ]
+
+
+async def test_memory_proposal_role_ref_resolves_to_latest_accepted_proposal():
+    action = DbPlannerAction(
+        action_id="commit",
+        kind=DbPlannerActionKind.COMMIT_MEMORY_UPDATE,
+        input={
+            "owner": "phase_two",
+            "proposal_ref": "latest_accepted_memory_proposal",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-five-memory-role-ref",
+        action,
+        memory_proposal_evidence=(
+            {
+                "evidence_id": "proposal-old",
+                "proposal_fingerprint": "proposal-fp-old",
+            },
+            {
+                "evidence_id": "proposal-new",
+                "proposal_fingerprint": "proposal-fp-new",
+            },
+        ),
+        explicit_mode="memory.update",
+        max_access="write",
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    commit = compilation.task_specs[0]
+    assert commit.input == {
+        "proposal_evidence_id": "proposal-new",
+        "proposal_fingerprint": "proposal-fp-new",
+    }
+    assert commit.dependencies[0].evidence_id == "proposal-new"
+    continuation = commit.metadata["continuation_resolution"]
+    assert continuation["source"] == "explicit_role"
+    assert continuation["role"] == "latest_accepted_memory_proposal"
+    assert continuation["evidence_id"] == "proposal-new"
+
+
+async def test_memory_commit_without_role_blocks_ambiguous_proposals():
+    action = DbPlannerAction(
+        action_id="commit",
+        kind=DbPlannerActionKind.COMMIT_MEMORY_UPDATE,
+        input={"owner": "phase_two"},
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-five-memory-ambiguous",
+        action,
+        memory_proposal_evidence=(
+            {"evidence_id": "proposal-one"},
+            {"evidence_id": "proposal-two"},
+        ),
+        explicit_mode="memory.update",
+        max_access="write",
+    )
+
+    assert compilation.task_specs == ()
+    rejected = compilation.rejected_action_summaries[0]
+    assert (
+        rejected["error"]
+        == "ambiguous_continuation:latest_accepted_memory_proposal"
+    )
+    assert rejected["continuation"]["candidate_ids"] == [
+        "proposal-one",
+        "proposal-two",
+    ]
 
 
 async def test_direct_sql_matching_latest_plan_ref_uses_plan_provenance():
@@ -1218,6 +1389,7 @@ async def _compile_single_action(
     *,
     plan_evidence=(),
     sql_validation_evidence=(),
+    memory_proposal_evidence=(),
     planning_context=False,
     explicit_mode=None,
     max_access="read",
@@ -1233,6 +1405,10 @@ async def _compile_single_action(
     for item in sql_validation_evidence:
         await runtime.store.save_evidence(
             _sql_validation_evidence(operation.id, **dict(item))
+        )
+    for item in memory_proposal_evidence:
+        await runtime.store.save_evidence(
+            _memory_proposal_evidence(operation.id, **dict(item))
         )
     if planning_context:
         await runtime.store.save_evidence(_planning_context_evidence(operation.id))
@@ -1293,6 +1469,30 @@ def _sql_validation_evidence(
         accepted=accepted,
         payload={"valid": valid, "sql": sql, "operation": operation},
         metadata={"payload_fingerprint": f"fp-{evidence_id}"},
+    )
+
+
+def _memory_proposal_evidence(
+    operation_id,
+    *,
+    evidence_id,
+    accepted=True,
+    task_id=None,
+    proposal_fingerprint=None,
+):
+    proposal_fingerprint = proposal_fingerprint or f"proposal-fp-{evidence_id}"
+    return Evidence(
+        id=evidence_id,
+        kind="db.memory.proposal",
+        owner="db_runtime",
+        operation_id=operation_id,
+        task_id=task_id or f"task-{evidence_id}",
+        accepted=accepted,
+        payload={"proposal_fingerprint": proposal_fingerprint},
+        metadata={
+            "payload_fingerprint": f"payload-fp-{evidence_id}",
+            "proposal_fingerprint": proposal_fingerprint,
+        },
     )
 
 
