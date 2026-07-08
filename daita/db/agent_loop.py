@@ -192,6 +192,8 @@ class _ResolvedSqlInput:
     sql: str
     provenance: str
     query_plan_dependency: TaskDependency | None = None
+    plan_validation_dependency: TaskDependency | None = None
+    sql_validation_dependency: TaskDependency | None = None
     source_evidence_id: str | None = None
     source_evidence_kind: str | None = None
     source_evidence_owner: str | None = None
@@ -1502,7 +1504,14 @@ class DbAgentLoop:
         if sql_error is not None or resolved_sql is None:
             return [], [], [_action_error(action, sql_error or "missing_sql")]
         owner = _action_owner(action)
-        validation = self._resolve_capability("db.sql.validate", owner=owner)
+        uses_existing_sql_validation = (
+            resolved_sql.sql_validation_dependency is not None
+        )
+        validation = (
+            None
+            if uses_existing_sql_validation
+            else self._resolve_capability("db.sql.validate", owner=owner)
+        )
         execute = self._resolve_capability(execute_capability_id, owner=owner)
         plan_validation = None
         planning_context = _latest_accepted_evidence_summary(
@@ -1525,7 +1534,11 @@ class DbAgentLoop:
                     if plan_validation is not None
                     else None
                 ),
-                self._capability_error(action, validation),
+                (
+                    self._capability_error(action, validation)
+                    if validation is not None
+                    else None
+                ),
                 self._capability_error(action, execute),
             )
             if error is not None
@@ -1534,7 +1547,7 @@ class DbAgentLoop:
             return [], [], errors
         capabilities = [
             *([plan_validation["capability"]] if plan_validation is not None else []),
-            validation["capability"],
+            *([validation["capability"]] if validation is not None else []),
             execute["capability"],
         ]
         access_error = self._access_errors(action, capabilities, state)
@@ -1586,46 +1599,60 @@ class DbAgentLoop:
                     },
                 )
             )
+        elif resolved_sql.plan_validation_dependency is not None:
+            validation_dependencies.append(resolved_sql.plan_validation_dependency)
         elif resolved_sql.query_plan_dependency is not None:
             validation_dependencies.append(resolved_sql.query_plan_dependency)
 
-        validation_spec = DbTaskSpec(
-            capability_id="db.sql.validate",
-            owner=validation["capability"].owner,
-            input={"sql": resolved_sql.sql, "operation": sql_operation},
-            reason=f"planner:{action.kind.value}:validation",
-            sequence=sequence_start + len(specs),
-            dependencies=tuple(validation_dependencies),
-            metadata=metadata,
-            deterministic_key=f"{action.action_id}:db.sql.validate",
-        )
-        validation_spec = _with_deterministic_task_id(
-            state.operation_id,
-            validation_spec,
-        )
+        validation_spec: DbTaskSpec | None = None
+        if validation is not None:
+            validation_spec = DbTaskSpec(
+                capability_id="db.sql.validate",
+                owner=validation["capability"].owner,
+                input={"sql": resolved_sql.sql, "operation": sql_operation},
+                reason=f"planner:{action.kind.value}:validation",
+                sequence=sequence_start + len(specs),
+                dependencies=tuple(validation_dependencies),
+                metadata=metadata,
+                deterministic_key=f"{action.action_id}:db.sql.validate",
+            )
+            validation_spec = _with_deterministic_task_id(
+                state.operation_id,
+                validation_spec,
+            )
         execute_capability = execute["capability"]
-        execute_input: dict[str, Any] = {
-            "sql_ref": "sql.validation",
-            "params": list(action.input.get("params") or ()),
-        }
-        if action.input.get("param_specs"):
-            execute_input["param_specs"] = list(action.input.get("param_specs") or ())
-        if action.input.get("focus") is not None:
-            execute_input["focus"] = action.input["focus"]
+        execute_input = _validated_sql_execute_input(
+            action,
+            resolved_sql,
+            validation_spec=validation_spec,
+        )
+        execute_dependencies = _validated_sql_execute_dependencies(
+            resolved_sql,
+            validation_spec=validation_spec,
+            operation_id=state.operation_id,
+        )
         execute_spec = DbTaskSpec(
             capability_id=execute_capability_id,
             owner=execute_capability.owner,
             input=execute_input,
             reason=f"planner:{action.kind.value}",
             sequence=sequence_start + len(specs) + 1,
+            dependencies=execute_dependencies,
             metadata=metadata,
-            deterministic_key=f"{action.action_id}:{execute_capability_id}",
+            deterministic_key=_validated_sql_execute_deterministic_key(
+                action,
+                execute_capability_id=execute_capability_id,
+                execute_input=execute_input,
+                dependencies=execute_dependencies,
+            ),
         )
         execute_spec = _with_deterministic_task_id(
             state.operation_id,
             execute_spec,
         )
-        specs.extend((validation_spec, execute_spec))
+        if validation_spec is not None:
+            specs.append(validation_spec)
+        specs.append(execute_spec)
         return (
             specs,
             [_capability_selection(item, action) for item in capabilities],
@@ -3405,6 +3432,110 @@ def _normalized_sql_input(sql: str) -> str:
     return re.sub(r"\s+", " ", sql.strip().rstrip(";")).strip()
 
 
+def _sql_input_fingerprint(sql: str) -> str:
+    return _stable_hash({"sql": sql})
+
+
+def _validated_sql_execute_input(
+    action: DbPlannerAction,
+    resolved_sql: _ResolvedSqlInput,
+    *,
+    validation_spec: DbTaskSpec | None,
+) -> dict[str, Any]:
+    execute_input: dict[str, Any] = {
+        "sql_fingerprint": _sql_input_fingerprint(resolved_sql.sql),
+        "params": list(action.input.get("params") or ()),
+    }
+    if validation_spec is not None:
+        execute_input["sql_validation_task_id"] = validation_spec.task_id
+        execute_input["sql_validation_input_hash"] = _stable_hash(
+            validation_spec.input
+        )
+    if resolved_sql.sql_validation_dependency is not None:
+        dependency = resolved_sql.sql_validation_dependency
+        if dependency.evidence_id:
+            execute_input["sql_validation_evidence_id"] = dependency.evidence_id
+        if dependency.payload_fingerprint:
+            execute_input["sql_validation_payload_fingerprint"] = (
+                dependency.payload_fingerprint
+            )
+        if dependency.producer_task_id:
+            execute_input["sql_validation_task_id"] = dependency.producer_task_id
+        if dependency.input_hash:
+            execute_input["sql_validation_input_hash"] = dependency.input_hash
+    if resolved_sql.query_plan_dependency is not None:
+        dependency = resolved_sql.query_plan_dependency
+        if dependency.evidence_id:
+            execute_input["plan_evidence_id"] = dependency.evidence_id
+        if dependency.payload_fingerprint:
+            execute_input["plan_payload_fingerprint"] = dependency.payload_fingerprint
+        if dependency.producer_task_id:
+            execute_input["plan_task_id"] = dependency.producer_task_id
+    if resolved_sql.plan_validation_dependency is not None:
+        dependency = resolved_sql.plan_validation_dependency
+        if dependency.evidence_id:
+            execute_input["plan_validation_evidence_id"] = dependency.evidence_id
+        if dependency.payload_fingerprint:
+            execute_input["plan_validation_payload_fingerprint"] = (
+                dependency.payload_fingerprint
+            )
+        if dependency.producer_task_id:
+            execute_input["plan_validation_task_id"] = dependency.producer_task_id
+    if action.input.get("param_specs"):
+        execute_input["param_specs"] = list(action.input.get("param_specs") or ())
+    if action.input.get("focus") is not None:
+        execute_input["focus"] = action.input["focus"]
+    return execute_input
+
+
+def _validated_sql_execute_dependencies(
+    resolved_sql: _ResolvedSqlInput,
+    *,
+    validation_spec: DbTaskSpec | None,
+    operation_id: str,
+) -> tuple[TaskDependency, ...]:
+    dependencies: list[TaskDependency] = []
+    if resolved_sql.query_plan_dependency is not None:
+        dependencies.append(resolved_sql.query_plan_dependency)
+    if resolved_sql.plan_validation_dependency is not None:
+        dependencies.append(resolved_sql.plan_validation_dependency)
+    if resolved_sql.sql_validation_dependency is not None:
+        dependencies.append(resolved_sql.sql_validation_dependency)
+    elif validation_spec is not None:
+        dependencies.append(
+            TaskDependency(
+                kind="evidence",
+                evidence_kind="sql.validation",
+                evidence_owner=validation_spec.owner,
+                producer_task_id=validation_spec.task_id,
+                producer_capability_id=validation_spec.capability_id,
+                evidence_accepted=True,
+                evidence_payload={"valid": True},
+                input_hash=_stable_hash(validation_spec.input),
+                operation_id=operation_id,
+                metadata={
+                    "sql_resolution": True,
+                    "provenance": "same_turn_sql_validation",
+                },
+            )
+        )
+    return _merge_dependencies((), tuple(dependencies))
+
+
+def _validated_sql_execute_deterministic_key(
+    action: DbPlannerAction,
+    *,
+    execute_capability_id: str,
+    execute_input: Mapping[str, Any],
+    dependencies: tuple[TaskDependency, ...],
+) -> str:
+    identity = {
+        "input": execute_input,
+        "dependencies": [dependency.to_dict() for dependency in dependencies],
+    }
+    return f"{action.action_id}:{execute_capability_id}:{_stable_hash(identity)[:16]}"
+
+
 def _resolve_sql_from_plan_evidence_id(
     plan_evidence_id: str,
     state: DbLoopState,
@@ -3484,6 +3615,7 @@ def _resolve_matching_sql_from_latest_accepted_validation(
             summary,
             sql=sql,
             provenance="latest_accepted_sql_validation",
+            state=state,
         )
     if valid_summaries:
         return None, "ambiguous_sql_input"
@@ -3529,6 +3661,7 @@ def _resolve_sql_from_validation_evidence_id(
         summary,
         sql=sql,
         provenance="validation_evidence_id",
+        state=state,
     )
 
 
@@ -3537,19 +3670,38 @@ def _resolved_sql_from_validation_summary(
     *,
     sql: str,
     provenance: str,
+    state: DbLoopState,
 ) -> tuple[_ResolvedSqlInput | None, str | None]:
     evidence_id = _optional_string(summary.get("id"))
+    evidence_owner = _optional_string(summary.get("owner"))
+    task_id = _optional_string(summary.get("task_id"))
+    payload_fingerprint = _optional_string(summary.get("payload_fingerprint"))
+    dependency = TaskDependency(
+        kind="evidence",
+        evidence_kind="sql.validation",
+        evidence_id=evidence_id,
+        evidence_owner=evidence_owner,
+        producer_task_id=task_id,
+        evidence_accepted=True,
+        evidence_payload={"valid": True},
+        operation_id=state.operation_id,
+        payload_fingerprint=payload_fingerprint,
+        input_hash=_optional_string(summary.get("task_input_hash")),
+        metadata={
+            "sql_resolution": True,
+            "provenance": provenance,
+        },
+    )
     return (
         _ResolvedSqlInput(
             sql=sql.strip(),
             provenance=provenance,
+            sql_validation_dependency=dependency,
             source_evidence_id=evidence_id,
             source_evidence_kind="sql.validation",
-            source_evidence_owner=_optional_string(summary.get("owner")),
-            source_task_id=_optional_string(summary.get("task_id")),
-            source_payload_fingerprint=_optional_string(
-                summary.get("payload_fingerprint")
-            ),
+            source_evidence_owner=evidence_owner,
+            source_task_id=task_id,
+            source_payload_fingerprint=payload_fingerprint,
         ),
         None,
     )
@@ -3582,11 +3734,16 @@ def _resolved_sql_from_plan_summary(
             "provenance": provenance,
         },
     )
+    plan_validation_dependency = _accepted_plan_validation_dependency_for_plan(
+        state,
+        plan_evidence_id=evidence_id,
+    )
     return (
         _ResolvedSqlInput(
             sql=sql.strip(),
             provenance=provenance,
             query_plan_dependency=dependency,
+            plan_validation_dependency=plan_validation_dependency,
             source_evidence_id=evidence_id,
             source_evidence_kind="query.plan.proposal",
             source_evidence_owner=evidence_owner,
@@ -3595,6 +3752,41 @@ def _resolved_sql_from_plan_summary(
         ),
         None,
     )
+
+
+def _accepted_plan_validation_dependency_for_plan(
+    state: DbLoopState,
+    *,
+    plan_evidence_id: str | None,
+) -> TaskDependency | None:
+    if not plan_evidence_id:
+        return None
+    for summary in reversed(state.accepted_evidence_summaries):
+        if summary.get("kind") != "query.plan.validation":
+            continue
+        if summary.get("accepted") is not True or summary.get("valid") is not True:
+            continue
+        if summary.get("plan_evidence_id") != plan_evidence_id:
+            continue
+        evidence_id = _optional_string(summary.get("id"))
+        if evidence_id is None:
+            continue
+        return TaskDependency(
+            kind="evidence",
+            evidence_kind="query.plan.validation",
+            evidence_id=evidence_id,
+            evidence_owner=_optional_string(summary.get("owner")),
+            producer_task_id=_optional_string(summary.get("task_id")),
+            evidence_accepted=True,
+            operation_id=state.operation_id,
+            payload_fingerprint=_optional_string(summary.get("payload_fingerprint")),
+            input_hash=_optional_string(summary.get("task_input_hash")),
+            metadata={
+                "sql_resolution": True,
+                "provenance": "query_plan_validation",
+            },
+        )
+    return None
 
 
 def _sql_provenance_metadata(resolved: _ResolvedSqlInput) -> dict[str, Any]:
@@ -3795,6 +3987,12 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
         }:
             if "valid" in evidence.payload:
                 summary["valid"] = evidence.payload.get("valid") is True
+            if evidence.kind == "query.plan.validation":
+                plan_evidence_id = _optional_string(
+                    evidence.payload.get("plan_evidence_id")
+                )
+                if plan_evidence_id is not None:
+                    summary["plan_evidence_id"] = plan_evidence_id
             validation_facts = _safe_validation_items(
                 evidence.payload.get("validation_facts")
             )
@@ -3848,6 +4046,9 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
     payload_fingerprint = evidence.metadata.get("payload_fingerprint")
     if payload_fingerprint:
         summary["payload_fingerprint"] = str(payload_fingerprint)
+    task_input_hash = evidence.metadata.get("task_input_hash")
+    if task_input_hash:
+        summary["task_input_hash"] = str(task_input_hash)
     return summary
 
 

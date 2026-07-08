@@ -790,14 +790,21 @@ class DbRuntimeTasksMixin:
             }
         )
         task_id = spec.task_id or f"db-task-{task_fingerprint[:32]}"
-        dependencies = _combine_dependencies(
-            _task_dependencies_for_capability(
-                operation,
-                capability,
-                validation_task=validation_task,
-            ),
-            spec.dependencies,
+        default_dependencies = _task_dependencies_for_capability(
+            operation,
+            capability,
+            validation_task=validation_task,
         )
+        if _has_sql_validation_dependency(spec.dependencies):
+            default_dependencies = tuple(
+                dependency
+                for dependency in default_dependencies
+                if not (
+                    dependency.kind.value == "evidence"
+                    and dependency.evidence_kind == "sql.validation"
+                )
+            )
+        dependencies = _combine_dependencies(default_dependencies, spec.dependencies)
         metadata = {
             **spec.metadata,
             "owner": capability.owner,
@@ -878,7 +885,7 @@ class DbRuntimeTasksMixin:
                 if (
                     dependency.payload_fingerprint is not None
                     and dependency.payload_fingerprint
-                    != _payload_fingerprint(evidence.payload)
+                    != _evidence_payload_fingerprint(evidence)
                 ):
                     continue
                 return True
@@ -1737,7 +1744,7 @@ class DbRuntimeTasksMixin:
             and (
                 dependency.payload_fingerprint is None
                 or dependency.payload_fingerprint
-                == _payload_fingerprint(evidence.payload)
+                == _evidence_payload_fingerprint(evidence)
             )
         ]
         return matches[-1] if matches else None
@@ -2711,6 +2718,13 @@ def _payload_fingerprint(payload: dict[str, Any]) -> str:
     return _stable_hash(payload)
 
 
+def _evidence_payload_fingerprint(evidence: Evidence) -> str:
+    return str(
+        evidence.metadata.get("payload_fingerprint")
+        or _payload_fingerprint(evidence.payload)
+    )
+
+
 def _prompt_from_direct_input(input: dict[str, Any]) -> str:
     for key in ("prompt", "sql", "query", "content"):
         value = input.get(key)
@@ -2750,6 +2764,16 @@ def _combine_dependencies(
         seen.add(fingerprint)
         combined.append(dependency)
     return tuple(combined)
+
+
+def _has_sql_validation_dependency(
+    dependencies: tuple[TaskDependency, ...],
+) -> bool:
+    return any(
+        dependency.kind.value == "evidence"
+        and dependency.evidence_kind == "sql.validation"
+        for dependency in dependencies
+    )
 
 
 def _task_dependencies_for_capability(

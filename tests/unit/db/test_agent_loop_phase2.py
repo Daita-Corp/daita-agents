@@ -12,6 +12,7 @@ from daita.db.planner_protocol import (
     DbPlannerDecision,
     DbPlannerDecisionStatus,
 )
+from daita.db.runtime.tasks import DbTaskSpec
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
 from daita.runtime import (
     AccessMode,
@@ -22,6 +23,7 @@ from daita.runtime import (
     EvidenceSchema,
     RiskLevel,
     Task,
+    TaskDependency,
 )
 from daita.plugins import MemoryPlugin
 from daita.plugins.catalog import CatalogPlugin
@@ -1182,7 +1184,18 @@ async def test_direct_sql_compiles_validation_and_read_task_specs():
     assert validation.input == {"sql": sql, "operation": "query"}
     assert validation.dependencies == ()
     assert validation.metadata["sql_provenance"]["provenance"] == "direct"
-    assert read.input["sql_ref"] == "sql.validation"
+    assert "sql_ref" not in read.input
+    assert read.input["params"] == []
+    assert read.input["sql_fingerprint"]
+    assert read.input["sql_validation_task_id"] == validation.task_id
+    assert read.input["sql_validation_input_hash"]
+    sql_dependency = next(
+        dependency
+        for dependency in read.dependencies
+        if dependency.evidence_kind == "sql.validation"
+    )
+    assert sql_dependency.producer_task_id == validation.task_id
+    assert sql_dependency.input_hash == read.input["sql_validation_input_hash"]
 
 
 async def test_explicit_plan_evidence_id_attaches_dependency_to_validation():
@@ -1204,7 +1217,10 @@ async def test_explicit_plan_evidence_id_attaches_dependency_to_validation():
     assert compilation.rejected_action_summaries == ()
     validation, read = compilation.task_specs
     assert validation.input == {"sql": sql, "operation": "query"}
-    assert read.input["sql_ref"] == "sql.validation"
+    assert "sql_ref" not in read.input
+    assert read.input["plan_evidence_id"] == "plan-explicit"
+    assert read.input["plan_payload_fingerprint"] == "fp-plan-explicit"
+    assert read.input["sql_validation_task_id"] == validation.task_id
     assert len(validation.dependencies) == 1
     dependency = validation.dependencies[0]
     assert dependency.evidence_kind == "query.plan.proposal"
@@ -1688,14 +1704,18 @@ async def test_write_execute_with_direct_sql_and_plan_ref_uses_matching_validati
 
     assert compilation.rejected_action_summaries == ()
     assert [spec.capability_id for spec in compilation.task_specs] == [
-        "db.sql.validate",
         "db.sql.execute_write",
     ]
-    validation, write = compilation.task_specs
-    assert validation.input == {"sql": f"{sql};", "operation": "write"}
-    assert validation.dependencies == ()
-    assert write.input["sql_ref"] == "sql.validation"
-    provenance = validation.metadata["sql_provenance"]
+    (write,) = compilation.task_specs
+    assert "sql_ref" not in write.input
+    assert write.input["sql_validation_evidence_id"] == "validation-write"
+    assert write.input["sql_validation_payload_fingerprint"] == "fp-validation-write"
+    dependency = write.dependencies[0]
+    assert dependency.evidence_kind == "sql.validation"
+    assert dependency.evidence_id == "validation-write"
+    assert dependency.payload_fingerprint == "fp-validation-write"
+    assert dependency.producer_task_id == "validation-task"
+    provenance = write.metadata["sql_provenance"]
     assert provenance["provenance"] == "latest_accepted_sql_validation"
     assert provenance["source_evidence_id"] == "validation-write"
     assert provenance["source_evidence_kind"] == "sql.validation"
@@ -1730,13 +1750,230 @@ async def test_write_execute_plan_evidence_id_can_reference_sql_validation():
     )
 
     assert compilation.rejected_action_summaries == ()
-    validation, write = compilation.task_specs
-    assert validation.input == {"sql": sql, "operation": "write"}
-    assert write.input["sql_ref"] == "sql.validation"
-    provenance = validation.metadata["sql_provenance"]
+    (write,) = compilation.task_specs
+    assert "sql_ref" not in write.input
+    assert write.input["sql_validation_evidence_id"] == "validation-write"
+    dependency = write.dependencies[0]
+    assert dependency.evidence_kind == "sql.validation"
+    assert dependency.evidence_id == "validation-write"
+    provenance = write.metadata["sql_provenance"]
     assert provenance["provenance"] == "validation_evidence_id"
     assert provenance["source_evidence_id"] == "validation-write"
     assert provenance["source_evidence_kind"] == "sql.validation"
+
+
+async def test_repaired_sql_validation_creates_distinct_execute_task():
+    old_sql = "select count(*) from orders where status = 'completed'"
+    repaired_sql = "select count(*) from orders where status = 'complete'"
+    runtime, operation = await _runtime_and_operation(
+        "phase-one-distinct-repaired-execute"
+    )
+    try:
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(
+                operation.id,
+                evidence_id="validation-old",
+                sql=old_sql,
+                task_id="validation-task-old",
+            )
+        )
+        old_compilation = await _compile_action_for_runtime(
+            runtime,
+            operation,
+            DbPlannerAction(
+                action_id="execute_repaired",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "phase_two",
+                    "plan_evidence_id": "validation-old",
+                },
+            ),
+        )
+        old_plan = await runtime.plan_task_specs(
+            operation,
+            old_compilation.task_specs,
+        )
+
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(
+                operation.id,
+                evidence_id="validation-repaired",
+                sql=repaired_sql,
+                task_id="validation-task-repaired",
+            )
+        )
+        repaired_compilation = await _compile_action_for_runtime(
+            runtime,
+            operation,
+            DbPlannerAction(
+                action_id="execute_repaired",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "phase_two",
+                    "plan_evidence_id": "validation-repaired",
+                },
+            ),
+        )
+        repaired_plan = await runtime.plan_task_specs(
+            operation,
+            repaired_compilation.task_specs,
+        )
+    finally:
+        await runtime.teardown()
+
+    old_execute = old_plan.tasks[0]
+    repaired_execute = repaired_plan.tasks[0]
+    assert old_execute.id != repaired_execute.id
+    assert old_execute.input["sql_validation_evidence_id"] == "validation-old"
+    assert (
+        repaired_execute.input["sql_validation_evidence_id"]
+        == "validation-repaired"
+    )
+    assert old_execute.input["sql_fingerprint"] != repaired_execute.input[
+        "sql_fingerprint"
+    ]
+    assert old_execute.dependencies[0].evidence_id == "validation-old"
+    assert repaired_execute.dependencies[0].evidence_id == "validation-repaired"
+
+
+async def test_stale_blocked_execute_does_not_block_repaired_execution():
+    old_sql = "select count(*) from orders where status = 'completed'"
+    repaired_sql = "select count(*) from orders where status = 'complete'"
+    runtime, operation = await _runtime_and_operation(
+        "phase-one-stale-blocked-execute"
+    )
+    try:
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(
+                operation.id,
+                evidence_id="validation-old",
+                sql=old_sql,
+                task_id="validation-task-old",
+            )
+        )
+        old_compilation = await _compile_action_for_runtime(
+            runtime,
+            operation,
+            DbPlannerAction(
+                action_id="execute_repaired",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "phase_two",
+                    "plan_evidence_id": "validation-old",
+                },
+            ),
+        )
+        old_plan = await runtime.plan_task_specs(
+            operation,
+            old_compilation.task_specs,
+        )
+        old_execute = old_plan.tasks[0]
+        await runtime.kernel.block_task(old_execute.id, message="stale execution")
+        old_blocked = await runtime.store.load_task(old_execute.id)
+
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(
+                operation.id,
+                evidence_id="validation-repaired",
+                sql=repaired_sql,
+                task_id="validation-task-repaired",
+            )
+        )
+        repaired_compilation = await _compile_action_for_runtime(
+            runtime,
+            operation,
+            DbPlannerAction(
+                action_id="execute_repaired",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "phase_two",
+                    "plan_evidence_id": "validation-repaired",
+                },
+            ),
+        )
+        repaired_plan = await runtime.plan_task_specs(
+            operation,
+            repaired_compilation.task_specs,
+        )
+        repaired_execute = repaired_plan.tasks[0]
+        repaired_readiness = await runtime._task_readiness(
+            repaired_execute,
+            operation,
+        )
+    finally:
+        await runtime.teardown()
+
+    assert old_execute.id != repaired_execute.id
+    assert old_blocked is not None
+    assert old_blocked.status.value == "blocked"
+    assert repaired_execute.status.value == "pending"
+    assert repaired_readiness["ready"] is True
+
+
+async def test_execute_read_readiness_requires_exact_sql_validation_evidence():
+    runtime, operation = await _runtime_and_operation(
+        "phase-one-exact-validation-readiness"
+    )
+    try:
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(
+                operation.id,
+                evidence_id="validation-other",
+                sql="select 2 as answer",
+                task_id="validation-task-other",
+            )
+        )
+        exact_dependency = TaskDependency(
+            kind="evidence",
+            evidence_kind="sql.validation",
+            evidence_id="validation-required",
+            evidence_owner="phase_two",
+            producer_task_id="validation-task-required",
+            evidence_accepted=True,
+            evidence_payload={"valid": True},
+            payload_fingerprint="fp-validation-required",
+            operation_id=operation.id,
+        )
+        plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.sql.execute_read",
+                    owner="phase_two",
+                    input={
+                        "sql_validation_evidence_id": "validation-required",
+                        "sql_validation_payload_fingerprint": (
+                            "fp-validation-required"
+                        ),
+                        "sql_fingerprint": "sql-fp-required",
+                        "params": [],
+                    },
+                    dependencies=(exact_dependency,),
+                    reason="phase_1_exact_validation_readiness",
+                    sequence=1,
+                ),
+            ),
+        )
+        task = plan.tasks[0]
+        readiness = await runtime._task_readiness(task, operation)
+
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(
+                operation.id,
+                evidence_id="validation-required",
+                sql="select 1 as answer",
+                task_id="validation-task-required",
+            )
+        )
+        repaired_readiness = await runtime._task_readiness(task, operation)
+    finally:
+        await runtime.teardown()
+
+    assert readiness["ready"] is False
+    assert readiness["unsatisfied_dependencies"][0]["evidence_id"] == (
+        "validation-required"
+    )
+    assert repaired_readiness["ready"] is True
 
 
 async def test_write_execute_ignores_invalid_matching_validation():
@@ -1804,7 +2041,15 @@ async def test_plan_evidence_with_context_validates_plan_before_sql():
     assert validation.input == {"sql": sql, "operation": "query"}
     assert validation.dependencies[0].evidence_kind == "query.plan.validation"
     assert validation.dependencies[0].producer_task_id == plan_validation.task_id
-    assert read.input["sql_ref"] == "sql.validation"
+    assert "sql_ref" not in read.input
+    assert read.input["plan_evidence_id"] == "plan-explicit"
+    assert read.input["sql_validation_task_id"] == validation.task_id
+    sql_dependency = next(
+        dependency
+        for dependency in read.dependencies
+        if dependency.evidence_kind == "sql.validation"
+    )
+    assert sql_dependency.producer_task_id == validation.task_id
 
 
 async def test_explicit_write_execute_mode_overrides_planner_data_query_intent():
@@ -2596,6 +2841,24 @@ async def _compile_single_action(
         actions=(action,),
     )
     return loop.compile_actions(decision, state), runtime, operation
+
+
+async def _compile_action_for_runtime(runtime, operation, action, *, max_access="read"):
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": max_access},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=(action,),
+    )
+    compilation = loop.compile_actions(decision, state)
+    assert compilation.rejected_action_summaries == ()
+    return compilation
 
 
 def _query_plan_evidence(
