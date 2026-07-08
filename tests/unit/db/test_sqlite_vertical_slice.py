@@ -131,11 +131,8 @@ class _ValidationRepairPlanner:
                 DbPlannerAction(
                     action_id="repair_plan",
                     kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
-                    input={
-                        "owner": "db_runtime",
-                        "prior_plan_evidence_id": plans[-1]["id"],
-                        "failure_evidence_id": failed_value_validation["id"],
-                    },
+                    input={"owner": "db_runtime"},
+                    depends_on=("a3",),
                 )
             )
         if not plans:
@@ -1688,7 +1685,23 @@ async def test_validation_grounding_repair_replans_with_refreshed_context():
     repair_task = next(
         task for task in tasks if task.capability_id == "db.query.repair"
     )
+    plans = [item for item in evidence if item.kind == "query.plan.proposal"]
     assert repair_task.input["planning_context_evidence_id"] == contexts[-1].id
+    assert repair_task.input["prior_plan_evidence_id"] == plans[0].id
+    assert repair_task.input["failure_evidence_id"] == validations[0].id
+    assert "query_plan_ref" not in repair_task.input
+    repair_dependencies = {
+        dependency.evidence_kind: dependency for dependency in repair_task.dependencies
+    }
+    assert repair_dependencies["planning.context"].evidence_id == contexts[-1].id
+    assert repair_dependencies["query.plan.proposal"].evidence_id == plans[0].id
+    assert repair_dependencies["query.plan.validation"].evidence_id == validations[0].id
+    assert repair_dependencies["query.plan.validation"].evidence_accepted is False
+    assert not any(
+        "missing_dependency:a3" in json.dumps(item.payload, sort_keys=True)
+        for item in evidence
+        if item.kind in {"planner.compilation", "planner.observation"}
+    )
     assert (
         contexts[-1].payload["column_value_hints"][0]["candidate_mapping"][
             "closest_value"

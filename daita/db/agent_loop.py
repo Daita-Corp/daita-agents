@@ -1838,37 +1838,19 @@ class DbAgentLoop:
             return [], [], access_errors
         specs: list[DbTaskSpec] = []
         task_input = _task_input_for_action(action)
+        task_dependencies: tuple[TaskDependency, ...] = ()
         if action.kind is DbPlannerActionKind.REPAIR_QUERY_PLAN:
-            planning_context = _latest_accepted_evidence_summary(
+            (
+                task_input,
+                task_dependencies,
+                repair_errors,
+            ) = _repair_query_plan_task_input_and_dependencies(
+                action,
                 state,
-                "planning.context",
+                task_input,
             )
-            if (
-                planning_context is not None
-                and "planning_context_evidence_id" not in task_input
-            ):
-                task_input["planning_context_evidence_id"] = planning_context["id"]
-            missing_repair_inputs = [
-                key
-                for key in (
-                    "planning_context_evidence_id",
-                    "failure_evidence_id",
-                    "prior_plan_evidence_id",
-                )
-                if not str(task_input.get(key) or "").strip()
-            ]
-            if missing_repair_inputs:
-                return (
-                    [],
-                    [],
-                    [
-                        _action_error(
-                            action,
-                            "missing_repair_input_ids:"
-                            + ",".join(missing_repair_inputs),
-                        )
-                    ],
-                )
+            if repair_errors:
+                return [], [], repair_errors
         for offset, capability in enumerate(capabilities):
             specs.append(
                 _with_deterministic_task_id(
@@ -1879,6 +1861,7 @@ class DbAgentLoop:
                         input=task_input,
                         reason=f"planner:{action.kind.value}",
                         sequence=sequence_start + offset,
+                        dependencies=task_dependencies,
                         metadata=_action_metadata(action, decision_fingerprint),
                         deterministic_key=f"{action.action_id}:{capability.id}",
                     ),
@@ -4588,6 +4571,227 @@ def _latest_accepted_evidence_summary(
         if item.get("kind") == kind and item.get("accepted", True) is True:
             return dict(item)
     return None
+
+
+def _repair_query_plan_task_input_and_dependencies(
+    action: DbPlannerAction,
+    state: DbLoopState,
+    task_input: Mapping[str, Any],
+) -> tuple[dict[str, Any], tuple[TaskDependency, ...], list[dict[str, Any]]]:
+    repair_input = dict(task_input)
+    repair_input.pop("query_plan_ref", None)
+    plan_alias = repair_input.pop("plan_evidence_id", None)
+    if "prior_plan_evidence_id" not in repair_input and str(plan_alias or "").strip():
+        repair_input["prior_plan_evidence_id"] = str(plan_alias).strip()
+
+    planning_context_id = str(
+        repair_input.get("planning_context_evidence_id") or ""
+    ).strip()
+    planning_context = _repair_evidence_summary(
+        state,
+        "planning.context",
+        evidence_id=planning_context_id or None,
+        accepted=True,
+    )
+    if planning_context is None and not planning_context_id:
+        planning_context = _latest_accepted_evidence_summary(
+            state,
+            "planning.context",
+        )
+    if planning_context is None:
+        return {}, (), [_action_error(action, "missing_repair_planning_context")]
+    repair_input["planning_context_evidence_id"] = planning_context["id"]
+
+    prior_plan_id = str(repair_input.get("prior_plan_evidence_id") or "").strip()
+    prior_plan = _repair_evidence_summary(
+        state,
+        "query.plan.proposal",
+        evidence_id=prior_plan_id or None,
+        accepted=True,
+        valid=True,
+        require_sql=True,
+    )
+    if prior_plan is None and not prior_plan_id:
+        prior_plan = _latest_repair_evidence_summary(
+            state,
+            "query.plan.proposal",
+            accepted=True,
+            valid=True,
+            require_sql=True,
+        )
+    if prior_plan is None:
+        return {}, (), [_action_error(action, "missing_repair_prior_plan")]
+    repair_input["prior_plan_evidence_id"] = prior_plan["id"]
+
+    failure_id = str(repair_input.get("failure_evidence_id") or "").strip()
+    failure_matches = _repair_failure_evidence_summaries(
+        state,
+        evidence_id=failure_id or None,
+    )
+    if failure_id:
+        if len(failure_matches) > 1:
+            return {}, (), [_action_error(action, "ambiguous_repair_failure_evidence")]
+        failure = failure_matches[0] if failure_matches else None
+    else:
+        failure = _latest_repair_evidence_summary(
+            state,
+            "query.plan.validation",
+            accepted=False,
+            valid=False,
+        )
+        if failure is None:
+            failure = _latest_repair_evidence_summary(
+                state,
+                "sql.validation",
+                accepted=False,
+                valid=False,
+            )
+    if failure is None:
+        return {}, (), [_action_error(action, "missing_repair_failure_evidence")]
+    repair_input["failure_evidence_id"] = failure["id"]
+
+    dependencies = (
+        _repair_input_dependency(
+            state,
+            planning_context,
+            input_name="planning_context_evidence_id",
+        ),
+        _repair_input_dependency(
+            state,
+            prior_plan,
+            input_name="prior_plan_evidence_id",
+        ),
+        _repair_input_dependency(
+            state,
+            failure,
+            input_name="failure_evidence_id",
+        ),
+    )
+    return repair_input, dependencies, []
+
+
+def _latest_repair_evidence_summary(
+    state: DbLoopState,
+    kind: str,
+    *,
+    accepted: bool,
+    valid: bool | None = None,
+    require_sql: bool = False,
+) -> dict[str, Any] | None:
+    summaries = (
+        state.accepted_evidence_summaries
+        if accepted
+        else state.rejected_evidence_summaries
+    )
+    for item in reversed(summaries):
+        if _repair_summary_matches(
+            item,
+            kind,
+            accepted=accepted,
+            valid=valid,
+            require_sql=require_sql,
+        ):
+            return dict(item)
+    return None
+
+
+def _repair_evidence_summary(
+    state: DbLoopState,
+    kind: str,
+    *,
+    evidence_id: str | None,
+    accepted: bool,
+    valid: bool | None = None,
+    require_sql: bool = False,
+) -> dict[str, Any] | None:
+    if evidence_id is None:
+        return None
+    summaries = (
+        state.accepted_evidence_summaries
+        if accepted
+        else state.rejected_evidence_summaries
+    )
+    matches = [
+        dict(item)
+        for item in summaries
+        if _repair_summary_matches(
+            item,
+            kind,
+            accepted=accepted,
+            valid=valid,
+            require_sql=require_sql,
+        )
+        and item.get("id") == evidence_id
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _repair_failure_evidence_summaries(
+    state: DbLoopState,
+    *,
+    evidence_id: str | None,
+) -> tuple[dict[str, Any], ...]:
+    if evidence_id is None:
+        return ()
+    matches: list[dict[str, Any]] = []
+    for kind in ("query.plan.validation", "sql.validation"):
+        item = _repair_evidence_summary(
+            state,
+            kind,
+            evidence_id=evidence_id,
+            accepted=False,
+            valid=False,
+        )
+        if item is not None:
+            matches.append(item)
+    return tuple(matches)
+
+
+def _repair_summary_matches(
+    summary: Mapping[str, Any],
+    kind: str,
+    *,
+    accepted: bool,
+    valid: bool | None,
+    require_sql: bool,
+) -> bool:
+    if summary.get("kind") != kind:
+        return False
+    if summary.get("accepted", True) is not accepted:
+        return False
+    if not str(summary.get("id") or "").strip():
+        return False
+    if valid is not None and summary.get("valid") is not valid:
+        return False
+    if require_sql:
+        sql = summary.get("sql")
+        if summary.get("valid") is not True or not isinstance(sql, str):
+            return False
+        if not sql.strip():
+            return False
+    return True
+
+
+def _repair_input_dependency(
+    state: DbLoopState,
+    summary: Mapping[str, Any],
+    *,
+    input_name: str,
+) -> TaskDependency:
+    return TaskDependency(
+        kind="evidence",
+        evidence_kind=str(summary["kind"]),
+        evidence_id=str(summary["id"]),
+        evidence_owner=_optional_string(summary.get("owner")),
+        producer_task_id=_optional_string(summary.get("task_id")),
+        evidence_accepted=summary.get("accepted", True) is True,
+        operation_id=state.operation_id,
+        metadata={
+            "repair_input": input_name,
+        },
+    )
 
 
 def _state_allows_read_profile(state: DbLoopState) -> bool:

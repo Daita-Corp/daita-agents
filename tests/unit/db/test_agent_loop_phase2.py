@@ -501,9 +501,164 @@ async def test_repair_query_plan_missing_input_ids_rejected_before_task_creation
         await runtime.teardown()
 
     assert compilation.task_specs == ()
-    assert compilation.rejected_action_summaries[0]["error"] == (
-        "missing_repair_input_ids:"
-        "planning_context_evidence_id,failure_evidence_id,prior_plan_evidence_id"
+    assert (
+        compilation.rejected_action_summaries[0]["error"]
+        == "missing_repair_failure_evidence"
+    )
+
+
+async def test_repair_query_plan_binds_durable_inputs_and_dependencies():
+    action = DbPlannerAction(
+        action_id="repair",
+        kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+        input={"owner": "db_runtime"},
+        depends_on=("a3",),
+    )
+
+    compilation, runtime, _ = await _compile_single_action(
+        "phase-three-repair-durable-inputs",
+        action,
+        plan_evidence=(
+            {
+                "evidence_id": "prior-plan",
+                "sql": "select count(*) from orders where status = 'completed'",
+            },
+        ),
+        query_plan_validation_evidence=(
+            {
+                "evidence_id": "failed-plan-validation",
+                "plan_evidence_id": "prior-plan",
+            },
+        ),
+        planning_context=True,
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    repair = next(
+        spec
+        for spec in compilation.task_specs
+        if spec.capability_id == "db.query.repair"
+    )
+    assert repair.capability_id == "db.query.repair"
+    assert repair.input["planning_context_evidence_id"] == "planning-context"
+    assert repair.input["prior_plan_evidence_id"] == "prior-plan"
+    assert repair.input["failure_evidence_id"] == "failed-plan-validation"
+    assert "query_plan_ref" not in repair.input
+    assert "plan_evidence_id" not in repair.input
+    assert [dependency.evidence_id for dependency in repair.dependencies] == [
+        "planning-context",
+        "prior-plan",
+        "failed-plan-validation",
+    ]
+    assert [dependency.evidence_kind for dependency in repair.dependencies] == [
+        "planning.context",
+        "query.plan.proposal",
+        "query.plan.validation",
+    ]
+    assert [dependency.evidence_accepted for dependency in repair.dependencies] == [
+        True,
+        True,
+        False,
+    ]
+
+
+async def test_repair_query_plan_falls_back_to_failed_sql_validation():
+    action = DbPlannerAction(
+        action_id="repair",
+        kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+        input={"owner": "db_runtime"},
+    )
+
+    compilation, runtime, _ = await _compile_single_action(
+        "phase-three-repair-failed-sql-validation",
+        action,
+        plan_evidence=(
+            {"evidence_id": "prior-plan", "sql": "select * from missing_table"},
+        ),
+        sql_validation_evidence=(
+            {
+                "evidence_id": "failed-sql-validation",
+                "sql": "select * from missing_table",
+                "valid": False,
+                "accepted": False,
+            },
+        ),
+        planning_context=True,
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    repair = compilation.task_specs[0]
+    assert repair.input["failure_evidence_id"] == "failed-sql-validation"
+    assert repair.dependencies[-1].evidence_id == "failed-sql-validation"
+    assert repair.dependencies[-1].evidence_kind == "sql.validation"
+    assert repair.dependencies[-1].evidence_accepted is False
+
+
+async def test_repair_query_plan_blocks_without_failed_validation_evidence():
+    action = DbPlannerAction(
+        action_id="repair",
+        kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+        input={"owner": "db_runtime"},
+    )
+
+    compilation, runtime, _ = await _compile_single_action(
+        "phase-three-repair-no-failure-evidence",
+        action,
+        plan_evidence=({"evidence_id": "prior-plan", "sql": "select 1"},),
+        planning_context=True,
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.teardown()
+
+    assert compilation.task_specs == ()
+    assert (
+        compilation.rejected_action_summaries[0]["error"]
+        == "missing_repair_failure_evidence"
+    )
+
+
+async def test_repair_query_plan_blocks_ambiguous_failure_evidence_id():
+    action = DbPlannerAction(
+        action_id="repair",
+        kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+        input={
+            "owner": "db_runtime",
+            "failure_evidence_id": "ambiguous-failure",
+        },
+    )
+
+    compilation, runtime, _ = await _compile_single_action(
+        "phase-three-repair-ambiguous-failure",
+        action,
+        plan_evidence=({"evidence_id": "prior-plan", "sql": "select 1"},),
+        query_plan_validation_evidence=(
+            {
+                "evidence_id": "ambiguous-failure",
+                "plan_evidence_id": "prior-plan",
+                "validation_facts": False,
+            },
+        ),
+        sql_validation_evidence=(
+            {
+                "evidence_id": "ambiguous-failure",
+                "sql": "select 1",
+                "valid": False,
+                "accepted": False,
+            },
+        ),
+        planning_context=True,
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.teardown()
+
+    assert compilation.task_specs == ()
+    assert (
+        compilation.rejected_action_summaries[0]["error"]
+        == "ambiguous_repair_failure_evidence"
     )
 
 
@@ -873,8 +1028,7 @@ async def test_prior_turn_query_plan_dependency_recovers_to_latest_plan():
     assert validation.input["sql"] == "select 1 as answer"
     assert validation.dependencies[0].evidence_id == "plan-accepted"
     assert (
-        validation.metadata["continuation_resolution"]["evidence_id"]
-        == "plan-accepted"
+        validation.metadata["continuation_resolution"]["evidence_id"] == "plan-accepted"
     )
     assert (
         validation.metadata["sql_provenance"]["provenance"]
@@ -2054,6 +2208,7 @@ async def _compile_single_action(
     action,
     *,
     plan_evidence=(),
+    query_plan_validation_evidence=(),
     sql_validation_evidence=(),
     memory_proposal_evidence=(),
     planning_context=False,
@@ -2069,6 +2224,10 @@ async def _compile_single_action(
     for item in plan_evidence:
         await runtime.store.save_evidence(
             _query_plan_evidence(operation.id, **dict(item))
+        )
+    for item in query_plan_validation_evidence:
+        await runtime.store.save_evidence(
+            _query_plan_validation_evidence(operation.id, **dict(item))
         )
     for item in sql_validation_evidence:
         await runtime.store.save_evidence(
@@ -2111,6 +2270,46 @@ def _query_plan_evidence(
         id=evidence_id,
         kind="query.plan.proposal",
         owner="phase_two",
+        operation_id=operation_id,
+        task_id=task_id or f"task-{evidence_id}",
+        accepted=accepted,
+        payload=payload,
+        metadata={"payload_fingerprint": f"fp-{evidence_id}"},
+    )
+
+
+def _query_plan_validation_evidence(
+    operation_id,
+    *,
+    evidence_id,
+    plan_evidence_id="plan-accepted",
+    valid=False,
+    accepted=False,
+    task_id=None,
+    validation_facts=True,
+):
+    payload = {
+        "valid": valid,
+        "plan_evidence_id": plan_evidence_id,
+    }
+    if validation_facts:
+        payload["errors"] = [
+            "filter_literal_requires_grounding:orders.status=completed"
+        ]
+        payload["validation_facts"] = [
+            {
+                "kind": "filter_literal_requires_grounding",
+                "table": "orders",
+                "column": "status",
+                "operator": "=",
+                "literal": "completed",
+                "source": "query.plan.validation",
+            }
+        ]
+    return Evidence(
+        id=evidence_id,
+        kind="query.plan.validation",
+        owner="db_runtime",
         operation_id=operation_id,
         task_id=task_id or f"task-{evidence_id}",
         accepted=accepted,
