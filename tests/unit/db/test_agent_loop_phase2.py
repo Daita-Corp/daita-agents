@@ -3,6 +3,7 @@ import json
 from daita.db import DbRuntime, DbRuntimeConfig
 from daita.db.agent_loop import DbAgentLoop
 from daita.db.llm_agent_planner import DbLLMAgentPlanner
+from daita.db.llm_planner import DbLLMPlannerExecutor, DbLLMRepairExecutor
 from daita.db.llm_service import DbLLMResponse, DbLLMService
 from daita.db.planner_protocol import (
     DbLoopState,
@@ -20,6 +21,7 @@ from daita.runtime import (
     Evidence,
     EvidenceSchema,
     RiskLevel,
+    Task,
 )
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
@@ -232,6 +234,7 @@ class FakePlanner:
 
 class FakeLLMService:
     available = True
+    safe_metadata = {"provider": "fake", "model": "phase-two"}
 
     def __init__(self, content):
         self.content = content
@@ -243,6 +246,264 @@ class FakeLLMService:
             content=self.content,
             diagnostics={"provider": "fake", "model": "phase-two"},
         )
+
+
+async def test_llm_query_plan_normalizes_sql_alias_and_accepts_executable_plan():
+    sql = "select count(*) as order_count from orders"
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-llm-plan-sql-alias",
+        db_llm_service=FakeLLMService(
+            json.dumps(
+                {
+                    "operation": "read",
+                    "sql": sql,
+                    "selected_tables": ["orders"],
+                    "confidence": 0.91,
+                }
+            )
+        ),
+    )
+    try:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+        evidence = await DbLLMPlannerExecutor(runtime=runtime).execute(
+            _llm_task(
+                operation,
+                capability_id="db.query.plan",
+                executor_id="db_runtime.query.plan.llm",
+                task_input={"planning_context_evidence_id": "planning-context"},
+            ),
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    proposal = evidence[0]
+    assert proposal.accepted is True
+    assert proposal.payload["valid"] is True
+    assert proposal.payload["sql"] == sql
+    assert proposal.payload["structured_plan"]["selected_sql"] == sql
+    assert "sql" not in proposal.payload["structured_plan"]
+    assert proposal.payload["parse_diagnostics"]["normalized_aliases"] == {
+        "sql": "selected_sql"
+    }
+
+
+async def test_llm_query_plan_without_sql_or_clarification_is_rejected():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-llm-plan-no-sql",
+        db_llm_service=FakeLLMService(
+            json.dumps(
+                {
+                    "operation": "read",
+                    "selected_tables": ["orders"],
+                    "confidence": 0.31,
+                }
+            )
+        ),
+    )
+    try:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+        evidence = await DbLLMPlannerExecutor(runtime=runtime).execute(
+            _llm_task(
+                operation,
+                capability_id="db.query.plan",
+                executor_id="db_runtime.query.plan.llm",
+                task_input={"planning_context_evidence_id": "planning-context"},
+            ),
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    proposal = evidence[0]
+    assert proposal.accepted is False
+    assert proposal.payload["valid"] is False
+    assert proposal.payload["sql"] is None
+    assert proposal.payload["raw_model_response"]
+
+
+async def test_llm_query_plan_clarification_only_is_not_executable_evidence():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-llm-plan-clarification",
+        db_llm_service=FakeLLMService(
+            json.dumps(
+                {
+                    "operation": "read",
+                    "clarification_question": "Which customer segment?",
+                    "confidence": 0.25,
+                }
+            )
+        ),
+    )
+    try:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+        evidence = await DbLLMPlannerExecutor(runtime=runtime).execute(
+            _llm_task(
+                operation,
+                capability_id="db.query.plan",
+                executor_id="db_runtime.query.plan.llm",
+                task_input={"planning_context_evidence_id": "planning-context"},
+            ),
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    proposal = evidence[0]
+    assert proposal.accepted is False
+    assert proposal.payload["valid"] is False
+    assert proposal.payload["sql"] is None
+    assert proposal.payload["structured_plan"]["clarification_question"] == (
+        "Which customer segment?"
+    )
+
+
+async def test_llm_repair_without_executable_sql_is_rejected():
+    runtime, operation = await _repair_runtime_and_operation(
+        "phase-two-llm-repair-no-sql",
+        json.dumps({"operation": "read", "confidence": 0.4}),
+    )
+    try:
+        task = _llm_task(
+            operation,
+            capability_id="db.query.repair",
+            executor_id="db_runtime.query.repair.llm",
+            task_input={
+                "planning_context_evidence_id": "planning-context",
+                "failure_evidence_id": "failure-validation",
+                "prior_plan_evidence_id": "prior-plan",
+            },
+        )
+        evidence = await DbLLMRepairExecutor(runtime=runtime).execute(
+            task,
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    repair, proposal = evidence
+    assert repair.accepted is False
+    assert repair.payload["valid"] is True
+    assert repair.payload["parse_succeeded"] is True
+    assert repair.payload["proposal_accepted"] is False
+    assert proposal.accepted is False
+    assert proposal.payload["valid"] is False
+    assert proposal.payload["sql"] is None
+
+
+async def test_llm_repair_repeated_sql_is_rejected():
+    sql = "select 1 as answer"
+    runtime, operation = await _repair_runtime_and_operation(
+        "phase-two-llm-repair-repeat",
+        json.dumps(
+            {
+                "operation": "read",
+                "selected_sql": sql,
+                "confidence": 0.9,
+            }
+        ),
+        prior_sql=sql,
+    )
+    try:
+        task = _llm_task(
+            operation,
+            capability_id="db.query.repair",
+            executor_id="db_runtime.query.repair.llm",
+            task_input={
+                "planning_context_evidence_id": "planning-context",
+                "failure_evidence_id": "failure-validation",
+                "prior_plan_evidence_id": "prior-plan",
+            },
+        )
+        evidence = await DbLLMRepairExecutor(runtime=runtime).execute(
+            task,
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    repair, proposal = evidence
+    assert repair.accepted is False
+    assert repair.payload["valid"] is True
+    assert repair.payload["proposal_accepted"] is False
+    assert repair.payload["repeated_sql_blocked"] is True
+    assert proposal.accepted is False
+    assert proposal.payload["valid"] is True
+    assert proposal.payload["repeated_sql_blocked"] is True
+
+
+async def test_llm_repair_missing_input_ids_produces_rejected_diagnostics():
+    service = FakeLLMService(json.dumps({"operation": "read"}))
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-llm-repair-missing-inputs",
+        db_llm_service=service,
+    )
+    try:
+        evidence = await DbLLMRepairExecutor(runtime=runtime).execute(
+            _llm_task(
+                operation,
+                capability_id="db.query.repair",
+                executor_id="db_runtime.query.repair.llm",
+                task_input={},
+            ),
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    repair, proposal = evidence
+    assert service.messages is None
+    assert repair.accepted is False
+    assert proposal.accepted is False
+    assert repair.payload["failure"] == "repair_inputs_missing"
+    assert proposal.payload["failure"] == "repair_inputs_missing"
+    assert set(repair.payload["missing_input_ids"]) == {
+        "planning_context_evidence_id",
+        "failure_evidence_id",
+        "prior_plan_evidence_id",
+    }
+
+
+async def test_repair_query_plan_missing_input_ids_rejected_before_task_creation():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-repair-missing-input-compile",
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "read"},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=(
+            DbPlannerAction(
+                action_id="repair",
+                kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+                input={"owner": "db_runtime"},
+            ),
+        ),
+    )
+
+    try:
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "missing_repair_input_ids:"
+        "planning_context_evidence_id,failure_evidence_id,prior_plan_evidence_id"
+    )
 
 
 async def test_agent_loop_runs_schema_and_read_flow_through_task_specs():
@@ -404,6 +665,10 @@ async def test_prior_turn_query_plan_dependency_recovers_to_latest_plan():
     validation = compilation.task_specs[0]
     assert validation.input["sql"] == "select 1 as answer"
     assert validation.dependencies[0].evidence_id == "plan-accepted"
+    assert (
+        validation.metadata["continuation_resolution"]["evidence_id"]
+        == "plan-accepted"
+    )
     assert (
         validation.metadata["sql_provenance"]["provenance"]
         == "latest_accepted_query_plan"
@@ -967,6 +1232,40 @@ async def test_latest_accepted_query_plan_ref_ignores_rejected_plan_evidence():
     assert validation.dependencies[0].evidence_id == "plan-accepted"
 
 
+async def test_latest_accepted_query_plan_ref_ignores_invalid_plan_evidence():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-invalid-plan-ignored",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-accepted", "sql": "select 1 as answer"},
+            {
+                "evidence_id": "plan-invalid",
+                "sql": "select 999 as answer",
+                "valid": False,
+            },
+            {
+                "evidence_id": "plan-rejected",
+                "sql": "select 888 as answer",
+                "accepted": False,
+            },
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-accepted"
+
+
 async def test_latest_accepted_query_plan_ref_skips_accepted_plans_without_sql():
     action = DbPlannerAction(
         action_id="read",
@@ -1477,10 +1776,11 @@ async def test_missing_db_llm_configuration_returns_no_planner_actions():
     assert persisted["metadata"]["configuration_required"] is True
 
 
-async def _runtime_and_operation(operation_id, *, mode=None):
+async def _runtime_and_operation(operation_id, *, mode=None, db_llm_service=None):
     runtime = DbRuntime(
         config=DbRuntimeConfig(plugins=(PhaseTwoPlugin(),)),
         runtime_id="phase-two-runtime",
+        db_llm_service=db_llm_service,
     )
     await runtime.setup(agent_id="agent-phase-two")
     operation = await runtime.kernel.create_operation(
@@ -1496,6 +1796,50 @@ async def _runtime_and_operation(operation_id, *, mode=None):
         evaluate_governance=False,
     )
     return runtime, operation
+
+
+async def _repair_runtime_and_operation(operation_id, content, *, prior_sql=None):
+    prior_sql = prior_sql or "select 0 as answer"
+    runtime, operation = await _runtime_and_operation(
+        operation_id,
+        db_llm_service=FakeLLMService(content),
+    )
+    await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+    await runtime.store.save_evidence(
+        Evidence(
+            id="prior-plan",
+            kind="query.plan.proposal",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=True,
+            payload={
+                "valid": True,
+                "sql": prior_sql,
+                "structured_plan": {"selected_sql": prior_sql},
+            },
+        )
+    )
+    await runtime.store.save_evidence(
+        Evidence(
+            id="failure-validation",
+            kind="query.plan.validation",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=False,
+            payload={"valid": False, "errors": ["validation failed"]},
+        )
+    )
+    return runtime, operation
+
+
+def _llm_task(operation, *, capability_id, executor_id, task_input):
+    return Task(
+        id=f"task-{capability_id.replace('.', '-')}",
+        operation_id=operation.id,
+        capability_id=capability_id,
+        executor_id=executor_id,
+        input=task_input,
+    )
 
 
 async def _compile_single_action(
@@ -1548,9 +1892,10 @@ def _query_plan_evidence(
     evidence_id,
     sql,
     accepted=True,
+    valid=None,
     task_id=None,
 ):
-    payload = {"valid": bool(sql)}
+    payload = {"valid": bool(sql) if valid is None else valid}
     if sql is not None:
         payload["sql"] = sql
     return Evidence(

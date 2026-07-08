@@ -182,6 +182,8 @@ class DbContinuationResolver:
             if not evidence_id:
                 continue
             if role.require_sql:
+                if summary.get("valid") is not True:
+                    continue
                 sql = summary.get("sql")
                 if not isinstance(sql, str) or not sql.strip():
                     continue

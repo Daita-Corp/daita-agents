@@ -3,12 +3,14 @@ import json
 from daita.db import DbRuntime, DbRuntimeConfig
 from daita.db.agent_loop import DbAgentLoop
 from daita.db.llm_service import DbLLMResponse
+from daita.db.plan_validation import DbQueryPlanValidator
 from daita.db.planner_protocol import (
     DbPlannerAction,
     DbPlannerActionKind,
     DbPlannerDecision,
     DbPlannerDecisionStatus,
 )
+from daita.db.query_plan import DbQueryPlan
 from daita.db.runtime.tasks import DbTaskSpec
 from daita.db.runtime import DbRuntimeGovernanceBlocked
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
@@ -95,7 +97,7 @@ class _ValidationRepairPlanner:
             for item in state.accepted_evidence_summaries
         )
         has_value_hint = any(
-            item.get("kind") == "schema.column_value_hint"
+            item.get("kind") == "schema.column_value_hint" and item.get("hints")
             for item in state.accepted_evidence_summaries
         )
         failed_value_validation = next(
@@ -196,9 +198,152 @@ def _planner_decision(*actions):
     )
 
 
+def test_query_plan_validation_requires_grounding_for_unprofiled_filter_literal():
+    plan = DbQueryPlan.from_mapping(
+        {
+            "operation": "read",
+            "selected_sql": (
+                "SELECT COUNT(*) AS order_count FROM orders "
+                "WHERE orders.status = 'completed'"
+            ),
+            "selected_tables": ["orders"],
+            "confidence": 0.91,
+        }
+    )
+    context = {
+        "dialect": "sqlite",
+        "schema": {
+            "database_type": "sqlite",
+            "tables": [
+                {
+                    "name": "orders",
+                    "columns": [
+                        {"name": "id", "data_type": "INTEGER"},
+                        {"name": "status", "data_type": "TEXT"},
+                    ],
+                }
+            ],
+        },
+        "column_value_hints": [],
+    }
+
+    validation = DbQueryPlanValidator().validate(plan, context)
+
+    assert validation.valid is False
+    assert validation.accepted_sql is None
+    assert validation.errors == (
+        "filter_literal_requires_grounding:orders.status=completed",
+    )
+    assert validation.validation_facts == (
+        {
+            "kind": "filter_literal_requires_grounding",
+            "table": "orders",
+            "column": "status",
+            "operator": "=",
+            "literal": "completed",
+            "source": "query.plan.validation",
+            "reason": ("proposed_sql_filter_literal_without_accepted_value_evidence"),
+        },
+    )
+
+
+def test_query_plan_validation_does_not_ground_numeric_filter_literal():
+    plan = DbQueryPlan.from_mapping(
+        {
+            "operation": "read",
+            "selected_sql": (
+                "SELECT COUNT(*) AS order_count FROM orders " "WHERE orders.total = 120"
+            ),
+            "selected_tables": ["orders"],
+            "confidence": 0.91,
+        }
+    )
+    context = {
+        "dialect": "sqlite",
+        "schema": {
+            "database_type": "sqlite",
+            "tables": [
+                {
+                    "name": "orders",
+                    "columns": [
+                        {"name": "id", "data_type": "INTEGER"},
+                        {"name": "total", "data_type": "REAL"},
+                    ],
+                }
+            ],
+        },
+        "column_value_hints": [],
+    }
+
+    validation = DbQueryPlanValidator().validate(plan, context)
+
+    assert validation.valid is True
+    assert validation.validation_facts == ()
+
+
+async def test_blocked_column_sql_validation_is_terminal_blocked():
+    class _BlockedColumnPlanner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def plan(self, state):
+            self.calls += 1
+            return _planner_decision(
+                DbPlannerAction(
+                    action_id=f"blocked_read_{self.calls}",
+                    kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                    input={
+                        "owner": "sqlite",
+                        "sql": "SELECT SUM(refunds.amount) AS total FROM refunds",
+                    },
+                )
+            )
+
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:", blocked_columns=["refunds.amount"])
+    runtime = DbRuntime(plugins=(catalog, sqlite))
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script("""
+        CREATE TABLE refunds (
+            id INTEGER PRIMARY KEY,
+            amount REAL NOT NULL
+        );
+        INSERT INTO refunds (id, amount) VALUES (1, 35.0);
+        """)
+    planner = _BlockedColumnPlanner()
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Calculate refunds amount.",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        result = await DbAgentLoop(runtime, planner).run(
+            operation,
+            safety_frame={"max_access": "read"},
+            max_turns=4,
+        )
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "blocked"
+    assert planner.calls == 1
+    assert "db_agent_loop_blocked_resource_validation" in result.warnings
+    assert [task.capability_id for task in tasks].count("db.sql.validate") == 1
+    assert not any(
+        task.capability_id == "db.sql.execute_read"
+        and task.status is TaskStatus.SUCCEEDED
+        for task in tasks
+    )
+
+
 async def _seed(plugin: SQLitePlugin) -> None:
-    await plugin.execute_script(
-        """
+    await plugin.execute_script("""
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             email TEXT NOT NULL
@@ -210,8 +355,7 @@ async def _seed(plugin: SQLitePlugin) -> None:
         );
         INSERT INTO customers (id, email) VALUES (1, 'ada@example.com');
         INSERT INTO orders (id, customer_id, total) VALUES (10, 1, 42.5);
-        """
-    )
+        """)
 
 
 async def test_sqlite_registers_provider_neutral_db_capabilities():
@@ -446,16 +590,14 @@ async def test_catalog_column_value_search_profiles_dotted_target_before_search(
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status)
         VALUES (1, 'complete'), (2, 'complete'), (3, 'pending');
-        """
-    )
+        """)
     try:
         operation = await runtime.kernel.create_operation(
             operation_type="data.query",
@@ -528,16 +670,14 @@ async def test_catalog_column_value_search_profiles_dotted_input_target_before_s
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status)
         VALUES (1, 'complete'), (2, 'complete'), (3, 'pending');
-        """
-    )
+        """)
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -597,8 +737,7 @@ async def test_planning_context_value_hints_profile_catalog_target_before_contex
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
@@ -606,8 +745,7 @@ async def test_planning_context_value_hints_profile_catalog_target_before_contex
         );
         INSERT INTO orders (id, status, total)
         VALUES (1, 'complete', 120.0), (2, 'pending', 80.0);
-        """
-    )
+        """)
     executed_capabilities = []
     original_execute_task = runtime.execute_task
 
@@ -727,8 +865,7 @@ async def test_planning_context_value_grounding_does_not_require_known_prompt_ke
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE account_revenue (
             id INTEGER PRIMARY KEY,
             loyalty_band TEXT NOT NULL,
@@ -736,8 +873,7 @@ async def test_planning_context_value_grounding_does_not_require_known_prompt_ke
         );
         INSERT INTO account_revenue (id, loyalty_band, amount)
         VALUES (1, 'platinum', 1200.0), (2, 'gold', 800.0);
-        """
-    )
+        """)
 
     try:
         schema = await runtime.execute_capability(
@@ -843,8 +979,7 @@ async def test_planning_context_general_prompt_does_not_profile_values_without_f
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             lifecycle_state TEXT NOT NULL,
@@ -853,8 +988,7 @@ async def test_planning_context_general_prompt_does_not_profile_values_without_f
         );
         INSERT INTO customers (id, lifecycle_state, customer_segment, revenue)
         VALUES (1, 'active', 'enterprise', 1200.0), (2, 'active', 'startup', 800.0);
-        """
-    )
+        """)
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -919,8 +1053,7 @@ async def test_validation_fact_value_grounding_profiles_only_target_column():
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
@@ -934,8 +1067,7 @@ async def test_validation_fact_value_grounding_profiles_only_target_column():
         VALUES (1, 'complete', 'web'), (2, 'pending', 'store');
         INSERT INTO customers (id, status)
         VALUES (1, 'active'), (2, 'inactive');
-        """
-    )
+        """)
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -1055,6 +1187,247 @@ async def test_validation_fact_value_grounding_profiles_only_target_column():
     assert context_hint["candidate_mapping"]["closest_value"] == "complete"
 
 
+async def test_validation_grounding_runtime_context_precedes_planner_search_choice():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            channel TEXT NOT NULL
+        );
+        INSERT INTO orders (id, status, channel)
+        VALUES (1, 'complete', 'web'), (2, 'pending', 'store');
+        """)
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Show completed order count.",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="validation-requires-status-grounding",
+                kind="query.plan.validation",
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=False,
+                payload={
+                    "valid": False,
+                    "errors": [
+                        "filter_literal_requires_grounding:" "orders.status=completed"
+                    ],
+                    "validation_facts": [
+                        {
+                            "kind": "filter_literal_requires_grounding",
+                            "table": "orders",
+                            "column": "status",
+                            "operator": "=",
+                            "literal": "completed",
+                            "source": "query.plan.validation",
+                            "reason": (
+                                "proposed_sql_filter_literal_without_accepted_"
+                                "value_evidence"
+                            ),
+                        }
+                    ],
+                },
+            )
+        )
+        loop = DbAgentLoop(runtime, object())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="planner_search_values",
+                    kind=DbPlannerActionKind.SEARCH_COLUMN_VALUES,
+                    input={"owner": "catalog"},
+                    metadata={
+                        "source_owner": "sqlite",
+                        "target": "orders.status",
+                        "query": "completed",
+                    },
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+        operation = await loop._persist_compiled_contract(operation, compilation)
+        plan = await runtime.plan_task_specs(
+            operation,
+            compilation.task_specs,
+            contract=compilation.compiled_contract_snapshot,
+        )
+        for task in plan.tasks:
+            await runtime.execute_task(task, operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert compilation.accepted_action_summaries[0]["kind"] == "build_planning_context"
+    assert compilation.accepted_action_summaries[1]["kind"] == "search_column_values"
+    capability_order = [spec.capability_id for spec in compilation.task_specs]
+    assert capability_order.index("db.planning.context.build") < capability_order.index(
+        "catalog.column_values.search"
+    )
+    hint = next(item for item in evidence if item.kind == "schema.column_value_hint")
+    assert [(item["table"], item["column"]) for item in hint.payload["hints"]] == [
+        ("orders", "status")
+    ]
+    latest_context = [item for item in evidence if item.kind == "planning.context"][-1]
+    assert latest_context.payload["column_value_hints"][0]["table"] == "orders"
+    assert latest_context.payload["column_value_hints"][0]["column"] == "status"
+
+
+async def test_validation_grounding_runtime_context_exhaustion_blocks_loop():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Show completed order count.",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="validation-requires-status-grounding",
+                kind="query.plan.validation",
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=False,
+                payload={
+                    "valid": False,
+                    "errors": [
+                        "filter_literal_requires_grounding:" "orders.status=completed"
+                    ],
+                    "validation_facts": [
+                        {
+                            "kind": "filter_literal_requires_grounding",
+                            "table": "orders",
+                            "column": "status",
+                            "operator": "=",
+                            "literal": "completed",
+                            "source": "query.plan.validation",
+                            "reason": (
+                                "proposed_sql_filter_literal_without_accepted_"
+                                "value_evidence"
+                            ),
+                        }
+                    ],
+                },
+            )
+        )
+        loop = DbAgentLoop(runtime, object())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="planner_search_values",
+                    kind=DbPlannerActionKind.SEARCH_COLUMN_VALUES,
+                    input={"owner": "catalog"},
+                    metadata={"target": "orders.status", "query": "completed"},
+                ),
+            ),
+        )
+        first_compilation = loop.compile_actions(decision, state)
+        fingerprint = next(
+            spec.metadata["validation_grounding_fingerprint"]
+            for spec in first_compilation.task_specs
+            if spec.capability_id == "db.planning.context.build"
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="context-with-exhausted-grounding",
+                kind="planning.context",
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "diagnostics": {
+                        "validation_grounding_repair": {
+                            "fingerprint": fingerprint,
+                            "target_refs": ["orders.status"],
+                            "targets": [
+                                {
+                                    "kind": "filter_literal_requires_grounding",
+                                    "table": "orders",
+                                    "column": "status",
+                                    "literal": "completed",
+                                }
+                            ],
+                        }
+                    },
+                    "column_value_hints": [],
+                },
+            )
+        )
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=2,
+            remaining_turns=1,
+        )
+
+        exhausted = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert exhausted.task_specs == ()
+    assert exhausted.rejected_action_summaries[0]["error"] == (
+        "validation_grounding_context_refresh_exhausted"
+    )
+    assert exhausted.rejected_action_summaries[0]["continuation"][
+        "missing_target_refs"
+    ] == ["orders.status"]
+
+
 async def test_validation_grounding_repair_replans_with_refreshed_context():
     catalog = CatalogPlugin(auto_persist=False)
     sqlite = SQLitePlugin(path=":memory:")
@@ -1104,8 +1477,7 @@ async def test_validation_grounding_repair_replans_with_refreshed_context():
         db_llm_service=llm_service,
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
@@ -1113,8 +1485,7 @@ async def test_validation_grounding_repair_replans_with_refreshed_context():
         );
         INSERT INTO orders (id, status, channel)
         VALUES (1, 'complete', 'web'), (2, 'pending', 'store');
-        """
-    )
+        """)
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -1125,42 +1496,6 @@ async def test_validation_grounding_repair_replans_with_refreshed_context():
             },
             metadata={"safety_frame": {"max_access": "read"}},
             evaluate_governance=False,
-        )
-        await runtime.store.save_evidence(
-            Evidence(
-                id="initial-context-with-known-status-values",
-                kind="planning.context",
-                owner="db_runtime",
-                operation_id=operation.id,
-                accepted=True,
-                payload={
-                    "schema": {
-                        "database_type": "sqlite",
-                        "tables": [
-                            {
-                                "name": "orders",
-                                "columns": [
-                                    {"name": "id", "data_type": "INTEGER"},
-                                    {"name": "status", "data_type": "TEXT"},
-                                    {"name": "channel", "data_type": "TEXT"},
-                                ],
-                            }
-                        ],
-                    },
-                    "column_value_hints": [
-                        {
-                            "table": "orders",
-                            "column": "status",
-                            "profile_status": "profiled",
-                            "observed_values": [
-                                {"value": "complete", "count": 1},
-                                {"value": "pending", "count": 1},
-                            ],
-                        }
-                    ],
-                },
-                metadata={"payload_fingerprint": "initial-context-fp"},
-            )
         )
         planner = _ValidationRepairPlanner()
         result = await DbAgentLoop(runtime, planner).run(
@@ -1178,11 +1513,13 @@ async def test_validation_grounding_repair_replans_with_refreshed_context():
     assert [item.accepted for item in validations] == [False, True]
     assert validations[0].payload["validation_facts"] == [
         {
-            "kind": "unobserved_filter_literal",
+            "kind": "filter_literal_requires_grounding",
             "table": "orders",
             "column": "status",
+            "operator": "=",
             "literal": "completed",
-            "candidates": ["complete", "pending"],
+            "source": "query.plan.validation",
+            "reason": ("proposed_sql_filter_literal_without_accepted_value_evidence"),
         }
     ]
     repaired_plan = [item for item in evidence if item.kind == "query.plan.proposal"][
@@ -1192,6 +1529,15 @@ async def test_validation_grounding_repair_replans_with_refreshed_context():
     query_result = next(item for item in evidence if item.kind == "query.result")
     assert query_result.payload["rows"] == [{"order_count": 1}]
     contexts = [item for item in evidence if item.kind == "planning.context"]
+    assert validations[0].payload["planning_context_evidence_id"] == contexts[0].id
+    assert validations[1].payload["planning_context_evidence_id"] == contexts[-1].id
+    assert validations[1].payload["planning_context_evidence_id"] != (
+        validations[0].payload["planning_context_evidence_id"]
+    )
+    repair_task = next(
+        task for task in tasks if task.capability_id == "db.query.repair"
+    )
+    assert repair_task.input["planning_context_evidence_id"] == contexts[-1].id
     assert (
         contexts[-1].payload["column_value_hints"][0]["candidate_mapping"][
             "closest_value"
@@ -1212,14 +1558,17 @@ async def test_validation_grounding_repair_replans_with_refreshed_context():
     register_tasks = [
         task for task in tasks if task.capability_id == "catalog.column_values.register"
     ]
-    hint_tasks = [
-        task
-        for task in tasks
-        if task.capability_id == "catalog.column_value_hints.resolve"
-    ]
     assert len(register_tasks) == 1
-    assert len(hint_tasks) == 1
-    assert sum(1 for item in evidence if item.kind == "schema.column_value_hint") == 1
+    assert (
+        len(
+            [
+                item
+                for item in evidence
+                if item.kind == "schema.column_value_hint" and item.payload.get("hints")
+            ]
+        )
+        == 1
+    )
 
 
 async def test_session_scope_value_grounding_profiles_non_keyword_value():
@@ -1236,8 +1585,7 @@ async def test_session_scope_value_grounding_profiles_non_keyword_value():
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             fulfillment_status TEXT NOT NULL,
@@ -1245,8 +1593,7 @@ async def test_session_scope_value_grounding_profiles_non_keyword_value():
         );
         INSERT INTO orders (id, fulfillment_status, channel)
         VALUES (1, 'fulfilled', 'web'), (2, 'queued', 'store');
-        """
-    )
+        """)
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -1336,16 +1683,14 @@ async def test_existing_catalog_profile_grounding_does_not_profile_again():
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status)
         VALUES (1, 'complete'), (2, 'pending');
-        """
-    )
+        """)
 
     try:
         schema = await runtime.execute_capability(
@@ -1445,16 +1790,14 @@ async def test_value_grounding_skipped_budget_target_does_not_profile():
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status)
         VALUES (1, 'complete'), (2, 'pending');
-        """
-    )
+        """)
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -1530,16 +1873,14 @@ async def test_catalog_column_value_profile_prerequisite_requires_contract_decla
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status)
         VALUES (1, 'complete'), (2, 'pending');
-        """
-    )
+        """)
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -1668,16 +2009,14 @@ async def test_sqlite_column_value_profile_registers_with_catalog():
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(catalog, sqlite))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (status)
         VALUES ('complete'), ('complete'), ('pending');
-        """
-    )
+        """)
 
     try:
         schema_evidence = await runtime.execute_capability(
@@ -1737,15 +2076,13 @@ async def test_sqlite_column_value_profile_fingerprint_only_uses_live_revision()
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(sqlite,))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (status) VALUES ('complete'), ('pending');
-        """
-    )
+        """)
 
     try:
         fingerprint = await runtime.execute_capability(
@@ -1855,16 +2192,14 @@ async def test_sqlite_column_value_profile_skips_when_row_count_exceeds_limit():
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(sqlite,))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (status)
         VALUES ('complete'), ('complete'), ('pending');
-        """
-    )
+        """)
 
     try:
         raw_profile = await runtime.execute_capability(

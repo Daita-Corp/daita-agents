@@ -1076,45 +1076,7 @@ class DbRuntimeTasksMixin:
             task_input,
             operation=operation,
         )
-        validation_facts, validation_warnings = (
-            await self._accepted_validation_inputs_for_value_grounding(operation.id)
-        )
-        if validation_facts and not enriched.get("validation_facts"):
-            enriched["validation_facts"] = validation_facts
-        if validation_warnings and not (
-            enriched.get("warnings") or enriched.get("validation_warnings")
-        ):
-            enriched["validation_warnings"] = validation_warnings
         return enriched
-
-    async def _accepted_validation_inputs_for_value_grounding(
-        self,
-        operation_id: str,
-    ) -> tuple[list[Any], list[Any]]:
-        facts: list[Any] = []
-        warnings: list[Any] = []
-        for evidence in await self.store.list_evidence(operation_id):
-            if not evidence.accepted or evidence.kind not in {
-                "sql.validation",
-                "query.plan.validation",
-            }:
-                continue
-            if not isinstance(evidence.payload, Mapping):
-                continue
-            facts.extend(
-                _validation_items_for_value_grounding(
-                    evidence.payload.get("validation_facts")
-                )
-            )
-            warnings.extend(
-                _validation_items_for_value_grounding(evidence.payload.get("warnings"))
-            )
-            warnings.extend(
-                _validation_items_for_value_grounding(
-                    evidence.payload.get("validation_warnings")
-                )
-            )
-        return _dedupe_json_values(facts), _dedupe_json_values(warnings)
 
     async def _ensure_catalog_value_grounding_plan(
         self,
@@ -2092,10 +2054,13 @@ def _validation_items_for_value_grounding(value: Any) -> list[Any]:
                     "table_name",
                     "column",
                     "column_name",
+                    "operator",
                     "literal",
                     "value",
                     "filter_literal",
                     "candidates",
+                    "source",
+                    "reason",
                 )
                 if key in item
             }

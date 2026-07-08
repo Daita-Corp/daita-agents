@@ -63,6 +63,7 @@ class SqlLiteralPredicate:
     column: SqlColumnRef
     operator: str
     values: tuple[str, ...]
+    value_kinds: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -384,12 +385,12 @@ def _literal_predicates(
             continue
         if isinstance(node, exp.In):
             column = _column_expression(node.this, exp)
-            values = tuple(
-                _literal_value(item, exp)
+            literal_values = [
+                literal
                 for item in node.expressions
-                if _literal_value(item, exp) is not None
-            )
-            if column is not None and values:
+                if (literal := _literal_value(item, exp)) is not None
+            ]
+            if column is not None and literal_values:
                 predicates.append(
                     SqlLiteralPredicate(
                         column=_resolve_column_qualifiers(
@@ -398,7 +399,8 @@ def _literal_predicates(
                             cte_names,
                         )[0],
                         operator="in",
-                        values=values,
+                        values=tuple(value for value, _kind in literal_values),
+                        value_kinds=tuple(kind for _value, kind in literal_values),
                     )
                 )
             continue
@@ -438,10 +440,10 @@ def _binary_literal_predicate(
     right_value = _literal_value(node.expression, exp)
     if left_column is not None and right_value is not None:
         column = left_column
-        value = right_value
+        value, value_kind = right_value
     elif right_column is not None and left_value is not None:
         column = right_column
-        value = left_value
+        value, value_kind = left_value
         operator = reversed_operator or operator
     else:
         return None
@@ -453,6 +455,7 @@ def _binary_literal_predicate(
         )[0],
         operator=operator,
         values=(value,),
+        value_kinds=(value_kind,),
     )
 
 
@@ -467,9 +470,11 @@ def _sql_column_ref(column: Any) -> SqlColumnRef:
     return SqlColumnRef(name=name, table=qualifier, parts=parts or (name,))
 
 
-def _literal_value(value: Any, exp: Any) -> str | None:
+def _literal_value(value: Any, exp: Any) -> tuple[str, str] | None:
     if not isinstance(value, exp.Literal):
         return None
-    if getattr(value, "is_string", False) or getattr(value, "is_number", False):
-        return str(value.this)
+    if getattr(value, "is_string", False):
+        return str(value.this), "string"
+    if getattr(value, "is_number", False):
+        return str(value.this), "number"
     return None

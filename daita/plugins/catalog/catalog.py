@@ -2094,7 +2094,8 @@ def _first_value_grounding_string(value: dict[str, Any], *keys: str) -> str:
 
 def _parse_value_grounding_warning(value: str) -> tuple[str, str, str] | None:
     match = re.search(
-        r"(?:unobserved_filter_literal|ambiguous_literal_column):"
+        r"(?:filter_literal_requires_grounding|unobserved_filter_literal|"
+        r"ambiguous_literal_column):"
         r"\s*([^=\s;]+)\s*=\s*([^;]+)",
         value,
     )

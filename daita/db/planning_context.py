@@ -163,11 +163,6 @@ class DbPlanningContextBuilder:
             _column_value_hints(
                 catalog_evidence,
                 schema,
-                profiles_stale=bool(
-                    schema_evidence is not None
-                    and schema_evidence.metadata.get("schema_cache")
-                    == "persistent_stale_fallback"
-                ),
             ),
             projection,
         )
@@ -509,8 +504,6 @@ def _compact_session_context(request: DbRequest) -> dict[str, Any]:
 def _column_value_hints(
     catalog_evidence: tuple[Evidence, ...],
     schema: dict[str, Any],
-    *,
-    profiles_stale: bool = False,
 ) -> tuple[dict[str, Any], ...]:
     hints: list[dict[str, Any]] = []
     for evidence in catalog_evidence:
@@ -518,24 +511,6 @@ def _column_value_hints(
             for hint in evidence.payload.get("hints", []) or []:
                 if isinstance(hint, dict):
                     hints.append(_compact_column_value_hint(hint))
-        elif evidence.kind == "schema.column_value_profile":
-            for profile in evidence.payload.get("profiles", []) or []:
-                if isinstance(profile, dict):
-                    hints.append(_hint_from_profile(profile))
-        elif evidence.kind == "schema.column_value_search_result":
-            for profile in evidence.payload.get("profiles", []) or []:
-                if isinstance(profile, dict):
-                    hints.append(_hint_from_profile(profile))
-
-    if not hints:
-        metadata = schema.get("metadata") or {}
-        profiles = (
-            metadata.get("column_value_profiles") if isinstance(metadata, dict) else {}
-        )
-        if isinstance(profiles, dict):
-            for profile in profiles.values():
-                if isinstance(profile, dict):
-                    hints.append(_hint_from_profile(profile, stale=profiles_stale))
 
     deduped: dict[tuple[str, str], dict[str, Any]] = {}
     for hint in hints:
@@ -555,27 +530,6 @@ def _prefer_column_value_hint(
     if candidate.get("candidate_mapping") and not existing.get("candidate_mapping"):
         return True
     return False
-
-
-def _hint_from_profile(
-    profile: dict[str, Any], *, stale: bool = False
-) -> dict[str, Any]:
-    return _compact_column_value_hint(
-        {
-            "table": profile.get("table"),
-            "column": profile.get("column"),
-            "profile_ref": profile.get("profile_ref")
-            or f"{profile.get('table')}.{profile.get('column')}",
-            "distinct_count": profile.get("distinct_count"),
-            "observed_values": profile.get("top_values") or [],
-            "profile_status": "stale" if stale else profile.get("profile_status"),
-            "sampled": profile.get("sampled"),
-            "truncated": profile.get("truncated"),
-            "redacted": profile.get("redacted"),
-            "stale": stale,
-            "stale_reason": profile.get("stale_reason"),
-        }
-    )
 
 
 def _compact_column_value_hint(hint: dict[str, Any]) -> dict[str, Any]:

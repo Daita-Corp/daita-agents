@@ -330,7 +330,29 @@ class DbAgentLoop:
                 current_action_ids=set(),
             )
             if runtime_continuation is None:
+                runtime_continuation = (
+                    _validation_grounding_runtime_continuation_action(
+                        state,
+                        current_action_ids=set(),
+                    )
+                )
+            if runtime_continuation is None:
                 decision = await self.planner.plan(state)
+            elif (
+                runtime_continuation.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT
+            ):
+                decision = DbPlannerDecision(
+                    status=DbPlannerDecisionStatus.CONTINUE,
+                    intent={"operation_type": DbIntentKind.DATA_QUERY.value},
+                    actions=(runtime_continuation,),
+                    rationale=(
+                        "Runtime continuation for validation-driven value grounding."
+                    ),
+                    metadata={
+                        "runtime_continuation": True,
+                        "continuation": "validation_grounding.context_refresh",
+                    },
+                )
             else:
                 decision = DbPlannerDecision(
                     status=DbPlannerDecisionStatus.CONTINUE,
@@ -606,6 +628,22 @@ class DbAgentLoop:
                 ),
                 turn=turn,
             )
+            blocked_resource_errors = _blocked_resource_execution_errors(
+                execution_errors
+            )
+            if blocked_resource_errors:
+                warnings.append("db_agent_loop_blocked_resource_validation")
+                return await self._result(
+                    operation,
+                    "blocked",
+                    warnings=warnings,
+                    diagnostics={
+                        "task_plan": task_plan.to_dict(),
+                        "progress": progress_facts,
+                        "blocked_resource_errors": blocked_resource_errors,
+                        "observation": observation.to_dict(),
+                    },
+                )
             if progress_decision.terminal_status is not None:
                 warnings.extend(progress_decision.warnings)
                 return await self._result(
@@ -751,6 +789,19 @@ class DbAgentLoop:
                 rejected.append(error or {"error": "invalid_action"})
                 continue
             actions.append(action)
+
+        runtime_continuation = _validation_grounding_runtime_continuation_action(
+            state,
+            current_action_ids={action.action_id for action in actions},
+        )
+        if runtime_continuation is not None:
+            if self.continuation_resolver.blocked_diagnostic(runtime_continuation):
+                actions = [runtime_continuation]
+            elif not any(
+                action.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT
+                for action in actions
+            ):
+                actions.insert(0, runtime_continuation)
 
         if not any(
             action.kind is DbPlannerActionKind.COMMIT_MEMORY_UPDATE
@@ -1681,6 +1732,37 @@ class DbAgentLoop:
             return [], [], access_errors
         specs: list[DbTaskSpec] = []
         task_input = _task_input_for_action(action)
+        if action.kind is DbPlannerActionKind.REPAIR_QUERY_PLAN:
+            planning_context = _latest_accepted_evidence_summary(
+                state,
+                "planning.context",
+            )
+            if (
+                planning_context is not None
+                and "planning_context_evidence_id" not in task_input
+            ):
+                task_input["planning_context_evidence_id"] = planning_context["id"]
+            missing_repair_inputs = [
+                key
+                for key in (
+                    "planning_context_evidence_id",
+                    "failure_evidence_id",
+                    "prior_plan_evidence_id",
+                )
+                if not str(task_input.get(key) or "").strip()
+            ]
+            if missing_repair_inputs:
+                return (
+                    [],
+                    [],
+                    [
+                        _action_error(
+                            action,
+                            "missing_repair_input_ids:"
+                            + ",".join(missing_repair_inputs),
+                        )
+                    ],
+                )
         for offset, capability in enumerate(capabilities):
             specs.append(
                 _with_deterministic_task_id(
@@ -2497,6 +2579,26 @@ def _is_sql_execution_error(error: Mapping[str, Any]) -> bool:
     return "sql" in text or "validation_failed" in text
 
 
+def _blocked_resource_execution_errors(
+    errors: Iterable[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    return tuple(dict(error) for error in errors if _is_blocked_resource_error(error))
+
+
+def _is_blocked_resource_error(error: Mapping[str, Any]) -> bool:
+    if str(error.get("capability_id") or "") != "db.sql.validate":
+        return False
+    text = str(error.get("error") or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "sql guardrail rejected blocked table",
+            "sql guardrail rejected blocked column",
+            "sql guardrail rejected table(s) outside allowlist",
+        )
+    )
+
+
 def _new_evidence_refs(
     before: tuple[dict[str, Any], ...],
     after: tuple[dict[str, Any], ...],
@@ -2608,6 +2710,125 @@ def _memory_update_runtime_continuation_action(
             "continuation_resolution": diagnostic,
         },
     )
+
+
+def _validation_grounding_runtime_continuation_action(
+    state: DbLoopState,
+    *,
+    current_action_ids: set[str],
+) -> DbPlannerAction | None:
+    repair_context = _validation_grounding_repair_context(state)
+    missing_refs = tuple(
+        str(item).strip()
+        for item in repair_context.get("missing_target_refs", ())
+        if str(item).strip()
+    )
+    if not missing_refs:
+        return None
+    if not _state_allows_read_profile(state):
+        return None
+
+    fingerprint = str(repair_context.get("fingerprint") or "").strip()
+    targets = _safe_target_list(repair_context.get("targets"))
+    action_input: dict[str, Any] = {}
+    source_owner = _single_source_owner_for_state(state)
+    if source_owner:
+        action_input["source_owner"] = source_owner
+
+    metadata: dict[str, Any] = {
+        "runtime_continuation": True,
+        "continuation": "validation_grounding.context_refresh",
+        "validation_grounding_fingerprint": fingerprint,
+        "validation_grounding_targets": targets,
+    }
+    if _validation_grounding_context_refresh_exhausted(state, repair_context):
+        metadata["continuation_resolution"] = {
+            "status": "blocked",
+            "source": "runtime_continuation",
+            "error": "validation_grounding_context_refresh_exhausted",
+            "continuation": "validation_grounding.context_refresh",
+            "validation_grounding_fingerprint": fingerprint,
+            "validation_grounding_targets": targets,
+            "missing_target_refs": list(missing_refs),
+        }
+
+    return DbPlannerAction(
+        action_id=_runtime_validation_grounding_action_id(
+            repair_context,
+            current_action_ids,
+        ),
+        kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+        input=action_input,
+        rationale="Runtime continuation for validation-driven value grounding.",
+        metadata=metadata,
+    )
+
+
+def _runtime_validation_grounding_action_id(
+    repair_context: Mapping[str, Any],
+    current_action_ids: set[str],
+) -> str:
+    fingerprint = str(repair_context.get("fingerprint") or "")
+    seed = {
+        "fingerprint": fingerprint,
+        "target_refs": list(repair_context.get("target_refs") or ()),
+    }
+    action_id = f"runtime_validation_grounding_{_stable_hash(seed)[:12]}"
+    if action_id not in current_action_ids:
+        return action_id
+    return (
+        f"{action_id}_{_stable_hash({'existing_ids': sorted(current_action_ids)})[:8]}"
+    )
+
+
+def _validation_grounding_context_refresh_exhausted(
+    state: DbLoopState,
+    repair_context: Mapping[str, Any],
+) -> bool:
+    fingerprint = str(repair_context.get("fingerprint") or "").strip()
+    if not fingerprint:
+        return False
+    missing_refs = {
+        str(item).strip().lower()
+        for item in repair_context.get("missing_target_refs", ())
+        if str(item).strip()
+    }
+    if not missing_refs:
+        return False
+    for summary in state.accepted_evidence_summaries:
+        if summary.get("kind") != "planning.context":
+            continue
+        if str(summary.get("validation_grounding_fingerprint") or "") != fingerprint:
+            continue
+        attempted_refs = {
+            str(item).strip().lower()
+            for item in summary.get("validation_grounding_target_refs", ())
+            if str(item).strip()
+        }
+        if missing_refs <= attempted_refs:
+            return True
+    return False
+
+
+def _single_source_owner_for_state(state: DbLoopState) -> str | None:
+    source_scope = _string_list(state.source_scope) or _string_list(
+        state.normalized_user_request.get("source_scope")
+    )
+    unique_scope = tuple(dict.fromkeys(source_scope))
+    if len(unique_scope) == 1:
+        return unique_scope[0]
+
+    source_capability_owners = tuple(
+        dict.fromkeys(
+            str(summary.get("owner") or "").strip()
+            for summary in state.capability_summaries
+            if summary.get("id") in {"db.schema.inspect", "db.column_values.profile"}
+            and str(summary.get("owner") or "").strip()
+        )
+    )
+    if len(source_capability_owners) == 1:
+        return source_capability_owners[0]
+    return None
 
 
 def _state_is_memory_update_operation(state: DbLoopState) -> bool:
@@ -3038,7 +3259,7 @@ def _resolve_sql_from_latest_accepted_query_plan(
     )
     for summary in reversed(summaries):
         sql = summary.get("sql")
-        if isinstance(sql, str) and sql.strip():
+        if summary.get("valid") is True and isinstance(sql, str) and sql.strip():
             return _resolved_sql_from_plan_summary(
                 summary,
                 state,
@@ -3380,7 +3601,11 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
     if sql:
         summary["sql"] = sql
     if isinstance(evidence.payload, dict):
-        if evidence.kind in {"sql.validation", "query.plan.validation"}:
+        if evidence.kind in {
+            "sql.validation",
+            "query.plan.validation",
+            "query.plan.proposal",
+        }:
             if "valid" in evidence.payload:
                 summary["valid"] = evidence.payload.get("valid") is True
             validation_facts = _safe_validation_items(
@@ -3400,6 +3625,21 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
             hints = _safe_column_value_hint_summaries(evidence.payload.get("hints"))
             if hints:
                 summary["hints"] = hints
+        if evidence.kind == "planning.context":
+            diagnostics = evidence.payload.get("diagnostics")
+            if isinstance(diagnostics, Mapping):
+                repair = diagnostics.get("validation_grounding_repair")
+                if isinstance(repair, Mapping):
+                    fingerprint = str(repair.get("fingerprint") or "").strip()
+                    if fingerprint:
+                        summary["validation_grounding_fingerprint"] = fingerprint
+                    target_refs = [
+                        str(item).strip()
+                        for item in repair.get("target_refs", ())
+                        if str(item).strip()
+                    ]
+                    if target_refs:
+                        summary["validation_grounding_target_refs"] = target_refs
         if evidence.kind == "db.memory.proposal":
             proposal_fingerprint = evidence.payload.get("proposal_fingerprint")
             if isinstance(proposal_fingerprint, str) and proposal_fingerprint.strip():
@@ -3436,10 +3676,13 @@ def _safe_validation_items(value: Any) -> list[Any]:
                     "table_name",
                     "column",
                     "column_name",
+                    "operator",
                     "literal",
                     "value",
                     "filter_literal",
                     "candidates",
+                    "source",
+                    "reason",
                 )
                 if key in item
             }
@@ -4019,6 +4262,7 @@ def _validation_value_grounding_targets(values: Iterable[Any]) -> list[dict[str,
         if isinstance(item, Mapping):
             kind = str(item.get("kind") or "")
             if kind and kind not in {
+                "filter_literal_requires_grounding",
                 "unobserved_filter_literal",
                 "ambiguous_literal_column",
             }:
@@ -4055,18 +4299,19 @@ def _validation_value_grounding_target_from_warning(
     value: str,
 ) -> dict[str, Any] | None:
     match = re.search(
-        r"(?:unobserved_filter_literal|ambiguous_literal_column):"
+        r"(filter_literal_requires_grounding|unobserved_filter_literal|"
+        r"ambiguous_literal_column):"
         r"\s*([^=\s;]+)\s*=\s*([^;]+)",
         str(value),
     )
     if match is None:
         return None
-    table, column = _split_column_ref(match.group(1))
-    literal = match.group(2).strip().strip("'\"")
+    table, column = _split_column_ref(match.group(2))
+    literal = match.group(3).strip().strip("'\"")
     if not table or not column or not literal:
         return None
     return {
-        "kind": "unobserved_filter_literal",
+        "kind": match.group(1),
         "table": table,
         "column": column,
         "literal": literal,

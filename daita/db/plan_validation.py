@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any
+from typing import Any, Iterable
 
 from .planning_context import planner_eligible_column_value_hint
 from .query_plan import DbQueryPlan, DbQueryPlanValidation
@@ -28,7 +28,8 @@ class DbQueryPlanValidator:
         dialect = str(
             planning_context.get("dialect") or schema.get("database_type") or ""
         )
-        table_columns = _table_columns(schema)
+        schema_columns = _schema_columns(schema)
+        table_columns = _table_columns_from_schema_columns(schema_columns)
         value_profiles = _value_profiles(planning_context)
         db_memory_validation = {
             "checked": bool(planning_context.get("db_memory_semantics")),
@@ -74,10 +75,13 @@ class DbQueryPlanValidator:
                 _validate_column(table_columns, table, column, errors, label="filter")
             _validate_filter_literal(
                 value_profiles,
+                schema_columns,
+                plan.selected_tables,
                 table,
                 column,
                 filter_spec.operator,
                 filter_spec.value,
+                None,
                 errors,
                 validation_facts,
             )
@@ -130,16 +134,21 @@ class DbQueryPlanValidator:
                     errors,
                 )
                 for predicate in analysis.literal_predicates:
+                    predicate_values = list(predicate.values)
+                    predicate_kinds = list(getattr(predicate, "value_kinds", ()) or ())
                     _validate_filter_literal(
                         value_profiles,
+                        schema_columns,
+                        sql_tables,
                         predicate.column.table or None,
                         predicate.column.name,
                         predicate.operator,
                         (
-                            list(predicate.values)
+                            predicate_values
                             if predicate.operator == "in"
-                            else predicate.values[0]
+                            else predicate_values[0]
                         ),
+                        predicate_kinds,
                         errors,
                         validation_facts,
                     )
@@ -175,18 +184,32 @@ class DbQueryPlanValidator:
         )
 
 
-def _table_columns(schema: dict[str, Any]) -> dict[str, set[str]]:
-    tables: dict[str, set[str]] = {}
+def _schema_columns(schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    tables: dict[str, dict[str, Any]] = {}
     for table in schema.get("tables", []) or []:
         name = str(table.get("name") or "")
         if not name:
             continue
-        tables[name.lower()] = {
-            str(column.get("name") or "").lower()
+        columns = {
+            str(column.get("name") or "").lower(): dict(column)
             for column in table.get("columns", []) or []
-            if column.get("name")
+            if isinstance(column, dict) and column.get("name")
         }
+        tables[name.lower()] = {"name": name, "columns": columns}
     return tables
+
+
+def _table_columns_from_schema_columns(
+    schema_columns: dict[str, dict[str, Any]],
+) -> dict[str, set[str]]:
+    return {
+        table_key: set(table.get("columns", {}))
+        for table_key, table in schema_columns.items()
+    }
+
+
+def _table_columns(schema: dict[str, Any]) -> dict[str, set[str]]:
+    return _table_columns_from_schema_columns(_schema_columns(schema))
 
 
 def _validate_column(
@@ -225,10 +248,13 @@ def _validate_join_column(
 
 def _validate_filter_literal(
     value_profiles: dict[tuple[str | None, str], set[str]],
+    schema_columns: dict[str, dict[str, Any]],
+    sql_tables: Iterable[str],
     table: str | None,
     column: str,
     operator: str,
     value: Any,
+    literal_kinds: Iterable[str] | None,
     errors: list[str],
     validation_facts: list[dict[str, Any]],
 ) -> None:
@@ -238,20 +264,56 @@ def _validate_filter_literal(
     if value is None:
         return
     if normalized_operator == "in" and isinstance(value, (list, tuple, set)):
-        for item in value:
+        kinds = list(literal_kinds or ())
+        for index, item in enumerate(value):
             _validate_filter_literal(
                 value_profiles,
+                schema_columns,
+                sql_tables,
                 table,
                 column,
                 "=",
                 item,
+                (kinds[index],) if index < len(kinds) else None,
                 errors,
                 validation_facts,
             )
         return
     literal = str(value)
     candidates = _observed_values(value_profiles, table, column)
-    if not candidates or literal.lower() in candidates:
+    if candidates and literal.lower() in candidates:
+        return
+    if not candidates:
+        if not _is_string_literal(value, literal_kinds):
+            return
+        resolved = _resolve_filter_literal_column(
+            schema_columns,
+            table=table,
+            column=column,
+            sql_tables=sql_tables,
+        )
+        if resolved is None:
+            return
+        table_label, column_label, column_metadata = resolved
+        if not _column_eligible_for_value_grounding(column_metadata):
+            return
+        errors.append(
+            "filter_literal_requires_grounding:"
+            f"{table_label}.{column_label}={literal}"
+        )
+        validation_facts.append(
+            {
+                "kind": "filter_literal_requires_grounding",
+                "table": table_label,
+                "column": column_label,
+                "operator": _normalize_operator(normalized_operator),
+                "literal": literal,
+                "source": "query.plan.validation",
+                "reason": (
+                    "proposed_sql_filter_literal_without_accepted_value_evidence"
+                ),
+            }
+        )
         return
     table_label = table or _single_table_for_column(value_profiles, column) or "unknown"
     sorted_candidates = sorted(candidates)
@@ -382,6 +444,77 @@ def _observed_values(
     if len(matches) == 1:
         return set(matches[0])
     return set()
+
+
+def _is_string_literal(value: Any, literal_kinds: Iterable[str] | None) -> bool:
+    kinds = [str(kind).lower() for kind in literal_kinds or () if str(kind)]
+    if kinds:
+        return all(kind == "string" for kind in kinds)
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _resolve_filter_literal_column(
+    schema_columns: dict[str, dict[str, Any]],
+    *,
+    table: str | None,
+    column: str,
+    sql_tables: Iterable[str],
+) -> tuple[str, str, dict[str, Any]] | None:
+    column_key = str(column or "").lower()
+    if not column_key:
+        return None
+    requested_tables = [str(item) for item in sql_tables if str(item or "").strip()]
+    if table:
+        requested_tables = [str(table), *requested_tables]
+
+    table_items = list(schema_columns.items())
+    if requested_tables:
+        requested_keys = {str(item).lower() for item in requested_tables}
+        requested_short_keys = {
+            _short_table_key(item)
+            for item in requested_tables
+            if _short_table_key(item)
+        }
+        table_items = [
+            (table_key, table_info)
+            for table_key, table_info in table_items
+            if table_key in requested_keys
+            or _short_table_key(str(table_info.get("name") or table_key))
+            in requested_keys
+            or table_key in requested_short_keys
+            or _short_table_key(str(table_info.get("name") or table_key))
+            in requested_short_keys
+        ]
+
+    matches: list[tuple[str, str, dict[str, Any]]] = []
+    for table_key, table_info in table_items:
+        columns = table_info.get("columns")
+        if not isinstance(columns, dict) or column_key not in columns:
+            continue
+        column_metadata = dict(columns[column_key])
+        table_name = str(table_info.get("name") or table_key)
+        column_name = str(column_metadata.get("name") or column)
+        matches.append((table_name, column_name, column_metadata))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _column_eligible_for_value_grounding(column: dict[str, Any]) -> bool:
+    data_type = str(
+        column.get("data_type") or column.get("type") or column.get("db_type") or ""
+    ).lower()
+    if not data_type:
+        return False
+    return any(
+        token in data_type
+        for token in (
+            "char",
+            "clob",
+            "enum",
+            "string",
+            "text",
+            "uuid",
+        )
+    )
 
 
 def _single_table_for_column(

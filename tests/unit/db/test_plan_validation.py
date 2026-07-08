@@ -44,6 +44,18 @@ def _planning_context():
     }
 
 
+def _requires_grounding_fact(literal: str = "completed") -> dict[str, str]:
+    return {
+        "kind": "filter_literal_requires_grounding",
+        "table": "orders",
+        "column": "status",
+        "operator": "=",
+        "literal": literal,
+        "source": "query.plan.validation",
+        "reason": "proposed_sql_filter_literal_without_accepted_value_evidence",
+    }
+
+
 def _relationship_planning_context():
     context = _planning_context()
     context["schema"]["tables"] = [
@@ -619,17 +631,53 @@ def test_validator_does_not_enforce_stale_value_hints():
 
     validation = DbQueryPlanValidator().validate(plan, context)
 
-    assert validation.valid is True
-    assert validation.accepted_sql == plan.selected_sql
+    assert validation.valid is False
+    assert validation.accepted_sql is None
+    assert validation.validation_facts == (_requires_grounding_fact(),)
+    assert not any(
+        str(error).startswith("unobserved_filter_literal:")
+        for error in validation.errors
+    )
 
 
-def test_planning_context_and_validator_share_value_hint_eligibility():
-    unsafe_profiles = [
-        {"profile_status": "stale", "stale": True},
-        {"profile_status": "profiled", "redacted": True},
-        {"profile_status": "profiled", "sampled": True},
-        {"profile_status": "profiled", "truncated": True},
-    ]
+def test_planning_context_column_value_hints_only_use_hint_evidence():
+    profile = {
+        "table": "orders",
+        "column": "status",
+        "profile_status": "profiled",
+        "top_values": [
+            {"value": "complete", "count": 4},
+            {"value": "pending", "count": 1},
+        ],
+    }
+    schema_with_metadata_profiles = {
+        **_planning_context()["schema"],
+        "metadata": {"column_value_profiles": {"orders.status": profile}},
+    }
+    profile_evidence = Evidence(
+        kind="schema.column_value_profile",
+        owner="catalog",
+        payload={"profiles": [profile]},
+    )
+    search_evidence = Evidence(
+        kind="schema.column_value_search_result",
+        owner="catalog",
+        payload={"profiles": [profile]},
+    )
+    hint_evidence = Evidence(
+        kind="schema.column_value_hint",
+        owner="catalog",
+        payload={
+            "hints": [
+                {
+                    "table": "orders",
+                    "column": "status",
+                    "profile_status": "profiled",
+                    "observed_values": profile["top_values"],
+                }
+            ]
+        },
+    )
     plan = DbQueryPlan(
         operation="read",
         selected_sql="SELECT * FROM orders WHERE status = 'completed' LIMIT 10",
@@ -637,70 +685,33 @@ def test_planning_context_and_validator_share_value_hint_eligibility():
         confidence=0.9,
     )
 
-    for overrides in unsafe_profiles:
-        profile = {
+    assert _column_value_hints((profile_evidence,), _planning_context()["schema"]) == ()
+    assert _column_value_hints((search_evidence,), _planning_context()["schema"]) == ()
+    assert _column_value_hints((), schema_with_metadata_profiles) == ()
+
+    hint_hints = _column_value_hints((hint_evidence,), _planning_context()["schema"])
+    assert hint_hints == (
+        {
             "table": "orders",
             "column": "status",
-            "profile_status": "profiled",
-            "top_values": [
+            "profile_ref": "orders.status",
+            "distinct_count": None,
+            "observed_values": [
                 {"value": "complete", "count": 4},
                 {"value": "pending", "count": 1},
             ],
-            **overrides,
-        }
-        hints = _column_value_hints(
-            (
-                Evidence(
-                    kind="schema.column_value_search_result",
-                    owner="catalog",
-                    payload={"profiles": [profile]},
-                ),
-            ),
-            _planning_context()["schema"],
-        )
-        context = _planning_context()
-        context["column_value_hints"] = [
-            {
-                "table": "orders",
-                "column": "status",
-                "profile_status": profile["profile_status"],
-                "stale": bool(profile.get("stale", False)),
-                "redacted": bool(profile.get("redacted", False)),
-                "sampled": bool(profile.get("sampled", False)),
-                "truncated": bool(profile.get("truncated", False)),
-                "observed_values": profile["top_values"],
-            }
-        ]
-
-        assert hints == ()
-        validation = DbQueryPlanValidator().validate(plan, context)
-        assert validation.valid is True
-
-    eligible_hints = _column_value_hints(
-        (
-            Evidence(
-                kind="schema.column_value_search_result",
-                owner="catalog",
-                payload={
-                    "profiles": [
-                        {
-                            "table": "orders",
-                            "column": "status",
-                            "profile_status": "profiled",
-                            "top_values": [
-                                {"value": "complete", "count": 4},
-                                {"value": "pending", "count": 1},
-                            ],
-                        }
-                    ]
-                },
-            ),
-        ),
-        _planning_context()["schema"],
+            "profile_status": "profiled",
+            "sampled": False,
+            "truncated": False,
+            "redacted": False,
+            "stale": False,
+        },
     )
     context = _planning_context()
-    context["column_value_hints"] = list(eligible_hints)
-
-    assert eligible_hints
+    context["column_value_hints"] = list(hint_hints)
     validation = DbQueryPlanValidator().validate(plan, context)
     assert validation.valid is False
+    assert (
+        "unobserved_filter_literal:orders.status=completed;"
+        "candidates=complete,pending"
+    ) in validation.errors
