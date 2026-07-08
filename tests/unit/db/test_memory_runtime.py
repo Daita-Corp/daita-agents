@@ -2548,6 +2548,15 @@ def test_planning_context_projects_blocked_memory_refs_before_rendering():
     assert "platinum" not in dumped
     assert context.db_memory_refs[0]["projection"]["reason"] == "blocked_by_policy"
     assert context.db_memory_semantics[0]["enforceable"] is False
+    raw_payload = context.to_payload()
+    assert raw_payload["db_memory_semantics"][0]["enforceable"] is False
+    assert raw_payload["db_memory_contract_diagnostics"]["enforced_count"] == 0
+    assert (
+        raw_payload["db_memory_contract_diagnostics"]["omitted_reasons"][
+            "blocked_by_policy"
+        ]
+        == 1
+    )
 
 
 def test_mixed_contract_projection_keeps_enforceable_and_advisory_separate():

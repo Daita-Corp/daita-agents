@@ -191,7 +191,13 @@ class DbLLMRepairExecutor:
             return [repair]
         plan = DbQueryPlan.from_mapping(parsed)
         prior_sql = _sql_from_plan_payload(prior_plan.payload)
+        context_changed = _repair_failure_context_changed(
+            failure.payload if failure is not None else {},
+            planning_context=planning_context,
+        )
         repeated = _same_sql(plan.selected_sql, prior_sql)
+        repeated_blocked = repeated and not context_changed
+        non_executable_reason = _repair_non_executable_reason(plan)
         payload = {
             **_plan_payload(
                 plan,
@@ -202,22 +208,48 @@ class DbLLMRepairExecutor:
             ),
             "repair_attempt": int(task.input.get("repair_attempt") or 1),
             "repaired_failure_evidence_id": getattr(failure, "id", None),
-            "repeated_sql_blocked": repeated,
+            "repeated_sql_blocked": repeated_blocked,
+            "repair_context_changed": context_changed,
             "repair_inputs_present": True,
         }
-        accepted = _query_plan_proposal_accepted(payload) and not repeated
+        if repeated and context_changed:
+            payload["repeated_sql_allowed_context_changed"] = True
+        if non_executable_reason is not None:
+            payload.update(
+                {
+                    "valid": False,
+                    "failure": "repair_non_executable_plan",
+                    "repair_rejection_reason": non_executable_reason,
+                }
+            )
+        accepted = (
+            non_executable_reason is None
+            and _query_plan_proposal_accepted(payload)
+            and not repeated_blocked
+        )
+        repair_payload = {
+            **repair.payload,
+            "valid": repair.payload["parse_succeeded"],
+            "proposal_accepted": accepted,
+            "repeated_sql_blocked": repeated_blocked,
+            "repair_context_changed": context_changed,
+        }
+        if repeated and context_changed:
+            repair_payload["repeated_sql_allowed_context_changed"] = True
+        if non_executable_reason is not None:
+            repair_payload.update(
+                {
+                    "failure": "repair_non_executable_plan",
+                    "repair_rejection_reason": non_executable_reason,
+                }
+            )
         repair = Evidence(
             kind=repair.kind,
             owner=repair.owner,
             operation_id=repair.operation_id,
             task_id=repair.task_id,
             accepted=accepted,
-            payload={
-                **repair.payload,
-                "valid": repair.payload["parse_succeeded"],
-                "proposal_accepted": accepted,
-                "repeated_sql_blocked": repeated,
-            },
+            payload=repair_payload,
         )
         proposal = Evidence(
             kind="query.plan.proposal",
@@ -283,11 +315,14 @@ def _repair_messages(
         {
             "role": "system",
             "content": (
-                "Repair a failed database query plan. Return only strict JSON "
-                "for a complete revised plan. Do not repeat the same SQL unless "
-                "the failure facts show the context changed. The operation "
-                "field must be one of: read, write_propose, schema, analysis. "
-                "Use read for SELECT queries."
+                "Repair a failed executable read database query plan. Return "
+                "only strict JSON for a complete revised DbQueryPlan. The "
+                'operation field must be exactly "read", selected_sql must be '
+                "a non-empty executable SELECT query, and candidates should "
+                "describe the executable SQL. Do not return analysis, "
+                "write_propose, schema, revised_plan, or meta-plan JSON. Do "
+                "not repeat the same SQL unless the failure facts show the "
+                "planning context changed."
             ),
         },
         {
@@ -374,6 +409,53 @@ def _query_plan_proposal_accepted(payload: Mapping[str, Any]) -> bool:
     )
 
 
+def _repair_non_executable_reason(plan: DbQueryPlan) -> str | None:
+    if plan.operation != "read":
+        return f"operation_not_read:{plan.operation}"
+    if not isinstance(plan.selected_sql, str) or not plan.selected_sql.strip():
+        return "missing_selected_sql"
+    return None
+
+
+def _repair_failure_context_changed(
+    failure_payload: Mapping[str, Any],
+    *,
+    planning_context: Evidence,
+) -> bool:
+    failed_context_id = str(
+        failure_payload.get("planning_context_evidence_id") or ""
+    ).strip()
+    if not failed_context_id or failed_context_id == planning_context.id:
+        return False
+    return _failure_facts_are_context_sensitive(failure_payload)
+
+
+def _failure_facts_are_context_sensitive(
+    failure_payload: Mapping[str, Any],
+) -> bool:
+    context_sensitive_kinds = {
+        "filter_literal_requires_grounding",
+        "unobserved_filter_literal",
+        "ambiguous_literal_column",
+    }
+    values: list[Any] = []
+    for key in ("validation_facts", "warnings", "validation_warnings", "errors"):
+        value = failure_payload.get(key)
+        if isinstance(value, (list, tuple)):
+            values.extend(value)
+        elif value is not None:
+            values.append(value)
+    for value in values:
+        if isinstance(value, Mapping):
+            kind = str(value.get("kind") or "").strip()
+            if kind in context_sensitive_kinds:
+                return True
+        text = str(value or "")
+        if any(kind in text for kind in context_sensitive_kinds):
+            return True
+    return False
+
+
 def _plan_payload(
     plan: DbQueryPlan,
     *,
@@ -447,9 +529,7 @@ def _missing_repair_input_evidence(
         "parse_succeeded": False,
         "repair_inputs_present": False,
         "missing_input_ids": list(diagnostics.get("missing_input_ids") or ()),
-        "missing_input_evidence": list(
-            diagnostics.get("missing_input_evidence") or ()
-        ),
+        "missing_input_evidence": list(diagnostics.get("missing_input_evidence") or ()),
         "input_ids": dict(diagnostics.get("input_ids") or {}),
     }
     return [

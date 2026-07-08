@@ -19,6 +19,8 @@ from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import AccessMode, Capability, Evidence, RiskLevel, TaskStatus
 import pytest
 
+from tests.db_evidence_helpers import assert_no_invalid_accepted_query_plans
+
 
 class _ProfileOnlyExecutor:
     def __init__(self, owner: str) -> None:
@@ -134,6 +136,86 @@ class _ValidationRepairPlanner:
                     input={"owner": "db_runtime"},
                     depends_on=("a3",),
                 )
+            )
+        if not plans:
+            return _planner_decision(
+                DbPlannerAction(
+                    action_id="plan_initial",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={"owner": "db_runtime"},
+                )
+            )
+        return _planner_decision(
+            DbPlannerAction(
+                action_id=f"execute_plan_{len(plans)}",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "sqlite",
+                    "query_plan_ref": "latest_accepted_query_plan",
+                },
+            )
+        )
+
+
+class _ValidationRepairSameTurnExecutePlanner(_ValidationRepairPlanner):
+    async def plan(self, state):
+        self.states.append(state)
+        plans = [
+            item
+            for item in state.accepted_evidence_summaries
+            if item.get("kind") == "query.plan.proposal"
+        ]
+        has_context = any(
+            item.get("kind") == "planning.context"
+            for item in state.accepted_evidence_summaries
+        )
+        has_value_hint = any(
+            item.get("kind") == "schema.column_value_hint" and item.get("hints")
+            for item in state.accepted_evidence_summaries
+        )
+        failed_value_validation = next(
+            (
+                item
+                for item in state.validation_summaries
+                if item.get("kind") == "query.plan.validation"
+                and item.get("valid") is False
+                and item.get("validation_facts")
+            ),
+            None,
+        )
+        if not has_context:
+            return _planner_decision(
+                DbPlannerAction(
+                    action_id="context_initial",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={"source_owner": "sqlite"},
+                )
+            )
+        if failed_value_validation is not None and not has_value_hint:
+            return _planner_decision(
+                DbPlannerAction(
+                    action_id="context_validation_repair",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={"source_owner": "sqlite"},
+                )
+            )
+        if failed_value_validation is not None and has_value_hint and len(plans) < 2:
+            return _planner_decision(
+                DbPlannerAction(
+                    action_id="repair_plan",
+                    kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+                    input={"owner": "db_runtime"},
+                    depends_on=("failed_validation",),
+                ),
+                DbPlannerAction(
+                    action_id="execute_same_turn_repair",
+                    kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                    input={
+                        "owner": "sqlite",
+                        "query_plan_ref": "latest_accepted_query_plan",
+                    },
+                    depends_on=("repair_plan",),
+                ),
             )
         if not plans:
             return _planner_decision(
@@ -465,6 +547,7 @@ async def test_propose_sql_read_builds_context_prerequisite_and_query_plan_succe
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     assert result.status == "finished"
     capability_order = [task.capability_id for task in tasks]
     assert capability_order.index("db.planning.context.build") < (
@@ -772,6 +855,7 @@ async def test_catalog_column_value_search_profiles_dotted_target_before_search(
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     prerequisite_tasks = {
         task.capability_id: task
         for task in tasks
@@ -860,6 +944,7 @@ async def test_catalog_column_value_search_profiles_dotted_input_target_before_s
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     kinds = {item.kind for item in evidence}
     assert "column_values.profile" in kinds
     assert "schema.column_value_profile" in kinds
@@ -948,6 +1033,7 @@ async def test_planning_context_value_hints_profile_catalog_target_before_contex
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     assert compilation.rejected_action_summaries == ()
     assert [spec.capability_id for spec in compilation.task_specs] == [
         "db.schema.inspect",
@@ -1095,6 +1181,7 @@ async def test_planning_context_value_grounding_does_not_require_known_prompt_ke
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     grounding_plan = next(
         item for item in evidence if item.kind == "catalog.value_grounding.plan"
     )
@@ -1294,6 +1381,7 @@ async def test_validation_fact_value_grounding_profiles_only_target_column():
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     assert compilation.rejected_action_summaries == ()
     grounding_plan = next(
         item for item in evidence if item.kind == "catalog.value_grounding.plan"
@@ -1435,6 +1523,7 @@ async def test_validation_grounding_runtime_context_precedes_planner_search_choi
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     assert compilation.rejected_action_summaries == ()
     assert compilation.accepted_action_summaries[0]["kind"] == "build_planning_context"
     assert compilation.accepted_action_summaries[1]["kind"] == "search_column_values"
@@ -1656,6 +1745,7 @@ async def test_validation_grounding_repair_replans_with_refreshed_context():
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     assert result.status == "finished"
     validations = [item for item in evidence if item.kind == "query.plan.validation"]
     assert [item.accepted for item in validations] == [False, True]
@@ -1733,6 +1823,121 @@ async def test_validation_grounding_repair_replans_with_refreshed_context():
         )
         == 1
     )
+
+
+async def test_same_turn_validation_repair_execute_defers_until_plan_is_durable():
+    stale_sql = (
+        "SELECT COUNT(*) AS order_count FROM orders "
+        "WHERE orders.status = 'completed'"
+    )
+    repaired_sql = (
+        "SELECT COUNT(*) AS order_count FROM orders " "WHERE orders.status = 'complete'"
+    )
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    llm_service = _SequentialLLMService(
+        {
+            "operation": "read",
+            "selected_sql": stale_sql,
+            "selected_tables": ["orders"],
+            "filters": [
+                {
+                    "column": "orders.status",
+                    "operator": "=",
+                    "value": "completed",
+                }
+            ],
+            "confidence": 0.91,
+        },
+        {
+            "operation": "read",
+            "selected_sql": repaired_sql,
+            "selected_tables": ["orders"],
+            "filters": [
+                {
+                    "column": "orders.status",
+                    "operator": "=",
+                    "value": "complete",
+                }
+            ],
+            "confidence": 0.93,
+        },
+    )
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+        db_llm_service=llm_service,
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            channel TEXT NOT NULL
+        );
+        INSERT INTO orders (id, status, channel)
+        VALUES (1, 'complete', 'web'), (2, 'pending', 'store');
+        """)
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Show the requested order count.",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        planner = _ValidationRepairSameTurnExecutePlanner()
+        result = await DbAgentLoop(runtime, planner).run(
+            operation,
+            safety_frame={"max_access": "read"},
+            max_turns=8,
+        )
+        evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    assert result.status == "finished"
+    deferred_compilation = next(
+        item
+        for item in evidence
+        if item.kind == "planner.compilation"
+        and any(
+            rejected["error"] == "deferred_until_query_plan_proposal_available"
+            for rejected in item.payload["compilation"]["rejected_action_summaries"]
+        )
+    )
+    deferred_payload = deferred_compilation.payload["compilation"]
+    assert [spec["capability_id"] for spec in deferred_payload["task_specs"]] == [
+        "db.query.repair"
+    ]
+    assert deferred_payload["rejected_action_summaries"][0]["deferred"][
+        "producer_action_ids"
+    ] == ["repair_plan"]
+    assert stale_sql not in json.dumps(deferred_payload["task_specs"], sort_keys=True)
+    plans = [item for item in evidence if item.kind == "query.plan.proposal"]
+    repaired_plan = plans[-1]
+    assert repaired_plan.accepted is True
+    assert repaired_plan.payload["sql"] == repaired_sql
+    repaired_validation_task = next(
+        task
+        for task in tasks
+        if task.capability_id == "db.query.plan.validate"
+        and task.input.get("plan_evidence_id") == repaired_plan.id
+    )
+    assert repaired_validation_task.input["planning_context_evidence_id"]
+    query_result = next(item for item in evidence if item.kind == "query.result")
+    assert query_result.payload["rows"] == [{"order_count": 1}]
 
 
 async def test_session_scope_value_grounding_profiles_non_keyword_value():
@@ -1816,6 +2021,7 @@ async def test_session_scope_value_grounding_profiles_non_keyword_value():
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     grounding_plan = next(
         item for item in evidence if item.kind == "catalog.value_grounding.plan"
     )
@@ -1928,6 +2134,7 @@ async def test_existing_catalog_profile_grounding_does_not_profile_again():
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     grounding_plan = next(
         item for item in evidence if item.kind == "catalog.value_grounding.plan"
     )
@@ -2009,6 +2216,7 @@ async def test_value_grounding_skipped_budget_target_does_not_profile():
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     grounding_plan = next(
         item for item in evidence if item.kind == "catalog.value_grounding.plan"
     )
@@ -2076,6 +2284,7 @@ async def test_catalog_column_value_profile_prerequisite_requires_contract_decla
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     assert "column_values.profile" not in {item.kind for item in evidence}
     assert not any(task.capability_id == "db.column_values.profile" for task in tasks)
     blocked_search = next(
@@ -2156,6 +2365,7 @@ async def test_catalog_column_value_profile_ambiguous_source_owner_blocks_prepar
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     assert "column_values.profile" not in {item.kind for item in evidence}
     assert not any(task.capability_id == "db.column_values.profile" for task in tasks)
     blocked_search = next(

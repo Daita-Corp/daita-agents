@@ -29,6 +29,8 @@ from daita.plugins.sqlite import SQLitePlugin
 
 import pytest
 
+from tests.db_evidence_helpers import assert_no_invalid_accepted_query_plans
+
 
 class PhaseTwoExecutor:
     def __init__(self, executor_id, capability_ids):
@@ -279,6 +281,7 @@ async def test_llm_query_plan_normalizes_sql_alias_and_accepts_executable_plan()
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     proposal = evidence[0]
     assert proposal.accepted is True
     assert proposal.payload["valid"] is True
@@ -318,6 +321,7 @@ async def test_llm_query_plan_without_sql_or_clarification_is_rejected():
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     proposal = evidence[0]
     assert proposal.accepted is False
     assert proposal.payload["valid"] is False
@@ -353,6 +357,7 @@ async def test_llm_query_plan_clarification_only_is_not_executable_evidence():
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     proposal = evidence[0]
     assert proposal.accepted is False
     assert proposal.payload["valid"] is False
@@ -386,6 +391,7 @@ async def test_llm_repair_without_executable_sql_is_rejected():
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     repair, proposal = evidence
     assert repair.accepted is False
     assert repair.payload["valid"] is True
@@ -394,6 +400,47 @@ async def test_llm_repair_without_executable_sql_is_rejected():
     assert proposal.accepted is False
     assert proposal.payload["valid"] is False
     assert proposal.payload["sql"] is None
+
+
+async def test_llm_repair_analysis_only_output_is_rejected_as_non_executable():
+    runtime, operation = await _repair_runtime_and_operation(
+        "phase-two-llm-repair-analysis-only",
+        json.dumps(
+            {
+                "operation": "analysis",
+                "revised_plan": {"steps": ["explain why the query failed"]},
+                "confidence": 0.4,
+            }
+        ),
+    )
+    try:
+        task = _llm_task(
+            operation,
+            capability_id="db.query.repair",
+            executor_id="db_runtime.query.repair.llm",
+            task_input={
+                "planning_context_evidence_id": "planning-context",
+                "failure_evidence_id": "failure-validation",
+                "prior_plan_evidence_id": "prior-plan",
+            },
+        )
+        evidence = await DbLLMRepairExecutor(runtime=runtime).execute(
+            task,
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    repair, proposal = evidence
+    assert repair.accepted is False
+    assert repair.payload["failure"] == "repair_non_executable_plan"
+    assert repair.payload["repair_rejection_reason"] == "operation_not_read:analysis"
+    assert repair.payload["proposal_accepted"] is False
+    assert proposal.accepted is False
+    assert proposal.payload["failure"] == "repair_non_executable_plan"
+    assert proposal.payload["valid"] is False
 
 
 async def test_llm_repair_repeated_sql_is_rejected():
@@ -428,6 +475,7 @@ async def test_llm_repair_repeated_sql_is_rejected():
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     repair, proposal = evidence
     assert repair.accepted is False
     assert repair.payload["valid"] is True
@@ -436,6 +484,60 @@ async def test_llm_repair_repeated_sql_is_rejected():
     assert proposal.accepted is False
     assert proposal.payload["valid"] is True
     assert proposal.payload["repeated_sql_blocked"] is True
+
+
+async def test_llm_repair_repeated_sql_allowed_when_failure_context_changed():
+    sql = "select 1 as answer"
+    runtime, operation = await _repair_runtime_and_operation(
+        "phase-two-llm-repair-repeat-context-changed",
+        json.dumps(
+            {
+                "operation": "read",
+                "selected_sql": sql,
+                "confidence": 0.9,
+            }
+        ),
+        prior_sql=sql,
+        failure_payload={
+            "valid": False,
+            "planning_context_evidence_id": "previous-planning-context",
+            "validation_facts": [
+                {
+                    "kind": "filter_literal_requires_grounding",
+                    "table": "orders",
+                    "column": "status",
+                    "literal": "completed",
+                }
+            ],
+        },
+    )
+    try:
+        task = _llm_task(
+            operation,
+            capability_id="db.query.repair",
+            executor_id="db_runtime.query.repair.llm",
+            task_input={
+                "planning_context_evidence_id": "planning-context",
+                "failure_evidence_id": "failure-validation",
+                "prior_plan_evidence_id": "prior-plan",
+            },
+        )
+        evidence = await DbLLMRepairExecutor(runtime=runtime).execute(
+            task,
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    repair, proposal = evidence
+    assert repair.accepted is True
+    assert repair.payload["repeated_sql_blocked"] is False
+    assert repair.payload["repeated_sql_allowed_context_changed"] is True
+    assert proposal.accepted is True
+    assert proposal.payload["repair_context_changed"] is True
+    assert proposal.payload["repeated_sql_allowed_context_changed"] is True
 
 
 async def test_llm_repair_missing_input_ids_produces_rejected_diagnostics():
@@ -458,6 +560,7 @@ async def test_llm_repair_missing_input_ids_produces_rejected_diagnostics():
     finally:
         await runtime.teardown()
 
+    assert_no_invalid_accepted_query_plans(evidence)
     repair, proposal = evidence
     assert service.messages is None
     assert repair.accepted is False
@@ -562,6 +665,149 @@ async def test_repair_query_plan_binds_durable_inputs_and_dependencies():
         True,
         False,
     ]
+
+
+async def test_same_decision_repair_execute_defers_until_repaired_plan_is_durable():
+    stale_sql = "select count(*) from orders where status = 'completed'"
+    runtime, operation = await _runtime_and_operation(
+        "phase-seven-same-turn-repair-defers",
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    try:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+        await runtime.store.save_evidence(
+            _query_plan_evidence(
+                operation.id,
+                evidence_id="prior-plan",
+                sql=stale_sql,
+            )
+        )
+        await runtime.store.save_evidence(
+            _query_plan_validation_evidence(
+                operation.id,
+                evidence_id="failed-plan-validation",
+                plan_evidence_id="prior-plan",
+                validation_facts=False,
+            )
+        )
+        loop = DbAgentLoop(runtime, FakePlanner())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = _same_turn_repair_execute_decision()
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.query.repair"
+    ]
+    repair = compilation.task_specs[0]
+    assert repair.input["prior_plan_evidence_id"] == "prior-plan"
+    assert repair.input["failure_evidence_id"] == "failed-plan-validation"
+    rejected = compilation.rejected_action_summaries
+    assert len(rejected) == 1
+    assert rejected[0]["action_id"] == "execute_repair"
+    assert rejected[0]["error"] == "deferred_until_query_plan_proposal_available"
+    assert rejected[0]["deferred"]["producer_action_ids"] == ["repair_plan"]
+    assert rejected[0]["deferred"]["non_terminal"] is True
+    assert not any(
+        spec.capability_id in {"db.query.plan.validate", "db.sql.validate"}
+        for spec in compilation.task_specs
+    )
+    dumped_specs = json.dumps(
+        [spec.to_dict() for spec in compilation.task_specs],
+        sort_keys=True,
+    )
+    assert stale_sql not in dumped_specs
+
+
+async def test_same_turn_repair_deferral_continues_after_repair_evidence():
+    stale_sql = "select count(*) as order_count from orders where status = 'completed'"
+    repaired_sql = (
+        "select count(*) as order_count from orders where status = 'complete'"
+    )
+    runtime, operation = await _runtime_and_operation(
+        "phase-seven-same-turn-repair-continues",
+        db_llm_service=FakeLLMService(
+            json.dumps(
+                {
+                    "operation": "read",
+                    "selected_sql": repaired_sql,
+                    "selected_tables": ["orders"],
+                    "confidence": 0.92,
+                }
+            )
+        ),
+        required_evidence={"query.result"},
+    )
+    try:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+        await runtime.store.save_evidence(
+            _query_plan_evidence(
+                operation.id,
+                evidence_id="prior-plan",
+                sql=stale_sql,
+            )
+        )
+        await runtime.store.save_evidence(
+            _query_plan_validation_evidence(
+                operation.id,
+                evidence_id="failed-plan-validation",
+                plan_evidence_id="prior-plan",
+                validation_facts=False,
+            )
+        )
+        result = await DbAgentLoop(
+            runtime,
+            FakePlanner(
+                _same_turn_repair_execute_decision(),
+                _planner_decision(
+                    DbPlannerAction(
+                        action_id="execute_repaired_durable_plan",
+                        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                        input={
+                            "owner": "phase_two",
+                            "query_plan_ref": "latest_accepted_query_plan",
+                        },
+                    )
+                ),
+            ),
+        ).run(
+            operation,
+            safety_frame={"max_access": "read"},
+            max_turns=3,
+        )
+        evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    assert result.status == "finished"
+    compilation = next(
+        item
+        for item in evidence
+        if item.kind == "planner.compilation"
+        and any(
+            rejected["error"] == "deferred_until_query_plan_proposal_available"
+            for rejected in item.payload["compilation"]["rejected_action_summaries"]
+        )
+    )
+    assert compilation.accepted is False
+    assert [
+        spec["capability_id"]
+        for spec in compilation.payload["compilation"]["task_specs"]
+    ] == ["db.query.repair"]
+    sql_validation_tasks = [
+        task for task in tasks if task.capability_id == "db.sql.validate"
+    ]
+    assert [task.input["sql"] for task in sql_validation_tasks] == [repaired_sql]
+    assert all(task.input["sql"] != stale_sql for task in sql_validation_tasks)
 
 
 async def test_repair_query_plan_falls_back_to_failed_sql_validation():
@@ -1007,6 +1253,59 @@ async def test_latest_accepted_query_plan_ref_selects_latest_accepted_plan():
     assert continuation["source"] == "explicit_role"
     assert continuation["role"] == "latest_accepted_query_plan"
     assert continuation["evidence_id"] == "plan-new"
+
+
+async def test_explicit_plan_id_matching_latest_plan_ref_is_not_ambiguous():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "plan_evidence_id": "plan-new",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-explicit-plan-and-latest-ref",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-old", "sql": "select 1 as answer"},
+            {"evidence_id": "plan-new", "sql": "select 2 as answer"},
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 2 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-new"
+    provenance = validation.metadata["sql_provenance"]
+    assert provenance["provenance"] == "plan_evidence_id"
+    assert provenance["source_evidence_id"] == "plan-new"
+
+
+async def test_explicit_plan_id_conflicting_with_latest_plan_ref_is_ambiguous():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "plan_evidence_id": "plan-old",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-explicit-plan-conflicts-with-latest-ref",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-old", "sql": "select 1 as answer"},
+            {"evidence_id": "plan-new", "sql": "select 2 as answer"},
+        ),
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == "ambiguous_sql_input"
 
 
 async def test_prior_turn_query_plan_dependency_recovers_to_latest_plan():
@@ -1593,7 +1892,7 @@ async def test_latest_accepted_query_plan_ref_ignores_rejected_plan_evidence():
     assert validation.dependencies[0].evidence_id == "plan-accepted"
 
 
-async def test_latest_accepted_query_plan_ref_ignores_invalid_plan_evidence():
+async def test_latest_accepted_query_plan_ref_ignores_rejected_invalid_plan_evidence():
     action = DbPlannerAction(
         action_id="read",
         kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
@@ -1612,6 +1911,7 @@ async def test_latest_accepted_query_plan_ref_ignores_invalid_plan_evidence():
                 "evidence_id": "plan-invalid",
                 "sql": "select 999 as answer",
                 "valid": False,
+                "accepted": False,
             },
             {
                 "evidence_id": "plan-rejected",
@@ -1627,7 +1927,7 @@ async def test_latest_accepted_query_plan_ref_ignores_invalid_plan_evidence():
     assert validation.dependencies[0].evidence_id == "plan-accepted"
 
 
-async def test_latest_accepted_query_plan_ref_skips_accepted_plans_without_sql():
+async def test_latest_accepted_query_plan_ref_ignores_rejected_plan_without_sql():
     action = DbPlannerAction(
         action_id="read",
         kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
@@ -1642,7 +1942,7 @@ async def test_latest_accepted_query_plan_ref_skips_accepted_plans_without_sql()
         action,
         plan_evidence=(
             {"evidence_id": "plan-with-sql", "sql": "select 1 as answer"},
-            {"evidence_id": "plan-without-sql", "sql": None},
+            {"evidence_id": "plan-without-sql", "sql": None, "accepted": False},
         ),
     )
 
@@ -1759,10 +2059,10 @@ async def test_invalid_sql_reference_inputs_are_rejected_clearly():
             "unsupported_query_plan_ref:latest_sql",
         ),
         (
-            "plan-without-sql",
+            "rejected-plan-without-sql",
             {"owner": "phase_two", "plan_evidence_id": "plan-nosql"},
-            ({"evidence_id": "plan-nosql", "sql": None},),
-            "plan_evidence_without_sql:plan-nosql",
+            ({"evidence_id": "plan-nosql", "sql": None, "accepted": False},),
+            "rejected_plan_evidence:plan-nosql",
         ),
     )
     for suffix, action_input, plan_evidence, expected_error in cases:
@@ -2137,7 +2437,13 @@ async def test_missing_db_llm_configuration_returns_no_planner_actions():
     assert persisted["metadata"]["configuration_required"] is True
 
 
-async def _runtime_and_operation(operation_id, *, mode=None, db_llm_service=None):
+async def _runtime_and_operation(
+    operation_id,
+    *,
+    mode=None,
+    db_llm_service=None,
+    required_evidence=frozenset(),
+):
     runtime = DbRuntime(
         config=DbRuntimeConfig(plugins=(PhaseTwoPlugin(),)),
         runtime_id="phase-two-runtime",
@@ -2152,14 +2458,20 @@ async def _runtime_and_operation(operation_id, *, mode=None, db_llm_service=None
             "source_scope": ["orders"],
             **({"mode": mode} if mode else {}),
         },
-        required_evidence=frozenset(),
+        required_evidence=frozenset(required_evidence),
         metadata=({"mode": mode} if mode else {}),
         evaluate_governance=False,
     )
     return runtime, operation
 
 
-async def _repair_runtime_and_operation(operation_id, content, *, prior_sql=None):
+async def _repair_runtime_and_operation(
+    operation_id,
+    content,
+    *,
+    prior_sql=None,
+    failure_payload=None,
+):
     prior_sql = prior_sql or "select 0 as answer"
     runtime, operation = await _runtime_and_operation(
         operation_id,
@@ -2187,7 +2499,8 @@ async def _repair_runtime_and_operation(operation_id, content, *, prior_sql=None
             owner="db_runtime",
             operation_id=operation.id,
             accepted=False,
-            payload={"valid": False, "errors": ["validation failed"]},
+            payload=failure_payload
+            or {"valid": False, "errors": ["validation failed"]},
         )
     )
     return runtime, operation
@@ -2200,6 +2513,34 @@ def _llm_task(operation, *, capability_id, executor_id, task_input):
         capability_id=capability_id,
         executor_id=executor_id,
         input=task_input,
+    )
+
+
+def _planner_decision(*actions):
+    return DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=actions,
+    )
+
+
+def _same_turn_repair_execute_decision():
+    return _planner_decision(
+        DbPlannerAction(
+            action_id="repair_plan",
+            kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+            input={"owner": "db_runtime"},
+            depends_on=("failed_plan_validation",),
+        ),
+        DbPlannerAction(
+            action_id="execute_repair",
+            kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+            input={
+                "owner": "phase_two",
+                "query_plan_ref": "latest_accepted_query_plan",
+            },
+            depends_on=("repair_plan",),
+        ),
     )
 
 
@@ -2245,6 +2586,9 @@ async def _compile_single_action(
         safety_frame={"max_access": max_access},
         turn=1,
         remaining_turns=1,
+    )
+    assert_no_invalid_accepted_query_plans(
+        await runtime.store.list_evidence(operation.id)
     )
     decision = DbPlannerDecision(
         status=DbPlannerDecisionStatus.CONTINUE,

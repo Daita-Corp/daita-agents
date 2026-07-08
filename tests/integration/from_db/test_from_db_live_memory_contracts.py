@@ -27,7 +27,7 @@ from tests.integration.from_db.test_from_db_memory_live import (
     _db_memory_keys,
     _memory_backend,
     _memory_option,
-    _planning_context,
+    _public_planning_context as _planning_context,
     _rows,
     _run_live,
     _seed_revenue_db,

@@ -35,6 +35,7 @@ from tests.integration.from_db.live_production_helpers import (
     task_capabilities,
     write_failure_artifacts,
 )
+from tests.db_evidence_helpers import assert_no_invalid_accepted_query_plans
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_llm]
 
@@ -261,6 +262,7 @@ async def test_live_literal_value_grounding_completed_vs_complete(tmp_path):
         assert_successful_prompt_run(result, snapshot=snapshot)
         assert_loop_evidence(result)
         assert_loop_evidence(snapshot)
+        assert_no_invalid_accepted_query_plans(snapshot.evidence)
         assert_synthesized_answer(result)
         assert "catalog.column_values.search" in task_capabilities(result)
         assert "schema.column_value_search_result" in evidence_kinds(result)
@@ -303,18 +305,23 @@ async def test_live_stateful_followup_uses_session_context(tmp_path):
     )
     first = None
     second = None
+    first_snapshot = None
     snapshot = None
 
     try:
         first = await agent.run_detailed(SESSION_FIRST_PROMPT)
         second = await agent.run_detailed(SESSION_FOLLOWUP_PROMPT)
+        first_snapshot = await agent.runtime.inspect_operation(first.operation_id)
         snapshot = await agent.runtime.inspect_operation(second.operation_id)
 
+        assert first_snapshot is not None
         assert snapshot is not None
         assert_successful_prompt_run(first)
         assert_successful_prompt_run(second, snapshot=snapshot)
         assert_loop_evidence(second)
         assert_loop_evidence(snapshot)
+        assert_no_invalid_accepted_query_plans(first_snapshot.evidence)
+        assert_no_invalid_accepted_query_plans(snapshot.evidence)
         assert_synthesized_answer(second)
         assert first.request.session_id
         assert second.request.session_id == first.request.session_id

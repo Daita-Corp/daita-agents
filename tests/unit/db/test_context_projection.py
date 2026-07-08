@@ -191,6 +191,140 @@ def test_public_diagnostic_and_audit_evidence_projection_modes():
     assert audit[0].payload == raw.payload
 
 
+def test_public_projection_redacts_same_turn_repair_deferred_diagnostics():
+    raw = Evidence(
+        id="planner-compilation",
+        kind="planner.compilation",
+        owner="db_runtime",
+        accepted=False,
+        payload={
+            "compilation": {
+                "rejected_action_summaries": [
+                    {
+                        "action_id": "execute_repair",
+                        "kind": "execute_validated_read",
+                        "error": "deferred_until_query_plan_proposal_available",
+                        "deferred": {
+                            "reason": "same_turn_repair_query_plan",
+                            "producer_action_ids": ["repair_plan"],
+                            "blocked_filter": ("customers.loyalty_band = platinum"),
+                        },
+                    }
+                ]
+            }
+        },
+    )
+
+    public = project_operation_evidence(
+        (raw,),
+        _projection(ProjectionMode.PUBLIC_RESULT),
+    )
+
+    payload = public[0].payload
+    dumped = json.dumps(payload, sort_keys=True)
+    assert payload["redacted"] is True
+    assert payload["source_kind"] == "planner.compilation"
+    assert payload["payload_keys"] == ["compilation"]
+    assert "deferred_until_query_plan_proposal_available" not in dumped
+    assert "customers.loyalty_band" not in dumped
+    assert "platinum" not in dumped
+
+
+def test_public_planning_context_projection_strips_blocked_memory_details():
+    raw = Evidence(
+        id="evidence-planning",
+        kind="planning.context",
+        owner="db_runtime",
+        payload={
+            "rendered_context": (
+                "Database memory:\n"
+                "- metric metric:board_revenue: subtract refunds.amount."
+            ),
+            "included_sections": [
+                "schema",
+                "db_memory",
+                "db_memory_semantics",
+            ],
+            "db_memory_refs": [
+                {
+                    "chunk_id": "mem-board-revenue",
+                    "kind": "metric_definition",
+                    "key": "metric:board_revenue",
+                    "text": "Board revenue subtracts refunds.amount.",
+                    "semantic_contract": {
+                        "requirements": {
+                            "refs": [
+                                {
+                                    "kind": "column",
+                                    "ref": "refunds.amount",
+                                }
+                            ],
+                            "filters": [
+                                {
+                                    "ref": "orders.status",
+                                    "operator": "=",
+                                    "value": "complete",
+                                }
+                            ],
+                        }
+                    },
+                }
+            ],
+            "db_memory_semantics": [
+                {
+                    "key": "metric:board_revenue",
+                    "required_refs": ["refunds.amount"],
+                    "required_filters": [
+                        {
+                            "ref": "orders.status",
+                            "operator": "=",
+                            "value": "complete",
+                        }
+                    ],
+                    "required_aggregations": [
+                        {"function": "sum", "ref": "refunds.amount"},
+                    ],
+                    "result_shape": {"grain": "single_aggregate"},
+                    "enforceable": False,
+                }
+            ],
+            "db_memory_contract_diagnostics": {
+                "enforced_count": 0,
+                "advisory_count": 1,
+                "omitted_reasons": {"blocked_by_policy": 1},
+            },
+            "diagnostics": {
+                "schema_table_count": 2,
+                "db_memory_ref_count": 1,
+                "db_memory_contract_count": 1,
+            },
+        },
+    )
+
+    public = project_operation_evidence(
+        (raw,),
+        ProjectionContext(
+            mode=ProjectionMode.PUBLIC_RESULT,
+            operation_intent="data.query",
+            policy_summary={"blocked_columns": ["refunds.amount"]},
+            safety_frame={"max_access": "read"},
+        ),
+    )
+
+    payload = public[0].payload
+    dumped = json.dumps(payload, sort_keys=True)
+    assert payload["redacted"] is True
+    assert "db_memory_refs" not in payload
+    assert "db_memory_semantics" not in payload
+    assert "db_memory_contract_diagnostics" not in payload
+    assert "rendered_context" not in payload
+    assert "refunds.amount" not in dumped
+    assert "complete" not in dumped
+    assert "blocked_by_policy" not in dumped
+    assert "semantic_contract" not in dumped
+    assert "required_filters" not in dumped
+
+
 def test_query_result_projection_redacts_blocked_error_scalars():
     raw = Evidence(
         id="query-result",

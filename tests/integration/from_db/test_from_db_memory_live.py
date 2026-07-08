@@ -23,6 +23,7 @@ from daita.db import DbRequest
 from daita.plugins.memory.local_backend import LocalMemoryBackend
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import OperationStatus, WorkerRuntime, WorkerRuntimeOptions
+from tests.db_evidence_helpers import assert_no_invalid_accepted_query_plans
 
 load_dotenv(Path.cwd() / ".env")
 
@@ -238,15 +239,23 @@ def _sql(result) -> str:
     return str(_evidence(result, "sql.validation").payload.get("sql") or "")
 
 
-def _planning_context(result) -> dict[str, Any]:
+def _public_planning_context(result) -> dict[str, Any]:
     evidence = _maybe_evidence(result, "planning.context")
     if evidence is None:
         return {}
     return dict(evidence.payload)
 
 
+async def _raw_planning_context(agent, result) -> dict[str, Any]:
+    evidence = await agent.runtime.store.list_evidence(result.operation_id)
+    contexts = [
+        item for item in evidence if item.kind == "planning.context" and item.accepted
+    ]
+    return dict(contexts[-1].payload) if contexts else {}
+
+
 def _db_memory_keys(result) -> list[str]:
-    context = _planning_context(result)
+    context = _public_planning_context(result)
     return [str(item.get("key")) for item in context.get("db_memory_refs", [])]
 
 
@@ -566,7 +575,7 @@ async def test_live_alias_and_schema_ref_memory_ranks_above_broad_match(tmp_path
         await agent.stop()
 
     assert _db_memory_keys(result)[0] == "metric:recognized_revenue"
-    top = _planning_context(result)["db_memory_refs"][0]
+    top = _public_planning_context(result)["db_memory_refs"][0]
     assert top["kind"] == "metric_definition"
     assert "complete" in _sql(result).lower()
 
@@ -653,7 +662,7 @@ async def test_live_direct_contract_payload_remains_advisory(tmp_path):
         stored_metadata["semantic_contract_diagnostics"]["reason"]
         == "direct_write_unvalidated"
     )
-    context = _planning_context(result)
+    context = _public_planning_context(result)
     semantics = context.get("db_memory_semantics") or []
     assert not any(item.get("enforceable") for item in semantics)
 
@@ -678,7 +687,7 @@ async def test_live_explicit_metric_memory_projects_enforceable_contract(tmp_pat
     finally:
         await agent.stop()
 
-    context = _planning_context(result)
+    context = _public_planning_context(result)
     semantics = context.get("db_memory_semantics") or []
     assert "metric:board_revenue" in _db_memory_keys(result)
     assert any(
@@ -718,12 +727,23 @@ async def test_live_policy_blocked_contract_is_not_enforceable(tmp_path):
             agent,
             "Calculate one aggregate board revenue from orders.total and refunds.amount.",
         )
+        evidence = await agent.runtime.store.list_evidence(result.operation_id)
+        assert_no_invalid_accepted_query_plans(evidence)
+        raw_context = await _raw_planning_context(agent, result)
     finally:
         await agent.stop()
 
-    context = _planning_context(result)
-    semantics = context.get("db_memory_semantics") or []
-    diagnostics = context.get("db_memory_contract_diagnostics") or {}
+    public_context = _public_planning_context(result)
+    public_dumped = str(public_context)
+    assert public_context.get("redacted") is True
+    assert "db_memory_refs" not in public_context
+    assert "db_memory_semantics" not in public_context
+    assert "db_memory_contract_diagnostics" not in public_context
+    assert "refunds.amount" not in public_dumped
+    assert "blocked_by_policy" not in public_dumped
+
+    semantics = raw_context.get("db_memory_semantics") or []
+    diagnostics = raw_context.get("db_memory_contract_diagnostics") or {}
     assert semantics
     assert not any(item.get("enforceable") for item in semantics)
     omitted = diagnostics.get("omitted_reasons") or {}
@@ -771,7 +791,7 @@ async def test_live_explicit_unit_convention_projects_and_enforces_conversion(tm
 
     assert memory_result.status is OperationStatus.SUCCEEDED
     assert result.status is OperationStatus.SUCCEEDED
-    context = _planning_context(result)
+    context = _public_planning_context(result)
     semantics = context.get("db_memory_semantics") or []
     assert any(
         item.get("memory_key") == "unit_convention:orders.total_cents"
@@ -1005,7 +1025,7 @@ async def test_live_golden_context_budget_under_memory_load(tmp_path):
     finally:
         await agent.stop()
 
-    context = _planning_context(result)
+    context = _public_planning_context(result)
     rendered = str(context.get("rendered_context") or "")
     diagnostics = context.get("db_memory_diagnostics") or {}
     assert len(context.get("db_memory_refs") or []) <= 3

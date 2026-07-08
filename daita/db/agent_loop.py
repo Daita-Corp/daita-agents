@@ -841,6 +841,11 @@ class DbAgentLoop:
         if dag_errors:
             rejected.extend(dag_errors)
 
+        same_decision_repair_action_ids = frozenset(
+            action.action_id
+            for action in ordered_actions
+            if action.kind is DbPlannerActionKind.REPAIR_QUERY_PLAN
+        )
         prior_action_specs: dict[str, tuple[DbTaskSpec, ...]] = {}
         for action in ordered_actions:
             planner_dependencies, dependency_errors = self._planner_dependency_specs(
@@ -854,6 +859,14 @@ class DbAgentLoop:
             mode_errors = _mode_action_errors(action, state)
             if mode_errors:
                 rejected.extend(mode_errors)
+                continue
+            repair_deferral = _same_turn_repair_execute_deferral(
+                action,
+                planner_dependencies,
+                same_decision_repair_action_ids=same_decision_repair_action_ids,
+            )
+            if repair_deferral is not None:
+                rejected.append(repair_deferral)
                 continue
             action_specs, action_capabilities, action_errors = self._compile_one_action(
                 action,
@@ -2532,6 +2545,56 @@ def _with_spec_dependencies(
     ]
 
 
+def _same_turn_repair_execute_deferral(
+    action: DbPlannerAction,
+    planner_dependencies: tuple[TaskDependency, ...],
+    *,
+    same_decision_repair_action_ids: frozenset[str],
+) -> dict[str, Any] | None:
+    if action.kind not in {
+        DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        DbPlannerActionKind.EXECUTE_VALIDATED_WRITE,
+    }:
+        return None
+    if not _validated_sql_action_requires_query_plan_proposal(action):
+        return None
+
+    producer_action_ids = tuple(
+        dict.fromkeys(
+            str(dependency.metadata.get("producer_action_id") or "")
+            for dependency in planner_dependencies
+            if dependency.evidence_kind == "query.plan.proposal"
+            and str(dependency.metadata.get("producer_action_id") or "")
+            in same_decision_repair_action_ids
+        )
+    )
+    if not producer_action_ids:
+        return None
+    return {
+        **_action_error(
+            action,
+            "deferred_until_query_plan_proposal_available",
+        ),
+        "deferred": {
+            "reason": "same_turn_repair_query_plan",
+            "required_evidence_kind": "query.plan.proposal",
+            "producer_action_ids": list(producer_action_ids),
+            "non_terminal": True,
+        },
+    }
+
+
+def _validated_sql_action_requires_query_plan_proposal(
+    action: DbPlannerAction,
+) -> bool:
+    if action.input.get("query_plan_ref") == "latest_accepted_query_plan":
+        return True
+    if str(action.input.get("plan_evidence_id") or "").strip():
+        return True
+    sql = action.input.get("sql")
+    return not (isinstance(sql, str) and sql.strip())
+
+
 def _mode_action_errors(
     action: DbPlannerAction,
     state: DbLoopState,
@@ -3272,7 +3335,33 @@ def _resolve_sql_input_for_action(
             return None, "ambiguous_sql_input"
         return resolved, None
     if has_plan_evidence_id and has_query_plan_ref:
-        return None, "ambiguous_sql_input"
+        plan_evidence_id = action.input.get("plan_evidence_id")
+        if not isinstance(plan_evidence_id, str) or not plan_evidence_id.strip():
+            return None, "missing_plan_evidence_id"
+        query_plan_ref = action.input.get("query_plan_ref")
+        if query_plan_ref != "latest_accepted_query_plan":
+            return None, f"unsupported_query_plan_ref:{query_plan_ref}"
+        explicit, explicit_error = _resolve_sql_from_plan_evidence_id(
+            plan_evidence_id.strip(),
+            state,
+        )
+        if explicit_error == f"plan_evidence_not_found:{plan_evidence_id.strip()}":
+            explicit, explicit_error = _resolve_sql_from_validation_evidence_id(
+                plan_evidence_id.strip(),
+                state,
+                sql_operation=sql_operation,
+            )
+        if explicit_error is not None or explicit is None:
+            return None, explicit_error
+        latest, latest_error = _resolve_sql_from_latest_accepted_query_plan(state)
+        if latest_error is not None or latest is None:
+            return None, latest_error
+        if (
+            explicit.source_evidence_id != latest.source_evidence_id
+            or not _sql_inputs_match(explicit.sql, latest.sql)
+        ):
+            return None, "ambiguous_sql_input"
+        return explicit, None
 
     if has_direct_sql:
         return (
