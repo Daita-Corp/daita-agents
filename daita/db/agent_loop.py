@@ -996,6 +996,13 @@ class DbAgentLoop:
                 sequence_start=sequence_start,
                 decision_fingerprint=decision_fingerprint,
             )
+        if action.kind is DbPlannerActionKind.PROPOSE_SQL_READ:
+            return self._compile_sql_read_proposal_action(
+                action,
+                state=state,
+                sequence_start=sequence_start,
+                decision_fingerprint=decision_fingerprint,
+            )
         if action.kind is DbPlannerActionKind.EXECUTE_VALIDATED_READ:
             return self._compile_validated_sql_action(
                 action,
@@ -1363,6 +1370,105 @@ class DbAgentLoop:
             ),
         )
         specs.append(context_spec)
+        return specs, selected, []
+
+    def _compile_sql_read_proposal_action(
+        self,
+        action: DbPlannerAction,
+        *,
+        state: DbLoopState,
+        sequence_start: int,
+        decision_fingerprint: str,
+    ) -> tuple[list[DbTaskSpec], list[dict[str, Any]], list[dict[str, Any]]]:
+        owner = _action_owner(action)
+        resolved = self._resolve_capability("db.query.plan", owner=owner)
+        query_error = self._capability_error(action, resolved)
+        if query_error is not None:
+            return [], [], [query_error]
+        query_capability = resolved["capability"]
+
+        task_input = _task_input_for_action(action)
+        task_input.pop("query_plan_ref", None)
+        task_input.pop("plan_evidence_id", None)
+
+        specs: list[DbTaskSpec] = []
+        selected: list[dict[str, Any]] = []
+        query_dependencies: list[TaskDependency] = []
+        planning_context = _latest_accepted_evidence_summary(
+            state,
+            "planning.context",
+        )
+        if planning_context is not None:
+            task_input["planning_context_evidence_id"] = planning_context["id"]
+        else:
+            context_specs, context_selected, context_errors = (
+                self._compile_planning_context_action(
+                    action,
+                    state=state,
+                    sequence_start=sequence_start,
+                    decision_fingerprint=decision_fingerprint,
+                )
+            )
+            if context_errors:
+                return context_specs, context_selected, context_errors
+            context_spec = next(
+                (
+                    spec
+                    for spec in reversed(context_specs)
+                    if spec.capability_id == "db.planning.context.build"
+                ),
+                None,
+            )
+            if context_spec is None:
+                return [], [], [_action_error(action, "missing_planning_context_task")]
+            context_resolved = self._resolve_capability(
+                context_spec.capability_id,
+                owner=context_spec.owner,
+            )
+            context_error = self._capability_error(action, context_resolved)
+            if context_error is not None:
+                return [], [], [context_error]
+            context_capability = context_resolved["capability"]
+            query_dependencies.append(
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind="planning.context",
+                    evidence_owner=context_capability.owner,
+                    producer_task_id=context_spec.task_id,
+                    producer_capability_id=context_capability.id,
+                    producer_executor_id=context_capability.executor,
+                    evidence_accepted=True,
+                    input_hash=_stable_hash(context_spec.input),
+                    operation_id=state.operation_id,
+                    metadata={
+                        "runtime_prerequisite": True,
+                        "producer_action_id": action.action_id,
+                        "consumer_action_id": action.action_id,
+                        "prerequisite_for": "db.query.plan",
+                    },
+                )
+            )
+            specs.extend(context_specs)
+            selected.extend(context_selected)
+
+        access_errors = self._access_errors(action, (query_capability,), state)
+        if access_errors:
+            return [], [], access_errors
+        query_spec = _with_deterministic_task_id(
+            state.operation_id,
+            DbTaskSpec(
+                capability_id=query_capability.id,
+                owner=query_capability.owner,
+                input=task_input,
+                reason=f"planner:{action.kind.value}",
+                sequence=sequence_start + len(specs),
+                dependencies=tuple(query_dependencies),
+                metadata=_action_metadata(action, decision_fingerprint),
+                deterministic_key=f"{action.action_id}:{query_capability.id}",
+            ),
+        )
+        specs.append(query_spec)
+        selected.append(_capability_selection(query_capability, action))
         return specs, selected, []
 
     def _compile_validated_sql_action(
@@ -1795,9 +1901,18 @@ class DbAgentLoop:
             tables, columns = _column_value_scope_for_action(action)
             if not tables or not columns or not _state_allows_read_profile(state):
                 return [], [], []
-        elif action.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT:
+        elif action.kind in {
+            DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+            DbPlannerActionKind.PROPOSE_SQL_READ,
+        }:
             target_capability_id = "catalog.column_value_hints.resolve"
             tables, columns = _column_value_scope_for_action(action)
+            if (
+                action.kind is DbPlannerActionKind.PROPOSE_SQL_READ
+                and _latest_accepted_evidence_summary(state, "planning.context")
+                is not None
+            ):
+                return [], [], []
             if not _state_should_plan_value_grounding_for_planning(state, action):
                 return [], [], []
         else:

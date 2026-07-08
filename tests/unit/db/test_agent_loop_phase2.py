@@ -23,6 +23,7 @@ from daita.runtime import (
     RiskLevel,
     Task,
 )
+from daita.plugins import MemoryPlugin
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
 
@@ -504,6 +505,212 @@ async def test_repair_query_plan_missing_input_ids_rejected_before_task_creation
         "missing_repair_input_ids:"
         "planning_context_evidence_id,failure_evidence_id,prior_plan_evidence_id"
     )
+
+
+async def test_propose_sql_read_without_context_compiles_context_prerequisite():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-propose-builds-context",
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    try:
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "metadata_read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="plan",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={"owner": "db_runtime"},
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.schema.inspect",
+        "db.planning.context.build",
+        "db.query.plan",
+    ]
+    context, query_plan = compilation.task_specs[1:]
+    assert "planning_context_evidence_id" not in query_plan.input
+    assert len(query_plan.dependencies) == 1
+    dependency = query_plan.dependencies[0]
+    assert dependency.evidence_kind == "planning.context"
+    assert dependency.evidence_owner == "db_runtime"
+    assert dependency.producer_task_id == context.task_id
+    assert dependency.producer_capability_id == "db.planning.context.build"
+    assert dependency.producer_executor_id == "db_runtime.planning.context.build"
+    assert dependency.evidence_accepted is True
+    assert dependency.evidence_id is None
+
+
+async def test_propose_sql_read_strips_unsupported_plan_refs_before_query_plan():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-propose-strips-refs",
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    try:
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "metadata_read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="plan",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={
+                        "owner": "db_runtime",
+                        "query_plan_ref": "latest_accepted_query_plan",
+                        "plan_evidence_id": "prior-plan",
+                    },
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.schema.inspect",
+        "db.planning.context.build",
+        "db.query.plan",
+    ]
+    query_plan = compilation.task_specs[-1]
+    assert "query_plan_ref" not in query_plan.input
+    assert "plan_evidence_id" not in query_plan.input
+    assert query_plan.dependencies[0].evidence_kind == "planning.context"
+    assert query_plan.dependencies[0].producer_task_id == (
+        compilation.task_specs[-2].task_id
+    )
+
+
+async def test_propose_sql_read_with_existing_context_injects_context_evidence_id():
+    action = DbPlannerAction(
+        action_id="plan",
+        kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+        input={
+            "owner": "db_runtime",
+            "query_plan_ref": "latest_accepted_query_plan",
+            "plan_evidence_id": "prior-plan",
+        },
+    )
+
+    compilation, runtime, _ = await _compile_single_action(
+        "phase-two-propose-existing-context",
+        action,
+        planning_context=True,
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == ["db.query.plan"]
+    query_plan = compilation.task_specs[0]
+    assert query_plan.input == {"planning_context_evidence_id": "planning-context"}
+    assert query_plan.dependencies == ()
+
+
+async def test_propose_sql_read_context_prerequisite_uses_memory_recall_chain():
+    runtime = DbRuntime(
+        plugins=(MemoryPlugin(),),
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "memory": {
+                        "enabled": True,
+                        "recall": "auto",
+                        "limit": 3,
+                        "char_budget": 800,
+                        "score_threshold": 0.0,
+                        "retrieval_mode": "structured",
+                        "source_identity": "sqlite:from_db:propose-memory",
+                    }
+                }
+            }
+        ),
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.setup(agent_id="agent-phase-two")
+    try:
+        state = DbLoopState(
+            operation_id="op-propose-memory-context",
+            normalized_user_request={
+                "prompt": "Calculate recognized revenue from orders.total."
+            },
+            safety_frame={"max_access": "metadata_read"},
+            available_action_kinds=tuple(DbPlannerActionKind),
+            accepted_evidence_summaries=(
+                {
+                    "id": "schema-existing",
+                    "kind": "schema.asset_profile",
+                    "owner": "sqlite",
+                    "accepted": True,
+                    "task_id": "schema-task",
+                },
+            ),
+            memory_context={
+                "enabled": True,
+                "source_identity": "sqlite:from_db:propose-memory",
+                "retrieval_mode": "structured",
+                "limit": 3,
+                "score_threshold": 0.0,
+                "recall_decision": {
+                    "recall": True,
+                    "reason": "semantic_prompt",
+                    "query": "recognized revenue orders.total complete",
+                },
+            },
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="plan",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={"owner": "db_runtime"},
+                ),
+            ),
+        )
+
+        compilation = DbAgentLoop(runtime, FakePlanner()).compile_actions(
+            decision,
+            state,
+        )
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "memory.semantic.recall",
+        "db.planning.context.build",
+        "db.query.plan",
+    ]
+    recall, context, query_plan = compilation.task_specs
+    assert context.dependencies[0].evidence_kind == "memory.semantic.recall"
+    assert context.dependencies[0].producer_task_id == recall.task_id
+    assert context.input["memory_recall_diagnostics"]["queried"] is True
+    assert query_plan.dependencies[0].evidence_kind == "planning.context"
+    assert query_plan.dependencies[0].producer_task_id == context.task_id
 
 
 async def test_agent_loop_runs_schema_and_read_flow_through_task_specs():
@@ -1850,12 +2057,14 @@ async def _compile_single_action(
     sql_validation_evidence=(),
     memory_proposal_evidence=(),
     planning_context=False,
+    db_llm_service=None,
     explicit_mode=None,
     max_access="read",
 ):
     runtime, operation = await _runtime_and_operation(
         operation_id,
         mode=explicit_mode,
+        db_llm_service=db_llm_service,
     )
     for item in plan_evidence:
         await runtime.store.save_evidence(

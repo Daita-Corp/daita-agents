@@ -158,6 +158,48 @@ class _ValidationRepairPlanner:
         )
 
 
+class _ProposeThenExecutePlanner:
+    def __init__(self, *, initial_input: dict | None = None) -> None:
+        self.initial_input = dict(initial_input or {})
+        self.states = []
+
+    async def plan(self, state):
+        self.states.append(state)
+        has_result = any(
+            item.get("kind") == "query.result"
+            for item in state.accepted_evidence_summaries
+        )
+        if has_result:
+            return DbPlannerDecision(
+                status=DbPlannerDecisionStatus.FINISH,
+                intent={"operation_type": "data.query"},
+                actions=(),
+            )
+        plans = [
+            item
+            for item in state.accepted_evidence_summaries
+            if item.get("kind") == "query.plan.proposal"
+        ]
+        if not plans:
+            return _planner_decision(
+                DbPlannerAction(
+                    action_id="plan_initial",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={"owner": "db_runtime", **self.initial_input},
+                )
+            )
+        return _planner_decision(
+            DbPlannerAction(
+                action_id=f"execute_plan_{len(plans)}",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "sqlite",
+                    "query_plan_ref": "latest_accepted_query_plan",
+                },
+            )
+        )
+
+
 async def _compile_column_value_search(
     runtime: DbRuntime,
     operation,
@@ -356,6 +398,115 @@ async def _seed(plugin: SQLitePlugin) -> None:
         INSERT INTO customers (id, email) VALUES (1, 'ada@example.com');
         INSERT INTO orders (id, customer_id, total) VALUES (10, 1, 42.5);
         """)
+
+
+async def test_propose_sql_read_builds_context_prerequisite_and_query_plan_succeeds():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    llm_service = _SequentialLLMService(
+        {
+            "operation": "read",
+            "selected_sql": (
+                "SELECT COUNT(*) AS order_count FROM orders "
+                "WHERE orders.status = 'complete'"
+            ),
+            "selected_tables": ["orders"],
+            "filters": [
+                {
+                    "column": "orders.status",
+                    "operator": "=",
+                    "value": "complete",
+                }
+            ],
+            "confidence": 0.94,
+        }
+    )
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+        db_llm_service=llm_service,
+    )
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO orders (id, status)
+        VALUES (1, 'complete'), (2, 'pending');
+        """)
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "How many completed orders are there?",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        planner = _ProposeThenExecutePlanner(
+            initial_input={
+                "source_owner": "sqlite",
+                "targets": [{"table": "orders", "column": "status"}],
+            }
+        )
+        result = await DbAgentLoop(runtime, planner).run(
+            operation,
+            safety_frame={"max_access": "read"},
+            max_turns=6,
+        )
+        evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "finished"
+    capability_order = [task.capability_id for task in tasks]
+    assert capability_order.index("db.planning.context.build") < (
+        capability_order.index("db.query.plan")
+    )
+    assert {
+        "db.schema.inspect",
+        "catalog.value_grounding.plan",
+        "catalog.column_value_hints.resolve",
+        "db.planning.context.build",
+        "db.query.plan",
+        "db.query.plan.validate",
+        "db.sql.validate",
+        "db.sql.execute_read",
+    } <= set(capability_order)
+    query_plan_task = next(
+        task for task in tasks if task.capability_id == "db.query.plan"
+    )
+    context_task = next(
+        task for task in tasks if task.capability_id == "db.planning.context.build"
+    )
+    assert "query_plan_ref" not in query_plan_task.input
+    assert "plan_evidence_id" not in query_plan_task.input
+    assert "planning_context_evidence_id" not in query_plan_task.input
+    assert query_plan_task.dependencies[0].evidence_kind == "planning.context"
+    assert query_plan_task.dependencies[0].producer_task_id == context_task.id
+    contexts = [item for item in evidence if item.kind == "planning.context"]
+    assert contexts
+    proposal = next(item for item in evidence if item.kind == "query.plan.proposal")
+    assert proposal.accepted is True
+    assert proposal.payload["planning_context_evidence_id"] == contexts[-1].id
+    assert proposal.payload["sql"].endswith("orders.status = 'complete'")
+    query_result = next(item for item in evidence if item.kind == "query.result")
+    assert query_result.payload["rows"] == [{"order_count": 1}]
+    hint = next(item for item in evidence if item.kind == "schema.column_value_hint")
+    assert hint.payload["hints"][0]["table"] == "orders"
+    assert hint.payload["hints"][0]["column"] == "status"
+    assert hint.payload["hints"][0]["observed_values"][0]["value"] == "complete"
+    assert any(task.capability_id == "db.column_values.profile" for task in tasks)
 
 
 async def test_sqlite_registers_provider_neutral_db_capabilities():

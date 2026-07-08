@@ -112,9 +112,12 @@ def _planner_messages(state: DbLoopState) -> list[dict[str, str]]:
                 "query planning and validated read execution until query.result "
                 "evidence exists, unless the request is genuinely ambiguous after "
                 "available runtime facts have been gathered. Use depends_on only "
-                "for actions in the same decision. To use SQL from prior accepted "
-                "query.plan.proposal evidence, set input.plan_evidence_id to that "
-                "evidence id or set "
+                "for actions in the same decision. propose_sql_read creates a new "
+                "query plan and must not include input.query_plan_ref or "
+                "input.plan_evidence_id. query_plan_ref is valid only for "
+                "execute_validated_read and repair_query_plan. To use SQL from "
+                "prior accepted query.plan.proposal evidence during execution or "
+                "repair, set input.plan_evidence_id to that evidence id or set "
                 'input.query_plan_ref="latest_accepted_query_plan"; do not depend '
                 "on a previous-turn action id. If the user explicitly asks for "
                 "catalog column values, gather them with search_column_values "
@@ -158,11 +161,13 @@ def _decision_schema_hint() -> dict[str, Any]:
                         "propose_sql_write, or execute_validated_write"
                     ),
                     "plan_evidence_id": (
-                        "optional accepted query.plan.proposal evidence id "
-                        "for prior SQL"
+                        "only for execute_validated_read or repair_query_plan; "
+                        "do not include on propose_sql_read"
                     ),
                     "query_plan_ref": (
-                        "optional latest_accepted_query_plan for prior accepted SQL"
+                        "only latest_accepted_query_plan for "
+                        "execute_validated_read or repair_query_plan; do not "
+                        "include on propose_sql_read"
                     ),
                 },
                 "depends_on": ["same-decision action ids only"],
