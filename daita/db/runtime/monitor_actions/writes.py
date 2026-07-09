@@ -29,7 +29,7 @@ from ..governance import (
     _sql_validation_governance_facts,
 )
 from ..monitor_helpers import _terminal_monitor_approval_reason
-from ..tasks.runtime import DbTaskSpec
+from ..tasks.models import DbTaskSpec
 
 
 class DbRuntimeMonitorActionWritesMixin:

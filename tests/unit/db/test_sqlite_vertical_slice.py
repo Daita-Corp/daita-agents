@@ -11,7 +11,7 @@ from daita.db.planner_protocol import (
     DbPlannerDecisionStatus,
 )
 from daita.db.query_plan import DbQueryPlan
-from daita.db.runtime.tasks.runtime import DbTaskSpec
+from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.db.runtime import DbRuntimeGovernanceBlocked
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
 from daita.plugins.catalog import CatalogPlugin

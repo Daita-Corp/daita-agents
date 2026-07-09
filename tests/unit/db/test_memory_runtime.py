@@ -41,7 +41,7 @@ from daita.db.planner_protocol import (
     DbPlannerDecision,
     DbPlannerDecisionStatus,
 )
-from daita.db.runtime.tasks.runtime import DbTaskSpec
+from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin

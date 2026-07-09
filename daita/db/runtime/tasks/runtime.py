@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from datetime import datetime, timezone
-import hashlib
 import json
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
@@ -34,6 +33,14 @@ from ..types import (
     DbRuntimeGovernanceBlocked,
     DbRuntimeTaskNotRunnable,
 )
+from .common import (
+    _evidence_payload_fingerprint,
+    _json_dict,
+    _payload_contains,
+    _payload_fingerprint,
+    _stable_hash,
+)
+from .models import DbTaskPlan, DbTaskSpec
 
 _CATALOG_COLUMN_VALUE_GROUNDING_REASON = "catalog_column_value_grounding"
 _SOURCE_OWNER_KEYS = (
@@ -47,82 +54,6 @@ _SOURCE_OWNER_OPTION_KEYS = (
     "source_plugin_id",
     "source_plugin",
 )
-
-
-@dataclass(frozen=True)
-class DbTaskSpec:
-    """Runtime-owned description of DB work before a persisted task exists."""
-
-    capability_id: str
-    task_id: str | None = None
-    owner: str | None = None
-    input: dict[str, Any] = field(default_factory=dict)
-    reason: str = "planner"
-    sequence: int = 1
-    dependencies: tuple[TaskDependency, ...] = ()
-    metadata: dict[str, Any] = field(default_factory=dict)
-    deterministic_key: str | None = None
-    idempotency_key: str | None = None
-
-    def __post_init__(self) -> None:
-        if not self.capability_id:
-            raise ValueError("capability_id is required")
-        if self.sequence < 0:
-            raise ValueError("sequence must be non-negative")
-        object.__setattr__(self, "input", _json_dict(self.input))
-        object.__setattr__(
-            self,
-            "dependencies",
-            tuple(
-                (
-                    dependency
-                    if isinstance(dependency, TaskDependency)
-                    else TaskDependency.from_dict(dependency)
-                )
-                for dependency in self.dependencies
-            ),
-        )
-        object.__setattr__(self, "metadata", _json_dict(self.metadata))
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "capability_id": self.capability_id,
-            "task_id": self.task_id,
-            "owner": self.owner,
-            "input": self.input,
-            "reason": self.reason,
-            "sequence": self.sequence,
-            "dependencies": [dependency.to_dict() for dependency in self.dependencies],
-            "metadata": self.metadata,
-            "deterministic_key": self.deterministic_key,
-            "idempotency_key": self.idempotency_key,
-        }
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "DbTaskSpec":
-        values = dict(data)
-        values["dependencies"] = tuple(
-            TaskDependency.from_dict(item) for item in values.get("dependencies", ())
-        )
-        return cls(**values)
-
-
-@dataclass(frozen=True)
-class DbTaskPlan:
-    """Materialization result for one or more DB task specs."""
-
-    tasks: tuple[Task, ...]
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "tasks", tuple(self.tasks))
-        object.__setattr__(self, "diagnostics", _json_dict(self.diagnostics))
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "tasks": [task.to_dict() for task in self.tasks],
-            "diagnostics": self.diagnostics,
-        }
 
 
 class DbRuntimeTasksMixin:
@@ -2723,38 +2654,6 @@ def _synthesis_context_option(
         except (TypeError, ValueError):
             return default
     return default
-
-
-def _payload_contains(payload: dict[str, Any], expected: dict[str, Any]) -> bool:
-    for key, value in expected.items():
-        if payload.get(key) != value:
-            return False
-    return True
-
-
-def _json_dict(value: Mapping[str, Any] | None) -> dict[str, Any]:
-    copied = dict(value or {})
-    try:
-        json.dumps(copied)
-    except TypeError as exc:
-        raise TypeError("DB runtime task mappings must be JSON serializable") from exc
-    return copied
-
-
-def _stable_hash(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _payload_fingerprint(payload: dict[str, Any]) -> str:
-    return _stable_hash(payload)
-
-
-def _evidence_payload_fingerprint(evidence: Evidence) -> str:
-    return str(
-        evidence.metadata.get("payload_fingerprint")
-        or _payload_fingerprint(evidence.payload)
-    )
 
 
 def _prompt_from_direct_input(input: dict[str, Any]) -> str:

@@ -16,7 +16,7 @@ from ..sql_evidence import (
     effective_source_scope,
     sql_validation_facts_from_evidence,
 )
-from ..runtime.tasks.runtime import DbTaskSpec
+from ..runtime.tasks.models import DbTaskSpec
 from .params import resolve_observation_params, resolve_monitor_state_ref
 from .state import _iso, _parse_iso
 from .types import (

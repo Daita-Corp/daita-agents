@@ -12,7 +12,7 @@ from daita.db.planner_protocol import (
     DbPlannerDecision,
     DbPlannerDecisionStatus,
 )
-from daita.db.runtime.tasks.runtime import DbTaskSpec
+from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
 from daita.runtime import (
     AccessMode,

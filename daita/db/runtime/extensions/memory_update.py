@@ -14,7 +14,7 @@ from ...memory import (
 )
 from ...memory_commands import DbMemoryCommandService
 from ...models import DbRequest
-from ..tasks.runtime import DbTaskSpec
+from ..tasks.models import DbTaskSpec
 
 _COMPLETED_TASK_STATUSES = {
     TaskStatus.SUCCEEDED,
