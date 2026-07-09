@@ -10,6 +10,11 @@ from daita.runtime import Capability, Operation, Task, TaskStatus
 
 from ...models import DbOperationContract
 from .common import _json_dict, _stable_hash
+from .dependencies import (
+    _combine_dependencies,
+    _has_sql_validation_dependency,
+    _task_dependencies_for_capability,
+)
 from .models import DbTaskPlan, DbTaskSpec
 
 
@@ -60,8 +65,6 @@ class DbRuntimeTaskPlanningMixin:
         operation: Operation,
         contract: DbOperationContract,
     ) -> None:
-        from .runtime import _task_dependencies_for_capability
-
         existing = {
             (task.capability_id, task.executor_id, task.metadata.get("owner"))
             for task in await self.store.list_tasks(operation.id)
@@ -239,8 +242,6 @@ class DbRuntimeTaskPlanningMixin:
         validation_task: Task | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Task:
-        from .runtime import _task_dependencies_for_capability
-
         input_hash = _stable_hash(input)
         task = Task(
             id=f"db-task-{uuid4()}",
@@ -286,12 +287,6 @@ class DbRuntimeTaskPlanningMixin:
         contract: DbOperationContract | Mapping[str, Any] | None = None,
         validation_task: Task | None = None,
     ) -> Task:
-        from .runtime import (
-            _combine_dependencies,
-            _has_sql_validation_dependency,
-            _task_dependencies_for_capability,
-        )
-
         input_hash = _stable_hash(spec.input)
         idempotency_key = spec.idempotency_key or _stable_hash(
             {

@@ -20,6 +20,7 @@ from daita.runtime import (
 )
 
 from ...session_context import session_query_scope_evidence_for
+from .dependencies import _task_dependencies_for_capability
 from ..types import (
     _DEFAULT_TASK_LEASE_SECONDS,
     DbRuntimeGovernanceBlocked,
@@ -35,8 +36,6 @@ class DbRuntimeTaskExecutionMixin:
         context: dict[str, Any] | None = None,
     ) -> tuple[Evidence, ...]:
         """Execute one runtime task through the shared runtime kernel."""
-        from .runtime import _task_dependencies_for_capability
-
         capability = self._capability_for_task(task)
         if capability.executor != task.executor_id:
             raise ValueError(
