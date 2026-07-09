@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
 import json
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
@@ -20,14 +19,10 @@ from daita.runtime import (
 )
 
 from ...models import DbIntent, DbIntentKind
-from ...sql_evidence import blocked_scope_resources, sql_validation_facts_from_evidence
-from .common import (
-    _evidence_payload_fingerprint,
-    _payload_contains,
-    _payload_fingerprint,
-    _stable_hash,
-)
+from .common import _payload_fingerprint, _stable_hash
+from .evidence import DbRuntimeTaskEvidenceMixin
 from .execution import DbRuntimeTaskExecutionMixin
+from .inputs import DbRuntimeTaskInputMixin
 from .planning import DbRuntimeTaskPlanningMixin
 from .readiness import DbRuntimeTaskReadinessMixin
 
@@ -49,64 +44,9 @@ class DbRuntimeTasksMixin(
     DbRuntimeTaskExecutionMixin,
     DbRuntimeTaskPlanningMixin,
     DbRuntimeTaskReadinessMixin,
+    DbRuntimeTaskInputMixin,
+    DbRuntimeTaskEvidenceMixin,
 ):
-    async def _persist_verification_result_evidence(
-        self,
-        operation: Operation,
-        verification: Any,
-        evidence: tuple[Evidence, ...],
-    ) -> Evidence:
-        existing = await self._latest_accepted_evidence(
-            operation.id,
-            "verification.result",
-            payload={"passed": True},
-        )
-        if existing is not None:
-            return existing
-        accepted = tuple(item for item in evidence if item.accepted and item.id)
-        evidence_details = [
-            {
-                "id": item.id,
-                "kind": item.kind,
-                "owner": item.owner,
-                "task_id": item.task_id,
-                "payload_fingerprint": item.metadata.get("payload_fingerprint")
-                or _payload_fingerprint(item.payload),
-            }
-            for item in accepted
-        ]
-        payload = {
-            "passed": bool(verification.passed),
-            "evidence_refs": [item["id"] for item in evidence_details],
-            "evidence_details": evidence_details,
-            "warnings": list(verification.warnings),
-            "missing_evidence": list(verification.missing_evidence),
-            "diagnostics": verification.diagnostics,
-            "input_fingerprint": _stable_hash(
-                {
-                    "operation_id": operation.id,
-                    "evidence": evidence_details,
-                    "warnings": list(verification.warnings),
-                    "missing_evidence": list(verification.missing_evidence),
-                }
-            ),
-            "verified_at": datetime.now(timezone.utc).isoformat(),
-        }
-        verification_evidence = Evidence(
-            id=f"evidence-{uuid4()}",
-            kind="verification.result",
-            owner="db_runtime",
-            operation_id=operation.id,
-            accepted=True,
-            payload=payload,
-            metadata={
-                "payload_fingerprint": _payload_fingerprint(payload),
-                "input_fingerprint": payload["input_fingerprint"],
-            },
-        )
-        await self.store.save_evidence(verification_evidence)
-        return verification_evidence
-
     async def _execute_answer_synthesis(
         self,
         *,
@@ -199,95 +139,6 @@ class DbRuntimeTasksMixin(
             raise RuntimeError("answer.synthesis evidence was not produced")
         stored_task = await self.store.load_task(task.id)
         return synthesis, stored_task or task
-
-    async def _executable_input_for_task(
-        self,
-        task: Task,
-        operation: Operation,
-    ) -> dict[str, Any]:
-        if task.capability_id in {
-            "catalog.schema.search",
-            "catalog.asset.inspect",
-            "catalog.relationship_paths.find",
-            "catalog.column_values.search",
-            "catalog.column_value_hints.resolve",
-            "catalog.value_grounding.plan",
-        }:
-            return await self._catalog_executable_input_for_task(task, operation)
-        if task.capability_id not in {
-            "db.sql.execute_read",
-            "db.sql.execute_write",
-        }:
-            return task.input
-        validation_dependency = next(
-            (
-                dependency
-                for dependency in task.dependencies
-                if dependency.kind.value == "evidence"
-                and dependency.evidence_kind == "sql.validation"
-            ),
-            None,
-        )
-        validation = (
-            await self._accepted_evidence_for_dependency(
-                operation.id,
-                validation_dependency,
-            )
-            if validation_dependency is not None
-            else await self._latest_accepted_evidence(
-                operation.id,
-                "sql.validation",
-                payload={"valid": True},
-            )
-        )
-        if validation is None:
-            return task.input
-        if task.metadata.get("monitor_action_role") == "write_execution":
-            proposal_fingerprint = str(task.metadata.get("proposal_fingerprint") or "")
-            proposal_evidence_id = str(task.metadata.get("proposal_evidence_id") or "")
-            proposal_matches = [
-                item
-                for item in await self.store.list_evidence(operation.id)
-                if item.kind == "monitor.write_proposal"
-                and item.id == proposal_evidence_id
-            ]
-            proposal = proposal_matches[-1] if proposal_matches else None
-            expected_validation_id = str(
-                task.metadata.get("validation_evidence_id") or ""
-            )
-            expected_validation_fingerprint = str(
-                task.metadata.get("validation_payload_fingerprint") or ""
-            )
-            actual_validation_fingerprint = validation.metadata.get(
-                "payload_fingerprint"
-            ) or _payload_fingerprint(validation.payload)
-            if (
-                proposal is None
-                or proposal.payload.get("status")
-                not in {"approval_required", "approved"}
-                or proposal.payload.get("proposal_fingerprint") != proposal_fingerprint
-                or validation.id != expected_validation_id
-                or actual_validation_fingerprint != expected_validation_fingerprint
-                or proposal.payload.get("validation_payload_fingerprint")
-                != expected_validation_fingerprint
-            ):
-                raise RuntimeError("monitor_write_proposal_stale")
-            facts = sql_validation_facts_from_evidence(validation)
-            blocked_resources = blocked_scope_resources(
-                facts.target_resources,
-                tuple(task.metadata.get("source_scope") or ()),
-            )
-            if facts.valid is not True or blocked_resources:
-                raise RuntimeError("monitor_write_validation_stale")
-        sql = validation.payload.get("sql")
-        if not sql:
-            return task.input
-        return {
-            **task.input,
-            "sql": sql,
-            "validated_evidence_id": validation.id,
-            "validated_task_id": validation.task_id,
-        }
 
     async def _catalog_executable_input_for_task(
         self,
@@ -992,122 +843,6 @@ class DbRuntimeTasksMixin(
                 if profile.get("table") == table and profile.get("column") == column:
                     return True
         return False
-
-    async def _accepted_evidence_for_dependency(
-        self,
-        operation_id: str,
-        dependency: TaskDependency,
-    ) -> Evidence | None:
-        matches = [
-            evidence
-            for evidence in await self.store.list_evidence(operation_id)
-            if evidence.kind == dependency.evidence_kind
-            and evidence.accepted is dependency.evidence_accepted
-            and (
-                dependency.evidence_id is None or evidence.id == dependency.evidence_id
-            )
-            and (
-                dependency.evidence_owner is None
-                or evidence.owner == dependency.evidence_owner
-            )
-            and (
-                dependency.producer_task_id is None
-                or evidence.task_id == dependency.producer_task_id
-            )
-            and (
-                dependency.input_hash is None
-                or evidence.metadata.get("task_input_hash") == dependency.input_hash
-            )
-            and _payload_contains(evidence.payload, dependency.evidence_payload)
-            and (
-                dependency.payload_fingerprint is None
-                or dependency.payload_fingerprint
-                == _evidence_payload_fingerprint(evidence)
-            )
-        ]
-        return matches[-1] if matches else None
-
-    async def _authoritative_validation_evidence(
-        self,
-        operation: Operation,
-        task: Task | None,
-    ) -> tuple[Evidence, ...]:
-        if task is None or task.capability_id not in {
-            "db.sql.execute_read",
-            "db.sql.execute_write",
-        }:
-            return ()
-        if task.metadata.get("monitor_action_role") == "write_execution":
-            expected_validation_id = str(
-                task.metadata.get("validation_evidence_id") or ""
-            )
-            if expected_validation_id:
-                matches = [
-                    evidence
-                    for evidence in await self.store.list_evidence(operation.id)
-                    if evidence.kind == "sql.validation"
-                    and evidence.id == expected_validation_id
-                    and evidence.accepted
-                ]
-                if matches:
-                    return (matches[-1],)
-        validation_dependency = next(
-            (
-                dependency
-                for dependency in task.dependencies
-                if dependency.kind.value == "evidence"
-                and dependency.evidence_kind == "sql.validation"
-            ),
-            None,
-        )
-        if validation_dependency is None:
-            return ()
-        evidence = await self._accepted_evidence_for_dependency(
-            operation.id,
-            validation_dependency,
-        )
-        return (evidence,) if evidence is not None else ()
-
-    async def _latest_accepted_evidence(
-        self,
-        operation_id: str,
-        kind: str,
-        *,
-        payload: dict[str, Any] | None = None,
-    ) -> Evidence | None:
-        matches = [
-            evidence
-            for evidence in await self.store.list_evidence(operation_id)
-            if evidence.kind == kind
-            and evidence.accepted
-            and _payload_contains(evidence.payload, payload or {})
-        ]
-        return matches[-1] if matches else None
-
-    async def _latest_evidence(
-        self,
-        operation_id: str,
-        kind: str,
-        *,
-        payload: dict[str, Any] | None = None,
-        accepted: bool | None = None,
-    ) -> Evidence | None:
-        matches = [
-            evidence
-            for evidence in await self.store.list_evidence(operation_id)
-            if evidence.kind == kind
-            and (accepted is None or evidence.accepted is accepted)
-            and _payload_contains(evidence.payload, payload or {})
-        ]
-        return matches[-1] if matches else None
-
-    async def executable_input_for_task(
-        self,
-        task: Task,
-        operation: Operation,
-    ) -> dict[str, Any]:
-        """Hydrate DB task input from authoritative validation evidence."""
-        return await self._executable_input_for_task(task, operation)
 
 
 def _catalog_task_input_from_metadata(
