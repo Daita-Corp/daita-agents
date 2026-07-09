@@ -1032,6 +1032,266 @@ async def test_propose_sql_read_with_existing_context_injects_context_evidence_i
     assert query_plan.dependencies == ()
 
 
+async def test_propose_sql_read_does_not_reuse_catalog_hint_only_context():
+    runtime, operation = await _catalog_runtime_and_operation(
+        "phase-two-catalog-hint-context"
+    )
+    try:
+        await runtime.store.save_evidence(
+            Evidence(
+                id="hint-only-context",
+                kind="planning.context",
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "schema": {
+                        "database_type": "sqlite",
+                        "tables": [
+                            {
+                                "name": "orders",
+                                "columns": [{"name": "status"}],
+                            }
+                        ],
+                    },
+                    "catalog_evidence_refs": ["catalog-status-hints"],
+                    "diagnostics": {
+                        "structural_schema_source": "connector",
+                        "catalog_structural_evidence_refs": [],
+                    },
+                },
+                metadata={"payload_fingerprint": "fp-hint-only-context"},
+            )
+        )
+        loop = DbAgentLoop(runtime, FakePlanner())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "metadata_read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="plan",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={"owner": "db_runtime"},
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.schema.inspect",
+        "catalog.schema.search",
+        "db.planning.context.build",
+        "db.query.plan",
+    ]
+    query_plan = compilation.task_specs[-1]
+    assert "planning_context_evidence_id" not in query_plan.input
+    assert query_plan.dependencies[0].producer_task_id == (
+        compilation.task_specs[-2].task_id
+    )
+
+
+async def test_propose_sql_read_inserts_catalog_search_and_asset_prerequisites():
+    runtime, operation = await _catalog_runtime_and_operation(
+        "phase-two-catalog-prereqs"
+    )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    try:
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "metadata_read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="plan",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={
+                        "owner": "db_runtime",
+                        "source_owner": "sqlite",
+                        "tables": ["orders"],
+                    },
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.schema.inspect",
+        "catalog.schema.search",
+        "catalog.asset.inspect",
+        "db.planning.context.build",
+        "db.query.plan",
+    ]
+    search = compilation.task_specs[1]
+    asset = compilation.task_specs[2]
+    context = compilation.task_specs[3]
+    query_plan = compilation.task_specs[4]
+    assert search.input["query"] == "phase two catalog"
+    assert asset.input["asset_ref"] == "orders"
+    assert asset.dependencies[0].producer_task_id == search.task_id
+    assert {dependency.evidence_kind for dependency in context.dependencies} == {
+        "schema.asset_profile",
+        "schema.search_result",
+    }
+    assert query_plan.dependencies[0].producer_task_id == context.task_id
+
+
+async def test_relationship_path_action_does_not_guess_assets_from_prompt_text():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="agent-phase-two")
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_id="phase-two-no-prompt-relationship-guessing",
+            operation_type="data.query",
+            request={
+                "prompt": "Join orders to customers using their relationship",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"source_scope": ["sqlite"]},
+            evaluate_governance=False,
+        )
+        loop = DbAgentLoop(runtime, FakePlanner())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "metadata_read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="relationships",
+                    kind=DbPlannerActionKind.FIND_RELATIONSHIP_PATHS,
+                    input={"owner": "catalog"},
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.task_specs == ()
+    assert [item["error"] for item in compilation.rejected_action_summaries] == [
+        "missing_from_assets",
+        "missing_to_assets",
+    ]
+
+
+async def test_execute_joined_query_plan_inserts_relationship_path_prerequisite():
+    sql = (
+        "SELECT o.id, c.email FROM orders o " "JOIN customers c ON o.customer_id = c.id"
+    )
+    runtime, operation = await _catalog_runtime_and_operation(
+        "phase-two-relationship-prereq"
+    )
+    try:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+        await runtime.store.save_evidence(
+            Evidence(
+                id="join-plan",
+                kind="query.plan.proposal",
+                owner="db_runtime",
+                operation_id=operation.id,
+                task_id="task-join-plan",
+                accepted=True,
+                payload={
+                    "valid": True,
+                    "sql": sql,
+                    "structured_plan": {
+                        "operation": "read",
+                        "selected_sql": sql,
+                        "selected_tables": ["orders", "customers"],
+                        "joins": [
+                            {
+                                "left_table": "orders",
+                                "left_column": "customer_id",
+                                "right_table": "customers",
+                                "right_column": "id",
+                            }
+                        ],
+                        "confidence": 0.95,
+                    },
+                },
+                metadata={"payload_fingerprint": "fp-join-plan"},
+            )
+        )
+        loop = DbAgentLoop(runtime, FakePlanner())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = _planner_decision(
+            DbPlannerAction(
+                action_id="execute_join",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "sqlite",
+                    "plan_evidence_id": "join-plan",
+                },
+            )
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "catalog.schema.search",
+        "catalog.relationship_paths.find",
+        "db.planning.context.build",
+        "db.query.plan.validate",
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    relationship = compilation.task_specs[1]
+    refreshed_context = compilation.task_specs[2]
+    plan_validation = compilation.task_specs[3]
+    assert relationship.input["from_assets"] == ["orders"]
+    assert relationship.input["to_assets"] == ["customers"]
+    assert refreshed_context.dependencies[-1].producer_task_id == relationship.task_id
+    assert "planning_context_evidence_id" not in plan_validation.input
+    assert any(
+        dependency.evidence_kind == "planning.context"
+        and dependency.producer_task_id == refreshed_context.task_id
+        for dependency in plan_validation.dependencies
+    )
+
+
 async def test_propose_sql_read_context_prerequisite_uses_memory_recall_chain():
     runtime = DbRuntime(
         plugins=(MemoryPlugin(),),
@@ -1825,13 +2085,11 @@ async def test_repaired_sql_validation_creates_distinct_execute_task():
     repaired_execute = repaired_plan.tasks[0]
     assert old_execute.id != repaired_execute.id
     assert old_execute.input["sql_validation_evidence_id"] == "validation-old"
+    assert repaired_execute.input["sql_validation_evidence_id"] == "validation-repaired"
     assert (
-        repaired_execute.input["sql_validation_evidence_id"]
-        == "validation-repaired"
+        old_execute.input["sql_fingerprint"]
+        != repaired_execute.input["sql_fingerprint"]
     )
-    assert old_execute.input["sql_fingerprint"] != repaired_execute.input[
-        "sql_fingerprint"
-    ]
     assert old_execute.dependencies[0].evidence_id == "validation-old"
     assert repaired_execute.dependencies[0].evidence_id == "validation-repaired"
 
@@ -1839,9 +2097,7 @@ async def test_repaired_sql_validation_creates_distinct_execute_task():
 async def test_stale_blocked_execute_does_not_block_repaired_execution():
     old_sql = "select count(*) from orders where status = 'completed'"
     repaired_sql = "select count(*) from orders where status = 'complete'"
-    runtime, operation = await _runtime_and_operation(
-        "phase-one-stale-blocked-execute"
-    )
+    runtime, operation = await _runtime_and_operation("phase-one-stale-blocked-execute")
     try:
         await runtime.store.save_evidence(
             _sql_validation_evidence(
@@ -2705,6 +2961,37 @@ async def _runtime_and_operation(
         },
         required_evidence=frozenset(required_evidence),
         metadata=({"mode": mode} if mode else {}),
+        evaluate_governance=False,
+    )
+    return runtime, operation
+
+
+async def _catalog_runtime_and_operation(operation_id):
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+            plugins=(CatalogPlugin(auto_persist=False), SQLitePlugin(path=":memory:")),
+        ),
+        runtime_id="phase-two-catalog-runtime",
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.setup(agent_id="agent-phase-two")
+    operation = await runtime.kernel.create_operation(
+        operation_id=operation_id,
+        operation_type="data.query",
+        request={
+            "prompt": "phase two catalog",
+            "source_scope": ["sqlite"],
+        },
+        required_evidence=frozenset(),
+        metadata={
+            "source_scope": ["sqlite"],
+            "safety_frame": {"max_access": "read"},
+        },
         evaluate_governance=False,
     )
     return runtime, operation

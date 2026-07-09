@@ -38,6 +38,7 @@ from .planner_protocol import (
 )
 from .runtime.tasks import DbTaskSpec
 from .runtime.types import DbRuntimeGovernanceBlocked, DbRuntimeTaskNotRunnable
+from .sql_analysis import SqlAnalysisError, analyze_sql
 from .verification import (
     DB_FINALIZATION_CONTROL_EVIDENCE_KINDS,
     db_run_finalization_check,
@@ -1166,6 +1167,26 @@ class DbAgentLoop:
                 )
                 context_dependencies.append(schema_dependency)
 
+        (
+            catalog_specs,
+            catalog_selected,
+            catalog_dependencies,
+            catalog_errors,
+        ) = self._catalog_structure_prerequisite_specs(
+            action,
+            state=state,
+            sequence_start=sequence_start + len(specs),
+            decision_fingerprint=decision_fingerprint,
+            upstream_dependencies=(
+                (schema_dependency,) if schema_dependency is not None else ()
+            ),
+        )
+        if catalog_errors:
+            return [], [], catalog_errors
+        specs.extend(catalog_specs)
+        selected.extend(catalog_selected)
+        context_dependencies.extend(catalog_dependencies)
+
         if _state_should_plan_value_grounding_for_planning(state, action):
             grounding_resolved = self._resolve_capability(
                 "catalog.value_grounding.plan",
@@ -1413,7 +1434,10 @@ class DbAgentLoop:
             state,
             "planning.context",
         )
-        if planning_context is not None:
+        if planning_context is not None and _planning_context_satisfies_catalog_phase2(
+            state,
+            planning_context,
+        ):
             task_input["planning_context_evidence_id"] = planning_context["id"]
         else:
             context_specs, context_selected, context_errors = (
@@ -1558,7 +1582,103 @@ class DbAgentLoop:
             "sql_provenance": _sql_provenance_metadata(resolved_sql),
         }
         specs: list[DbTaskSpec] = []
+        selected_capabilities: list[Any] = []
+        if plan_validation is not None:
+            selected_capabilities.append(plan_validation["capability"])
+        if validation is not None:
+            selected_capabilities.append(validation["capability"])
+        selected_capabilities.append(execute["capability"])
         validation_dependencies: list[TaskDependency] = []
+        refreshed_context_dependency: TaskDependency | None = None
+        relationship_dependencies: list[TaskDependency] = []
+        relationship_scope = _relationship_scope_for_resolved_sql(resolved_sql, state)
+        if (
+            plan_validation is not None
+            and planning_context is not None
+            and relationship_scope[0]
+            and relationship_scope[1]
+            and not _planning_context_has_matching_relationship(
+                planning_context,
+                relationship_scope[0],
+                relationship_scope[1],
+            )
+        ):
+            (
+                relationship_specs,
+                relationship_selected,
+                relationship_dependencies,
+                relationship_errors,
+            ) = self._catalog_structure_prerequisite_specs(
+                action,
+                state=state,
+                sequence_start=sequence_start,
+                decision_fingerprint=decision_fingerprint,
+                force_relationship_scope=relationship_scope,
+            )
+            if relationship_errors:
+                return [], [], relationship_errors
+            if not any(
+                dependency.evidence_kind == "schema.relationship_path"
+                for dependency in relationship_dependencies
+            ):
+                relationship_specs = []
+                relationship_selected = []
+                relationship_dependencies = []
+            specs.extend(relationship_specs)
+            selected_capabilities.extend(
+                item
+                for item in (
+                    self._resolve_capability(
+                        selected["id"], owner=selected.get("owner")
+                    ).get("capability")
+                    for selected in relationship_selected
+                )
+                if item is not None
+            )
+        if (
+            plan_validation is not None
+            and relationship_dependencies
+            and planning_context is not None
+        ):
+            context_resolved = self._resolve_capability(
+                "db.planning.context.build",
+                owner="db_runtime",
+            )
+            context_error = self._capability_error(action, context_resolved)
+            if context_error is not None:
+                return [], [], [context_error]
+            context_capability = context_resolved["capability"]
+            selected_capabilities.append(context_capability)
+            context_spec = _with_deterministic_task_id(
+                state.operation_id,
+                DbTaskSpec(
+                    capability_id=context_capability.id,
+                    owner=context_capability.owner,
+                    input={},
+                    reason="runtime_prerequisite:catalog_relationship_context",
+                    sequence=sequence_start + len(specs),
+                    dependencies=tuple(relationship_dependencies),
+                    metadata={
+                        **metadata,
+                        "runtime_prerequisite": True,
+                        "catalog_relationship_context": True,
+                    },
+                    deterministic_key=(
+                        f"{action.action_id}:db.planning.context.build:"
+                        "catalog_relationship"
+                    ),
+                ),
+            )
+            specs.append(context_spec)
+            refreshed_context_dependency = _dependency_for_prerequisite_spec(
+                context_spec,
+                capability=context_capability,
+                operation_id=state.operation_id,
+                action_id=action.action_id,
+                consumer_capability_id="db.query.plan.validate",
+            )
+            planning_context = None
+
         if plan_validation is not None and planning_context is not None:
             plan_capability = plan_validation["capability"]
             plan_validation_spec = DbTaskSpec(
@@ -1574,6 +1694,48 @@ class DbAgentLoop:
                     (resolved_sql.query_plan_dependency,)
                     if resolved_sql.query_plan_dependency is not None
                     else ()
+                ),
+                metadata=metadata,
+                deterministic_key=f"{action.action_id}:db.query.plan.validate",
+            )
+            plan_validation_spec = _with_deterministic_task_id(
+                state.operation_id,
+                plan_validation_spec,
+            )
+            specs.append(plan_validation_spec)
+            validation_dependencies.append(
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind="query.plan.validation",
+                    evidence_owner=plan_capability.owner,
+                    producer_task_id=plan_validation_spec.task_id,
+                    producer_capability_id=plan_capability.id,
+                    producer_executor_id=plan_capability.executor,
+                    evidence_accepted=True,
+                    operation_id=state.operation_id,
+                    metadata={
+                        "sql_resolution": True,
+                        "provenance": "query_plan_validation",
+                    },
+                )
+            )
+        elif plan_validation is not None and refreshed_context_dependency is not None:
+            plan_capability = plan_validation["capability"]
+            plan_validation_spec = DbTaskSpec(
+                capability_id=plan_capability.id,
+                owner=plan_capability.owner,
+                input={
+                    "plan_evidence_id": resolved_sql.source_evidence_id,
+                },
+                reason=f"planner:{action.kind.value}:query_plan_validation",
+                sequence=sequence_start + len(specs),
+                dependencies=(
+                    *(
+                        (resolved_sql.query_plan_dependency,)
+                        if resolved_sql.query_plan_dependency is not None
+                        else ()
+                    ),
+                    refreshed_context_dependency,
                 ),
                 metadata=metadata,
                 deterministic_key=f"{action.action_id}:db.query.plan.validate",
@@ -1655,7 +1817,7 @@ class DbAgentLoop:
         specs.append(execute_spec)
         return (
             specs,
-            [_capability_selection(item, action) for item in capabilities],
+            [_capability_selection(item, action) for item in selected_capabilities],
             [],
         )
 
@@ -1725,6 +1887,149 @@ class DbAgentLoop:
         )
         spec = _with_deterministic_task_id(state.operation_id, spec)
         return [spec], [_capability_selection(capability, action)], []
+
+    def _catalog_structure_prerequisite_specs(
+        self,
+        action: DbPlannerAction,
+        *,
+        state: DbLoopState,
+        sequence_start: int,
+        decision_fingerprint: str,
+        upstream_dependencies: tuple[TaskDependency, ...] = (),
+        force_relationship_scope: tuple[list[str], list[str]] | None = None,
+    ) -> tuple[
+        list[DbTaskSpec],
+        list[dict[str, Any]],
+        list[TaskDependency],
+        list[dict[str, Any]],
+    ]:
+        if not _state_can_use_catalog_structure(state):
+            return [], [], [], []
+        if not _catalog_capability_present(state, "catalog.schema.search"):
+            return [], [], [], []
+
+        specs: list[DbTaskSpec] = []
+        selected: list[dict[str, Any]] = []
+        dependencies: list[TaskDependency] = []
+        errors: list[dict[str, Any]] = []
+        prior_dependency: TaskDependency | None = None
+
+        def add_spec(
+            capability_id: str,
+            *,
+            task_input: dict[str, Any],
+            reason: str,
+            deterministic_key: str,
+            extra_dependencies: tuple[TaskDependency, ...] = (),
+        ) -> TaskDependency | None:
+            resolved = self._resolve_capability(capability_id, owner="catalog")
+            error = self._capability_error(action, resolved)
+            if error is not None:
+                errors.append(error)
+                return None
+            capability = resolved["capability"]
+            access_errors = self._access_errors(action, (capability,), state)
+            if access_errors:
+                errors.extend(access_errors)
+                return None
+            spec = _with_deterministic_task_id(
+                state.operation_id,
+                DbTaskSpec(
+                    capability_id=capability.id,
+                    owner=capability.owner,
+                    input=task_input,
+                    reason=reason,
+                    sequence=sequence_start + len(specs),
+                    dependencies=extra_dependencies,
+                    metadata={
+                        **_action_metadata(action, decision_fingerprint),
+                        "runtime_prerequisite": True,
+                        "catalog_structure": "planning",
+                        "prerequisite_for": "db.planning.context.build",
+                    },
+                    deterministic_key=deterministic_key,
+                ),
+            )
+            specs.append(spec)
+            selected.append(_capability_selection(capability, action, reason=reason))
+            dependency = _dependency_for_prerequisite_spec(
+                spec,
+                capability=capability,
+                operation_id=state.operation_id,
+                action_id=action.action_id,
+                consumer_capability_id="db.planning.context.build",
+            )
+            dependencies.append(dependency)
+            return dependency
+
+        if not _state_has_catalog_structural_evidence(state, "schema.search_result"):
+            search_query = _catalog_search_query(action, state)
+            prior_dependency = add_spec(
+                "catalog.schema.search",
+                task_input={"query": search_query, "limit": 20},
+                reason="runtime_prerequisite:catalog_schema_search",
+                deterministic_key=f"{action.action_id}:catalog.schema.search",
+                extra_dependencies=upstream_dependencies,
+            )
+
+        assets = _catalog_assets_for_action_or_state(action, state)
+        if assets and not _state_has_catalog_asset_profile(state):
+            for asset in assets[:4]:
+                asset_dependency = add_spec(
+                    "catalog.asset.inspect",
+                    task_input={
+                        "asset_ref": asset,
+                        "limit": 100,
+                        "include_relationships": True,
+                    },
+                    reason="runtime_prerequisite:catalog_asset_inspect",
+                    deterministic_key=(
+                        f"{action.action_id}:catalog.asset.inspect:{asset}"
+                    ),
+                    extra_dependencies=(
+                        (prior_dependency,)
+                        if prior_dependency is not None
+                        else upstream_dependencies
+                    ),
+                )
+                if asset_dependency is not None:
+                    prior_dependency = asset_dependency
+
+        relationship_scope = force_relationship_scope or (
+            _catalog_relationship_scope_for_action_or_state(action, state)
+        )
+        if (
+            relationship_scope[0]
+            and relationship_scope[1]
+            and not _state_has_matching_relationship_evidence(
+                state,
+                relationship_scope[0],
+                relationship_scope[1],
+            )
+            and _catalog_capability_present(state, "catalog.relationship_paths.find")
+        ):
+            add_spec(
+                "catalog.relationship_paths.find",
+                task_input={
+                    "from_assets": relationship_scope[0],
+                    "to_assets": relationship_scope[1],
+                    "max_hops": 4,
+                    "max_paths": 5,
+                },
+                reason="runtime_prerequisite:catalog_relationship_paths",
+                deterministic_key=(
+                    f"{action.action_id}:catalog.relationship_paths.find:"
+                    f"{','.join(relationship_scope[0])}:"
+                    f"{','.join(relationship_scope[1])}"
+                ),
+                extra_dependencies=(
+                    (prior_dependency,)
+                    if prior_dependency is not None
+                    else upstream_dependencies
+                ),
+            )
+
+        return specs, selected, dependencies, errors
 
     def _compile_monitor_action(
         self,
@@ -3226,7 +3531,7 @@ def _relationship_paths_task_input(
     if from_assets and not to_assets and len(from_assets) >= 2:
         to_assets = from_assets[1:]
         from_assets = from_assets[:1]
-    fallback_from, fallback_to = _relationship_assets_from_state(state)
+    fallback_from, fallback_to = _relationship_assets_from_structured_state(state)
     if not from_assets:
         from_assets = fallback_from
     if not to_assets:
@@ -3245,7 +3550,7 @@ def _relationship_paths_task_input(
     }, ()
 
 
-def _relationship_assets_from_state(
+def _relationship_assets_from_structured_state(
     state: DbLoopState,
 ) -> tuple[list[str], list[str]]:
     scoped = _string_list(state.source_scope) or _string_list(
@@ -3258,9 +3563,7 @@ def _relationship_assets_from_state(
     )
     if len(session_tables) >= 2:
         return session_tables[:1], session_tables[1:]
-    return _relationship_assets_from_text(
-        str(state.normalized_user_request.get("prompt") or "")
-    )
+    return [], []
 
 
 def _session_context_tables(value: Any) -> list[str]:
@@ -3272,24 +3575,309 @@ def _session_context_tables(value: Any) -> list[str]:
     return _string_list(referents.get("tables"))
 
 
-def _relationship_assets_from_text(text: str) -> tuple[list[str], list[str]]:
-    identifier = r"([A-Za-z_][A-Za-z0-9_]*)"
-    patterns = (
-        rf"\bjoin\s+(?:the\s+)?{identifier}\s+(?:table\s+)?"
-        rf"(?:to|with|and)\s+(?:the\s+)?{identifier}\b",
-        rf"\b(?:relationship|relationships|path|paths)\s+"
-        rf"(?:between|from)\s+(?:the\s+)?{identifier}\s+"
-        rf"(?:and|to)\s+(?:the\s+)?{identifier}\b",
-        rf"\b{identifier}\s+(?:to|and)\s+{identifier}\s+"
-        rf"(?:relationship|relationships|join|joins|path|paths)\b",
+def _dependency_for_prerequisite_spec(
+    spec: DbTaskSpec,
+    *,
+    capability: Any,
+    operation_id: str,
+    action_id: str,
+    consumer_capability_id: str,
+) -> TaskDependency:
+    evidence_kind = next(iter(sorted(capability.output_evidence)), "")
+    return TaskDependency(
+        kind="evidence",
+        evidence_kind=evidence_kind,
+        evidence_owner=capability.owner,
+        producer_task_id=spec.task_id,
+        producer_capability_id=capability.id,
+        producer_executor_id=capability.executor,
+        evidence_accepted=True,
+        input_hash=_stable_hash(spec.input),
+        operation_id=operation_id,
+        metadata={
+            "runtime_prerequisite": True,
+            "producer_action_id": action_id,
+            "consumer_action_id": action_id,
+            "prerequisite_for": consumer_capability_id,
+        },
     )
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match is not None:
-            left, right = match.group(1).strip(), match.group(2).strip()
-            if left and right:
-                return [left], [right]
-    return [], []
+
+
+def _state_can_use_catalog_structure(state: DbLoopState) -> bool:
+    effective_mode = _explicit_mode_operation_type(state.explicit_mode)
+    operation_type = str(
+        effective_mode
+        or state.normalized_user_request.get("operation_type")
+        or "db.run"
+    )
+    return operation_type in {
+        "db.run",
+        DbIntentKind.DATA_QUERY.value,
+        DbIntentKind.CATALOG_ASSISTED_DATA_QUERY.value,
+        "query.plan",
+    }
+
+
+def _catalog_capability_present(state: DbLoopState, capability_id: str) -> bool:
+    return any(
+        summary.get("id") == capability_id and summary.get("owner") == "catalog"
+        for summary in state.capability_summaries
+    )
+
+
+def _state_has_catalog_structural_evidence(
+    state: DbLoopState,
+    kind: str | None = None,
+) -> bool:
+    structural_kinds = {
+        "catalog.source_registered",
+        "catalog.profile",
+        "schema.search_result",
+        "schema.asset_profile",
+    }
+    return any(
+        summary.get("kind") in ({kind} if kind else structural_kinds)
+        and summary.get("accepted", True) is True
+        and (
+            summary.get("owner") == "catalog"
+            or str(summary.get("kind") or "").startswith("catalog.")
+        )
+        for summary in state.accepted_evidence_summaries
+    )
+
+
+def _state_has_catalog_asset_profile(state: DbLoopState) -> bool:
+    return _state_has_catalog_structural_evidence(state, "schema.asset_profile")
+
+
+def _planning_context_satisfies_catalog_phase2(
+    state: DbLoopState,
+    planning_context: Mapping[str, Any],
+) -> bool:
+    if not _state_can_use_catalog_structure(state):
+        return True
+    if not _catalog_capability_present(state, "catalog.schema.search"):
+        return True
+    diagnostics = planning_context.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        diagnostics = {}
+    structural_source = planning_context.get(
+        "structural_schema_source"
+    ) or diagnostics.get("structural_schema_source")
+    if structural_source == "catalog":
+        return True
+    structural_refs = _safe_string_list(
+        planning_context.get("catalog_structural_evidence_refs")
+    ) or _safe_string_list(diagnostics.get("catalog_structural_evidence_refs"))
+    if structural_refs:
+        return True
+    return False
+
+
+def _catalog_search_query(action: DbPlannerAction, state: DbLoopState) -> str:
+    values = (
+        action.input.get("query"),
+        action.input.get("prompt"),
+        action.input.get("goal"),
+        state.normalized_user_request.get("query"),
+        state.normalized_user_request.get("prompt"),
+    )
+    return " ".join(str(value).strip() for value in values if str(value or "").strip())
+
+
+def _catalog_assets_for_action_or_state(
+    action: DbPlannerAction,
+    state: DbLoopState,
+) -> list[str]:
+    assets = _first_string_list_from_mappings(
+        (action.input, action.metadata),
+        "asset_ref",
+        "asset",
+        "assets",
+        "tables",
+        "table",
+        "selected_tables",
+    )
+    if assets:
+        return _ordered_unique_strings(assets)
+    return _source_scope_asset_refs(state)
+
+
+def _source_scope_asset_refs(state: DbLoopState) -> list[str]:
+    scoped = _string_list(state.source_scope) or _string_list(
+        state.normalized_user_request.get("source_scope")
+    )
+    if not scoped:
+        return []
+    source_owners = {
+        str(summary.get("owner") or "").strip()
+        for summary in state.capability_summaries
+        if summary.get("id")
+        in {
+            "db.schema.inspect",
+            "db.sql.validate",
+            "db.sql.execute_read",
+            "db.sql.execute_write",
+            "db.column_values.profile",
+        }
+        and str(summary.get("owner") or "").strip()
+    }
+    reserved = source_owners | {"catalog", "db_runtime", "memory"}
+    return [
+        item
+        for item in _ordered_unique_strings(scoped)
+        if item not in reserved and ":" not in item
+    ]
+
+
+def _catalog_relationship_scope_for_action_or_state(
+    action: DbPlannerAction,
+    state: DbLoopState,
+) -> tuple[list[str], list[str]]:
+    from_assets = _first_string_list_from_mappings(
+        (action.input, action.metadata),
+        "from_assets",
+        "from",
+        "source_assets",
+        "source",
+    )
+    to_assets = _first_string_list_from_mappings(
+        (action.input, action.metadata),
+        "to_assets",
+        "to",
+        "target_assets",
+        "target",
+    )
+    paired_assets = _first_string_list_from_mappings(
+        (action.input, action.metadata),
+        "assets",
+        "tables",
+        "selected_tables",
+    )
+    if not from_assets and not to_assets and len(paired_assets) >= 2:
+        from_assets = paired_assets[:1]
+        to_assets = paired_assets[1:]
+    if from_assets and not to_assets and len(from_assets) >= 2:
+        to_assets = from_assets[1:]
+        from_assets = from_assets[:1]
+    if not from_assets and not to_assets:
+        assets = _catalog_assets_for_action_or_state(action, state)
+        if len(assets) >= 2:
+            from_assets = assets[:1]
+            to_assets = assets[1:]
+    return _ordered_unique_strings(from_assets), _ordered_unique_strings(to_assets)
+
+
+def _relationship_scope_for_resolved_sql(
+    resolved_sql: _ResolvedSqlInput,
+    state: DbLoopState,
+) -> tuple[list[str], list[str]]:
+    tables = _sql_join_tables(resolved_sql.sql)
+    if not tables:
+        plan_summary = _evidence_summary_by_id(
+            state,
+            resolved_sql.source_evidence_id,
+            kind=resolved_sql.source_evidence_kind,
+        )
+        if plan_summary is not None:
+            tables = _safe_string_list(plan_summary.get("selected_tables"))
+    if len(tables) < 2:
+        return [], []
+    return [tables[0]], tables[1:]
+
+
+def _sql_join_tables(sql: str) -> list[str]:
+    if not sql.strip():
+        return []
+    try:
+        analysis = analyze_sql(sql)
+    except (ImportError, SqlAnalysisError):
+        return []
+    tables = [
+        str(table.short_key)
+        for table in analysis.tables
+        if not table.is_cte and str(table.short_key)
+    ]
+    if len(tables) < 2:
+        return []
+    return _ordered_unique_strings(tables)
+
+
+def _evidence_summary_by_id(
+    state: DbLoopState,
+    evidence_id: str | None,
+    *,
+    kind: str | None = None,
+) -> dict[str, Any] | None:
+    if not evidence_id:
+        return None
+    matches = [
+        summary
+        for summary in state.accepted_evidence_summaries
+        if summary.get("id") == evidence_id
+        and (kind is None or summary.get("kind") == kind)
+    ]
+    return dict(matches[-1]) if matches else None
+
+
+def _state_has_matching_relationship_evidence(
+    state: DbLoopState,
+    from_assets: list[str],
+    to_assets: list[str],
+) -> bool:
+    for summary in state.accepted_evidence_summaries:
+        if summary.get("kind") == "schema.relationship_path":
+            if _join_summaries_match_scope(
+                _safe_join_summaries(summary.get("joins")),
+                from_assets,
+                to_assets,
+            ):
+                return True
+        if summary.get("kind") == "planning.context":
+            if _planning_context_has_matching_relationship(
+                summary,
+                from_assets,
+                to_assets,
+            ):
+                return True
+    return False
+
+
+def _planning_context_has_matching_relationship(
+    planning_context: Mapping[str, Any],
+    from_assets: list[str],
+    to_assets: list[str],
+) -> bool:
+    return _join_summaries_match_scope(
+        _safe_join_summaries(planning_context.get("relationship_joins")),
+        from_assets,
+        to_assets,
+    )
+
+
+def _join_summaries_match_scope(
+    joins: list[dict[str, Any]],
+    from_assets: list[str],
+    to_assets: list[str],
+) -> bool:
+    if not joins:
+        return False
+    from_keys = {_short_asset_key(item) for item in from_assets if item}
+    to_keys = {_short_asset_key(item) for item in to_assets if item}
+    if not from_keys or not to_keys:
+        return False
+    for join in joins:
+        left = _short_asset_key(join.get("left_table"))
+        right = _short_asset_key(join.get("right_table"))
+        if left in from_keys and right in to_keys:
+            return True
+        if right in from_keys and left in to_keys:
+            return True
+    return False
+
+
+def _short_asset_key(value: Any) -> str:
+    return str(value or "").split(".")[-1].strip().lower()
 
 
 def _first_string_list_from_mappings(
@@ -3448,9 +4036,7 @@ def _validated_sql_execute_input(
     }
     if validation_spec is not None:
         execute_input["sql_validation_task_id"] = validation_spec.task_id
-        execute_input["sql_validation_input_hash"] = _stable_hash(
-            validation_spec.input
-        )
+        execute_input["sql_validation_input_hash"] = _stable_hash(validation_spec.input)
     if resolved_sql.sql_validation_dependency is not None:
         dependency = resolved_sql.sql_validation_dependency
         if dependency.evidence_id:
@@ -4006,13 +4592,49 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
                 summary["warnings"] = validation_warnings
             if validation_errors:
                 summary["validation_warnings"] = validation_errors
+            if evidence.kind == "query.plan.proposal":
+                structured_plan = evidence.payload.get("structured_plan")
+                if isinstance(structured_plan, Mapping):
+                    selected_tables = _safe_string_list(
+                        structured_plan.get("selected_tables")
+                    )
+                    if selected_tables:
+                        summary["selected_tables"] = selected_tables
+                    joins = _safe_join_summaries(structured_plan.get("joins"))
+                    if joins:
+                        summary["joins"] = joins
         if evidence.kind == "schema.column_value_hint":
             hints = _safe_column_value_hint_summaries(evidence.payload.get("hints"))
             if hints:
                 summary["hints"] = hints
         if evidence.kind == "planning.context":
+            for key in (
+                "schema_evidence_refs",
+                "catalog_evidence_refs",
+                "relationship_evidence_refs",
+            ):
+                values = _safe_string_list(evidence.payload.get(key))
+                if values:
+                    summary[key] = values
+            relationship_joins = _planning_context_relationship_join_summaries(
+                evidence.payload
+            )
+            if relationship_joins:
+                summary["relationship_joins"] = relationship_joins
             diagnostics = evidence.payload.get("diagnostics")
             if isinstance(diagnostics, Mapping):
+                structural_source = _optional_string(
+                    diagnostics.get("structural_schema_source")
+                )
+                if structural_source is not None:
+                    summary["structural_schema_source"] = structural_source
+                catalog_structural_refs = _safe_string_list(
+                    diagnostics.get("catalog_structural_evidence_refs")
+                )
+                if catalog_structural_refs:
+                    summary["catalog_structural_evidence_refs"] = (
+                        catalog_structural_refs
+                    )
                 repair = diagnostics.get("validation_grounding_repair")
                 if isinstance(repair, Mapping):
                     fingerprint = str(repair.get("fingerprint") or "").strip()
@@ -4043,6 +4665,11 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
         operation = _optional_string(evidence.payload.get("operation"))
         if operation is not None:
             summary["operation"] = operation
+        if evidence.kind == "schema.relationship_path":
+            summary["reachable"] = evidence.payload.get("reachable")
+            joins = _relationship_path_join_summaries(evidence.payload)
+            if joins:
+                summary["joins"] = joins
     payload_fingerprint = evidence.metadata.get("payload_fingerprint")
     if payload_fingerprint:
         summary["payload_fingerprint"] = str(payload_fingerprint)
@@ -4110,6 +4737,65 @@ def _safe_column_value_hint_summaries(value: Any) -> list[dict[str, Any]]:
             hint["candidate_mapping"] = dict(candidate_mapping)
         hints.append(hint)
     return _dedupe_dicts(hints, keys=("table", "column"))
+
+
+def _safe_join_summaries(value: Any) -> list[dict[str, Any]]:
+    joins: list[dict[str, Any]] = []
+    for item in _safe_iterable(value):
+        if not isinstance(item, Mapping):
+            continue
+        left_table = _optional_string(item.get("left_table") or item.get("left_asset"))
+        right_table = _optional_string(
+            item.get("right_table") or item.get("right_asset")
+        )
+        if not left_table or not right_table:
+            continue
+        join = {
+            "left_table": left_table,
+            "right_table": right_table,
+        }
+        left_column = _optional_string(
+            item.get("left_column") or item.get("left_field") or item.get("left_key")
+        )
+        right_column = _optional_string(
+            item.get("right_column") or item.get("right_field") or item.get("right_key")
+        )
+        if left_column:
+            join["left_column"] = left_column.split(".")[-1]
+        if right_column:
+            join["right_column"] = right_column.split(".")[-1]
+        joins.append(join)
+    return _dedupe_dicts(
+        joins, keys=("left_table", "left_column", "right_table", "right_column")
+    )
+
+
+def _relationship_path_join_summaries(
+    payload: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    joins: list[dict[str, Any]] = []
+    for path in payload.get("paths", []) or []:
+        if not isinstance(path, Mapping):
+            continue
+        joins.extend(_safe_join_summaries(path.get("joins")))
+    return _dedupe_dicts(
+        joins,
+        keys=("left_table", "left_column", "right_table", "right_column"),
+    )
+
+
+def _planning_context_relationship_join_summaries(
+    payload: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    joins: list[dict[str, Any]] = []
+    for detail in payload.get("relationship_evidence_details", []) or []:
+        if not isinstance(detail, Mapping):
+            continue
+        joins.extend(_relationship_path_join_summaries(detail))
+    return _dedupe_dicts(
+        joins,
+        keys=("left_table", "left_column", "right_table", "right_column"),
+    )
 
 
 def _evidence_ref(evidence: Evidence) -> dict[str, Any]:

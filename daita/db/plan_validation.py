@@ -37,7 +37,15 @@ class DbQueryPlanValidator:
             "passed": True,
             "errors": [],
         }
+        catalog_relationship_validation = {
+            "checked": False,
+            "required_joins": [],
+            "relationship_evidence_refs": [],
+            "passed": True,
+            "errors": [],
+        }
         sql = plan.selected_sql
+        analysis_for_relationships: Any | None = None
 
         if plan.confidence < 0 or plan.confidence > 1:
             errors.append("confidence_out_of_bounds")
@@ -92,6 +100,7 @@ class DbQueryPlanValidator:
             except SqlAnalysisError as exc:
                 errors.append(f"sql_parse_failed:{exc.error_type}")
             else:
+                analysis_for_relationships = analysis
                 if analysis.has_multiple_statements:
                     errors.append("sql_multiple_statements")
                 if plan.operation == "read" and (
@@ -167,6 +176,18 @@ class DbQueryPlanValidator:
                     if isinstance(item, dict) and item.get("enforceable")
                 ]
 
+        relationship_errors, relationship_facts, relationship_metadata = (
+            _validate_catalog_relationships(
+                plan,
+                planning_context,
+                analysis_for_relationships,
+            )
+        )
+        if relationship_errors:
+            errors.extend(relationship_errors)
+            validation_facts.extend(relationship_facts)
+        catalog_relationship_validation.update(relationship_metadata)
+
         fingerprint = _fingerprint(plan.to_dict())
         return DbQueryPlanValidation(
             valid=not errors,
@@ -180,6 +201,7 @@ class DbQueryPlanValidator:
                 "validator": "deterministic",
                 "schema_fingerprint": planning_context.get("schema_fingerprint"),
                 "db_memory_contract_validation": db_memory_validation,
+                "catalog_relationship_validation": catalog_relationship_validation,
             },
         )
 
@@ -571,6 +593,248 @@ def _split_column_ref(value: str) -> tuple[str | None, str]:
 def _looks_aggregated(sql: str) -> bool:
     lowered = sql.lower()
     return any(token in lowered for token in ("count(", "sum(", "avg(", "min(", "max("))
+
+
+def _validate_catalog_relationships(
+    plan: DbQueryPlan,
+    planning_context: dict[str, Any],
+    analysis: Any | None,
+) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    required = _required_join_edges(plan, analysis)
+    evidence_edges, relationship_refs = _catalog_relationship_edges(planning_context)
+    metadata = {
+        "checked": bool(required),
+        "required_joins": [dict(item) for item in required],
+        "relationship_evidence_refs": relationship_refs,
+        "passed": True,
+        "errors": [],
+    }
+    if plan.operation != "read" or not required:
+        return [], [], metadata
+
+    errors: list[str] = []
+    facts: list[dict[str, Any]] = []
+    for edge in required:
+        if any(
+            _relationship_edge_matches(edge, evidence) for evidence in evidence_edges
+        ):
+            continue
+        label = _join_edge_label(edge)
+        error = f"missing_catalog_relationship_path:{label}"
+        errors.append(error)
+        fact = {
+            "kind": "missing_catalog_relationship_path",
+            "left_table": edge["left_table"],
+            "right_table": edge["right_table"],
+            "source": edge.get("source") or "query.plan.validation",
+            "reason": "joined_data_query_without_catalog_relationship_evidence",
+        }
+        if edge.get("left_column"):
+            fact["left_column"] = edge["left_column"]
+        if edge.get("right_column"):
+            fact["right_column"] = edge["right_column"]
+        facts.append(fact)
+    if errors:
+        metadata["passed"] = False
+        metadata["errors"] = list(errors)
+    return errors, facts, metadata
+
+
+def _required_join_edges(
+    plan: DbQueryPlan,
+    analysis: Any | None,
+) -> tuple[dict[str, str], ...]:
+    edges: list[dict[str, str]] = []
+    for join in plan.joins:
+        edge = _join_edge(
+            join.left_table,
+            join.left_column,
+            join.right_table,
+            join.right_column,
+            source="query_plan_join",
+        )
+        if edge is not None:
+            edges.append(edge)
+
+    if analysis is not None:
+        for predicate in getattr(analysis, "column_predicates", ()) or ():
+            if str(getattr(predicate, "operator", "") or "") != "=":
+                continue
+            left = getattr(predicate, "left", None)
+            right = getattr(predicate, "right", None)
+            edge = _join_edge(
+                getattr(left, "table", "") if left is not None else "",
+                getattr(left, "name", "") if left is not None else "",
+                getattr(right, "table", "") if right is not None else "",
+                getattr(right, "name", "") if right is not None else "",
+                source="sql_column_predicate",
+            )
+            if edge is not None:
+                edges.append(edge)
+
+    if not edges:
+        tables = _join_candidate_tables(plan, analysis)
+        if len(tables) > 1:
+            first = tables[0]
+            for table in tables[1:]:
+                edge = _join_edge(first, "", table, "", source="multi_table_plan")
+                if edge is not None:
+                    edges.append(edge)
+    return _dedupe_join_edges(edges)
+
+
+def _join_candidate_tables(
+    plan: DbQueryPlan,
+    analysis: Any | None,
+) -> list[str]:
+    tables: list[str] = []
+    if analysis is not None:
+        tables.extend(
+            str(table.short_key)
+            for table in getattr(analysis, "tables", ()) or ()
+            if not getattr(table, "is_cte", False) and str(table.short_key)
+        )
+    tables.extend(str(table) for table in plan.selected_tables if str(table).strip())
+    return list(
+        dict.fromkeys(_short_table_key(table) or str(table) for table in tables)
+    )
+
+
+def _join_edge(
+    left_table: Any,
+    left_column: Any,
+    right_table: Any,
+    right_column: Any,
+    *,
+    source: str,
+) -> dict[str, str] | None:
+    left_table_key = _short_table_key(str(left_table or ""))
+    right_table_key = _short_table_key(str(right_table or ""))
+    if not left_table_key or not right_table_key or left_table_key == right_table_key:
+        return None
+    return {
+        "left_table": left_table_key,
+        "left_column": str(left_column or "").strip().lower(),
+        "right_table": right_table_key,
+        "right_column": str(right_column or "").strip().lower(),
+        "source": source,
+    }
+
+
+def _dedupe_join_edges(edges: Iterable[dict[str, str]]) -> tuple[dict[str, str], ...]:
+    seen: set[tuple[str, str, str, str]] = set()
+    out: list[dict[str, str]] = []
+    for edge in edges:
+        key = (
+            edge.get("left_table", ""),
+            edge.get("left_column", ""),
+            edge.get("right_table", ""),
+            edge.get("right_column", ""),
+        )
+        reverse = (key[2], key[3], key[0], key[1])
+        if key in seen or reverse in seen:
+            continue
+        seen.add(key)
+        out.append(edge)
+    return tuple(out)
+
+
+def _catalog_relationship_edges(
+    planning_context: dict[str, Any],
+) -> tuple[tuple[dict[str, str], ...], list[dict[str, str]]]:
+    edges: list[dict[str, str]] = []
+    refs: list[dict[str, str]] = []
+    for detail in planning_context.get("relationship_evidence_details", []) or []:
+        if not isinstance(detail, dict):
+            continue
+        if detail.get("accepted", True) is not True:
+            continue
+        if detail.get("owner") != "catalog":
+            continue
+        if detail.get("kind", "schema.relationship_path") != "schema.relationship_path":
+            continue
+        ref = {
+            "id": str(detail.get("id") or ""),
+            "kind": "schema.relationship_path",
+            "owner": "catalog",
+        }
+        if detail.get("payload_fingerprint"):
+            ref["payload_fingerprint"] = str(detail["payload_fingerprint"])
+        refs.append(ref)
+        payload = (
+            detail.get("payload") if isinstance(detail.get("payload"), dict) else detail
+        )
+        if payload.get("reachable") is False:
+            continue
+        for path in payload.get("paths", []) or []:
+            if not isinstance(path, dict):
+                continue
+            for join in path.get("joins", []) or path.get("relationships", []) or []:
+                if not isinstance(join, dict):
+                    continue
+                edge = _join_edge(
+                    join.get("left_table")
+                    or join.get("left_asset")
+                    or join.get("source_table")
+                    or join.get("source_asset"),
+                    join.get("left_column")
+                    or join.get("left_field")
+                    or join.get("source_column")
+                    or join.get("source_field"),
+                    join.get("right_table")
+                    or join.get("right_asset")
+                    or join.get("target_table")
+                    or join.get("target_asset"),
+                    join.get("right_column")
+                    or join.get("right_field")
+                    or join.get("target_column")
+                    or join.get("target_field"),
+                    source="schema.relationship_path",
+                )
+                if edge is not None:
+                    edges.append(edge)
+    return _dedupe_join_edges(edges), refs
+
+
+def _relationship_edge_matches(
+    required: dict[str, str],
+    evidence: dict[str, str],
+) -> bool:
+    if _relationship_edge_matches_direction(required, evidence):
+        return True
+    reversed_required = {
+        "left_table": required["right_table"],
+        "left_column": required.get("right_column", ""),
+        "right_table": required["left_table"],
+        "right_column": required.get("left_column", ""),
+    }
+    return _relationship_edge_matches_direction(reversed_required, evidence)
+
+
+def _relationship_edge_matches_direction(
+    required: dict[str, str],
+    evidence: dict[str, str],
+) -> bool:
+    if required["left_table"] != evidence["left_table"]:
+        return False
+    if required["right_table"] != evidence["right_table"]:
+        return False
+    left_column = required.get("left_column", "")
+    right_column = required.get("right_column", "")
+    if left_column and left_column != evidence.get("left_column", ""):
+        return False
+    if right_column and right_column != evidence.get("right_column", ""):
+        return False
+    return True
+
+
+def _join_edge_label(edge: dict[str, str]) -> str:
+    left = edge["left_table"]
+    right = edge["right_table"]
+    if edge.get("left_column") and edge.get("right_column"):
+        left = f"{left}.{edge['left_column']}"
+        right = f"{right}.{edge['right_column']}"
+    return f"{left}->{right}"
 
 
 def _validate_db_memory_semantics(

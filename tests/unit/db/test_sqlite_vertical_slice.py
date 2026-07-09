@@ -1026,7 +1026,7 @@ async def test_planning_context_value_hints_profile_catalog_target_before_contex
             compilation.task_specs,
             contract=compilation.compiled_contract_snapshot,
         )
-        for task in plan.tasks[:3]:
+        for task in plan.tasks[:4]:
             await runtime.execute_task(task, operation)
         evidence = await runtime.store.list_evidence(operation.id)
         tasks = await runtime.store.list_tasks(operation.id)
@@ -1037,6 +1037,7 @@ async def test_planning_context_value_hints_profile_catalog_target_before_contex
     assert compilation.rejected_action_summaries == ()
     assert [spec.capability_id for spec in compilation.task_specs] == [
         "db.schema.inspect",
+        "catalog.schema.search",
         "catalog.value_grounding.plan",
         "catalog.column_value_hints.resolve",
         "db.planning.context.build",

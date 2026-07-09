@@ -36,9 +36,10 @@ async def test_relationship_path_action_requires_structured_assets():
         await runtime.teardown()
 
     assert compilation.task_specs == ()
-    assert {
-        item["error"] for item in compilation.rejected_action_summaries
-    } == {"missing_from_assets", "missing_to_assets"}
+    assert {item["error"] for item in compilation.rejected_action_summaries} == {
+        "missing_from_assets",
+        "missing_to_assets",
+    }
 
 
 async def test_relationship_path_action_normalizes_common_metadata_pair():
@@ -72,7 +73,7 @@ async def test_relationship_path_action_normalizes_common_metadata_pair():
     }
 
 
-async def test_relationship_path_action_infers_explicit_request_pair():
+async def test_relationship_path_action_normalizes_explicit_input_pair():
     runtime = DbRuntime(plugins=(CatalogPlugin(auto_persist=False),))
     await runtime.setup(agent_id="agent-loop-live-hardening")
 
@@ -85,13 +86,14 @@ async def test_relationship_path_action_infers_explicit_request_pair():
                     DbPlannerAction(
                         action_id="find_join",
                         kind=DbPlannerActionKind.FIND_RELATIONSHIP_PATHS,
-                        input={"owner": "catalog"},
+                        input={
+                            "owner": "catalog",
+                            "tables": ["orders", "customers"],
+                        },
                     ),
                 ),
             ),
-            _loop_state(
-                prompt="Join orders to customers using their relationship"
-            ),
+            _loop_state(prompt="Find relationship paths for the selected assets"),
         )
     finally:
         await runtime.teardown()

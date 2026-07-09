@@ -10,9 +10,10 @@ from daita.db.context_projection import (
     project_session_context,
 )
 from daita.db.models import DbIntent, DbIntentKind
+from daita.db.planning_context import DbPlanningContextBuilder
 from daita.db.planner_protocol import DbPlannerDecision, DbPlannerDecisionStatus
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import Evidence, Operation, OperationStatus
+from daita.runtime import AccessMode, Evidence, Operation, OperationStatus
 
 
 class _BlockedPlanner:
@@ -189,6 +190,63 @@ def test_public_diagnostic_and_audit_evidence_projection_modes():
     assert "customers.loyalty_band" not in json.dumps(diagnostic[0].payload)
     assert diagnostic[0].payload["diagnostics"]["schema_table_count"] == 1
     assert audit[0].payload == raw.payload
+
+
+def test_data_query_planning_context_prefers_catalog_asset_evidence():
+    context = DbPlanningContextBuilder(DbRuntimeConfig()).build(
+        request=DbRequest(prompt="Show customer revenue", source_scope=("sqlite",)),
+        intent=DbIntent(
+            kind=DbIntentKind.DATA_QUERY,
+            confidence=1.0,
+            access=AccessMode.READ,
+        ),
+        operation=Operation(id="op-catalog-first", operation_type="data.query"),
+        schema_evidence=Evidence(
+            id="connector-schema",
+            kind="schema.asset_profile",
+            owner="sqlite",
+            accepted=True,
+            payload={
+                "database_type": "sqlite",
+                "tables": [
+                    {
+                        "name": "orders",
+                        "columns": [{"name": "id", "data_type": "INTEGER"}],
+                    }
+                ],
+            },
+            metadata={"payload_fingerprint": "fp-connector-schema"},
+        ),
+        catalog_evidence=(
+            Evidence(
+                id="catalog-customers",
+                kind="schema.asset_profile",
+                owner="catalog",
+                accepted=True,
+                payload={
+                    "success": True,
+                    "store_id": "store:sqlite",
+                    "asset": {"name": "customers", "asset_ref": "customers"},
+                    "fields": [
+                        {"name": "id", "type": "INTEGER"},
+                        {"name": "revenue", "type": "REAL"},
+                    ],
+                },
+                metadata={"payload_fingerprint": "fp-catalog-customers"},
+            ),
+        ),
+    )
+
+    assert context.diagnostics["structural_schema_source"] == "catalog"
+    assert [table["name"] for table in context.schema["tables"]] == ["customers"]
+    assert context.schema_evidence_refs == ("connector-schema",)
+    assert context.catalog_evidence_refs == ("catalog-customers",)
+    assert context.source_fingerprints == {
+        "connector-schema": "fp-connector-schema",
+        "catalog-customers": "fp-catalog-customers",
+    }
+    assert "orders" not in context.rendered_context
+    assert "customers" in context.rendered_context
 
 
 def test_public_projection_redacts_same_turn_repair_deferred_diagnostics():

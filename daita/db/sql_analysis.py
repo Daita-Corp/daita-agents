@@ -67,6 +67,13 @@ class SqlLiteralPredicate:
 
 
 @dataclass(frozen=True)
+class SqlColumnPredicate:
+    left: SqlColumnRef
+    operator: str
+    right: SqlColumnRef
+
+
+@dataclass(frozen=True)
 class SqlAnalysis:
     sql: str
     dialect: str
@@ -78,6 +85,7 @@ class SqlAnalysis:
     columns: tuple[SqlColumnRef, ...]
     select_items: tuple[SqlSelectItem, ...]
     literal_predicates: tuple[SqlLiteralPredicate, ...] = field(default_factory=tuple)
+    column_predicates: tuple[SqlColumnPredicate, ...] = field(default_factory=tuple)
     mutating_statement_types: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -132,6 +140,7 @@ def analyze_sql(sql: str, *, dialect: str = "") -> SqlAnalysis:
             columns=inner.columns,
             select_items=inner.select_items,
             literal_predicates=inner.literal_predicates,
+            column_predicates=inner.column_predicates,
             mutating_statement_types=inner.mutating_statement_types,
         )
 
@@ -155,6 +164,9 @@ def analyze_sql(sql: str, *, dialect: str = "") -> SqlAnalysis:
         select_items=select_items,
         literal_predicates=tuple(
             _literal_predicates(root, exp, alias_to_table, cte_names)
+        ),
+        column_predicates=tuple(
+            _column_predicates(root, exp, alias_to_table, cte_names)
         ),
         mutating_statement_types=mutating_types,
     )
@@ -422,6 +434,45 @@ def _literal_predicates(
             )
             if predicate is not None:
                 predicates.append(predicate)
+    return predicates
+
+
+def _column_predicates(
+    root: Any,
+    exp: Any,
+    alias_to_table: dict[str, SqlTableRef],
+    cte_names: set[str],
+) -> list[SqlColumnPredicate]:
+    predicates: list[SqlColumnPredicate] = []
+    binary_operators = (
+        (exp.EQ, "="),
+        (exp.NEQ, "!="),
+        (exp.GT, ">"),
+        (exp.GTE, ">="),
+        (exp.LT, "<"),
+        (exp.LTE, "<="),
+    )
+    for node in root.walk():
+        for klass, operator in binary_operators:
+            if not isinstance(node, klass):
+                continue
+            left_column = _column_expression(node.this, exp)
+            right_column = _column_expression(node.expression, exp)
+            if left_column is None or right_column is None:
+                break
+            left_ref, right_ref = _resolve_column_qualifiers(
+                (_sql_column_ref(left_column), _sql_column_ref(right_column)),
+                alias_to_table,
+                cte_names,
+            )
+            predicates.append(
+                SqlColumnPredicate(
+                    left=left_ref,
+                    operator=operator,
+                    right=right_ref,
+                )
+            )
+            break
     return predicates
 
 

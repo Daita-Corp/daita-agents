@@ -39,17 +39,18 @@ class DbPlanningContextExecutor:
             task.input.get("schema_evidence_id"),
         )
         if schema_evidence is None:
-            schema_evidence = await _latest_accepted_evidence(
+            schema_evidence = await _latest_accepted_schema_evidence(
                 runtime,
                 operation.id,
-                "schema.asset_profile",
             )
-        catalog_evidence = await _load_evidence_refs_or_latest(
+        catalog_evidence = await _load_catalog_evidence_refs_or_latest(
             runtime,
             operation.id,
             task.input.get("catalog_evidence_ids", ()),
             kinds=(
                 "catalog.source_registered",
+                "catalog.profile",
+                "schema.asset_profile",
                 "schema.search_result",
                 "schema.column_value_profile",
                 "schema.column_value_search_result",
@@ -125,6 +126,13 @@ class DbQueryPlanValidationExecutor:
             operation.id,
             task.input.get("planning_context_evidence_id"),
         )
+        if context_evidence is None:
+            context_evidence = await _load_dependency_evidence(
+                runtime,
+                operation.id,
+                task,
+                "planning.context",
+            )
         if plan_evidence is None or context_evidence is None:
             raise RuntimeError("plan and planning context evidence are required")
         plan = DbQueryPlan.from_mapping(
@@ -168,6 +176,39 @@ async def _load_evidence(
     return None
 
 
+async def _load_dependency_evidence(
+    runtime: Any,
+    operation_id: str,
+    task: Task,
+    kind: str,
+) -> Evidence | None:
+    for dependency in reversed(task.dependencies):
+        if dependency.kind.value != "evidence":
+            continue
+        if dependency.evidence_kind != kind:
+            continue
+        matches = [
+            evidence
+            for evidence in await runtime.store.list_evidence(operation_id)
+            if evidence.kind == kind
+            and evidence.accepted is dependency.evidence_accepted
+            and (
+                dependency.evidence_id is None or evidence.id == dependency.evidence_id
+            )
+            and (
+                dependency.evidence_owner is None
+                or evidence.owner == dependency.evidence_owner
+            )
+            and (
+                dependency.producer_task_id is None
+                or evidence.task_id == dependency.producer_task_id
+            )
+        ]
+        if matches:
+            return matches[-1]
+    return None
+
+
 async def _latest_accepted_evidence(
     runtime: Any,
     operation_id: str,
@@ -179,6 +220,21 @@ async def _latest_accepted_evidence(
         if evidence.kind == kind and evidence.accepted
     ]
     return matches[-1] if matches else None
+
+
+async def _latest_accepted_schema_evidence(
+    runtime: Any,
+    operation_id: str,
+) -> Evidence | None:
+    evidence = [
+        item
+        for item in await runtime.store.list_evidence(operation_id)
+        if item.kind == "schema.asset_profile" and item.accepted
+    ]
+    catalog = [item for item in evidence if item.owner == "catalog"]
+    if catalog:
+        return catalog[-1]
+    return evidence[-1] if evidence else None
 
 
 async def _load_evidence_refs_or_latest(
@@ -200,6 +256,26 @@ async def _load_evidence_refs_or_latest(
         return loaded
     evidence = await runtime.store.list_evidence(operation_id)
     return tuple(item for item in evidence if item.kind in kinds and item.accepted)
+
+
+async def _load_catalog_evidence_refs_or_latest(
+    runtime: Any,
+    operation_id: str,
+    evidence_ids: Any,
+    *,
+    kinds: tuple[str, ...],
+) -> tuple[Evidence, ...]:
+    evidence = await _load_evidence_refs_or_latest(
+        runtime,
+        operation_id,
+        evidence_ids,
+        kinds=kinds,
+    )
+    return tuple(
+        item
+        for item in evidence
+        if item.owner == "catalog" or item.kind.startswith("catalog.")
+    )
 
 
 def _planner_capability_summaries(runtime: Any) -> tuple[dict[str, Any], ...]:

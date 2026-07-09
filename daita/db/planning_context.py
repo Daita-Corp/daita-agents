@@ -42,6 +42,7 @@ class DbPlanningContext:
     schema_evidence_refs: tuple[str, ...] = ()
     catalog_evidence_refs: tuple[str, ...] = ()
     relationship_evidence_refs: tuple[str, ...] = ()
+    relationship_evidence_details: tuple[dict[str, Any], ...] = ()
     column_value_evidence_refs: tuple[str, ...] = ()
     column_value_hints: tuple[dict[str, Any], ...] = ()
     db_memory_refs: tuple[dict[str, Any], ...] = ()
@@ -75,6 +76,9 @@ class DbPlanningContext:
             "schema_evidence_refs": list(self.schema_evidence_refs),
             "catalog_evidence_refs": list(self.catalog_evidence_refs),
             "relationship_evidence_refs": list(self.relationship_evidence_refs),
+            "relationship_evidence_details": [
+                dict(item) for item in self.relationship_evidence_details
+            ],
             "column_value_evidence_refs": list(self.column_value_evidence_refs),
             "column_value_hints": [dict(item) for item in self.column_value_hints],
             "db_memory_refs": [dict(item) for item in self.db_memory_refs],
@@ -119,7 +123,20 @@ class DbPlanningContextBuilder:
         capability_summaries: tuple[dict[str, Any], ...] = (),
         source: Any = None,
     ) -> DbPlanningContext:
-        schema = dict(schema_evidence.payload) if schema_evidence is not None else {}
+        catalog_structural_evidence = _catalog_structural_evidence(
+            schema_evidence,
+            catalog_evidence,
+        )
+        relationship_details = _relationship_evidence_details(relationship_evidence)
+        schema = _schema_from_catalog_evidence(
+            catalog_structural_evidence,
+            relationship_evidence,
+        )
+        schema_source = "catalog" if schema else "connector"
+        if not schema:
+            schema = (
+                dict(schema_evidence.payload) if schema_evidence is not None else {}
+            )
         schema_fingerprint = structural_schema_fingerprint(schema)
         dialect = (
             str(
@@ -130,7 +147,7 @@ class DbPlanningContextBuilder:
             or None
         )
         options = _from_db_options(self.config.metadata)
-        source_evidence = tuple(
+        source_evidence = _dedupe_evidence(
             item
             for item in (schema_evidence, *catalog_evidence, *relationship_evidence)
             if item is not None and item.accepted
@@ -237,6 +254,11 @@ class DbPlanningContextBuilder:
             "column_value_hint_count": len(column_value_hints),
             "db_memory_ref_count": len(db_memory_refs),
             "db_memory_contract_count": len(db_memory_semantics),
+            "structural_schema_source": schema_source,
+            "catalog_structural_evidence_refs": [
+                item.id for item in catalog_structural_evidence if item.id
+            ],
+            "relationship_evidence_ref_count": len(relationship_details),
         }
         session_context = project_session_context(
             _compact_session_context(request),
@@ -254,6 +276,7 @@ class DbPlanningContextBuilder:
             schema_evidence_refs=_evidence_refs((schema_evidence,)),
             catalog_evidence_refs=_evidence_refs(catalog_evidence),
             relationship_evidence_refs=_evidence_refs(relationship_evidence),
+            relationship_evidence_details=relationship_details,
             column_value_evidence_refs=_evidence_refs(column_value_evidence),
             column_value_hints=column_value_hints,
             db_memory_refs=db_memory_refs,
@@ -322,6 +345,355 @@ class DbPlanningContextBuilder:
                 "payload_fingerprint": _fingerprint(context.to_payload()),
             },
         )
+
+
+def _catalog_structural_evidence(
+    schema_evidence: Evidence | None,
+    catalog_evidence: tuple[Evidence, ...],
+) -> tuple[Evidence, ...]:
+    evidence = []
+    for item in (schema_evidence, *catalog_evidence):
+        if item is None or not item.accepted:
+            continue
+        if item.owner != "catalog":
+            continue
+        if item.kind in {
+            "schema.asset_profile",
+            "schema.search_result",
+            "catalog.source_registered",
+            "catalog.profile",
+        }:
+            evidence.append(item)
+    return _dedupe_evidence(evidence)
+
+
+def _schema_from_catalog_evidence(
+    catalog_evidence: tuple[Evidence, ...],
+    relationship_evidence: tuple[Evidence, ...],
+) -> dict[str, Any]:
+    if not catalog_evidence:
+        return {}
+    tables: dict[str, dict[str, Any]] = {}
+    foreign_keys: list[dict[str, Any]] = []
+    database_type: str | None = None
+    database_name: str | None = None
+
+    for evidence in catalog_evidence:
+        payload = dict(evidence.payload)
+        database_type = database_type or _optional_string(payload.get("database_type"))
+        database_name = database_name or _optional_string(payload.get("database_name"))
+        schema = payload.get("schema")
+        if isinstance(schema, dict):
+            database_type = database_type or _optional_string(
+                schema.get("database_type")
+            )
+            database_name = database_name or _optional_string(
+                schema.get("database_name")
+            )
+            _merge_catalog_tables(tables, schema.get("tables"))
+            foreign_keys.extend(_foreign_keys_from_payload(schema))
+        if evidence.kind == "schema.asset_profile":
+            table = _table_from_asset_profile(payload)
+            if table is not None:
+                _merge_table(tables, table)
+            foreign_keys.extend(_foreign_keys_from_payload(payload))
+        elif evidence.kind == "schema.search_result":
+            _merge_catalog_tables(
+                tables, payload.get("tables") or payload.get("assets")
+            )
+        elif evidence.kind == "catalog.profile":
+            _merge_catalog_tables(
+                tables, payload.get("tables") or payload.get("assets")
+            )
+            foreign_keys.extend(_foreign_keys_from_payload(payload))
+
+    for evidence in relationship_evidence:
+        if evidence.accepted and evidence.owner == "catalog":
+            foreign_keys.extend(_foreign_keys_from_relationship_path(evidence))
+
+    if not tables and not foreign_keys:
+        return {}
+    for foreign_key in foreign_keys:
+        for table_name, column_name in (
+            (foreign_key.get("source_table"), foreign_key.get("source_column")),
+            (foreign_key.get("target_table"), foreign_key.get("target_column")),
+        ):
+            if not table_name:
+                continue
+            table = tables.setdefault(
+                str(table_name).lower(),
+                {"name": str(table_name), "columns": [], "metadata": {}},
+            )
+            if column_name:
+                _merge_column(table, {"name": column_name})
+    return {
+        "database_type": database_type,
+        "database_name": database_name,
+        "table_count": len(tables),
+        "tables": list(tables.values()),
+        "foreign_keys": _dedupe_foreign_keys(foreign_keys),
+        "metadata": {"structural_source": "catalog"},
+    }
+
+
+def _table_from_asset_profile(payload: dict[str, Any]) -> dict[str, Any] | None:
+    asset = payload.get("asset") if isinstance(payload.get("asset"), dict) else None
+    table = payload.get("table") if isinstance(payload.get("table"), dict) else None
+    source = table or asset
+    if source is None and payload.get("name"):
+        source = payload
+    if not isinstance(source, dict):
+        return None
+    name = _optional_string(
+        source.get("name")
+        or source.get("asset_ref")
+        or payload.get("table_name")
+        or payload.get("asset_ref")
+    )
+    if not name:
+        return None
+    columns = payload.get("fields") or payload.get("columns") or source.get("columns")
+    return {
+        "name": name,
+        "columns": [_column_from_catalog_field(item) for item in columns or ()],
+        "metadata": {
+            **dict(source.get("metadata") or {}),
+            "catalog_asset_ref": source.get("asset_ref") or name,
+        },
+    }
+
+
+def _merge_catalog_tables(
+    tables: dict[str, dict[str, Any]],
+    raw_tables: Any,
+) -> None:
+    if not isinstance(raw_tables, list):
+        return
+    for raw in raw_tables:
+        if not isinstance(raw, dict):
+            continue
+        name = _optional_string(raw.get("name") or raw.get("asset_ref"))
+        if not name:
+            continue
+        raw_columns = (
+            raw.get("columns") or raw.get("fields") or raw.get("matched_fields")
+        )
+        table = {
+            "name": name,
+            "columns": [_column_from_catalog_field(item) for item in raw_columns or ()],
+            "metadata": dict(raw.get("metadata") or {}),
+        }
+        _merge_table(tables, table)
+
+
+def _merge_table(
+    tables: dict[str, dict[str, Any]],
+    table: dict[str, Any],
+) -> None:
+    name = _optional_string(table.get("name"))
+    if not name:
+        return
+    key = name.lower()
+    existing = tables.setdefault(
+        key,
+        {"name": name, "columns": [], "metadata": {}},
+    )
+    existing["metadata"] = {
+        **dict(existing.get("metadata") or {}),
+        **dict(table.get("metadata") or {}),
+    }
+    for column in table.get("columns", []) or []:
+        _merge_column(existing, column)
+
+
+def _merge_column(table: dict[str, Any], column: dict[str, Any]) -> None:
+    name = _optional_string(column.get("name"))
+    if not name:
+        return
+    columns = table.setdefault("columns", [])
+    existing_names = {
+        str(item.get("name") or "").lower()
+        for item in columns
+        if isinstance(item, dict)
+    }
+    if name.lower() in existing_names:
+        return
+    columns.append(
+        {
+            "name": name,
+            "data_type": column.get("data_type") or column.get("type"),
+            "is_primary_key": column.get("is_primary_key"),
+        }
+    )
+
+
+def _column_from_catalog_field(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        "name": value.get("name"),
+        "data_type": value.get("data_type") or value.get("type"),
+        "is_primary_key": value.get("is_primary_key"),
+    }
+
+
+def _foreign_keys_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    foreign_keys = list(payload.get("foreign_keys", []) or [])
+    for relationship in payload.get("relationships", []) or []:
+        if not isinstance(relationship, dict):
+            continue
+        foreign_key = _foreign_key_from_relationship(relationship)
+        if foreign_key is not None:
+            foreign_keys.append(foreign_key)
+    return [
+        item
+        for item in (_compact_foreign_key(item) for item in foreign_keys)
+        if item is not None
+    ]
+
+
+def _foreign_keys_from_relationship_path(evidence: Evidence) -> list[dict[str, Any]]:
+    foreign_keys: list[dict[str, Any]] = []
+    for path in evidence.payload.get("paths", []) or []:
+        if not isinstance(path, dict):
+            continue
+        for join in path.get("joins", []) or path.get("relationships", []) or []:
+            if not isinstance(join, dict):
+                continue
+            foreign_key = _foreign_key_from_relationship(join)
+            if foreign_key is not None:
+                foreign_keys.append(
+                    {
+                        **foreign_key,
+                        "metadata": {
+                            "relationship_evidence_id": evidence.id,
+                            "relationship_evidence_owner": evidence.owner,
+                        },
+                    }
+                )
+    return foreign_keys
+
+
+def _foreign_key_from_relationship(value: dict[str, Any]) -> dict[str, Any] | None:
+    source_table = _optional_string(
+        value.get("source_table")
+        or value.get("source_asset")
+        or value.get("left_table")
+        or value.get("left_asset")
+    )
+    source_column = _optional_string(
+        value.get("source_column")
+        or value.get("source_field")
+        or value.get("left_column")
+        or value.get("left_field")
+    )
+    target_table = _optional_string(
+        value.get("target_table")
+        or value.get("target_asset")
+        or value.get("right_table")
+        or value.get("right_asset")
+    )
+    target_column = _optional_string(
+        value.get("target_column")
+        or value.get("target_field")
+        or value.get("right_column")
+        or value.get("right_field")
+    )
+    if not all((source_table, source_column, target_table, target_column)):
+        return None
+    return {
+        "source_table": source_table,
+        "source_column": source_column,
+        "target_table": target_table,
+        "target_column": target_column,
+    }
+
+
+def _compact_foreign_key(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    foreign_key = _foreign_key_from_relationship(value)
+    if foreign_key is None:
+        return None
+    if isinstance(value.get("metadata"), dict):
+        foreign_key["metadata"] = dict(value["metadata"])
+    return foreign_key
+
+
+def _dedupe_foreign_keys(values: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str, str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for value in values:
+        key = (
+            str(value.get("source_table") or "").lower(),
+            str(value.get("source_column") or "").lower(),
+            str(value.get("target_table") or "").lower(),
+            str(value.get("target_column") or "").lower(),
+        )
+        if not all(key) or key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
+
+
+def _relationship_evidence_details(
+    relationship_evidence: tuple[Evidence, ...],
+) -> tuple[dict[str, Any], ...]:
+    details = []
+    for evidence in relationship_evidence:
+        if not evidence.accepted or evidence.kind != "schema.relationship_path":
+            continue
+        details.append(
+            {
+                "id": evidence.id,
+                "kind": evidence.kind,
+                "owner": evidence.owner,
+                "task_id": evidence.task_id,
+                "accepted": evidence.accepted,
+                "payload_fingerprint": evidence.metadata.get("payload_fingerprint")
+                or _fingerprint(evidence.payload),
+                "reachable": evidence.payload.get("reachable"),
+                "paths": [
+                    {
+                        "tables": list(path.get("tables") or path.get("assets") or []),
+                        "joins": [
+                            dict(join)
+                            for join in path.get("joins", []) or []
+                            if isinstance(join, dict)
+                        ],
+                    }
+                    for path in evidence.payload.get("paths", []) or []
+                    if isinstance(path, dict)
+                ],
+            }
+        )
+    return tuple(details)
+
+
+def _dedupe_evidence(values: Iterable[Evidence]) -> tuple[Evidence, ...]:
+    seen: set[str] = set()
+    out: list[Evidence] = []
+    for evidence in values:
+        key = evidence.id or _fingerprint(
+            {
+                "kind": evidence.kind,
+                "owner": evidence.owner,
+                "payload": evidence.payload,
+            }
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(evidence)
+    return tuple(out)
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _compact_schema(schema: dict[str, Any]) -> dict[str, Any]:

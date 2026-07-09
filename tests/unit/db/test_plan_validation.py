@@ -75,6 +75,15 @@ def _relationship_planning_context():
             ],
         },
     ]
+    context["relationship_evidence_details"] = [
+        _relationship_evidence_detail(
+            "relationship-customers-regions",
+            "customers",
+            "region_id",
+            "regions",
+            "id",
+        )
+    ]
     return context
 
 
@@ -99,7 +108,46 @@ def _order_refund_planning_context():
             ],
         },
     ]
+    context["relationship_evidence_details"] = [
+        _relationship_evidence_detail(
+            "relationship-orders-refunds",
+            "refunds",
+            "order_id",
+            "orders",
+            "id",
+        )
+    ]
     return context
+
+
+def _relationship_evidence_detail(
+    evidence_id,
+    left_table,
+    left_column,
+    right_table,
+    right_column,
+):
+    return {
+        "id": evidence_id,
+        "kind": "schema.relationship_path",
+        "owner": "catalog",
+        "accepted": True,
+        "payload_fingerprint": f"fp-{evidence_id}",
+        "reachable": True,
+        "paths": [
+            {
+                "tables": [left_table, right_table],
+                "joins": [
+                    {
+                        "left_table": left_table,
+                        "left_column": left_column,
+                        "right_table": right_table,
+                        "right_column": right_column,
+                    }
+                ],
+            }
+        ],
+    }
 
 
 def _board_revenue_context():
@@ -405,6 +453,83 @@ def test_plan_mapping_accepts_llm_join_key_aliases():
     assert plan.joins[0].right_column == "order_id"
     assert validation.valid is True
     assert validation.accepted_sql == sql
+
+
+def test_join_sql_without_relationship_evidence_fails_query_plan_validation():
+    sql = (
+        "SELECT COUNT(DISTINCT r.order_id) AS refunded_orders, "
+        "COUNT(DISTINCT o.id) AS total_orders "
+        "FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"
+    )
+    plan = DbQueryPlan.from_mapping(
+        {
+            "operation": "read",
+            "selected_sql": sql,
+            "selected_tables": ["orders", "refunds"],
+            "joins": [
+                {
+                    "left_table": "orders",
+                    "right_table": "refunds",
+                    "left_key": "orders.id",
+                    "right_key": "refunds.order_id",
+                }
+            ],
+            "confidence": 0.96,
+        }
+    )
+    context = _order_refund_planning_context()
+    context["relationship_evidence_details"] = []
+
+    validation = DbQueryPlanValidator().validate(plan, context)
+
+    assert validation.valid is False
+    assert validation.accepted_sql is None
+    assert (
+        "missing_catalog_relationship_path:orders.id->refunds.order_id"
+        in validation.errors
+    )
+    assert validation.validation_facts[-1] == {
+        "kind": "missing_catalog_relationship_path",
+        "left_table": "orders",
+        "right_table": "refunds",
+        "source": "query_plan_join",
+        "reason": "joined_data_query_without_catalog_relationship_evidence",
+        "left_column": "id",
+        "right_column": "order_id",
+    }
+
+
+def test_accepted_relationship_evidence_allows_matching_join():
+    sql = (
+        "SELECT COUNT(DISTINCT r.order_id) AS refunded_orders, "
+        "COUNT(DISTINCT o.id) AS total_orders "
+        "FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"
+    )
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql=sql,
+        selected_tables=("orders", "refunds"),
+        confidence=0.96,
+    )
+
+    validation = DbQueryPlanValidator().validate(
+        plan,
+        _order_refund_planning_context(),
+    )
+
+    assert validation.valid is True
+    assert validation.accepted_sql == sql
+    relationship_validation = validation.metadata["catalog_relationship_validation"]
+    assert relationship_validation["checked"] is True
+    assert relationship_validation["passed"] is True
+    assert relationship_validation["relationship_evidence_refs"] == [
+        {
+            "id": "relationship-orders-refunds",
+            "kind": "schema.relationship_path",
+            "owner": "catalog",
+            "payload_fingerprint": "fp-relationship-orders-refunds",
+        }
+    ]
 
 
 def test_validator_rejects_board_revenue_missing_ref_filter_aggregation_and_shape():
