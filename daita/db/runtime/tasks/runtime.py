@@ -13,33 +13,23 @@ from daita.runtime import (
     ApprovalStatus,
     Capability,
     Evidence,
-    GovernanceResult,
     Operation,
-    RuntimeKernelExecutorFailed,
-    RuntimeKernelGovernanceBlocked,
-    RuntimeKernelLeaseLost,
-    RuntimeKernelTaskAlreadyTerminal,
-    RuntimeKernelTaskNotRunnable,
     Task,
     TaskDependency,
     TaskStatus,
 )
 
 from ...models import DbIntent, DbIntentKind
-from ...session_context import session_query_scope_evidence_for
 from ...sql_evidence import blocked_scope_resources, sql_validation_facts_from_evidence
-from ..types import (
-    _DEFAULT_TASK_LEASE_SECONDS,
-    DbRuntimeGovernanceBlocked,
-    DbRuntimeTaskNotRunnable,
-)
 from .common import (
     _evidence_payload_fingerprint,
     _payload_contains,
     _payload_fingerprint,
     _stable_hash,
 )
+from .execution import DbRuntimeTaskExecutionMixin
 from .planning import DbRuntimeTaskPlanningMixin
+from .readiness import DbRuntimeTaskReadinessMixin
 
 _CATALOG_COLUMN_VALUE_GROUNDING_REASON = "catalog_column_value_grounding"
 _SOURCE_OWNER_KEYS = (
@@ -55,267 +45,11 @@ _SOURCE_OWNER_OPTION_KEYS = (
 )
 
 
-class DbRuntimeTasksMixin(DbRuntimeTaskPlanningMixin):
-    async def execute_task(
-        self,
-        task: Task,
-        operation: Operation,
-        context: dict[str, Any] | None = None,
-    ) -> tuple[Evidence, ...]:
-        """Execute one runtime task through the shared runtime kernel."""
-        capability = self._capability_for_task(task)
-        if capability.executor != task.executor_id:
-            raise ValueError(
-                f"task executor {task.executor_id!r} does not match capability "
-                f"{task.capability_id!r} executor {capability.executor!r}"
-            )
-        stored_task = await self.store.load_task(task.id)
-        if stored_task is None:
-            task = replace(
-                task,
-                dependencies=task.dependencies
-                or _task_dependencies_for_capability(operation, capability),
-            )
-            task = await self._plan_kernel_task(task)
-        elif (
-            stored_task.status is TaskStatus.PENDING and stored_task.input != task.input
-        ):
-            task = replace(
-                stored_task,
-                input=task.input,
-                dependencies=task.dependencies or stored_task.dependencies,
-                metadata={
-                    **stored_task.metadata,
-                    **{
-                        key: value
-                        for key, value in task.metadata.items()
-                        if key in {"owner", "reason"}
-                    },
-                },
-            )
-            await self.store.save_task(task)
-        else:
-            task = stored_task
-        default_dependencies = _task_dependencies_for_capability(operation, capability)
-        if not task.dependencies and default_dependencies:
-            task = replace(task, dependencies=default_dependencies)
-            await self.store.save_task(task)
-        try:
-            result = await self.kernel.execute_task(
-                task.id,
-                context={
-                    "capability_owner": capability.owner,
-                    **(context or {}),
-                },
-                lease_owner=self.runtime_id,
-                lease_seconds=_DEFAULT_TASK_LEASE_SECONDS,
-            )
-        except RuntimeKernelGovernanceBlocked as exc:
-            result = exc.result
-            raise DbRuntimeGovernanceBlocked(
-                operation=result.operation if result is not None else operation,
-                task=result.task if result is not None else task,
-                governance=(
-                    result.governance
-                    if result is not None and result.governance is not None
-                    else GovernanceResult(False, True, False)
-                ),
-            ) from exc
-        except RuntimeKernelTaskAlreadyTerminal as exc:
-            result = exc.result
-            blocked_task = result.task if result is not None else task
-            raise DbRuntimeTaskNotRunnable(
-                blocked_task,
-                f"Task {blocked_task.id} is already {blocked_task.status.value}; "
-                "completed tasks are not replayed without explicit invalidation.",
-            ) from exc
-        except RuntimeKernelLeaseLost as exc:
-            result = exc.result
-            blocked_task = result.task if result is not None else task
-            raise DbRuntimeTaskNotRunnable(
-                blocked_task,
-                f"Task {blocked_task.id} lease was lost before commit.",
-            ) from exc
-        except RuntimeKernelTaskNotRunnable as exc:
-            result = exc.result
-            blocked_task = result.task if result is not None else task
-            readiness = (
-                result.events[-1].payload.get("readiness", {})
-                if result is not None and result.events
-                else {}
-            )
-            raise DbRuntimeTaskNotRunnable(
-                blocked_task,
-                str(exc),
-                readiness=readiness,
-            ) from exc
-        except RuntimeKernelExecutorFailed as exc:
-            raise (exc.__cause__ or exc) from exc
-        evidence = tuple(result.evidence)
-        scope_evidence = await self._session_query_scope_evidence_for_task(
-            task,
-            operation,
-            evidence,
-        )
-        if scope_evidence is not None:
-            evidence = (*evidence, scope_evidence)
-        return evidence
-
-    async def execute_capability(
-        self,
-        capability_id: str,
-        *,
-        owner: str | None = None,
-        operation_type: str,
-        input: dict[str, Any] | None = None,
-        operation_id: str | None = None,
-    ) -> tuple[Evidence, ...]:
-        """Create and execute a single task for one registered capability."""
-        if not self._is_setup:
-            await self.setup()
-        capability = self.registry.get_capability(capability_id, owner=owner)
-        output_evidence = capability.output_evidence
-        validation_capability = self._validation_capability_for_sql_execute(capability)
-        if (
-            capability.id
-            in {
-                "db.sql.execute_read",
-                "db.sql.execute_write",
-            }
-            and validation_capability is not None
-        ):
-            output_evidence = frozenset(
-                (
-                    *sorted(validation_capability.output_evidence),
-                    *sorted(output_evidence),
-                )
-            )
-        try:
-            operation = await self.kernel.create_operation(
-                operation_id=operation_id,
-                operation_type=operation_type,
-                request={
-                    "prompt": self._prompt_from_direct_input(input or {}),
-                    "input": input or {},
-                    "capability_id": capability.id,
-                    "capability_owner": capability.owner,
-                },
-                required_evidence=output_evidence,
-                metadata={
-                    "direct_capability_id": capability.id,
-                    "direct_capability_owner": capability.owner,
-                    "access": capability.access.value,
-                },
-                evaluate_governance=False,
-            )
-        except RuntimeKernelGovernanceBlocked as exc:
-            raise DbRuntimeGovernanceBlocked(
-                operation=exc.operation
-                or await self.store.load_operation(operation_id or ""),
-                task=None,
-                governance=exc.governance or GovernanceResult(False, True, False),
-            ) from exc
-        task_plans = self._direct_capability_tasks(
-            operation,
-            capability,
-            input or {},
-            validation_capability=validation_capability,
-        )
-        tasks = []
-        for task in task_plans:
-            tasks.append(await self._plan_kernel_task(task))
-        primary_task = tasks[-1]
-        if (
-            capability.id == "db.sql.execute_write"
-            and validation_capability is None
-            and not (input or {}).get("validated_evidence_id")
-        ):
-            blocked_task = await self.kernel.block_task(
-                primary_task.id,
-                message=(
-                    "Direct write execution requires db.sql.validate "
-                    "or a validated_evidence_id."
-                ),
-            )
-            await self.kernel.block_operation(
-                operation.id,
-                message=(
-                    "Direct write execution requires db.sql.validate "
-                    "or a validated_evidence_id."
-                ),
-            )
-            raise DbRuntimeTaskNotRunnable(
-                blocked_task,
-                "Direct write execution requires db.sql.validate or validated_evidence_id.",
-            )
-        try:
-            await self.kernel.evaluate_operation_governance(
-                operation.id,
-                capability=capability,
-            )
-        except RuntimeKernelGovernanceBlocked as exc:
-            await self.kernel.block_task(
-                primary_task.id,
-                message=f"Task {primary_task.id} blocked by operation governance.",
-                payload={
-                    "governance": (
-                        exc.governance.to_dict() if exc.governance is not None else {}
-                    )
-                },
-            )
-            raise DbRuntimeGovernanceBlocked(
-                operation=exc.operation or operation,
-                task=replace(primary_task, status=TaskStatus.BLOCKED),
-                governance=exc.governance or GovernanceResult(False, True, False),
-            ) from exc
-        try:
-            collected: list[Evidence] = []
-            for task in tasks:
-                collected.extend(await self.execute_task(task, operation))
-            evidence = tuple(collected)
-        except DbRuntimeGovernanceBlocked:
-            raise
-        except Exception as exc:
-            await self.kernel.fail_operation_if_active(operation.id, exc)
-            raise
-        await self.kernel.complete_operation(operation.id)
-        return evidence
-
-    async def _plan_kernel_task(self, task: Task) -> Task:
-        """Persist a DB-planned task through the shared kernel planner."""
-        return await self.kernel.plan_task(
-            task_id=task.id,
-            operation_id=task.operation_id,
-            capability_id=task.capability_id,
-            owner=str(task.metadata["owner"]) if task.metadata.get("owner") else None,
-            input=task.input,
-            metadata=task.metadata,
-            dependencies=task.dependencies,
-        )
-
-    async def _session_query_scope_evidence_for_task(
-        self,
-        task: Task,
-        operation: Operation,
-        task_evidence: tuple[Evidence, ...],
-    ) -> Evidence | None:
-        if task.capability_id != "db.sql.execute_read":
-            return None
-        if not any(
-            item.kind == "query.result" and item.accepted for item in task_evidence
-        ):
-            return None
-        operation_evidence = tuple(await self.store.list_evidence(operation.id))
-        scope_evidence = session_query_scope_evidence_for(
-            operation,
-            operation_evidence,
-            task_id=task.id,
-        )
-        if scope_evidence is None:
-            return None
-        await self.store.save_evidence(scope_evidence)
-        return scope_evidence
-
+class DbRuntimeTasksMixin(
+    DbRuntimeTaskExecutionMixin,
+    DbRuntimeTaskPlanningMixin,
+    DbRuntimeTaskReadinessMixin,
+):
     async def _persist_verification_result_evidence(
         self,
         operation: Operation,
@@ -465,97 +199,6 @@ class DbRuntimeTasksMixin(DbRuntimeTaskPlanningMixin):
             raise RuntimeError("answer.synthesis evidence was not produced")
         stored_task = await self.store.load_task(task.id)
         return synthesis, stored_task or task
-
-    async def _task_readiness(
-        self,
-        task: Task,
-        operation: Operation,
-    ) -> dict[str, Any]:
-        unsatisfied: list[dict[str, Any]] = []
-        for dependency in task.dependencies:
-            if dependency.kind.value == "evidence":
-                if not await self._evidence_dependency_satisfied(dependency, operation):
-                    unsatisfied.append(dependency.to_dict())
-            elif dependency.kind.value == "approval":
-                if not await self._approval_dependency_satisfied(dependency, operation):
-                    unsatisfied.append(dependency.to_dict())
-        return {
-            "ready": not unsatisfied,
-            "unsatisfied_dependencies": unsatisfied,
-            "dependency_count": len(task.dependencies),
-        }
-
-    async def _evidence_dependency_satisfied(
-        self,
-        dependency: TaskDependency,
-        operation: Operation,
-    ) -> bool:
-        operation_id = dependency.operation_id or operation.id
-        for evidence in await self.store.list_evidence(operation_id):
-            if evidence.kind != dependency.evidence_kind:
-                continue
-            if (
-                dependency.evidence_id is not None
-                and evidence.id != dependency.evidence_id
-            ):
-                continue
-            if (
-                dependency.evidence_owner is not None
-                and evidence.owner != dependency.evidence_owner
-            ):
-                continue
-            if (
-                dependency.producer_task_id is not None
-                and evidence.task_id != dependency.producer_task_id
-            ):
-                continue
-            if evidence.accepted is not dependency.evidence_accepted:
-                continue
-            if (
-                dependency.input_hash is not None
-                and evidence.metadata.get("task_input_hash") != dependency.input_hash
-            ):
-                continue
-            if _payload_contains(evidence.payload, dependency.evidence_payload):
-                if (
-                    dependency.payload_fingerprint is not None
-                    and dependency.payload_fingerprint
-                    != _evidence_payload_fingerprint(evidence)
-                ):
-                    continue
-                return True
-        return False
-
-    async def _approval_dependency_satisfied(
-        self,
-        dependency: TaskDependency,
-        operation: Operation,
-    ) -> bool:
-        operation_id = dependency.operation_id or operation.id
-        for approval in await self.store.list_approval_requests(operation_id):
-            if (
-                dependency.approval_id is not None
-                and approval.approval_id != dependency.approval_id
-            ):
-                continue
-            if (
-                dependency.approval_policy_id is not None
-                and approval.requested_by_policy_id != dependency.approval_policy_id
-            ):
-                continue
-            if (
-                dependency.approval_name is not None
-                and approval.proposed_action.get("approval") != dependency.approval_name
-            ):
-                continue
-            if (
-                dependency.approval_version is not None
-                and approval.metadata.get("version") != dependency.approval_version
-            ):
-                continue
-            if approval.status is dependency.approval_status:
-                return True
-        return False
 
     async def _executable_input_for_task(
         self,
@@ -1458,14 +1101,6 @@ class DbRuntimeTasksMixin(DbRuntimeTaskPlanningMixin):
         ]
         return matches[-1] if matches else None
 
-    async def task_readiness(
-        self,
-        task: Task,
-        operation: Operation,
-    ) -> dict[str, Any]:
-        """Return DB-owned dependency readiness for kernel task execution."""
-        return await self._task_readiness(task, operation)
-
     async def executable_input_for_task(
         self,
         task: Task,
@@ -1474,20 +1109,6 @@ class DbRuntimeTasksMixin(DbRuntimeTaskPlanningMixin):
         """Hydrate DB task input from authoritative validation evidence."""
         return await self._executable_input_for_task(task, operation)
 
-    def _capability_for_task(self, task: Task) -> Capability:
-        owner = task.metadata.get("owner") if task.metadata else None
-        if owner:
-            return self.registry.get_capability(task.capability_id, owner=str(owner))
-        try:
-            return self.registry.get_capability(task.capability_id)
-        except ValueError:
-            for capability in self.registry.capabilities:
-                if (
-                    capability.id == task.capability_id
-                    and capability.executor == task.executor_id
-                ):
-                    return capability
-            raise
 
 def _catalog_task_input_from_metadata(
     task: Task, operation: Operation
@@ -2316,6 +1937,7 @@ def _synthesis_context_option(
         except (TypeError, ValueError):
             return default
     return default
+
 
 def _combine_dependencies(
     default_dependencies: tuple[TaskDependency, ...],
