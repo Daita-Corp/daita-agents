@@ -44,6 +44,16 @@ class DbQueryPlanValidator:
             "passed": True,
             "errors": [],
         }
+        session_scope_validation = {
+            "checked": False,
+            "source_scope_id": None,
+            "source_operation_id": None,
+            "binding_status": None,
+            "required_filter_count": 0,
+            "required_join_count": 0,
+            "passed": True,
+            "errors": [],
+        }
         sql = plan.selected_sql
         analysis_for_relationships: Any | None = None
 
@@ -175,6 +185,23 @@ class DbQueryPlanValidator:
                     for item in planning_context.get("db_memory_semantics", []) or []
                     if isinstance(item, dict) and item.get("enforceable")
                 ]
+                session_errors, session_facts, session_metadata = (
+                    _validate_session_scope_binding(
+                        plan,
+                        planning_context,
+                        analysis,
+                        sql_tables,
+                    )
+                )
+                if session_errors:
+                    errors.extend(session_errors)
+                    validation_facts.extend(session_facts)
+                session_scope_validation.update(session_metadata)
+        elif plan.clarification_question:
+            session_metadata = _session_scope_binding_metadata(planning_context)
+            if session_metadata["checked"]:
+                session_metadata["binding_status"] = "clarification_requested"
+                session_scope_validation.update(session_metadata)
 
         relationship_errors, relationship_facts, relationship_metadata = (
             _validate_catalog_relationships(
@@ -202,6 +229,7 @@ class DbQueryPlanValidator:
                 "schema_fingerprint": planning_context.get("schema_fingerprint"),
                 "db_memory_contract_validation": db_memory_validation,
                 "catalog_relationship_validation": catalog_relationship_validation,
+                "session_scope_binding_validation": session_scope_validation,
             },
         )
 
@@ -908,6 +936,195 @@ def _validate_metric_contract(
                 f"missing_db_memory_required_result_shape:"
                 f"{memory_key}:single_aggregate"
             )
+
+
+def _validate_session_scope_binding(
+    plan: DbQueryPlan,
+    planning_context: dict[str, Any],
+    analysis: Any,
+    sql_tables: list[str],
+) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    metadata = _session_scope_binding_metadata(planning_context)
+    if not metadata["checked"]:
+        return [], [], metadata
+    binding = planning_context.get("session_scope_binding")
+    if not isinstance(binding, dict):
+        return [], [], metadata
+    status = str(binding.get("binding_status") or "").strip().lower()
+    if status and status not in {"bound", "accepted", "enforced", "required"}:
+        return [], [], metadata
+    if plan.operation != "read":
+        return [], [], metadata
+
+    errors: list[str] = []
+    facts: list[dict[str, Any]] = []
+    for required in _binding_required_filters(binding):
+        if _sql_contains_scope_filter(required, analysis, sql_tables):
+            continue
+        label = _scope_filter_label(required)
+        error = f"missing_session_scope_filter:{label}"
+        errors.append(error)
+        facts.append(
+            {
+                "kind": "missing_session_scope_filter",
+                "column": str(required.get("column") or required.get("ref") or ""),
+                "operator": _normalize_operator(required.get("operator")),
+                "values": list(_binding_filter_values(required)),
+                "source": "session.scope_binding",
+                "reason": "follow_up_sql_missing_bound_scope_filter",
+            }
+        )
+
+    sql_edges = _required_join_edges(plan, analysis)
+    for required in _binding_required_joins(binding):
+        if any(_relationship_edge_matches(required, edge) for edge in sql_edges):
+            continue
+        label = _join_edge_label(required)
+        error = f"missing_session_scope_join:{label}"
+        errors.append(error)
+        fact = {
+            "kind": "missing_session_scope_join",
+            "left_table": required["left_table"],
+            "right_table": required["right_table"],
+            "source": "session.scope_binding",
+            "reason": "follow_up_sql_missing_bound_scope_join",
+        }
+        if required.get("left_column"):
+            fact["left_column"] = required["left_column"]
+        if required.get("right_column"):
+            fact["right_column"] = required["right_column"]
+        facts.append(fact)
+
+    if errors:
+        metadata["passed"] = False
+        metadata["errors"] = list(errors)
+    return errors, facts, metadata
+
+
+def _session_scope_binding_metadata(
+    planning_context: dict[str, Any],
+) -> dict[str, Any]:
+    binding = planning_context.get("session_scope_binding")
+    metadata = {
+        "checked": isinstance(binding, dict),
+        "source_scope_id": None,
+        "source_operation_id": None,
+        "binding_status": None,
+        "required_filter_count": 0,
+        "required_join_count": 0,
+        "passed": True,
+        "errors": [],
+    }
+    if not isinstance(binding, dict):
+        return metadata
+    metadata.update(
+        {
+            "source_scope_id": binding.get("source_scope_id"),
+            "source_operation_id": binding.get("source_operation_id"),
+            "binding_status": binding.get("binding_status"),
+            "required_filter_count": len(_binding_required_filters(binding)),
+            "required_join_count": len(_binding_required_joins(binding)),
+        }
+    )
+    return metadata
+
+
+def _binding_required_filters(binding: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    filters = []
+    for item in binding.get("required_filters", ()) or ():
+        if not isinstance(item, dict):
+            continue
+        column = str(item.get("column") or item.get("ref") or "").strip()
+        operator = str(item.get("operator") or item.get("op") or "").strip()
+        values = _binding_filter_values(item)
+        if column and operator and values:
+            filters.append(
+                {
+                    "column": column,
+                    "operator": operator,
+                    "values": list(values),
+                }
+            )
+    return tuple(filters)
+
+
+def _binding_required_joins(binding: dict[str, Any]) -> tuple[dict[str, str], ...]:
+    joins = []
+    for item in binding.get("required_joins", ()) or ():
+        if not isinstance(item, dict):
+            continue
+        edge = _join_edge(
+            item.get("left_table") or item.get("source_table"),
+            item.get("left_column") or item.get("source_column"),
+            item.get("right_table") or item.get("target_table"),
+            item.get("right_column") or item.get("target_column"),
+            source="session.scope_binding",
+        )
+        if edge is not None:
+            joins.append(edge)
+    return _dedupe_join_edges(joins)
+
+
+def _sql_contains_scope_filter(
+    required: dict[str, Any],
+    analysis: Any,
+    sql_tables: list[str],
+) -> bool:
+    required_table, required_column = _split_column_ref(str(required.get("column")))
+    required_operator = _normalize_operator(required.get("operator"))
+    required_values = set(_binding_filter_values(required))
+    if not required_values:
+        return False
+    for predicate in getattr(analysis, "literal_predicates", ()) or ():
+        predicate_column = getattr(predicate, "column", None)
+        predicate_table = str(getattr(predicate_column, "table", "") or "") or None
+        predicate_column_name = str(getattr(predicate_column, "name", "") or "")
+        if required_column.lower() != predicate_column_name.lower():
+            continue
+        if not _tables_match(required_table, predicate_table, sql_tables):
+            continue
+        predicate_operator = _normalize_operator(getattr(predicate, "operator", ""))
+        if not _scope_operator_matches(required_operator, predicate_operator):
+            continue
+        predicate_values = {
+            str(value).lower() for value in getattr(predicate, "values", ()) or ()
+        }
+        if {value.lower() for value in required_values} <= predicate_values:
+            return True
+    return False
+
+
+def _scope_operator_matches(required: str, actual: str) -> bool:
+    if required == actual:
+        return True
+    if required == "=" and actual == "in":
+        return True
+    if required == "in" and actual == "=":
+        return True
+    return False
+
+
+def _binding_filter_values(filter_spec: dict[str, Any]) -> tuple[str, ...]:
+    raw = (
+        filter_spec.get("values")
+        if "values" in filter_spec
+        else filter_spec.get("value")
+    )
+    if raw is None:
+        return ()
+    if isinstance(raw, (list, tuple, set)):
+        values = raw
+    else:
+        values = (raw,)
+    return tuple(str(item).lower() for item in values if item is not None)
+
+
+def _scope_filter_label(filter_spec: dict[str, Any]) -> str:
+    values = ",".join(_binding_filter_values(filter_spec))
+    return (
+        f"{filter_spec.get('column')}"
+        f"{_normalize_operator(filter_spec.get('operator'))}{values}"
+    )
 
 
 def _validate_unit_contract(

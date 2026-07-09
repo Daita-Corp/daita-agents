@@ -10,6 +10,7 @@ from daita.runtime import Evidence, Operation, Task
 from ...plan_validation import DbQueryPlanValidator
 from ...planning_context import DbPlanningContextBuilder, _evidence_ref
 from ...query_plan import DbQueryPlan
+from ...session_context import session_scope_binding_evidence_for
 
 
 @dataclass(frozen=True)
@@ -158,17 +159,36 @@ class DbQueryPlanValidationExecutor:
             )
         if plan_evidence is None or context_evidence is None:
             raise RuntimeError("plan and planning context evidence are required")
-        plan = DbQueryPlan.from_mapping(
+        plan_payload = (
             plan_evidence.payload.get("structured_plan") or plan_evidence.payload
         )
-        validation = DbQueryPlanValidator().validate(plan, context_evidence.payload)
+        plan = DbQueryPlan.from_mapping(plan_payload)
+        binding = session_scope_binding_evidence_for(
+            operation,
+            plan,
+            context_evidence.payload,
+            plan_payload=plan_payload if isinstance(plan_payload, Mapping) else None,
+            task_id=task.id,
+        )
+        validation_context = dict(context_evidence.payload)
+        if binding is not None:
+            validation_context["session_scope_binding"] = dict(binding.payload)
+        validation = DbQueryPlanValidator().validate(plan, validation_context)
         payload = {
             **validation.to_dict(),
             "plan_evidence_id": plan_evidence.id,
             "planning_context_evidence_id": context_evidence.id,
             "schema_fingerprint": context_evidence.payload.get("schema_fingerprint"),
         }
-        return [
+        if binding is not None:
+            payload["session_scope_binding_evidence_id"] = binding.id
+            payload["session_scope_binding_fingerprint"] = binding.metadata.get(
+                "payload_fingerprint"
+            )
+        evidence = []
+        if binding is not None:
+            evidence.append(binding)
+        evidence.append(
             Evidence(
                 kind="query.plan.validation",
                 owner="db_runtime",
@@ -183,7 +203,8 @@ class DbQueryPlanValidationExecutor:
                     "sql_fingerprint": validation.sql_fingerprint,
                 },
             )
-        ]
+        )
+        return evidence
 
 
 async def _load_evidence(

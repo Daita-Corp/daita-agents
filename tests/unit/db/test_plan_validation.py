@@ -44,6 +44,24 @@ def _planning_context():
     }
 
 
+def _session_scope_binding_context():
+    context = _planning_context()
+    context["session_scope_binding"] = {
+        "binding_status": "bound",
+        "source_scope_id": "scope-orders-complete",
+        "source_operation_id": "op-prior",
+        "required_filters": [
+            {
+                "column": "orders.status",
+                "operator": "=",
+                "values": ["complete"],
+            }
+        ],
+        "required_joins": [],
+    }
+    return context
+
+
 def _requires_grounding_fact(literal: str = "completed") -> dict[str, str]:
     return {
         "kind": "filter_literal_requires_grounding",
@@ -337,6 +355,89 @@ def test_validator_accepts_declared_filters_present_in_sql():
     assert validation.accepted_sql == plan.selected_sql
 
 
+def test_validator_rejects_follow_up_missing_required_scope_filter():
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql="SELECT SUM(total) AS total FROM orders LIMIT 10",
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(
+        plan,
+        _session_scope_binding_context(),
+    )
+
+    assert validation.valid is False
+    assert validation.accepted_sql is None
+    assert "missing_session_scope_filter:orders.status=complete" in validation.errors
+    assert {
+        "kind": "missing_session_scope_filter",
+        "column": "orders.status",
+        "operator": "=",
+        "values": ["complete"],
+        "source": "session.scope_binding",
+        "reason": "follow_up_sql_missing_bound_scope_filter",
+    } in validation.validation_facts
+    scope_validation = validation.metadata["session_scope_binding_validation"]
+    assert scope_validation["checked"] is True
+    assert scope_validation["passed"] is False
+    assert scope_validation["source_scope_id"] == "scope-orders-complete"
+
+
+def test_validator_accepts_follow_up_with_required_scope_filter():
+    sql = "SELECT SUM(total) AS total FROM orders WHERE status = 'complete' LIMIT 10"
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql=sql,
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(
+        plan,
+        _session_scope_binding_context(),
+    )
+
+    assert validation.valid is True
+    assert validation.accepted_sql == sql
+    scope_validation = validation.metadata["session_scope_binding_validation"]
+    assert scope_validation["checked"] is True
+    assert scope_validation["passed"] is True
+    assert scope_validation["required_filter_count"] == 1
+
+
+def test_validator_does_not_enforce_unbound_stateless_session_scope():
+    context = _planning_context()
+    context["session_context"] = {
+        "query_scopes": [
+            {
+                "operation_id": "op-prior",
+                "tables": ["orders"],
+                "filters": [
+                    {
+                        "column": "orders.status",
+                        "operator": "=",
+                        "values": ["complete"],
+                    }
+                ],
+            }
+        ]
+    }
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql="SELECT SUM(total) AS total FROM orders LIMIT 10",
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, context)
+
+    assert validation.valid is True
+    assert validation.accepted_sql == plan.selected_sql
+    assert validation.metadata["session_scope_binding_validation"]["checked"] is False
+
+
 def test_validator_matches_declared_filter_against_sql_alias():
     plan = DbQueryPlan(
         operation="read",
@@ -530,6 +631,81 @@ def test_accepted_relationship_evidence_allows_matching_join():
             "payload_fingerprint": "fp-relationship-orders-refunds",
         }
     ]
+
+
+def test_validator_rejects_follow_up_missing_required_scope_join():
+    context = _order_refund_planning_context()
+    context["session_scope_binding"] = {
+        "binding_status": "bound",
+        "source_scope_id": "scope-refunds",
+        "source_operation_id": "op-prior",
+        "required_filters": [],
+        "required_joins": [
+            {
+                "left_table": "refunds",
+                "left_column": "order_id",
+                "right_table": "orders",
+                "right_column": "id",
+            }
+        ],
+    }
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql="SELECT SUM(total) AS total FROM orders",
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, context)
+
+    assert validation.valid is False
+    assert "missing_session_scope_join:refunds.order_id->orders.id" in validation.errors
+    assert {
+        "kind": "missing_session_scope_join",
+        "left_table": "refunds",
+        "right_table": "orders",
+        "source": "session.scope_binding",
+        "reason": "follow_up_sql_missing_bound_scope_join",
+        "left_column": "order_id",
+        "right_column": "id",
+    } in validation.validation_facts
+
+
+def test_validator_accepts_follow_up_with_required_scope_join():
+    context = _order_refund_planning_context()
+    context["session_scope_binding"] = {
+        "binding_status": "bound",
+        "source_scope_id": "scope-refunds",
+        "source_operation_id": "op-prior",
+        "required_filters": [],
+        "required_joins": [
+            {
+                "left_table": "refunds",
+                "left_column": "order_id",
+                "right_table": "orders",
+                "right_column": "id",
+            }
+        ],
+    }
+    sql = (
+        "SELECT SUM(o.total) - COALESCE(SUM(r.amount), 0) AS net_total "
+        "FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"
+    )
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql=sql,
+        selected_tables=("orders", "refunds"),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, context)
+
+    assert validation.valid is True
+    assert validation.accepted_sql == sql
+    scope_validation = validation.metadata["session_scope_binding_validation"]
+    assert scope_validation["checked"] is True
+    assert scope_validation["required_join_count"] == 1
+    assert scope_validation["passed"] is True
 
 
 def test_validator_rejects_board_revenue_missing_ref_filter_aggregation_and_shape():

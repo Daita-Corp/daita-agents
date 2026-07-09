@@ -10,9 +10,13 @@ from daita.db.models import (
     DbOperationResult,
 )
 from daita.db.planning_context import DbPlanningContextBuilder
+from daita.db.query_plan import DbQueryPlan
+from daita.db.runtime.tasks import DbTaskSpec
 from daita.db.session_context import (
     DbSessionContextBuilder,
     db_session_context_from_request,
+    session_query_scope_evidence_for,
+    session_scope_binding_evidence_for,
 )
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import AccessMode, Evidence, Operation, OperationStatus
@@ -170,6 +174,240 @@ async def test_session_context_builder_collects_runtime_referents_and_diagnostic
         "runtime.evidence" in context.diagnostics["referent_sources"]["tables"].values()
     )
     assert "conversation_history" in context.diagnostics["sources"]
+
+
+def test_session_query_scope_evidence_captures_safe_runtime_facts():
+    operation = Operation(
+        id="op-scope",
+        operation_type="data.query",
+        request={"prompt": "Show enterprise customers", "session_id": "s1"},
+        metadata={"session_id": "s1"},
+    )
+    evidence = (
+        Evidence(
+            id="plan-scope",
+            kind="query.plan.proposal",
+            owner="db_runtime",
+            operation_id="op-scope",
+            accepted=True,
+            payload={
+                "sql": (
+                    "SELECT c.id, r.name AS region_name FROM customers c "
+                    "JOIN regions r ON c.region_id = r.id "
+                    "WHERE c.tier = 'enterprise'"
+                ),
+                "structured_plan": {
+                    "selected_tables": ["customers", "regions"],
+                    "selected_columns": ["customers.id", "regions.name"],
+                    "joins": [
+                        {
+                            "left_table": "customers",
+                            "left_column": "region_id",
+                            "right_table": "regions",
+                            "right_column": "id",
+                        }
+                    ],
+                    "filters": [
+                        {
+                            "column": "customers.tier",
+                            "operator": "=",
+                            "value": "enterprise",
+                        }
+                    ],
+                },
+            },
+        ),
+        Evidence(
+            id="sql-scope",
+            kind="sql.validation",
+            owner="sqlite",
+            operation_id="op-scope",
+            accepted=True,
+            payload={
+                "valid": True,
+                "sql": (
+                    "SELECT c.id, r.name AS region_name FROM customers c "
+                    "JOIN regions r ON c.region_id = r.id "
+                    "WHERE c.tier = 'enterprise'"
+                ),
+                "tables": ["customers", "regions"],
+            },
+        ),
+        Evidence(
+            id="result-scope",
+            kind="query.result",
+            owner="sqlite",
+            operation_id="op-scope",
+            accepted=True,
+            payload={"rows": [{"id": 1, "region_name": "NA"}]},
+        ),
+    )
+
+    scope = session_query_scope_evidence_for(operation, evidence, task_id="task-read")
+
+    assert scope is not None
+    assert scope.kind == "session.query_scope"
+    assert scope.owner == "db_runtime"
+    assert scope.task_id == "task-read"
+    assert scope.payload["source_operation_id"] == "op-scope"
+    assert {"customers", "regions"} <= set(scope.payload["tables"])
+    assert {
+        (
+            item["left_table"],
+            item["left_column"],
+            item["right_table"],
+            item["right_column"],
+        )
+        for item in scope.payload["joins"]
+    } >= {("customers", "region_id", "regions", "id")}
+    assert {
+        (item["column"], item["operator"], tuple(item["values"]))
+        for item in scope.payload["filters"]
+    } >= {("customers.tier", "=", ("enterprise",))}
+    assert "customers.id" in scope.payload["selected_columns"]
+    assert scope.payload["result_row_count"] == 1
+    assert scope.payload["scope_id"].startswith("session-scope-")
+
+
+async def test_stateful_read_execution_emits_session_query_scope():
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(config=DbRuntimeConfig(plugins=(sqlite,)))
+    await runtime.setup(agent_id="db-session-scope-test")
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO orders (id, status) VALUES (1, 'complete'), (2, 'pending');
+        """)
+
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Show complete orders",
+                "session_id": "stateful-scope",
+            },
+            metadata={"session_id": "stateful-scope"},
+            evaluate_governance=False,
+        )
+        plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.sql.validate",
+                    owner="sqlite",
+                    input={
+                        "sql": "SELECT id FROM orders WHERE status = 'complete'",
+                        "operation": "query",
+                    },
+                    sequence=1,
+                ),
+                DbTaskSpec(
+                    capability_id="db.sql.execute_read",
+                    owner="sqlite",
+                    input={"sql_ref": "sql.validation", "params": []},
+                    sequence=2,
+                ),
+            ),
+        )
+        for task in plan.tasks:
+            await runtime.execute_task(task, operation)
+        evidence = await runtime.store.list_evidence(operation.id)
+    finally:
+        await runtime.teardown()
+
+    scope = next(item for item in evidence if item.kind == "session.query_scope")
+    assert scope.payload["source_operation_id"] == operation.id
+    assert scope.payload["tables"] == ["orders"]
+    assert scope.payload["filters"] == [
+        {"column": "status", "operator": "=", "values": ["complete"]}
+    ]
+    assert scope.payload["result_row_count"] == 1
+
+
+def test_follow_up_with_prior_scope_emits_scope_binding():
+    operation = Operation(
+        id="op-follow-up",
+        operation_type="data.query",
+        request={"prompt": "Now total them", "session_id": "s1"},
+        metadata={"session_id": "s1"},
+    )
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql=(
+            "SELECT SUM(total) AS total FROM orders WHERE status = 'complete'"
+        ),
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+    binding = session_scope_binding_evidence_for(
+        operation,
+        plan,
+        {
+            "session_context": {
+                "query_scopes": [
+                    {
+                        "scope_id": "scope-prior",
+                        "operation_id": "op-prior",
+                        "tables": ["orders"],
+                        "filters": [
+                            {
+                                "column": "orders.status",
+                                "operator": "=",
+                                "values": ["complete"],
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+        task_id="task-validate",
+    )
+
+    assert binding is not None
+    assert binding.kind == "session.scope_binding"
+    assert binding.task_id == "task-validate"
+    assert binding.payload["source_scope_id"] == "scope-prior"
+    assert binding.payload["source_operation_id"] == "op-prior"
+    assert binding.payload["binding_status"] == "bound"
+    assert binding.payload["required_filters"] == [
+        {"column": "orders.status", "operator": "=", "values": ["complete"]}
+    ]
+
+
+def test_follow_up_without_required_scope_facts_does_not_emit_empty_binding():
+    operation = Operation(
+        id="op-follow-up",
+        operation_type="data.query",
+        request={"prompt": "Show another summary", "session_id": "s1"},
+        metadata={"session_id": "s1"},
+    )
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql="SELECT COUNT(*) AS count FROM orders",
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+
+    binding = session_scope_binding_evidence_for(
+        operation,
+        plan,
+        {
+            "session_context": {
+                "query_scopes": [
+                    {
+                        "scope_id": "scope-prior",
+                        "operation_id": "op-prior",
+                        "tables": ["orders"],
+                    }
+                ]
+            }
+        },
+        task_id="task-validate",
+    )
+
+    assert binding is None
 
 
 def test_planner_visible_session_context_redacts_blocked_columns():

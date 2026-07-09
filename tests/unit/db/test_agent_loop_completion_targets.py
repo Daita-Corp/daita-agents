@@ -1113,6 +1113,47 @@ async def test_planner_dag_missing_dependency_is_rejected_clearly():
     assert not await runtime.store.list_tasks(operation.id)
 
 
+async def test_prior_turn_action_dependency_uses_durable_task_summary():
+    first_turn = ScriptedPlanner(_inspect_schema_decision())
+    runtime, _ = await _runtime_with_planner(first_turn)
+    operation = await _bootstrap_run_operation(runtime, "dag-prior-action-target")
+    loop = DbAgentLoop(runtime, first_turn)
+    await loop.run(
+        operation,
+        safety_frame={"max_access": "read"},
+        max_turns=1,
+    )
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "read"},
+        turn=2,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "schema.query"},
+        actions=(
+            DbPlannerAction(
+                action_id="catalog",
+                kind=DbPlannerActionKind.SEARCH_SCHEMA,
+                input={"owner": OWNER, "query": "orders"},
+                depends_on=("schema",),
+            ),
+        ),
+    )
+
+    compilation = loop.compile_actions(decision, state)
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "catalog.schema.search"
+    ]
+    dependency = compilation.task_specs[0].dependencies[0]
+    assert dependency.metadata["durable_prior_action"] is True
+    assert dependency.metadata["producer_action_id"] == "schema"
+    assert dependency.producer_task_id
+
+
 async def test_planner_dag_cycle_is_rejected_clearly():
     runtime, _ = await _runtime_with_planner(ScriptedPlanner())
     operation = await _bootstrap_run_operation(runtime, "dag-cycle-target")

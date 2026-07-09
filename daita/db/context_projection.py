@@ -193,6 +193,7 @@ def project_session_query_scopes(
             )
             if item is not None
         ]
+        joins = _project_session_joins(scope.get("joins"), projection)
         selected_columns = [
             column
             for column in _string_list(scope.get("selected_columns"))
@@ -202,6 +203,11 @@ def project_session_query_scopes(
         item: dict[str, Any] = {}
         if (
             projection.mode is not ProjectionMode.PUBLIC_RESULT
+            and scope.get("scope_id") is not None
+        ):
+            item["scope_id"] = scope.get("scope_id")
+        if (
+            projection.mode is not ProjectionMode.PUBLIC_RESULT
             and scope.get("operation_id") is not None
         ):
             item["operation_id"] = scope.get("operation_id")
@@ -209,12 +215,14 @@ def project_session_query_scopes(
             item["tables"] = tables
         if filters:
             item["filters"] = filters
+        if joins:
+            item["joins"] = joins
         if selected_columns:
             item["selected_columns"] = selected_columns
         if isinstance(scope.get("result_row_count"), int):
             item["result_row_count"] = max(0, int(scope["result_row_count"]))
         if item and (
-            tables or filters or selected_columns or "result_row_count" in item
+            tables or filters or joins or selected_columns or "result_row_count" in item
         ):
             projected.append(item)
     return tuple(projected)
@@ -390,6 +398,46 @@ def _project_evidence_payload(
     elif evidence.kind == "planning.context":
         base["included_sections"] = list(payload.get("included_sections") or [])
         base["omitted_sections"] = list(payload.get("omitted_sections") or [])
+        memory_refs = project_memory_refs(
+            payload.get("db_memory_refs") or (),
+            projection,
+        )
+        if projection.mode is ProjectionMode.PUBLIC_RESULT:
+            memory_refs = tuple(
+                item
+                for item in memory_refs
+                if not (
+                    isinstance(item.get("projection"), Mapping)
+                    and item["projection"].get("redacted") is True
+                )
+            )
+        if memory_refs:
+            base["db_memory_refs"] = [dict(item) for item in memory_refs]
+        memory_semantics = project_memory_semantics(
+            payload.get("db_memory_semantics") or (),
+            projection,
+        )
+        if projection.mode is ProjectionMode.PUBLIC_RESULT:
+            memory_semantics = tuple(
+                item
+                for item in memory_semantics
+                if not (
+                    isinstance(item.get("projection"), Mapping)
+                    and item["projection"].get("redacted") is True
+                )
+            )
+        if memory_semantics:
+            base["db_memory_semantics"] = [dict(item) for item in memory_semantics]
+        memory_diagnostics = _project_memory_diagnostics(
+            payload.get("db_memory_diagnostics"),
+        )
+        if memory_diagnostics and memory_refs:
+            base["db_memory_diagnostics"] = memory_diagnostics
+        contract_diagnostics = _project_memory_contract_diagnostics(
+            payload.get("db_memory_contract_diagnostics"),
+        )
+        if contract_diagnostics and memory_semantics:
+            base["db_memory_contract_diagnostics"] = contract_diagnostics
         diagnostics = payload.get("diagnostics")
         if isinstance(diagnostics, Mapping):
             base["diagnostics"] = {
@@ -421,6 +469,9 @@ def _project_evidence_payload(
         results = payload.get("results")
         if isinstance(results, list):
             base["result_count"] = len(results)
+        diagnostics = _project_recall_diagnostics(payload.get("diagnostics"))
+        if diagnostics:
+            base["diagnostics"] = diagnostics
     elif evidence.kind == "db.memory.selection":
         base["raw_candidate_count"] = int(payload.get("raw_candidate_count") or 0)
         base["included_count"] = int(payload.get("included_count") or 0)
@@ -465,6 +516,79 @@ def _project_evidence_payload(
             applicability = payload.get("source_schema_applicability")
             if isinstance(applicability, Mapping):
                 base["source_schema_applicability"] = dict(applicability)
+    elif evidence.kind == "session.query_scope":
+        base["table_count"] = len(_string_list(payload.get("tables")))
+        base["filter_count"] = len(
+            [
+                item
+                for item in payload.get("filters", ()) or ()
+                if isinstance(item, Mapping)
+            ]
+        )
+        base["join_count"] = len(
+            [
+                item
+                for item in payload.get("joins", ()) or ()
+                if isinstance(item, Mapping)
+            ]
+        )
+        if isinstance(payload.get("result_row_count"), int):
+            base["result_row_count"] = max(0, int(payload["result_row_count"]))
+        if projection.mode is ProjectionMode.DIAGNOSTIC:
+            base["scope_id"] = payload.get("scope_id")
+            base["source_operation_id"] = payload.get(
+                "source_operation_id"
+            ) or payload.get("operation_id")
+            base["tables"] = [
+                table
+                for table in _string_list(payload.get("tables"))
+                if not _table_blocked(table, projection)
+            ]
+            base["filters"] = [
+                item
+                for item in (
+                    _project_session_filter(filter_item, projection)
+                    for filter_item in payload.get("filters", ()) or ()
+                )
+                if item is not None
+            ]
+            base["joins"] = _project_session_joins(payload.get("joins"), projection)
+    elif evidence.kind == "session.scope_binding":
+        filters = [
+            item
+            for item in payload.get("required_filters", ()) or ()
+            if isinstance(item, Mapping)
+        ]
+        joins = [
+            item
+            for item in payload.get("required_joins", ()) or ()
+            if isinstance(item, Mapping)
+        ]
+        omitted = [
+            item
+            for item in payload.get("omitted_unsafe_referents", ()) or ()
+            if isinstance(item, Mapping)
+        ]
+        base["required_filter_count"] = len(filters)
+        base["required_join_count"] = len(joins)
+        base["omitted_unsafe_referent_count"] = len(omitted)
+        if projection.mode is ProjectionMode.DIAGNOSTIC:
+            base["binding_status"] = payload.get("binding_status")
+            base["source_scope_id"] = payload.get("source_scope_id")
+            base["source_operation_id"] = payload.get("source_operation_id")
+            base["required_filters"] = [
+                item
+                for item in (
+                    _project_session_filter(filter_item, projection)
+                    for filter_item in filters
+                )
+                if item is not None
+            ]
+            base["required_joins"] = _project_session_joins(joins, projection)
+            base["omitted_unsafe_referents"] = [
+                {"reason": item.get("reason"), "count": item.get("count", 1)}
+                for item in omitted
+            ]
     elif evidence.kind == "schema.column_value_hint":
         hints = project_catalog_hints(
             payload.get("hints") or (),
@@ -510,6 +634,57 @@ def _project_evidence_payload(
     return base
 
 
+def _project_recall_diagnostics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        key: value[key]
+        for key in (
+            "retrieval_mode",
+            "embedding_available",
+            "structured_candidate_count",
+            "embedding_candidate_count",
+            "returned_count",
+            "limit",
+        )
+        if key in value
+    }
+
+
+def _project_memory_diagnostics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        key: value[key]
+        for key in (
+            "candidate_count",
+            "included_count",
+            "used_chars",
+            "char_budget",
+            "limit",
+            "score_threshold",
+            "omitted_reasons",
+        )
+        if key in value
+    }
+
+
+def _project_memory_contract_diagnostics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        key: value[key]
+        for key in (
+            "candidate_count",
+            "enforced_count",
+            "advisory_count",
+            "omitted_count",
+            "omitted_reasons",
+        )
+        if key in value
+    }
+
+
 def _project_session_referents(
     referents: Any,
     projection: ProjectionContext,
@@ -552,6 +727,42 @@ def _project_session_filter(
         "operator": str(value.get("operator") or "").strip(),
         "values": values,
     }
+
+
+def _project_session_joins(
+    value: Any,
+    projection: ProjectionContext,
+) -> list[dict[str, Any]]:
+    joins = value if isinstance(value, (list, tuple)) else []
+    projected = []
+    for item in joins:
+        if not isinstance(item, Mapping):
+            continue
+        left_table = str(item.get("left_table") or "").strip()
+        right_table = str(item.get("right_table") or "").strip()
+        left_column = str(item.get("left_column") or "").strip()
+        right_column = str(item.get("right_column") or "").strip()
+        if _table_blocked(left_table, projection) or _table_blocked(
+            right_table,
+            projection,
+        ):
+            continue
+        left_ref = f"{left_table}.{left_column}" if left_column else left_table
+        right_ref = f"{right_table}.{right_column}" if right_column else right_table
+        if _column_blocked_or_sensitive(
+            left_ref,
+            projection,
+        ) or _column_blocked_or_sensitive(right_ref, projection):
+            continue
+        projected.append(
+            {
+                "left_table": left_table,
+                **({"left_column": left_column} if left_column else {}),
+                "right_table": right_table,
+                **({"right_column": right_column} if right_column else {}),
+            }
+        )
+    return projected
 
 
 def _project_validation_items(

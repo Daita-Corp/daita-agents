@@ -79,6 +79,12 @@ class DbPlanningContext:
     schema_fingerprint: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
+        db_memory_diagnostics = _db_memory_selection_diagnostics(
+            self.db_memory_selection_artifact
+        )
+        db_memory_contract_diagnostics = _db_memory_contract_diagnostics(
+            self.db_memory_contracts_artifact
+        )
         return {
             "operation_id": self.operation_id,
             "prompt": self.prompt,
@@ -102,6 +108,8 @@ class DbPlanningContext:
             "db_memory_contracts_evidence_ref": dict(
                 self.db_memory_contracts_evidence_ref
             ),
+            "db_memory_diagnostics": db_memory_diagnostics,
+            "db_memory_contract_diagnostics": db_memory_contract_diagnostics,
             "source_evidence_refs": [dict(item) for item in self.source_evidence_refs],
             "source_fingerprints": dict(self.source_fingerprints),
             "capability_summaries": [dict(item) for item in self.capability_summaries],
@@ -456,6 +464,60 @@ class DbPlanningContextBuilder:
                 _evidence_ref(contracts_evidence) if contracts_evidence else {}
             ),
         )
+
+
+def _db_memory_selection_diagnostics(artifact: dict[str, Any]) -> dict[str, Any]:
+    if not artifact:
+        return {}
+    budget = artifact.get("budget_usage")
+    budget_usage = dict(budget) if isinstance(budget, dict) else {}
+    return {
+        "candidate_count": int(
+            artifact.get("raw_candidate_count")
+            or budget_usage.get("raw_candidate_count")
+            or 0
+        ),
+        "included_count": int(
+            artifact.get("included_count") or budget_usage.get("included_count") or 0
+        ),
+        "used_chars": int(budget_usage.get("used_chars") or 0),
+        "char_budget": int(budget_usage.get("char_budget") or 0),
+        "limit": int(budget_usage.get("limit") or 0),
+        "score_threshold": float(budget_usage.get("score_threshold") or 0.0),
+        "omitted_reasons": {
+            str(reason): int(count)
+            for reason, count in dict(
+                artifact.get("omitted_counts_by_reason") or {}
+            ).items()
+        },
+    }
+
+
+def _db_memory_contract_diagnostics(artifact: dict[str, Any]) -> dict[str, Any]:
+    if not artifact:
+        return {}
+    applicability = artifact.get("source_schema_applicability")
+    applicability = dict(applicability) if isinstance(applicability, dict) else {}
+    return {
+        "candidate_count": int(applicability.get("contract_candidate_count") or 0),
+        "enforced_count": int(
+            applicability.get("enforced_count")
+            if "enforced_count" in applicability
+            else len(artifact.get("enforceable_contracts") or ())
+        ),
+        "advisory_count": int(
+            applicability.get("advisory_count")
+            if "advisory_count" in applicability
+            else len(artifact.get("advisory_contracts") or ())
+        ),
+        "omitted_count": int(applicability.get("omitted_count") or 0),
+        "omitted_reasons": {
+            str(reason): int(count)
+            for reason, count in dict(
+                artifact.get("contract_omission_reasons") or {}
+            ).items()
+        },
+    }
 
 
 def _catalog_structural_evidence(

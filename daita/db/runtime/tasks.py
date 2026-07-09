@@ -27,6 +27,7 @@ from daita.runtime import (
 )
 
 from ..models import DbIntent, DbIntentKind, DbOperationContract
+from ..session_context import session_query_scope_evidence_for
 from ..sql_evidence import blocked_scope_resources, sql_validation_facts_from_evidence
 from .types import (
     _DEFAULT_TASK_LEASE_SECONDS,
@@ -220,7 +221,15 @@ class DbRuntimeTasksMixin:
             ) from exc
         except RuntimeKernelExecutorFailed as exc:
             raise (exc.__cause__ or exc) from exc
-        return result.evidence
+        evidence = tuple(result.evidence)
+        scope_evidence = await self._session_query_scope_evidence_for_task(
+            task,
+            operation,
+            evidence,
+        )
+        if scope_evidence is not None:
+            evidence = (*evidence, scope_evidence)
+        return evidence
 
     async def execute_capability(
         self,
@@ -353,6 +362,29 @@ class DbRuntimeTasksMixin:
             metadata=task.metadata,
             dependencies=task.dependencies,
         )
+
+    async def _session_query_scope_evidence_for_task(
+        self,
+        task: Task,
+        operation: Operation,
+        task_evidence: tuple[Evidence, ...],
+    ) -> Evidence | None:
+        if task.capability_id != "db.sql.execute_read":
+            return None
+        if not any(
+            item.kind == "query.result" and item.accepted for item in task_evidence
+        ):
+            return None
+        operation_evidence = tuple(await self.store.list_evidence(operation.id))
+        scope_evidence = session_query_scope_evidence_for(
+            operation,
+            operation_evidence,
+            task_id=task.id,
+        )
+        if scope_evidence is None:
+            return None
+        await self.store.save_evidence(scope_evidence)
+        return scope_evidence
 
     async def plan_task_specs(
         self,

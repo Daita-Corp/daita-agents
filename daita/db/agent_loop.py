@@ -840,7 +840,11 @@ class DbAgentLoop:
             resolved_actions.append(resolved_action)
         actions = resolved_actions
 
-        ordered_actions, dag_errors = _ordered_actions_or_errors(tuple(actions))
+        durable_action_summaries = _durable_action_task_summaries(state)
+        ordered_actions, dag_errors = _ordered_actions_or_errors(
+            tuple(actions),
+            external_dependency_ids=frozenset(durable_action_summaries),
+        )
         if dag_errors:
             rejected.extend(dag_errors)
 
@@ -854,6 +858,7 @@ class DbAgentLoop:
             planner_dependencies, dependency_errors = self._planner_dependency_specs(
                 action,
                 prior_action_specs=prior_action_specs,
+                durable_action_summaries=durable_action_summaries,
                 operation_id=state.operation_id,
             )
             if dependency_errors:
@@ -932,25 +937,30 @@ class DbAgentLoop:
         action: DbPlannerAction,
         *,
         prior_action_specs: Mapping[str, tuple[DbTaskSpec, ...]],
+        durable_action_summaries: Mapping[str, tuple[dict[str, Any], ...]],
         operation_id: str,
     ) -> tuple[tuple[TaskDependency, ...], tuple[dict[str, Any], ...]]:
         dependencies: list[TaskDependency] = []
         errors: list[dict[str, Any]] = []
         for dependency_action_id in dict.fromkeys(action.depends_on):
             producer_specs = prior_action_specs.get(dependency_action_id)
-            if not producer_specs:
-                errors.append(
-                    _action_error(
-                        action, f"dependency_not_durable:{dependency_action_id}"
-                    )
+            if producer_specs:
+                dependency = self._dependency_for_producer_specs(
+                    action,
+                    dependency_action_id=dependency_action_id,
+                    producer_specs=producer_specs,
+                    operation_id=operation_id,
                 )
-                continue
-            dependency = self._dependency_for_producer_specs(
-                action,
-                dependency_action_id=dependency_action_id,
-                producer_specs=producer_specs,
-                operation_id=operation_id,
-            )
+            else:
+                dependency = self._dependency_for_durable_action_summary(
+                    action,
+                    dependency_action_id=dependency_action_id,
+                    task_summaries=durable_action_summaries.get(
+                        dependency_action_id,
+                        (),
+                    ),
+                    operation_id=operation_id,
+                )
             if dependency is None:
                 errors.append(
                     _action_error(
@@ -960,6 +970,50 @@ class DbAgentLoop:
                 continue
             dependencies.append(dependency)
         return tuple(dependencies), tuple(errors)
+
+    def _dependency_for_durable_action_summary(
+        self,
+        action: DbPlannerAction,
+        *,
+        dependency_action_id: str,
+        task_summaries: tuple[dict[str, Any], ...],
+        operation_id: str,
+    ) -> TaskDependency | None:
+        for summary in reversed(task_summaries):
+            capability_id = str(summary.get("capability_id") or "").strip()
+            metadata = summary.get("metadata") if isinstance(summary, Mapping) else {}
+            owner = (
+                str(metadata.get("owner") or "").strip()
+                if isinstance(metadata, Mapping)
+                else ""
+            )
+            resolved = self._resolve_capability(capability_id, owner=owner or None)
+            capability = resolved.get("capability")
+            if capability is None:
+                continue
+            evidence_kind = _preferred_output_evidence_kind(capability)
+            if evidence_kind is None:
+                continue
+            task_id = str(summary.get("task_id") or "").strip() or None
+            if task_id is None:
+                continue
+            return TaskDependency(
+                kind="evidence",
+                evidence_kind=evidence_kind,
+                evidence_owner=capability.owner,
+                producer_task_id=task_id,
+                producer_capability_id=capability.id,
+                producer_executor_id=capability.executor,
+                evidence_accepted=True,
+                operation_id=operation_id,
+                metadata={
+                    "planner_dependency": True,
+                    "durable_prior_action": True,
+                    "producer_action_id": dependency_action_id,
+                    "consumer_action_id": action.action_id,
+                },
+            )
+        return None
 
     def _dependency_for_producer_specs(
         self,
@@ -2795,8 +2849,27 @@ def _coerce_action(
     return None, {"action_id": "", "kind": "", "error": "invalid_action_shape"}
 
 
+def _durable_action_task_summaries(
+    state: DbLoopState,
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for summary in state.task_summaries:
+        if str(summary.get("status") or "") != TaskStatus.SUCCEEDED.value:
+            continue
+        metadata = summary.get("metadata")
+        if not isinstance(metadata, Mapping):
+            continue
+        action_id = str(metadata.get("planner_action_id") or "").strip()
+        if not action_id:
+            continue
+        grouped.setdefault(action_id, []).append(dict(summary))
+    return {action_id: tuple(items) for action_id, items in grouped.items()}
+
+
 def _ordered_actions_or_errors(
     actions: tuple[DbPlannerAction, ...],
+    *,
+    external_dependency_ids: frozenset[str] = frozenset(),
 ) -> tuple[tuple[DbPlannerAction, ...], tuple[dict[str, Any], ...]]:
     by_id: dict[str, DbPlannerAction] = {}
     duplicate_ids: set[str] = set()
@@ -2818,7 +2891,7 @@ def _ordered_actions_or_errors(
         dependencies = tuple(dict.fromkeys(action.depends_on))
         dependency_sets[action.action_id] = dependencies
         for dependency in dependencies:
-            if dependency not in by_id:
+            if dependency not in by_id and dependency not in external_dependency_ids:
                 missing_errors.append(
                     _action_error(action, f"missing_dependency:{dependency}")
                 )
@@ -2829,8 +2902,11 @@ def _ordered_actions_or_errors(
     remaining_dependencies: dict[str, int] = {}
     for action in actions:
         dependencies = dependency_sets[action.action_id]
-        remaining_dependencies[action.action_id] = len(dependencies)
-        for dependency in dependencies:
+        current_dependencies = tuple(
+            dependency for dependency in dependencies if dependency in by_id
+        )
+        remaining_dependencies[action.action_id] = len(current_dependencies)
+        for dependency in current_dependencies:
             dependents[dependency].append(action.action_id)
 
     ready = [

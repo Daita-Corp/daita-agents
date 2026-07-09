@@ -376,6 +376,94 @@ def test_public_planning_context_projection_strips_blocked_memory_details():
     assert "required_filters" not in dumped
 
 
+def test_public_planning_context_projection_exposes_safe_memory_provenance():
+    raw = Evidence(
+        id="planning-context",
+        kind="planning.context",
+        owner="db_runtime",
+        payload={
+            "included_sections": ["schema", "db_memory", "db_memory_semantics"],
+            "db_memory_refs": [
+                {
+                    "chunk_id": "mem-recognized-revenue",
+                    "kind": "metric_definition",
+                    "key": "metric:recognized_revenue",
+                    "text": "Recognized revenue uses complete orders.",
+                    "semantic_contract": {"internal": "not public"},
+                }
+            ],
+            "db_memory_semantics": [
+                {
+                    "memory_key": "metric:recognized_revenue",
+                    "required_refs": ["orders.total", "orders.status"],
+                    "required_filters": [
+                        {"ref": "orders.status", "operator": "=", "value": "complete"}
+                    ],
+                    "enforceable": True,
+                }
+            ],
+            "db_memory_diagnostics": {
+                "candidate_count": 2,
+                "included_count": 1,
+                "used_chars": 42,
+                "char_budget": 120,
+            },
+            "db_memory_contract_diagnostics": {
+                "candidate_count": 1,
+                "enforced_count": 1,
+                "omitted_reasons": {},
+            },
+        },
+    )
+
+    public = project_operation_evidence(
+        (raw,),
+        ProjectionContext(mode=ProjectionMode.PUBLIC_RESULT),
+    )
+
+    payload = public[0].payload
+    dumped = json.dumps(payload, sort_keys=True)
+    assert payload["db_memory_refs"][0]["key"] == "metric:recognized_revenue"
+    assert "text" not in payload["db_memory_refs"][0]
+    assert "semantic_contract" not in dumped
+    assert payload["db_memory_semantics"][0]["memory_key"] == (
+        "metric:recognized_revenue"
+    )
+    assert payload["db_memory_diagnostics"]["included_count"] == 1
+    assert payload["db_memory_diagnostics"]["used_chars"] == 42
+    assert payload["db_memory_contract_diagnostics"]["enforced_count"] == 1
+
+
+def test_memory_recall_projection_exposes_safe_retrieval_diagnostics():
+    recall = Evidence(
+        id="memory-recall",
+        kind="memory.semantic.recall",
+        owner="memory",
+        payload={
+            "results": [{"id": "one"}],
+            "diagnostics": {
+                "retrieval_mode": "structured",
+                "embedding_available": False,
+                "structured_candidate_count": 1,
+                "embedding_candidate_count": 0,
+            },
+        },
+    )
+
+    public = project_operation_evidence(
+        (recall,),
+        ProjectionContext(mode=ProjectionMode.PUBLIC_RESULT),
+    )
+
+    assert public[0].payload["result_count"] == 1
+    assert public[0].payload["diagnostics"] == {
+        "retrieval_mode": "structured",
+        "embedding_available": False,
+        "structured_candidate_count": 1,
+        "embedding_candidate_count": 0,
+    }
+
+
 def test_memory_artifact_projection_redacts_public_and_exposes_diagnostics():
     selection = Evidence(
         id="memory-selection",
@@ -490,6 +578,111 @@ def test_memory_artifact_projection_redacts_public_and_exposes_diagnostics():
         == 1
     )
     assert "contracts" not in diagnostic[1].payload
+
+
+def test_session_scope_artifact_projection_redacts_public_and_summarizes_diagnostic():
+    scope = Evidence(
+        id="scope-evidence",
+        kind="session.query_scope",
+        owner="db_runtime",
+        payload={
+            "scope_id": "scope-prior",
+            "source_operation_id": "op-prior",
+            "tables": ["customers"],
+            "filters": [
+                {
+                    "column": "customers.loyalty_band",
+                    "operator": "=",
+                    "values": ["platinum"],
+                },
+                {
+                    "column": "customers.region",
+                    "operator": "=",
+                    "values": ["west"],
+                },
+            ],
+            "joins": [
+                {
+                    "left_table": "customers",
+                    "left_column": "region_id",
+                    "right_table": "regions",
+                    "right_column": "id",
+                }
+            ],
+            "selected_columns": ["customers.revenue"],
+            "result_row_count": 4,
+        },
+    )
+    binding = Evidence(
+        id="binding-evidence",
+        kind="session.scope_binding",
+        owner="db_runtime",
+        payload={
+            "binding_status": "bound",
+            "source_scope_id": "scope-prior",
+            "source_operation_id": "op-prior",
+            "required_filters": [
+                {
+                    "column": "customers.loyalty_band",
+                    "operator": "=",
+                    "values": ["platinum"],
+                },
+                {
+                    "column": "customers.region",
+                    "operator": "=",
+                    "values": ["west"],
+                },
+            ],
+            "required_joins": [
+                {
+                    "left_table": "customers",
+                    "left_column": "region_id",
+                    "right_table": "regions",
+                    "right_column": "id",
+                }
+            ],
+            "omitted_unsafe_referents": [{"reason": "blocked_by_policy", "count": 1}],
+        },
+    )
+
+    public = project_operation_evidence(
+        (scope, binding),
+        _projection(ProjectionMode.PUBLIC_RESULT),
+    )
+    diagnostic = project_operation_evidence(
+        (scope, binding),
+        _projection(ProjectionMode.DIAGNOSTIC),
+    )
+
+    public_dumped = json.dumps([item.payload for item in public], sort_keys=True)
+    assert "scope-prior" not in public_dumped
+    assert "op-prior" not in public_dumped
+    assert "customers.loyalty_band" not in public_dumped
+    assert "platinum" not in public_dumped
+    assert public[0].payload["table_count"] == 1
+    assert public[0].payload["filter_count"] == 2
+    assert public[0].payload["join_count"] == 1
+    assert "binding_status" not in public[1].payload
+    assert public[1].payload["required_filter_count"] == 2
+    assert public[1].payload["required_join_count"] == 1
+
+    diagnostic_dumped = json.dumps(
+        [item.payload for item in diagnostic], sort_keys=True
+    )
+    assert "customers.loyalty_band" not in diagnostic_dumped
+    assert "platinum" not in diagnostic_dumped
+    assert diagnostic[0].payload["scope_id"] == "scope-prior"
+    assert diagnostic[0].payload["filters"] == [
+        {"column": "customers.region", "operator": "=", "values": ["west"]}
+    ]
+    assert diagnostic[1].payload["source_scope_id"] == "scope-prior"
+    assert diagnostic[1].payload["binding_status"] == "bound"
+    assert diagnostic[1].payload["required_filters"] == [
+        {"column": "customers.region", "operator": "=", "values": ["west"]}
+    ]
+    assert diagnostic[1].payload["omitted_unsafe_referents"] == [
+        {"reason": "blocked_by_policy", "count": 1}
+    ]
 
 
 def test_query_result_projection_redacts_blocked_error_scalars():

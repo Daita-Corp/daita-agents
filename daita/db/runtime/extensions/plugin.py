@@ -569,6 +569,18 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 description="DB memory semantic contracts and omission facts.",
             ),
             EvidenceSchema(
+                kind="session.query_scope",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Durable normalized scope from a successful session query.",
+            ),
+            EvidenceSchema(
+                kind="session.scope_binding",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Durable binding of a follow-up query to prior session scope.",
+            ),
+            EvidenceSchema(
                 kind="planner.decision",
                 owner="db_runtime",
                 json_schema=object_schema,

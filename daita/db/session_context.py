@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import json
 import re
 from typing import Any, Iterable, Mapping
 
@@ -17,6 +18,7 @@ _MAX_OPERATIONS = 8
 _MAX_REFERENTS = 24
 _MAX_QUERY_SCOPES = 4
 _MAX_QUERY_FILTERS = 12
+_MAX_QUERY_JOINS = 12
 _MAX_FILTER_VALUES = 8
 _MAX_FILTER_VALUE_CHARS = 80
 _MAX_IDENTIFIER_CHARS = 160
@@ -73,13 +75,22 @@ class DbSessionQueryScope:
     """Compact predicate scope from a prior same-session query."""
 
     operation_id: str
+    scope_id: str | None = None
     tables: tuple[str, ...] = ()
     filters: tuple[dict[str, Any], ...] = ()
+    joins: tuple[dict[str, Any], ...] = ()
     selected_columns: tuple[str, ...] = ()
     result_row_count: int | None = None
+    source_scope: tuple[str, ...] = ()
+    schema_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = {
+            **(
+                {"scope_id": _clip(self.scope_id, _MAX_IDENTIFIER_CHARS)}
+                if self.scope_id
+                else {}
+            ),
             "operation_id": _clip(self.operation_id, _MAX_IDENTIFIER_CHARS),
             "tables": [
                 _clip(item, _MAX_IDENTIFIER_CHARS)
@@ -93,6 +104,14 @@ class DbSessionQueryScope:
                 )
                 if item is not None
             ],
+            "joins": [
+                item
+                for item in (
+                    _compact_query_join(join_item)
+                    for join_item in self.joins[:_MAX_QUERY_JOINS]
+                )
+                if item is not None
+            ],
             "selected_columns": [
                 _clip(item, _MAX_IDENTIFIER_CHARS)
                 for item in self.selected_columns[:_MAX_REFERENTS]
@@ -100,6 +119,15 @@ class DbSessionQueryScope:
         }
         if self.result_row_count is not None:
             result["result_row_count"] = max(0, int(self.result_row_count))
+        if self.source_scope:
+            result["source_scope"] = [
+                _clip(item, _MAX_IDENTIFIER_CHARS)
+                for item in self.source_scope[:_MAX_REFERENTS]
+            ]
+        if self.schema_fingerprint:
+            result["schema_fingerprint"] = _clip(
+                self.schema_fingerprint, _MAX_IDENTIFIER_CHARS
+            )
         return result
 
     @classmethod
@@ -113,13 +141,34 @@ class DbSessionQueryScope:
             )
             if item is not None
         )
+        joins = tuple(
+            item
+            for item in (
+                _compact_query_join(join_item)
+                for join_item in value.get("joins", ()) or ()
+                if isinstance(join_item, Mapping)
+            )
+            if item is not None
+        )
         row_count = value.get("result_row_count")
         return cls(
-            operation_id=str(value.get("operation_id") or ""),
+            operation_id=str(
+                value.get("operation_id") or value.get("source_operation_id") or ""
+            ),
+            scope_id=(
+                str(value["scope_id"]) if value.get("scope_id") is not None else None
+            ),
             tables=_strings(value.get("tables")),
             filters=filters,
+            joins=joins,
             selected_columns=_strings(value.get("selected_columns")),
             result_row_count=int(row_count) if isinstance(row_count, int) else None,
+            source_scope=_strings(value.get("source_scope")),
+            schema_fingerprint=(
+                str(value["schema_fingerprint"])
+                if value.get("schema_fingerprint") is not None
+                else None
+            ),
         )
 
 
@@ -423,6 +472,174 @@ def db_session_context_from_request(request: DbRequest) -> DbSessionContext | No
     return DbSessionContext.from_dict(context)
 
 
+def session_query_scope_evidence_for(
+    operation: Operation,
+    evidence: Iterable[Evidence],
+    *,
+    task_id: str | None = None,
+) -> Evidence | None:
+    """Build durable scope evidence from accepted runtime query facts."""
+
+    if not _operation_has_session_scope(operation):
+        return None
+    evidence_tuple = tuple(evidence)
+    if any(
+        item.kind == "session.query_scope" and item.accepted
+        for item in evidence_tuple
+        if item.operation_id in {None, operation.id}
+    ):
+        return None
+    if not _has_successful_query_result(evidence_tuple):
+        return None
+    scope = _query_scope_from_evidence(operation.id, evidence_tuple)
+    if scope is None:
+        return None
+    payload = scope.to_dict()
+    payload["source_operation_id"] = operation.id
+    if not payload.get("source_scope"):
+        source_scope = _strings(operation.request.get("source_scope"))
+        if source_scope:
+            payload["source_scope"] = list(source_scope)
+    refs = _query_scope_source_refs(evidence_tuple)
+    if refs:
+        payload["source_evidence_refs"] = refs
+    scope_fingerprint = _fingerprint_value(
+        {
+            "operation_id": operation.id,
+            "tables": payload.get("tables") or [],
+            "filters": payload.get("filters") or [],
+            "joins": payload.get("joins") or [],
+            "selected_columns": payload.get("selected_columns") or [],
+            "result_row_count": payload.get("result_row_count"),
+            "source_evidence_refs": refs,
+        }
+    )
+    payload.setdefault("scope_id", f"session-scope-{scope_fingerprint[:16]}")
+    payload["scope_fingerprint"] = scope_fingerprint
+    payload.setdefault("version", 1)
+    payload_fingerprint = _fingerprint_value(payload)
+    return Evidence(
+        id=f"evidence-{payload_fingerprint}",
+        kind="session.query_scope",
+        owner="db_runtime",
+        operation_id=operation.id,
+        task_id=task_id,
+        accepted=True,
+        payload=payload,
+        metadata={
+            "payload_fingerprint": payload_fingerprint,
+            "source_operation_id": operation.id,
+            "scope_id": payload["scope_id"],
+        },
+    )
+
+
+def session_scope_binding_evidence_for(
+    operation: Operation,
+    plan: Any,
+    planning_context: Mapping[str, Any],
+    *,
+    plan_payload: Mapping[str, Any] | None = None,
+    task_id: str | None = None,
+) -> Evidence | None:
+    """Build a binding artifact for a plan that uses prior session scope."""
+
+    session_context = planning_context.get("session_context")
+    if not isinstance(session_context, Mapping):
+        return None
+    raw_scopes = [
+        dict(item)
+        for item in session_context.get("query_scopes", ()) or ()
+        if isinstance(item, Mapping)
+    ]
+    if not raw_scopes:
+        return None
+
+    explicit = _explicit_scope_binding(plan_payload)
+    explicit_status = str(
+        explicit.get("binding_status") or explicit.get("status") or ""
+    ).strip()
+    selected_scope = _select_scope_for_binding(
+        raw_scopes,
+        plan=plan,
+        explicit=explicit,
+    )
+    if selected_scope is None:
+        return None
+
+    status = explicit_status or "bound"
+    required_filters = _required_scope_filters(selected_scope)
+    required_joins = _required_scope_joins(selected_scope)
+    if not explicit and not required_filters and not required_joins:
+        return None
+    omitted = [
+        dict(item)
+        for item in selected_scope.get("omitted_unsafe_referents", ()) or ()
+        if isinstance(item, Mapping)
+    ]
+    scope_id = str(selected_scope.get("scope_id") or "").strip()
+    source_operation_id = str(
+        selected_scope.get("operation_id")
+        or selected_scope.get("source_operation_id")
+        or ""
+    ).strip()
+    payload: dict[str, Any] = {
+        "version": 1,
+        "binding_status": status,
+        "source_scope_id": scope_id or None,
+        "source_operation_id": source_operation_id or None,
+        "required_filters": required_filters,
+        "required_joins": required_joins,
+        "binding_confidence": _binding_confidence(explicit, selected_scope),
+        "omitted_unsafe_referents": omitted,
+        "source_tables": list(_strings(selected_scope.get("tables"))),
+        "source_selected_columns": list(
+            _strings(selected_scope.get("selected_columns"))
+        ),
+    }
+    if isinstance(selected_scope.get("result_row_count"), int):
+        payload["source_result_row_count"] = int(selected_scope["result_row_count"])
+    if selected_scope.get("schema_fingerprint"):
+        payload["schema_fingerprint"] = str(selected_scope["schema_fingerprint"])
+    if explicit:
+        payload["planner_binding"] = {
+            str(key): value
+            for key, value in explicit.items()
+            if key in {"binding_status", "status", "reason", "confidence"}
+        }
+    binding_fingerprint = _fingerprint_value(
+        {
+            "operation_id": operation.id,
+            "source_scope_id": payload.get("source_scope_id"),
+            "source_operation_id": payload.get("source_operation_id"),
+            "required_filters": required_filters,
+            "required_joins": required_joins,
+            "binding_status": status,
+        }
+    )
+    payload["binding_fingerprint"] = binding_fingerprint
+    payload_fingerprint = _fingerprint_value(payload)
+    return Evidence(
+        id=f"evidence-{payload_fingerprint}",
+        kind="session.scope_binding",
+        owner="db_runtime",
+        operation_id=operation.id,
+        task_id=task_id,
+        accepted=True,
+        payload=payload,
+        metadata={
+            "payload_fingerprint": payload_fingerprint,
+            "binding_fingerprint": binding_fingerprint,
+            **({"source_scope_id": scope_id} if scope_id else {}),
+            **(
+                {"source_operation_id": source_operation_id}
+                if source_operation_id
+                else {}
+            ),
+        },
+    )
+
+
 def _operation_session_id(operation: Operation) -> str | None:
     value = operation.metadata.get("session_id")
     if value is None:
@@ -532,6 +749,11 @@ def _extract_evidence_referents(
                 asset_tables.add(str(table), source="evidence")
             for column in payload.get("columns", []) or []:
                 columns.add(str(column), source="evidence")
+        elif item.kind == "session.query_scope":
+            for table in payload.get("tables", []) or []:
+                asset_tables.add(str(table), source="evidence")
+            for column in payload.get("selected_columns", []) or []:
+                columns.add(str(column), source="evidence")
         elif item.kind in {"monitor.definition", "monitor.proposal"}:
             monitor_id = payload.get("monitor_id")
             if monitor_id is None and isinstance(payload.get("monitor"), Mapping):
@@ -558,10 +780,20 @@ def _query_scope_from_evidence(
     operation_id: str,
     evidence: tuple[Evidence, ...],
 ) -> DbSessionQueryScope | None:
+    for item in reversed(evidence):
+        if item.accepted and item.kind == "session.query_scope":
+            return DbSessionQueryScope.from_dict(item.payload)
+
+    # Compatibility path for operations completed before durable
+    # session.query_scope evidence existed. New successful reads emit the
+    # artifact directly from accepted runtime facts.
     tables = _OrderedStrings()
     selected_columns = _OrderedStrings()
     filters: list[dict[str, Any]] = []
+    joins: list[dict[str, Any]] = []
     result_row_count: int | None = None
+    source_scope = _OrderedStrings()
+    schema_fingerprint: str | None = None
 
     for item in evidence:
         if not item.accepted:
@@ -580,11 +812,14 @@ def _query_scope_from_evidence(
                     selected_columns.add(column, source="query.plan")
                 for filter_item in structured.get("filters", ()) or ():
                     _append_query_filter(filters, filter_item)
+                for join_item in structured.get("joins", ()) or ():
+                    _append_query_join(joins, join_item)
             _add_sql_scope(
                 _first_sql_value(payload),
                 tables=tables,
                 selected_columns=selected_columns,
                 filters=filters,
+                joins=joins,
             )
         elif item.kind == "sql.validation":
             for table in payload.get("referenced_tables", ()) or ():
@@ -598,20 +833,43 @@ def _query_scope_from_evidence(
                 tables=tables,
                 selected_columns=selected_columns,
                 filters=filters,
+                joins=joins,
             )
         elif item.kind == "query.result":
             rows = payload.get("rows")
             if isinstance(rows, list):
                 result_row_count = len(rows)
+            elif isinstance(payload.get("total_rows"), int):
+                result_row_count = int(payload["total_rows"])
+        elif item.kind == "planning.context":
+            for scope in payload.get("source_scope", ()) or ():
+                source_scope.add(scope, source="planning.context")
+            if payload.get("schema_fingerprint"):
+                schema_fingerprint = str(payload["schema_fingerprint"])
 
     if not tables.values and not filters and not selected_columns.values:
         return None
+    scope_payload = {
+        "operation_id": operation_id,
+        "tables": list(tables.values),
+        "filters": filters[:_MAX_QUERY_FILTERS],
+        "joins": joins[:_MAX_QUERY_JOINS],
+        "selected_columns": list(selected_columns.values),
+        "result_row_count": result_row_count,
+        "source_scope": list(source_scope.values),
+        "schema_fingerprint": schema_fingerprint,
+    }
+    scope_id = f"session-scope-{_fingerprint_value(scope_payload)[:16]}"
     return DbSessionQueryScope(
         operation_id=operation_id,
+        scope_id=scope_id,
         tables=tables.values,
         filters=tuple(filters[:_MAX_QUERY_FILTERS]),
+        joins=tuple(joins[:_MAX_QUERY_JOINS]),
         selected_columns=selected_columns.values,
         result_row_count=result_row_count,
+        source_scope=source_scope.values,
+        schema_fingerprint=schema_fingerprint,
     )
 
 
@@ -621,6 +879,7 @@ def _add_sql_scope(
     tables: _OrderedStrings,
     selected_columns: _OrderedStrings,
     filters: list[dict[str, Any]],
+    joins: list[dict[str, Any]],
 ) -> None:
     if not sql.strip():
         return
@@ -644,6 +903,24 @@ def _add_sql_scope(
                 "column": column,
                 "operator": predicate.operator,
                 "values": list(predicate.values),
+            },
+        )
+    for predicate in getattr(analysis, "column_predicates", ()) or ():
+        if str(getattr(predicate, "operator", "") or "").strip() != "=":
+            continue
+        left = getattr(predicate, "left", None)
+        right = getattr(predicate, "right", None)
+        _append_query_join(
+            joins,
+            {
+                "left_table": getattr(left, "table", "") if left is not None else "",
+                "left_column": getattr(left, "name", "") if left is not None else "",
+                "right_table": (
+                    getattr(right, "table", "") if right is not None else ""
+                ),
+                "right_column": (
+                    getattr(right, "name", "") if right is not None else ""
+                ),
             },
         )
 
@@ -671,6 +948,32 @@ def _append_query_filter(filters: list[dict[str, Any]], raw: Any) -> None:
         filters.append(compact)
 
 
+def _append_query_join(joins: list[dict[str, Any]], raw: Any) -> None:
+    if len(joins) >= _MAX_QUERY_JOINS:
+        return
+    compact = _compact_query_join(raw)
+    if compact is None:
+        return
+    key = (
+        compact["left_table"].lower(),
+        compact.get("left_column", "").lower(),
+        compact["right_table"].lower(),
+        compact.get("right_column", "").lower(),
+    )
+    reverse = (key[2], key[3], key[0], key[1])
+    existing = {
+        (
+            item["left_table"].lower(),
+            item.get("left_column", "").lower(),
+            item["right_table"].lower(),
+            item.get("right_column", "").lower(),
+        )
+        for item in joins
+    }
+    if key not in existing and reverse not in existing:
+        joins.append(compact)
+
+
 def _compact_query_filter(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, Mapping):
         return None
@@ -691,6 +994,55 @@ def _compact_query_filter(raw: Any) -> dict[str, Any] | None:
             for value in values[:_MAX_FILTER_VALUES]
         ],
     }
+
+
+def _compact_query_join(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    left_table = _short_table_name(
+        raw.get("left_table")
+        or raw.get("left_asset")
+        or raw.get("source_table")
+        or raw.get("source_asset")
+    )
+    right_table = _short_table_name(
+        raw.get("right_table")
+        or raw.get("right_asset")
+        or raw.get("target_table")
+        or raw.get("target_asset")
+    )
+    left_column = _column_name(
+        raw.get("left_column")
+        or raw.get("left_field")
+        or raw.get("source_column")
+        or raw.get("source_field")
+        or raw.get("left_key")
+    )
+    right_column = _column_name(
+        raw.get("right_column")
+        or raw.get("right_field")
+        or raw.get("target_column")
+        or raw.get("target_field")
+        or raw.get("right_key")
+    )
+    if (not left_table or not right_table) and raw.get("condition"):
+        parsed = _join_from_condition(str(raw.get("condition") or ""))
+        if parsed is not None:
+            left_table = left_table or parsed["left_table"]
+            left_column = left_column or parsed.get("left_column", "")
+            right_table = right_table or parsed["right_table"]
+            right_column = right_column or parsed.get("right_column", "")
+    if not left_table or not right_table or left_table.lower() == right_table.lower():
+        return None
+    item = {
+        "left_table": _clip(left_table, _MAX_IDENTIFIER_CHARS),
+        "right_table": _clip(right_table, _MAX_IDENTIFIER_CHARS),
+    }
+    if left_column:
+        item["left_column"] = _clip(left_column, _MAX_IDENTIFIER_CHARS)
+    if right_column:
+        item["right_column"] = _clip(right_column, _MAX_IDENTIFIER_CHARS)
+    return item
 
 
 def _filter_value_strings(value: Any) -> tuple[str, ...]:
@@ -726,6 +1078,204 @@ def _first_sql_value(payload: Any) -> str:
             if nested:
                 return nested
     return ""
+
+
+def _operation_has_session_scope(operation: Operation) -> bool:
+    return bool(
+        _operation_session_id(operation)
+        or operation.request.get("session_id")
+        or (
+            isinstance(operation.request.get("session_context"), Mapping)
+            and operation.request["session_context"].get("session_id")
+        )
+    )
+
+
+def _has_successful_query_result(evidence: tuple[Evidence, ...]) -> bool:
+    for item in evidence:
+        if item.kind != "query.result" or not item.accepted:
+            continue
+        if item.payload.get("success") is False:
+            continue
+        return True
+    return False
+
+
+def _query_scope_source_refs(evidence: tuple[Evidence, ...]) -> list[dict[str, Any]]:
+    refs = []
+    for item in evidence:
+        if not item.accepted or item.kind not in {
+            "planning.context",
+            "query.plan.proposal",
+            "query.plan.validation",
+            "sql.validation",
+            "query.result",
+            "schema.relationship_path",
+        }:
+            continue
+        if not item.id:
+            continue
+        refs.append(
+            {
+                "id": item.id,
+                "kind": item.kind,
+                "owner": item.owner,
+                "payload_fingerprint": item.metadata.get("payload_fingerprint")
+                or _fingerprint_value(item.payload),
+            }
+        )
+    return refs
+
+
+def _explicit_scope_binding(plan_payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(plan_payload, Mapping):
+        return {}
+    for key in ("session_scope_binding", "scope_binding"):
+        value = plan_payload.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    metadata = plan_payload.get("metadata")
+    if isinstance(metadata, Mapping):
+        return _explicit_scope_binding(metadata)
+    return {}
+
+
+def _select_scope_for_binding(
+    scopes: list[dict[str, Any]],
+    *,
+    plan: Any,
+    explicit: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    requested_scope_id = str(
+        explicit.get("source_scope_id") or explicit.get("scope_id") or ""
+    ).strip()
+    requested_operation_id = str(
+        explicit.get("source_operation_id") or explicit.get("operation_id") or ""
+    ).strip()
+    if requested_scope_id or requested_operation_id:
+        for scope in scopes:
+            if (
+                requested_scope_id
+                and str(scope.get("scope_id") or "") == requested_scope_id
+            ):
+                return scope
+            if (
+                requested_operation_id
+                and str(
+                    scope.get("operation_id") or scope.get("source_operation_id") or ""
+                )
+                == requested_operation_id
+            ):
+                return scope
+        return None
+
+    plan_tables = _plan_table_keys(plan)
+    if plan_tables:
+        for scope in scopes:
+            scope_tables = {
+                _short_table_name(item) for item in scope.get("tables") or ()
+            }
+            if plan_tables & {item.lower() for item in scope_tables if item}:
+                return scope
+        return None
+
+    status = str(explicit.get("binding_status") or explicit.get("status") or "")
+    if status and len(scopes) == 1:
+        return scopes[0]
+    return None
+
+
+def _plan_table_keys(plan: Any) -> set[str]:
+    tables = {
+        _short_table_name(item).lower()
+        for item in getattr(plan, "selected_tables", ()) or ()
+        if _short_table_name(item)
+    }
+    sql = str(getattr(plan, "selected_sql", "") or "")
+    if sql.strip():
+        try:
+            analysis = analyze_sql(sql)
+        except (ImportError, SqlAnalysisError, ValueError):
+            analysis = None
+        if analysis is not None:
+            tables.update(
+                table.short_key.lower()
+                for table in analysis.tables
+                if not table.is_cte and table.short_key
+            )
+    return tables
+
+
+def _required_scope_filters(scope: Mapping[str, Any]) -> list[dict[str, Any]]:
+    filters = []
+    for item in scope.get("filters", ()) or ():
+        compact = _compact_query_filter(item)
+        if compact is not None:
+            filters.append(compact)
+    return filters[:_MAX_QUERY_FILTERS]
+
+
+def _required_scope_joins(scope: Mapping[str, Any]) -> list[dict[str, Any]]:
+    joins = []
+    for item in scope.get("joins", ()) or ():
+        compact = _compact_query_join(item)
+        if compact is not None:
+            joins.append(compact)
+    return joins[:_MAX_QUERY_JOINS]
+
+
+def _binding_confidence(
+    explicit: Mapping[str, Any],
+    scope: Mapping[str, Any],
+) -> float:
+    for value in (explicit.get("confidence"), scope.get("confidence")):
+        if value is None:
+            continue
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            continue
+        return max(0.0, min(1.0, confidence))
+    return 1.0
+
+
+def _join_from_condition(value: str) -> dict[str, str] | None:
+    if value.count("=") != 1:
+        return None
+    left, right = (_column_ref(part) for part in value.split("=", maxsplit=1))
+    if left is None or right is None:
+        return None
+    return {
+        "left_table": left[0],
+        "left_column": left[1],
+        "right_table": right[0],
+        "right_column": right[1],
+    }
+
+
+def _column_ref(value: Any) -> tuple[str, str] | None:
+    parts = [
+        part.strip().strip('"`[]')
+        for part in str(value or "").split(".")
+        if part.strip().strip('"`[]')
+    ]
+    if len(parts) < 2:
+        return None
+    return _short_table_name(parts[-2]), _column_name(parts[-1])
+
+
+def _short_table_name(value: Any) -> str:
+    text = str(value or "").strip().strip('"`[]')
+    if not text:
+        return ""
+    return text.split(".")[-1].strip().strip('"`[]')
+
+
+def _column_name(value: Any) -> str:
+    text = str(value or "").strip().strip('"`[]')
+    if not text:
+        return ""
+    return text.split(".")[-1].strip().strip('"`[]')
 
 
 def _schema_search_table_matched(table: Any) -> bool:
@@ -881,6 +1431,11 @@ def _clip(value: str, max_chars: int) -> str:
 
 def _fingerprint_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _fingerprint_value(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class _OrderedStrings:
