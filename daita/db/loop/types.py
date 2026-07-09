@@ -7,7 +7,7 @@ from typing import Any
 
 from daita.runtime import TaskDependency
 
-from ..runtime.tasks import DbTaskSpec
+from ..runtime.tasks.runtime import DbTaskSpec
 from .utils import _json_dict
 
 

@@ -14,7 +14,7 @@ from daita.db.planner_protocol import (
     DbPlannerObservation,
 )
 from daita.db.runtime.extensions.plugin import DbRuntimePlanningPlugin
-from daita.db.runtime.tasks import DbTaskSpec
+from daita.db.runtime.tasks.runtime import DbTaskSpec
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
 from daita.runtime import AccessMode, Capability, EvidenceSchema, RiskLevel, Task
 

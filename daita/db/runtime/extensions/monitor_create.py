@@ -16,7 +16,7 @@ from ...monitor_commands.planner import (
 )
 from ...monitor_commands.types import DbMonitorCommand, DbMonitorValidation
 from ...monitors import DbMonitorMutation, DbMonitorState
-from ..tasks import DbTaskSpec
+from ..tasks.runtime import DbTaskSpec
 
 
 @dataclass(frozen=True)

@@ -11,7 +11,7 @@ from daita.db.models import (
 )
 from daita.db.planning_context import DbPlanningContextBuilder
 from daita.db.query_plan import DbQueryPlan
-from daita.db.runtime.tasks import DbTaskSpec
+from daita.db.runtime.tasks.runtime import DbTaskSpec
 from daita.db.session_context import (
     DbSessionContextBuilder,
     db_session_context_from_request,

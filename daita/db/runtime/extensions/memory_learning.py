@@ -22,7 +22,7 @@ from ...memory import (
 )
 from ...memory_contracts import extract_db_memory_semantic_contract
 from ..memory_learning import _learner_task_id_from_operation
-from ..tasks import DbTaskSpec
+from ..tasks.runtime import DbTaskSpec
 
 _LEARNING_SOURCE_EVIDENCE_KINDS = frozenset(
     {

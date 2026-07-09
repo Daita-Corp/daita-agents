@@ -20,7 +20,7 @@ from daita.db.monitor_scheduler.observation import (
 from daita.db.monitor_scheduler.state import (
     _cursor_updates_from_plan as _state_cursor_updates_from_plan,
 )
-from daita.db.runtime.tasks import DbTaskSpec
+from daita.db.runtime.tasks.runtime import DbTaskSpec
 from daita.plugins import RuntimeExtensionPlugin, PluginKind, PluginManifest
 from daita.runtime import (
     AccessMode,

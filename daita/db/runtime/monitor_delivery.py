@@ -35,7 +35,7 @@ from ..monitors import (
 )
 from .analysis import _payload_fingerprint, _stable_hash
 from .resume import _monitor_delivery_context
-from .tasks import DbTaskSpec
+from .tasks.runtime import DbTaskSpec
 from .types import (
     _TERMINAL_TASK_STATUSES,
     DbRuntimeGovernanceBlocked,

@@ -38,7 +38,7 @@ from ...models import (
     DbRequest,
 )
 from ..cache import _from_db_options
-from ..tasks import DbTaskSpec
+from ..tasks.runtime import DbTaskSpec
 from ..types import (
     DbRuntimeGovernanceBlocked,
     _governance_blocked_answer,

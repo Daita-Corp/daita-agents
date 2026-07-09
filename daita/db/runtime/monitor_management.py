@@ -40,7 +40,7 @@ from ..monitors import (
     SQLiteDbMonitorStore,
 )
 from ..monitor_scheduler.scheduler import DbMonitorScheduler
-from .tasks import DbTaskSpec
+from .tasks.runtime import DbTaskSpec
 from .types import DbRuntimeGovernanceBlocked
 
 

@@ -9,7 +9,7 @@ from daita.runtime import Operation, OperationStatus
 from ..analysis import stable_fingerprint
 from ..memory import db_memory_options_from_runtime_metadata
 from ..models import DbOperationResult
-from .tasks import DbTaskSpec
+from .tasks.runtime import DbTaskSpec
 
 _ELIGIBLE_OPERATION_TYPES = frozenset(
     {

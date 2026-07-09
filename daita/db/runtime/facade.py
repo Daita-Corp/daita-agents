@@ -74,7 +74,7 @@ from .resume import (
     _db_request_from_context,
 )
 from .results import DbRuntimeResultsMixin
-from .tasks import DbRuntimeTasksMixin
+from .tasks.runtime import DbRuntimeTasksMixin
 from .types import (
     _SourcePreparationSnapshot,
     _governance_blocked_answer,

@@ -8,7 +8,7 @@ from typing import Any, Mapping
 from daita.runtime import TaskDependency
 
 from ..planner_protocol import DbLoopState, DbPlannerAction
-from ..runtime.tasks import DbTaskSpec
+from ..runtime.tasks.runtime import DbTaskSpec
 from .actions import _action_error, _merge_dependencies
 from .summaries import _latest_accepted_evidence_summary
 from .types import _ResolvedSqlInput

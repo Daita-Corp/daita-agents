@@ -9,7 +9,7 @@ from daita.runtime import TaskDependency, TaskStatus
 
 from ..models import DbIntentKind
 from ..planner_protocol import DbLoopState, DbPlannerAction, DbPlannerActionKind
-from ..runtime.tasks import DbTaskSpec
+from ..runtime.tasks.runtime import DbTaskSpec
 from .types import DbActionCompilation
 from .utils import _stable_hash
 

@@ -27,7 +27,7 @@ from daita.runtime import GovernanceResult, PolicyEffect
 from ..governance import default_db_policies
 from ..models import DbOperationContract
 from .resume import _db_contract_from_context, _operation_has_run_context
-from .tasks import _stable_hash
+from .tasks.runtime import _stable_hash
 from .types import _GovernancePersistence, _MonitorEffectGovernanceDecision
 
 

@@ -19,7 +19,7 @@ from ..resume import (
     _db_intent_from_context,
     _db_request_from_context,
 )
-from ..tasks import DbTaskSpec
+from ..tasks.runtime import DbTaskSpec
 from ..types import DbRuntimeGovernanceBlocked
 
 

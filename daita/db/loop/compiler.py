@@ -14,7 +14,7 @@ from ..planner_protocol import (
     DbPlannerActionKind,
     DbPlannerDecision,
 )
-from ..runtime.tasks import DbTaskSpec
+from ..runtime.tasks.runtime import DbTaskSpec
 from .actions import (
     _SIMPLE_ACTION_CAPABILITIES,
     _action_error,
