@@ -426,7 +426,7 @@ def test_new_protocol_and_loop_code_do_not_construct_raw_tasks_outside_task_owne
     repo = Path(__file__).parents[3]
     checked = [
         repo / "daita/db/planner_protocol.py",
-        repo / "daita/db/agent_loop.py",
+        repo / "daita/db/loop/runner.py",
         repo / "daita/db/llm_agent_planner.py",
     ]
 

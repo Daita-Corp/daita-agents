@@ -1,5 +1,6 @@
 from daita.db import DbRuntime
-from daita.db.agent_loop import DbAgentLoop, _LoopProgressGuard
+from daita.db.loop import DbAgentLoop
+from daita.db.loop.runner import _LoopProgressGuard
 from daita.db.planner_protocol import (
     DbLoopState,
     DbPlannerAction,

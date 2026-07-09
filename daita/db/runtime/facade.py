@@ -29,7 +29,7 @@ from daita.runtime import (
 )
 from daita.skills import SkillResolution, SkillResolver
 
-from ..agent_loop import DbAgentLoop, DbLoopResult
+from ..loop import DbAgentLoop, DbLoopResult
 from ..context_projection import (
     ProjectionContext,
     ProjectionMode,

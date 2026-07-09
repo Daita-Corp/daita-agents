@@ -282,7 +282,7 @@ async def test_resume_uses_persisted_tasks_without_rebuilding_completed_tasks():
 
 def test_phase5_source_scan_normal_run_has_no_executor_or_intent_classifier():
     facade = Path("daita/db/runtime/facade.py").read_text()
-    loop = Path("daita/db/agent_loop.py").read_text()
+    loop = Path("daita/db/loop/runner.py").read_text()
     planner = Path("daita/db/llm_agent_planner.py").read_text()
 
     assert "DbOperationExecutor" not in facade

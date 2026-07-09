@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from daita.db.agent_loop import DbAgentLoop
+from daita.db.loop import DbAgentLoop
 from daita.db.planner_protocol import (
     DbPlannerAction,
     DbPlannerActionKind,

@@ -1,7 +1,7 @@
 import json
 
 from daita.db import DbRuntime, DbRuntimeConfig
-from daita.db.agent_loop import DbAgentLoop
+from daita.db.loop import DbAgentLoop
 from daita.db.llm_agent_planner import DbLLMAgentPlanner
 from daita.db.llm_planner import DbLLMPlannerExecutor, DbLLMRepairExecutor
 from daita.db.llm_service import DbLLMResponse, DbLLMService

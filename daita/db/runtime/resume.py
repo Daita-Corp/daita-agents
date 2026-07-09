@@ -15,7 +15,7 @@ from daita.runtime import (
     TaskStatus,
 )
 
-from ..agent_loop import DbAgentLoop
+from ..loop import DbAgentLoop
 from ..models import (
     DbIntent,
     DbIntentKind,
