@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-import hashlib
-import json
+from dataclasses import replace
 import re
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
@@ -12,16 +10,14 @@ from uuid import uuid4
 from daita.runtime import (
     AccessMode,
     Evidence,
-    GovernanceResult,
     Operation,
     RuntimeKernelGovernanceBlocked,
     Task,
     TaskDependency,
-    TaskStatus,
 )
 
 from ..continuation import DbContinuationResolver
-from ..models import DbIntent, DbIntentKind, DbLimits, DbOperationContract
+from ..models import DbIntentKind, DbOperationContract
 from ..memory import (
     db_memory_options_from_runtime_metadata,
     db_memory_planning_recall_decision,
@@ -40,248 +36,78 @@ from ..runtime.tasks import DbTaskSpec
 from ..runtime.types import DbRuntimeGovernanceBlocked, DbRuntimeTaskNotRunnable
 from ..sql_analysis import SqlAnalysisError, analyze_sql
 from ..verification import (
-    DB_FINALIZATION_CONTROL_EVIDENCE_KINDS,
     db_run_finalization_check,
 )
 
-_ACCESS_ORDER = {
-    AccessMode.NONE.value: 0,
-    AccessMode.METADATA_READ.value: 1,
-    AccessMode.READ.value: 2,
-    AccessMode.WRITE.value: 3,
-    AccessMode.ADMIN.value: 4,
-}
-
-_SIMPLE_ACTION_CAPABILITIES: dict[DbPlannerActionKind, tuple[str, ...]] = {
-    DbPlannerActionKind.INSPECT_SCHEMA: ("db.schema.inspect",),
-    DbPlannerActionKind.REGISTER_CATALOG_SOURCE: ("catalog.source.register",),
-    DbPlannerActionKind.SEARCH_SCHEMA: ("catalog.schema.search",),
-    DbPlannerActionKind.INSPECT_ASSET: ("catalog.asset.inspect",),
-    DbPlannerActionKind.FIND_RELATIONSHIP_PATHS: ("catalog.relationship_paths.find",),
-    DbPlannerActionKind.SEARCH_COLUMN_VALUES: ("catalog.column_values.search",),
-    DbPlannerActionKind.BUILD_PLANNING_CONTEXT: ("db.planning.context.build",),
-    DbPlannerActionKind.PROPOSE_SQL_READ: ("db.query.plan",),
-    DbPlannerActionKind.REPAIR_QUERY_PLAN: ("db.query.repair",),
-    DbPlannerActionKind.RECALL_MEMORY: ("memory.semantic.recall",),
-    DbPlannerActionKind.PLAN_MEMORY_UPDATE: ("db.memory.plan_update",),
-    DbPlannerActionKind.COMMIT_MEMORY_UPDATE: ("db.memory.commit_update",),
-    DbPlannerActionKind.PLAN_ANALYSIS: (
-        "db.analysis.plan",
-        "db.analysis.plan.validate",
-    ),
-    DbPlannerActionKind.EXECUTE_ANALYSIS_STEP: ("db.analysis.checkpoint",),
-    DbPlannerActionKind.SUMMARIZE_ANALYSIS: ("db.analysis.summarize",),
-    DbPlannerActionKind.SYNTHESIZE: ("db.answer.synthesize",),
-}
-
-_SQL_QUERY_ACTIONS = {
-    DbPlannerActionKind.PROPOSE_SQL_READ,
-    DbPlannerActionKind.REPAIR_QUERY_PLAN,
-    DbPlannerActionKind.EXECUTE_VALIDATED_READ,
-}
-
-_MONITOR_ACTION_CAPABILITIES: dict[DbPlannerActionKind, str] = {
-    DbPlannerActionKind.PLAN_MONITOR_CREATE: "db.monitor.plan_create",
-    DbPlannerActionKind.COMMIT_MONITOR_CREATE: "db.monitor.commit_create",
-    DbPlannerActionKind.PLAN_MONITOR_LIFECYCLE: "db.monitor.plan_lifecycle",
-    DbPlannerActionKind.COMMIT_MONITOR_LIFECYCLE: "db.monitor.commit_lifecycle",
-    DbPlannerActionKind.READ_MONITOR_STATE: "db.monitor.read",
-    DbPlannerActionKind.RESOLVE_MONITOR_APPROVAL: "db.monitor.resolve_approval",
-}
-
-_TERMINAL_TASK_STATUSES = {
-    TaskStatus.SUCCEEDED,
-    TaskStatus.FAILED,
-    TaskStatus.CANCELLED,
-    TaskStatus.BLOCKED,
-    TaskStatus.SKIPPED,
-}
+from .actions import (
+    _SIMPLE_ACTION_CAPABILITIES,
+    _TERMINAL_TASK_STATUSES,
+    _action_error,
+    _action_metadata,
+    _action_owner,
+    _capability_selection,
+    _coerce_action,
+    _continuation_action_error,
+    _dependency_for_prerequisite_spec,
+    _durable_action_task_summaries,
+    _explicit_mode_operation_type,
+    _has_runtime_continuation_block,
+    _has_terminal_compilation_error,
+    _merge_dependencies,
+    _mode_action_errors,
+    _ordered_actions_or_errors,
+    _preferred_output_evidence_kind,
+    _same_turn_repair_execute_deferral,
+    _source_capability_owner,
+    _summary_id,
+    _task_input_for_action,
+    _validated_sql_action_requires_query_plan_proposal,
+    _with_deterministic_task_id,
+    _with_spec_dependencies,
+)
+from .contracts import (
+    _access_rank,
+    _contract_from_latest_snapshot,
+    _contract_snapshot,
+    _fallback_contract_for_operation,
+    _fallback_intent_for_operation,
+    _governance_summary,
+    _intent_from_contract,
+    _intent_summary,
+    _state_allows_read_profile,
+)
+from .monitors import (
+    _MONITOR_ACTION_CAPABILITIES,
+    _monitor_action_output_evidence,
+)
+from .progress import (
+    _LoopProgressDecision,
+    _LoopProgressGuard,
+    _LoopProgressSnapshot,
+    _blocked_resource_execution_errors,
+    _compiled_action_fingerprints,
+    _execution_error_fingerprint,
+    _is_sql_execution_error,
+    _new_evidence_refs,
+)
+from .types import DbActionCompilation, DbLoopResult, _ResolvedSqlInput
+from .utils import (
+    _dedupe_dicts,
+    _dedupe_json_values,
+    _first_present,
+    _first_string_list_from_mappings,
+    _float_option,
+    _json_dict,
+    _optional_string,
+    _ordered_unique_strings,
+    _safe_iterable,
+    _safe_string_list,
+    _split_column_ref,
+    _stable_hash,
+    _string_list,
+)
 
 _CATALOG_COLUMN_VALUE_GROUNDING_REASON = "catalog_column_value_grounding"
-
-
-@dataclass(frozen=True)
-class DbActionCompilation:
-    """Runtime compilation of planner actions to governed DB task specs."""
-
-    accepted_action_summaries: tuple[dict[str, Any], ...] = ()
-    rejected_action_summaries: tuple[dict[str, Any], ...] = ()
-    task_specs: tuple[DbTaskSpec, ...] = ()
-    compiled_contract_snapshot: dict[str, Any] = field(default_factory=dict)
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "accepted_action_summaries",
-            tuple(_json_dict(item) for item in self.accepted_action_summaries),
-        )
-        object.__setattr__(
-            self,
-            "rejected_action_summaries",
-            tuple(_json_dict(item) for item in self.rejected_action_summaries),
-        )
-        object.__setattr__(self, "task_specs", tuple(self.task_specs))
-        object.__setattr__(
-            self,
-            "compiled_contract_snapshot",
-            _json_dict(self.compiled_contract_snapshot),
-        )
-        object.__setattr__(self, "diagnostics", _json_dict(self.diagnostics))
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "accepted_action_summaries": list(self.accepted_action_summaries),
-            "rejected_action_summaries": list(self.rejected_action_summaries),
-            "task_specs": [spec.to_dict() for spec in self.task_specs],
-            "compiled_contract_snapshot": self.compiled_contract_snapshot,
-            "diagnostics": self.diagnostics,
-        }
-
-
-@dataclass(frozen=True)
-class DbLoopResult:
-    """Terminal result returned by the DB agent loop."""
-
-    status: str
-    evidence_refs: tuple[dict[str, Any], ...] = ()
-    task_refs: tuple[dict[str, Any], ...] = ()
-    warnings: tuple[str, ...] = ()
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if not self.status:
-            raise ValueError("status is required")
-        object.__setattr__(
-            self,
-            "evidence_refs",
-            tuple(_json_dict(item) for item in self.evidence_refs),
-        )
-        object.__setattr__(
-            self, "task_refs", tuple(_json_dict(item) for item in self.task_refs)
-        )
-        object.__setattr__(self, "warnings", tuple(str(item) for item in self.warnings))
-        object.__setattr__(self, "diagnostics", _json_dict(self.diagnostics))
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "status": self.status,
-            "evidence_refs": list(self.evidence_refs),
-            "task_refs": list(self.task_refs),
-            "warnings": list(self.warnings),
-            "diagnostics": self.diagnostics,
-        }
-
-
-@dataclass(frozen=True)
-class _LoopProgressSnapshot:
-    task_statuses: dict[str, str]
-    accepted_evidence: tuple[dict[str, Any], ...] = ()
-    rejected_evidence: tuple[dict[str, Any], ...] = ()
-
-
-@dataclass(frozen=True)
-class _LoopProgressDecision:
-    terminal_status: str | None = None
-    warnings: tuple[str, ...] = ()
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-    retry_facts: tuple[dict[str, Any], ...] = ()
-
-
-@dataclass(frozen=True)
-class _ResolvedSqlInput:
-    sql: str
-    provenance: str
-    query_plan_dependency: TaskDependency | None = None
-    plan_validation_dependency: TaskDependency | None = None
-    sql_validation_dependency: TaskDependency | None = None
-    source_evidence_id: str | None = None
-    source_evidence_kind: str | None = None
-    source_evidence_owner: str | None = None
-    source_task_id: str | None = None
-    source_payload_fingerprint: str | None = None
-
-
-@dataclass
-class _LoopProgressGuard:
-    seen_no_progress_fingerprints: set[str] = field(default_factory=set)
-    failed_action_counts: dict[str, int] = field(default_factory=dict)
-    sql_error_counts: dict[str, int] = field(default_factory=dict)
-    no_progress_count: int = 0
-
-    def evaluate(self, facts: Mapping[str, Any]) -> _LoopProgressDecision:
-        retry_facts: list[dict[str, Any]] = []
-        sql_terminal = False
-        for fingerprint in facts.get("sql_error_fingerprints") or ():
-            previous = self.sql_error_counts.get(str(fingerprint), 0)
-            count = previous + 1
-            self.sql_error_counts[str(fingerprint)] = count
-            if previous == 1:
-                retry_facts.append(
-                    {
-                        "warning": "db_agent_loop_repeated_sql_failure",
-                        "fingerprint": str(fingerprint),
-                        "count": count,
-                        "message": (
-                            "The same SQL validation or execution failure "
-                            "repeated; choose a different action or repair the SQL."
-                        ),
-                    }
-                )
-                sql_terminal = True
-            elif previous >= 2:
-                sql_terminal = True
-
-        repeated_failed_action = False
-        if facts.get("failed_action") and not facts.get("new_accepted_evidence_refs"):
-            for fingerprint in facts.get("compiled_action_fingerprints") or ():
-                previous = self.failed_action_counts.get(str(fingerprint), 0)
-                self.failed_action_counts[str(fingerprint)] = previous + 1
-                if previous >= 1:
-                    repeated_failed_action = True
-
-        repeated_no_progress = False
-        progress_fingerprint = str(facts.get("progress_fingerprint") or "")
-        if facts.get("no_progress"):
-            self.no_progress_count += 1
-            repeated_no_progress = (
-                progress_fingerprint in self.seen_no_progress_fingerprints
-                or self.no_progress_count >= 2
-            )
-            if progress_fingerprint:
-                self.seen_no_progress_fingerprints.add(progress_fingerprint)
-        else:
-            self.no_progress_count = 0
-
-        if retry_facts and not sql_terminal:
-            return _LoopProgressDecision(retry_facts=tuple(retry_facts))
-
-        warnings: list[str] = []
-        terminal_status: str | None = None
-        if sql_terminal:
-            terminal_status = "failed"
-            warnings.append("db_agent_loop_repeated_sql_failure")
-        if repeated_failed_action:
-            terminal_status = terminal_status or "failed"
-            warnings.append("db_agent_loop_repeated_action")
-        if repeated_no_progress:
-            terminal_status = terminal_status or "blocked"
-            warnings.append("db_agent_loop_no_progress")
-
-        if terminal_status is None:
-            return _LoopProgressDecision()
-
-        return _LoopProgressDecision(
-            terminal_status=terminal_status,
-            warnings=tuple(dict.fromkeys(warnings)),
-            diagnostics={
-                "sql_terminal": sql_terminal,
-                "repeated_failed_action": repeated_failed_action,
-                "repeated_no_progress": repeated_no_progress,
-                "no_progress_count": self.no_progress_count,
-            },
-            retry_facts=tuple(retry_facts),
-        )
 
 
 class DbAgentLoop:
@@ -2832,389 +2658,6 @@ class DbAgentLoop:
         )
 
 
-def _coerce_action(
-    raw_action: Any,
-) -> tuple[DbPlannerAction | None, dict[str, Any] | None]:
-    if isinstance(raw_action, DbPlannerAction):
-        return raw_action, None
-    if isinstance(raw_action, Mapping):
-        try:
-            return DbPlannerAction.from_dict(raw_action), None
-        except Exception as exc:
-            return None, {
-                "action_id": str(raw_action.get("action_id") or ""),
-                "kind": str(raw_action.get("kind") or ""),
-                "error": f"invalid_action:{exc}",
-            }
-    return None, {"action_id": "", "kind": "", "error": "invalid_action_shape"}
-
-
-def _durable_action_task_summaries(
-    state: DbLoopState,
-) -> dict[str, tuple[dict[str, Any], ...]]:
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for summary in state.task_summaries:
-        if str(summary.get("status") or "") != TaskStatus.SUCCEEDED.value:
-            continue
-        metadata = summary.get("metadata")
-        if not isinstance(metadata, Mapping):
-            continue
-        action_id = str(metadata.get("planner_action_id") or "").strip()
-        if not action_id:
-            continue
-        grouped.setdefault(action_id, []).append(dict(summary))
-    return {action_id: tuple(items) for action_id, items in grouped.items()}
-
-
-def _ordered_actions_or_errors(
-    actions: tuple[DbPlannerAction, ...],
-    *,
-    external_dependency_ids: frozenset[str] = frozenset(),
-) -> tuple[tuple[DbPlannerAction, ...], tuple[dict[str, Any], ...]]:
-    by_id: dict[str, DbPlannerAction] = {}
-    duplicate_ids: set[str] = set()
-    for action in actions:
-        if action.action_id in by_id:
-            duplicate_ids.add(action.action_id)
-            continue
-        by_id[action.action_id] = action
-    if duplicate_ids:
-        return (), tuple(
-            _action_error(action, "duplicate_action_id")
-            for action in actions
-            if action.action_id in duplicate_ids
-        )
-
-    missing_errors: list[dict[str, Any]] = []
-    dependency_sets: dict[str, tuple[str, ...]] = {}
-    for action in actions:
-        dependencies = tuple(dict.fromkeys(action.depends_on))
-        dependency_sets[action.action_id] = dependencies
-        for dependency in dependencies:
-            if dependency not in by_id and dependency not in external_dependency_ids:
-                missing_errors.append(
-                    _action_error(action, f"missing_dependency:{dependency}")
-                )
-    if missing_errors:
-        return (), tuple(missing_errors)
-
-    dependents: dict[str, list[str]] = {action.action_id: [] for action in actions}
-    remaining_dependencies: dict[str, int] = {}
-    for action in actions:
-        dependencies = dependency_sets[action.action_id]
-        current_dependencies = tuple(
-            dependency for dependency in dependencies if dependency in by_id
-        )
-        remaining_dependencies[action.action_id] = len(current_dependencies)
-        for dependency in current_dependencies:
-            dependents[dependency].append(action.action_id)
-
-    ready = [
-        action.action_id
-        for action in actions
-        if remaining_dependencies[action.action_id] == 0
-    ]
-    ordered: list[DbPlannerAction] = []
-    while ready:
-        action_id = ready.pop(0)
-        ordered.append(by_id[action_id])
-        for dependent_id in dependents[action_id]:
-            remaining_dependencies[dependent_id] -= 1
-            if remaining_dependencies[dependent_id] == 0:
-                ready.append(dependent_id)
-
-    if len(ordered) != len(actions):
-        cyclic_ids = tuple(
-            action.action_id
-            for action in actions
-            if remaining_dependencies[action.action_id] > 0
-        )
-        cycle_label = "->".join(cyclic_ids) if cyclic_ids else "unknown"
-        return (), tuple(
-            _action_error(action, f"dependency_cycle:{cycle_label}")
-            for action in actions
-            if action.action_id in cyclic_ids
-        )
-    return tuple(ordered), ()
-
-
-def _with_spec_dependencies(
-    specs: list[DbTaskSpec],
-    dependencies: tuple[TaskDependency, ...],
-) -> list[DbTaskSpec]:
-    if not dependencies:
-        return specs
-    return [
-        replace(
-            spec,
-            dependencies=_merge_dependencies(spec.dependencies, dependencies),
-        )
-        for spec in specs
-    ]
-
-
-def _same_turn_repair_execute_deferral(
-    action: DbPlannerAction,
-    planner_dependencies: tuple[TaskDependency, ...],
-    *,
-    same_decision_repair_action_ids: frozenset[str],
-) -> dict[str, Any] | None:
-    if action.kind not in {
-        DbPlannerActionKind.EXECUTE_VALIDATED_READ,
-        DbPlannerActionKind.EXECUTE_VALIDATED_WRITE,
-    }:
-        return None
-    if not _validated_sql_action_requires_query_plan_proposal(action):
-        return None
-
-    producer_action_ids = tuple(
-        dict.fromkeys(
-            str(dependency.metadata.get("producer_action_id") or "")
-            for dependency in planner_dependencies
-            if dependency.evidence_kind == "query.plan.proposal"
-            and str(dependency.metadata.get("producer_action_id") or "")
-            in same_decision_repair_action_ids
-        )
-    )
-    if not producer_action_ids:
-        return None
-    return {
-        **_action_error(
-            action,
-            "deferred_until_query_plan_proposal_available",
-        ),
-        "deferred": {
-            "reason": "same_turn_repair_query_plan",
-            "required_evidence_kind": "query.plan.proposal",
-            "producer_action_ids": list(producer_action_ids),
-            "non_terminal": True,
-        },
-    }
-
-
-def _validated_sql_action_requires_query_plan_proposal(
-    action: DbPlannerAction,
-) -> bool:
-    if action.input.get("query_plan_ref") == "latest_accepted_query_plan":
-        return True
-    if str(action.input.get("plan_evidence_id") or "").strip():
-        return True
-    sql = action.input.get("sql")
-    return not (isinstance(sql, str) and sql.strip())
-
-
-def _mode_action_errors(
-    action: DbPlannerAction,
-    state: DbLoopState,
-) -> tuple[dict[str, Any], ...]:
-    metadata_only_modes = {
-        DbIntentKind.SCHEMA_QUERY.value,
-        DbIntentKind.SCHEMA_RELATIONSHIP_QUERY.value,
-    }
-    effective_mode = _explicit_mode_operation_type(state.explicit_mode)
-    if effective_mode in metadata_only_modes and action.kind in _SQL_QUERY_ACTIONS:
-        return (
-            _action_error(
-                action,
-                f"action_outside_explicit_mode:{action.kind.value}:{effective_mode}",
-            ),
-        )
-    return ()
-
-
-def _explicit_mode_operation_type(mode: str | None) -> str | None:
-    normalized = (mode or "").strip().lower()
-    if normalized in {"schema", "schema.query"}:
-        return DbIntentKind.SCHEMA_QUERY.value
-    if normalized in {
-        "relationships",
-        "relationship",
-        "schema_relationship",
-        "schema.relationship_query",
-    }:
-        return DbIntentKind.SCHEMA_RELATIONSHIP_QUERY.value
-    if normalized in {"data", "data.query", "query", "read"}:
-        return DbIntentKind.DATA_QUERY.value
-    if normalized in {"write", "write.propose"}:
-        return DbIntentKind.WRITE_PROPOSE.value
-    if normalized in {"write.execute", "write_execute"}:
-        return DbIntentKind.WRITE_EXECUTE.value
-    if normalized == "admin":
-        return DbIntentKind.ADMIN.value
-    return None
-
-
-def _with_deterministic_task_id(
-    operation_id: str,
-    spec: DbTaskSpec,
-) -> DbTaskSpec:
-    if spec.task_id:
-        return spec
-    input_hash = _stable_hash(spec.input)
-    idempotency_key = spec.idempotency_key or _stable_hash(
-        {
-            "operation_id": operation_id,
-            "capability_id": spec.capability_id,
-            "owner": spec.owner,
-            "input_hash": input_hash,
-            "sequence": spec.sequence,
-            "deterministic_key": spec.deterministic_key,
-        }
-    )
-    task_fingerprint = _stable_hash(
-        {
-            "operation_id": operation_id,
-            "idempotency_key": idempotency_key,
-        }
-    )
-    return replace(spec, task_id=f"db-task-{task_fingerprint[:32]}")
-
-
-def _merge_dependencies(
-    left: tuple[TaskDependency, ...],
-    right: tuple[TaskDependency, ...],
-) -> tuple[TaskDependency, ...]:
-    merged: list[TaskDependency] = []
-    seen: set[str] = set()
-    for dependency in (*left, *right):
-        fingerprint = _stable_hash(dependency.to_dict())
-        if fingerprint in seen:
-            continue
-        seen.add(fingerprint)
-        merged.append(dependency)
-    return tuple(merged)
-
-
-def _has_terminal_compilation_error(compilation: DbActionCompilation) -> bool:
-    terminal_prefixes = (
-        "duplicate_action_id",
-        "missing_dependency:",
-        "dependency_cycle:",
-        "dependency_not_durable:",
-        "ambiguous_continuation:",
-        "ambiguous_continuation_evidence:",
-    )
-    return any(
-        str(item.get("error") or "").startswith(terminal_prefixes)
-        for item in compilation.rejected_action_summaries
-    )
-
-
-def _has_runtime_continuation_block(compilation: DbActionCompilation) -> bool:
-    return any(
-        isinstance(item.get("continuation"), Mapping)
-        and item["continuation"].get("status") == "blocked"
-        and item["continuation"].get("source") == "runtime_continuation"
-        for item in compilation.rejected_action_summaries
-    )
-
-
-def _compiled_action_fingerprints(
-    decision: DbPlannerDecision,
-) -> tuple[str, ...]:
-    return tuple(
-        _stable_hash(
-            {
-                "kind": action.kind.value,
-                "input": action.input,
-                "depends_on": list(action.depends_on),
-                "metadata": action.metadata,
-            }
-        )
-        for action in decision.actions
-    )
-
-
-def _execution_error_fingerprint(error: Mapping[str, Any]) -> str:
-    return _stable_hash(
-        {
-            "capability_id": error.get("capability_id"),
-            "error": error.get("error"),
-            "error_type": error.get("error_type"),
-            "readiness": error.get("readiness"),
-        }
-    )
-
-
-def _is_sql_execution_error(error: Mapping[str, Any]) -> bool:
-    capability_id = str(error.get("capability_id") or "")
-    if capability_id in {
-        "db.sql.validate",
-        "db.sql.execute_read",
-        "db.sql.execute_write",
-    }:
-        return True
-    text = str(error.get("error") or "").lower()
-    return "sql" in text or "validation_failed" in text
-
-
-def _blocked_resource_execution_errors(
-    errors: Iterable[Mapping[str, Any]],
-) -> tuple[dict[str, Any], ...]:
-    return tuple(dict(error) for error in errors if _is_blocked_resource_error(error))
-
-
-def _is_blocked_resource_error(error: Mapping[str, Any]) -> bool:
-    if str(error.get("capability_id") or "") != "db.sql.validate":
-        return False
-    text = str(error.get("error") or "").lower()
-    return any(
-        marker in text
-        for marker in (
-            "sql guardrail rejected blocked table",
-            "sql guardrail rejected blocked column",
-            "sql guardrail rejected table(s) outside allowlist",
-        )
-    )
-
-
-def _new_evidence_refs(
-    before: tuple[dict[str, Any], ...],
-    after: tuple[dict[str, Any], ...],
-    *,
-    include_loop_control: bool,
-) -> tuple[dict[str, Any], ...]:
-    before_ids = {item.get("id") for item in before}
-    refs = tuple(item for item in after if item.get("id") not in before_ids)
-    if include_loop_control:
-        return refs
-    return tuple(
-        item
-        for item in refs
-        if item.get("kind") not in DB_FINALIZATION_CONTROL_EVIDENCE_KINDS
-    )
-
-
-def _action_owner(action: DbPlannerAction) -> str | None:
-    owner = action.input.get("owner") or action.input.get("capability_owner")
-    return str(owner) if owner else None
-
-
-def _source_capability_owner(action: DbPlannerAction) -> str | None:
-    for source in (action.input, action.metadata):
-        owner = (
-            source.get("source_owner")
-            or source.get("db_owner")
-            or source.get("connector_owner")
-            or source.get("source_capability_owner")
-        )
-        if owner:
-            return str(owner)
-    return None
-
-
-def _task_input_for_action(action: DbPlannerAction) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in action.input.items()
-        if key not in {"owner", "capability_owner"}
-    }
-
-
-def _summary_id(summary: Mapping[str, Any]) -> str:
-    return str(summary.get("id") or "").strip()
-
-
 def _memory_update_runtime_continuation_action(
     state: DbLoopState,
     *,
@@ -3651,44 +3094,6 @@ def _session_context_tables(value: Any) -> list[str]:
     return _string_list(referents.get("tables"))
 
 
-def _dependency_for_prerequisite_spec(
-    spec: DbTaskSpec,
-    *,
-    capability: Any,
-    operation_id: str,
-    action_id: str,
-    consumer_capability_id: str,
-) -> TaskDependency:
-    evidence_kind = _preferred_output_evidence_kind(capability) or ""
-    return TaskDependency(
-        kind="evidence",
-        evidence_kind=evidence_kind,
-        evidence_owner=capability.owner,
-        producer_task_id=spec.task_id,
-        producer_capability_id=capability.id,
-        producer_executor_id=capability.executor,
-        evidence_accepted=True,
-        input_hash=_stable_hash(spec.input),
-        operation_id=operation_id,
-        metadata={
-            "runtime_prerequisite": True,
-            "producer_action_id": action_id,
-            "consumer_action_id": action_id,
-            "prerequisite_for": consumer_capability_id,
-        },
-    )
-
-
-def _preferred_output_evidence_kind(capability: Any) -> str | None:
-    output_evidence = set(getattr(capability, "output_evidence", ()) or ())
-    if (
-        capability.id == "db.planning.context.build"
-        and "planning.context" in output_evidence
-    ):
-        return "planning.context"
-    return next(iter(sorted(output_evidence)), None)
-
-
 def _state_can_use_catalog_structure(state: DbLoopState) -> bool:
     effective_mode = _explicit_mode_operation_type(state.explicit_mode)
     operation_type = str(
@@ -3964,29 +3369,6 @@ def _join_summaries_match_scope(
 
 def _short_asset_key(value: Any) -> str:
     return str(value or "").split(".")[-1].strip().lower()
-
-
-def _first_string_list_from_mappings(
-    mappings: Iterable[Mapping[str, Any]],
-    *keys: str,
-) -> list[str]:
-    for mapping in mappings:
-        for key in keys:
-            values = _string_list(mapping.get(key))
-            if values:
-                return values
-    return []
-
-
-def _string_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value.strip()] if value.strip() else []
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [str(item).strip() for item in value if str(item).strip()]
-    text = str(value).strip()
-    return [text] if text else []
 
 
 def _resolve_sql_input_for_action(
@@ -4479,114 +3861,6 @@ def _sql_provenance_metadata(resolved: _ResolvedSqlInput) -> dict[str, Any]:
     return metadata
 
 
-def _monitor_action_output_evidence(
-    action: DbPlannerAction,
-) -> tuple[str, str | None]:
-    if action.kind is DbPlannerActionKind.PLAN_MONITOR_CREATE:
-        return "monitor.proposal", None
-    if action.kind is DbPlannerActionKind.COMMIT_MONITOR_CREATE:
-        return "monitor.definition", None
-    if action.kind is DbPlannerActionKind.PLAN_MONITOR_LIFECYCLE:
-        return "monitor.proposal", None
-    if action.kind is DbPlannerActionKind.COMMIT_MONITOR_LIFECYCLE:
-        lifecycle_action = _monitor_lifecycle_action_label(
-            action.input.get("action") or action.input.get("operation_type")
-        )
-        if lifecycle_action is None:
-            return "", "missing_monitor_lifecycle_action"
-        return _monitor_lifecycle_evidence_kind(lifecycle_action), None
-    if action.kind is DbPlannerActionKind.READ_MONITOR_STATE:
-        read_kind = str(action.input.get("read_kind") or "list").lower()
-        evidence_kind = {
-            "list": "monitor.listing",
-            "inspect": "monitor.inspection",
-            "explain_run": "monitor.run_summary",
-            "approvals": "monitor.approval_state",
-        }.get(read_kind)
-        if evidence_kind is None:
-            return "", f"unsupported_monitor_read_kind:{read_kind}"
-        return evidence_kind, None
-    if action.kind is DbPlannerActionKind.RESOLVE_MONITOR_APPROVAL:
-        return "monitor.approval_resolution", None
-    return "", "unsupported_monitor_action_kind"
-
-
-def _monitor_lifecycle_action_label(value: Any) -> str | None:
-    normalized = str(value or "").removeprefix("monitor.").replace("_", ".").lower()
-    if normalized in {"update", "pause", "resume", "delete", "disable"}:
-        return normalized
-    if normalized == "disabled":
-        return "disable"
-    return None
-
-
-def _monitor_lifecycle_evidence_kind(action: str) -> str:
-    if action == "delete":
-        return "monitor.deleted"
-    if action == "disable":
-        return "monitor.disabled"
-    if action == "pause":
-        return "monitor.paused"
-    if action == "resume":
-        return "monitor.resumed"
-    return "monitor.state_update"
-
-
-def _action_metadata(
-    action: DbPlannerAction,
-    decision_fingerprint: str,
-) -> dict[str, Any]:
-    return {
-        **action.metadata,
-        "planner_action_id": action.action_id,
-        "planner_action_kind": action.kind.value,
-        "planner_decision_fingerprint": decision_fingerprint,
-    }
-
-
-def _action_error(action: DbPlannerAction, error: str) -> dict[str, Any]:
-    return {
-        "action_id": action.action_id,
-        "kind": action.kind.value,
-        "error": error,
-    }
-
-
-def _continuation_action_error(
-    action: DbPlannerAction,
-    diagnostic: Mapping[str, Any],
-) -> dict[str, Any]:
-    return {
-        **_action_error(
-            action,
-            str(diagnostic.get("error") or "continuation_resolution_blocked"),
-        ),
-        "continuation": dict(diagnostic),
-    }
-
-
-def _capability_selection(
-    capability: Any,
-    action: DbPlannerAction,
-    *,
-    output_evidence: tuple[str, ...] | None = None,
-    reason: str | None = None,
-) -> dict[str, Any]:
-    return {
-        "id": capability.id,
-        "owner": capability.owner,
-        "access": capability.access.value,
-        "risk": capability.risk.value,
-        "output_evidence": (
-            sorted(output_evidence)
-            if output_evidence is not None
-            else sorted(capability.output_evidence)
-        ),
-        "action_id": action.action_id,
-        "reason": reason or action.kind.value,
-    }
-
-
 def _capability_summary(capability: Any) -> dict[str, Any]:
     return {
         "id": capability.id,
@@ -4907,124 +4181,6 @@ def _sql_from_evidence_payload(payload: Any) -> str | None:
     return None
 
 
-def _fallback_contract_for_operation(
-    operation: Operation,
-    *,
-    limits: DbLimits,
-) -> DbOperationContract:
-    return DbOperationContract(
-        operation_type=operation.operation_type,
-        required_evidence=tuple(sorted(operation.required_evidence)),
-        access=AccessMode.NONE,
-        limits=limits,
-        policy_ids=(),
-        metadata={"source": "operation_state"},
-    )
-
-
-def _contract_from_latest_snapshot(
-    operation: Operation,
-    fallback: DbOperationContract,
-) -> DbOperationContract:
-    context = operation.metadata.get("resume_context")
-    context = context if isinstance(context, dict) else {}
-    snapshot = (
-        operation.metadata.get("latest_compiled_contract_snapshot")
-        or context.get("latest_compiled_contract_snapshot")
-        or context.get("contract")
-    )
-    if not isinstance(snapshot, dict):
-        return fallback
-    limits = snapshot.get("limits")
-    limits = limits if isinstance(limits, dict) else {}
-    metadata = snapshot.get("metadata")
-    metadata = metadata if isinstance(metadata, dict) else {}
-    try:
-        access = AccessMode(str(snapshot.get("access") or fallback.access.value))
-    except ValueError:
-        access = fallback.access
-    try:
-        db_limits = DbLimits(**limits) if limits else fallback.limits
-    except (TypeError, ValueError):
-        db_limits = fallback.limits
-    return DbOperationContract(
-        operation_type=str(snapshot.get("operation_type") or fallback.operation_type),
-        required_evidence=_string_tuple(snapshot.get("required_evidence")),
-        access=access,
-        limits=db_limits,
-        policy_ids=_string_tuple(snapshot.get("policy_ids")),
-        metadata=metadata,
-    )
-
-
-def _fallback_intent_for_operation(
-    operation: Operation,
-    contract: DbOperationContract,
-) -> DbIntent:
-    context = operation.metadata.get("resume_context")
-    context = context if isinstance(context, dict) else {}
-    intent_context = context.get("intent")
-    intent_context = intent_context if isinstance(intent_context, dict) else {}
-    kind_value = str(intent_context.get("kind") or operation.operation_type)
-    try:
-        kind = DbIntentKind(kind_value)
-    except ValueError:
-        kind = DbIntentKind.CONVERSATIONAL
-    return DbIntent(
-        kind=kind,
-        confidence=1.0,
-        access=contract.access,
-        evidence_mode="planner_loop",
-        diagnostics={
-            "source": "operation_state",
-            "operation_type": operation.operation_type,
-        },
-    )
-
-
-def _intent_from_contract(
-    contract: DbOperationContract,
-    fallback: DbIntent,
-) -> DbIntent:
-    intent_metadata = contract.metadata.get("planner_intent")
-    intent_metadata = intent_metadata if isinstance(intent_metadata, dict) else {}
-    operation_type = str(
-        intent_metadata.get("operation_type") or contract.operation_type
-    )
-    try:
-        kind = DbIntentKind(operation_type)
-    except ValueError:
-        kind = fallback.kind
-    return DbIntent(
-        kind=kind,
-        confidence=1.0,
-        access=contract.access,
-        evidence_mode="planner_loop",
-        diagnostics={
-            "source": "planner_compiled_contract",
-            "operation_type": operation_type,
-            "planner_intent": intent_metadata,
-        },
-    )
-
-
-def _intent_summary(intent: DbIntent) -> dict[str, Any]:
-    return {
-        "kind": intent.kind.value,
-        "access": intent.access.value,
-        "evidence_mode": intent.evidence_mode,
-        "diagnostics": intent.diagnostics,
-    }
-
-
-def _string_tuple(value: Any) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, str):
-        return (value,)
-    return tuple(str(item) for item in value)
-
-
 def _column_value_scope_for_action(
     action: DbPlannerAction,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -5111,28 +4267,6 @@ def _first_action_string_list(
             if values:
                 return values
     return []
-
-
-def _safe_string_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value.strip()] if value.strip() else []
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [str(item).strip() for item in value if str(item).strip()]
-    text = str(value).strip()
-    return [text] if text else []
-
-
-def _ordered_unique_strings(values: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        out.append(value)
-    return out
 
 
 def _memory_context_for_state(
@@ -5504,75 +4638,6 @@ def _state_session_query_scopes(state: DbLoopState) -> list[dict[str, Any]]:
     return _dedupe_json_values(scopes)
 
 
-def _safe_iterable(value: Any) -> list[Any]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return list(value)
-    return [value]
-
-
-def _first_present(
-    *sources: Mapping[str, Any],
-    keys: tuple[str, ...],
-    default: Any,
-) -> Any:
-    for source in sources:
-        for key in keys:
-            if key in source and source.get(key) is not None:
-                return source[key]
-    return default
-
-
-def _split_column_ref(value: Any) -> tuple[str, str]:
-    parts = [
-        part.strip().strip('"`[]')
-        for part in str(value or "").split(".")
-        if part.strip().strip('"`[]')
-    ]
-    if len(parts) >= 2:
-        return ".".join(parts[:-1]), parts[-1]
-    return "", ""
-
-
-def _dedupe_dicts(
-    values: list[dict[str, Any]],
-    *,
-    keys: tuple[str, ...],
-) -> list[dict[str, Any]]:
-    seen: set[tuple[str, ...]] = set()
-    out: list[dict[str, Any]] = []
-    for value in values:
-        key = tuple(str(value.get(item) or "") for item in keys)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(value)
-    return out
-
-
-def _dedupe_json_values(values: list[Any]) -> list[Any]:
-    seen: set[str] = set()
-    out: list[Any] = []
-    for value in values:
-        key = json.dumps(value, sort_keys=True, default=str)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(value)
-    return out
-
-
-def _float_option(value: Mapping[str, Any], key: str, default: float) -> float:
-    raw = value.get(key)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
-
-
 def _state_has_accepted_evidence(state: DbLoopState, kind: str) -> bool:
     return any(
         item.get("kind") == kind and item.get("accepted", True) is True
@@ -5854,56 +4919,3 @@ def _repair_input_dependency(
             "repair_input": input_name,
         },
     )
-
-
-def _state_allows_read_profile(state: DbLoopState) -> bool:
-    safety_frame = state.safety_frame or {}
-    max_access = str(
-        safety_frame.get("max_access")
-        or safety_frame.get("max_allowed_access")
-        or AccessMode.ADMIN.value
-    )
-    return _access_rank(max_access) >= _access_rank(AccessMode.READ.value)
-
-
-def _governance_summary(governance: GovernanceResult | None) -> dict[str, Any]:
-    if governance is None:
-        return {}
-    return governance.to_dict()
-
-
-def _contract_snapshot(contract: DbOperationContract) -> dict[str, Any]:
-    return {
-        "operation_type": contract.operation_type,
-        "required_capabilities": list(contract.required_capabilities),
-        "required_evidence": list(contract.required_evidence),
-        "access": contract.access.value,
-        "limits": contract.limits.to_dict(),
-        "policy_ids": list(contract.policy_ids),
-        "metadata": contract.metadata,
-    }
-
-
-def _access_rank(value: str) -> int:
-    return _ACCESS_ORDER.get(value, _ACCESS_ORDER[AccessMode.ADMIN.value])
-
-
-def _optional_string(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value)
-    return text or None
-
-
-def _stable_hash(value: Mapping[str, Any]) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _json_dict(value: Mapping[str, Any] | None) -> dict[str, Any]:
-    copied = dict(value or {})
-    try:
-        json.dumps(copied, sort_keys=True, default=str)
-    except TypeError as exc:
-        raise TypeError("DB agent loop mappings must be JSON serializable") from exc
-    return copied
