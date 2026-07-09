@@ -7,13 +7,42 @@ from enum import Enum
 import re
 from typing import Any, Iterable, Mapping
 
-from daita.runtime import Evidence
+from daita.runtime import Evidence, OperationStatus
 
 from .memory import PII_COLUMN_PATTERNS, _detect_pii_value as _memory_detect_pii_value
 from .memory_contracts import (
     DB_MEMORY_SEMANTIC_CONTRACT_KEY,
     db_memory_contract_refs,
 )
+from .models import DbOperationResult
+
+_PUBLIC_WARNING_CODE = re.compile(r"[a-z0-9_.:-]+")
+_PUBLIC_ERROR_TYPE = re.compile(r"[A-Za-z0-9_.:-]+")
+_PUBLIC_TELEMETRY_FIELDS = (
+    "provider",
+    "model",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "llm_calls",
+    "estimated_cost_usd",
+    "latency_ms",
+    "mode",
+)
+_PUBLIC_TRACE_ID_FIELDS = (
+    "trace_id",
+    "span_id",
+    "root_span_id",
+    "parent_span_id",
+    "correlation_id",
+    "operation_id",
+    "execution_id",
+    "request_id",
+    "run_id",
+)
+_REDACTED_WARNING_CODE = "db_runtime_warning_redacted"
+_REDACTED_ERROR_CODE = "db_runtime_error_redacted"
+_PUBLIC_MACHINE_CODE_MAX_LENGTH = 128
 
 
 class ProjectionMode(str, Enum):
@@ -341,13 +370,271 @@ def project_operation_evidence(
             item,
             payload=_project_evidence_payload(item, projection),
             metadata={
-                **item.metadata,
+                **(
+                    {}
+                    if projection.mode is ProjectionMode.PUBLIC_RESULT
+                    else item.metadata
+                ),
                 "projection_mode": projection.mode.value,
                 "projected": True,
             },
         )
         for item in evidence
     )
+
+
+def project_operation_result(
+    result: DbOperationResult,
+    projection: ProjectionContext,
+) -> DbOperationResult:
+    """Build the allowlisted public view of one DB operation result."""
+
+    if projection.mode is not ProjectionMode.PUBLIC_RESULT:
+        raise ValueError("operation results require public_result projection")
+
+    evidence = project_operation_evidence(result.evidence, projection)
+    diagnostics = result.diagnostics
+    projected_diagnostics: dict[str, Any] = {}
+
+    planner = _project_result_planner_diagnostics(diagnostics.get("planner"))
+    if planner:
+        projected_diagnostics["planner"] = planner
+
+    projected_diagnostics["execution"] = _project_result_execution_diagnostics(
+        diagnostics.get("execution"),
+        operation_id=result.operation_id,
+        evidence=evidence,
+    )
+
+    verification = _project_result_verification_diagnostics(
+        diagnostics.get("verification")
+    )
+    if verification:
+        projected_diagnostics["verification"] = verification
+
+    telemetry_source = diagnostics.get("telemetry")
+    if not isinstance(telemetry_source, Mapping):
+        telemetry_source = result.telemetry
+    telemetry = _project_result_telemetry(telemetry_source)
+    projected_diagnostics["synthesis"] = dict(telemetry)
+    projected_diagnostics["telemetry"] = dict(telemetry)
+
+    trace = _project_result_trace_diagnostics(diagnostics.get("trace"))
+    if trace:
+        projected_diagnostics["trace"] = trace
+
+    error = _project_result_error_diagnostics(diagnostics.get("error"))
+    if error:
+        projected_diagnostics["error"] = error
+
+    return replace(
+        result,
+        answer=_project_result_answer(result),
+        evidence=evidence,
+        warnings=_public_warning_codes(result.warnings),
+        diagnostics=projected_diagnostics,
+    )
+
+
+def _project_result_answer(result: DbOperationResult) -> str | None:
+    if result.status is OperationStatus.FAILED:
+        return "DB operation failed before final synthesis."
+    if result.status is OperationStatus.CANCELLED:
+        return "DB operation was cancelled before completion."
+    if (
+        result.status is OperationStatus.BLOCKED
+        and result.diagnostics.get("error") is not None
+    ):
+        return "DB operation was blocked before completion."
+    return result.answer
+
+
+def _project_result_planner_diagnostics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    status = _public_machine_code(value.get("status"))
+    if status is not None:
+        result["status"] = status
+    turn_count = _planner_turn_count(value)
+    if turn_count is not None:
+        result["turn_count"] = turn_count
+    warnings = value.get("warning_codes", value.get("warnings"))
+    result["warning_codes"] = list(_public_warning_codes(warnings))
+    terminal_reason = value.get("terminal_reason_code")
+    nested = value.get("diagnostics")
+    if terminal_reason is None and isinstance(nested, Mapping):
+        terminal_reason = nested.get("terminal_reason_code")
+    if terminal_reason is None:
+        terminal_reason = status
+    terminal_reason_code = _public_machine_code(terminal_reason)
+    if terminal_reason_code is not None:
+        result["terminal_reason_code"] = terminal_reason_code
+    return result
+
+
+def _planner_turn_count(value: Mapping[str, Any]) -> int | None:
+    candidates = [value.get("turn_count"), value.get("turn")]
+    diagnostics = value.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        candidates.extend(
+            (
+                diagnostics.get("turn_count"),
+                diagnostics.get("turn"),
+                diagnostics.get("turn_budget"),
+            )
+        )
+        observation = diagnostics.get("observation")
+        if isinstance(observation, Mapping):
+            observation_diagnostics = observation.get("diagnostics")
+            if isinstance(observation_diagnostics, Mapping):
+                candidates.extend(
+                    (
+                        observation_diagnostics.get("turn_count"),
+                        observation_diagnostics.get("turn"),
+                    )
+                )
+    for candidate in candidates:
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            return max(0, candidate)
+    return None
+
+
+def _project_result_execution_diagnostics(
+    value: Any,
+    *,
+    operation_id: str,
+    evidence: tuple[Evidence, ...],
+) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    raw_task_refs = source.get("task_refs")
+    if not isinstance(raw_task_refs, (list, tuple)):
+        raw_task_refs = source.get("tasks")
+    task_refs = _project_result_task_refs(raw_task_refs)
+    task_count = source.get("task_count")
+    if not isinstance(task_count, int) or isinstance(task_count, bool):
+        task_count = len(task_refs)
+    evidence_refs = [_public_evidence_ref(item) for item in evidence]
+    return {
+        "operation_id": operation_id,
+        "task_count": max(0, task_count),
+        "evidence_count": len(evidence_refs),
+        "evidence_refs": evidence_refs,
+        "task_refs": task_refs,
+    }
+
+
+def _project_result_task_refs(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    result = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        task_id = item.get("id", item.get("task_id"))
+        capability_id = item.get("capability_id")
+        status = item.get("status")
+        result.append(
+            {
+                "id": str(task_id) if task_id is not None else None,
+                "capability_id": (
+                    str(capability_id) if capability_id is not None else None
+                ),
+                "status": str(status) if status is not None else None,
+            }
+        )
+    return result
+
+
+def _public_evidence_ref(evidence: Evidence) -> dict[str, Any]:
+    return {
+        "id": evidence.id,
+        "kind": evidence.kind,
+        "task_id": evidence.task_id,
+        "accepted": evidence.accepted,
+    }
+
+
+def _project_result_verification_diagnostics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    diagnostics = value.get("diagnostics")
+    diagnostics = diagnostics if isinstance(diagnostics, Mapping) else {}
+    required = value.get("required_evidence_kinds")
+    if required is None:
+        required = value.get("required_evidence", diagnostics.get("required_evidence"))
+    missing = value.get("missing_evidence_kinds")
+    if missing is None:
+        missing = value.get("missing_evidence")
+    warnings = value.get("warning_codes", value.get("warnings"))
+    return {
+        "passed": value.get("passed") is True,
+        "required_evidence_kinds": _public_machine_codes(required),
+        "missing_evidence_kinds": _public_machine_codes(missing),
+        "warning_codes": list(_public_warning_codes(warnings)),
+    }
+
+
+def _project_result_telemetry(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {key: value[key] for key in _PUBLIC_TELEMETRY_FIELDS if key in value}
+
+
+def _project_result_trace_diagnostics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        key: str(value[key])
+        for key in _PUBLIC_TRACE_ID_FIELDS
+        if value.get(key) is not None
+    }
+
+
+def _project_result_error_diagnostics(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    source = value if isinstance(value, Mapping) else {}
+    error_type = source.get("type", source.get("error_type"))
+    error_type_text = str(error_type or "Error")
+    if _PUBLIC_ERROR_TYPE.fullmatch(error_type_text) is None:
+        error_type_text = "Error"
+    elif len(error_type_text) > _PUBLIC_MACHINE_CODE_MAX_LENGTH:
+        error_type_text = "Error"
+    code = _public_machine_code(source.get("code", source.get("error_code")))
+    return {
+        "type": error_type_text,
+        "code": code or _REDACTED_ERROR_CODE,
+    }
+
+
+def _public_warning_codes(value: Any) -> tuple[str, ...]:
+    result: list[str] = []
+    for item in _string_list(value):
+        code = _public_machine_code(item) or _REDACTED_WARNING_CODE
+        if code not in result:
+            result.append(code)
+    return tuple(result)
+
+
+def _public_machine_codes(value: Any) -> list[str]:
+    return [
+        code
+        for item in _string_list(value)
+        if (code := _public_machine_code(item)) is not None
+    ]
+
+
+def _public_machine_code(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if (
+        len(text) > _PUBLIC_MACHINE_CODE_MAX_LENGTH
+        or _PUBLIC_WARNING_CODE.fullmatch(text) is None
+    ):
+        return None
+    return text
 
 
 def _project_evidence_payload(
@@ -369,7 +656,9 @@ def _project_evidence_payload(
             base["valid"] = payload.get("valid") is True
         operation = payload.get("operation")
         if operation is not None:
-            base["operation"] = str(operation)
+            operation_code = _public_machine_code(operation)
+            if operation_code is not None:
+                base["operation"] = operation_code
         facts = _project_validation_items(
             payload.get("validation_facts")
             or payload.get("warnings")
@@ -382,12 +671,23 @@ def _project_evidence_payload(
         rows = payload.get("rows")
         if isinstance(rows, list):
             base["row_count"] = len(rows)
-        for key in ("total_rows", "truncated", "success"):
-            if key in payload:
-                base[key] = payload[key]
+        if projection.mode is ProjectionMode.PUBLIC_RESULT:
+            total_rows = payload.get("total_rows")
+            if isinstance(total_rows, int) and not isinstance(total_rows, bool):
+                base["total_rows"] = max(0, total_rows)
+            for key in ("truncated", "success"):
+                if isinstance(payload.get(key), bool):
+                    base[key] = payload[key]
+        else:
+            for key in ("total_rows", "truncated", "success"):
+                if key in payload:
+                    base[key] = payload[key]
         if "error" in payload:
             error = payload["error"]
-            if error is not None and _text_contains_blocked_or_sensitive(
+            if projection.mode is ProjectionMode.PUBLIC_RESULT:
+                base["error_code"] = _REDACTED_ERROR_CODE
+                base["redacted_fields"] = ["error"]
+            elif error is not None and _text_contains_blocked_or_sensitive(
                 str(error),
                 projection,
             ):
@@ -624,13 +924,17 @@ def _project_evidence_payload(
                     for table in safe_tables
                 ]
     else:
-        for key in ("status", "success", "error", "reason"):
-            value = payload.get(key)
-            if value is not None and not _text_contains_blocked_or_sensitive(
-                str(value),
-                projection,
-            ):
-                base[key] = value
+        if projection.mode is ProjectionMode.PUBLIC_RESULT:
+            if isinstance(payload.get("success"), bool):
+                base["success"] = payload["success"]
+        else:
+            for key in ("status", "success", "error", "reason"):
+                value = payload.get(key)
+                if value is not None and not _text_contains_blocked_or_sensitive(
+                    str(value),
+                    projection,
+                ):
+                    base[key] = value
     return base
 
 

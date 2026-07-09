@@ -297,6 +297,9 @@ def db_operation_telemetry(result: DbOperationResult) -> dict[str, Any]:
 
 
 def _telemetry_source_diagnostics(result: DbOperationResult) -> dict[str, Any]:
+    telemetry = result.diagnostics.get("telemetry")
+    if isinstance(telemetry, dict) and telemetry:
+        return dict(telemetry)
     answer = _latest_synthesis_diagnostics(result.evidence, kind="answer.synthesis")
     if answer:
         return answer

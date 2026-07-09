@@ -1,4 +1,6 @@
 from collections.abc import Mapping
+from dataclasses import asdict
+import json
 
 from daita.db import (
     DbAgent,
@@ -114,6 +116,16 @@ async def test_db_agent_typed_monitor_crud_records_runtime_operations():
         assert "monitor id cannot be changed" in str(exc)
     else:
         raise AssertionError("monitor id update should fail")
+    rejected_result = runtime.operation_results[-1]
+    assert rejected_result.status is OperationStatus.BLOCKED
+    assert rejected_result.answer == (
+        "Monitor update proposal is incomplete or unsupported."
+    )
+    assert "monitor id cannot be changed" not in json.dumps(
+        asdict(rejected_result),
+        default=str,
+        sort_keys=True,
+    )
 
     paused = await agent.pause_monitor(
         "orders_backlog",

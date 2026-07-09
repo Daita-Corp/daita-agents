@@ -103,14 +103,20 @@ class DbRuntimeMonitorManagementMixin:
         patch: dict[str, Any],
     ) -> DbMonitor:
         """Patch a durable monitor definition through runtime lifecycle tasks."""
-        result = await self.execute_monitor_lifecycle_operation(
-            {
-                "operation_type": "monitor.update",
-                "monitor_id": monitor_id,
-                "patch": dict(patch),
-            }
+        result, monitor, validation_errors = (
+            await self._execute_monitor_lifecycle_operation(
+                {
+                    "operation_type": "monitor.update",
+                    "monitor_id": monitor_id,
+                    "patch": dict(patch),
+                }
+            )
         )
-        return _monitor_from_lifecycle_result(result)
+        return _monitor_from_lifecycle_outcome(
+            result,
+            monitor=monitor,
+            validation_errors=validation_errors,
+        )
 
     async def pause_monitor(
         self,
@@ -119,34 +125,52 @@ class DbRuntimeMonitorManagementMixin:
         paused_until: str | None = None,
     ) -> DbMonitor:
         """Pause a monitor through runtime lifecycle tasks."""
-        result = await self.execute_monitor_lifecycle_operation(
-            {
-                "operation_type": "monitor.pause",
-                "monitor_id": monitor_id,
-                "paused_until": paused_until,
-            }
+        result, monitor, validation_errors = (
+            await self._execute_monitor_lifecycle_operation(
+                {
+                    "operation_type": "monitor.pause",
+                    "monitor_id": monitor_id,
+                    "paused_until": paused_until,
+                }
+            )
         )
-        return _monitor_from_lifecycle_result(result)
+        return _monitor_from_lifecycle_outcome(
+            result,
+            monitor=monitor,
+            validation_errors=validation_errors,
+        )
 
     async def resume_monitor(self, monitor_id: str) -> DbMonitor:
         """Resume a monitor through runtime lifecycle tasks."""
-        result = await self.execute_monitor_lifecycle_operation(
-            {
-                "operation_type": "monitor.resume",
-                "monitor_id": monitor_id,
-            }
+        result, monitor, validation_errors = (
+            await self._execute_monitor_lifecycle_operation(
+                {
+                    "operation_type": "monitor.resume",
+                    "monitor_id": monitor_id,
+                }
+            )
         )
-        return _monitor_from_lifecycle_result(result)
+        return _monitor_from_lifecycle_outcome(
+            result,
+            monitor=monitor,
+            validation_errors=validation_errors,
+        )
 
     async def delete_monitor(self, monitor_id: str) -> DbMonitor:
         """Delete a monitor through runtime lifecycle tasks."""
-        result = await self.execute_monitor_lifecycle_operation(
-            {
-                "operation_type": "monitor.delete",
-                "monitor_id": monitor_id,
-            }
+        result, monitor, validation_errors = (
+            await self._execute_monitor_lifecycle_operation(
+                {
+                    "operation_type": "monitor.delete",
+                    "monitor_id": monitor_id,
+                }
+            )
         )
-        return _monitor_from_lifecycle_result(result)
+        return _monitor_from_lifecycle_outcome(
+            result,
+            monitor=monitor,
+            validation_errors=validation_errors,
+        )
 
     async def execute_monitor_lifecycle_operation(
         self,
@@ -156,7 +180,24 @@ class DbRuntimeMonitorManagementMixin:
         operation_id: str | None = None,
         source: str = "runtime",
     ) -> DbOperationResult:
-        """Run update/delete/pause/resume through proposal and commit tasks."""
+        """Run a monitor lifecycle operation and return its public result."""
+        result, _, _ = await self._execute_monitor_lifecycle_operation(
+            request,
+            context=context,
+            operation_id=operation_id,
+            source=source,
+        )
+        return result
+
+    async def _execute_monitor_lifecycle_operation(
+        self,
+        request: dict[str, Any],
+        *,
+        context: dict[str, Any] | None = None,
+        operation_id: str | None = None,
+        source: str = "runtime",
+    ) -> tuple[DbOperationResult, DbMonitor | None, tuple[str, ...]]:
+        """Run lifecycle tasks while retaining owner-local typed outcomes."""
 
         if not self._is_setup:
             await self.setup()
@@ -255,12 +296,12 @@ class DbRuntimeMonitorManagementMixin:
                 message="Monitor lifecycle proposal is incomplete or unsupported.",
                 payload={"validation": validation.to_dict()},
             )
-            return await self._record_monitor_lifecycle_result(
+            result = await self._record_monitor_lifecycle_result(
                 request=request,
                 operation=operation,
                 action=action,
                 status=OperationStatus.BLOCKED,
-                answer=_monitor_lifecycle_validation_answer(action, validation),
+                answer=_monitor_lifecycle_validation_answer(action),
                 evidence=tuple(plan_evidence),
                 warnings=("db_monitor_validation_failed", *validation.warnings),
                 diagnostics={
@@ -268,6 +309,7 @@ class DbRuntimeMonitorManagementMixin:
                     "validation": validation.to_dict(),
                 },
             )
+            return result, None, tuple(str(item) for item in validation.errors)
 
         commit_plan = await self.plan_task_specs(
             operation,
@@ -311,7 +353,7 @@ class DbRuntimeMonitorManagementMixin:
             evidence = tuple(plan_evidence)
             if snapshot is not None:
                 evidence = tuple(snapshot.evidence)
-            return await self._record_monitor_lifecycle_result(
+            result = await self._record_monitor_lifecycle_result(
                 request=request,
                 operation=exc.operation,
                 action=action,
@@ -325,6 +367,7 @@ class DbRuntimeMonitorManagementMixin:
                     "governance": exc.governance.to_dict(),
                 },
             )
+            return result, None, ()
 
         lifecycle_evidence = next(
             (
@@ -354,7 +397,7 @@ class DbRuntimeMonitorManagementMixin:
             message=f"Monitor {monitor_id} {action} committed.",
             payload={"monitor_id": monitor_id, "action": action},
         )
-        return await self._record_monitor_lifecycle_result(
+        result = await self._record_monitor_lifecycle_result(
             request=request,
             operation=operation,
             action=action,
@@ -367,6 +410,7 @@ class DbRuntimeMonitorManagementMixin:
                 "monitor": None if monitor is None else monitor.to_dict(),
             },
         )
+        return result, monitor, ()
 
     async def _record_monitor_lifecycle_result(
         self,
@@ -561,22 +605,25 @@ def _raise_if_non_executable_active_monitor(monitor: DbMonitor) -> None:
         )
 
 
-def _monitor_from_lifecycle_result(result: DbOperationResult) -> DbMonitor:
+def _monitor_from_lifecycle_outcome(
+    result: DbOperationResult,
+    *,
+    monitor: DbMonitor | None,
+    validation_errors: tuple[str, ...],
+) -> DbMonitor:
     if result.status is OperationStatus.BLOCKED:
         if "db_monitor_validation_failed" in result.warnings:
-            validation = result.diagnostics.get("validation")
-            if isinstance(validation, dict) and validation.get("errors"):
-                message = ", ".join(str(item) for item in validation["errors"])
+            if validation_errors:
+                message = ", ".join(validation_errors)
                 message = message.replace("monitor.lifecycle:", "")
                 raise ValueError(message)
             raise ValueError(result.answer or "Monitor lifecycle proposal is invalid.")
         raise PermissionError(
             result.answer or "Monitor lifecycle operation is blocked."
         )
-    monitor = result.diagnostics.get("monitor")
-    if not isinstance(monitor, dict):
+    if monitor is None:
         raise RuntimeError("monitor lifecycle operation did not return a monitor")
-    return DbMonitor.from_dict(monitor)
+    return monitor
 
 
 def _monitor_lifecycle_action(operation_type: str) -> str:
@@ -609,11 +656,8 @@ def _validation_from_lifecycle_proposal(proposal: dict[str, Any]) -> Any:
     return DbMonitorValidation(accepted=bool(proposal.get("accepted", True)))
 
 
-def _monitor_lifecycle_validation_answer(action: str, validation: Any) -> str:
-    errors = ", ".join(str(item) for item in validation.errors)
-    return f"Monitor {action} proposal is incomplete or unsupported" + (
-        f": {errors}" if errors else "."
-    )
+def _monitor_lifecycle_validation_answer(action: str) -> str:
+    return f"Monitor {action} proposal is incomplete or unsupported."
 
 
 def _monitor_lifecycle_answer(action: str, monitor_id: str) -> str:

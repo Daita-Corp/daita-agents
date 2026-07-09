@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation, OperationStatus, RuntimeEventType
 
+from ..context_projection import (
+    ProjectionContext,
+    ProjectionMode,
+    policy_summary_from_source,
+    project_operation_result,
+)
 from ..models import DbOperationResult
 
 
@@ -28,6 +34,7 @@ class DbRuntimeResultsMixin:
         *,
         operation: Operation | None = None,
     ) -> DbOperationResult:
+        raw_result = result
         operation_for_trace = operation
         if operation_for_trace is None:
             try:
@@ -44,6 +51,20 @@ class DbRuntimeResultsMixin:
             result = self._result_with_observability(result, operation_for_trace)
         else:
             result = self._result_with_observability(result, None)
+        projection = ProjectionContext(
+            mode=ProjectionMode.PUBLIC_RESULT,
+            operation_intent=result.intent.kind.value,
+            safety_frame=(
+                operation_for_trace.metadata.get("safety_frame")
+                if operation_for_trace is not None
+                else None
+            ),
+            policy_summary=policy_summary_from_source(_result_projection_source(self)),
+            source_identity=_projection_source_identity(self.config.metadata),
+            session_id=result.request.session_id,
+            user_id=result.request.user_id,
+        )
+        result = project_operation_result(result, projection)
         self._operation_results.append(result)
         self._audit_log.append(_audit_entry_from_result(result))
         if operation is not None:
@@ -51,7 +72,7 @@ class DbRuntimeResultsMixin:
                 f"Operation {result.operation_id} finished with "
                 f"{result.status.value}."
             )
-            payload = {"warnings": list(result.warnings)}
+            payload = {"warnings": list(raw_result.warnings)}
             if result.status in {
                 OperationStatus.SUCCEEDED,
                 OperationStatus.FAILED,
@@ -83,7 +104,7 @@ class DbRuntimeResultsMixin:
             )
             if enqueue_learning is not None:
                 try:
-                    await enqueue_learning(result, operation=operation)
+                    await enqueue_learning(raw_result, operation=operation)
                 except Exception:
                     await self.kernel.append_event(
                         RuntimeEventType.DIAGNOSTIC,
@@ -225,3 +246,26 @@ def _evidence_audit_summary(evidence: Evidence) -> dict[str, Any]:
     if "error" in payload:
         summary["error"] = payload["error"]
     return summary
+
+
+def _result_projection_source(runtime: Any) -> Any:
+    if runtime.source is not None:
+        return runtime.source
+    for plugin in getattr(runtime.config, "plugins", ()) or ():
+        if any(
+            hasattr(plugin, attribute)
+            for attribute in ("blocked_tables", "blocked_columns", "allowed_tables")
+        ):
+            return plugin
+    return None
+
+
+def _projection_source_identity(metadata: Mapping[str, Any]) -> str | None:
+    options = metadata.get("from_db_options")
+    if not isinstance(options, Mapping):
+        return None
+    memory = options.get("memory")
+    if not isinstance(memory, Mapping):
+        return None
+    value = memory.get("source_identity")
+    return str(value) if value is not None else None

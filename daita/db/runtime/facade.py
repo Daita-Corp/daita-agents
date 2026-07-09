@@ -5,7 +5,7 @@ Skeleton database runtime built on the extension registry.
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 from uuid import uuid4
 
 from daita.plugins import ExtensionRegistry, PluginContext, ServiceRegistry
@@ -14,7 +14,6 @@ from daita.runtime import (
     Capability,
     ContextAudience,
     ContextBlock,
-    Evidence,
     ApprovalStatus,
     InMemoryApprovalChannel,
     InMemoryRuntimeStore,
@@ -30,12 +29,6 @@ from daita.runtime import (
 from daita.skills import SkillResolution, SkillResolver
 
 from ..loop import DbAgentLoop, DbLoopResult
-from ..context_projection import (
-    ProjectionContext,
-    ProjectionMode,
-    policy_summary_from_source,
-    project_operation_evidence,
-)
 from ..llm_agent_planner import DbLLMAgentPlanner
 from ..llm_service import DbLLMService, db_llm_service_from_metadata
 from ..models import (
@@ -452,7 +445,7 @@ class DbRuntime(
                     intent=intent,
                     contract=contract,
                     status=OperationStatus.FAILED,
-                    answer=f"DB operation failed: {exc}",
+                    answer="DB operation failed before final synthesis.",
                     warnings=("db_runtime_execution_failed",),
                     diagnostics={
                         **base_diagnostics,
@@ -474,13 +467,7 @@ class DbRuntime(
 
         current_operation = await self.store.load_operation(operation_id) or operation
         evidence = tuple(await self.store.list_evidence(operation_id))
-        projected_evidence, evidence_projection = self._project_result_evidence(
-            evidence,
-            request=db_request,
-            intent=intent,
-            operation=current_operation,
-            safety_frame=safety_frame.to_dict(),
-        )
+        tasks = tuple(await self.store.list_tasks(operation_id))
         return await self._record_operation_result(
             DbOperationResult(
                 operation_id=operation_id,
@@ -489,75 +476,19 @@ class DbRuntime(
                 contract=contract,
                 status=_operation_status_from_loop_status(loop_result.status),
                 answer=_answer_from_loop_result(loop_result),
-                evidence=projected_evidence,
+                evidence=evidence,
                 warnings=tuple(loop_result.warnings),
                 diagnostics={
                     **base_diagnostics,
                     "planner": _planner_diagnostics(loop_result),
-                    "evidence_projection": evidence_projection,
+                    "execution": _execution_diagnostics(
+                        operation=current_operation,
+                        tasks=tasks,
+                        evidence=evidence,
+                    ),
                 },
             ),
             operation=current_operation,
-        )
-
-    def _project_result_evidence(
-        self,
-        evidence: tuple[Evidence, ...],
-        *,
-        request: DbRequest,
-        intent: DbIntent,
-        operation: Operation,
-        safety_frame: dict[str, Any] | None,
-    ) -> tuple[tuple[Evidence, ...], dict[str, Any]]:
-        public_projection = self._result_projection_context(
-            request=request,
-            intent=intent,
-            operation=operation,
-            safety_frame=safety_frame,
-            mode=ProjectionMode.PUBLIC_RESULT,
-        )
-        diagnostic_projection = self._result_projection_context(
-            request=request,
-            intent=intent,
-            operation=operation,
-            safety_frame=safety_frame,
-            mode=ProjectionMode.DIAGNOSTIC,
-        )
-        projected_evidence = project_operation_evidence(evidence, public_projection)
-        diagnostic_evidence = project_operation_evidence(
-            evidence, diagnostic_projection
-        )
-        return projected_evidence, {
-            "public_mode": public_projection.mode.value,
-            "diagnostic_mode": diagnostic_projection.mode.value,
-            "diagnostic_evidence": [
-                {
-                    "id": item.id,
-                    "kind": item.kind,
-                    "accepted": item.accepted,
-                    "payload": item.payload,
-                }
-                for item in diagnostic_evidence
-            ],
-        }
-
-    def _result_projection_context(
-        self,
-        *,
-        request: DbRequest,
-        intent: DbIntent,
-        operation: Operation,
-        safety_frame: dict[str, Any] | None,
-        mode: ProjectionMode,
-    ) -> ProjectionContext:
-        return ProjectionContext(
-            mode=mode,
-            operation_intent=intent.kind.value,
-            safety_frame=safety_frame or operation.metadata.get("safety_frame"),
-            policy_summary=policy_summary_from_source(_result_projection_source(self)),
-            source_identity=_projection_source_identity(self.config.metadata),
-            session_id=request.session_id,
-            user_id=request.user_id,
         )
 
     def _select_db_agent_planner(self) -> DbAgentPlanner | None:
@@ -602,13 +533,6 @@ class DbRuntime(
         )
         verification = finalization.verification
         if not finalization.finalizable:
-            projected_evidence, evidence_projection = self._project_result_evidence(
-                evidence,
-                request=request,
-                intent=intent,
-                operation=operation,
-                safety_frame=None,
-            )
             return await self._record_operation_result(
                 DbOperationResult(
                     operation_id=operation_id,
@@ -617,11 +541,10 @@ class DbRuntime(
                     contract=contract,
                     status=OperationStatus.FAILED,
                     answer="DB operation could not be verified against required evidence.",
-                    evidence=projected_evidence,
+                    evidence=evidence,
                     warnings=tuple((*loop_warnings, *verification.warnings)),
                     diagnostics={
                         **diagnostics,
-                        "evidence_projection": evidence_projection,
                         "execution": _execution_diagnostics(
                             operation=operation,
                             tasks=tasks,
@@ -1206,26 +1129,3 @@ def _current_trace_ids() -> tuple[str | None, str | None]:
         return context.current_trace_id, context.current_span_id
     except Exception:
         return None, None
-
-
-def _result_projection_source(runtime: DbRuntime) -> Any:
-    if runtime.source is not None:
-        return runtime.source
-    for plugin in getattr(runtime.config, "plugins", ()) or ():
-        if any(
-            hasattr(plugin, attribute)
-            for attribute in ("blocked_tables", "blocked_columns", "allowed_tables")
-        ):
-            return plugin
-    return None
-
-
-def _projection_source_identity(metadata: Mapping[str, Any]) -> str | None:
-    options = metadata.get("from_db_options")
-    if not isinstance(options, Mapping):
-        return None
-    memory = options.get("memory")
-    if not isinstance(memory, Mapping):
-        return None
-    value = memory.get("source_identity")
-    return str(value) if value is not None else None

@@ -155,7 +155,11 @@ async def test_prompt_monitor_loop_result_has_trace_correlation(tmp_path):
     assert snapshot is not None
     assert len(planner.states) == 1
     trace = result.diagnostics["trace"]
-    assert snapshot.operation.metadata["trace"] == trace
+    assert trace == {
+        key: value
+        for key, value in snapshot.operation.metadata["trace"].items()
+        if key in {"trace_id", "root_span_id"}
+    }
     assert snapshot.operation.operation_type == "db.run"
     assert any(item.kind == "monitor.listing" for item in snapshot.evidence)
     assert any(item.kind == "answer.synthesis" for item in snapshot.evidence)
@@ -189,7 +193,11 @@ async def test_blocked_operation_keeps_trace_correlation(tmp_path):
 
     assert result.status is OperationStatus.BLOCKED
     assert snapshot is not None
-    assert result.diagnostics["trace"] == snapshot.operation.metadata["trace"]
+    assert result.diagnostics["trace"] == {
+        key: value
+        for key, value in snapshot.operation.metadata["trace"].items()
+        if key in {"trace_id", "root_span_id"}
+    }
     assert all(
         event.trace_id == result.diagnostics["trace"]["trace_id"]
         for event in snapshot.events

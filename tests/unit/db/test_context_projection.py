@@ -1,3 +1,4 @@
+from dataclasses import asdict
 import json
 
 from daita.db import DbRequest, DbRuntime, DbRuntimeConfig
@@ -7,9 +8,15 @@ from daita.db.context_projection import (
     project_memory_refs,
     project_memory_semantics,
     project_operation_evidence,
+    project_operation_result,
     project_session_context,
 )
-from daita.db.models import DbIntent, DbIntentKind
+from daita.db.models import (
+    DbIntent,
+    DbIntentKind,
+    DbOperationContract,
+    DbOperationResult,
+)
 from daita.db.planning_context import DbPlanningContextBuilder
 from daita.db.planner_protocol import DbPlannerDecision, DbPlannerDecisionStatus
 from daita.plugins.sqlite import SQLitePlugin
@@ -713,56 +720,138 @@ def test_query_result_projection_redacts_blocked_error_scalars():
     )
     assert "customers.loyalty_band" not in dumped
     assert "platinum" not in dumped
-    assert public[0].payload["error"] == "<redacted>"
+    assert "error" not in public[0].payload
+    assert public[0].payload["error_code"] == "db_runtime_error_redacted"
     assert diagnostic[0].payload["error"] == "<redacted>"
     assert public[0].payload["row_count"] == 0
 
 
-def test_runtime_result_projection_helper_redacts_failed_result_evidence():
-    sqlite = SQLitePlugin(path=":memory:", blocked_columns=["customers.loyalty_band"])
-    runtime = DbRuntime(
-        source=sqlite,
-        config=DbRuntimeConfig(plugins=(sqlite,)),
-    )
+def test_operation_result_projection_rebuilds_diagnostics_from_allowlists():
+    canary = "architecture_canary_9f4d7e2b"
     raw = Evidence(
         id="query-result",
         kind="query.result",
         owner="sqlite",
         payload={
-            "rows": [{"loyalty_band": "platinum"}],
+            "rows": [{"loyalty_band": canary}],
+            "sql": f"select '{canary}'",
             "success": False,
-            "error": "SQL guardrail rejected customers.loyalty_band = platinum.",
+            "error": f"validation failed for {canary}",
         },
+        metadata={"internal": canary},
     )
-
-    projected, diagnostics = runtime._project_result_evidence(
-        (raw,),
+    generic = Evidence(
+        id="custom-result",
+        kind="custom.result",
+        owner="db_runtime",
+        payload={"status": canary, "success": canary},
+    )
+    raw_result = DbOperationResult(
+        operation_id="operation-1",
         request=DbRequest("Summarize customer revenue."),
         intent=DbIntent(kind=DbIntentKind.DATA_QUERY),
-        operation=Operation(
-            id="operation-1",
-            operation_type="db.run",
-            metadata={
-                "safety_frame": {
-                    "blocked_columns": ["customers.loyalty_band"],
-                }
+        contract=DbOperationContract(operation_type="data.query"),
+        status=OperationStatus.FAILED,
+        answer=f"DB analysis failed: {canary}",
+        evidence=(raw, generic),
+        warnings=("db_runtime_failed", f"warning text {canary}"),
+        diagnostics={
+            "planner": {
+                "status": "failed",
+                "warnings": [f"planner warning {canary}"],
+                "diagnostics": {
+                    "turn": 2,
+                    "task_plan": {"tasks": [{"input": {"secret": canary}}]},
+                },
             },
-        ),
-        safety_frame=None,
+            "execution": {
+                "operation_id": "operation-1",
+                "task_count": 1,
+                "tasks": [
+                    {
+                        "id": "task-1",
+                        "capability_id": "db.sql.execute_read",
+                        "status": "failed",
+                        "input": {"sql": canary},
+                        "metadata": {"secret": canary},
+                    }
+                ],
+                "planned_sql": canary,
+            },
+            "verification": {
+                "passed": False,
+                "missing_evidence": ["query.result"],
+                "warnings": [f"validation warning {canary}"],
+                "diagnostics": {"required_evidence": ["query.result"]},
+            },
+            "telemetry": {
+                "provider": "safe-provider",
+                "model": "safe-model",
+                "input_tokens": 3,
+                "output_tokens": 2,
+                "total_tokens": 5,
+                "llm_calls": 1,
+                "estimated_cost_usd": 0.01,
+                "latency_ms": 4.5,
+                "mode": "llm",
+                "debug": canary,
+            },
+            "trace": {"trace_id": "trace-1", "span_name": canary},
+            "error": {
+                "type": "ValidationError",
+                "code": "db_runtime_validation_failed",
+                "message": canary,
+            },
+            "internal": canary,
+        },
+    )
+    projected = project_operation_result(
+        raw_result,
+        _projection(ProjectionMode.PUBLIC_RESULT),
     )
 
-    dumped = json.dumps(
-        {
-            "projected": [item.to_dict() for item in projected],
-            "diagnostics": diagnostics,
-        },
-        sort_keys=True,
+    dumped = json.dumps(asdict(projected), default=str, sort_keys=True)
+    assert canary not in dumped
+    assert projected is not raw_result
+    assert projected.answer == "DB operation failed before final synthesis."
+    assert raw.payload["rows"][0]["loyalty_band"] == canary
+    assert raw.metadata["internal"] == canary
+    assert raw_result.diagnostics["internal"] == canary
+    assert "status" not in projected.evidence[1].payload
+    assert "success" not in projected.evidence[1].payload
+    assert projected.warnings == (
+        "db_runtime_failed",
+        "db_runtime_warning_redacted",
     )
-    assert "customers.loyalty_band" not in dumped
-    assert "platinum" not in dumped
-    assert projected[0].payload["error"] == "<redacted>"
-    assert diagnostics["public_mode"] == "public_result"
-    assert diagnostics["diagnostic_mode"] == "diagnostic"
+    assert projected.diagnostics["planner"] == {
+        "status": "failed",
+        "turn_count": 2,
+        "warning_codes": ["db_runtime_warning_redacted"],
+        "terminal_reason_code": "failed",
+    }
+    assert projected.diagnostics["execution"]["task_refs"] == [
+        {
+            "id": "task-1",
+            "capability_id": "db.sql.execute_read",
+            "status": "failed",
+        }
+    ]
+    assert projected.diagnostics["verification"] == {
+        "passed": False,
+        "required_evidence_kinds": ["query.result"],
+        "missing_evidence_kinds": ["query.result"],
+        "warning_codes": ["db_runtime_warning_redacted"],
+    }
+    assert projected.diagnostics["error"] == {
+        "type": "ValidationError",
+        "code": "db_runtime_validation_failed",
+    }
+    assert projected.diagnostics["trace"] == {"trace_id": "trace-1"}
+    assert projected.diagnostics["synthesis"] == projected.telemetry
+    assert projected.evidence[0].metadata == {
+        "projection_mode": "public_result",
+        "projected": True,
+    }
 
 
 async def test_non_finished_runtime_result_returns_public_projected_evidence():
@@ -790,6 +879,15 @@ async def test_non_finished_runtime_result_returns_public_projected_evidence():
     assert all(
         item.metadata["projection_mode"] == "public_result" for item in result.evidence
     )
-    diagnostics_dumped = json.dumps(result.diagnostics["evidence_projection"])
+    diagnostics_dumped = json.dumps(result.diagnostics, sort_keys=True)
     assert "customers.loyalty_band" not in diagnostics_dumped
     assert "platinum" not in diagnostics_dumped
+    assert set(result.diagnostics) <= {
+        "planner",
+        "execution",
+        "verification",
+        "synthesis",
+        "telemetry",
+        "trace",
+        "error",
+    }
