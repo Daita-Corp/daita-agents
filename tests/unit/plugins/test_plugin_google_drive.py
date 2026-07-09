@@ -10,7 +10,7 @@ import csv
 import io
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from daita.plugins.google_drive import (
     GoogleDrivePlugin,
     google_drive,

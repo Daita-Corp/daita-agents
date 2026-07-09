@@ -320,7 +320,7 @@ class TestGCPDiscovererLive:
         """test_access() returns True when credentials are valid."""
         assert await gcp_discoverer.test_access() is True
 
-    async def test_enumerate_yields_stores(self, gcp_discoverer: GCPDiscoverer, capsys):
+    async def test_enumerate_yields_stores(self, gcp_discoverer: GCPDiscoverer):
         """
         enumerate() iterates across all configured services and yields
         DiscoveredStore instances. Empty accounts are allowed, but no
@@ -346,9 +346,7 @@ class TestGCPDiscovererLive:
 class TestCatalogPluginWithGCP:
     """CatalogPlugin orchestration against live GCP."""
 
-    async def test_discover_all_returns_result(
-        self, catalog_with_gcp: CatalogPlugin, capsys
-    ):
+    async def test_discover_all_returns_result(self, catalog_with_gcp: CatalogPlugin):
         """discover_all() returns a DiscoveryResult with no discoverer errors."""
         result = await catalog_with_gcp.discover_all()
 
@@ -383,7 +381,6 @@ class TestBigQueryConstraints:
         self,
         gcp_discoverer: GCPDiscoverer,
         bq_constrained_dataset: dict[str, str],
-        capsys,
     ):
         """
         Seeded dataset declares:
@@ -456,7 +453,6 @@ class TestPubSubSchemaRegistry:
         self,
         gcp_discoverer: GCPDiscoverer,
         pubsub_topic_with_avro_schema: dict[str, str],
-        capsys,
     ):
         """
         A topic bound to an Avro schema must surface the record's fields as
@@ -507,7 +503,6 @@ class TestFirestoreIndexes:
         self,
         gcp_discoverer: GCPDiscoverer,
         firestore_collection_with_index: dict[str, str],
-        capsys,
     ):
         """
         Seeded collection declares a composite index on
@@ -774,9 +769,7 @@ class TestGraphEmissionLive:
 class TestAgentWithGCPCatalog:
     """End-to-end: Agent + OpenAI + CatalogPlugin with live GCP."""
 
-    async def test_agent_lists_gcp_stores(
-        self, catalog_with_gcp: CatalogPlugin, capsys
-    ):
+    async def test_agent_lists_gcp_stores(self, catalog_with_gcp: CatalogPlugin):
         """
         Infrastructure discovery is runtime-owned and produces catalog evidence.
         """
@@ -802,9 +795,7 @@ class TestAgentWithGCPCatalog:
         expected_count = len(catalog_with_gcp.get_stores())
         assert evidence["payload"]["store_count"] == expected_count
 
-    async def test_agent_finds_store_by_type(
-        self, catalog_with_gcp: CatalogPlugin, capsys
-    ):
+    async def test_agent_finds_store_by_type(self, catalog_with_gcp: CatalogPlugin):
         """
         After a discovery sweep, the agent should use find_store to query
         the catalog for a specific GCP store type.
