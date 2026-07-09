@@ -82,7 +82,13 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 access=AccessMode.METADATA_READ,
                 risk=RiskLevel.LOW,
                 input_schema=common_schema,
-                output_evidence=frozenset({"planning.context"}),
+                output_evidence=frozenset(
+                    {
+                        "planning.context",
+                        "db.memory.selection",
+                        "db.memory.contracts",
+                    }
+                ),
                 executor="db_runtime.planning.context.build",
                 runtime_only=True,
                 side_effecting=False,
@@ -549,6 +555,18 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 json_schema=object_schema,
                 description="Evidence-backed context used by DB planners.",
+            ),
+            EvidenceSchema(
+                kind="db.memory.selection",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="DB memory selection refs, omissions, and budget facts.",
+            ),
+            EvidenceSchema(
+                kind="db.memory.contracts",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="DB memory semantic contracts and omission facts.",
             ),
             EvidenceSchema(
                 kind="planner.decision",

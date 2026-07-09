@@ -537,6 +537,52 @@ def db_memory_refs_from_recall_evidence(
     return tuple(refs), tuple(dict.fromkeys(evidence_refs)), diagnostics
 
 
+def db_memory_selection_artifact_payload(
+    *,
+    source_identity: str | None,
+    schema_fingerprint: str | None,
+    recall_evidence_refs: tuple[str, ...] | list[str],
+    memory_evidence_refs: tuple[str, ...] | list[str],
+    included_refs: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    diagnostics: dict[str, Any],
+    limit: int,
+    char_budget: int,
+    score_threshold: float,
+) -> dict[str, Any]:
+    """Return first-class evidence payload for DB memory selection."""
+
+    omitted_counts = {
+        str(reason): int(count)
+        for reason, count in dict(diagnostics.get("omitted_reasons") or {}).items()
+    }
+    raw_candidate_count = int(diagnostics.get("candidate_count") or 0)
+    included_count = int(diagnostics.get("included_count") or len(included_refs))
+    return {
+        "artifact_kind": "db.memory.selection",
+        "source_identity": source_identity,
+        "schema_fingerprint": schema_fingerprint,
+        "recall_evidence_refs": [
+            str(ref) for ref in recall_evidence_refs if str(ref).strip()
+        ],
+        "memory_evidence_refs": [
+            str(ref) for ref in memory_evidence_refs if str(ref).strip()
+        ],
+        "raw_candidate_count": raw_candidate_count,
+        "included_refs": [dict(ref) for ref in included_refs],
+        "included_count": included_count,
+        "omitted_counts_by_reason": omitted_counts,
+        "safe_diagnostic_omission_summaries": _safe_omission_summaries(omitted_counts),
+        "budget_usage": {
+            "limit": max(0, int(limit)),
+            "char_budget": max(0, int(char_budget)),
+            "used_chars": int(diagnostics.get("used_chars") or 0),
+            "score_threshold": float(score_threshold),
+            "included_count": included_count,
+            "raw_candidate_count": raw_candidate_count,
+        },
+    }
+
+
 def db_memory_record_refs_known_schema(
     metadata: dict[str, Any],
     schema: dict[str, Any],
@@ -1457,13 +1503,15 @@ def _planner_memory_omit_reason(
         return "cross_source" if record_source else "missing_source_identity"
     if metadata.get("active") is False:
         return "inactive"
-    if bool(metadata.get("stale")) or _is_memory_expired(metadata):
+    if metadata.get("stale") is True:
         return "stale"
+    if _is_memory_expired(metadata):
+        return "expired"
     record_schema = metadata.get("source_schema_fingerprint") or metadata.get(
         "schema_fingerprint"
     )
     if record_schema and schema_fingerprint and record_schema != schema_fingerprint:
-        return "stale_schema"
+        return "schema_mismatch"
     if _confidence_value(metadata.get("confidence"), default=1.0) < 0.5:
         return "low_confidence"
     if kind == "value_alias" and not _value_alias_has_catalog_citation(metadata):
@@ -1692,6 +1740,16 @@ def _memory_evidence_ref_ids(metadata: dict[str, Any]) -> list[str]:
         if metadata.get(key):
             refs.append(str(metadata[key]))
     return list(dict.fromkeys(refs))
+
+
+def _safe_omission_summaries(
+    omitted_counts: dict[str, int],
+) -> list[dict[str, Any]]:
+    return [
+        {"reason": reason, "count": int(count)}
+        for reason, count in sorted(omitted_counts.items())
+        if int(count) > 0
+    ]
 
 
 def _bump_omitted(diagnostics: dict[str, Any], reason: str) -> None:

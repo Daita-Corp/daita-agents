@@ -189,13 +189,68 @@ def project_db_memory_semantic_contracts(
         if omit_reason:
             _bump_omitted(diagnostics, omit_reason)
             projected.append(
-                _compact_semantic_contract(ref, contract, enforceable=False)
+                _compact_semantic_contract(
+                    ref,
+                    contract,
+                    enforceable=False,
+                    omission_reason=omit_reason,
+                )
             )
             diagnostics["advisory_count"] += 1
             continue
         projected.append(_compact_semantic_contract(ref, contract, enforceable=True))
         diagnostics["enforced_count"] += 1
     return tuple(projected), diagnostics
+
+
+def db_memory_contracts_artifact_payload(
+    *,
+    source_identity: str | None,
+    schema_fingerprint: str | None,
+    recall_evidence_refs: tuple[str, ...] | list[str],
+    selection_evidence_ref: dict[str, Any] | None,
+    contracts: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    """Return first-class evidence payload for DB memory contracts."""
+
+    projected_contracts = [dict(contract) for contract in contracts]
+    omitted_counts = {
+        str(reason): int(count)
+        for reason, count in dict(diagnostics.get("omitted_reasons") or {}).items()
+    }
+    enforceable = [
+        dict(contract)
+        for contract in projected_contracts
+        if contract.get("enforceable") is True
+    ]
+    advisory = [
+        dict(contract)
+        for contract in projected_contracts
+        if contract.get("enforceable") is not True
+    ]
+    return {
+        "artifact_kind": "db.memory.contracts",
+        "source_identity": source_identity,
+        "schema_fingerprint": schema_fingerprint,
+        "recall_evidence_refs": [
+            str(ref) for ref in recall_evidence_refs if str(ref).strip()
+        ],
+        "selection_evidence_ref": dict(selection_evidence_ref or {}),
+        "contracts": projected_contracts,
+        "enforceable_contracts": enforceable,
+        "advisory_contracts": advisory,
+        "contract_omission_reasons": omitted_counts,
+        "source_schema_applicability": {
+            "source_identity": source_identity,
+            "schema_fingerprint": schema_fingerprint,
+            "contract_candidate_count": int(diagnostics.get("candidate_count") or 0),
+            "enforced_count": int(diagnostics.get("enforced_count") or 0),
+            "advisory_count": int(diagnostics.get("advisory_count") or 0),
+            "omitted_count": int(diagnostics.get("omitted_count") or 0),
+        },
+        "safe_diagnostic_summaries": _safe_omission_summaries(omitted_counts),
+    }
 
 
 def _metric_definition_contract(
@@ -443,6 +498,7 @@ def _compact_semantic_contract(
     contract: dict[str, Any],
     *,
     enforceable: bool,
+    omission_reason: str | None = None,
 ) -> dict[str, Any]:
     requirements = contract.get("requirements") or {}
     subject = contract.get("subject") or {}
@@ -454,7 +510,7 @@ def _compact_semantic_contract(
             relationships.append(f"{item.get('from')} -> {item.get('to')}")
     evidence_refs = list(ref.get("evidence_refs") or [])
     evidence_refs.extend(grounding.get("evidence_refs") or [])
-    return {
+    compact = {
         "key": subject.get("key") or ref.get("key"),
         "memory_key": ref.get("key"),
         "kind": ref.get("kind"),
@@ -483,6 +539,9 @@ def _compact_semantic_contract(
         "enforcement_mode": enforcement.get("mode") or "required_when_recalled",
         "enforceable": bool(enforceable),
     }
+    if omission_reason:
+        compact["omission_reason"] = omission_reason
+    return compact
 
 
 def _contract_omit_reason(
@@ -730,3 +789,13 @@ def _bump_omitted(diagnostics: dict[str, Any], reason: str) -> None:
     diagnostics["omitted_count"] = int(diagnostics.get("omitted_count") or 0) + 1
     omitted = diagnostics.setdefault("omitted_reasons", {})
     omitted[reason] = int(omitted.get(reason) or 0) + 1
+
+
+def _safe_omission_summaries(
+    omitted_counts: dict[str, int],
+) -> list[dict[str, Any]]:
+    return [
+        {"reason": reason, "count": int(count)}
+        for reason, count in sorted(omitted_counts.items())
+        if int(count) > 0
+    ]

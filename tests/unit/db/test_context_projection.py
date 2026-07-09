@@ -346,11 +346,6 @@ def test_public_planning_context_projection_strips_blocked_memory_details():
                     "enforceable": False,
                 }
             ],
-            "db_memory_contract_diagnostics": {
-                "enforced_count": 0,
-                "advisory_count": 1,
-                "omitted_reasons": {"blocked_by_policy": 1},
-            },
             "diagnostics": {
                 "schema_table_count": 2,
                 "db_memory_ref_count": 1,
@@ -374,13 +369,127 @@ def test_public_planning_context_projection_strips_blocked_memory_details():
     assert payload["redacted"] is True
     assert "db_memory_refs" not in payload
     assert "db_memory_semantics" not in payload
-    assert "db_memory_contract_diagnostics" not in payload
     assert "rendered_context" not in payload
     assert "refunds.amount" not in dumped
     assert "complete" not in dumped
-    assert "blocked_by_policy" not in dumped
     assert "semantic_contract" not in dumped
     assert "required_filters" not in dumped
+
+
+def test_memory_artifact_projection_redacts_public_and_exposes_diagnostics():
+    selection = Evidence(
+        id="memory-selection",
+        kind="db.memory.selection",
+        owner="db_runtime",
+        payload={
+            "source_identity": "sqlite:from_db:source-a",
+            "schema_fingerprint": "schema-a",
+            "recall_evidence_refs": ["memory-recall"],
+            "raw_candidate_count": 3,
+            "included_count": 1,
+            "included_refs": [
+                {
+                    "chunk_id": "mem-board-revenue",
+                    "kind": "metric_definition",
+                    "key": "metric:board_revenue",
+                    "text": "Board revenue subtracts refunds.amount.",
+                }
+            ],
+            "omitted_counts_by_reason": {"cross_source": 1, "unsafe": 1},
+            "safe_diagnostic_omission_summaries": [
+                {"reason": "cross_source", "count": 1},
+                {"reason": "unsafe", "count": 1},
+            ],
+            "budget_usage": {
+                "limit": 3,
+                "char_budget": 120,
+                "used_chars": 58,
+            },
+        },
+    )
+    contracts = Evidence(
+        id="memory-contracts",
+        kind="db.memory.contracts",
+        owner="db_runtime",
+        payload={
+            "source_identity": "sqlite:from_db:source-a",
+            "schema_fingerprint": "schema-a",
+            "contracts": [
+                {
+                    "key": "metric:board_revenue",
+                    "required_refs": ["refunds.amount"],
+                    "required_filters": [
+                        {
+                            "ref": "orders.status",
+                            "operator": "=",
+                            "value": "complete",
+                        }
+                    ],
+                    "enforceable": False,
+                    "omission_reason": "blocked_by_policy",
+                }
+            ],
+            "enforceable_contracts": [],
+            "advisory_contracts": [
+                {
+                    "key": "metric:board_revenue",
+                    "required_refs": ["refunds.amount"],
+                    "enforceable": False,
+                    "omission_reason": "blocked_by_policy",
+                }
+            ],
+            "contract_omission_reasons": {"blocked_by_policy": 1},
+            "source_schema_applicability": {
+                "source_identity": "sqlite:from_db:source-a",
+                "schema_fingerprint": "schema-a",
+                "contract_candidate_count": 1,
+            },
+            "safe_diagnostic_summaries": [{"reason": "blocked_by_policy", "count": 1}],
+        },
+    )
+
+    public = project_operation_evidence(
+        (selection, contracts),
+        _projection(ProjectionMode.PUBLIC_RESULT),
+    )
+    diagnostic = project_operation_evidence(
+        (selection, contracts),
+        _projection(ProjectionMode.DIAGNOSTIC),
+    )
+
+    public_dumped = json.dumps([item.payload for item in public], sort_keys=True)
+    assert "Board revenue subtracts refunds.amount." not in public_dumped
+    assert "metric:board_revenue" not in public_dumped
+    assert "sqlite:from_db:source-a" not in public_dumped
+    assert "schema-a" not in public_dumped
+    assert public[0].payload["raw_candidate_count"] == 3
+    assert public[0].payload["included_count"] == 1
+    assert public[0].payload["omitted_count"] == 2
+    assert public[1].payload["enforceable_count"] == 0
+    assert public[1].payload["advisory_count"] == 1
+    assert public[1].payload["omitted_count"] == 1
+
+    assert diagnostic[0].payload["omitted_counts_by_reason"] == {
+        "cross_source": 1,
+        "unsafe": 1,
+    }
+    assert diagnostic[0].payload["safe_diagnostic_omission_summaries"] == [
+        {"reason": "cross_source", "count": 1},
+        {"reason": "unsafe", "count": 1},
+    ]
+    assert diagnostic[0].payload["budget_usage"]["char_budget"] == 120
+    assert "included_refs" not in diagnostic[0].payload
+    assert diagnostic[1].payload["contract_omission_reasons"] == {
+        "blocked_by_policy": 1
+    }
+    assert diagnostic[1].payload["safe_diagnostic_summaries"] == [
+        {"reason": "blocked_by_policy", "count": 1}
+    ]
+    assert (
+        diagnostic[1].payload["source_schema_applicability"]["contract_candidate_count"]
+        == 1
+    )
+    assert "contracts" not in diagnostic[1].payload
 
 
 def test_query_result_projection_redacts_blocked_error_scalars():

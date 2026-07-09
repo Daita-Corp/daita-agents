@@ -421,6 +421,50 @@ def _project_evidence_payload(
         results = payload.get("results")
         if isinstance(results, list):
             base["result_count"] = len(results)
+    elif evidence.kind == "db.memory.selection":
+        base["raw_candidate_count"] = int(payload.get("raw_candidate_count") or 0)
+        base["included_count"] = int(payload.get("included_count") or 0)
+        omitted = payload.get("omitted_counts_by_reason")
+        if isinstance(omitted, Mapping):
+            base["omitted_count"] = sum(
+                int(count) for count in omitted.values() if isinstance(count, int)
+            )
+        if projection.mode is ProjectionMode.DIAGNOSTIC:
+            base["omitted_counts_by_reason"] = dict(
+                payload.get("omitted_counts_by_reason") or {}
+            )
+            base["safe_diagnostic_omission_summaries"] = [
+                dict(item)
+                for item in payload.get("safe_diagnostic_omission_summaries", ()) or ()
+                if isinstance(item, Mapping)
+            ]
+            budget = payload.get("budget_usage")
+            if isinstance(budget, Mapping):
+                base["budget_usage"] = dict(budget)
+    elif evidence.kind == "db.memory.contracts":
+        enforceable = payload.get("enforceable_contracts")
+        advisory = payload.get("advisory_contracts")
+        if isinstance(enforceable, list):
+            base["enforceable_count"] = len(enforceable)
+        if isinstance(advisory, list):
+            base["advisory_count"] = len(advisory)
+        omitted = payload.get("contract_omission_reasons")
+        if isinstance(omitted, Mapping):
+            base["omitted_count"] = sum(
+                int(count) for count in omitted.values() if isinstance(count, int)
+            )
+        if projection.mode is ProjectionMode.DIAGNOSTIC:
+            base["contract_omission_reasons"] = dict(
+                payload.get("contract_omission_reasons") or {}
+            )
+            base["safe_diagnostic_summaries"] = [
+                dict(item)
+                for item in payload.get("safe_diagnostic_summaries", ()) or ()
+                if isinstance(item, Mapping)
+            ]
+            applicability = payload.get("source_schema_applicability")
+            if isinstance(applicability, Mapping):
+                base["source_schema_applicability"] = dict(applicability)
     elif evidence.kind == "schema.column_value_hint":
         hints = project_catalog_hints(
             payload.get("hints") or (),

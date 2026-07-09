@@ -20,6 +20,7 @@ from daita.db.memory import (
     db_memory_planning_recall_decision,
     db_memory_planning_recall_query,
     db_memory_refs_from_recall_evidence,
+    db_memory_selection_artifact_payload,
     has_db_memory_marker,
     normalize_db_memory_record,
     recall_db_memory_records,
@@ -28,6 +29,7 @@ from daita.db.memory import (
 )
 from daita.db.memory_contracts import (
     DB_MEMORY_SEMANTIC_CONTRACT_KEY,
+    db_memory_contracts_artifact_payload,
     extract_db_memory_semantic_contract,
     project_db_memory_semantic_contracts,
 )
@@ -627,6 +629,12 @@ async def test_planning_time_db_memory_recall_adds_bounded_context(tmp_path):
         )
         tasks.extend(context_plan.tasks)
         context_evidence = await runtime.execute_task(context_plan.tasks[0], operation)
+        selection = next(
+            item for item in context_evidence if item.kind == "db.memory.selection"
+        )
+        contracts = next(
+            item for item in context_evidence if item.kind == "db.memory.contracts"
+        )
         context = next(
             item for item in context_evidence if item.kind == "planning.context"
         )
@@ -638,8 +646,21 @@ async def test_planning_time_db_memory_recall_adds_bounded_context(tmp_path):
         "db.planning.context.build",
     ]
     assert recall.owner == "memory"
+    assert selection.owner == "db_runtime"
+    assert contracts.owner == "db_runtime"
     assert backend.recall_db_records.await_args.kwargs["category"] == "db_semantics"
     assert backend.recall.await_count == 0
+    assert selection.payload["source_identity"] == source_identity
+    assert selection.payload["recall_evidence_refs"] == [recall.id]
+    assert selection.payload["raw_candidate_count"] == 1
+    assert selection.payload["included_count"] == 1
+    assert selection.payload["included_refs"][0]["key"] == "metric:revenue"
+    assert selection.payload["omitted_counts_by_reason"] == {}
+    assert selection.payload["budget_usage"]["char_budget"] == 120
+    assert contracts.payload["selection_evidence_ref"]["id"] == selection.id
+    assert contracts.payload["recall_evidence_refs"] == [recall.id]
+    assert contracts.payload["enforceable_contracts"] == []
+    assert contracts.payload["contract_omission_reasons"] == {}
     assert context.payload["db_memory_refs"] == [
         {
             "chunk_id": "mem-1",
@@ -653,7 +674,8 @@ async def test_planning_time_db_memory_recall_adds_bounded_context(tmp_path):
             "schema_fingerprint": None,
         }
     ]
-    assert context.payload["db_memory_evidence_refs"] == [recall.id]
+    assert context.payload["db_memory_selection_evidence_ref"]["id"] == selection.id
+    assert context.payload["db_memory_contracts_evidence_ref"]["id"] == contracts.id
     assert "Database memory:" in context.payload["rendered_context"]
     assert "DB memory record:" not in context.payload["rendered_context"]
 
@@ -2056,6 +2078,176 @@ def test_db_memory_planning_refs_omit_cross_source_irrelevant_and_stale_records(
     assert diagnostics["omitted_reasons"]["low_confidence"] == 1
 
 
+def test_db_memory_selection_artifact_reports_required_omission_reasons():
+    source_identity = "sqlite:from_db:source-a"
+
+    def result(chunk_id, text, metadata, *, score=0.9):
+        return {
+            "chunk_id": chunk_id,
+            "content": "DB memory record:\n{}",
+            "metadata": {
+                "db_memory": {
+                    "kind": "metric_definition",
+                    "key": f"metric:{chunk_id}",
+                    "text": text,
+                    "metadata": {
+                        "source_identity": source_identity,
+                        "workspace_scope": "source",
+                        "active": True,
+                        "confidence": 0.95,
+                        **metadata,
+                    },
+                    "importance": 0.7,
+                    "category": "db_semantics",
+                }
+            },
+            "score": score,
+        }
+
+    evidence = Evidence(
+        id="evidence-memory",
+        kind="memory.semantic.recall",
+        owner="memory",
+        payload={
+            "results": [
+                result("active", "Revenue excludes refunded orders.", {}),
+                result("stale", "Revenue includes archived orders.", {"stale": True}),
+                result(
+                    "expired",
+                    "Revenue expires when the source profile expires.",
+                    {"expires_at": "2000-01-01T00:00:00+00:00"},
+                ),
+                result(
+                    "inactive", "Revenue excludes wholesale orders.", {"active": False}
+                ),
+                result(
+                    "other-source",
+                    "Revenue includes tax in the other warehouse.",
+                    {"source_identity": "sqlite:from_db:source-b"},
+                ),
+                result(
+                    "schema-mismatch",
+                    "Revenue uses total from the prior schema.",
+                    {"source_schema_fingerprint": "schema-b"},
+                ),
+                result(
+                    "low-confidence", "Revenue excludes shipping.", {"confidence": 0.2}
+                ),
+                result(
+                    "unsafe",
+                    "Revenue owner email jane@example.com must be contacted.",
+                    {},
+                ),
+                result("low-score", "Revenue excludes test orders.", {}, score=0.1),
+                result("irrelevant", "Inventory turns are counted weekly.", {}),
+            ]
+        },
+    )
+
+    refs, evidence_refs, diagnostics = db_memory_refs_from_recall_evidence(
+        (evidence,),
+        prompt="How should revenue be calculated?",
+        schema={"tables": [{"name": "orders", "columns": [{"name": "total"}]}]},
+        source_identity=source_identity,
+        schema_fingerprint="schema-a",
+        limit=20,
+        char_budget=2000,
+        score_threshold=0.45,
+    )
+    payload = db_memory_selection_artifact_payload(
+        source_identity=source_identity,
+        schema_fingerprint="schema-a",
+        recall_evidence_refs=("evidence-memory",),
+        memory_evidence_refs=evidence_refs,
+        included_refs=refs,
+        diagnostics=diagnostics,
+        limit=20,
+        char_budget=2000,
+        score_threshold=0.45,
+    )
+
+    assert [ref["key"] for ref in refs] == ["metric:active"]
+    assert payload["raw_candidate_count"] == 10
+    assert payload["included_count"] == 1
+    assert payload["omitted_counts_by_reason"] == {
+        "cross_source": 1,
+        "expired": 1,
+        "inactive": 1,
+        "irrelevant": 1,
+        "low_confidence": 1,
+        "low_score": 1,
+        "schema_mismatch": 1,
+        "stale": 1,
+        "unsafe": 1,
+    }
+    assert {
+        item["reason"] for item in payload["safe_diagnostic_omission_summaries"]
+    } == set(payload["omitted_counts_by_reason"])
+
+    budget_refs, _budget_evidence_refs, budget_diagnostics = (
+        db_memory_refs_from_recall_evidence(
+            (
+                Evidence(
+                    id="evidence-budget",
+                    kind="memory.semantic.recall",
+                    owner="memory",
+                    payload={
+                        "results": [
+                            result(
+                                "budget-a",
+                                "Revenue excludes refunds.",
+                                {},
+                            ),
+                            result(
+                                "budget-b",
+                                "Revenue excludes a very long list of unusual "
+                                "adjustments that should exceed the tiny budget.",
+                                {},
+                            ),
+                        ]
+                    },
+                ),
+            ),
+            prompt="How should revenue be calculated?",
+            schema={"tables": []},
+            source_identity=source_identity,
+            schema_fingerprint=None,
+            limit=20,
+            char_budget=70,
+            score_threshold=0.0,
+        )
+    )
+    assert [ref["key"] for ref in budget_refs] == ["metric:budget-a"]
+    assert budget_diagnostics["omitted_reasons"]["budget"] == 1
+
+    limit_refs, _limit_evidence_refs, limit_diagnostics = (
+        db_memory_refs_from_recall_evidence(
+            (
+                Evidence(
+                    id="evidence-limit",
+                    kind="memory.semantic.recall",
+                    owner="memory",
+                    payload={
+                        "results": [
+                            result("limit-a", "Revenue excludes refunds.", {}),
+                            result("limit-b", "Revenue excludes taxes.", {}),
+                        ]
+                    },
+                ),
+            ),
+            prompt="How should revenue be calculated?",
+            schema={"tables": []},
+            source_identity=source_identity,
+            schema_fingerprint=None,
+            limit=1,
+            char_budget=2000,
+            score_threshold=0.0,
+        )
+    )
+    assert [ref["key"] for ref in limit_refs] == ["metric:limit-a"]
+    assert limit_diagnostics["omitted_reasons"]["limit"] == 1
+
+
 def test_db_memory_schema_fingerprint_uses_structural_schema_shape():
     source_identity = "sqlite:from_db:source-a"
     write_schema = {
@@ -2224,6 +2416,172 @@ def test_board_revenue_metric_memory_projects_semantic_contract():
     assert semantics[0]["enforceable"] is True
     assert contract_diagnostics["candidate_count"] == 1
     assert contract_diagnostics["enforced_count"] == 1
+
+
+def test_db_memory_contracts_artifact_records_enforceable_advisory_and_omissions():
+    source_identity = "sqlite:from_db:source-a"
+    schema = _board_revenue_schema()
+    record = DBMemoryRecord(
+        kind="metric_definition",
+        key="metric:board_revenue",
+        text="Board revenue is complete order total minus refunds.",
+        metadata=_board_revenue_contract_metadata(source_identity),
+    )
+    contract = extract_db_memory_semantic_contract(
+        record,
+        schema=schema,
+        source_identity=source_identity,
+        schema_fingerprint="schema-a",
+    )
+    assert contract is not None
+
+    semantics, diagnostics = project_db_memory_semantic_contracts(
+        [
+            {
+                "key": "metric:board_revenue",
+                "kind": "metric_definition",
+                "text": record.text,
+                "confidence": 0.95,
+                "source_identity": source_identity,
+                "semantic_contract_status": "validated",
+                DB_MEMORY_SEMANTIC_CONTRACT_KEY: contract,
+            },
+            {
+                "key": "metric:warehouse_revenue",
+                "kind": "metric_definition",
+                "text": record.text,
+                "confidence": 0.95,
+                "source_identity": "sqlite:from_db:source-b",
+                "semantic_contract_status": "validated",
+                DB_MEMORY_SEMANTIC_CONTRACT_KEY: contract,
+            },
+        ],
+        prompt="Calculate board revenue",
+        schema=schema,
+        policy_summary={},
+        source_identity=source_identity,
+    )
+    payload = db_memory_contracts_artifact_payload(
+        source_identity=source_identity,
+        schema_fingerprint="schema-a",
+        recall_evidence_refs=("evidence-memory",),
+        selection_evidence_ref={
+            "id": "selection-evidence",
+            "kind": "db.memory.selection",
+            "owner": "db_runtime",
+        },
+        contracts=semantics,
+        diagnostics=diagnostics,
+    )
+
+    assert [item["enforceable"] for item in payload["contracts"]] == [True, False]
+    assert payload["enforceable_contracts"][0]["key"] == "metric:board_revenue"
+    assert payload["advisory_contracts"][0]["omission_reason"] == "cross_source"
+    assert payload["contract_omission_reasons"] == {"cross_source": 1}
+    assert payload["source_schema_applicability"] == {
+        "source_identity": source_identity,
+        "schema_fingerprint": "schema-a",
+        "contract_candidate_count": 2,
+        "enforced_count": 1,
+        "advisory_count": 1,
+        "omitted_count": 1,
+    }
+    assert payload["safe_diagnostic_summaries"] == [
+        {"reason": "cross_source", "count": 1}
+    ]
+
+
+def test_planning_context_renders_memory_compatibility_fields_from_artifacts():
+    source_identity = "sqlite:from_db:source-a"
+    schema = _board_revenue_schema()
+    record = DBMemoryRecord(
+        kind="metric_definition",
+        key="metric:board_revenue",
+        text="Board revenue is complete order total minus refunds.",
+        metadata=_board_revenue_contract_metadata(source_identity),
+    )
+    contract = extract_db_memory_semantic_contract(
+        record,
+        schema=schema,
+        source_identity=source_identity,
+        schema_fingerprint="schema-a",
+    )
+    assert contract is not None
+    record = normalize_db_memory_record(
+        {
+            **record.to_dict(),
+            "metadata": {
+                **record.metadata,
+                "confidence": 0.95,
+                "semantic_contract_status": "validated",
+                DB_MEMORY_SEMANTIC_CONTRACT_KEY: contract,
+            },
+        }
+    )
+    memory_evidence = Evidence(
+        id="evidence-memory",
+        kind="memory.semantic.recall",
+        owner="memory",
+        accepted=True,
+        payload={
+            "results": [
+                {
+                    "chunk_id": "mem-board-revenue",
+                    "metadata": {"db_memory": record.to_dict()},
+                    "score": 0.99,
+                }
+            ]
+        },
+    )
+
+    context = DbPlanningContextBuilder(
+        DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "memory": {
+                        "enabled": True,
+                        "source_identity": source_identity,
+                        "score_threshold": 0.0,
+                    }
+                }
+            }
+        )
+    ).build(
+        request=DbRequest("Calculate board revenue."),
+        intent=DbIntent(
+            kind=DbIntentKind.DATA_QUERY,
+            confidence=1.0,
+            access=AccessMode.READ,
+        ),
+        operation=Operation(id="op-memory-artifacts", operation_type="data.query"),
+        schema_evidence=Evidence(
+            id="schema-memory-artifacts",
+            kind="schema.asset_profile",
+            owner="sqlite",
+            accepted=True,
+            payload=schema,
+        ),
+        memory_recall_evidence=(memory_evidence,),
+    )
+    raw_payload = context.to_payload()
+
+    assert context.db_memory_selection_artifact["included_refs"][0]["key"] == (
+        "metric:board_revenue"
+    )
+    assert context.db_memory_contracts_artifact["contracts"][0]["key"] == (
+        "metric:board_revenue"
+    )
+    assert raw_payload["db_memory_refs"][0]["key"] == (
+        context.db_memory_selection_artifact["included_refs"][0]["key"]
+    )
+    assert raw_payload["db_memory_semantics"][0]["key"] == (
+        context.db_memory_contracts_artifact["contracts"][0]["key"]
+    )
+    assert raw_payload["db_memory_semantics"][0]["enforceable"] is True
+    assert "Database memory:" in raw_payload["rendered_context"]
+    assert "Board revenue is complete order total minus refunds." in (
+        raw_payload["rendered_context"]
+    )
 
 
 def test_valid_contract_memory_ref_survives_schema_scope_mismatch_for_projection():
@@ -2550,9 +2908,14 @@ def test_planning_context_projects_blocked_memory_refs_before_rendering():
     assert context.db_memory_semantics[0]["enforceable"] is False
     raw_payload = context.to_payload()
     assert raw_payload["db_memory_semantics"][0]["enforceable"] is False
-    assert raw_payload["db_memory_contract_diagnostics"]["enforced_count"] == 0
     assert (
-        raw_payload["db_memory_contract_diagnostics"]["omitted_reasons"][
+        context.db_memory_contracts_artifact["source_schema_applicability"][
+            "enforced_count"
+        ]
+        == 0
+    )
+    assert (
+        context.db_memory_contracts_artifact["contract_omission_reasons"][
             "blocked_by_policy"
         ]
         == 1

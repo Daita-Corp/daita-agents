@@ -974,7 +974,7 @@ class DbAgentLoop:
             capability = resolved.get("capability")
             if capability is None:
                 continue
-            evidence_kind = next(iter(sorted(capability.output_evidence)), None)
+            evidence_kind = _preferred_output_evidence_kind(capability)
             if evidence_kind is None:
                 continue
             return TaskDependency(
@@ -3583,7 +3583,7 @@ def _dependency_for_prerequisite_spec(
     action_id: str,
     consumer_capability_id: str,
 ) -> TaskDependency:
-    evidence_kind = next(iter(sorted(capability.output_evidence)), "")
+    evidence_kind = _preferred_output_evidence_kind(capability) or ""
     return TaskDependency(
         kind="evidence",
         evidence_kind=evidence_kind,
@@ -3601,6 +3601,16 @@ def _dependency_for_prerequisite_spec(
             "prerequisite_for": consumer_capability_id,
         },
     )
+
+
+def _preferred_output_evidence_kind(capability: Any) -> str | None:
+    output_evidence = set(getattr(capability, "output_evidence", ()) or ())
+    if (
+        capability.id == "db.planning.context.build"
+        and "planning.context" in output_evidence
+    ):
+        return "planning.context"
+    return next(iter(sorted(output_evidence)), None)
 
 
 def _state_can_use_catalog_structure(state: DbLoopState) -> bool:

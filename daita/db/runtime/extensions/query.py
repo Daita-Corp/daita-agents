@@ -8,7 +8,7 @@ from typing import Any, Mapping
 from daita.runtime import Evidence, Operation, Task
 
 from ...plan_validation import DbQueryPlanValidator
-from ...planning_context import DbPlanningContextBuilder
+from ...planning_context import DbPlanningContextBuilder, _evidence_ref
 from ...query_plan import DbQueryPlan
 
 
@@ -97,7 +97,30 @@ class DbPlanningContextExecutor:
                     "validation_grounding_repair": dict(validation_repair),
                 },
             )
-        return [builder.evidence_for(planning_context)]
+        memory_selection = builder.memory_selection_evidence_for(
+            planning_context,
+            task_id=task.id,
+        )
+        memory_selection_ref = (
+            _evidence_ref(memory_selection) if memory_selection is not None else None
+        )
+        memory_contracts = builder.memory_contracts_evidence_for(
+            planning_context,
+            selection_evidence_ref=memory_selection_ref,
+            task_id=task.id,
+        )
+        planning_context = builder.with_memory_artifact_refs(
+            planning_context,
+            selection_evidence=memory_selection,
+            contracts_evidence=memory_contracts,
+        )
+        evidence: list[Evidence] = []
+        if memory_selection is not None:
+            evidence.append(memory_selection)
+        if memory_contracts is not None:
+            evidence.append(memory_contracts)
+        evidence.append(builder.evidence_for(planning_context))
+        return evidence
 
 
 @dataclass(frozen=True)

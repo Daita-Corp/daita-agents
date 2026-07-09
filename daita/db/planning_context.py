@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 from typing import Any
@@ -23,8 +23,12 @@ from .context_projection import (
 from .memory import (
     db_memory_options_from_from_db_options,
     db_memory_refs_from_recall_evidence,
+    db_memory_selection_artifact_payload,
 )
-from .memory_contracts import project_db_memory_semantic_contracts
+from .memory_contracts import (
+    db_memory_contracts_artifact_payload,
+    project_db_memory_semantic_contracts,
+)
 from .models import DbIntent, DbRequest, DbRuntimeConfig
 from .session_context import db_session_context_from_request
 
@@ -47,9 +51,18 @@ class DbPlanningContext:
     column_value_hints: tuple[dict[str, Any], ...] = ()
     db_memory_refs: tuple[dict[str, Any], ...] = ()
     db_memory_semantics: tuple[dict[str, Any], ...] = ()
-    db_memory_evidence_refs: tuple[str, ...] = ()
-    db_memory_diagnostics: dict[str, Any] = field(default_factory=dict)
-    db_memory_contract_diagnostics: dict[str, Any] = field(default_factory=dict)
+    db_memory_selection_evidence_ref: dict[str, Any] = field(default_factory=dict)
+    db_memory_contracts_evidence_ref: dict[str, Any] = field(default_factory=dict)
+    db_memory_selection_artifact: dict[str, Any] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    db_memory_contracts_artifact: dict[str, Any] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
     source_evidence_refs: tuple[dict[str, Any], ...] = ()
     source_fingerprints: dict[str, str] = field(default_factory=dict)
     capability_summaries: tuple[dict[str, Any], ...] = ()
@@ -83,9 +96,12 @@ class DbPlanningContext:
             "column_value_hints": [dict(item) for item in self.column_value_hints],
             "db_memory_refs": [dict(item) for item in self.db_memory_refs],
             "db_memory_semantics": [dict(item) for item in self.db_memory_semantics],
-            "db_memory_evidence_refs": list(self.db_memory_evidence_refs),
-            "db_memory_diagnostics": dict(self.db_memory_diagnostics),
-            "db_memory_contract_diagnostics": dict(self.db_memory_contract_diagnostics),
+            "db_memory_selection_evidence_ref": dict(
+                self.db_memory_selection_evidence_ref
+            ),
+            "db_memory_contracts_evidence_ref": dict(
+                self.db_memory_contracts_evidence_ref
+            ),
             "source_evidence_refs": [dict(item) for item in self.source_evidence_refs],
             "source_fingerprints": dict(self.source_fingerprints),
             "capability_summaries": [dict(item) for item in self.capability_summaries],
@@ -206,38 +222,75 @@ class DbPlanningContextBuilder:
             session_id=request.session_id,
             user_id=request.user_id,
         )
-        raw_db_memory_refs, db_memory_evidence_refs, db_memory_diagnostics = (
+        memory_limit = int(memory_options.get("limit") or 3)
+        memory_char_budget = int(memory_options.get("char_budget") or 800)
+        memory_score_threshold = _float_option(
+            memory_options,
+            "score_threshold",
+            0.45,
+        )
+        accepted_memory_recall_evidence = tuple(
+            item for item in memory_recall_evidence if item.accepted
+        )
+        memory_recall_refs = _evidence_refs(accepted_memory_recall_evidence)
+        raw_db_memory_refs, db_memory_evidence_refs, selection_diagnostics = (
             db_memory_refs_from_recall_evidence(
-                tuple(item for item in memory_recall_evidence if item.accepted),
+                accepted_memory_recall_evidence,
                 prompt=request.prompt,
                 schema=schema,
                 source_identity=memory_options.get("source_identity"),
                 schema_fingerprint=schema_fingerprint,
-                limit=int(memory_options.get("limit") or 3),
-                char_budget=int(memory_options.get("char_budget") or 800),
-                score_threshold=_float_option(
-                    memory_options,
-                    "score_threshold",
-                    0.45,
-                ),
+                limit=memory_limit,
+                char_budget=memory_char_budget,
+                score_threshold=memory_score_threshold,
             )
         )
-        db_memory_refs = project_memory_refs(raw_db_memory_refs, projection)
-        db_memory_diagnostics = {
-            **db_memory_diagnostics,
+        selection_diagnostics = {
+            **selection_diagnostics,
             **dict(memory_recall_diagnostics or {}),
         }
-        raw_db_memory_semantics, db_memory_contract_diagnostics = (
+        db_memory_selection_artifact = (
+            db_memory_selection_artifact_payload(
+                source_identity=memory_options.get("source_identity"),
+                schema_fingerprint=schema_fingerprint,
+                recall_evidence_refs=memory_recall_refs,
+                memory_evidence_refs=db_memory_evidence_refs,
+                included_refs=raw_db_memory_refs,
+                diagnostics=selection_diagnostics,
+                limit=memory_limit,
+                char_budget=memory_char_budget,
+                score_threshold=memory_score_threshold,
+            )
+            if accepted_memory_recall_evidence or memory_recall_diagnostics
+            else {}
+        )
+        db_memory_refs = project_memory_refs(
+            db_memory_selection_artifact.get("included_refs") or raw_db_memory_refs,
+            projection,
+        )
+        raw_db_memory_semantics, contract_projection_diagnostics = (
             project_db_memory_semantic_contracts(
-                raw_db_memory_refs,
+                db_memory_selection_artifact.get("included_refs") or raw_db_memory_refs,
                 prompt=request.prompt,
                 schema=schema,
                 policy_summary=policy_summary,
                 source_identity=memory_options.get("source_identity"),
             )
         )
+        db_memory_contracts_artifact = (
+            db_memory_contracts_artifact_payload(
+                source_identity=memory_options.get("source_identity"),
+                schema_fingerprint=schema_fingerprint,
+                recall_evidence_refs=memory_recall_refs,
+                selection_evidence_ref=None,
+                contracts=raw_db_memory_semantics,
+                diagnostics=contract_projection_diagnostics,
+            )
+            if db_memory_selection_artifact
+            else {}
+        )
         db_memory_semantics = project_memory_semantics(
-            raw_db_memory_semantics,
+            db_memory_contracts_artifact.get("contracts") or raw_db_memory_semantics,
             projection,
         )
         if db_memory_refs:
@@ -281,9 +334,8 @@ class DbPlanningContextBuilder:
             column_value_hints=column_value_hints,
             db_memory_refs=db_memory_refs,
             db_memory_semantics=db_memory_semantics,
-            db_memory_evidence_refs=db_memory_evidence_refs,
-            db_memory_diagnostics=db_memory_diagnostics,
-            db_memory_contract_diagnostics=db_memory_contract_diagnostics,
+            db_memory_selection_artifact=db_memory_selection_artifact,
+            db_memory_contracts_artifact=db_memory_contracts_artifact,
             source_evidence_refs=source_refs,
             source_fingerprints=source_fingerprints,
             capability_summaries=tuple(capability_summaries),
@@ -293,7 +345,7 @@ class DbPlanningContextBuilder:
                 "rendered_context_chars": 0,
                 "capability_summary_count": len(capability_summaries),
                 "source_evidence_count": len(source_evidence),
-                "db_memory_chars": int(db_memory_diagnostics.get("used_chars") or 0),
+                "db_memory_chars": int(selection_diagnostics.get("used_chars") or 0),
             },
             context_selection_diagnostics={
                 "mode": "runtime_bounded",
@@ -344,6 +396,65 @@ class DbPlanningContextBuilder:
                 "schema_fingerprint": context.schema_fingerprint,
                 "payload_fingerprint": _fingerprint(context.to_payload()),
             },
+        )
+
+    def memory_selection_evidence_for(
+        self,
+        context: DbPlanningContext,
+        *,
+        task_id: str | None = None,
+    ) -> Evidence | None:
+        if not context.db_memory_selection_artifact:
+            return None
+        return _artifact_evidence(
+            kind="db.memory.selection",
+            operation_id=context.operation_id,
+            task_id=task_id,
+            payload=context.db_memory_selection_artifact,
+        )
+
+    def memory_contracts_evidence_for(
+        self,
+        context: DbPlanningContext,
+        *,
+        selection_evidence_ref: dict[str, Any] | None = None,
+        task_id: str | None = None,
+    ) -> Evidence | None:
+        if not context.db_memory_contracts_artifact:
+            return None
+        payload = {
+            **context.db_memory_contracts_artifact,
+            "selection_evidence_ref": dict(
+                selection_evidence_ref
+                or context.db_memory_contracts_artifact.get(
+                    "selection_evidence_ref",
+                    {},
+                )
+                or {}
+            ),
+        }
+        return _artifact_evidence(
+            kind="db.memory.contracts",
+            operation_id=context.operation_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    def with_memory_artifact_refs(
+        self,
+        context: DbPlanningContext,
+        *,
+        selection_evidence: Evidence | None,
+        contracts_evidence: Evidence | None,
+    ) -> DbPlanningContext:
+        return replace(
+            context,
+            db_memory_selection_evidence_ref=(
+                _evidence_ref(selection_evidence) if selection_evidence else {}
+            ),
+            db_memory_contracts_evidence_ref=(
+                _evidence_ref(contracts_evidence) if contracts_evidence else {}
+            ),
         )
 
 
@@ -970,6 +1081,33 @@ def _evidence_ref(evidence: Evidence) -> dict[str, Any]:
         "payload_fingerprint": evidence.metadata.get("payload_fingerprint")
         or _fingerprint(evidence.payload),
     }
+
+
+def _artifact_evidence(
+    *,
+    kind: str,
+    operation_id: str,
+    task_id: str | None,
+    payload: dict[str, Any],
+) -> Evidence:
+    payload_fingerprint = _fingerprint(payload)
+    evidence_id = _fingerprint(
+        {
+            "operation_id": operation_id,
+            "task_id": task_id,
+            "kind": kind,
+            "payload": payload,
+        }
+    )
+    return Evidence(
+        id=f"evidence-{evidence_id}",
+        kind=kind,
+        owner="db_runtime",
+        operation_id=operation_id,
+        task_id=task_id,
+        payload=payload,
+        metadata={"payload_fingerprint": payload_fingerprint},
+    )
 
 
 def _fingerprint(value: Any) -> str:
