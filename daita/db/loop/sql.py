@@ -21,12 +21,16 @@ def _resolve_sql_input_for_action(
     *,
     sql_operation: str,
 ) -> tuple[_ResolvedSqlInput | None, str | None]:
-    direct_sql = action.input.get("sql")
-    has_direct_sql = isinstance(direct_sql, str) and bool(direct_sql.strip())
+    raw_direct_sql = action.input.get("sql")
+    direct_sql = (
+        raw_direct_sql.strip()
+        if isinstance(raw_direct_sql, str) and raw_direct_sql.strip()
+        else None
+    )
     has_plan_evidence_id = "plan_evidence_id" in action.input
     has_query_plan_ref = "query_plan_ref" in action.input
 
-    if has_direct_sql and has_plan_evidence_id:
+    if direct_sql is not None and has_plan_evidence_id:
         plan_evidence_id = action.input.get("plan_evidence_id")
         if not isinstance(plan_evidence_id, str) or not plan_evidence_id.strip():
             return None, "missing_plan_evidence_id"
@@ -45,7 +49,7 @@ def _resolve_sql_input_for_action(
         if not _sql_inputs_match(direct_sql, resolved.sql):
             return None, "ambiguous_sql_input"
         return resolved, None
-    if has_direct_sql and has_query_plan_ref:
+    if direct_sql is not None and has_query_plan_ref:
         query_plan_ref = action.input.get("query_plan_ref")
         if query_plan_ref != "latest_accepted_query_plan":
             return None, f"unsupported_query_plan_ref:{query_plan_ref}"
@@ -90,10 +94,10 @@ def _resolve_sql_input_for_action(
             return None, "ambiguous_sql_input"
         return explicit, None
 
-    if has_direct_sql:
+    if direct_sql is not None:
         return (
             _ResolvedSqlInput(
-                sql=direct_sql.strip(),
+                sql=direct_sql,
                 provenance="direct",
             ),
             None,

@@ -127,7 +127,7 @@ def _memory_update_runtime_continuation_action(
             },
         )
 
-    proposal = proposals[0]
+    proposal = next(iter(proposals))
     proposal_id = _summary_id(proposal)
     proposal_fingerprint = str(
         proposal.get("proposal_fingerprint")
@@ -335,4 +335,4 @@ def _resolve_memory_proposal_for_action(
         return None, "missing_accepted_memory_proposal"
     if len(summaries) > 1:
         return None, "ambiguous_memory_proposal"
-    return dict(summaries[-1]), None
+    return dict(next(iter(summaries))), None
