@@ -19,6 +19,7 @@ from .models import (
     DbRuntimeConfig,
 )
 
+
 @dataclass(frozen=True)
 class CapabilitySelection:
     """One selected capability plus the reason it was selected."""

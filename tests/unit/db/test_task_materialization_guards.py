@@ -1,10 +1,9 @@
 import re
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DB_ROOT = REPO_ROOT / "daita" / "db"
-TASK_OWNER = DB_ROOT / "runtime" / "tasks.py"
+TASK_OWNER = DB_ROOT / "runtime" / "tasks"
 RAW_VALIDATED_READ_HELPER = "plan_validated_read" + "_tasks"
 VALIDATED_SPEC_HELPERS = (
     "plan_validated_read" + "_spec",
@@ -13,7 +12,9 @@ VALIDATED_SPEC_HELPERS = (
 
 
 def _production_python_files():
-    return tuple(path for path in DB_ROOT.rglob("*.py") if path != TASK_OWNER)
+    return tuple(
+        path for path in DB_ROOT.rglob("*.py") if TASK_OWNER not in path.parents
+    )
 
 
 def test_private_task_materializers_stay_inside_task_owner():
