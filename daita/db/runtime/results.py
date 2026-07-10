@@ -7,7 +7,14 @@ from datetime import datetime, timezone
 import re
 from typing import Any, Mapping
 
-from daita.runtime import Evidence, Operation, OperationStatus, RuntimeEventType
+from daita.runtime import (
+    Evidence,
+    Operation,
+    OperationStatus,
+    RuntimeEventType,
+    RuntimeKernel,
+    RuntimeStore,
+)
 
 from ..context_projection import (
     ProjectionContext,
@@ -16,7 +23,7 @@ from ..context_projection import (
     project_operation_result,
 )
 from ..fingerprints import sensitive_fingerprint
-from ..models import DbOperationResult
+from ..models import DbOperationResult, DbRuntimeConfig
 
 _AUDIT_MACHINE_CODE = re.compile(r"[a-z0-9_.:-]+")
 _AUDIT_ERROR_TYPE = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]*")
@@ -26,6 +33,15 @@ _REDACTED_ERROR_CODE = "db_runtime_error_redacted"
 
 
 class DbRuntimeResultsMixin:
+    _operation_results: list[DbOperationResult]
+    _audit_log: list[dict[str, Any]]
+    _audit_fingerprint_key: bytes
+    store: RuntimeStore
+    kernel: RuntimeKernel
+    config: DbRuntimeConfig
+    runtime_id: str
+    runtime_kind: str
+
     @property
     def operation_results(self) -> tuple[DbOperationResult, ...]:
         """Typed operation results retained by this in-memory runtime."""

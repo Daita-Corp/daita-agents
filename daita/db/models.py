@@ -303,25 +303,25 @@ def _telemetry_source_diagnostics(result: DbOperationResult) -> dict[str, Any]:
     answer = _latest_synthesis_diagnostics(result.evidence, kind="answer.synthesis")
     if answer:
         return answer
-    analysis = _latest_synthesis_diagnostics(
+    analysis_synthesis_diagnostics = _latest_synthesis_diagnostics(
         result.evidence,
         kind="analysis.synthesis",
         require_final=True,
     )
-    if analysis:
-        return analysis
+    if analysis_synthesis_diagnostics:
+        return analysis_synthesis_diagnostics
     synthesis = result.diagnostics.get("synthesis")
     if isinstance(synthesis, dict):
         diagnostics = synthesis.get("diagnostics")
         if isinstance(diagnostics, dict) and diagnostics:
             return dict(diagnostics)
-    analysis = result.diagnostics.get("analysis")
-    if isinstance(analysis, dict):
-        if not bool(analysis.get("partial")):
-            diagnostics = analysis.get("diagnostics")
+    analysis_diagnostics = result.diagnostics.get("analysis")
+    if isinstance(analysis_diagnostics, dict):
+        if not bool(analysis_diagnostics.get("partial")):
+            diagnostics = analysis_diagnostics.get("diagnostics")
             if isinstance(diagnostics, dict) and diagnostics:
                 return dict(diagnostics)
-            synthesis = analysis.get("synthesis")
+            synthesis = analysis_diagnostics.get("synthesis")
             if isinstance(synthesis, dict) and not bool(synthesis.get("partial")):
                 diagnostics = synthesis.get("diagnostics")
                 if isinstance(diagnostics, dict) and diagnostics:
@@ -388,9 +388,8 @@ def normalize_db_telemetry_diagnostics(
     diagnostics: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Normalize one synthesis diagnostics payload into DB telemetry fields."""
-    tokens = (
-        diagnostics.get("tokens") if isinstance(diagnostics.get("tokens"), dict) else {}
-    )
+    raw_tokens = diagnostics.get("tokens")
+    tokens = raw_tokens if isinstance(raw_tokens, dict) else {}
     input_tokens = db_optional_int(
         diagnostics.get("input_tokens")
         if diagnostics.get("input_tokens") is not None

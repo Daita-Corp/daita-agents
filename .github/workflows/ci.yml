@@ -23,6 +23,49 @@ jobs:
       - name: Run pre-commit hooks
         run: pre-commit run --all-files
 
+  db-types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+
+      - name: Type-check DB safety boundaries
+        run: |
+          python -m mypy --follow-imports=skip \
+            daita/db/models.py \
+            daita/db/planner_protocol.py \
+            daita/db/runtime/tasks/context.py \
+            daita/db/runtime/tasks/models.py \
+            daita/db/runtime/tasks/execution.py \
+            daita/runtime/primitives.py \
+            daita/db/runtime/tasks/common.py \
+            daita/db/runtime/tasks/dependencies.py \
+            daita/db/runtime/tasks/planning.py \
+            daita/db/runtime/tasks/readiness.py \
+            daita/db/runtime/tasks/inputs.py \
+            daita/db/runtime/tasks/catalog.py \
+            daita/db/runtime/tasks/evidence.py \
+            daita/db/runtime/tasks/synthesis.py \
+            daita/db/runtime/tasks/runtime.py \
+            daita/db/runtime/facade.py \
+            daita/db/context_projection.py \
+            daita/db/runtime/results.py \
+            daita/db/runtime/governance.py \
+            daita/db/runtime/resume.py \
+            daita/db/loop/compiler.py \
+            daita/db/loop/runner.py \
+            daita/db/analysis.py \
+            daita/db/monitors.py \
+            daita/db/runtime/monitors.py
+
   test:
     runs-on: ubuntu-latest
     strategy:

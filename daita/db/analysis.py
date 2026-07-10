@@ -43,6 +43,7 @@ CAPABILITY_ANALYSIS_STEP_CONTRACTS = {
 ANALYSIS_STEP_KINDS = frozenset(
     {"query", "checkpoint", "synthesis", *CAPABILITY_ANALYSIS_STEP_CONTRACTS}
 )
+_RegisteredCapabilities = set[str] | Mapping[str | tuple[str | None, str], Any] | None
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,7 @@ class DbAnalysisStep:
         purpose = str(data.get("purpose") or "").strip()
         if not purpose:
             raise ValueError(f"analysis_step_purpose_required:{step_id}")
+        raw_input = data.get("input")
         return cls(
             id=step_id,
             kind=kind,
@@ -157,11 +159,7 @@ class DbAnalysisStep:
                 if data.get("capability_owner")
                 else None
             ),
-            input=(
-                dict(data.get("input"))
-                if isinstance(data.get("input"), Mapping)
-                else {}
-            ),
+            input=dict(raw_input) if isinstance(raw_input, Mapping) else {},
             context_evidence_refs=tuple(
                 dict(item)
                 for item in data.get("context_evidence_refs") or ()
@@ -262,7 +260,7 @@ def validate_analysis_plan_payload(
     payload: Mapping[str, Any],
     *,
     plan_evidence: Evidence | None = None,
-    registered_capabilities: set[str] | Mapping[str, Any] | None = None,
+    registered_capabilities: _RegisteredCapabilities = None,
 ) -> DbAnalysisPlanValidation:
     """Validate DAG shape, step kinds, dependency refs, and budgets."""
     errors: list[str] = []
@@ -350,7 +348,7 @@ def capability_contract_for_step_kind(kind: str) -> Mapping[str, Any] | None:
 def _validate_capability_step(
     step: DbAnalysisStep,
     *,
-    registered_capabilities: set[str] | Mapping[str, Any] | None,
+    registered_capabilities: _RegisteredCapabilities,
     errors: list[str],
 ) -> None:
     contract = CAPABILITY_ANALYSIS_STEP_CONTRACTS[step.kind]
@@ -389,7 +387,7 @@ def _validate_capability_step(
 
 
 def _registered_capability_ids(
-    registered_capabilities: set[str] | Mapping[str, Any] | None,
+    registered_capabilities: _RegisteredCapabilities,
 ) -> set[str] | None:
     if registered_capabilities is None:
         return None
@@ -424,7 +422,7 @@ def _structural_schema_payload(schema: Mapping[str, Any]) -> dict[str, Any]:
         table_name = str(table.get("name") or "").strip()
         if not table_name:
             continue
-        columns = []
+        columns: list[dict[str, Any]] = []
         for column in table.get("columns", []) or []:
             if not isinstance(column, Mapping):
                 continue
@@ -438,10 +436,11 @@ def _structural_schema_payload(schema: Mapping[str, Any]) -> dict[str, Any]:
                     "is_primary_key": bool(column.get("is_primary_key")),
                 }
             )
+        columns.sort(key=lambda column: str(column.get("name") or ""))
         tables.append(
             {
                 "name": table_name,
-                "columns": sorted(columns, key=lambda item: item["name"]),
+                "columns": columns,
             }
         )
 

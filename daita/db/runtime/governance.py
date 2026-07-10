@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
-from daita.plugins import PluginKind
+from daita.plugins import ExtensionRegistry, PluginKind
 from daita.runtime import (
     AccessMode,
     ApprovalRequest,
@@ -19,19 +19,45 @@ from daita.runtime import (
     PolicyEvaluator,
     RuntimeEvent,
     RuntimeEventType,
+    RuntimeStore,
     Task,
 )
 from daita.runtime import Evidence
 from daita.runtime import GovernanceResult, PolicyEffect
 
 from ..governance import default_db_policies
-from ..models import DbOperationContract
+from ..models import DbOperationContract, DbRuntimeConfig
 from .resume import _db_contract_from_context, _operation_has_run_context
 from .tasks.common import _stable_hash
+from .tasks.runtime import DbTaskRuntime
 from .types import _GovernancePersistence, _MonitorEffectGovernanceDecision
 
 
 class DbRuntimeGovernanceMixin:
+    if TYPE_CHECKING:
+        source: Any
+        store: RuntimeStore
+        tasks: DbTaskRuntime
+        config: DbRuntimeConfig
+        registry: ExtensionRegistry
+        runtime_id: str
+        runtime_kind: str
+
+        def _runtime_event(
+            self,
+            *,
+            type: RuntimeEventType,
+            operation_id: str,
+            message: str,
+            task_id: str | None = None,
+            task: Task | None = None,
+            capability: Capability | None = None,
+            payload: dict[str, Any] | None = None,
+            policy_id: str | None = None,
+            approval_id: str | None = None,
+            evidence_id: str | None = None,
+        ) -> RuntimeEvent: ...
+
     async def evaluate_governance_persistence(
         self,
         operation: Operation,
@@ -718,12 +744,10 @@ def _governance_evaluation_trace(
 
 def _request_summary(request: dict[str, Any]) -> dict[str, Any]:
     prompt = request.get("prompt")
-    input_payload = (
-        request.get("input") if isinstance(request.get("input"), dict) else {}
-    )
-    metadata = (
-        request.get("metadata") if isinstance(request.get("metadata"), dict) else {}
-    )
+    raw_input_payload = request.get("input")
+    input_payload = raw_input_payload if isinstance(raw_input_payload, dict) else {}
+    raw_metadata = request.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     return {
         "has_prompt": bool(prompt),
         "prompt_hash": _stable_hash(prompt) if prompt else None,

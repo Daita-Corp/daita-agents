@@ -826,7 +826,7 @@ class SQLiteDbMonitorStore:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _transaction(self) -> sqlite3.Connection:
+    def _transaction(self) -> _Transaction:
         return _Transaction(self)
 
 

@@ -223,7 +223,7 @@ async def from_db(
         temperature=temperature,
         agent_id=name,
     )
-    runtime = DbRuntime(
+    db_runtime = DbRuntime(
         source=source,
         config=runtime_config,
         store=runtime_store,
@@ -231,10 +231,10 @@ async def from_db(
         host_services=host_services,
     )
     try:
-        await runtime.setup(agent_id=name)
+        await db_runtime.setup(agent_id=name)
         if calibrate_memory:
             await calibrate_db_memory(
-                runtime,
+                db_runtime,
                 source_owner=source_plugin.manifest.id,
                 marker_key=(
                     "numeric_unit_calibration:"
@@ -243,7 +243,7 @@ async def from_db(
             )
     except Exception as exc:
         with suppress(Exception):
-            await runtime.teardown()
+            await db_runtime.teardown()
         raise AgentError(
             f"Failed to initialize database runtime: {exc}",
             retry_hint=getattr(exc, "retry_hint", "retryable"),
@@ -252,7 +252,7 @@ async def from_db(
     default_history = history if isinstance(history, ConversationHistory) else None
     if default_history is None and stateful:
         default_history = ConversationHistory(workspace=name)
-    return DbAgent(runtime=runtime, name=name, default_history=default_history)
+    return DbAgent(runtime=db_runtime, name=name, default_history=default_history)
 
 
 def _resolve_runtime_source(

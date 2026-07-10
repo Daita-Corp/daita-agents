@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from daita.runtime import (
     AccessMode,
@@ -11,22 +11,96 @@ from daita.runtime import (
     OperationSnapshot,
     OperationStatus,
     RuntimeEventType,
+    RuntimeKernel,
+    RuntimeStore,
     Task,
     TaskStatus,
 )
 
-from ..loop import DbAgentLoop
+from ..loop import DbAgentLoop, DbLoopResult
 from ..models import (
     DbIntent,
     DbIntentKind,
     DbLimits,
     DbOperationContract,
+    DbOperationResult,
     DbRequest,
 )
+from ..planner_protocol import DbAgentPlanner
+from .tasks.runtime import DbTaskRuntime
 from .types import DbRuntimeGovernanceBlocked, DbRuntimeTaskNotRunnable
 
 
 class DbRuntimeResumeMixin:
+    if TYPE_CHECKING:
+        store: RuntimeStore
+        kernel: RuntimeKernel
+        tasks: DbTaskRuntime
+        runtime_id: str
+        _is_setup: bool
+
+        async def setup(self, *, agent_id: str | None = None) -> None: ...
+
+        def _analysis_progress_payload(
+            self,
+            snapshot: OperationSnapshot | None,
+            *,
+            plan_evidence: Evidence | None = None,
+        ) -> dict[str, Any]: ...
+
+        async def _finalize_resumed_monitor_action(
+            self,
+            snapshot: OperationSnapshot,
+        ) -> None: ...
+
+        async def _finalize_resumed_monitor_delivery(
+            self,
+            snapshot: OperationSnapshot,
+        ) -> None: ...
+
+        def _has_pending_approvals(self, snapshot: OperationSnapshot) -> bool: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
+
+        async def _run_multi_step_analysis(
+            self,
+            request: DbRequest,
+            intent: DbIntent,
+            contract: DbOperationContract,
+            operation: Operation,
+            *,
+            base_diagnostics: dict[str, Any],
+            reuse_existing_plan: bool = False,
+        ) -> DbOperationResult: ...
+
+        async def _try_finalize_run_operation_from_snapshot(
+            self,
+            snapshot: OperationSnapshot,
+            *,
+            request: DbRequest,
+            fallback_intent: DbIntent,
+            fallback_contract: DbOperationContract,
+            base_diagnostics: dict[str, Any] | None = None,
+        ) -> OperationSnapshot | None: ...
+
+        def _select_db_agent_planner(self) -> DbAgentPlanner | None: ...
+
+        async def _finalize_run_operation(
+            self,
+            *,
+            operation_id: str,
+            request: DbRequest,
+            fallback_intent: DbIntent,
+            fallback_contract: DbOperationContract,
+            loop_result: DbLoopResult | None = None,
+            base_diagnostics: dict[str, Any] | None = None,
+        ) -> DbOperationResult: ...
+
     async def inspect_operation(self, operation_id: str) -> OperationSnapshot | None:
         """Inspect persisted state for one operation."""
         inspect = getattr(self.store, "inspect_operation", None)

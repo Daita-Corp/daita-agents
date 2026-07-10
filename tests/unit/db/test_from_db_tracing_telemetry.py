@@ -330,3 +330,22 @@ def test_telemetry_numeric_normalization_preserves_zero_and_unknown_values():
         "latency_ms": 2.5,
         "mode": "llm",
     }
+
+
+def test_telemetry_optional_token_mapping_retains_unknown_result_shape():
+    assert normalize_db_telemetry_diagnostics(
+        {
+            "mode": "unknown",
+            "tokens": None,
+        }
+    ) == {
+        "provider": "unknown",
+        "model": "unknown",
+        "input_tokens": "unknown",
+        "output_tokens": "unknown",
+        "total_tokens": "unknown",
+        "llm_calls": "unknown",
+        "estimated_cost_usd": "unknown",
+        "latency_ms": None,
+        "mode": "unknown",
+    }

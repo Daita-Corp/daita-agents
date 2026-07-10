@@ -81,7 +81,12 @@ class ProjectionContext:
     @property
     def blocked_tables(self) -> frozenset[str]:
         values = []
-        for source in (self.policy_summary, self.safety_frame, self.guardrail_summary):
+        sources = (
+            self.policy_summary or {},
+            self.safety_frame or {},
+            self.guardrail_summary or {},
+        )
+        for source in sources:
             values.extend(_string_list(source.get("blocked_tables")))
             values.extend(_string_list(source.get("deny_tables")))
             values.extend(_string_list(source.get("restricted_tables")))
@@ -90,7 +95,12 @@ class ProjectionContext:
     @property
     def blocked_columns(self) -> frozenset[str]:
         values = []
-        for source in (self.policy_summary, self.safety_frame, self.guardrail_summary):
+        sources = (
+            self.policy_summary or {},
+            self.safety_frame or {},
+            self.guardrail_summary or {},
+        )
+        for source in sources:
             values.extend(_string_list(source.get("blocked_columns")))
             values.extend(_string_list(source.get("blocked_fields")))
             values.extend(_string_list(source.get("sensitive_columns")))
@@ -100,7 +110,12 @@ class ProjectionContext:
     @property
     def blocked_values(self) -> frozenset[str]:
         values = []
-        for source in (self.policy_summary, self.safety_frame, self.guardrail_summary):
+        sources = (
+            self.policy_summary or {},
+            self.safety_frame or {},
+            self.guardrail_summary or {},
+        )
+        for source in sources:
             values.extend(_string_list(source.get("blocked_values")))
             values.extend(_string_list(source.get("sensitive_values")))
         return frozenset(str(value).strip().lower() for value in values if str(value))

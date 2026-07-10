@@ -24,6 +24,7 @@ from daita.runtime import (
     RuntimeStreamEvent,
     Task,
     TaskDependency,
+    TaskDependencyKind,
     TaskStatus,
     ToolView,
     Worker,
@@ -204,6 +205,52 @@ def test_operation_and_task_statuses_are_explicit_and_serializable():
     assert operation.to_dict()["status"] == "running"
     assert task.to_dict()["status"] == "running"
     assert task.to_dict()["dependencies"][0]["evidence_kind"] == "sql.validation"
+
+
+def test_enum_or_string_records_normalize_and_preserve_wire_values():
+    dependency = TaskDependency(
+        kind="evidence",
+        evidence_kind="sql.validation",
+    )
+    decision = PolicyDecision(
+        policy_id="governance.warn",
+        owner="governance",
+        effect="warn",
+        reason="Review the operation.",
+        severity=RiskLevel.LOW,
+    )
+    trace = PolicyDecisionTrace(
+        trace_id="trace-string-effect",
+        operation_id="op-1",
+        policy_id=decision.policy_id,
+        owner=decision.owner,
+        policy_version=decision.policy_version,
+        policy_identity=str(decision.policy_identity),
+        effect="warn",
+        reason=decision.reason,
+        stage="task",
+    )
+    approval = ApprovalRequest(
+        approval_id="approval-string-status",
+        operation_id="op-1",
+        reason="Approval is required.",
+        proposed_action={"operation_type": "data.write"},
+        risk=RiskLevel.HIGH,
+        status="pending",
+    )
+
+    assert dependency.kind is TaskDependencyKind.EVIDENCE
+    assert decision.effect is PolicyEffect.WARN
+    assert trace.effect is PolicyEffect.WARN
+    assert approval.status is ApprovalStatus.PENDING
+    assert dependency.to_dict()["kind"] == "evidence"
+    assert decision.to_dict()["effect"] == "warn"
+    assert trace.to_dict()["effect"] == "warn"
+    assert approval.to_dict()["status"] == "pending"
+    assert TaskDependency.from_dict(dependency.to_dict()) == dependency
+    assert PolicyDecision.from_dict(decision.to_dict()) == decision
+    assert PolicyDecisionTrace.from_dict(trace.to_dict()) == trace
+    assert ApprovalRequest.from_dict(approval.to_dict()) == approval
 
 
 def test_runtime_event_round_trips():

@@ -468,14 +468,14 @@ class DbAgentLoop:
                     diagnostics=diagnostics,
                 )
             continue
-        diagnostics: dict[str, Any] = {"turn_budget": turn_budget}
+        budget_diagnostics: dict[str, Any] = {"turn_budget": turn_budget}
         if last_compilation is not None:
-            diagnostics["last_compilation"] = last_compilation.to_dict()
+            budget_diagnostics["last_compilation"] = last_compilation.to_dict()
         return await self._result(
             operation,
             "budget_exhausted",
             warnings=warnings,
-            diagnostics=diagnostics,
+            diagnostics=budget_diagnostics,
         )
 
     async def build_loop_state(

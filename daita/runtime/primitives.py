@@ -517,7 +517,11 @@ class TaskDependency:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "kind": self.kind.value,
+            "kind": (
+                self.kind.value
+                if isinstance(self.kind, TaskDependencyKind)
+                else self.kind
+            ),
             "evidence_kind": self.evidence_kind,
             "evidence_id": self.evidence_id,
             "evidence_owner": self.evidence_owner,
@@ -713,7 +717,11 @@ class PolicyDecision:
             "owner": self.owner,
             "policy_version": self.policy_version,
             "policy_identity": self.policy_identity,
-            "effect": self.effect.value,
+            "effect": (
+                self.effect.value
+                if isinstance(self.effect, PolicyEffect)
+                else self.effect
+            ),
             "reason": self.reason,
             "severity": self.severity.value,
             "operation_id": self.operation_id,
@@ -791,7 +799,11 @@ class PolicyDecisionTrace:
             "owner": self.owner,
             "policy_version": self.policy_version,
             "policy_identity": self.policy_identity,
-            "effect": self.effect.value,
+            "effect": (
+                self.effect.value
+                if isinstance(self.effect, PolicyEffect)
+                else self.effect
+            ),
             "reason": self.reason,
             "stage": self.stage,
             "task_id": self.task_id,
@@ -952,7 +964,11 @@ class ApprovalRequest:
             "proposed_action": self.proposed_action,
             "risk": self.risk.value,
             "evidence_ids": list(self.evidence_ids),
-            "status": self.status.value,
+            "status": (
+                self.status.value
+                if isinstance(self.status, ApprovalStatus)
+                else self.status
+            ),
             "requested_by_policy_id": self.requested_by_policy_id,
             "owner": self.owner,
             "metadata": self.metadata,
