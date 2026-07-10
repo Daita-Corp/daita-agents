@@ -583,7 +583,9 @@ async def _accepted_dependency_evidence(
     for dependency in task.dependencies:
         if dependency.kind.value != "evidence":
             continue
-        item = await runtime._accepted_evidence_for_dependency(operation.id, dependency)
+        item = await runtime.tasks.accepted_evidence_for_dependency(
+            operation.id, dependency
+        )
         if item is not None and item.accepted and item.operation_id == operation.id:
             evidence.append(item)
     return tuple(evidence)

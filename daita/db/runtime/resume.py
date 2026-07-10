@@ -99,7 +99,7 @@ class DbRuntimeResumeMixin:
                     RuntimeEventType.TASK_SKIPPED,
                     operation_id=operation_id,
                     task=task,
-                    capability=self._capability_for_task(task),
+                    capability=self.tasks.capability_for_task(task),
                     message=f"Task {task.id} already completed; not re-running.",
                 )
 

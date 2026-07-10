@@ -9,102 +9,106 @@ from daita.runtime import Evidence, Operation, Task, TaskDependency
 
 from ...models import DbIntent, DbIntentKind
 from .common import _stable_hash
+from .context import DbTaskContext
 from .dependencies import _dependency_for_evidence
+from .evidence import latest_accepted_evidence
+from .execution import execute_task
 
 
-class DbRuntimeTaskSynthesisMixin:
-    async def _execute_answer_synthesis(
-        self,
-        *,
-        operation: Operation,
-        intent: DbIntent,
-        outcome_evidence: tuple[Evidence, ...],
-    ) -> tuple[Evidence, Task]:
-        existing = await self._latest_accepted_evidence(
-            operation.id,
-            "answer.synthesis",
-        )
-        if existing is not None:
-            task = next(
-                (
-                    item
-                    for item in await self.store.list_tasks(operation.id)
-                    if item.id == existing.task_id
-                ),
-                Task(
-                    id=str(existing.task_id or f"db-task-{uuid4()}"),
-                    operation_id=operation.id,
-                    capability_id="db.answer.synthesize",
-                    executor_id="db.answer.synthesize.runtime",
-                    required_evidence=frozenset({"answer.synthesis"}),
-                    metadata={"owner": "db_runtime", "reason": "answer_synthesis"},
-                ),
-            )
-            return existing, task
-
-        capability = self.registry.get_capability(
-            "db.answer.synthesize", owner="db_runtime"
-        )
-        dependencies = _synthesis_dependencies(operation, intent, outcome_evidence)
-        task_input = {
-            "evidence_refs": [
-                {
-                    "id": dependency.evidence_id,
-                    "kind": dependency.evidence_kind,
-                    "payload_fingerprint": dependency.payload_fingerprint,
-                }
-                for dependency in dependencies
-            ],
-            "row_budget": _synthesis_context_option(
-                self.config.metadata, "synthesis_row_budget", 25
-            ),
-            "char_budget": _synthesis_context_option(
-                self.config.metadata, "synthesis_context_char_budget", 16000
-            ),
-        }
-        input_hash = _stable_hash(task_input)
-        task = Task(
-            id=f"db-task-{uuid4()}",
-            operation_id=operation.id,
-            capability_id=capability.id,
-            executor_id=capability.executor,
-            input={**task_input, "input_hash": input_hash},
-            required_evidence=capability.output_evidence,
-            dependencies=dependencies,
-            metadata={
-                "owner": capability.owner,
-                "reason": "answer_synthesis",
-                "sequence": 10_000,
-                "input_hash": input_hash,
-                "idempotency_key": _stable_hash(
-                    {
-                        "operation_id": operation.id,
-                        "capability_id": capability.id,
-                        "evidence_refs": task_input["evidence_refs"],
-                    }
-                ),
-                "idempotent": capability.idempotent,
-                "replay_safe": capability.replay_safe,
-                "side_effecting": capability.side_effecting,
-            },
-        )
-        evidence = await self.execute_task(
-            task,
-            operation,
-            context={"capability_owner": capability.owner},
-        )
-        synthesis = next(
+async def execute_answer_synthesis(
+    context: DbTaskContext,
+    *,
+    operation: Operation,
+    intent: DbIntent,
+    outcome_evidence: tuple[Evidence, ...],
+) -> tuple[Evidence, Task]:
+    existing = await latest_accepted_evidence(
+        context,
+        operation.id,
+        "answer.synthesis",
+    )
+    if existing is not None:
+        task = next(
             (
                 item
-                for item in evidence
-                if item.kind == "answer.synthesis" and item.accepted
+                for item in await context.store.list_tasks(operation.id)
+                if item.id == existing.task_id
             ),
-            None,
+            Task(
+                id=str(existing.task_id or f"db-task-{uuid4()}"),
+                operation_id=operation.id,
+                capability_id="db.answer.synthesize",
+                executor_id="db.answer.synthesize.runtime",
+                required_evidence=frozenset({"answer.synthesis"}),
+                metadata={"owner": "db_runtime", "reason": "answer_synthesis"},
+            ),
         )
-        if synthesis is None:
-            raise RuntimeError("answer.synthesis evidence was not produced")
-        stored_task = await self.store.load_task(task.id)
-        return synthesis, stored_task or task
+        return existing, task
+
+    capability = context.registry.get_capability(
+        "db.answer.synthesize", owner="db_runtime"
+    )
+    dependencies = _synthesis_dependencies(operation, intent, outcome_evidence)
+    task_input = {
+        "evidence_refs": [
+            {
+                "id": dependency.evidence_id,
+                "kind": dependency.evidence_kind,
+                "payload_fingerprint": dependency.payload_fingerprint,
+            }
+            for dependency in dependencies
+        ],
+        "row_budget": _synthesis_context_option(
+            context.config.metadata, "synthesis_row_budget", 25
+        ),
+        "char_budget": _synthesis_context_option(
+            context.config.metadata, "synthesis_context_char_budget", 16000
+        ),
+    }
+    input_hash = _stable_hash(task_input)
+    task = Task(
+        id=f"db-task-{uuid4()}",
+        operation_id=operation.id,
+        capability_id=capability.id,
+        executor_id=capability.executor,
+        input={**task_input, "input_hash": input_hash},
+        required_evidence=capability.output_evidence,
+        dependencies=dependencies,
+        metadata={
+            "owner": capability.owner,
+            "reason": "answer_synthesis",
+            "sequence": 10_000,
+            "input_hash": input_hash,
+            "idempotency_key": _stable_hash(
+                {
+                    "operation_id": operation.id,
+                    "capability_id": capability.id,
+                    "evidence_refs": task_input["evidence_refs"],
+                }
+            ),
+            "idempotent": capability.idempotent,
+            "replay_safe": capability.replay_safe,
+            "side_effecting": capability.side_effecting,
+        },
+    )
+    evidence = await execute_task(
+        context,
+        task,
+        operation,
+        execution_context={"capability_owner": capability.owner},
+    )
+    synthesis = next(
+        (
+            item
+            for item in evidence
+            if item.kind == "answer.synthesis" and item.accepted
+        ),
+        None,
+    )
+    if synthesis is None:
+        raise RuntimeError("answer.synthesis evidence was not produced")
+    stored_task = await context.store.load_task(task.id)
+    return synthesis, stored_task or task
 
 
 def _synthesis_dependencies(

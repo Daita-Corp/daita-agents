@@ -29,7 +29,7 @@ class DbRuntimeMonitorActionResultsMixin:
         action_plan_fingerprint: str,
         tick_evidence_refs: tuple[dict[str, Any], ...],
     ) -> Evidence:
-        existing = await self._latest_evidence(
+        existing = await self.tasks.latest_evidence(
             operation.id,
             "monitor.action_plan",
             payload={"action_plan_fingerprint": action_plan_fingerprint},
@@ -76,7 +76,7 @@ class DbRuntimeMonitorActionResultsMixin:
         tick_evidence_refs: tuple[dict[str, Any], ...],
     ) -> Evidence:
         fingerprint = stable_fingerprint(analysis_plan.to_dict())
-        existing = await self._latest_accepted_evidence(
+        existing = await self.tasks.latest_accepted_evidence(
             operation.id,
             "analysis.plan",
             payload={"analysis_id": analysis_plan.analysis_id},
@@ -210,7 +210,7 @@ class DbRuntimeMonitorActionResultsMixin:
         tick_evidence_refs: tuple[dict[str, Any], ...],
         produced_evidence: tuple[Evidence, ...],
     ) -> Evidence:
-        existing = await self._latest_evidence(
+        existing = await self.tasks.latest_evidence(
             operation.id,
             "monitor.report",
             payload={"action_plan_fingerprint": action_plan_fingerprint},

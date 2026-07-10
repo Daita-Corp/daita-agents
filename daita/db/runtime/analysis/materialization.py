@@ -161,12 +161,12 @@ class DbRuntimeAnalysisMixin(
                 },
             )
             plan_evidence = (
-                await self._latest_accepted_evidence(operation.id, "analysis.plan")
+                await self.tasks.latest_accepted_evidence(operation.id, "analysis.plan")
                 if reuse_existing_plan
                 else None
             )
             validation_evidence = (
-                await self._latest_accepted_evidence(
+                await self.tasks.latest_accepted_evidence(
                     operation.id, "analysis.plan.validation", payload={"valid": True}
                 )
                 if plan_evidence is not None
@@ -978,7 +978,7 @@ class DbRuntimeAnalysisMixin(
                 "db.sql.execute_read",
                 owner=owner,
             )
-            validation_capability = self._validation_capability_for_sql_execute(
+            validation_capability = self.tasks.validation_capability_for_sql_execute(
                 read_capability
             )
             if validation_capability is None:

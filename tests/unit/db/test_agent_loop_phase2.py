@@ -2152,7 +2152,7 @@ async def test_stale_blocked_execute_does_not_block_repaired_execution():
             repaired_compilation.task_specs,
         )
         repaired_execute = repaired_plan.tasks[0]
-        repaired_readiness = await runtime._task_readiness(
+        repaired_readiness = await runtime.task_readiness(
             repaired_execute,
             operation,
         )
@@ -2211,7 +2211,7 @@ async def test_execute_read_readiness_requires_exact_sql_validation_evidence():
             ),
         )
         task = plan.tasks[0]
-        readiness = await runtime._task_readiness(task, operation)
+        readiness = await runtime.task_readiness(task, operation)
 
         await runtime.store.save_evidence(
             _sql_validation_evidence(
@@ -2221,7 +2221,7 @@ async def test_execute_read_readiness_requires_exact_sql_validation_evidence():
                 task_id="validation-task-required",
             )
         )
-        repaired_readiness = await runtime._task_readiness(task, operation)
+        repaired_readiness = await runtime.task_readiness(task, operation)
     finally:
         await runtime.teardown()
 

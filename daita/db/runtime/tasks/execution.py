@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from daita.runtime import (
     Capability,
@@ -25,12 +25,125 @@ from .planning import (
     _direct_capability_tasks,
     _prompt_from_direct_input,
     _validation_capability_for_sql_execute,
+    plan_kernel_task,
 )
 from ..types import (
     _DEFAULT_TASK_LEASE_SECONDS,
     DbRuntimeGovernanceBlocked,
     DbRuntimeTaskNotRunnable,
 )
+
+
+def capability_for_task(context: DbTaskContext, task: Task) -> Capability:
+    owner = task.metadata.get("owner") if task.metadata else None
+    if owner:
+        return context.registry.get_capability(task.capability_id, owner=str(owner))
+    try:
+        return context.registry.get_capability(task.capability_id)
+    except ValueError:
+        for capability in context.registry.capabilities:
+            if (
+                capability.id == task.capability_id
+                and capability.executor == task.executor_id
+            ):
+                return capability
+        raise
+
+
+async def execute_task(
+    context: DbTaskContext,
+    task: Task,
+    operation: Operation,
+    execution_context: dict[str, Any] | None = None,
+) -> tuple[Evidence, ...]:
+    """Prepare one interactive DB task and delegate it to the kernel."""
+    capability = capability_for_task(context, task)
+    if capability.executor != task.executor_id:
+        raise ValueError(
+            f"task executor {task.executor_id!r} does not match capability "
+            f"{task.capability_id!r} executor {capability.executor!r}"
+        )
+    stored_task = await context.store.load_task(task.id)
+    if stored_task is None:
+        task = replace(
+            task,
+            dependencies=task.dependencies
+            or _task_dependencies_for_capability(operation, capability),
+        )
+        task = await plan_kernel_task(context, task)
+    elif stored_task.status is TaskStatus.PENDING and stored_task.input != task.input:
+        task = replace(
+            stored_task,
+            input=task.input,
+            dependencies=task.dependencies or stored_task.dependencies,
+            metadata={
+                **stored_task.metadata,
+                **{
+                    key: value
+                    for key, value in task.metadata.items()
+                    if key in {"owner", "reason"}
+                },
+            },
+        )
+        await context.store.save_task(task)
+    else:
+        task = stored_task
+    default_dependencies = _task_dependencies_for_capability(operation, capability)
+    if not task.dependencies and default_dependencies:
+        task = replace(task, dependencies=default_dependencies)
+        await context.store.save_task(task)
+    try:
+        result = await context.kernel.execute_task(
+            task.id,
+            context={
+                "capability_owner": capability.owner,
+                **(execution_context or {}),
+            },
+            lease_owner=context.runtime_id,
+            lease_seconds=_DEFAULT_TASK_LEASE_SECONDS,
+        )
+    except RuntimeKernelGovernanceBlocked as exc:
+        result = exc.result
+        raise DbRuntimeGovernanceBlocked(
+            operation=result.operation if result is not None else operation,
+            task=result.task if result is not None else task,
+            governance=(
+                result.governance
+                if result is not None and result.governance is not None
+                else GovernanceResult(False, True, False)
+            ),
+        ) from exc
+    except RuntimeKernelTaskAlreadyTerminal as exc:
+        result = exc.result
+        blocked_task = result.task if result is not None else task
+        raise DbRuntimeTaskNotRunnable(
+            blocked_task,
+            f"Task {blocked_task.id} is already {blocked_task.status.value}; "
+            "completed tasks are not replayed without explicit invalidation.",
+        ) from exc
+    except RuntimeKernelLeaseLost as exc:
+        result = exc.result
+        blocked_task = result.task if result is not None else task
+        raise DbRuntimeTaskNotRunnable(
+            blocked_task,
+            f"Task {blocked_task.id} lease was lost before commit.",
+        ) from exc
+    except RuntimeKernelTaskNotRunnable as exc:
+        result = exc.result
+        blocked_task = result.task if result is not None else task
+        readiness = (
+            result.events[-1].payload.get("readiness", {})
+            if result is not None and result.events
+            else {}
+        )
+        raise DbRuntimeTaskNotRunnable(
+            blocked_task,
+            str(exc),
+            readiness=readiness,
+        ) from exc
+    except RuntimeKernelExecutorFailed as exc:
+        raise (exc.__cause__ or exc) from exc
+    return tuple(result.evidence)
 
 
 class DbTaskExecutor:
@@ -45,96 +158,7 @@ class DbTaskExecutor:
         operation: Operation,
         context: dict[str, Any] | None = None,
     ) -> tuple[Evidence, ...]:
-        """Prepare one interactive DB task and delegate it to the kernel."""
-        capability = self.capability_for_task(task)
-        if capability.executor != task.executor_id:
-            raise ValueError(
-                f"task executor {task.executor_id!r} does not match capability "
-                f"{task.capability_id!r} executor {capability.executor!r}"
-            )
-        stored_task = await self.context.store.load_task(task.id)
-        if stored_task is None:
-            task = replace(
-                task,
-                dependencies=task.dependencies
-                or _task_dependencies_for_capability(operation, capability),
-            )
-            task = await self.plan_kernel_task(task)
-        elif (
-            stored_task.status is TaskStatus.PENDING and stored_task.input != task.input
-        ):
-            task = replace(
-                stored_task,
-                input=task.input,
-                dependencies=task.dependencies or stored_task.dependencies,
-                metadata={
-                    **stored_task.metadata,
-                    **{
-                        key: value
-                        for key, value in task.metadata.items()
-                        if key in {"owner", "reason"}
-                    },
-                },
-            )
-            await self.context.store.save_task(task)
-        else:
-            task = stored_task
-        default_dependencies = _task_dependencies_for_capability(operation, capability)
-        if not task.dependencies and default_dependencies:
-            task = replace(task, dependencies=default_dependencies)
-            await self.context.store.save_task(task)
-        try:
-            result = await self.context.kernel.execute_task(
-                task.id,
-                context={
-                    "capability_owner": capability.owner,
-                    **(context or {}),
-                },
-                lease_owner=self.context.runtime_id,
-                lease_seconds=_DEFAULT_TASK_LEASE_SECONDS,
-            )
-        except RuntimeKernelGovernanceBlocked as exc:
-            result = exc.result
-            raise DbRuntimeGovernanceBlocked(
-                operation=result.operation if result is not None else operation,
-                task=result.task if result is not None else task,
-                governance=(
-                    result.governance
-                    if result is not None and result.governance is not None
-                    else GovernanceResult(False, True, False)
-                ),
-            ) from exc
-        except RuntimeKernelTaskAlreadyTerminal as exc:
-            result = exc.result
-            blocked_task = result.task if result is not None else task
-            raise DbRuntimeTaskNotRunnable(
-                blocked_task,
-                f"Task {blocked_task.id} is already {blocked_task.status.value}; "
-                "completed tasks are not replayed without explicit invalidation.",
-            ) from exc
-        except RuntimeKernelLeaseLost as exc:
-            result = exc.result
-            blocked_task = result.task if result is not None else task
-            raise DbRuntimeTaskNotRunnable(
-                blocked_task,
-                f"Task {blocked_task.id} lease was lost before commit.",
-            ) from exc
-        except RuntimeKernelTaskNotRunnable as exc:
-            result = exc.result
-            blocked_task = result.task if result is not None else task
-            readiness = (
-                result.events[-1].payload.get("readiness", {})
-                if result is not None and result.events
-                else {}
-            )
-            raise DbRuntimeTaskNotRunnable(
-                blocked_task,
-                str(exc),
-                readiness=readiness,
-            ) from exc
-        except RuntimeKernelExecutorFailed as exc:
-            raise (exc.__cause__ or exc) from exc
-        return tuple(result.evidence)
+        return await execute_task(self.context, task, operation, context)
 
     async def execute_capability(
         self,
@@ -199,7 +223,7 @@ class DbTaskExecutor:
         )
         tasks = []
         for task in task_plans:
-            tasks.append(await self.plan_kernel_task(task))
+            tasks.append(await plan_kernel_task(self.context, task))
         primary_task = tasks[-1]
         if (
             capability.id == "db.sql.execute_write"
@@ -257,75 +281,5 @@ class DbTaskExecutor:
         await self.context.kernel.complete_operation(operation.id)
         return evidence
 
-    async def plan_kernel_task(self, task: Task) -> Task:
-        """Persist a DB-planned task through the shared kernel planner."""
-        return await self.context.kernel.plan_task(
-            task_id=task.id,
-            operation_id=task.operation_id,
-            capability_id=task.capability_id,
-            owner=str(task.metadata["owner"]) if task.metadata.get("owner") else None,
-            input=task.input,
-            metadata=task.metadata,
-            dependencies=task.dependencies,
-        )
-
     def capability_for_task(self, task: Task) -> Capability:
-        owner = task.metadata.get("owner") if task.metadata else None
-        if owner:
-            return self.context.registry.get_capability(
-                task.capability_id,
-                owner=str(owner),
-            )
-        try:
-            return self.context.registry.get_capability(task.capability_id)
-        except ValueError:
-            for capability in self.context.registry.capabilities:
-                if (
-                    capability.id == task.capability_id
-                    and capability.executor == task.executor_id
-                ):
-                    return capability
-            raise
-
-
-class DbRuntimeTaskExecutionMixin:
-    """Temporary ``DbRuntime`` delegates for the representative conversion."""
-
-    if TYPE_CHECKING:
-        _is_setup: bool
-        _tasks: DbTaskExecutor
-
-        async def setup(self, *, agent_id: str | None = None) -> None: ...
-
-    async def execute_task(
-        self,
-        task: Task,
-        operation: Operation,
-        context: dict[str, Any] | None = None,
-    ) -> tuple[Evidence, ...]:
-        return await self._tasks.execute_task(task, operation, context)
-
-    async def execute_capability(
-        self,
-        capability_id: str,
-        *,
-        owner: str | None = None,
-        operation_type: str,
-        input: dict[str, Any] | None = None,
-        operation_id: str | None = None,
-    ) -> tuple[Evidence, ...]:
-        if not self._is_setup:
-            await self.setup()
-        return await self._tasks.execute_capability(
-            capability_id,
-            owner=owner,
-            operation_type=operation_type,
-            input=input,
-            operation_id=operation_id,
-        )
-
-    async def _plan_kernel_task(self, task: Task) -> Task:
-        return await self._tasks.plan_kernel_task(task)
-
-    def _capability_for_task(self, task: Task) -> Capability:
-        return self._tasks.capability_for_task(task)
+        return capability_for_task(self.context, task)

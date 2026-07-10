@@ -138,7 +138,7 @@ class DbRuntimeGovernanceMixin:
         current_evidence = tuple(await self.store.list_evidence(operation.id))
         current_approvals = tuple(await self.store.list_approval_requests(operation.id))
         authoritative_validation_evidence = (
-            await self._authoritative_validation_evidence(operation, task)
+            await self.tasks.authoritative_validation_evidence(operation, task)
         )
         governance_facts = _governance_fact_envelope(
             operation,

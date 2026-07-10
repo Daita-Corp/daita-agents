@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError, dataclass, fields
+import inspect
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,7 +11,9 @@ from daita.db import (
     DbRuntimeConfig,
     DbRuntimeInspection,
 )
-from daita.db.runtime.tasks import DbTaskContext, DbTaskExecutor
+from daita.db.runtime.tasks import DbTaskContext, DbTaskExecutor, DbTaskRuntime
+from daita.db.runtime.tasks import execution as task_execution
+from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.plugins import (
     ExtensionRegistry,
     RuntimeExtensionPlugin,
@@ -172,7 +175,7 @@ class CountingRuntimePlugin(RuntimeExtensionPlugin):
 def test_db_task_context_is_frozen_and_contains_only_approved_fields():
     runtime = DbRuntime(runtime_id="db-runtime-context")
 
-    context = runtime._tasks.context
+    context = runtime.tasks.context
 
     assert isinstance(context, DbTaskContext)
     assert tuple(field.name for field in fields(context)) == (
@@ -246,7 +249,103 @@ async def test_db_task_executor_runs_without_db_runtime_and_persists_before_kern
     assert persisted_at_execution[0].dependencies == task.dependencies
 
 
-async def test_db_runtime_execute_task_delegates_to_composed_executor(monkeypatch):
+async def test_db_task_runtime_composes_without_db_runtime():
+    plugin = CountingRuntimePlugin()
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    store = InMemoryRuntimeStore()
+    kernel = RuntimeKernel(
+        runtime_id="standalone-task-runtime",
+        runtime_kind="db",
+        extension_registry=registry,
+        runtime_store=store,
+    )
+
+    tasks = DbTaskRuntime(
+        DbTaskContext(
+            registry=registry,
+            store=store,
+            kernel=kernel,
+            config=DbRuntimeConfig(),
+            runtime_id="standalone-task-runtime",
+        )
+    )
+
+    operation = Operation(
+        id="standalone-runtime-operation",
+        operation_type="runtime.inspect",
+        status=OperationStatus.RUNNING,
+    )
+    await store.save_operation(operation)
+    plan = await tasks.plan_task_specs(
+        operation,
+        (
+            DbTaskSpec(
+                capability_id="runtime_probe.count",
+                owner="runtime_probe_counting",
+                input={"probe": True},
+            ),
+        ),
+    )
+    readiness = await tasks.task_readiness(plan.tasks[0], operation)
+    executable_input = await tasks.executable_input_for_task(plan.tasks[0], operation)
+    evidence = await tasks.execute_task(plan.tasks[0], operation)
+
+    assert isinstance(tasks.executor, DbTaskExecutor)
+    assert tasks.context.kernel is kernel
+    assert readiness == {
+        "ready": True,
+        "unsatisfied_dependencies": [],
+        "dependency_count": 0,
+    }
+    assert executable_input == plan.tasks[0].input
+    assert evidence[0].payload == {"calls": 1}
+    assert (
+        await tasks.latest_accepted_evidence(operation.id, "runtime_probe.counted")
+        == evidence[0]
+    )
+    assert tasks.capability_for_task(plan.tasks[0]).owner == "runtime_probe_counting"
+
+
+def test_task_facades_preserve_explicit_typed_signatures():
+    expected_parameters = {
+        "execute_task": ("self", "task", "operation", "context"),
+        "execute_capability": (
+            "self",
+            "capability_id",
+            "owner",
+            "operation_type",
+            "input",
+            "operation_id",
+        ),
+        "plan_task_specs": ("self", "operation", "specs", "contract"),
+        "task_readiness": ("self", "task", "operation"),
+        "executable_input_for_task": ("self", "task", "operation"),
+    }
+    for owner in (DbTaskRuntime, DbRuntime):
+        for method_name, parameter_names in expected_parameters.items():
+            signature = inspect.signature(getattr(owner, method_name))
+            assert tuple(signature.parameters) == parameter_names
+            assert all(
+                parameter.kind
+                not in {
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                }
+                for parameter in signature.parameters.values()
+            )
+            assert signature.return_annotation is not inspect.Signature.empty
+
+
+def test_db_task_executor_and_task_modules_share_one_execution_implementation():
+    class_source = inspect.getsource(DbTaskExecutor.execute_task)
+    function_source = inspect.getsource(task_execution.execute_task)
+
+    assert "return await execute_task(self.context" in class_source
+    assert "DbTaskExecutor(" not in function_source
+
+
+async def test_db_runtime_execute_task_delegates_to_composed_task_runtime(monkeypatch):
     runtime = DbRuntime()
     operation = Operation(id="delegate-operation", operation_type="runtime.inspect")
     task = Task(
@@ -256,7 +355,7 @@ async def test_db_runtime_execute_task_delegates_to_composed_executor(monkeypatc
         executor_id="runtime_probe.count",
     )
     delegated = AsyncMock(return_value=())
-    monkeypatch.setattr(runtime._tasks, "execute_task", delegated)
+    monkeypatch.setattr(runtime.tasks, "execute_task", delegated)
 
     result = await runtime.execute_task(task, operation, {"trace_id": "trace-1"})
 
@@ -266,6 +365,36 @@ async def test_db_runtime_execute_task_delegates_to_composed_executor(monkeypatc
         operation,
         {"trace_id": "trace-1"},
     )
+
+
+async def test_db_runtime_execute_capability_owns_setup_before_delegation(monkeypatch):
+    runtime = DbRuntime()
+    setup = AsyncMock()
+    delegated = AsyncMock(return_value=())
+    monkeypatch.setattr(runtime, "setup", setup)
+    monkeypatch.setattr(runtime.tasks, "execute_capability", delegated)
+
+    result = await runtime.execute_capability(
+        "runtime_probe.count",
+        owner="runtime_probe_counting",
+        operation_type="runtime.inspect",
+        input={"probe": True},
+        operation_id="setup-delegate-operation",
+    )
+
+    assert result == ()
+    setup.assert_awaited_once_with()
+    delegated.assert_awaited_once_with(
+        "runtime_probe.count",
+        owner="runtime_probe_counting",
+        operation_type="runtime.inspect",
+        input={"probe": True},
+        operation_id="setup-delegate-operation",
+    )
+
+
+def test_db_runtime_mro_contains_no_task_mixins():
+    assert all("Task" not in base.__name__ for base in DbRuntime.__mro__[1:])
 
 
 async def test_db_task_executor_rejects_executor_mismatch_before_kernel(monkeypatch):
@@ -282,7 +411,7 @@ async def test_db_task_executor_rejects_executor_mismatch_before_kernel(monkeypa
     monkeypatch.setattr(runtime.kernel, "execute_task", execute_task)
 
     with pytest.raises(ValueError, match="does not match capability"):
-        await runtime._tasks.execute_task(task, operation)
+        await runtime.tasks.executor.execute_task(task, operation)
 
     execute_task.assert_not_awaited()
     assert await runtime.store.load_task(task.id) is None
@@ -349,7 +478,7 @@ async def test_db_task_executor_preserves_pending_input_and_dependency_update(
 
     monkeypatch.setattr(runtime.kernel, "execute_task", execute_updated_task)
 
-    assert await runtime._tasks.execute_task(incoming_task, operation) == ()
+    assert await runtime.tasks.executor.execute_task(incoming_task, operation) == ()
 
     updated = persisted_at_execution[0]
     assert updated.input == incoming_task.input

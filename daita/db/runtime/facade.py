@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import secrets
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from daita.plugins import ExtensionRegistry, PluginContext, ServiceRegistry
@@ -15,6 +15,7 @@ from daita.runtime import (
     Capability,
     ContextAudience,
     ContextBlock,
+    Evidence,
     ApprovalStatus,
     InMemoryApprovalChannel,
     InMemoryRuntimeStore,
@@ -71,8 +72,9 @@ from .resume import (
     _db_request_from_context,
 )
 from .results import DbRuntimeResultsMixin
-from .tasks import DbTaskContext, DbTaskExecutor
-from .tasks.runtime import DbRuntimeTasksMixin
+from .tasks.context import DbTaskContext
+from .tasks.models import DbTaskPlan, DbTaskSpec
+from .tasks.runtime import DbTaskRuntime
 from .types import (
     _SourcePreparationSnapshot,
     _governance_blocked_answer,
@@ -89,7 +91,6 @@ class DbRuntime(
     DbRuntimeMemoryLearningMixin,
     DbRuntimeResultsMixin,
     DbRuntimeResumeMixin,
-    DbRuntimeTasksMixin,
 ):
     """Operation-centric database runtime.
 
@@ -154,15 +155,14 @@ class DbRuntime(
             approval_channel=self.approval_channel,
             fact_provider=self,
         )
-        self._tasks = DbTaskExecutor(
-            DbTaskContext(
-                registry=self.registry,
-                store=self.store,
-                kernel=self.kernel,
-                config=self.config,
-                runtime_id=self.runtime_id,
-            )
+        task_context = DbTaskContext(
+            registry=self.registry,
+            store=self.store,
+            kernel=self.kernel,
+            config=self.config,
+            runtime_id=self.runtime_id,
         )
+        self.tasks = DbTaskRuntime(task_context)
 
         self.registry.register(
             DbRuntimePlanningPlugin(llm_capable=self.db_llm_service.available)
@@ -220,6 +220,60 @@ class DbRuntime(
         await self.registry.setup_all(context)
         self._setup_context = context
         self._is_setup = True
+
+    async def execute_task(
+        self,
+        task: Task,
+        operation: Operation,
+        context: dict[str, Any] | None = None,
+    ) -> tuple[Evidence, ...]:
+        return await self.tasks.execute_task(task, operation, context)
+
+    async def execute_capability(
+        self,
+        capability_id: str,
+        *,
+        owner: str | None = None,
+        operation_type: str,
+        input: dict[str, Any] | None = None,
+        operation_id: str | None = None,
+    ) -> tuple[Evidence, ...]:
+        if not self._is_setup:
+            await self.setup()
+        return await self.tasks.execute_capability(
+            capability_id,
+            owner=owner,
+            operation_type=operation_type,
+            input=input,
+            operation_id=operation_id,
+        )
+
+    async def plan_task_specs(
+        self,
+        operation: Operation,
+        specs: Iterable[DbTaskSpec],
+        *,
+        contract: DbOperationContract | Mapping[str, Any] | None = None,
+    ) -> DbTaskPlan:
+        return await self.tasks.plan_task_specs(
+            operation,
+            specs,
+            contract=contract,
+        )
+
+    async def task_readiness(
+        self,
+        task: Task,
+        operation: Operation,
+    ) -> dict[str, Any]:
+        return await self.tasks.task_readiness(task, operation)
+
+    async def executable_input_for_task(
+        self,
+        task: Task,
+        operation: Operation,
+    ) -> dict[str, Any]:
+        return await self.tasks.executable_input_for_task(task, operation)
 
     async def teardown(self) -> None:
         """Tear down registered plugins in reverse registration order."""
@@ -595,12 +649,12 @@ class DbRuntime(
                 operation=operation,
             )
 
-        verification_evidence = await self._persist_verification_result_evidence(
+        verification_evidence = await self.tasks.persist_verification_result_evidence(
             operation,
             verification,
             evidence,
         )
-        synthesis_evidence, synthesis_task = await self._execute_answer_synthesis(
+        synthesis_evidence, synthesis_task = await self.tasks.execute_answer_synthesis(
             operation=operation,
             intent=intent,
             outcome_evidence=(*evidence, verification_evidence),
@@ -826,7 +880,7 @@ class DbRuntime(
     ) -> RuntimeEvent:
         if capability is None and task is not None:
             try:
-                capability = self._capability_for_task(task)
+                capability = self.tasks.capability_for_task(task)
             except Exception:
                 capability = None
         trace_id, span_id = _current_trace_ids()

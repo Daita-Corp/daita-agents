@@ -370,7 +370,7 @@ class DbRuntimeMonitorActionReportsMixin:
             "db.sql.execute_read",
             owner=owner,
         )
-        validation_capability = self._validation_capability_for_sql_execute(
+        validation_capability = self.tasks.validation_capability_for_sql_execute(
             read_capability
         )
         if validation_capability is None:

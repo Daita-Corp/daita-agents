@@ -65,7 +65,7 @@ class DbRuntimeMonitorActionWritesMixin:
                 "db.sql.execute_write",
                 owner=str(owner) if owner else None,
             )
-            validation_capability = self._validation_capability_for_sql_execute(
+            validation_capability = self.tasks.validation_capability_for_sql_execute(
                 write_capability
             )
             if validation_capability is None:
@@ -402,7 +402,7 @@ class DbRuntimeMonitorActionWritesMixin:
         block_reason: str | None = None,
         supersede: bool = False,
     ) -> Evidence:
-        existing = await self._latest_evidence(
+        existing = await self.tasks.latest_evidence(
             operation.id,
             "monitor.write_proposal",
             payload={"proposal_fingerprint": proposal_fingerprint},
@@ -515,7 +515,7 @@ class DbRuntimeMonitorActionWritesMixin:
         status: str,
         block_reason: str | None = None,
     ) -> Evidence:
-        existing = await self._latest_evidence(
+        existing = await self.tasks.latest_evidence(
             operation.id,
             "monitor.write_execution",
             payload={
@@ -590,7 +590,7 @@ class DbRuntimeMonitorActionWritesMixin:
             else ""
         )
         proposal = (
-            await self._latest_evidence(
+            await self.tasks.latest_evidence(
                 snapshot.operation.id,
                 "monitor.write_proposal",
                 payload={"proposal_fingerprint": proposal_fingerprint},

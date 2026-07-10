@@ -9,6 +9,10 @@ from typing import Any, Iterable, Mapping
 from daita.runtime import AccessMode, Capability, Evidence, Operation, Task, TaskStatus
 
 from .common import _payload_fingerprint, _stable_hash
+from .context import DbTaskContext
+from .evidence import accepted_evidence_for_dependency, latest_evidence
+from .execution import execute_task
+from .planning import plan_kernel_task
 
 _CATALOG_COLUMN_VALUE_GROUNDING_REASON = "catalog_column_value_grounding"
 _SOURCE_OWNER_KEYS = (
@@ -24,17 +28,23 @@ _SOURCE_OWNER_OPTION_KEYS = (
 )
 
 
-class DbRuntimeTaskCatalogMixin:
-    async def _catalog_executable_input_for_task(
+class DbTaskCatalog:
+    """Catalog-prerequisite orchestration over explicit task dependencies."""
+
+    def __init__(self, context: DbTaskContext) -> None:
+        self.context = context
+
+    async def executable_input_for_task(
         self,
         task: Task,
         operation: Operation,
     ) -> dict[str, Any]:
         task_input = _catalog_task_input_from_metadata(task, operation)
-        store_id = _catalog_store_id(task_input, self.config.metadata)
+        store_id = _catalog_store_id(task_input, self.context.config.metadata)
         if not store_id:
             return task_input
-        schema_evidence = await self._latest_evidence(
+        schema_evidence = await latest_evidence(
+            self.context,
             operation.id,
             "schema.asset_profile",
             accepted=True,
@@ -56,11 +66,9 @@ class DbRuntimeTaskCatalogMixin:
                 prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
             )
         if task.capability_id == "catalog.value_grounding.plan":
-            task_input = await self._value_grounding_plan_executable_input(
+            task_input = _value_grounding_plan_input_with_operation_context(
                 task_input,
                 operation=operation,
-                schema_evidence=schema_evidence,
-                parent_task=task,
             )
         elif task.capability_id in {
             "catalog.column_values.search",
@@ -85,20 +93,6 @@ class DbRuntimeTaskCatalogMixin:
             )
         return {**task_input, "store_id": store_id}
 
-    async def _value_grounding_plan_executable_input(
-        self,
-        task_input: dict[str, Any],
-        *,
-        operation: Operation,
-        schema_evidence: Evidence | None,
-        parent_task: Task,
-    ) -> dict[str, Any]:
-        enriched = _value_grounding_plan_input_with_operation_context(
-            task_input,
-            operation=operation,
-        )
-        return enriched
-
     async def _ensure_catalog_value_grounding_plan(
         self,
         operation: Operation,
@@ -113,14 +107,15 @@ class DbRuntimeTaskCatalogMixin:
                 dependency.kind.value == "evidence"
                 and dependency.evidence_kind == "catalog.value_grounding.plan"
             ):
-                evidence = await self._accepted_evidence_for_dependency(
+                evidence = await accepted_evidence_for_dependency(
+                    self.context,
                     operation.id,
                     dependency,
                 )
                 if evidence is not None:
                     return evidence
 
-        capability = self.registry.get_capability(
+        capability = self.context.registry.get_capability(
             "catalog.value_grounding.plan",
             owner="catalog",
         )
@@ -135,11 +130,9 @@ class DbRuntimeTaskCatalogMixin:
             **task_input,
             "store_id": store_id,
         }
-        plan_input = await self._value_grounding_plan_executable_input(
+        plan_input = _value_grounding_plan_input_with_operation_context(
             plan_input,
             operation=operation,
-            schema_evidence=schema_evidence,
-            parent_task=parent_task,
         )
         input_hash = _stable_hash(plan_input)
         prerequisite_metadata = _runtime_prerequisite_task_metadata(
@@ -160,14 +153,15 @@ class DbRuntimeTaskCatalogMixin:
             }
         )
         task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
-        existing = await self.store.load_task(task_id)
+        existing = await self.context.store.load_task(task_id)
         if existing is not None:
             plan_task = await self._merge_runtime_prerequisite_metadata(
                 existing,
                 prerequisite_metadata,
             )
         else:
-            plan_task = await self._plan_kernel_task(
+            plan_task = await plan_kernel_task(
+                self.context,
                 Task(
                     id=task_id,
                     operation_id=operation.id,
@@ -190,13 +184,13 @@ class DbRuntimeTaskCatalogMixin:
                         "replay_safe": capability.replay_safe,
                         "side_effecting": capability.side_effecting,
                     },
-                )
+                ),
             )
         if plan_task.status is not TaskStatus.SUCCEEDED:
-            await self.execute_task(plan_task, operation)
+            await execute_task(self.context, plan_task, operation)
         matches = [
             evidence
-            for evidence in await self.store.list_evidence(operation.id)
+            for evidence in await self.context.store.list_evidence(operation.id)
             if evidence.kind == "catalog.value_grounding.plan"
             and evidence.accepted
             and evidence.task_id == plan_task.id
@@ -211,7 +205,8 @@ class DbRuntimeTaskCatalogMixin:
         prerequisite_for: str | None = None,
         prerequisite_reason: str = _CATALOG_COLUMN_VALUE_GROUNDING_REASON,
     ) -> Evidence | None:
-        existing = await self._latest_evidence(
+        existing = await latest_evidence(
+            self.context,
             operation.id,
             "schema.asset_profile",
             accepted=True,
@@ -247,14 +242,15 @@ class DbRuntimeTaskCatalogMixin:
             }
         )
         task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
-        existing_task = await self.store.load_task(task_id)
+        existing_task = await self.context.store.load_task(task_id)
         if existing_task is not None:
             schema_task = await self._merge_runtime_prerequisite_metadata(
                 existing_task,
                 prerequisite_metadata,
             )
         else:
-            schema_task = await self._plan_kernel_task(
+            schema_task = await plan_kernel_task(
+                self.context,
                 Task(
                     id=task_id,
                     operation_id=operation.id,
@@ -274,11 +270,12 @@ class DbRuntimeTaskCatalogMixin:
                         "replay_safe": capability.replay_safe,
                         "side_effecting": capability.side_effecting,
                     },
-                )
+                ),
             )
         if schema_task.status is not TaskStatus.SUCCEEDED:
-            await self.execute_task(schema_task, operation)
-        return await self._latest_evidence(
+            await execute_task(self.context, schema_task, operation)
+        return await latest_evidence(
+            self.context,
             operation.id,
             "schema.asset_profile",
             accepted=True,
@@ -294,7 +291,8 @@ class DbRuntimeTaskCatalogMixin:
         prerequisite_for: str | None = None,
         prerequisite_reason: str = _CATALOG_COLUMN_VALUE_GROUNDING_REASON,
     ) -> None:
-        registered = await self._latest_evidence(
+        registered = await latest_evidence(
+            self.context,
             operation.id,
             "catalog.source_registered",
             payload={"store_id": store_id},
@@ -302,7 +300,7 @@ class DbRuntimeTaskCatalogMixin:
         )
         if registered is not None:
             return
-        capability = self.registry.get_capability(
+        capability = self.context.registry.get_capability(
             "catalog.source.register",
             owner="catalog",
         )
@@ -334,7 +332,7 @@ class DbRuntimeTaskCatalogMixin:
             }
         )
         task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
-        existing = await self.store.load_task(task_id)
+        existing = await self.context.store.load_task(task_id)
         if existing is not None:
             if existing.status is TaskStatus.SUCCEEDED:
                 return
@@ -343,7 +341,8 @@ class DbRuntimeTaskCatalogMixin:
                 prerequisite_metadata,
             )
         else:
-            register_task = await self._plan_kernel_task(
+            register_task = await plan_kernel_task(
+                self.context,
                 Task(
                     id=task_id,
                     operation_id=operation.id,
@@ -367,9 +366,9 @@ class DbRuntimeTaskCatalogMixin:
                         "schema_evidence_id": schema_evidence.id,
                         "schema_fingerprint": schema_fingerprint,
                     },
-                )
+                ),
             )
-        await self.execute_task(register_task, operation)
+        await execute_task(self.context, register_task, operation)
 
     async def _ensure_catalog_column_values_profiled(
         self,
@@ -393,7 +392,7 @@ class DbRuntimeTaskCatalogMixin:
         if profile_capability is None:
             return
         try:
-            register_capability = self.registry.get_capability(
+            register_capability = self.context.registry.get_capability(
                 "catalog.column_values.register",
                 owner="catalog",
             )
@@ -476,14 +475,15 @@ class DbRuntimeTaskCatalogMixin:
             }
         )
         task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
-        existing = await self.store.load_task(task_id)
+        existing = await self.context.store.load_task(task_id)
         if existing is not None:
             task = await self._merge_runtime_prerequisite_metadata(
                 existing,
                 prerequisite_metadata,
             )
         else:
-            task = await self._plan_kernel_task(
+            task = await plan_kernel_task(
+                self.context,
                 Task(
                     id=task_id,
                     operation_id=operation.id,
@@ -505,11 +505,12 @@ class DbRuntimeTaskCatalogMixin:
                         "replay_safe": capability.replay_safe,
                         "side_effecting": capability.side_effecting,
                     },
-                )
+                ),
             )
         if task.status is not TaskStatus.SUCCEEDED:
-            await self.execute_task(task, operation)
-        return await self._latest_evidence(
+            await execute_task(self.context, task, operation)
+        return await latest_evidence(
+            self.context,
             operation.id,
             "column_values.profile",
             payload={"table": table, "column": column},
@@ -566,14 +567,15 @@ class DbRuntimeTaskCatalogMixin:
             }
         )
         task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
-        existing = await self.store.load_task(task_id)
+        existing = await self.context.store.load_task(task_id)
         if existing is not None:
             task = await self._merge_runtime_prerequisite_metadata(
                 existing,
                 prerequisite_metadata,
             )
         else:
-            task = await self._plan_kernel_task(
+            task = await plan_kernel_task(
+                self.context,
                 Task(
                     id=task_id,
                     operation_id=operation.id,
@@ -597,10 +599,10 @@ class DbRuntimeTaskCatalogMixin:
                         "side_effecting": capability.side_effecting,
                         "profile_evidence_id": profile.id,
                     },
-                )
+                ),
             )
         if task.status is not TaskStatus.SUCCEEDED:
-            await self.execute_task(task, operation)
+            await execute_task(self.context, task, operation)
 
     async def _merge_runtime_prerequisite_metadata(
         self,
@@ -613,7 +615,7 @@ class DbRuntimeTaskCatalogMixin:
         if merged == task.metadata:
             return task
         updated = replace(task, metadata=merged)
-        await self.store.save_task(updated)
+        await self.context.store.save_task(updated)
         return updated
 
     async def _source_prerequisite_capability(
@@ -626,10 +628,10 @@ class DbRuntimeTaskCatalogMixin:
         prerequisite_for: str | None,
         prerequisite_reason: str,
     ) -> Capability | None:
-        owners = _capability_owners(self.registry.capabilities, capability_id)
+        owners = _capability_owners(self.context.registry.capabilities, capability_id)
         owner = _source_owner_for_prerequisite(
             operation,
-            metadata=self.config.metadata,
+            metadata=self.context.config.metadata,
             owners=owners,
             parent_task=parent_task,
             task_input=task_input,
@@ -645,7 +647,7 @@ class DbRuntimeTaskCatalogMixin:
                 )
             return None
         try:
-            return self.registry.get_capability(capability_id, owner=owner)
+            return self.context.registry.get_capability(capability_id, owner=owner)
         except KeyError:
             return None
 
@@ -667,7 +669,7 @@ class DbRuntimeTaskCatalogMixin:
             "prerequisite_for_task_id": parent_task.id,
             "prerequisite_reason": prerequisite_reason,
         }
-        await self.kernel.block_task(
+        await self.context.kernel.block_task(
             parent_task.id,
             message=error,
             payload={"runtime_prerequisite": details},
@@ -701,7 +703,7 @@ class DbRuntimeTaskCatalogMixin:
             "prerequisite_for_task_id": parent_task.id,
             "prerequisite_reason": prerequisite_reason,
         }
-        await self.kernel.block_task(
+        await self.context.kernel.block_task(
             parent_task.id,
             message=error,
             payload={"runtime_prerequisite": details},
@@ -717,7 +719,7 @@ class DbRuntimeTaskCatalogMixin:
         table: str,
         column: str,
     ) -> bool:
-        for evidence in await self.store.list_evidence(operation_id):
+        for evidence in await self.context.store.list_evidence(operation_id):
             if evidence.kind != "schema.column_value_profile" or not evidence.accepted:
                 continue
             if evidence.payload.get("store_id") != store_id:
@@ -728,6 +730,14 @@ class DbRuntimeTaskCatalogMixin:
                 if profile.get("table") == table and profile.get("column") == column:
                     return True
         return False
+
+
+async def catalog_executable_input_for_task(
+    context: DbTaskContext,
+    task: Task,
+    operation: Operation,
+) -> dict[str, Any]:
+    return await DbTaskCatalog(context).executable_input_for_task(task, operation)
 
 
 def _catalog_task_input_from_metadata(

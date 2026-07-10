@@ -110,7 +110,7 @@ class DbRuntimeMonitorDeliveryMixin:
             report=report,
             source_evidence_refs=source_refs,
         )
-        existing = await self._latest_evidence(
+        existing = await self.tasks.latest_evidence(
             operation.id,
             "monitor.delivery_result",
             payload={"report_fingerprint": report_fingerprint},
@@ -166,7 +166,7 @@ class DbRuntimeMonitorDeliveryMixin:
 
         capability = plan.capability
         idempotency_key = plan.idempotency_key
-        existing = await self._latest_evidence(
+        existing = await self.tasks.latest_evidence(
             operation.id,
             "monitor.delivery_result",
             payload={"idempotency_key": idempotency_key},
@@ -392,7 +392,7 @@ class DbRuntimeMonitorDeliveryMixin:
         report_fingerprint = str(
             report.metadata.get("payload_fingerprint") or ""
         ) or _payload_fingerprint(report.payload)
-        existing = await self._latest_evidence(
+        existing = await self.tasks.latest_evidence(
             operation.id,
             "monitor.delivery_plan",
             payload={"report_fingerprint": report_fingerprint},
@@ -458,7 +458,7 @@ class DbRuntimeMonitorDeliveryMixin:
         supersede_approval_block: bool = False,
     ) -> dict[str, Any]:
         if idempotency_key:
-            existing = await self._latest_evidence(
+            existing = await self.tasks.latest_evidence(
                 operation.id,
                 "monitor.delivery_result",
                 payload={"idempotency_key": idempotency_key},
@@ -751,7 +751,7 @@ class DbRuntimeMonitorDeliveryMixin:
         if not context:
             return
         report_id = context.get("report_evidence_id")
-        result = await self._latest_evidence(
+        result = await self.tasks.latest_evidence(
             snapshot.operation.id,
             "monitor.delivery_result",
             payload={

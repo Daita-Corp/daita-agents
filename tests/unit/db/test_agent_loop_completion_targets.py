@@ -916,7 +916,7 @@ async def test_runtime_finalization_state_uses_shared_policy_for_query_plan_only
     assert "query_result_missing" in diagnostics["verification"]["warnings"]
 
 
-async def test_resume_executes_persisted_runnable_tasks_then_finalizes():
+async def test_resume_executes_persisted_runnable_tasks_then_finalizes(monkeypatch):
     runtime, _ = await _runtime_with_planner(ScriptedPlanner())
     operation = await _bootstrap_run_operation(runtime, "resume-pending-tasks-target")
     operation, tasks = await _plan_read_tasks_without_execution(
@@ -925,13 +925,14 @@ async def test_resume_executes_persisted_runnable_tasks_then_finalizes():
         sql="select status, count(*) as count from orders",
     )
     executed = []
-    original_execute_task = runtime.execute_task
+    original_execute_task = runtime.kernel.execute_task
 
-    async def execute_task_spy(task, operation, context=None):
+    async def execute_task_spy(task_id, **kwargs):
+        task = await runtime.store.load_task(task_id)
         executed.append(task.capability_id)
-        return await original_execute_task(task, operation, context)
+        return await original_execute_task(task_id, **kwargs)
 
-    runtime.execute_task = execute_task_spy
+    monkeypatch.setattr(runtime.kernel, "execute_task", execute_task_spy)
     runtime._select_db_agent_planner = _fail_planner_selection
 
     resumed = await runtime.resume_operation(operation.id)

@@ -51,7 +51,7 @@ class DbRuntimeMonitorManagementMixin:
         *,
         action_plan_fingerprint: str,
     ) -> Evidence | None:
-        return await self._latest_evidence(
+        return await self.tasks.latest_evidence(
             operation_id,
             "monitor.action_result",
             payload={"action_plan_fingerprint": action_plan_fingerprint},

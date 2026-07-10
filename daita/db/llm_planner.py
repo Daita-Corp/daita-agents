@@ -346,7 +346,7 @@ async def _load_context_evidence(
     context_id = str(task.input.get("planning_context_evidence_id") or "")
     evidence = await _load_evidence_id(runtime, operation.id, context_id)
     if evidence is None:
-        evidence = await runtime._latest_accepted_evidence(
+        evidence = await runtime.tasks.latest_accepted_evidence(
             operation.id, "planning.context"
         )
     if evidence is None:

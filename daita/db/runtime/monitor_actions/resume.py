@@ -66,7 +66,7 @@ class DbRuntimeMonitorActionResumeMixin:
             for item in context.get("cited_tick_evidence_refs") or ()
             if isinstance(item, dict)
         )
-        plan_evidence = await self._latest_evidence(
+        plan_evidence = await self.tasks.latest_evidence(
             snapshot.operation.id,
             "monitor.action_plan",
             payload={"action_plan_fingerprint": fingerprint},
@@ -101,7 +101,7 @@ class DbRuntimeMonitorActionResumeMixin:
 
         status = _monitor_action_status_from_operation(snapshot.operation)
         if action_plan.get("kind") == "scheduled_report":
-            report = await self._latest_evidence(
+            report = await self.tasks.latest_evidence(
                 snapshot.operation.id,
                 "monitor.report",
                 payload={"action_plan_fingerprint": fingerprint},

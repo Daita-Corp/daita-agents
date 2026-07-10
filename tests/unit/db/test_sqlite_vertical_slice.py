@@ -980,13 +980,14 @@ async def test_planning_context_value_hints_profile_catalog_target_before_contex
         VALUES (1, 'complete', 120.0), (2, 'pending', 80.0);
         """)
     executed_capabilities = []
-    original_execute_task = runtime.execute_task
+    original_execute_task = runtime.kernel.execute_task
 
-    async def execute_task_spy(task, operation, context=None):
+    async def execute_task_spy(task_id, **kwargs):
+        task = await runtime.store.load_task(task_id)
         executed_capabilities.append(task.capability_id)
-        return await original_execute_task(task, operation, context)
+        return await original_execute_task(task_id, **kwargs)
 
-    runtime.execute_task = execute_task_spy
+    runtime.kernel.execute_task = execute_task_spy
 
     try:
         operation = await runtime.kernel.create_operation(
