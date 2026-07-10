@@ -8,7 +8,6 @@ from uuid import uuid4
 
 from daita.runtime import Evidence, Operation, Task
 
-from ...evidence import load_evidence
 from ...fingerprints import persisted_fingerprint
 from ...monitor_commands.planner import (
     DbMonitorPlanner,
@@ -18,6 +17,7 @@ from ...monitor_commands.planner import (
 from ...monitor_commands.types import DbMonitorCommand, DbMonitorValidation
 from ...monitors import DbMonitorMutation, DbMonitorState
 from ..tasks.models import DbTaskSpec
+from .monitor_evidence import load_monitor_proposal_evidence
 
 
 @dataclass(frozen=True)
@@ -230,7 +230,7 @@ class DbMonitorCommitCreateExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        proposal_evidence = await _load_monitor_proposal_evidence(
+        proposal_evidence = await load_monitor_proposal_evidence(
             runtime,
             operation,
             task,
@@ -298,53 +298,6 @@ class DbMonitorCommitCreateExecutor:
                 },
             )
         ]
-
-
-async def _load_monitor_proposal_evidence(
-    runtime: Any,
-    operation: Operation,
-    task: Task,
-    evidence_id: Any,
-) -> Evidence | None:
-    explicit = await load_evidence(runtime, operation.id, evidence_id)
-    if explicit is not None:
-        return explicit
-    evidence = await runtime.store.list_evidence(operation.id)
-    for dependency in task.dependencies:
-        if dependency.kind.value != "evidence":
-            continue
-        if dependency.evidence_kind != "monitor.proposal":
-            continue
-        for item in reversed(evidence):
-            if _evidence_matches_dependency(item, dependency):
-                return item
-    for item in reversed(evidence):
-        if item.kind == "monitor.proposal" and item.accepted:
-            return item
-    return None
-
-
-def _evidence_matches_dependency(evidence: Evidence, dependency: Any) -> bool:
-    if evidence.kind != dependency.evidence_kind:
-        return False
-    if dependency.evidence_id is not None and evidence.id != dependency.evidence_id:
-        return False
-    if (
-        dependency.evidence_owner is not None
-        and evidence.owner != dependency.evidence_owner
-    ):
-        return False
-    if (
-        dependency.producer_task_id is not None
-        and evidence.task_id != dependency.producer_task_id
-    ):
-        return False
-    if evidence.accepted is not dependency.evidence_accepted:
-        return False
-    for key, value in dependency.evidence_payload.items():
-        if evidence.payload.get(key) != value:
-            return False
-    return True
 
 
 async def _inspect_monitor_target_schema(
