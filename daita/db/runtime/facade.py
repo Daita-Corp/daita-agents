@@ -4,6 +4,7 @@ Skeleton database runtime built on the extension registry.
 
 from __future__ import annotations
 
+import secrets
 from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
@@ -122,6 +123,19 @@ class DbRuntime(
             self.config.metadata
         )
         self.host_services = dict(host_services or {})
+        if "audit_fingerprint_key" in self.host_services:
+            audit_fingerprint_key = self.host_services.pop("audit_fingerprint_key")
+            if (
+                not isinstance(audit_fingerprint_key, bytes)
+                or len(audit_fingerprint_key) < 32
+            ):
+                raise ValueError(
+                    "host_services['audit_fingerprint_key'] must be bytes with "
+                    "length at least 32"
+                )
+        else:
+            audit_fingerprint_key = secrets.token_bytes(32)
+        self._audit_fingerprint_key = audit_fingerprint_key
         self._setup_context: PluginContext | None = None
         self._is_setup = False
         self._schema_profile_cache: dict[str, Any] | None = None
