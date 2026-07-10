@@ -13,7 +13,7 @@ from .utils import (
     _dedupe_json_values,
     _optional_string,
     _safe_iterable,
-    _safe_string_list,
+    _string_list,
 )
 
 
@@ -111,7 +111,7 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
             if evidence.kind == "query.plan.proposal":
                 structured_plan = evidence.payload.get("structured_plan")
                 if isinstance(structured_plan, Mapping):
-                    selected_tables = _safe_string_list(
+                    selected_tables = _string_list(
                         structured_plan.get("selected_tables")
                     )
                     if selected_tables:
@@ -129,7 +129,7 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
                 "catalog_evidence_refs",
                 "relationship_evidence_refs",
             ):
-                values = _safe_string_list(evidence.payload.get(key))
+                values = _string_list(evidence.payload.get(key))
                 if values:
                     summary[key] = values
             relationship_joins = _planning_context_relationship_join_summaries(
@@ -144,7 +144,7 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
                 )
                 if structural_source is not None:
                     summary["structural_schema_source"] = structural_source
-                catalog_structural_refs = _safe_string_list(
+                catalog_structural_refs = _string_list(
                     diagnostics.get("catalog_structural_evidence_refs")
                 )
                 if catalog_structural_refs:

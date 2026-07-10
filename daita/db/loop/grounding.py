@@ -16,7 +16,7 @@ from .utils import (
     _first_present,
     _ordered_unique_strings,
     _safe_iterable,
-    _safe_string_list,
+    _string_list,
     _split_column_ref,
 )
 
@@ -105,7 +105,7 @@ def _first_action_string_list(
 ) -> list[str]:
     for source in (action.input, action.metadata):
         for key in keys:
-            values = _safe_string_list(source.get(key))
+            values = _string_list(source.get(key))
             if values:
                 return values
     return []

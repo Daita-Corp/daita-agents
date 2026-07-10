@@ -13,7 +13,6 @@ from .types import _ResolvedSqlInput
 from .utils import (
     _first_string_list_from_mappings,
     _ordered_unique_strings,
-    _safe_string_list,
     _string_list,
 )
 
@@ -81,9 +80,9 @@ def _planning_context_satisfies_catalog_phase2(
     ) or diagnostics.get("structural_schema_source")
     if structural_source == "catalog":
         return True
-    structural_refs = _safe_string_list(
+    structural_refs = _string_list(
         planning_context.get("catalog_structural_evidence_refs")
-    ) or _safe_string_list(diagnostics.get("catalog_structural_evidence_refs"))
+    ) or _string_list(diagnostics.get("catalog_structural_evidence_refs"))
     if structural_refs:
         return True
     return False
@@ -195,7 +194,7 @@ def _relationship_scope_for_resolved_sql(
             kind=resolved_sql.source_evidence_kind,
         )
         if plan_summary is not None:
-            tables = _safe_string_list(plan_summary.get("selected_tables"))
+            tables = _string_list(plan_summary.get("selected_tables"))
     if len(tables) < 2:
         return [], []
     return [tables[0]], tables[1:]
