@@ -45,7 +45,10 @@ from ..models import (
 from ..monitors import DbMonitorStore
 from ..planning import DbContractBuilder, build_safety_frame, classify_db_request
 from ..planner_protocol import DbAgentPlanner
-from ..session_context import db_session_context_from_request
+from ..session_context import (
+    db_session_context_from_request,
+    persist_session_query_scopes,
+)
 from ..synthesis import DbSynthesizer
 from ..verification import DbVerifier, db_run_finalization_check
 from .analysis import DbRuntimeAnalysisMixin
@@ -531,6 +534,13 @@ class DbRuntime(
             raise KeyError(operation_id)
         evidence = tuple(await self.store.list_evidence(operation_id))
         tasks = tuple(await self.store.list_tasks(operation_id))
+        await persist_session_query_scopes(
+            self.store,
+            operation,
+            tasks,
+            evidence,
+        )
+        evidence = tuple(await self.store.list_evidence(operation_id))
         contract = _contract_from_latest_loop_snapshot(operation, fallback_contract)
         intent = _intent_from_loop_contract(contract, fallback_intent)
         diagnostics = dict(base_diagnostics or {})

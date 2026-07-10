@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from daita.agents.agent import Agent
 from daita.agents.conversation import ConversationHistory
 from daita.db import DbAgent, DbRequest, DbRuntime, DbRuntimeConfig
@@ -10,16 +12,30 @@ from daita.db.models import (
     DbOperationResult,
 )
 from daita.db.planning_context import DbPlanningContextBuilder
+from daita.db.planner_protocol import (
+    DbPlannerAction,
+    DbPlannerActionKind,
+    DbPlannerDecision,
+    DbPlannerDecisionStatus,
+)
 from daita.db.query_plan import DbQueryPlan
-from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.db.session_context import (
     DbSessionContextBuilder,
     db_session_context_from_request,
+    persist_session_query_scopes,
     session_query_scope_evidence_for,
     session_scope_binding_evidence_for,
 )
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import AccessMode, Evidence, Operation, OperationStatus
+from daita.runtime import (
+    AccessMode,
+    Evidence,
+    Operation,
+    OperationStatus,
+    Task,
+    TaskDependency,
+    TaskStatus,
+)
 
 
 class SpyRuntime(DbRuntime):
@@ -49,6 +65,91 @@ class _BlockedColumnSource:
     allowed_tables = set()
     blocked_tables = set()
     blocked_columns = {"customers.loyalty_band"}
+
+
+class _SessionReadPlanner:
+    def __init__(self, *sql_statements: str) -> None:
+        self.sql_statements = sql_statements
+
+    async def plan(self, state):
+        return DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=tuple(
+                DbPlannerAction(
+                    action_id=f"session_read_{index}",
+                    kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                    input={"owner": "sqlite", "sql": sql},
+                )
+                for index, sql in enumerate(self.sql_statements, start=1)
+            ),
+        )
+
+
+def _scope_read_facts(
+    operation_id: str,
+    suffix: str,
+    sql: str,
+    *,
+    status: TaskStatus = TaskStatus.SUCCEEDED,
+    result_payload: dict | None = None,
+    result_accepted: bool = True,
+) -> tuple[Task, tuple[Evidence, ...]]:
+    plan_id = f"plan-{suffix}"
+    validation_id = f"validation-{suffix}"
+    task = Task(
+        id=f"read-{suffix}",
+        operation_id=operation_id,
+        capability_id="db.sql.execute_read",
+        executor_id="sqlite.sql.execute_read",
+        status=status,
+        dependencies=(
+            TaskDependency(
+                kind="evidence",
+                evidence_kind="query.plan.proposal",
+                evidence_id=plan_id,
+                operation_id=operation_id,
+            ),
+            TaskDependency(
+                kind="evidence",
+                evidence_kind="sql.validation",
+                evidence_id=validation_id,
+                operation_id=operation_id,
+            ),
+        ),
+        metadata={"owner": "sqlite"},
+    )
+    evidence = [
+        Evidence(
+            id=plan_id,
+            kind="query.plan.proposal",
+            owner="db_runtime",
+            operation_id=operation_id,
+            accepted=True,
+            payload={"sql": sql},
+        ),
+        Evidence(
+            id=validation_id,
+            kind="sql.validation",
+            owner="sqlite",
+            operation_id=operation_id,
+            accepted=True,
+            payload={"valid": True, "sql": sql},
+        ),
+    ]
+    if result_payload is not None:
+        evidence.append(
+            Evidence(
+                id=f"result-{suffix}",
+                kind="query.result",
+                owner="sqlite",
+                operation_id=operation_id,
+                task_id=task.id,
+                accepted=result_accepted,
+                payload=result_payload,
+            )
+        )
+    return task, tuple(evidence)
 
 
 async def _seed_agent_schema(path):
@@ -269,9 +370,24 @@ def test_session_query_scope_evidence_captures_safe_runtime_facts():
     assert scope.payload["scope_id"].startswith("session-scope-")
 
 
-async def test_stateful_read_execution_emits_session_query_scope():
+async def test_successful_db_run_persists_one_scope_and_follow_up_retrieves_it():
     sqlite = SQLitePlugin(path=":memory:")
-    runtime = DbRuntime(config=DbRuntimeConfig(plugins=(sqlite,)))
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(plugins=(sqlite,)),
+        host_services={
+            "db_agent_planner": _SessionReadPlanner(
+                "SELECT id FROM orders WHERE status = 'complete'"
+            )
+        },
+    )
+    verification_evidence_kinds = []
+    original_verify = runtime.verifier.verify
+
+    def capture_verification_evidence(contract, intent, evidence, tasks):
+        verification_evidence_kinds.append(tuple(item.kind for item in evidence))
+        return original_verify(contract, intent, evidence, tasks)
+
+    runtime.verifier.verify = capture_verification_evidence
     await runtime.setup(agent_id="db-session-scope-test")
     await sqlite.execute_script("""
         CREATE TABLE orders (
@@ -282,48 +398,233 @@ async def test_stateful_read_execution_emits_session_query_scope():
         """)
 
     try:
-        operation = await runtime.kernel.create_operation(
-            operation_type="data.query",
-            request={
-                "prompt": "Show complete orders",
-                "session_id": "stateful-scope",
-            },
-            metadata={"session_id": "stateful-scope"},
-            evaluate_governance=False,
+        result = await runtime.run(
+            DbRequest("Show complete orders", session_id="stateful-scope")
         )
-        plan = await runtime.plan_task_specs(
+        operation = await runtime.store.load_operation(result.operation_id)
+        tasks = tuple(await runtime.store.list_tasks(result.operation_id))
+        evidence = tuple(await runtime.store.list_evidence(result.operation_id))
+        follow_up = await DbSessionContextBuilder(runtime).build(
+            DbRequest("Now total them", session_id="stateful-scope")
+        )
+        assert operation is not None
+        repeated = await persist_session_query_scopes(
+            runtime.store,
             operation,
-            (
-                DbTaskSpec(
-                    capability_id="db.sql.validate",
-                    owner="sqlite",
-                    input={
-                        "sql": "SELECT id FROM orders WHERE status = 'complete'",
-                        "operation": "query",
-                    },
-                    sequence=1,
-                ),
-                DbTaskSpec(
-                    capability_id="db.sql.execute_read",
-                    owner="sqlite",
-                    input={"sql_ref": "sql.validation", "params": []},
-                    sequence=2,
-                ),
-            ),
+            tasks,
+            evidence,
         )
-        for task in plan.tasks:
-            await runtime.execute_task(task, operation)
-        evidence = await runtime.store.list_evidence(operation.id)
+        evidence_after_repeat = tuple(
+            await runtime.store.list_evidence(result.operation_id)
+        )
     finally:
         await runtime.teardown()
 
-    scope = next(item for item in evidence if item.kind == "session.query_scope")
-    assert scope.payload["source_operation_id"] == operation.id
+    scopes = [item for item in evidence if item.kind == "session.query_scope"]
+    scopes_after_repeat = [
+        item for item in evidence_after_repeat if item.kind == "session.query_scope"
+    ]
+    assert result.status is OperationStatus.SUCCEEDED
+    assert verification_evidence_kinds
+    assert "session.query_scope" in verification_evidence_kinds[-1]
+    assert len(scopes) == 1
+    assert repeated == ()
+    assert [item.id for item in scopes_after_repeat] == [item.id for item in scopes]
+    scope = scopes[0]
+    assert scope.payload["source_operation_id"] == result.operation_id
     assert scope.payload["tables"] == ["orders"]
     assert scope.payload["filters"] == [
         {"column": "status", "operator": "=", "values": ["complete"]}
     ]
     assert scope.payload["result_row_count"] == 1
+    assert scope.task_id == next(
+        task.id for task in tasks if task.capability_id == "db.sql.execute_read"
+    )
+    assert [item.scope_id for item in follow_up.query_scopes] == [
+        scope.payload["scope_id"]
+    ]
+
+
+async def test_multiple_successful_reads_persist_deterministic_scopes_once():
+    runtime = DbRuntime()
+    operation = Operation(
+        id="op-multiple-scopes",
+        operation_type="db.run",
+        request={
+            "prompt": "Show complete and pending orders",
+            "session_id": "multiple-scopes",
+            "source_scope": ["orders"],
+        },
+        metadata={"session_id": "multiple-scopes"},
+    )
+    first_task, first_evidence = _scope_read_facts(
+        operation.id,
+        "complete",
+        "SELECT id FROM orders WHERE status = 'complete'",
+        result_payload={"rows": [{"id": 1}]},
+    )
+    second_task, second_evidence = _scope_read_facts(
+        operation.id,
+        "pending",
+        "SELECT id FROM orders WHERE status = 'pending'",
+        result_payload={"rows": [{"id": 2}, {"id": 3}]},
+    )
+    tasks = (first_task, second_task)
+    evidence = (*first_evidence, *second_evidence)
+    await runtime.store.save_operation(operation)
+    for task in tasks:
+        await runtime.store.save_task(task)
+    for item in evidence:
+        await runtime.store.save_evidence(item)
+
+    first_pass = await persist_session_query_scopes(
+        runtime.store,
+        operation,
+        tasks,
+        evidence,
+    )
+    second_pass = await persist_session_query_scopes(
+        runtime.store,
+        operation,
+        tasks,
+        evidence,
+    )
+    scopes = [
+        item
+        for item in await runtime.store.list_evidence(operation.id)
+        if item.kind == "session.query_scope"
+    ]
+
+    assert len(first_pass) == 2
+    assert second_pass == ()
+    assert len(scopes) == 2
+    assert len({item.payload["scope_id"] for item in scopes}) == 2
+    assert {item.task_id for item in scopes} == {first_task.id, second_task.id}
+    assert {
+        tuple(filter_item["values"])
+        for item in scopes
+        for filter_item in item.payload["filters"]
+    } == {("complete",), ("pending",)}
+    assert {item.payload["result_row_count"] for item in scopes} == {1, 2}
+    assert all(item.payload["source_scope"] == ["orders"] for item in scopes)
+    assert all(
+        {ref["kind"] for ref in item.payload["source_evidence_refs"]}
+        == {"query.plan.proposal", "sql.validation", "query.result"}
+        for item in scopes
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "result_payload", "result_accepted"),
+    (
+        (TaskStatus.FAILED, {"rows": [{"id": 1}]}, True),
+        (TaskStatus.BLOCKED, {"rows": [{"id": 1}]}, True),
+        (TaskStatus.PENDING, {"rows": [{"id": 1}]}, True),
+        (TaskStatus.RUNNING, {"rows": [{"id": 1}]}, True),
+        (TaskStatus.CANCELLED, {"rows": [{"id": 1}]}, True),
+        (TaskStatus.SKIPPED, {"rows": [{"id": 1}]}, True),
+        (TaskStatus.SUCCEEDED, None, True),
+        (TaskStatus.SUCCEEDED, {"success": False, "rows": []}, True),
+        (TaskStatus.SUCCEEDED, {"rows": [{"id": 1}]}, False),
+    ),
+)
+async def test_unsuccessful_or_missing_result_reads_do_not_persist_scopes(
+    status,
+    result_payload,
+    result_accepted,
+):
+    runtime = DbRuntime()
+    operation = Operation(
+        id=f"op-scope-{status.value}-{result_payload is None}-{result_accepted}",
+        operation_type="db.run",
+        request={"prompt": "Show orders", "session_id": "scope-status"},
+    )
+    task, evidence = _scope_read_facts(
+        operation.id,
+        "status",
+        "SELECT id FROM orders",
+        status=status,
+        result_payload=result_payload,
+        result_accepted=result_accepted,
+    )
+    await runtime.store.save_operation(operation)
+    await runtime.store.save_task(task)
+    for item in evidence:
+        await runtime.store.save_evidence(item)
+
+    persisted = await persist_session_query_scopes(
+        runtime.store,
+        operation,
+        (task,),
+        evidence,
+    )
+
+    assert persisted == ()
+    assert not [
+        item
+        for item in await runtime.store.list_evidence(operation.id)
+        if item.kind == "session.query_scope"
+    ]
+
+
+@pytest.mark.parametrize("operation_type", ("monitor.source", "scheduled.operation"))
+async def test_monitor_and_scheduler_operations_do_not_persist_session_scopes(
+    operation_type,
+):
+    runtime = DbRuntime()
+    operation = Operation(
+        id=f"op-{operation_type}",
+        operation_type=operation_type,
+        request={"prompt": "Show orders", "session_id": "non-run-session"},
+    )
+    task, evidence = _scope_read_facts(
+        operation.id,
+        "non-run",
+        "SELECT id FROM orders",
+        result_payload={"rows": [{"id": 1}]},
+    )
+    await runtime.store.save_operation(operation)
+    await runtime.store.save_task(task)
+    for item in evidence:
+        await runtime.store.save_evidence(item)
+
+    persisted = await persist_session_query_scopes(
+        runtime.store,
+        operation,
+        (task,),
+        evidence,
+    )
+
+    assert persisted == ()
+
+
+async def test_direct_capability_execution_does_not_persist_session_scope():
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(config=DbRuntimeConfig(plugins=(sqlite,)))
+    await runtime.setup(agent_id="db-direct-scope-test")
+    await sqlite.execute_script("""
+        CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT NOT NULL);
+        INSERT INTO orders (id, status) VALUES (1, 'complete');
+        """)
+
+    try:
+        result_evidence = await runtime.execute_capability(
+            "db.sql.execute_read",
+            owner="sqlite",
+            operation_type="data.query",
+            input={
+                "prompt": "Show complete orders",
+                "session_id": "direct-session",
+                "sql": "SELECT id FROM orders WHERE status = 'complete'",
+            },
+        )
+        operation = (await runtime.store.list_operations())[-1]
+        stored_evidence = await runtime.store.list_evidence(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert any(item.kind == "query.result" for item in result_evidence)
+    assert not [item for item in stored_evidence if item.kind == "session.query_scope"]
 
 
 def test_follow_up_with_prior_scope_emits_scope_binding():

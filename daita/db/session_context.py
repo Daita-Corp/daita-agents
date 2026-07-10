@@ -8,7 +8,14 @@ import json
 import re
 from typing import Any, Iterable, Mapping
 
-from daita.runtime import Evidence, Operation, OperationStatus
+from daita.runtime import (
+    Evidence,
+    Operation,
+    OperationStatus,
+    RuntimeStore,
+    Task,
+    TaskStatus,
+)
 
 from .models import DbRequest
 from .sql_analysis import SqlAnalysisError, analyze_sql
@@ -534,6 +541,106 @@ def session_query_scope_evidence_for(
     )
 
 
+async def persist_session_query_scopes(
+    store: RuntimeStore,
+    operation: Operation,
+    tasks: Iterable[Task],
+    evidence: Iterable[Evidence],
+) -> tuple[Evidence, ...]:
+    """Persist deterministic query scopes during successful ``db.run`` finalization."""
+
+    if operation.operation_type != "db.run" or not _operation_has_session_scope(
+        operation
+    ):
+        return ()
+
+    task_tuple = tuple(tasks)
+    evidence_tuple = tuple(evidence)
+    stored_evidence = tuple(await store.list_evidence(operation.id))
+    existing_scope_ids = {
+        str(item.payload.get("scope_id"))
+        for item in (*evidence_tuple, *stored_evidence)
+        if item.kind == "session.query_scope" and item.payload.get("scope_id")
+    }
+    persisted: list[Evidence] = []
+
+    for task in task_tuple:
+        if (
+            task.operation_id != operation.id
+            or task.capability_id != "db.sql.execute_read"
+            or task.status is not TaskStatus.SUCCEEDED
+        ):
+            continue
+        result_evidence = tuple(
+            item
+            for item in evidence_tuple
+            if item.operation_id in {None, operation.id}
+            and item.task_id == task.id
+            and item.kind == "query.result"
+        )
+        if not _has_successful_query_result(result_evidence):
+            continue
+        scope_facts = _session_query_scope_facts_for_task(
+            task,
+            task_tuple,
+            evidence_tuple,
+        )
+        scope_evidence = session_query_scope_evidence_for(
+            operation,
+            scope_facts,
+            task_id=task.id,
+        )
+        if scope_evidence is None:
+            continue
+        scope_id = str(scope_evidence.payload.get("scope_id") or "")
+        if not scope_id or scope_id in existing_scope_ids:
+            continue
+        await store.save_evidence(scope_evidence)
+        existing_scope_ids.add(scope_id)
+        persisted.append(scope_evidence)
+
+    return tuple(persisted)
+
+
+def _session_query_scope_facts_for_task(
+    task: Task,
+    tasks: tuple[Task, ...],
+    evidence: tuple[Evidence, ...],
+) -> tuple[Evidence, ...]:
+    tasks_by_id = {
+        item.id: item for item in tasks if item.operation_id == task.operation_id
+    }
+    related_task_ids = {task.id}
+    related_evidence_ids: set[str] = set()
+    pending_task_ids = [task.id]
+    while pending_task_ids:
+        related_task = tasks_by_id.get(pending_task_ids.pop())
+        if related_task is None:
+            continue
+        for dependency in related_task.dependencies:
+            if dependency.kind.value != "evidence":
+                continue
+            if dependency.evidence_id:
+                related_evidence_ids.add(dependency.evidence_id)
+            if (
+                dependency.producer_task_id
+                and dependency.producer_task_id not in related_task_ids
+            ):
+                related_task_ids.add(dependency.producer_task_id)
+                pending_task_ids.append(dependency.producer_task_id)
+
+    return tuple(
+        item
+        for item in evidence
+        if item.operation_id in {None, task.operation_id}
+        and item.kind != "session.query_scope"
+        and (
+            item.task_id in related_task_ids
+            or (item.id is not None and item.id in related_evidence_ids)
+        )
+    )
+
+
 def session_scope_binding_evidence_for(
     operation: Operation,
     plan: Any,
@@ -785,8 +892,8 @@ def _query_scope_from_evidence(
             return DbSessionQueryScope.from_dict(item.payload)
 
     # Compatibility path for operations completed before durable
-    # session.query_scope evidence existed. New successful reads emit the
-    # artifact directly from accepted runtime facts.
+    # session.query_scope evidence existed. Successful db.run finalization
+    # now emits the artifact directly from accepted runtime facts.
     tables = _OrderedStrings()
     selected_columns = _OrderedStrings()
     filters: list[dict[str, Any]] = []

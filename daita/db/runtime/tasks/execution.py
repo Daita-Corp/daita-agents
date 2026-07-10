@@ -19,7 +19,6 @@ from daita.runtime import (
     TaskStatus,
 )
 
-from ...session_context import session_query_scope_evidence_for
 from .dependencies import _task_dependencies_for_capability
 from ..types import (
     _DEFAULT_TASK_LEASE_SECONDS,
@@ -35,7 +34,7 @@ class DbRuntimeTaskExecutionMixin:
         operation: Operation,
         context: dict[str, Any] | None = None,
     ) -> tuple[Evidence, ...]:
-        """Execute one runtime task through the shared runtime kernel."""
+        """Prepare one interactive DB task and delegate it to the kernel."""
         capability = self._capability_for_task(task)
         if capability.executor != task.executor_id:
             raise ValueError(
@@ -124,15 +123,7 @@ class DbRuntimeTaskExecutionMixin:
             ) from exc
         except RuntimeKernelExecutorFailed as exc:
             raise (exc.__cause__ or exc) from exc
-        evidence = tuple(result.evidence)
-        scope_evidence = await self._session_query_scope_evidence_for_task(
-            task,
-            operation,
-            evidence,
-        )
-        if scope_evidence is not None:
-            evidence = (*evidence, scope_evidence)
-        return evidence
+        return tuple(result.evidence)
 
     async def execute_capability(
         self,
@@ -265,29 +256,6 @@ class DbRuntimeTaskExecutionMixin:
             metadata=task.metadata,
             dependencies=task.dependencies,
         )
-
-    async def _session_query_scope_evidence_for_task(
-        self,
-        task: Task,
-        operation: Operation,
-        task_evidence: tuple[Evidence, ...],
-    ) -> Evidence | None:
-        if task.capability_id != "db.sql.execute_read":
-            return None
-        if not any(
-            item.kind == "query.result" and item.accepted for item in task_evidence
-        ):
-            return None
-        operation_evidence = tuple(await self.store.list_evidence(operation.id))
-        scope_evidence = session_query_scope_evidence_for(
-            operation,
-            operation_evidence,
-            task_id=task.id,
-        )
-        if scope_evidence is None:
-            return None
-        await self.store.save_evidence(scope_evidence)
-        return scope_evidence
 
     def _capability_for_task(self, task: Task) -> Capability:
         owner = task.metadata.get("owner") if task.metadata else None
