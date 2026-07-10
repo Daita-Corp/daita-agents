@@ -7,11 +7,11 @@ from typing import Any, Mapping
 
 from daita.runtime import TaskDependency, TaskStatus
 
+from ..fingerprints import persisted_fingerprint
 from ..models import DbIntentKind
 from ..planner_protocol import DbLoopState, DbPlannerAction, DbPlannerActionKind
 from ..runtime.tasks.models import DbTaskSpec
 from .types import DbActionCompilation
-from .utils import _stable_hash
 
 _SIMPLE_ACTION_CAPABILITIES: dict[DbPlannerActionKind, tuple[str, ...]] = {
     DbPlannerActionKind.INSPECT_SCHEMA: ("db.schema.inspect",),
@@ -270,8 +270,8 @@ def _with_deterministic_task_id(
 ) -> DbTaskSpec:
     if spec.task_id:
         return spec
-    input_hash = _stable_hash(spec.input)
-    idempotency_key = spec.idempotency_key or _stable_hash(
+    input_hash = persisted_fingerprint(spec.input)
+    idempotency_key = spec.idempotency_key or persisted_fingerprint(
         {
             "operation_id": operation_id,
             "capability_id": spec.capability_id,
@@ -281,7 +281,7 @@ def _with_deterministic_task_id(
             "deterministic_key": spec.deterministic_key,
         }
     )
-    task_fingerprint = _stable_hash(
+    task_fingerprint = persisted_fingerprint(
         {
             "operation_id": operation_id,
             "idempotency_key": idempotency_key,
@@ -297,7 +297,7 @@ def _merge_dependencies(
     merged: list[TaskDependency] = []
     seen: set[str] = set()
     for dependency in (*left, *right):
-        fingerprint = _stable_hash(dependency.to_dict())
+        fingerprint = persisted_fingerprint(dependency.to_dict())
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
@@ -376,7 +376,7 @@ def _dependency_for_prerequisite_spec(
         producer_capability_id=capability.id,
         producer_executor_id=capability.executor,
         evidence_accepted=True,
-        input_hash=_stable_hash(spec.input),
+        input_hash=persisted_fingerprint(spec.input),
         operation_id=operation_id,
         metadata={
             "runtime_prerequisite": True,

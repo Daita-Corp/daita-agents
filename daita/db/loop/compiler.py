@@ -7,6 +7,7 @@ from typing import Any, Iterable, Mapping
 from daita.runtime import AccessMode, TaskDependency
 
 from ..continuation import DbContinuationResolver
+from ..fingerprints import persisted_fingerprint
 from ..models import DbOperationContract
 from ..planner_protocol import (
     DbLoopState,
@@ -87,7 +88,6 @@ from .summaries import (
     _state_has_accepted_evidence,
 )
 from .types import DbActionCompilation
-from .utils import _stable_hash
 
 
 class DbActionCompiler:
@@ -111,7 +111,7 @@ class DbActionCompiler:
         selected_capabilities: list[dict[str, Any]] = []
         runtime_prerequisites: list[dict[str, Any]] = []
         runtime_prerequisite_capabilities: list[dict[str, Any]] = []
-        decision_fingerprint = _stable_hash(decision.to_dict())
+        decision_fingerprint = persisted_fingerprint(decision.to_dict())
         actions: list[DbPlannerAction] = []
 
         for raw_action in decision.actions:
@@ -367,7 +367,7 @@ class DbActionCompiler:
                 producer_capability_id=capability.id,
                 producer_executor_id=capability.executor,
                 evidence_accepted=True,
-                input_hash=_stable_hash(spec.input),
+                input_hash=persisted_fingerprint(spec.input),
                 operation_id=operation_id,
                 metadata={
                     "planner_dependency": True,
@@ -539,7 +539,7 @@ class DbActionCompiler:
                     producer_capability_id=schema_capability.id,
                     producer_executor_id=schema_capability.executor,
                     evidence_accepted=True,
-                    input_hash=_stable_hash({}),
+                    input_hash=persisted_fingerprint({}),
                     operation_id=state.operation_id,
                     metadata={
                         "runtime_prerequisite": True,
@@ -633,7 +633,7 @@ class DbActionCompiler:
                     producer_capability_id=grounding_capability.id,
                     producer_executor_id=grounding_capability.executor,
                     evidence_accepted=True,
-                    input_hash=_stable_hash(grounding_input),
+                    input_hash=persisted_fingerprint(grounding_input),
                     operation_id=state.operation_id,
                     metadata={
                         "runtime_prerequisite": True,
@@ -678,7 +678,7 @@ class DbActionCompiler:
                         producer_capability_id=hints_capability.id,
                         producer_executor_id=hints_capability.executor,
                         evidence_accepted=True,
-                        input_hash=_stable_hash(hints_input),
+                        input_hash=persisted_fingerprint(hints_input),
                         operation_id=state.operation_id,
                         metadata={
                             "runtime_prerequisite": True,
@@ -738,7 +738,7 @@ class DbActionCompiler:
                         producer_capability_id=recall_capability.id,
                         producer_executor_id=recall_capability.executor,
                         evidence_accepted=True,
-                        input_hash=_stable_hash(recall_input),
+                        input_hash=persisted_fingerprint(recall_input),
                         operation_id=state.operation_id,
                         metadata={
                             "runtime_prerequisite": True,
@@ -859,7 +859,7 @@ class DbActionCompiler:
                     producer_capability_id=context_capability.id,
                     producer_executor_id=context_capability.executor,
                     evidence_accepted=True,
-                    input_hash=_stable_hash(context_spec.input),
+                    input_hash=persisted_fingerprint(context_spec.input),
                     operation_id=state.operation_id,
                     metadata={
                         "runtime_prerequisite": True,
@@ -1525,7 +1525,7 @@ class DbActionCompiler:
                 f"{action.action_id}:{capability.id}:"
                 f"{proposal_fingerprint or proposal_id}"
             ),
-            idempotency_key=_stable_hash(
+            idempotency_key=persisted_fingerprint(
                 {
                     "operation_id": state.operation_id,
                     "capability_id": capability.id,

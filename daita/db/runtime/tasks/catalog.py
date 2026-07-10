@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping
 
 from daita.runtime import AccessMode, Capability, Evidence, Operation, Task, TaskStatus
 
-from .common import _payload_fingerprint, _stable_hash
+from ...fingerprints import persisted_fingerprint
 from .context import DbTaskContext
 from .evidence import accepted_evidence_for_dependency, latest_evidence
 from .execution import execute_task
@@ -134,7 +134,7 @@ class DbTaskCatalog:
             plan_input,
             operation=operation,
         )
-        input_hash = _stable_hash(plan_input)
+        input_hash = persisted_fingerprint(plan_input)
         prerequisite_metadata = _runtime_prerequisite_task_metadata(
             operation,
             parent_task=parent_task,
@@ -143,7 +143,7 @@ class DbTaskCatalog:
             prerequisite_reason=_CATALOG_COLUMN_VALUE_GROUNDING_REASON,
             prerequisite_declaration=prerequisite_declaration,
         )
-        idempotency_key = _stable_hash(
+        idempotency_key = persisted_fingerprint(
             {
                 "operation_id": operation.id,
                 "capability_id": capability.id,
@@ -152,7 +152,7 @@ class DbTaskCatalog:
                 "input_hash": input_hash,
             }
         )
-        task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
+        task_id = f"db-task-{persisted_fingerprint({'idempotency_key': idempotency_key})[:32]}"
         existing = await self.context.store.load_task(task_id)
         if existing is not None:
             plan_task = await self._merge_runtime_prerequisite_metadata(
@@ -232,8 +232,8 @@ class DbTaskCatalog:
         )
 
         task_input: dict[str, Any] = {}
-        input_hash = _stable_hash(task_input)
-        idempotency_key = _stable_hash(
+        input_hash = persisted_fingerprint(task_input)
+        idempotency_key = persisted_fingerprint(
             {
                 "operation_id": operation.id,
                 "capability_id": capability.id,
@@ -241,7 +241,7 @@ class DbTaskCatalog:
                 "reason": "runtime:schema_profile_prepare",
             }
         )
-        task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
+        task_id = f"db-task-{persisted_fingerprint({'idempotency_key': idempotency_key})[:32]}"
         existing_task = await self.context.store.load_task(task_id)
         if existing_task is not None:
             schema_task = await self._merge_runtime_prerequisite_metadata(
@@ -318,11 +318,11 @@ class DbTaskCatalog:
             "store_id": store_id,
             "persist": False,
         }
-        input_hash = _stable_hash(task_input)
+        input_hash = persisted_fingerprint(task_input)
         schema_fingerprint = schema_evidence.metadata.get(
             "payload_fingerprint"
-        ) or _payload_fingerprint(schema)
-        idempotency_key = _stable_hash(
+        ) or persisted_fingerprint(schema)
+        idempotency_key = persisted_fingerprint(
             {
                 "operation_id": operation.id,
                 "capability_id": capability.id,
@@ -331,7 +331,7 @@ class DbTaskCatalog:
                 "schema_fingerprint": schema_fingerprint,
             }
         )
-        task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
+        task_id = f"db-task-{persisted_fingerprint({'idempotency_key': idempotency_key})[:32]}"
         existing = await self.context.store.load_task(task_id)
         if existing is not None:
             if existing.status is TaskStatus.SUCCEEDED:
@@ -456,7 +456,7 @@ class DbTaskCatalog:
         prerequisite_declaration: dict[str, Any] | None = None,
     ) -> Evidence | None:
         task_input = {"table": table, "column": column, "max_values": 25}
-        input_hash = _stable_hash(task_input)
+        input_hash = persisted_fingerprint(task_input)
         prerequisite_metadata = _runtime_prerequisite_task_metadata(
             operation,
             parent_task=parent_task,
@@ -465,7 +465,7 @@ class DbTaskCatalog:
             prerequisite_reason=prerequisite_reason,
             prerequisite_declaration=prerequisite_declaration,
         )
-        idempotency_key = _stable_hash(
+        idempotency_key = persisted_fingerprint(
             {
                 "operation_id": operation.id,
                 "capability_id": capability.id,
@@ -474,7 +474,7 @@ class DbTaskCatalog:
                 "column": column,
             }
         )
-        task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
+        task_id = f"db-task-{persisted_fingerprint({'idempotency_key': idempotency_key})[:32]}"
         existing = await self.context.store.load_task(task_id)
         if existing is not None:
             task = await self._merge_runtime_prerequisite_metadata(
@@ -546,7 +546,7 @@ class DbTaskCatalog:
             "source_evidence_id": profile.id,
             "persist": False,
         }
-        input_hash = _stable_hash(task_input)
+        input_hash = persisted_fingerprint(task_input)
         prerequisite_metadata = _runtime_prerequisite_task_metadata(
             operation,
             parent_task=parent_task,
@@ -555,7 +555,7 @@ class DbTaskCatalog:
             prerequisite_reason=prerequisite_reason,
             prerequisite_declaration=prerequisite_declaration,
         )
-        idempotency_key = _stable_hash(
+        idempotency_key = persisted_fingerprint(
             {
                 "operation_id": operation.id,
                 "capability_id": capability.id,
@@ -566,7 +566,7 @@ class DbTaskCatalog:
                 "profile_evidence_id": profile.id,
             }
         )
-        task_id = f"db-task-{_stable_hash({'idempotency_key': idempotency_key})[:32]}"
+        task_id = f"db-task-{persisted_fingerprint({'idempotency_key': idempotency_key})[:32]}"
         existing = await self.context.store.load_task(task_id)
         if existing is not None:
             task = await self._merge_runtime_prerequisite_metadata(

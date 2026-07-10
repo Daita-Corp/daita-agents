@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 from dataclasses import replace
 from typing import Any
 
 from daita.runtime import Evidence
 
+from ..fingerprints import persisted_fingerprint
 from .types import _SourcePreparationSnapshot
 
 
@@ -178,8 +177,7 @@ def _schema_cache_ttl(metadata: dict[str, Any]) -> float | None:
 
 
 def _source_schema_fingerprint(schema: dict[str, Any]) -> str:
-    encoded = json.dumps(schema, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return persisted_fingerprint(schema)
 
 
 def _from_db_options(metadata: dict[str, Any]) -> dict[str, Any]:

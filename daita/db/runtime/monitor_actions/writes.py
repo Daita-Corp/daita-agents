@@ -18,12 +18,12 @@ from daita.runtime import (
 )
 
 from ...analysis import evidence_ref
+from ...fingerprints import persisted_fingerprint
 from ...sql_evidence import (
     blocked_scope_resources,
     effective_source_scope,
     sql_validation_facts_from_evidence,
 )
-from ..analysis import _payload_fingerprint, _stable_hash
 from ..governance import (
     _governance_policy_block_reason,
     _sql_validation_governance_facts,
@@ -136,8 +136,10 @@ class DbRuntimeMonitorActionWritesMixin:
                 reason="write_validation_missing",
             )
         validation_facts = sql_validation_facts_from_evidence(validation_evidence)
-        sql_fingerprint = validation_facts.sql_fingerprint or _stable_hash({"sql": sql})
-        proposal_fingerprint = _stable_hash(
+        sql_fingerprint = validation_facts.sql_fingerprint or persisted_fingerprint(
+            {"sql": sql}
+        )
+        proposal_fingerprint = persisted_fingerprint(
             {
                 "action_plan_fingerprint": action_plan_fingerprint,
                 "sql_fingerprint": sql_fingerprint,
@@ -147,7 +149,7 @@ class DbRuntimeMonitorActionWritesMixin:
         )
         validation_payload_fingerprint = validation_evidence.metadata.get(
             "payload_fingerprint"
-        ) or _payload_fingerprint(validation_evidence.payload)
+        ) or persisted_fingerprint(validation_evidence.payload)
         proposal = await self._persist_monitor_write_proposal(
             operation,
             monitor_id=monitor_id,
@@ -421,7 +423,7 @@ class DbRuntimeMonitorActionWritesMixin:
             "validation_evidence_id": validation_evidence.id,
             "validation_payload_fingerprint": (
                 validation_evidence.metadata.get("payload_fingerprint")
-                or _payload_fingerprint(validation_evidence.payload)
+                or persisted_fingerprint(validation_evidence.payload)
             ),
             "source_evidence_refs": [dict(item) for item in source_evidence_refs],
             "status": status,
@@ -444,7 +446,7 @@ class DbRuntimeMonitorActionWritesMixin:
                 "monitor_action_fingerprint": action_plan_fingerprint,
                 "proposal_fingerprint": proposal_fingerprint,
                 "sql_fingerprint": sql_fingerprint,
-                "payload_fingerprint": _payload_fingerprint(payload),
+                "payload_fingerprint": persisted_fingerprint(payload),
             },
         )
         await self.store.save_evidence(evidence)
@@ -558,7 +560,7 @@ class DbRuntimeMonitorActionWritesMixin:
                 "monitor_action_kind": "write_proposal",
                 "monitor_action_fingerprint": action_plan_fingerprint,
                 "proposal_fingerprint": proposal.payload.get("proposal_fingerprint"),
-                "payload_fingerprint": _payload_fingerprint(payload),
+                "payload_fingerprint": persisted_fingerprint(payload),
             },
         )
         await self.store.save_evidence(evidence)

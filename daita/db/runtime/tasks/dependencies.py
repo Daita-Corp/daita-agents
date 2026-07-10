@@ -11,7 +11,7 @@ from daita.runtime import (
     TaskDependency,
 )
 
-from .common import _payload_fingerprint, _stable_hash
+from ...fingerprints import persisted_fingerprint
 
 
 def _combine_dependencies(
@@ -21,7 +21,7 @@ def _combine_dependencies(
     combined: list[TaskDependency] = []
     seen: set[str] = set()
     for dependency in (*default_dependencies, *spec_dependencies):
-        fingerprint = _stable_hash(dependency.to_dict())
+        fingerprint = persisted_fingerprint(dependency.to_dict())
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
@@ -90,5 +90,5 @@ def _dependency_for_evidence(evidence: Evidence) -> TaskDependency:
         evidence_accepted=True,
         operation_id=evidence.operation_id,
         payload_fingerprint=evidence.metadata.get("payload_fingerprint")
-        or _payload_fingerprint(evidence.payload),
+        or persisted_fingerprint(evidence.payload),
     )

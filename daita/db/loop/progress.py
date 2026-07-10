@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
+from ..fingerprints import persisted_fingerprint
 from ..planner_protocol import DbPlannerDecision
 from ..verification import DB_FINALIZATION_CONTROL_EVIDENCE_KINDS
-from .utils import _stable_hash
 
 
 @dataclass(frozen=True)
@@ -111,7 +111,7 @@ def _compiled_action_fingerprints(
     decision: DbPlannerDecision,
 ) -> tuple[str, ...]:
     return tuple(
-        _stable_hash(
+        persisted_fingerprint(
             {
                 "kind": action.kind.value,
                 "input": action.input,
@@ -124,7 +124,7 @@ def _compiled_action_fingerprints(
 
 
 def _execution_error_fingerprint(error: Mapping[str, Any]) -> str:
-    return _stable_hash(
+    return persisted_fingerprint(
         {
             "capability_id": error.get("capability_id"),
             "error": error.get("error"),

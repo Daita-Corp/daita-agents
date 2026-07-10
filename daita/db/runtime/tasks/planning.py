@@ -8,8 +8,9 @@ from uuid import uuid4
 
 from daita.runtime import Capability, Operation, Task
 
+from ...fingerprints import persisted_fingerprint
 from ...models import DbOperationContract
-from .common import _json_dict, _stable_hash
+from .common import _json_dict
 from .context import DbTaskContext
 from .dependencies import (
     _combine_dependencies,
@@ -96,7 +97,7 @@ def _task_for_capability(
     validation_task: Task | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Task:
-    input_hash = _stable_hash(input)
+    input_hash = persisted_fingerprint(input)
     task = Task(
         id=f"db-task-{uuid4()}",
         operation_id=operation.id,
@@ -110,7 +111,7 @@ def _task_for_capability(
             "reason": reason,
             "sequence": sequence,
             "input_hash": input_hash,
-            "idempotency_key": _stable_hash(
+            "idempotency_key": persisted_fingerprint(
                 {
                     "operation_id": operation.id,
                     "capability_id": capability.id,
@@ -204,8 +205,8 @@ def _task_for_spec(
     contract: DbOperationContract | Mapping[str, Any] | None = None,
     validation_task: Task | None = None,
 ) -> Task:
-    input_hash = _stable_hash(spec.input)
-    idempotency_key = spec.idempotency_key or _stable_hash(
+    input_hash = persisted_fingerprint(spec.input)
+    idempotency_key = spec.idempotency_key or persisted_fingerprint(
         {
             "operation_id": operation.id,
             "capability_id": capability.id,
@@ -215,7 +216,7 @@ def _task_for_spec(
             "deterministic_key": spec.deterministic_key,
         }
     )
-    task_fingerprint = _stable_hash(
+    task_fingerprint = persisted_fingerprint(
         {
             "operation_id": operation.id,
             "idempotency_key": idempotency_key,

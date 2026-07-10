@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
-import hashlib
-import json
 import time
 from typing import Any
 from uuid import uuid4
@@ -26,10 +24,10 @@ from ...analysis import (
     analysis_metadata,
     capability_contract_for_step_kind,
     evidence_ref,
-    stable_fingerprint,
     with_analysis_evidence_trace,
 )
 from ...evidence import DbEvidenceStore
+from ...fingerprints import persisted_fingerprint
 from ...models import (
     DbIntent,
     DbIntentKind,
@@ -56,17 +54,8 @@ def _dependency_for_evidence(evidence: Evidence) -> TaskDependency:
         evidence_accepted=True,
         operation_id=evidence.operation_id,
         payload_fingerprint=evidence.metadata.get("payload_fingerprint")
-        or _payload_fingerprint(evidence.payload),
+        or persisted_fingerprint(evidence.payload),
     )
-
-
-def _stable_hash(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _payload_fingerprint(payload: dict[str, Any]) -> str:
-    return _stable_hash(payload)
 
 
 from .budgets import DbRuntimeAnalysisBudgetMixin
@@ -676,7 +665,7 @@ class DbRuntimeAnalysisMixin(
             dependencies=dependencies,
             sequence=1000 + len(tasks),
             reason="analysis_planning_context",
-            deterministic_key=_stable_hash(
+            deterministic_key=persisted_fingerprint(
                 {
                     "analysis_context": analysis_metadata,
                     "prompt": request.prompt,
@@ -726,7 +715,7 @@ class DbRuntimeAnalysisMixin(
             ),
             sequence=2000 + len(tasks),
             reason="analysis_query_planning",
-            deterministic_key=_stable_hash(
+            deterministic_key=persisted_fingerprint(
                 {
                     "analysis_query_plan": step_metadata,
                     "prompt": request.prompt,
@@ -771,7 +760,7 @@ class DbRuntimeAnalysisMixin(
             ),
             sequence=2100 + len(tasks),
             reason="analysis_query_plan_validation",
-            deterministic_key=_stable_hash(
+            deterministic_key=persisted_fingerprint(
                 {
                     "analysis_query_plan_validation": step_metadata,
                     "plan_evidence_id": plan_evidence.id,
@@ -908,7 +897,7 @@ class DbRuntimeAnalysisMixin(
                     payload_fingerprint=plan_evidence.metadata.get(
                         "payload_fingerprint"
                     )
-                    or _payload_fingerprint(plan_evidence.payload),
+                    or persisted_fingerprint(plan_evidence.payload),
                 ),
             ),
             sequence=101,
@@ -983,7 +972,7 @@ class DbRuntimeAnalysisMixin(
             )
             if validation_capability is None:
                 raise KeyError("db.sql.validate")
-            deterministic_key = _stable_hash(
+            deterministic_key = persisted_fingerprint(
                 {
                     "analysis_validated_read": step_metadata,
                     "query_plan_validation_id": validation.id,
@@ -1011,7 +1000,7 @@ class DbRuntimeAnalysisMixin(
                                 payload_fingerprint=validation.metadata.get(
                                     "payload_fingerprint"
                                 )
-                                or _payload_fingerprint(validation.payload),
+                                or persisted_fingerprint(validation.payload),
                             ),
                         ),
                         metadata=with_analysis_evidence_trace(step_metadata),
@@ -1127,7 +1116,7 @@ class DbRuntimeAnalysisMixin(
             "warnings": list(verification.warnings),
             "missing_evidence": list(verification.missing_evidence),
             "diagnostics": verification.diagnostics,
-            "input_fingerprint": stable_fingerprint(evidence_details),
+            "input_fingerprint": persisted_fingerprint(evidence_details),
             "verified_at": datetime.now(timezone.utc).isoformat(),
         }
         verification_evidence = Evidence(
@@ -1139,7 +1128,7 @@ class DbRuntimeAnalysisMixin(
             payload=payload,
             metadata={
                 **step_metadata,
-                "payload_fingerprint": stable_fingerprint(payload),
+                "payload_fingerprint": persisted_fingerprint(payload),
                 "input_fingerprint": payload["input_fingerprint"],
             },
         )
@@ -1232,7 +1221,7 @@ class DbRuntimeAnalysisMixin(
                     f"analysis context evidence not accepted: {evidence_id}"
                 )
             fingerprint = ref.get("payload_fingerprint")
-            actual = item.metadata.get("payload_fingerprint") or _payload_fingerprint(
+            actual = item.metadata.get("payload_fingerprint") or persisted_fingerprint(
                 item.payload
             )
             if fingerprint is not None and str(fingerprint) != actual:
@@ -1261,7 +1250,7 @@ class DbRuntimeAnalysisMixin(
             sequence=sequence,
             dependencies=dependencies,
             metadata=with_analysis_evidence_trace(metadata),
-            deterministic_key=_stable_hash(
+            deterministic_key=persisted_fingerprint(
                 {
                     "analysis": metadata,
                     "capability_id": capability.id,

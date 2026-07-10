@@ -6,9 +6,9 @@ from typing import Any
 
 from daita.runtime import Operation, Task
 
+from ...fingerprints import persisted_fingerprint
 from ...sql_evidence import blocked_scope_resources, sql_validation_facts_from_evidence
 from .catalog import catalog_executable_input_for_task
-from .common import _payload_fingerprint
 from .context import DbTaskContext
 from .evidence import accepted_evidence_for_dependency, latest_accepted_evidence
 
@@ -73,7 +73,7 @@ async def executable_input_for_task(
         )
         actual_validation_fingerprint = validation.metadata.get(
             "payload_fingerprint"
-        ) or _payload_fingerprint(validation.payload)
+        ) or persisted_fingerprint(validation.payload)
         if (
             proposal is None
             or proposal.payload.get("status") not in {"approval_required", "approved"}

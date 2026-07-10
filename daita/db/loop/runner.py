@@ -13,6 +13,7 @@ from daita.runtime import (
 )
 
 from ..continuation import DbContinuationResolver
+from ..fingerprints import persisted_fingerprint
 from ..models import DbIntentKind
 from ..planner_protocol import (
     DbAgentPlanner,
@@ -70,7 +71,6 @@ from .types import DbActionCompilation, DbLoopResult
 from .utils import (
     _json_dict,
     _optional_string,
-    _stable_hash,
 )
 
 
@@ -606,7 +606,7 @@ class DbAgentLoop:
             payload={
                 "turn": turn,
                 "decision": decision.to_dict(),
-                "fingerprint": _stable_hash(decision.to_dict()),
+                "fingerprint": persisted_fingerprint(decision.to_dict()),
             },
             metadata={"planner_loop": True},
         )
@@ -629,7 +629,7 @@ class DbAgentLoop:
             accepted=not compilation.rejected_action_summaries,
             payload={
                 "turn": turn,
-                "decision_fingerprint": _stable_hash(decision.to_dict()),
+                "decision_fingerprint": persisted_fingerprint(decision.to_dict()),
                 "compilation": compilation.to_dict(),
             },
             metadata={"planner_loop": True},
@@ -701,10 +701,10 @@ class DbAgentLoop:
             after.rejected_evidence,
             include_loop_control=False,
         )
-        decision_fingerprint = _stable_hash(decision.to_dict())
+        decision_fingerprint = persisted_fingerprint(decision.to_dict())
         compiled_action_fingerprints = _compiled_action_fingerprints(decision)
         task_spec_fingerprints = tuple(
-            _stable_hash(spec.to_dict()) for spec in compilation.task_specs
+            persisted_fingerprint(spec.to_dict()) for spec in compilation.task_specs
         )
         execution_error_fingerprints = tuple(
             _execution_error_fingerprint(error) for error in execution_errors
@@ -726,7 +726,7 @@ class DbAgentLoop:
             and not new_rejected
             and not has_useful_error_observation
         )
-        progress_fingerprint = _stable_hash(
+        progress_fingerprint = persisted_fingerprint(
             {
                 "decision_fingerprint": decision_fingerprint,
                 "compiled_action_fingerprints": compiled_action_fingerprints,

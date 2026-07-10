@@ -25,10 +25,10 @@ from daita.runtime import (
 from daita.runtime import Evidence
 from daita.runtime import GovernanceResult, PolicyEffect
 
+from ..fingerprints import persisted_fingerprint
 from ..governance import default_db_policies
 from ..models import DbOperationContract, DbRuntimeConfig
 from .resume import _db_contract_from_context, _operation_has_run_context
-from .tasks.common import _stable_hash
 from .tasks.runtime import DbTaskRuntime
 from .types import _GovernancePersistence, _MonitorEffectGovernanceDecision
 
@@ -750,7 +750,7 @@ def _request_summary(request: dict[str, Any]) -> dict[str, Any]:
     metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     return {
         "has_prompt": bool(prompt),
-        "prompt_hash": _stable_hash(prompt) if prompt else None,
+        "prompt_hash": persisted_fingerprint(prompt) if prompt else None,
         "user_id": request.get("user_id"),
         "session_id": request.get("session_id"),
         "source_scope": list(_source_scope_from_value(request.get("source_scope"))),
@@ -773,10 +773,10 @@ def _task_input_summary(input: dict[str, Any]) -> dict[str, Any]:
     query = input.get("query")
     return {
         "keys": sorted(str(key) for key in input),
-        "input_hash": input.get("input_hash") or _stable_hash(input),
-        "sql_hash": _stable_hash(sql) if sql else None,
-        "prompt_hash": _stable_hash(prompt) if prompt else None,
-        "query_hash": _stable_hash(query) if query else None,
+        "input_hash": input.get("input_hash") or persisted_fingerprint(input),
+        "sql_hash": persisted_fingerprint(sql) if sql else None,
+        "prompt_hash": persisted_fingerprint(prompt) if prompt else None,
+        "query_hash": persisted_fingerprint(query) if query else None,
         "sql_ref": input.get("sql_ref"),
         "validated_evidence_id": input.get("validated_evidence_id"),
         "operation": input.get("operation"),

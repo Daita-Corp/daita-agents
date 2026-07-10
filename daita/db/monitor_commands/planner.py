@@ -5,13 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-import hashlib
-import json
 import re
 from typing import Any
 
 from daita.plugins import ExtensionRegistry
 
+from ..fingerprints import persisted_fingerprint
 from ..monitor_plugin_planning import (
     MonitorPluginPlanner,
     MonitorPluginPlanningBlocked,
@@ -993,8 +992,7 @@ def _stable_monitor_payload_hash(payload: dict[str, Any]) -> str:
         for key, value in payload.items()
         if key not in {"proposal_fingerprint"}
     }
-    encoded = json.dumps(cleaned, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return persisted_fingerprint(cleaned)
 
 
 def _now_iso() -> str:

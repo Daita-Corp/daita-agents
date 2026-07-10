@@ -8,8 +8,8 @@ from uuid import uuid4
 
 from daita.runtime import Evidence, Operation, Task
 
-from ...analysis import stable_fingerprint
 from ...evidence import load_evidence
+from ...fingerprints import persisted_fingerprint
 from ...monitor_commands.planner import (
     DbMonitorPlanner,
     _monitor_from_proposal,
@@ -98,7 +98,7 @@ class DbMonitorPlanCreateExecutor:
         else:
             proposal, validation = _blocked_structured_input_required(task_input)
         fingerprint = str(
-            proposal.get("proposal_fingerprint") or stable_fingerprint(proposal)
+            proposal.get("proposal_fingerprint") or persisted_fingerprint(proposal)
         )
         proposal.setdefault("proposal_fingerprint", fingerprint)
         proposal.setdefault("kind", "monitor.proposal")
@@ -191,7 +191,7 @@ def _blocked_structured_input_required(
         },
         "validation": validation.to_dict(),
     }
-    proposal["proposal_fingerprint"] = stable_fingerprint(proposal)
+    proposal["proposal_fingerprint"] = persisted_fingerprint(proposal)
     proposal["metadata"]["proposal_fingerprint"] = proposal["proposal_fingerprint"]
     return proposal, validation
 
@@ -242,9 +242,9 @@ class DbMonitorCommitCreateExecutor:
             raise RuntimeError("monitor proposal evidence was not accepted")
         proposal = dict(proposal_evidence.payload)
         expected_fingerprint = task.input.get("proposal_fingerprint")
-        actual_fingerprint = proposal.get("proposal_fingerprint") or stable_fingerprint(
-            proposal
-        )
+        actual_fingerprint = proposal.get(
+            "proposal_fingerprint"
+        ) or persisted_fingerprint(proposal)
         if expected_fingerprint and expected_fingerprint != actual_fingerprint:
             raise RuntimeError("monitor proposal fingerprint mismatch")
 

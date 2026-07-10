@@ -7,8 +7,9 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation, Task, TaskDependency, TaskStatus
 
-from ...analysis import stable_fingerprint, structural_schema_fingerprint
+from ...analysis import structural_schema_fingerprint
 from ...evidence import load_evidence
+from ...fingerprints import persisted_fingerprint
 from ...memory import (
     db_memory_options_from_runtime_metadata,
     db_memory_record_chunk_ids_by_key,
@@ -73,7 +74,7 @@ class DbMemoryPlanUpdateExecutor:
                 }
             )
             proposal["validation"] = validation_payload
-            proposal["proposal_fingerprint"] = stable_fingerprint(
+            proposal["proposal_fingerprint"] = persisted_fingerprint(
                 {
                     key: value
                     for key, value in proposal.items()
@@ -133,8 +134,8 @@ class DbMemoryCommitUpdateExecutor:
         expected_fingerprint = task.input.get("proposal_fingerprint")
         actual_fingerprint = str(proposal.get("proposal_fingerprint") or "")
         if not actual_fingerprint:
-            actual_fingerprint = stable_fingerprint(proposal)
-        recomputed_fingerprint = stable_fingerprint(
+            actual_fingerprint = persisted_fingerprint(proposal)
+        recomputed_fingerprint = persisted_fingerprint(
             {
                 key: value
                 for key, value in proposal.items()
@@ -235,7 +236,7 @@ class DbMemoryCommitUpdateExecutor:
             accepted=write_success,
             payload=definition_payload,
             metadata={
-                "payload_fingerprint": stable_fingerprint(definition_payload),
+                "payload_fingerprint": persisted_fingerprint(definition_payload),
                 "proposal_evidence_id": proposal_evidence.id,
                 "proposal_fingerprint": actual_fingerprint,
                 "source_identity": proposal_source_identity,
@@ -314,7 +315,7 @@ async def _annotate_duplicate_behavior(runtime: Any, proposal: dict[str, Any]) -
         proposal["existing_chunk_ids"] = list(existing_chunk_ids)
         proposal["commit_behavior"] = "update" if existing_chunk_ids else "create"
         accepted = True
-    proposal["proposal_fingerprint"] = stable_fingerprint(
+    proposal["proposal_fingerprint"] = persisted_fingerprint(
         {key: value for key, value in proposal.items() if key != "proposal_fingerprint"}
     )
     return accepted

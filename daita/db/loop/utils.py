@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from typing import Any, Iterable, Mapping
 
@@ -134,11 +133,6 @@ def _ordered_unique_strings(values: Iterable[str]) -> list[str]:
         seen.add(value)
         out.append(value)
     return out
-
-
-def _stable_hash(value: Mapping[str, Any]) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _json_dict(value: Mapping[str, Any] | None) -> dict[str, Any]:

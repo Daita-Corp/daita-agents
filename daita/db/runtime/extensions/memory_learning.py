@@ -10,7 +10,8 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation, Task
 
-from ...analysis import stable_fingerprint, structural_schema_fingerprint
+from ...analysis import structural_schema_fingerprint
+from ...fingerprints import persisted_fingerprint
 from ...memory import (
     DB_MEMORY_SEMANTIC_CONTRACT_KEY,
     DBMemoryRecord,
@@ -108,7 +109,7 @@ class DbMemoryLearningEnqueueExecutor:
                             "worker_id": "db.memory.learner",
                             "worker_owner": "db_runtime",
                         },
-                        idempotency_key=stable_fingerprint(
+                        idempotency_key=persisted_fingerprint(
                             {
                                 "source_operation_id": source_operation_id,
                                 "source_identity": source_identity,
@@ -139,7 +140,7 @@ class DbMemoryLearningEnqueueExecutor:
                 task_id=task.id,
                 payload=payload,
                 metadata={
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                     "source_operation_id": source_operation_id,
                     "source_identity": source_identity,
                     "learning_mode": learning_mode,
@@ -195,7 +196,7 @@ class DbMemoryLearningRunExecutor:
                         "candidate_kind": candidate.kind,
                         "source_operation_id": source_operation_id,
                         "source_identity": candidate.source_identity,
-                        "payload_fingerprint": stable_fingerprint(candidate_payload),
+                        "payload_fingerprint": persisted_fingerprint(candidate_payload),
                     },
                 )
             )
@@ -604,7 +605,7 @@ async def _write_candidate(
                     "candidate_key": candidate.key,
                     "candidate_kind": candidate.kind,
                 },
-                deterministic_key=stable_fingerprint(
+                deterministic_key=persisted_fingerprint(
                     {
                         "source_operation_id": candidate.source_operation_id,
                         "source_identity": candidate.source_identity,
@@ -667,7 +668,7 @@ def _promotion_evidence(
             "candidate_key": candidate.key,
             "source_operation_id": candidate.source_operation_id,
             "source_identity": candidate.source_identity,
-            "payload_fingerprint": stable_fingerprint(payload),
+            "payload_fingerprint": persisted_fingerprint(payload),
         },
     )
 
@@ -699,7 +700,7 @@ def _rejection_evidence(
             "candidate_key": candidate.key,
             "source_operation_id": candidate.source_operation_id,
             "source_identity": candidate.source_identity,
-            "payload_fingerprint": stable_fingerprint(payload),
+            "payload_fingerprint": persisted_fingerprint(payload),
         },
     )
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import hashlib
 import json
 import re
 from typing import Any, Iterable, Mapping
@@ -17,6 +16,7 @@ from daita.runtime import (
     TaskStatus,
 )
 
+from .fingerprints import persisted_fingerprint, text_fingerprint
 from .models import DbRequest
 from .sql_analysis import SqlAnalysisError, analyze_sql
 
@@ -56,7 +56,7 @@ class DbSessionOperationRef:
             "monitor_id": self.monitor_id,
         }
         if self.prompt:
-            result["prompt_fingerprint"] = _fingerprint_text(self.prompt)
+            result["prompt_fingerprint"] = text_fingerprint(self.prompt)
         return result
 
     @classmethod
@@ -510,7 +510,7 @@ def session_query_scope_evidence_for(
     refs = _query_scope_source_refs(evidence_tuple)
     if refs:
         payload["source_evidence_refs"] = refs
-    scope_fingerprint = _fingerprint_value(
+    scope_fingerprint = persisted_fingerprint(
         {
             "operation_id": operation.id,
             "tables": payload.get("tables") or [],
@@ -524,7 +524,7 @@ def session_query_scope_evidence_for(
     payload.setdefault("scope_id", f"session-scope-{scope_fingerprint[:16]}")
     payload["scope_fingerprint"] = scope_fingerprint
     payload.setdefault("version", 1)
-    payload_fingerprint = _fingerprint_value(payload)
+    payload_fingerprint = persisted_fingerprint(payload)
     return Evidence(
         id=f"evidence-{payload_fingerprint}",
         kind="session.query_scope",
@@ -714,7 +714,7 @@ def session_scope_binding_evidence_for(
             for key, value in explicit.items()
             if key in {"binding_status", "status", "reason", "confidence"}
         }
-    binding_fingerprint = _fingerprint_value(
+    binding_fingerprint = persisted_fingerprint(
         {
             "operation_id": operation.id,
             "source_scope_id": payload.get("source_scope_id"),
@@ -725,7 +725,7 @@ def session_scope_binding_evidence_for(
         }
     )
     payload["binding_fingerprint"] = binding_fingerprint
-    payload_fingerprint = _fingerprint_value(payload)
+    payload_fingerprint = persisted_fingerprint(payload)
     return Evidence(
         id=f"evidence-{payload_fingerprint}",
         kind="session.scope_binding",
@@ -966,7 +966,7 @@ def _query_scope_from_evidence(
         "source_scope": list(source_scope.values),
         "schema_fingerprint": schema_fingerprint,
     }
-    scope_id = f"session-scope-{_fingerprint_value(scope_payload)[:16]}"
+    scope_id = f"session-scope-{persisted_fingerprint(scope_payload)[:16]}"
     return DbSessionQueryScope(
         operation_id=operation_id,
         scope_id=scope_id,
@@ -1228,7 +1228,7 @@ def _query_scope_source_refs(evidence: tuple[Evidence, ...]) -> list[dict[str, A
                 "kind": item.kind,
                 "owner": item.owner,
                 "payload_fingerprint": item.metadata.get("payload_fingerprint")
-                or _fingerprint_value(item.payload),
+                or persisted_fingerprint(item.payload),
             }
         )
     return refs
@@ -1534,15 +1534,6 @@ def _clip(value: str, max_chars: int) -> str:
     if len(value) <= max_chars:
         return value
     return value[: max_chars - 3] + "..."
-
-
-def _fingerprint_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def _fingerprint_value(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 class _OrderedStrings:

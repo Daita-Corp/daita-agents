@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-import hashlib
 import json
 from typing import Any
 
@@ -20,6 +19,7 @@ from .context_projection import (
     project_policy_summary,
     project_session_context,
 )
+from .fingerprints import persisted_fingerprint
 from .memory import (
     db_memory_options_from_from_db_options,
     db_memory_refs_from_recall_evidence,
@@ -179,7 +179,8 @@ class DbPlanningContextBuilder:
         source_refs = tuple(_evidence_ref(item) for item in source_evidence)
         source_fingerprints = {
             str(item.id): str(
-                item.metadata.get("payload_fingerprint") or _fingerprint(item.payload)
+                item.metadata.get("payload_fingerprint")
+                or persisted_fingerprint(item.payload)
             )
             for item in source_evidence
             if item.id
@@ -402,7 +403,7 @@ class DbPlanningContextBuilder:
             payload=context.to_payload(),
             metadata={
                 "schema_fingerprint": context.schema_fingerprint,
-                "payload_fingerprint": _fingerprint(context.to_payload()),
+                "payload_fingerprint": persisted_fingerprint(context.to_payload()),
             },
         )
 
@@ -825,7 +826,7 @@ def _relationship_evidence_details(
                 "task_id": evidence.task_id,
                 "accepted": evidence.accepted,
                 "payload_fingerprint": evidence.metadata.get("payload_fingerprint")
-                or _fingerprint(evidence.payload),
+                or persisted_fingerprint(evidence.payload),
                 "reachable": evidence.payload.get("reachable"),
                 "paths": [
                     {
@@ -848,7 +849,7 @@ def _dedupe_evidence(values: Iterable[Evidence]) -> tuple[Evidence, ...]:
     seen: set[str] = set()
     out: list[Evidence] = []
     for evidence in values:
-        key = evidence.id or _fingerprint(
+        key = evidence.id or persisted_fingerprint(
             {
                 "kind": evidence.kind,
                 "owner": evidence.owner,
@@ -1141,7 +1142,7 @@ def _evidence_ref(evidence: Evidence) -> dict[str, Any]:
         "owner": evidence.owner,
         "task_id": evidence.task_id,
         "payload_fingerprint": evidence.metadata.get("payload_fingerprint")
-        or _fingerprint(evidence.payload),
+        or persisted_fingerprint(evidence.payload),
     }
 
 
@@ -1152,8 +1153,8 @@ def _artifact_evidence(
     task_id: str | None,
     payload: dict[str, Any],
 ) -> Evidence:
-    payload_fingerprint = _fingerprint(payload)
-    evidence_id = _fingerprint(
+    payload_fingerprint = persisted_fingerprint(payload)
+    evidence_id = persisted_fingerprint(
         {
             "operation_id": operation_id,
             "task_id": task_id,
@@ -1170,11 +1171,6 @@ def _artifact_evidence(
         payload=payload,
         metadata={"payload_fingerprint": payload_fingerprint},
     )
-
-
-def _fingerprint(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _from_db_options(metadata: dict[str, Any]) -> dict[str, Any]:

@@ -7,8 +7,8 @@ from uuid import uuid4
 
 from daita.runtime import Evidence, Operation, Task, TaskDependency
 
+from ...fingerprints import persisted_fingerprint
 from ...models import DbIntent, DbIntentKind
-from .common import _stable_hash
 from .context import DbTaskContext
 from .dependencies import _dependency_for_evidence
 from .evidence import latest_accepted_evidence
@@ -65,7 +65,7 @@ async def execute_answer_synthesis(
             context.config.metadata, "synthesis_context_char_budget", 16000
         ),
     }
-    input_hash = _stable_hash(task_input)
+    input_hash = persisted_fingerprint(task_input)
     task = Task(
         id=f"db-task-{uuid4()}",
         operation_id=operation.id,
@@ -79,7 +79,7 @@ async def execute_answer_synthesis(
             "reason": "answer_synthesis",
             "sequence": 10_000,
             "input_hash": input_hash,
-            "idempotency_key": _stable_hash(
+            "idempotency_key": persisted_fingerprint(
                 {
                     "operation_id": operation.id,
                     "capability_id": capability.id,

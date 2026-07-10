@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import date
 import hashlib
 import hmac
 import json
 
 import pytest
 
-from daita.db.fingerprints import sensitive_fingerprint, stable_fingerprint
+from daita.db.fingerprints import (
+    persisted_fingerprint,
+    sensitive_fingerprint,
+    stable_fingerprint,
+    text_fingerprint,
+)
 from daita.db.models import (
     DbIntent,
     DbIntentKind,
@@ -205,6 +211,22 @@ def test_canonical_fingerprints_are_deterministic_and_keyed():
     assert sensitive_fingerprint(first, _AUDIT_KEY) != sensitive_fingerprint(
         first,
         _OTHER_AUDIT_KEY,
+    )
+
+
+def test_persisted_fingerprint_preserves_existing_json_bytes_and_output_length():
+    value = {"b": [2, 1], "a": "é", "when": date(2026, 7, 10)}
+
+    assert persisted_fingerprint(value) == (
+        "66a71663afeefcfed0da86e82fa140c4c05141eac62bb3e85cdd4f914007cfa5"
+    )
+    assert len(persisted_fingerprint(value)) == 64
+    assert persisted_fingerprint(value) != stable_fingerprint(value)
+
+
+def test_text_fingerprint_preserves_utf8_sha256_contract():
+    assert text_fingerprint("Résumé Δ") == (
+        "a4d22a0950287fec8f740ab132168b47d07b8e3fd5488d0a71775b1ee8da88bf"
     )
 
 

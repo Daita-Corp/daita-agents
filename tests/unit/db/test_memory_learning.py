@@ -9,7 +9,7 @@ from daita.db import (
     DbRuntime,
     DbRuntimeConfig,
 )
-from daita.db.analysis import stable_fingerprint
+from daita.db.fingerprints import persisted_fingerprint
 from daita.plugins.memory.memory_plugin import MemoryPlugin
 from daita.runtime import (
     AccessMode,
@@ -94,7 +94,7 @@ def _schema_evidence(
         accepted=True,
         payload=schema,
         metadata={
-            "payload_fingerprint": stable_fingerprint(schema),
+            "payload_fingerprint": persisted_fingerprint(schema),
             **({"source_identity": source_identity} if source_identity else {}),
         },
     )

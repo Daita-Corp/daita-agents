@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from daita.db import DbRequest, DbRuntime, DbRuntimeConfig
-from daita.db.analysis import stable_fingerprint
+from daita.db.fingerprints import persisted_fingerprint
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
 from daita.plugins.memory.memory_plugin import MemoryPlugin
 from daita.runtime import (
@@ -185,7 +185,7 @@ def _proposal_evidence(operation_id: str, *, source_identity: str) -> Evidence:
         "record": record,
         "validation": {"accepted": True, "status": "accepted", "reasons": []},
     }
-    payload["proposal_fingerprint"] = stable_fingerprint(payload)
+    payload["proposal_fingerprint"] = persisted_fingerprint(payload)
     return Evidence(
         id=f"proposal-{source_identity}",
         kind="db.memory.proposal",

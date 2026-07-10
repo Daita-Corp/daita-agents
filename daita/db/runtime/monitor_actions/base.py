@@ -7,7 +7,7 @@ from typing import Any
 
 from daita.runtime import AccessMode, Operation, OperationStatus
 
-from ...analysis import stable_fingerprint
+from ...fingerprints import persisted_fingerprint
 from ...models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
 from ..monitor_helpers import _normalize_monitor_action_plan
 from ..resume import (
@@ -50,7 +50,7 @@ class DbRuntimeMonitorActionsMixin(
             action_plan,
             operation_id=operation_id,
         )
-        fingerprint = stable_fingerprint(normalized)
+        fingerprint = persisted_fingerprint(normalized)
         operation = await self._prepare_monitor_action_operation(
             operation,
             monitor_id=monitor_id,

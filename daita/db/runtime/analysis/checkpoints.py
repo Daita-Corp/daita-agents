@@ -8,7 +8,7 @@ from daita.runtime import Evidence, GovernanceResult, Operation, Task, TaskDepen
 
 from ...analysis import analysis_metadata
 from ...evidence import DbEvidenceStore
-from .materialization import _payload_fingerprint
+from ...fingerprints import persisted_fingerprint
 
 
 class DbRuntimeAnalysisCheckpointMixin:
@@ -38,7 +38,7 @@ class DbRuntimeAnalysisCheckpointMixin:
                 evidence_accepted=item.accepted,
                 operation_id=item.operation_id,
                 payload_fingerprint=item.metadata.get("payload_fingerprint")
-                or _payload_fingerprint(item.payload),
+                or persisted_fingerprint(item.payload),
             )
             for item in cited_evidence
             if item.id

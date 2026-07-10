@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping
 
+from ..fingerprints import persisted_fingerprint
 from ..planner_protocol import DbLoopState, DbPlannerAction, DbPlannerActionKind
 from .contracts import _state_allows_read_profile
 from .memory import _single_source_owner_for_state
@@ -17,7 +18,6 @@ from .utils import (
     _safe_iterable,
     _safe_string_list,
     _split_column_ref,
-    _stable_hash,
 )
 
 _CATALOG_COLUMN_VALUE_GROUNDING_REASON = "catalog_column_value_grounding"
@@ -300,7 +300,7 @@ def _validation_grounding_repair_context(
     target_refs = [f"{target['table']}.{target['column']}" for target in targets]
     satisfied_refs = _state_column_value_hint_refs(state)
     missing_refs = [ref for ref in target_refs if ref.lower() not in satisfied_refs]
-    fingerprint = _stable_hash(
+    fingerprint = persisted_fingerprint(
         {
             "operation_id": state.operation_id,
             "targets": targets,
@@ -512,12 +512,10 @@ def _runtime_validation_grounding_action_id(
         "fingerprint": fingerprint,
         "target_refs": list(repair_context.get("target_refs") or ()),
     }
-    action_id = f"runtime_validation_grounding_{_stable_hash(seed)[:12]}"
+    action_id = f"runtime_validation_grounding_{persisted_fingerprint(seed)[:12]}"
     if action_id not in current_action_ids:
         return action_id
-    return (
-        f"{action_id}_{_stable_hash({'existing_ids': sorted(current_action_ids)})[:8]}"
-    )
+    return f"{action_id}_{persisted_fingerprint({'existing_ids': sorted(current_action_ids)})[:8]}"
 
 
 def _validation_grounding_context_refresh_exhausted(

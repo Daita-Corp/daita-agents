@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from typing import Any, Iterable
 
+from .fingerprints import persisted_fingerprint
 from .planning_context import planner_eligible_column_value_hint
 from .query_plan import DbQueryPlan, DbQueryPlanValidation
 from .query_sql_validation import sql_fingerprint
@@ -215,7 +215,7 @@ class DbQueryPlanValidator:
             validation_facts.extend(relationship_facts)
         catalog_relationship_validation.update(relationship_metadata)
 
-        fingerprint = _fingerprint(plan.to_dict())
+        fingerprint = persisted_fingerprint(plan.to_dict())
         return DbQueryPlanValidation(
             valid=not errors,
             accepted_sql=sql if not errors else None,
@@ -1291,11 +1291,6 @@ def _normalized_sql_text(sql: str) -> str:
 
 def _memory_key(contract: dict[str, Any]) -> str:
     return str(contract.get("memory_key") or contract.get("key") or "db_memory")
-
-
-def _fingerprint(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _dedupe_validation_facts(

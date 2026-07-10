@@ -9,6 +9,7 @@ from typing import Any, Mapping
 from daita.runtime import Evidence, Operation, Task
 
 from .evidence import load_evidence
+from .fingerprints import persisted_fingerprint
 from .query_plan import DbQueryPlan
 from .query_sql_validation import sql_fingerprint
 
@@ -466,7 +467,7 @@ def _plan_payload(
         "planning_context_evidence_id": planning_context.id,
         "planning_context_refs": [planning_context.id] if planning_context.id else [],
         "schema_fingerprint": planning_context.payload.get("schema_fingerprint"),
-        "plan_fingerprint": _fingerprint(plan_dict),
+        "plan_fingerprint": persisted_fingerprint(plan_dict),
         "sql_fingerprint": (
             sql_fingerprint(plan.selected_sql) if plan.selected_sql else None
         ),
@@ -559,10 +560,3 @@ def _same_sql(left: str | None, right: str | None) -> bool:
     if not left or not right:
         return False
     return sql_fingerprint(left) == sql_fingerprint(right)
-
-
-def _fingerprint(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    import hashlib
-
-    return hashlib.sha256(encoded).hexdigest()

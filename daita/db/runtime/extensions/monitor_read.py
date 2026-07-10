@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation, Task
 
-from ...analysis import stable_fingerprint
+from ...fingerprints import persisted_fingerprint
 from ...monitor_commands.resolver import DbMonitorResolver
 from ...monitor_commands.types import DbMonitorCommand, DbMonitorResolution
 
@@ -215,7 +215,7 @@ def _monitor_evidence(
         task_id=task.id,
         accepted=accepted,
         payload=payload,
-        metadata={"payload_fingerprint": stable_fingerprint(payload)},
+        metadata={"payload_fingerprint": persisted_fingerprint(payload)},
     )
 
 

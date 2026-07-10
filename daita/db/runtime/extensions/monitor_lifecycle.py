@@ -7,8 +7,8 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation, Task
 
-from ...analysis import stable_fingerprint
 from ...evidence import load_evidence
+from ...fingerprints import persisted_fingerprint
 from ...monitor_commands.types import DbMonitorValidation
 from ...monitors import (
     DbMonitor,
@@ -91,7 +91,7 @@ class DbMonitorPlanLifecycleExecutor:
             "paused_until": paused_until,
             "validation": validation.to_dict(),
         }
-        fingerprint = stable_fingerprint(proposal)
+        fingerprint = persisted_fingerprint(proposal)
         proposal["proposal_fingerprint"] = fingerprint
         return [
             Evidence(
@@ -139,9 +139,9 @@ class DbMonitorCommitLifecycleExecutor:
             raise RuntimeError("monitor lifecycle proposal evidence was not accepted")
         proposal = dict(proposal_evidence.payload)
         expected_fingerprint = task.input.get("proposal_fingerprint")
-        actual_fingerprint = proposal.get("proposal_fingerprint") or stable_fingerprint(
-            proposal
-        )
+        actual_fingerprint = proposal.get(
+            "proposal_fingerprint"
+        ) or persisted_fingerprint(proposal)
         if expected_fingerprint and expected_fingerprint != actual_fingerprint:
             raise RuntimeError("monitor lifecycle proposal fingerprint mismatch")
 
@@ -300,7 +300,7 @@ class DbMonitorLocalDeliveryExecutor:
                     "monitor_report_fingerprint": payload["report_fingerprint"],
                     "monitor_action_fingerprint": payload["action_plan_fingerprint"],
                     "idempotency_key": payload["idempotency_key"],
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                 },
             )
         ]

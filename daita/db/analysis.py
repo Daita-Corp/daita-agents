@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from daita.runtime import Evidence
 
+from .fingerprints import persisted_fingerprint
 from .json_normalization import strip_json_fence
 
 CAPABILITY_ANALYSIS_STEP_CONTRACTS = {
@@ -331,7 +332,7 @@ def validate_analysis_plan_payload(
         errors=tuple(dict.fromkeys(errors)),
         warnings=tuple(warnings),
         accepted_step_ids=tuple(ids) if not errors else (),
-        plan_fingerprint=stable_fingerprint(plan.to_dict()),
+        plan_fingerprint=persisted_fingerprint(plan.to_dict()),
         diagnostics={
             "step_count": len(plan.steps),
             "query_step_count": query_count,
@@ -401,18 +402,11 @@ def _registered_capability_ids(
     return ids
 
 
-def stable_fingerprint(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    import hashlib
-
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def structural_schema_fingerprint(schema: Mapping[str, Any] | None) -> str | None:
     """Fingerprint catalog-owned schema structure without incidental metadata."""
     if not schema:
         return None
-    return stable_fingerprint(_structural_schema_payload(schema))
+    return persisted_fingerprint(_structural_schema_payload(schema))
 
 
 def _structural_schema_payload(schema: Mapping[str, Any]) -> dict[str, Any]:
@@ -522,7 +516,7 @@ def evidence_ref(evidence: Evidence) -> dict[str, Any]:
         "task_id": evidence.task_id,
         "operation_id": evidence.operation_id,
         "payload_fingerprint": evidence.metadata.get("payload_fingerprint")
-        or stable_fingerprint(evidence.payload),
+        or persisted_fingerprint(evidence.payload),
         "analysis_step_id": evidence.metadata.get("analysis_step_id"),
         "analysis_step_kind": evidence.metadata.get("analysis_step_kind"),
     }

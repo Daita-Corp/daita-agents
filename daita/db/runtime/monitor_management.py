@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-import hashlib
-import json
 from typing import Any
 from uuid import uuid4
 
@@ -22,6 +20,7 @@ from daita.runtime import (
     TaskDependency,
 )
 
+from ..fingerprints import persisted_fingerprint
 from ..models import (
     DbIntent,
     DbIntentKind,
@@ -267,7 +266,7 @@ class DbRuntimeMonitorManagementMixin:
                     },
                     reason=f"monitor_{action}_planning",
                     sequence=1,
-                    idempotency_key=_stable_monitor_lifecycle_hash(
+                    idempotency_key=persisted_fingerprint(
                         {
                             "operation_type": operation_type,
                             "monitor_id": monitor_id,
@@ -669,11 +668,6 @@ def _monitor_lifecycle_answer(action: str, monitor_id: str) -> str:
         "disable": "Disabled",
     }.get(action, "Updated")
     return f"{verb} monitor {monitor_id}."
-
-
-def _stable_monitor_lifecycle_hash(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _non_executable_observation_plan_reason(plan: dict[str, Any]) -> str | None:

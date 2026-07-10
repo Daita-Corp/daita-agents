@@ -7,12 +7,13 @@ from typing import Any, Mapping
 
 from daita.runtime import TaskDependency
 
+from ..fingerprints import persisted_fingerprint
 from ..planner_protocol import DbLoopState, DbPlannerAction
 from ..runtime.tasks.models import DbTaskSpec
 from .actions import _action_error, _merge_dependencies
 from .summaries import _latest_accepted_evidence_summary
 from .types import _ResolvedSqlInput
-from .utils import _optional_string, _stable_hash
+from .utils import _optional_string
 
 
 def _resolve_sql_input_for_action(
@@ -137,7 +138,7 @@ def _normalized_sql_input(sql: str) -> str:
 
 
 def _sql_input_fingerprint(sql: str) -> str:
-    return _stable_hash({"sql": sql})
+    return persisted_fingerprint({"sql": sql})
 
 
 def _validated_sql_execute_input(
@@ -152,7 +153,9 @@ def _validated_sql_execute_input(
     }
     if validation_spec is not None:
         execute_input["sql_validation_task_id"] = validation_spec.task_id
-        execute_input["sql_validation_input_hash"] = _stable_hash(validation_spec.input)
+        execute_input["sql_validation_input_hash"] = persisted_fingerprint(
+            validation_spec.input
+        )
     if resolved_sql.sql_validation_dependency is not None:
         dependency = resolved_sql.sql_validation_dependency
         if dependency.evidence_id:
@@ -213,7 +216,7 @@ def _validated_sql_execute_dependencies(
                 producer_capability_id=validation_spec.capability_id,
                 evidence_accepted=True,
                 evidence_payload={"valid": True},
-                input_hash=_stable_hash(validation_spec.input),
+                input_hash=persisted_fingerprint(validation_spec.input),
                 operation_id=operation_id,
                 metadata={
                     "sql_resolution": True,
@@ -235,7 +238,7 @@ def _validated_sql_execute_deterministic_key(
         "input": execute_input,
         "dependencies": [dependency.to_dict() for dependency in dependencies],
     }
-    return f"{action.action_id}:{execute_capability_id}:{_stable_hash(identity)[:16]}"
+    return f"{action.action_id}:{execute_capability_id}:{persisted_fingerprint(identity)[:16]}"
 
 
 def _resolve_sql_from_plan_evidence_id(
@@ -494,7 +497,7 @@ def _accepted_plan_validation_dependency_for_plan(
 def _sql_provenance_metadata(resolved: _ResolvedSqlInput) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "provenance": resolved.provenance,
-        "sql_fingerprint": _stable_hash({"sql": resolved.sql}),
+        "sql_fingerprint": persisted_fingerprint({"sql": resolved.sql}),
     }
     if resolved.source_evidence_id is not None:
         metadata["source_evidence_id"] = resolved.source_evidence_id

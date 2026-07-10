@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation
 
+from ..fingerprints import persisted_fingerprint
 from ..memory import (
     db_memory_options_from_runtime_metadata,
     db_memory_planning_recall_decision,
@@ -14,7 +15,7 @@ from ..models import DbIntentKind
 from ..planner_protocol import DbLoopState, DbPlannerAction, DbPlannerActionKind
 from .actions import _summary_id
 from .summaries import _state_has_accepted_evidence
-from .utils import _float_option, _stable_hash, _string_list
+from .utils import _float_option, _string_list
 
 
 def _memory_context_for_state(
@@ -300,12 +301,10 @@ def _runtime_memory_commit_action_id(
         seed = {
             "candidate_ids": [_summary_id(proposal) for proposal in proposals],
         }
-    action_id = f"runtime_memory_commit_{_stable_hash(seed)[:12]}"
+    action_id = f"runtime_memory_commit_{persisted_fingerprint(seed)[:12]}"
     if action_id not in current_action_ids:
         return action_id
-    return (
-        f"{action_id}_{_stable_hash({'existing_ids': sorted(current_action_ids)})[:8]}"
-    )
+    return f"{action_id}_{persisted_fingerprint({'existing_ids': sorted(current_action_ids)})[:8]}"
 
 
 def _resolve_memory_proposal_for_action(

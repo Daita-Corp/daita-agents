@@ -6,7 +6,7 @@ from typing import Any
 
 from daita.runtime import Operation, OperationStatus
 
-from ..analysis import stable_fingerprint
+from ..fingerprints import persisted_fingerprint
 from ..memory import db_memory_options_from_runtime_metadata
 from ..models import DbOperationResult
 from .tasks.models import DbTaskSpec
@@ -154,7 +154,7 @@ def _schema_fingerprint_from_result(result: DbOperationResult) -> str | None:
                     return str(value)
     for evidence in result.evidence:
         if evidence.kind in {"schema.asset_profile", "catalog.source"}:
-            return stable_fingerprint(evidence.payload)
+            return persisted_fingerprint(evidence.payload)
     return None
 
 

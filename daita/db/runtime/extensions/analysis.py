@@ -14,10 +14,10 @@ from ...analysis import (
     analysis_metadata,
     evidence_ref,
     parse_analysis_plan_json,
-    stable_fingerprint,
     validate_analysis_plan_payload,
 )
 from ...evidence import load_evidence
+from ...fingerprints import persisted_fingerprint
 
 
 async def _analysis_context_ref_errors(
@@ -53,9 +53,9 @@ async def _analysis_context_ref_errors(
                 )
                 continue
             fingerprint = ref.get("payload_fingerprint")
-            actual = evidence.metadata.get("payload_fingerprint") or stable_fingerprint(
-                evidence.payload
-            )
+            actual = evidence.metadata.get(
+                "payload_fingerprint"
+            ) or persisted_fingerprint(evidence.payload)
             if fingerprint is not None and str(fingerprint) != actual:
                 errors.append(
                     f"context_evidence_fingerprint_mismatch:{step_id}:{evidence_id}"
@@ -187,7 +187,7 @@ class DbAnalysisPlanExecutor:
                         plan_evidence_id=evidence_id,
                         phase="plan",
                     ),
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                 },
             )
         ]
@@ -273,7 +273,7 @@ class DbAnalysisPlanValidationExecutor:
                 payload=payload,
                 metadata={
                     **metadata,
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                     "analysis_plan_fingerprint": validation.plan_fingerprint,
                 },
             )
@@ -332,7 +332,7 @@ class DbAnalysisCheckpointExecutor:
                         step_kind="checkpoint",
                         plan_evidence_id=task.metadata.get("analysis_plan_evidence_id"),
                     ),
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                 },
             )
         ]
@@ -430,7 +430,7 @@ class DbAnalysisSummarizeExecutor:
                     ),
                     "cited_evidence_refs": [item.id for item in cited if item.id],
                     "partial": bool(task.input.get("partial")),
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                 },
             )
         ]
@@ -555,7 +555,7 @@ class DbAnalysisReplanExecutor:
                         phase="replan",
                         plan_evidence_id=parent.id if parent is not None else None,
                     ),
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                     "analysis_revision_number": payload["revision_number"],
                 },
             )
@@ -747,4 +747,4 @@ def _predicted_evidence_id(
     kind: str,
     payload: dict[str, Any],
 ) -> str:
-    return f"evidence-{stable_fingerprint({'operation_id': operation.id, 'task_id': task.id, 'kind': kind, 'payload': payload})}"
+    return f"evidence-{persisted_fingerprint({'operation_id': operation.id, 'task_id': task.id, 'kind': kind, 'payload': payload})}"

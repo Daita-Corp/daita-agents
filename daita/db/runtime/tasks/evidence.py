@@ -8,11 +8,10 @@ from uuid import uuid4
 
 from daita.runtime import Evidence, Operation, Task, TaskDependency
 
+from ...fingerprints import persisted_fingerprint
 from .common import (
     _evidence_payload_fingerprint,
     _payload_contains,
-    _payload_fingerprint,
-    _stable_hash,
 )
 from .context import DbTaskContext
 
@@ -39,7 +38,7 @@ async def persist_verification_result_evidence(
             "owner": item.owner,
             "task_id": item.task_id,
             "payload_fingerprint": item.metadata.get("payload_fingerprint")
-            or _payload_fingerprint(item.payload),
+            or persisted_fingerprint(item.payload),
         }
         for item in accepted
     ]
@@ -50,7 +49,7 @@ async def persist_verification_result_evidence(
         "warnings": list(verification.warnings),
         "missing_evidence": list(verification.missing_evidence),
         "diagnostics": verification.diagnostics,
-        "input_fingerprint": _stable_hash(
+        "input_fingerprint": persisted_fingerprint(
             {
                 "operation_id": operation.id,
                 "evidence": evidence_details,
@@ -68,7 +67,7 @@ async def persist_verification_result_evidence(
         accepted=True,
         payload=payload,
         metadata={
-            "payload_fingerprint": _payload_fingerprint(payload),
+            "payload_fingerprint": persisted_fingerprint(payload),
             "input_fingerprint": payload["input_fingerprint"],
         },
     )

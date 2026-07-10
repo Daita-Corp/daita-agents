@@ -22,6 +22,7 @@ from daita.runtime import (
 )
 
 from ..analysis import evidence_ref
+from ..fingerprints import persisted_fingerprint
 from ..monitor_plugin_planning import (
     MonitorPluginPlanner,
     MonitorPluginPlanningBlocked,
@@ -33,7 +34,6 @@ from ..monitors import (
     DbMonitorRun,
     DbMonitorState,
 )
-from .analysis import _payload_fingerprint, _stable_hash
 from .resume import _monitor_delivery_context
 from .tasks.models import DbTaskSpec
 from .types import (
@@ -350,7 +350,7 @@ class DbRuntimeMonitorDeliveryMixin:
                 "report_evidence_id": report.id,
                 "report_fingerprint": (
                     report.metadata.get("payload_fingerprint")
-                    or _payload_fingerprint(report.payload)
+                    or persisted_fingerprint(report.payload)
                 ),
                 "action_plan_fingerprint": report.payload.get(
                     "action_plan_fingerprint"
@@ -391,7 +391,7 @@ class DbRuntimeMonitorDeliveryMixin:
     ) -> Evidence:
         report_fingerprint = str(
             report.metadata.get("payload_fingerprint") or ""
-        ) or _payload_fingerprint(report.payload)
+        ) or persisted_fingerprint(report.payload)
         existing = await self.tasks.latest_evidence(
             operation.id,
             "monitor.delivery_plan",
@@ -431,7 +431,7 @@ class DbRuntimeMonitorDeliveryMixin:
                 "tick_operation_id": tick_operation_id,
                 "monitor_delivery_kind": payload["delivery_kind"],
                 "monitor_report_fingerprint": report_fingerprint,
-                "payload_fingerprint": _payload_fingerprint(payload),
+                "payload_fingerprint": persisted_fingerprint(payload),
             },
         )
         await self.store.save_evidence(evidence)
@@ -527,7 +527,7 @@ class DbRuntimeMonitorDeliveryMixin:
                 "monitor_delivery_kind": delivery_kind,
                 "monitor_delivery_channel": delivery_channel,
                 "monitor_report_fingerprint": report_fingerprint,
-                "payload_fingerprint": _payload_fingerprint(payload),
+                "payload_fingerprint": persisted_fingerprint(payload),
             },
         )
         await self.store.save_evidence(evidence)
@@ -561,7 +561,7 @@ class DbRuntimeMonitorDeliveryMixin:
         metadata: dict[str, Any],
         approval_requests: tuple[ApprovalRequest, ...] = (),
     ) -> Task:
-        task_key = _stable_hash(
+        task_key = persisted_fingerprint(
             {
                 "operation_id": operation.id,
                 "capability_id": capability.id,
