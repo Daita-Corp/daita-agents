@@ -13,6 +13,7 @@ from typing import Any, Literal
 from daita.runtime import Evidence, Operation, Task
 
 from .context import DbContextRenderer
+from .json_normalization import strip_json_fence
 from .models import (
     DbIntent,
     DbIntentKind,
@@ -1586,7 +1587,7 @@ def deterministic_synthesis_payload(
 
 
 def parse_synthesis_json(content: str) -> dict[str, Any]:
-    raw = _strip_json_fence(content)
+    raw = strip_json_fence(content)
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise ValueError("synthesis_json_not_object")
@@ -2215,9 +2216,3 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     if isinstance(value, list):
         return tuple(str(item) for item in value)
     return (str(value),)
-
-
-def _strip_json_fence(content: str) -> str:
-    stripped = content.strip()
-    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, flags=re.DOTALL)
-    return match.group(1).strip() if match else stripped

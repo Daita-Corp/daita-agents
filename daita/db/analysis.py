@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-import re
 from typing import Any, Mapping
 from uuid import uuid4
 
 from daita.runtime import Evidence
+
+from .json_normalization import strip_json_fence
 
 CAPABILITY_ANALYSIS_STEP_CONTRACTS = {
     "catalog_search": {
@@ -249,7 +250,7 @@ class DbAnalysisPlanValidation:
 
 def parse_analysis_plan_json(content: str) -> DbAnalysisPlan:
     """Parse strict JSON analysis plan output."""
-    raw = _strip_json_fence(content)
+    raw = strip_json_fence(content)
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise ValueError("analysis_plan_json_not_object")
@@ -551,12 +552,6 @@ def _cycle_errors(steps: tuple[DbAnalysisStep, ...]) -> list[str]:
     for step in steps:
         visit(step.id, ())
     return errors
-
-
-def _strip_json_fence(content: str) -> str:
-    stripped = content.strip()
-    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, flags=re.DOTALL)
-    return match.group(1).strip() if match else stripped
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:

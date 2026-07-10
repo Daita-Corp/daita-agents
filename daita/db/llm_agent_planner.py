@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
+from .json_normalization import strip_json_fence
 from .llm_service import DbLLMService
 from .planner_protocol import (
     DbAgentPlanner,
@@ -243,7 +243,7 @@ def _decision_schema_hint() -> dict[str, Any]:
 
 def _parse_planner_json(content: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     diagnostics: dict[str, Any] = {"normalization_steps": []}
-    raw = _strip_json_fence(content)
+    raw = strip_json_fence(content)
     if raw != content.strip():
         _add_normalization_step(diagnostics, "json_fence_stripped")
     try:
@@ -255,12 +255,6 @@ def _parse_planner_json(content: str) -> tuple[dict[str, Any] | None, dict[str, 
         diagnostics["error"] = "planner_json_not_object"
         return None, diagnostics
     return _normalize_planner_decision_payload(parsed, diagnostics)
-
-
-def _strip_json_fence(content: str) -> str:
-    stripped = content.strip()
-    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, flags=re.DOTALL)
-    return match.group(1).strip() if match else stripped
 
 
 def _normalize_planner_decision_payload(
