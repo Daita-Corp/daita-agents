@@ -1,4 +1,4 @@
-"""Task mixin composition for ``DbRuntime``."""
+"""Temporary task-mixin composition during package E."""
 
 from __future__ import annotations
 

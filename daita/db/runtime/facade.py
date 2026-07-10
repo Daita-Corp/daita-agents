@@ -71,6 +71,7 @@ from .resume import (
     _db_request_from_context,
 )
 from .results import DbRuntimeResultsMixin
+from .tasks import DbTaskContext, DbTaskExecutor
 from .tasks.runtime import DbRuntimeTasksMixin
 from .types import (
     _SourcePreparationSnapshot,
@@ -152,6 +153,15 @@ class DbRuntime(
             runtime_store=self.store,
             approval_channel=self.approval_channel,
             fact_provider=self,
+        )
+        self._tasks = DbTaskExecutor(
+            DbTaskContext(
+                registry=self.registry,
+                store=self.store,
+                kernel=self.kernel,
+                config=self.config,
+                runtime_id=self.runtime_id,
+            )
         )
 
         self.registry.register(

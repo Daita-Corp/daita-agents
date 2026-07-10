@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass, fields
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -9,7 +10,13 @@ from daita.db import (
     DbRuntimeConfig,
     DbRuntimeInspection,
 )
-from daita.plugins import RuntimeExtensionPlugin, PluginKind, PluginManifest
+from daita.db.runtime.tasks import DbTaskContext, DbTaskExecutor
+from daita.plugins import (
+    ExtensionRegistry,
+    RuntimeExtensionPlugin,
+    PluginKind,
+    PluginManifest,
+)
 from daita.runtime import (
     AccessMode,
     Capability,
@@ -19,6 +26,9 @@ from daita.runtime import (
     Operation,
     OperationStatus,
     RiskLevel,
+    RuntimeKernel,
+    TaskDependency,
+    TaskExecutionResult,
     RuntimeEventType,
     Task,
 )
@@ -157,6 +167,200 @@ class CountingRuntimePlugin(RuntimeExtensionPlugin):
                 json_schema={"type": "object"},
             )
         ]
+
+
+def test_db_task_context_is_frozen_and_contains_only_approved_fields():
+    runtime = DbRuntime(runtime_id="db-runtime-context")
+
+    context = runtime._tasks.context
+
+    assert isinstance(context, DbTaskContext)
+    assert tuple(field.name for field in fields(context)) == (
+        "registry",
+        "store",
+        "kernel",
+        "config",
+        "runtime_id",
+    )
+    assert context.registry is runtime.registry
+    assert context.store is runtime.store
+    assert context.kernel is runtime.kernel
+    assert context.config is runtime.config
+    assert context.runtime_id == runtime.runtime_id
+    with pytest.raises(FrozenInstanceError):
+        setattr(context, "runtime_id", "changed")
+
+
+async def test_db_task_executor_runs_without_db_runtime_and_persists_before_kernel(
+    monkeypatch,
+):
+    plugin = CountingRuntimePlugin()
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    store = InMemoryRuntimeStore()
+    kernel = RuntimeKernel(
+        runtime_id="standalone-task-runtime",
+        runtime_kind="db",
+        extension_registry=registry,
+        runtime_store=store,
+    )
+    executor = DbTaskExecutor(
+        DbTaskContext(
+            registry=registry,
+            store=store,
+            kernel=kernel,
+            config=DbRuntimeConfig(),
+            runtime_id="standalone-task-runtime",
+        )
+    )
+    operation = Operation(
+        id="standalone-operation",
+        operation_type="runtime.inspect",
+        status=OperationStatus.RUNNING,
+    )
+    task = Task(
+        id="standalone-task",
+        operation_id=operation.id,
+        capability_id="runtime_probe.count",
+        executor_id="runtime_probe.count",
+        input={"probe": True},
+        metadata={"owner": "runtime_probe_counting", "reason": "test"},
+    )
+    await store.save_operation(operation)
+    original_execute_task = kernel.execute_task
+    persisted_at_execution = []
+
+    async def execute_after_persist(task_id, **kwargs):
+        persisted_at_execution.append(await store.load_task(task_id))
+        return await original_execute_task(task_id, **kwargs)
+
+    monkeypatch.setattr(kernel, "execute_task", execute_after_persist)
+
+    evidence = await executor.execute_task(task, operation)
+
+    assert plugin.executor.calls == 1
+    assert evidence[0].payload == {"calls": 1}
+    assert persisted_at_execution[0] is not None
+    assert persisted_at_execution[0].id == task.id
+    assert persisted_at_execution[0].input == task.input
+    assert persisted_at_execution[0].dependencies == task.dependencies
+
+
+async def test_db_runtime_execute_task_delegates_to_composed_executor(monkeypatch):
+    runtime = DbRuntime()
+    operation = Operation(id="delegate-operation", operation_type="runtime.inspect")
+    task = Task(
+        id="delegate-task",
+        operation_id=operation.id,
+        capability_id="runtime_probe.count",
+        executor_id="runtime_probe.count",
+    )
+    delegated = AsyncMock(return_value=())
+    monkeypatch.setattr(runtime._tasks, "execute_task", delegated)
+
+    result = await runtime.execute_task(task, operation, {"trace_id": "trace-1"})
+
+    assert result == ()
+    delegated.assert_awaited_once_with(
+        task,
+        operation,
+        {"trace_id": "trace-1"},
+    )
+
+
+async def test_db_task_executor_rejects_executor_mismatch_before_kernel(monkeypatch):
+    runtime = DbRuntime(plugins=(CountingRuntimePlugin(),))
+    operation = Operation(id="mismatch-operation", operation_type="runtime.inspect")
+    task = Task(
+        id="mismatch-task",
+        operation_id=operation.id,
+        capability_id="runtime_probe.count",
+        executor_id="wrong.executor",
+        metadata={"owner": "runtime_probe_counting"},
+    )
+    execute_task = AsyncMock()
+    monkeypatch.setattr(runtime.kernel, "execute_task", execute_task)
+
+    with pytest.raises(ValueError, match="does not match capability"):
+        await runtime._tasks.execute_task(task, operation)
+
+    execute_task.assert_not_awaited()
+    assert await runtime.store.load_task(task.id) is None
+
+
+async def test_db_task_executor_preserves_pending_input_and_dependency_update(
+    monkeypatch,
+):
+    runtime = DbRuntime(plugins=(CountingRuntimePlugin(),))
+    capability = runtime.registry.get_capability(
+        "runtime_probe.count",
+        owner="runtime_probe_counting",
+    )
+    operation = Operation(
+        id="pending-update-operation",
+        operation_type="runtime.inspect",
+        status=OperationStatus.RUNNING,
+    )
+    old_dependency = TaskDependency(
+        kind="evidence",
+        evidence_kind="probe.old",
+        operation_id=operation.id,
+    )
+    new_dependency = TaskDependency(
+        kind="evidence",
+        evidence_kind="probe.new",
+        producer_task_id="producer-new",
+        operation_id=operation.id,
+    )
+    stored_task = Task(
+        id="pending-update-task",
+        operation_id=operation.id,
+        capability_id=capability.id,
+        executor_id=capability.executor,
+        input={"version": "old"},
+        dependencies=(old_dependency,),
+        metadata={
+            "owner": capability.owner,
+            "reason": "old",
+            "preserved": True,
+        },
+    )
+    incoming_task = Task(
+        id=stored_task.id,
+        operation_id=operation.id,
+        capability_id=capability.id,
+        executor_id=capability.executor,
+        input={"version": "new"},
+        dependencies=(new_dependency,),
+        metadata={
+            "owner": capability.owner,
+            "reason": "new",
+            "discarded": True,
+        },
+    )
+    await runtime.store.save_operation(operation)
+    await runtime.store.save_task(stored_task)
+    persisted_at_execution = []
+
+    async def execute_updated_task(task_id, **kwargs):
+        persisted = await runtime.store.load_task(task_id)
+        persisted_at_execution.append(persisted)
+        return TaskExecutionResult(operation, persisted, capability)
+
+    monkeypatch.setattr(runtime.kernel, "execute_task", execute_updated_task)
+
+    assert await runtime._tasks.execute_task(incoming_task, operation) == ()
+
+    updated = persisted_at_execution[0]
+    assert updated.input == incoming_task.input
+    assert [item.to_dict() for item in updated.dependencies] == [
+        new_dependency.to_dict()
+    ]
+    assert updated.metadata == {
+        "owner": capability.owner,
+        "reason": "new",
+        "preserved": True,
+    }
 
 
 def test_db_runtime_owns_registry_and_accepts_config_plugins():

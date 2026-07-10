@@ -10,12 +10,135 @@ from daita.runtime import Capability, Operation, Task, TaskStatus
 
 from ...models import DbOperationContract
 from .common import _json_dict, _stable_hash
+from .context import DbTaskContext
 from .dependencies import (
     _combine_dependencies,
     _has_sql_validation_dependency,
     _task_dependencies_for_capability,
 )
 from .models import DbTaskPlan, DbTaskSpec
+
+
+def _validation_capability_for_sql_execute(
+    context: DbTaskContext,
+    capability: Capability,
+) -> Capability | None:
+    if capability.id not in {"db.sql.execute_read", "db.sql.execute_write"}:
+        return None
+    try:
+        return context.registry.get_capability(
+            "db.sql.validate", owner=capability.owner
+        )
+    except KeyError:
+        return None
+
+
+def _direct_capability_tasks(
+    operation: Operation,
+    capability: Capability,
+    input: dict[str, Any],
+    *,
+    validation_capability: Capability | None,
+) -> tuple[Task, ...]:
+    if (
+        capability.id not in {"db.sql.execute_read", "db.sql.execute_write"}
+        or validation_capability is None
+    ):
+        task = _task_for_capability(
+            operation,
+            capability,
+            input=input,
+            reason="direct",
+            sequence=1,
+        )
+        return (task,)
+    validation_task = _task_for_capability(
+        operation,
+        validation_capability,
+        input={
+            "sql": str(input.get("sql") or ""),
+            "operation": (
+                "query"
+                if capability.id == "db.sql.execute_read"
+                else operation.operation_type
+            ),
+        },
+        reason="direct_validation",
+        sequence=1,
+    )
+    execute_input = {
+        "sql_ref": "sql.validation",
+        "params": list(input.get("params") or []),
+        **(
+            {"param_specs": list(input.get("param_specs") or [])}
+            if input.get("param_specs")
+            else {}
+        ),
+    }
+    execute_task = _task_for_capability(
+        operation,
+        capability,
+        input=execute_input,
+        reason="direct",
+        sequence=2,
+        validation_task=validation_task,
+    )
+    return (validation_task, execute_task)
+
+
+def _task_for_capability(
+    operation: Operation,
+    capability: Capability,
+    *,
+    input: dict[str, Any],
+    reason: str,
+    sequence: int,
+    validation_task: Task | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Task:
+    input_hash = _stable_hash(input)
+    task = Task(
+        id=f"db-task-{uuid4()}",
+        operation_id=operation.id,
+        capability_id=capability.id,
+        executor_id=capability.executor,
+        input={**input, "input_hash": input_hash},
+        required_evidence=capability.output_evidence,
+        metadata={
+            **dict(metadata or {}),
+            "owner": capability.owner,
+            "reason": reason,
+            "sequence": sequence,
+            "input_hash": input_hash,
+            "idempotency_key": _stable_hash(
+                {
+                    "operation_id": operation.id,
+                    "capability_id": capability.id,
+                    "executor_id": capability.executor,
+                    "input": input,
+                }
+            ),
+            "idempotent": capability.idempotent,
+            "replay_safe": capability.replay_safe,
+            "side_effecting": capability.side_effecting,
+        },
+    )
+    return replace(
+        task,
+        dependencies=_task_dependencies_for_capability(
+            operation,
+            capability,
+            validation_task=validation_task,
+        ),
+    )
+
+
+def _prompt_from_direct_input(input: dict[str, Any]) -> str:
+    for key in ("prompt", "sql", "query", "content"):
+        value = input.get(key)
+        if value:
+            return str(value)
+    return ""
 
 
 class DbRuntimeTaskPlanningMixin:
@@ -157,125 +280,9 @@ class DbRuntimeTaskPlanningMixin:
         self,
         capability: Capability,
     ) -> Capability | None:
-        if capability.id not in {"db.sql.execute_read", "db.sql.execute_write"}:
-            return None
-        try:
-            return self.registry.get_capability(
-                "db.sql.validate", owner=capability.owner
-            )
-        except KeyError:
-            return None
-
-    def _direct_capability_tasks(
-        self,
-        operation: Operation,
-        capability: Capability,
-        input: dict[str, Any],
-        *,
-        validation_capability: Capability | None,
-    ) -> tuple[Task, ...]:
-        if (
-            capability.id not in {"db.sql.execute_read", "db.sql.execute_write"}
-            or validation_capability is None
-        ):
-            task = self._task_for_capability(
-                operation,
-                capability,
-                input=input,
-                reason="direct",
-                sequence=1,
-            )
-            return (task,)
-        validation_task = self._task_for_capability(
-            operation,
-            validation_capability,
-            input={
-                "sql": str(input.get("sql") or ""),
-                "operation": (
-                    "query"
-                    if capability.id == "db.sql.execute_read"
-                    else operation.operation_type
-                ),
-            },
-            reason="direct_validation",
-            sequence=1,
-        )
-        execute_input = (
-            {
-                "sql_ref": "sql.validation",
-                "params": list(input.get("params") or []),
-                **(
-                    {"param_specs": list(input.get("param_specs") or [])}
-                    if input.get("param_specs")
-                    else {}
-                ),
-            }
-            if capability.id == "db.sql.execute_read"
-            else {
-                "sql_ref": "sql.validation",
-                "params": list(input.get("params") or []),
-                **(
-                    {"param_specs": list(input.get("param_specs") or [])}
-                    if input.get("param_specs")
-                    else {}
-                ),
-            }
-        )
-        execute_task = self._task_for_capability(
-            operation,
+        return _validation_capability_for_sql_execute(
+            self._tasks.context,
             capability,
-            input=execute_input,
-            reason="direct",
-            sequence=2,
-            validation_task=validation_task,
-        )
-        return (validation_task, execute_task)
-
-    def _task_for_capability(
-        self,
-        operation: Operation,
-        capability: Capability,
-        *,
-        input: dict[str, Any],
-        reason: str,
-        sequence: int,
-        validation_task: Task | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> Task:
-        input_hash = _stable_hash(input)
-        task = Task(
-            id=f"db-task-{uuid4()}",
-            operation_id=operation.id,
-            capability_id=capability.id,
-            executor_id=capability.executor,
-            input={**input, "input_hash": input_hash},
-            required_evidence=capability.output_evidence,
-            metadata={
-                **dict(metadata or {}),
-                "owner": capability.owner,
-                "reason": reason,
-                "sequence": sequence,
-                "input_hash": input_hash,
-                "idempotency_key": _stable_hash(
-                    {
-                        "operation_id": operation.id,
-                        "capability_id": capability.id,
-                        "executor_id": capability.executor,
-                        "input": input,
-                    }
-                ),
-                "idempotent": capability.idempotent,
-                "replay_safe": capability.replay_safe,
-                "side_effecting": capability.side_effecting,
-            },
-        )
-        return replace(
-            task,
-            dependencies=_task_dependencies_for_capability(
-                operation,
-                capability,
-                validation_task=validation_task,
-            ),
         )
 
     def _task_for_spec(
@@ -357,13 +364,6 @@ class DbRuntimeTaskPlanningMixin:
         if capability.id == "db.sql.validate":
             return {"sql": prompt, "operation": operation.operation_type}
         return {"prompt": prompt}
-
-    def _prompt_from_direct_input(self, input: dict[str, Any]) -> str:
-        for key in ("prompt", "sql", "query", "content"):
-            value = input.get(key)
-            if value:
-                return str(value)
-        return ""
 
     def _contract_snapshot(
         self,
