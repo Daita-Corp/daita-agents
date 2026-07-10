@@ -1,6 +1,9 @@
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import inspect
+import sqlite3
+import threading
 
 import pytest
 
@@ -42,6 +45,88 @@ from daita.runtime import (
 NOW = datetime(2026, 6, 12, 12, 0, tzinfo=timezone.utc)
 
 
+async def test_sqlite_monitor_store_does_not_block_the_event_loop(
+    tmp_path, monkeypatch
+):
+    store = SQLiteDbMonitorStore(tmp_path / "monitor-responsive.sqlite")
+    monitor = DbMonitor(id="responsive-monitor", name="Responsive monitor")
+    helper_started = threading.Event()
+    helper_released = threading.Event()
+    helper_finished = threading.Event()
+    release_timed_out = threading.Event()
+    save_monitor_sync = store._save_monitor_sync
+
+    def blocking_save_monitor_sync(value):
+        helper_started.set()
+        if not helper_released.wait(timeout=5):
+            release_timed_out.set()
+        try:
+            return save_monitor_sync(value)
+        finally:
+            helper_finished.set()
+
+    monkeypatch.setattr(store, "_save_monitor_sync", blocking_save_monitor_sync)
+    store_task = asyncio.create_task(store.save_monitor(monitor))
+    loop_advanced = asyncio.Event()
+
+    async def advance_loop():
+        loop_advanced.set()
+
+    try:
+        assert await asyncio.to_thread(helper_started.wait, 5)
+        progress_task = asyncio.create_task(advance_loop())
+        await progress_task
+
+        assert loop_advanced.is_set()
+        assert not helper_released.is_set()
+        assert not helper_finished.is_set()
+        assert not release_timed_out.is_set()
+    finally:
+        helper_released.set()
+        await store_task
+
+    assert await store.load_monitor(monitor.id) == monitor
+
+
+async def test_sqlite_monitor_store_closes_read_connection_before_return(
+    tmp_path, monkeypatch
+):
+    store = SQLiteDbMonitorStore(tmp_path / "monitor-read-close.sqlite")
+    monitor = DbMonitor(id="read-close-monitor", name="Read close monitor")
+    await store.save_monitor(monitor)
+    connections = []
+
+    class ConnectionProbe:
+        def __init__(self):
+            self.connection = sqlite3.connect(store.path)
+            self.connection.row_factory = sqlite3.Row
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self.connection.__exit__(exc_type, exc, tb)
+
+        def execute(self, *args, **kwargs):
+            return self.connection.execute(*args, **kwargs)
+
+        def close(self):
+            self.closed = True
+            self.connection.close()
+
+    def connect():
+        connection = ConnectionProbe()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", connect)
+
+    assert await store.load_monitor(monitor.id) == monitor
+    assert len(connections) == 1
+    assert connections[0].closed is True
+
+
 def _validation(accepted=True, **kwargs):
     return DbMonitorValidation(accepted=accepted, **kwargs).to_dict()
 
@@ -54,6 +139,7 @@ def test_cursor_updates_capture_non_null_values_once_before_max():
             return super().get(key, default)
 
     plan = {"cursor_update": {"last_id": "max(rows.id)"}}
+
     def payload():
         return {"rows": [PopOnceRow(id=41), {"id": None}, {"id": 42}]}
 

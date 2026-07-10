@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -502,6 +503,9 @@ class SQLiteDbMonitorStore:
         self._initialize()
 
     async def save_monitor(self, monitor: DbMonitor) -> None:
+        return await asyncio.to_thread(self._save_monitor_sync, monitor)
+
+    def _save_monitor_sync(self, monitor: DbMonitor) -> None:
         with self._transaction() as conn:
             conn.execute(
                 """
@@ -521,7 +525,10 @@ class SQLiteDbMonitorStore:
             )
 
     async def load_monitor(self, monitor_id: str) -> DbMonitor | None:
-        with self._connect() as conn:
+        return await asyncio.to_thread(self._load_monitor_sync, monitor_id)
+
+    def _load_monitor_sync(self, monitor_id: str) -> DbMonitor | None:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "select data from monitors where id = ?", (monitor_id,)
             ).fetchone()
@@ -530,17 +537,25 @@ class SQLiteDbMonitorStore:
     async def list_monitors(
         self, *, status: str | None = None
     ) -> tuple[DbMonitor, ...]:
+        return await asyncio.to_thread(self._list_monitors_sync, status=status)
+
+    def _list_monitors_sync(
+        self, *, status: str | None = None
+    ) -> tuple[DbMonitor, ...]:
         sql = "select data from monitors"
         params: tuple[Any, ...] = ()
         if status is not None:
             sql += " where status = ?"
             params = (status,)
         sql += " order by rowid"
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
         return tuple(DbMonitor.from_dict(_loads(row["data"])) for row in rows)
 
     async def delete_monitor(self, monitor_id: str) -> None:
+        return await asyncio.to_thread(self._delete_monitor_sync, monitor_id)
+
+    def _delete_monitor_sync(self, monitor_id: str) -> None:
         with self._transaction() as conn:
             conn.execute("delete from monitors where id = ?", (monitor_id,))
             conn.execute(
@@ -552,6 +567,9 @@ class SQLiteDbMonitorStore:
             )
 
     async def save_monitor_state(self, state: DbMonitorState) -> None:
+        return await asyncio.to_thread(self._save_monitor_state_sync, state)
+
+    def _save_monitor_state_sync(self, state: DbMonitorState) -> None:
         with self._transaction() as conn:
             conn.execute(
                 """
@@ -563,13 +581,19 @@ class SQLiteDbMonitorStore:
             )
 
     async def load_monitor_state(self, monitor_id: str) -> DbMonitorState | None:
-        with self._connect() as conn:
+        return await asyncio.to_thread(self._load_monitor_state_sync, monitor_id)
+
+    def _load_monitor_state_sync(self, monitor_id: str) -> DbMonitorState | None:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "select data from monitor_states where monitor_id = ?", (monitor_id,)
             ).fetchone()
         return DbMonitorState.from_dict(_loads(row["data"])) if row else None
 
     async def save_monitor_run(self, run: DbMonitorRun) -> None:
+        return await asyncio.to_thread(self._save_monitor_run_sync, run)
+
+    def _save_monitor_run_sync(self, run: DbMonitorRun) -> None:
         with self._transaction() as conn:
             conn.execute(
                 """
@@ -591,7 +615,10 @@ class SQLiteDbMonitorStore:
             )
 
     async def list_monitor_runs(self, monitor_id: str) -> tuple[DbMonitorRun, ...]:
-        with self._connect() as conn:
+        return await asyncio.to_thread(self._list_monitor_runs_sync, monitor_id)
+
+    def _list_monitor_runs_sync(self, monitor_id: str) -> tuple[DbMonitorRun, ...]:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
                 select data from monitor_runs
@@ -603,6 +630,22 @@ class SQLiteDbMonitorStore:
         return tuple(DbMonitorRun.from_dict(_loads(row["data"])) for row in rows)
 
     async def claim_monitor_tick_lease(
+        self,
+        monitor_id: str,
+        *,
+        lease_id: str,
+        now: str,
+        expires_at: str,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._claim_monitor_tick_lease_sync,
+            monitor_id,
+            lease_id=lease_id,
+            now=now,
+            expires_at=expires_at,
+        )
+
+    def _claim_monitor_tick_lease_sync(
         self,
         monitor_id: str,
         *,
@@ -641,6 +684,18 @@ class SQLiteDbMonitorStore:
         *,
         lease_id: str,
     ) -> None:
+        return await asyncio.to_thread(
+            self._release_monitor_tick_lease_sync,
+            monitor_id,
+            lease_id=lease_id,
+        )
+
+    def _release_monitor_tick_lease_sync(
+        self,
+        monitor_id: str,
+        *,
+        lease_id: str,
+    ) -> None:
         with self._transaction() as conn:
             conn.execute(
                 """
@@ -651,6 +706,9 @@ class SQLiteDbMonitorStore:
             )
 
     async def commit_monitor_mutation(self, mutation: DbMonitorMutation) -> None:
+        return await asyncio.to_thread(self._commit_monitor_mutation_sync, mutation)
+
+    def _commit_monitor_mutation_sync(self, mutation: DbMonitorMutation) -> None:
         with self._transaction() as conn:
             self._validate_expected_monitor(conn, mutation)
             self._validate_expected_state(conn, mutation)

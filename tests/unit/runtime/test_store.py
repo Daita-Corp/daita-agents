@@ -1,3 +1,7 @@
+import asyncio
+import sqlite3
+import threading
+
 from daita.runtime import (
     ApprovalRequest,
     ApprovalStatus,
@@ -16,6 +20,88 @@ from daita.runtime import (
     TaskDependency,
     TaskStatus,
 )
+
+
+async def test_sqlite_runtime_store_does_not_block_the_event_loop(
+    tmp_path, monkeypatch
+):
+    store = SQLiteRuntimeStore(tmp_path / "runtime-responsive.sqlite")
+    operation = Operation(id="responsive-op", operation_type="data.query")
+    helper_started = threading.Event()
+    helper_released = threading.Event()
+    helper_finished = threading.Event()
+    release_timed_out = threading.Event()
+    save_operation_sync = store._save_operation_sync
+
+    def blocking_save_operation_sync(value):
+        helper_started.set()
+        if not helper_released.wait(timeout=5):
+            release_timed_out.set()
+        try:
+            return save_operation_sync(value)
+        finally:
+            helper_finished.set()
+
+    monkeypatch.setattr(store, "_save_operation_sync", blocking_save_operation_sync)
+    store_task = asyncio.create_task(store.save_operation(operation))
+    loop_advanced = asyncio.Event()
+
+    async def advance_loop():
+        loop_advanced.set()
+
+    try:
+        assert await asyncio.to_thread(helper_started.wait, 5)
+        progress_task = asyncio.create_task(advance_loop())
+        await progress_task
+
+        assert loop_advanced.is_set()
+        assert not helper_released.is_set()
+        assert not helper_finished.is_set()
+        assert not release_timed_out.is_set()
+    finally:
+        helper_released.set()
+        await store_task
+
+    assert await store.load_operation(operation.id) == operation
+
+
+async def test_sqlite_runtime_store_closes_read_connection_before_return(
+    tmp_path, monkeypatch
+):
+    store = SQLiteRuntimeStore(tmp_path / "runtime-read-close.sqlite")
+    operation = Operation(id="read-close-op", operation_type="data.query")
+    await store.save_operation(operation)
+    connections = []
+
+    class ConnectionProbe:
+        def __init__(self):
+            self.connection = sqlite3.connect(store.path)
+            self.connection.row_factory = sqlite3.Row
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self.connection.__exit__(exc_type, exc, tb)
+
+        def execute(self, *args, **kwargs):
+            return self.connection.execute(*args, **kwargs)
+
+        def close(self):
+            self.closed = True
+            self.connection.close()
+
+    def connect():
+        connection = ConnectionProbe()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", connect)
+
+    assert await store.load_operation(operation.id) == operation
+    assert len(connections) == 1
+    assert connections[0].closed is True
 
 
 async def test_in_memory_runtime_store_persists_operation_state_for_inspection():
