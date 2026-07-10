@@ -74,7 +74,7 @@ def normalize_db_memory_semantic_contract(value: Any) -> dict[str, Any] | None:
         },
         "enforcement": {
             "mode": str(enforcement.get("mode") or "required_when_recalled").strip(),
-            "min_confidence": _confidence_value(
+            "min_confidence": confidence_value(
                 enforcement.get("min_confidence"), default=0.8
             ),
         },
@@ -249,7 +249,7 @@ def db_memory_contracts_artifact_payload(
             "advisory_count": int(diagnostics.get("advisory_count") or 0),
             "omitted_count": int(diagnostics.get("omitted_count") or 0),
         },
-        "safe_diagnostic_summaries": _safe_omission_summaries(omitted_counts),
+        "safe_diagnostic_summaries": safe_omission_summaries(omitted_counts),
     }
 
 
@@ -270,7 +270,7 @@ def _metric_definition_contract(
     refs = db_memory_contract_refs({"requirements": requirements})
     if not refs:
         return None
-    if schema.get("tables") and not _schema_refs_known_schema(refs, schema):
+    if schema.get("tables") and not schema_refs_known_schema(refs, schema):
         return None
     if not schema.get("tables") and not _metadata_schema_refs_cover(metadata, refs):
         return None
@@ -324,7 +324,7 @@ def _unit_convention_contract(
     if not table or not column or not unit:
         return None
     refs = ({"table": table, "column": column},)
-    if schema.get("tables") and not _schema_refs_known_schema(refs, schema):
+    if schema.get("tables") and not schema_refs_known_schema(refs, schema):
         return None
     if not schema.get("tables") and not _metadata_schema_refs_cover(metadata, refs):
         return None
@@ -487,7 +487,7 @@ def _enforcement(metadata: dict[str, Any], *, min_confidence: float) -> dict[str
     )
     return {
         "mode": str(enforcement.get("mode") or "required_when_recalled").strip(),
-        "min_confidence": _confidence_value(
+        "min_confidence": confidence_value(
             enforcement.get("min_confidence"), default=min_confidence
         ),
     }
@@ -570,8 +570,8 @@ def _contract_omit_reason(
         "required_when_relevant",
     }:
         return "advisory_mode"
-    confidence = _confidence_value(ref.get("confidence"), default=0.0)
-    min_confidence = _confidence_value(enforcement.get("min_confidence"), default=0.8)
+    confidence = confidence_value(ref.get("confidence"), default=0.0)
+    min_confidence = confidence_value(enforcement.get("min_confidence"), default=0.8)
     if confidence < min_confidence:
         return "low_confidence"
     if not _contract_refs_known_schema(contract, schema):
@@ -591,7 +591,7 @@ def _contract_refs_known_schema(
         return True
     if not schema.get("tables"):
         return False
-    return _schema_refs_known_schema(refs, schema)
+    return schema_refs_known_schema(refs, schema)
 
 
 def _contract_blocked_by_policy(
@@ -631,12 +631,12 @@ def _contract_relevant_to_prompt(
         subject.get("key"),
         *(subject.get("aliases") or []),
     ]
-    prompt_tokens = set(_meaningful_tokens(prompt))
-    contract_tokens = set(_meaningful_tokens(" ".join(str(term) for term in terms)))
+    prompt_tokens = set(meaningful_tokens(prompt))
+    contract_tokens = set(meaningful_tokens(" ".join(str(term) for term in terms)))
     return not prompt_tokens or bool(prompt_tokens & contract_tokens)
 
 
-def _schema_refs_known_schema(
+def schema_refs_known_schema(
     refs: tuple[dict[str, Any], ...] | list[dict[str, Any]],
     schema: dict[str, Any],
 ) -> bool:
@@ -720,7 +720,7 @@ def _dedupe_schema_refs(refs: list[dict[str, str]]) -> list[dict[str, str]]:
     return deduped
 
 
-def _confidence_value(value: Any, *, default: float) -> float:
+def confidence_value(value: Any, *, default: float) -> float:
     if value is None:
         return default
     if isinstance(value, str):
@@ -755,7 +755,7 @@ def _short_ref_key(value: Any) -> str:
     return str(value or "").split(".")[-1].strip().lower()
 
 
-def _meaningful_tokens(text: Any) -> list[str]:
+def meaningful_tokens(text: Any) -> list[str]:
     stop = {
         "about",
         "after",
@@ -791,7 +791,7 @@ def _bump_omitted(diagnostics: dict[str, Any], reason: str) -> None:
     omitted[reason] = int(omitted.get(reason) or 0) + 1
 
 
-def _safe_omission_summaries(
+def safe_omission_summaries(
     omitted_counts: dict[str, int],
 ) -> list[dict[str, Any]]:
     return [

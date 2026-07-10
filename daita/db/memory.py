@@ -16,8 +16,12 @@ from typing import Any, Iterable
 from daita.db.query_catalog import has_likely_catalog_match
 from daita.db.memory_contracts import (
     DB_MEMORY_SEMANTIC_CONTRACT_KEY,
+    confidence_value,
     extract_db_memory_semantic_contract,
+    meaningful_tokens,
     normalize_db_memory_semantic_contract as _normalize_contract,
+    safe_omission_summaries,
+    schema_refs_known_schema,
 )
 
 logger = logging.getLogger(__name__)
@@ -340,7 +344,7 @@ def _matched_schema_terms_for_recall(
     schema: dict[str, Any],
 ) -> tuple[str, ...]:
     """Return schema terms that are actually mentioned by the prompt."""
-    prompt_terms = set(_meaningful_tokens(prompt))
+    prompt_terms = set(meaningful_tokens(prompt))
     if not prompt_terms:
         return ()
     matches: list[str] = []
@@ -383,7 +387,7 @@ def _recall_terms_for_prompt(
     intent_kind: str,
 ) -> tuple[str, ...]:
     terms: list[str] = []
-    prompt_terms = set(_meaningful_tokens(prompt))
+    prompt_terms = set(meaningful_tokens(prompt))
     for term in schema_terms:
         cleaned = str(term or "").strip()
         if not cleaned:
@@ -418,14 +422,14 @@ def _bounded_recall_terms(
 
 
 def _identifier_matches_terms(identifier: str, prompt_terms: set[str]) -> bool:
-    identifier_terms = set(_meaningful_tokens(identifier))
+    identifier_terms = set(meaningful_tokens(identifier))
     if identifier_terms & prompt_terms:
         return True
     return bool(_singular_terms(identifier_terms) & _singular_terms(prompt_terms))
 
 
 def _identifier_key(identifier: str) -> str:
-    return " ".join(_meaningful_tokens(identifier))
+    return " ".join(meaningful_tokens(identifier))
 
 
 def _singular_terms(terms: Iterable[str]) -> set[str]:
@@ -506,7 +510,7 @@ def db_memory_refs_from_recall_evidence(
             "kind": kind,
             "key": key,
             "text": text,
-            "confidence": _confidence_value(metadata.get("confidence"), default=1.0),
+            "confidence": confidence_value(metadata.get("confidence"), default=1.0),
             "importance": float(record.get("importance") or 0.0),
             "source_identity": metadata.get("source_identity"),
             "evidence_refs": ref_evidence,
@@ -571,7 +575,7 @@ def db_memory_selection_artifact_payload(
         "included_refs": [dict(ref) for ref in included_refs],
         "included_count": included_count,
         "omitted_counts_by_reason": omitted_counts,
-        "safe_diagnostic_omission_summaries": _safe_omission_summaries(omitted_counts),
+        "safe_diagnostic_omission_summaries": safe_omission_summaries(omitted_counts),
         "budget_usage": {
             "limit": max(0, int(limit)),
             "char_budget": max(0, int(char_budget)),
@@ -1512,7 +1516,7 @@ def _planner_memory_omit_reason(
     )
     if record_schema and schema_fingerprint and record_schema != schema_fingerprint:
         return "schema_mismatch"
-    if _confidence_value(metadata.get("confidence"), default=1.0) < 0.5:
+    if confidence_value(metadata.get("confidence"), default=1.0) < 0.5:
         return "low_confidence"
     if kind == "value_alias" and not _value_alias_has_catalog_citation(metadata):
         return "missing_catalog_citation"
@@ -1547,23 +1551,6 @@ def _score_is_high_enough(result: dict[str, Any], threshold: float) -> bool:
         return True
 
 
-def _confidence_value(value: Any, *, default: float) -> float:
-    if value is None:
-        return default
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered == "high":
-            return 0.9
-        if lowered == "medium":
-            return 0.7
-        if lowered == "low":
-            return 0.4
-    try:
-        return max(0.0, min(1.0, float(value)))
-    except (TypeError, ValueError):
-        return default
-
-
 def _is_memory_expired(metadata: dict[str, Any]) -> bool:
     expires_at = metadata.get("expires_at")
     if not expires_at:
@@ -1588,9 +1575,7 @@ def _value_alias_has_catalog_citation(metadata: dict[str, Any]) -> bool:
 def _record_refs_known_schema(metadata: dict[str, Any], schema: dict[str, Any]) -> bool:
     schema_refs = metadata.get("schema_refs")
     if isinstance(schema_refs, list) and schema_refs:
-        return _schema_refs_known_schema(
-            _schema_refs_from_metadata(schema_refs), schema
-        )
+        return schema_refs_known_schema(_schema_refs_from_metadata(schema_refs), schema)
     tables = {
         str(table.get("name") or "").lower(): {
             str(column.get("name") or "").lower()
@@ -1634,33 +1619,8 @@ def _schema_refs_from_metadata(value: Any) -> tuple[dict[str, str], ...]:
     return tuple(refs)
 
 
-def _schema_refs_known_schema(
-    refs: tuple[dict[str, Any], ...] | list[dict[str, Any]],
-    schema: dict[str, Any],
-) -> bool:
-    tables = {
-        str(table.get("name") or "").lower(): {
-            str(column.get("name") or "").lower()
-            for column in table.get("columns", []) or []
-            if column.get("name")
-        }
-        for table in schema.get("tables", []) or []
-        if table.get("name")
-    }
-    if not tables:
-        return True
-    for ref in refs:
-        table = str(ref.get("table") or "").lower()
-        column = str(ref.get("column") or "").lower()
-        if table and table not in tables:
-            return False
-        if table and column and column not in tables.get(table, set()):
-            return False
-    return True
-
-
 def _memory_relevant_to_prompt(prompt: str, record: dict[str, Any]) -> bool:
-    prompt_tokens = set(_meaningful_tokens(prompt))
+    prompt_tokens = set(meaningful_tokens(prompt))
     if not prompt_tokens:
         return True
     metadata = (
@@ -1679,52 +1639,20 @@ def _memory_relevant_to_prompt(prompt: str, record: dict[str, Any]) -> bool:
         )
         if value
     )
-    record_tokens = set(_meaningful_tokens(record_text))
+    record_tokens = set(meaningful_tokens(record_text))
     return bool(prompt_tokens & record_tokens)
 
 
 def _prompt_matches_schema(prompt: str, schema: dict[str, Any]) -> bool:
-    prompt_tokens = set(_meaningful_tokens(prompt))
+    prompt_tokens = set(meaningful_tokens(prompt))
     if not prompt_tokens:
         return False
     for table in schema.get("tables", []) or []:
         names = [table.get("name")]
         names.extend(column.get("name") for column in table.get("columns", []) or [])
-        if prompt_tokens & set(
-            _meaningful_tokens(" ".join(str(n) for n in names if n))
-        ):
+        if prompt_tokens & set(meaningful_tokens(" ".join(str(n) for n in names if n))):
             return True
     return False
-
-
-def _meaningful_tokens(text: Any) -> list[str]:
-    stop = {
-        "about",
-        "after",
-        "before",
-        "calculate",
-        "computed",
-        "does",
-        "from",
-        "have",
-        "many",
-        "show",
-        "that",
-        "their",
-        "there",
-        "this",
-        "what",
-        "when",
-        "where",
-        "which",
-        "with",
-    }
-    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_]{2,}", str(text or "").lower())
-    expanded: list[str] = []
-    for token in tokens:
-        expanded.extend(part for part in token.split("_") if len(part) > 2)
-        expanded.append(token)
-    return [token for token in expanded if token not in stop]
 
 
 def _memory_evidence_ref_ids(metadata: dict[str, Any]) -> list[str]:
@@ -1740,16 +1668,6 @@ def _memory_evidence_ref_ids(metadata: dict[str, Any]) -> list[str]:
         if metadata.get(key):
             refs.append(str(metadata[key]))
     return list(dict.fromkeys(refs))
-
-
-def _safe_omission_summaries(
-    omitted_counts: dict[str, int],
-) -> list[dict[str, Any]]:
-    return [
-        {"reason": reason, "count": int(count)}
-        for reason, count in sorted(omitted_counts.items())
-        if int(count) > 0
-    ]
 
 
 def _bump_omitted(diagnostics: dict[str, Any], reason: str) -> None:

@@ -29,9 +29,14 @@ from daita.db.memory import (
 )
 from daita.db.memory_contracts import (
     DB_MEMORY_SEMANTIC_CONTRACT_KEY,
+    confidence_value,
+    db_memory_contract_refs,
     db_memory_contracts_artifact_payload,
     extract_db_memory_semantic_contract,
+    meaningful_tokens,
     project_db_memory_semantic_contracts,
+    safe_omission_summaries,
+    schema_refs_known_schema,
 )
 from daita.db.planning_context import DbPlanningContextBuilder
 from daita.db.planner_protocol import (
@@ -2416,6 +2421,59 @@ def test_board_revenue_metric_memory_projects_semantic_contract():
     assert semantics[0]["enforceable"] is True
     assert contract_diagnostics["candidate_count"] == 1
     assert contract_diagnostics["enforced_count"] == 1
+
+
+def test_memory_contract_schema_refs_preserve_normalization_and_dedupe_order():
+    refs = db_memory_contract_refs(
+        {
+            "requirements": {
+                "refs": [
+                    {"ref": "Orders.Customer_ID"},
+                    {"ref": {"table": "orders", "column": "customer_id"}},
+                    {"ref": "customers.id"},
+                ],
+                "relationships": [{"from": "customers.id", "to": "orders.customer_id"}],
+            }
+        }
+    )
+
+    assert refs == (
+        {"table": "Orders", "column": "Customer_ID"},
+        {"table": "customers", "column": "id"},
+    )
+    schema = {
+        "tables": [
+            {"name": "orders", "columns": [{"name": "customer_id"}]},
+            {"name": "customers", "columns": [{"name": "id"}]},
+        ]
+    }
+    assert schema_refs_known_schema(refs, schema) is True
+    assert (
+        schema_refs_known_schema((*refs, {"table": "missing", "column": "id"}), schema)
+        is False
+    )
+    assert schema_refs_known_schema(refs, {"tables": []}) is True
+
+
+def test_memory_contract_confidence_token_and_omission_helpers_are_golden():
+    assert confidence_value(None, default=0.25) == 0.25
+    assert confidence_value(" high ", default=0.0) == 0.9
+    assert confidence_value("medium", default=0.0) == 0.7
+    assert confidence_value("low", default=0.0) == 0.4
+    assert confidence_value(2, default=0.0) == 1.0
+    assert confidence_value(-1, default=1.0) == 0.0
+    assert confidence_value("unknown", default=0.25) == 0.25
+    assert meaningful_tokens("Show gross_revenue revenue2 with X") == [
+        "gross",
+        "revenue",
+        "gross_revenue",
+        "revenue2",
+        "revenue2",
+    ]
+    assert safe_omission_summaries({"z": 2, "a": 1, "zero": 0, "neg": -1}) == [
+        {"reason": "a", "count": 1},
+        {"reason": "z", "count": 2},
+    ]
 
 
 def test_db_memory_contracts_artifact_records_enforceable_advisory_and_omissions():
