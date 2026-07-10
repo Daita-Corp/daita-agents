@@ -17,6 +17,7 @@ from ...analysis import (
     stable_fingerprint,
     validate_analysis_plan_payload,
 )
+from ...evidence import load_evidence
 
 
 async def _analysis_context_ref_errors(
@@ -79,7 +80,7 @@ class DbAnalysisPlanExecutor:
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
         analysis_id = str(task.input.get("analysis_id") or f"analysis-{operation.id}")
-        planning_context = await _load_evidence(
+        planning_context = await load_evidence(
             runtime,
             operation.id,
             task.input.get("planning_context_evidence_id"),
@@ -208,7 +209,7 @@ class DbAnalysisPlanValidationExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        plan_evidence = await _load_evidence(
+        plan_evidence = await load_evidence(
             runtime,
             operation.id,
             task.input.get("analysis_plan_evidence_id"),
@@ -451,7 +452,7 @@ class DbAnalysisReplanExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        parent = await _load_evidence(
+        parent = await load_evidence(
             runtime,
             operation.id,
             task.input.get("parent_plan_evidence_id"),
@@ -462,7 +463,7 @@ class DbAnalysisReplanExecutor:
         triggers = tuple(
             item
             for item in [
-                await _load_evidence(runtime, operation.id, evidence_id)
+                await load_evidence(runtime, operation.id, evidence_id)
                 for evidence_id in trigger_ids
             ]
             if item is not None
@@ -559,19 +560,6 @@ class DbAnalysisReplanExecutor:
                 },
             )
         ]
-
-
-async def _load_evidence(
-    runtime: Any,
-    operation_id: str,
-    evidence_id: Any,
-) -> Evidence | None:
-    if not evidence_id:
-        return None
-    for evidence in await runtime.store.list_evidence(operation_id):
-        if evidence.id == evidence_id:
-            return evidence
-    return None
 
 
 async def _accepted_dependency_evidence(

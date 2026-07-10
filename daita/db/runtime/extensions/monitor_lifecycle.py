@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from daita.runtime import Evidence, Operation, Task
 
 from ...analysis import stable_fingerprint
+from ...evidence import load_evidence
 from ...monitor_commands.types import DbMonitorValidation
 from ...monitors import (
     DbMonitor,
@@ -247,7 +248,7 @@ class DbMonitorLocalDeliveryExecutor:
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
         payload_source = dict(task.input.get("payload_source") or {})
-        report = await _load_evidence(
+        report = await load_evidence(
             runtime,
             operation.id,
             payload_source.get("report_evidence_id"),
@@ -305,26 +306,13 @@ class DbMonitorLocalDeliveryExecutor:
         ]
 
 
-async def _load_evidence(
-    runtime: Any,
-    operation_id: str,
-    evidence_id: Any,
-) -> Evidence | None:
-    if not evidence_id:
-        return None
-    for evidence in await runtime.store.list_evidence(operation_id):
-        if evidence.id == evidence_id:
-            return evidence
-    return None
-
-
 async def _load_monitor_proposal_evidence(
     runtime: Any,
     operation: Operation,
     task: Task,
     evidence_id: Any,
 ) -> Evidence | None:
-    explicit = await _load_evidence(runtime, operation.id, evidence_id)
+    explicit = await load_evidence(runtime, operation.id, evidence_id)
     if explicit is not None:
         return explicit
     evidence = await runtime.store.list_evidence(operation.id)

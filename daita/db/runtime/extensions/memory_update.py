@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from daita.runtime import Evidence, Operation, Task, TaskDependency, TaskStatus
 
 from ...analysis import stable_fingerprint, structural_schema_fingerprint
+from ...evidence import load_evidence
 from ...memory import (
     db_memory_options_from_runtime_metadata,
     db_memory_record_chunk_ids_by_key,
@@ -118,7 +119,7 @@ class DbMemoryCommitUpdateExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        proposal_evidence = await _load_evidence(
+        proposal_evidence = await load_evidence(
             runtime,
             operation.id,
             task.input.get("proposal_evidence_id"),
@@ -257,19 +258,6 @@ def _request_from_task(runtime: Any, operation: Operation, task: Task) -> DbRequ
             requested_capabilities=tuple(payload.get("requested_capabilities") or ()),
         )
     return runtime._db_request_from_operation(operation)
-
-
-async def _load_evidence(
-    runtime: Any,
-    operation_id: str,
-    evidence_id: Any,
-) -> Evidence | None:
-    if not evidence_id:
-        return None
-    for evidence in await runtime.store.list_evidence(operation_id):
-        if evidence.id == evidence_id:
-            return evidence
-    return None
 
 
 async def _task_evidence(

@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation, Task
 
+from .evidence import load_evidence
 from .query_plan import DbQueryPlan
 from .query_sql_validation import sql_fingerprint
 
@@ -134,17 +135,17 @@ class DbLLMRepairExecutor:
                 task=task,
                 diagnostics=required_inputs,
             )
-        planning_context = await _load_evidence_id(
+        planning_context = await load_evidence(
             runtime,
             operation.id,
             str(task.input.get("planning_context_evidence_id") or ""),
         )
-        failure = await _load_evidence_id(
+        failure = await load_evidence(
             runtime,
             operation.id,
             str(task.input.get("failure_evidence_id") or ""),
         )
-        prior_plan = await _load_evidence_id(
+        prior_plan = await load_evidence(
             runtime,
             operation.id,
             str(task.input.get("prior_plan_evidence_id") or ""),
@@ -344,7 +345,7 @@ async def _load_context_evidence(
     runtime: Any, task: Task, operation: Operation
 ) -> Evidence:
     context_id = str(task.input.get("planning_context_evidence_id") or "")
-    evidence = await _load_evidence_id(runtime, operation.id, context_id)
+    evidence = await load_evidence(runtime, operation.id, context_id)
     if evidence is None:
         evidence = await runtime.tasks.latest_accepted_evidence(
             operation.id, "planning.context"
@@ -352,19 +353,6 @@ async def _load_context_evidence(
     if evidence is None:
         raise RuntimeError("planning.context evidence is required")
     return evidence
-
-
-async def _load_evidence_id(
-    runtime: Any,
-    operation_id: str,
-    evidence_id: str,
-) -> Evidence | None:
-    if not evidence_id:
-        return None
-    for evidence in await runtime.store.list_evidence(operation_id):
-        if evidence.id == evidence_id:
-            return evidence
-    return None
 
 
 def _parse_plan_response(content: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:

@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation, Task
 
+from ...evidence import load_evidence, load_evidence_refs_or_latest
 from ...plan_validation import DbQueryPlanValidator
 from ...planning_context import DbPlanningContextBuilder, _evidence_ref
 from ...query_plan import DbQueryPlan
@@ -34,7 +35,7 @@ class DbPlanningContextExecutor:
         prompt = task.input.get("prompt")
         if isinstance(prompt, str) and prompt.strip():
             base_request = replace(base_request, prompt=prompt)
-        schema_evidence = await _load_evidence(
+        schema_evidence = await load_evidence(
             runtime,
             operation.id,
             task.input.get("schema_evidence_id"),
@@ -59,13 +60,13 @@ class DbPlanningContextExecutor:
                 "catalog.value_grounding.plan",
             ),
         )
-        relationship_evidence = await _load_evidence_refs_or_latest(
+        relationship_evidence = await load_evidence_refs_or_latest(
             runtime,
             operation.id,
             task.input.get("relationship_evidence_ids", ()),
             kinds=("schema.relationship_path",),
         )
-        memory_recall_evidence = await _load_evidence_refs_or_latest(
+        memory_recall_evidence = await load_evidence_refs_or_latest(
             runtime,
             operation.id,
             task.input.get("memory_recall_evidence_ids", ()),
@@ -140,12 +141,12 @@ class DbQueryPlanValidationExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        plan_evidence = await _load_evidence(
+        plan_evidence = await load_evidence(
             runtime,
             operation.id,
             task.input.get("plan_evidence_id"),
         )
-        context_evidence = await _load_evidence(
+        context_evidence = await load_evidence(
             runtime,
             operation.id,
             task.input.get("planning_context_evidence_id"),
@@ -205,19 +206,6 @@ class DbQueryPlanValidationExecutor:
             )
         )
         return evidence
-
-
-async def _load_evidence(
-    runtime: Any,
-    operation_id: str,
-    evidence_id: Any,
-) -> Evidence | None:
-    if not evidence_id:
-        return None
-    for evidence in await runtime.store.list_evidence(operation_id):
-        if evidence.id == evidence_id:
-            return evidence
-    return None
 
 
 async def _load_dependency_evidence(
@@ -281,27 +269,6 @@ async def _latest_accepted_schema_evidence(
     return evidence[-1] if evidence else None
 
 
-async def _load_evidence_refs_or_latest(
-    runtime: Any,
-    operation_id: str,
-    evidence_ids: Any,
-    *,
-    kinds: tuple[str, ...],
-) -> tuple[Evidence, ...]:
-    loaded = tuple(
-        item
-        for item in [
-            await _load_evidence(runtime, operation_id, evidence_id)
-            for evidence_id in evidence_ids or ()
-        ]
-        if item is not None
-    )
-    if loaded:
-        return loaded
-    evidence = await runtime.store.list_evidence(operation_id)
-    return tuple(item for item in evidence if item.kind in kinds and item.accepted)
-
-
 async def _load_catalog_evidence_refs_or_latest(
     runtime: Any,
     operation_id: str,
@@ -309,7 +276,7 @@ async def _load_catalog_evidence_refs_or_latest(
     *,
     kinds: tuple[str, ...],
 ) -> tuple[Evidence, ...]:
-    evidence = await _load_evidence_refs_or_latest(
+    evidence = await load_evidence_refs_or_latest(
         runtime,
         operation_id,
         evidence_ids,

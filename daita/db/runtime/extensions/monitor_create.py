@@ -9,6 +9,7 @@ from uuid import uuid4
 from daita.runtime import Evidence, Operation, Task
 
 from ...analysis import stable_fingerprint
+from ...evidence import load_evidence
 from ...monitor_commands.planner import (
     DbMonitorPlanner,
     _monitor_from_proposal,
@@ -299,26 +300,13 @@ class DbMonitorCommitCreateExecutor:
         ]
 
 
-async def _load_evidence(
-    runtime: Any,
-    operation_id: str,
-    evidence_id: Any,
-) -> Evidence | None:
-    if not evidence_id:
-        return None
-    for evidence in await runtime.store.list_evidence(operation_id):
-        if evidence.id == evidence_id:
-            return evidence
-    return None
-
-
 async def _load_monitor_proposal_evidence(
     runtime: Any,
     operation: Operation,
     task: Task,
     evidence_id: Any,
 ) -> Evidence | None:
-    explicit = await _load_evidence(runtime, operation.id, evidence_id)
+    explicit = await load_evidence(runtime, operation.id, evidence_id)
     if explicit is not None:
         return explicit
     evidence = await runtime.store.list_evidence(operation.id)
