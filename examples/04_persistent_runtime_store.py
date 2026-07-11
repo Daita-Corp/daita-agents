@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from daita.agents.agent import Agent
-from daita.db import DbRuntimeOptions
+from daita.db import DbLLMConfig, DbMemoryConfig, DbRuntimeOptions, DbSourceOptions
 
 from local_sqlite_fixtures import seed_sales_sqlite
 
@@ -31,10 +31,12 @@ def llm_options(use_live_llm: bool) -> dict[str, Any]:
         print("OPENAI_API_KEY is not set; using deterministic DB runtime output.\n")
         return {}
     return {
-        "llm_provider": "openai",
-        "model": os.getenv("OPENAI_MODEL", "gpt-5.4-mini"),
-        "api_key": api_key,
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=os.getenv("OPENAI_MODEL", "gpt-5.4-mini"),
+            api_key=api_key,
+            temperature=0,
+        )
     }
 
 
@@ -42,8 +44,8 @@ async def create_agent(db_path: Path, store_path: Path, options: dict[str, Any])
     return await Agent.from_db(
         str(db_path),
         name="PersistentRuntimeStore",
-        cache_ttl=0,
-        memory=False,
+        source_options=DbSourceOptions(cache_ttl=0),
+        memory=DbMemoryConfig(enabled=False),
         runtime=DbRuntimeOptions(store="sqlite", store_path=store_path),
         **options,
     )

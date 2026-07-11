@@ -49,6 +49,20 @@ def _json_dict(value: Mapping[str, Any] | None) -> dict[str, Any]:
     return copied
 
 
+def _optional_tuple_strings(
+    values: tuple[str, ...] | list[str] | set[str] | None,
+) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+    normalized = []
+    for value in _tuple_strings(values):
+        identifier = value.strip().lower()
+        if not identifier:
+            raise ValueError("source option identifiers must not be empty")
+        normalized.append(identifier)
+    return tuple(sorted(set(normalized)))
+
+
 @dataclass(frozen=True)
 class DbLimits:
     """Execution limits used while planning and running DB operations."""
@@ -92,12 +106,71 @@ class DbExecutionConfig:
 
 
 @dataclass(frozen=True)
+class DbSourceOptions:
+    """Typed construction options for a database source binding."""
+
+    schema: str | None = None
+    include_sample_values: bool | None = None
+    redact_pii_columns: bool | None = None
+    read_only: bool | None = None
+    query_default_limit: int | None = None
+    query_max_rows: int | None = None
+    query_max_chars: int | None = None
+    query_timeout: float | None = None
+    allowed_tables: tuple[str, ...] | list[str] | set[str] | None = None
+    blocked_tables: tuple[str, ...] | list[str] | set[str] | None = None
+    blocked_columns: tuple[str, ...] | list[str] | set[str] | None = None
+    cache_ttl: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.schema is not None and not self.schema.strip():
+            raise ValueError("source_options.schema must not be empty")
+        for name in ("query_default_limit", "query_max_rows", "query_max_chars"):
+            value = getattr(self, name)
+            if value is not None and value < 1:
+                raise ValueError(f"source_options.{name} must be at least 1")
+        if self.query_timeout is not None and self.query_timeout <= 0:
+            raise ValueError("source_options.query_timeout must be positive")
+        if self.cache_ttl is not None and self.cache_ttl < 0:
+            raise ValueError("source_options.cache_ttl must be non-negative")
+        for name in ("allowed_tables", "blocked_tables", "blocked_columns"):
+            object.__setattr__(
+                self,
+                name,
+                _optional_tuple_strings(getattr(self, name)),
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a deterministic, JSON-safe representation."""
+        values: dict[str, Any] = {}
+        for name in (
+            "schema",
+            "include_sample_values",
+            "redact_pii_columns",
+            "read_only",
+            "query_default_limit",
+            "query_max_rows",
+            "query_max_chars",
+            "query_timeout",
+            "allowed_tables",
+            "blocked_tables",
+            "blocked_columns",
+            "cache_ttl",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                values[name] = list(value) if isinstance(value, tuple) else value
+        return values
+
+
+@dataclass(frozen=True)
 class DbRuntimeConfig:
     """Configuration for a `DbRuntime` instance."""
 
     profile: str = "analyst"
     limits: DbLimits = field(default_factory=DbLimits)
     execution: DbExecutionConfig = field(default_factory=DbExecutionConfig)
+    source_options: DbSourceOptions | None = None
     plugins: tuple[Any, ...] = ()
     policies: tuple[Any, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -107,6 +180,10 @@ class DbRuntimeConfig:
             raise ValueError("profile is required")
         object.__setattr__(self, "plugins", tuple(self.plugins))
         object.__setattr__(self, "policies", tuple(self.policies))
+        if self.source_options is not None and not isinstance(
+            self.source_options, DbSourceOptions
+        ):
+            raise TypeError("source_options must be a DbSourceOptions instance")
         metadata = _json_dict(self.metadata)
         existing_options = metadata.get("from_db_options")
         from_db_options = (
@@ -151,12 +228,18 @@ class DbMemoryConfig:
     limit: int = 3
     char_budget: int = 800
     score_threshold: float = 0.45
-    backend: str = "local"
+    backend: Any = "local"
     retrieval_mode: Literal["structured", "hybrid", "embedding"] = "structured"
+    embedding_provider: str | None = None
+    embedding_model: str | None = None
+    embedder: Any | None = None
+    max_chunks: int | None = None
+    default_ttl_days: int | None = None
     embedding_available: bool = False
     structured_index: str = "sqlite_fts5"
     workspace_scope: Literal["source"] = "source"
     source_identity: str | None = None
+    calibrate: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "recall", str(self.recall or "auto"))
@@ -183,6 +266,13 @@ class DbMemoryConfig:
             raise ValueError("memory.char_budget must be non-negative")
         if not 0 <= self.score_threshold <= 1:
             raise ValueError("memory.score_threshold must be between 0 and 1")
+        if self.max_chunks is not None and self.max_chunks < 1:
+            raise ValueError("memory.max_chunks must be at least 1")
+        if self.default_ttl_days is not None and self.default_ttl_days < 1:
+            raise ValueError("memory.default_ttl_days must be at least 1")
+        if not self.enabled:
+            object.__setattr__(self, "recall", "off")
+            object.__setattr__(self, "learning", "off")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -192,13 +282,25 @@ class DbMemoryConfig:
             "limit": self.limit,
             "char_budget": self.char_budget,
             "score_threshold": self.score_threshold,
-            "backend": self.backend,
+            "backend": _memory_backend_name(self.backend),
             "retrieval_mode": self.retrieval_mode,
             "embedding_available": self.embedding_available,
             "structured_index": self.structured_index,
             "workspace_scope": self.workspace_scope,
             "source_identity": self.source_identity,
+            "calibrate": self.calibrate,
         }
+
+
+def _memory_backend_name(backend: Any) -> str:
+    if isinstance(backend, str):
+        return backend
+    name = type(backend).__name__.lower()
+    if "supabase" in name:
+        return "supabase"
+    if "local" in name:
+        return "local"
+    return name or "custom"
 
 
 @dataclass(frozen=True)

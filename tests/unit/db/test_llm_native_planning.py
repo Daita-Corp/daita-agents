@@ -1,4 +1,5 @@
 from daita.agents.agent import Agent
+from daita.db import DbLLMConfig
 from daita.plugins.sqlite import SQLitePlugin
 
 
@@ -8,7 +9,9 @@ async def test_from_db_model_config_registers_llm_planning_capability(tmp_path):
     await sqlite.execute_script("CREATE TABLE customers (id INTEGER PRIMARY KEY)")
     await sqlite.disconnect()
 
-    agent = await Agent.from_db(str(db_path), model="mock-model", llm_provider="mock")
+    agent = await Agent.from_db(
+        str(db_path), llm=DbLLMConfig(provider="mock", model="mock-model")
+    )
     try:
         inspection = await agent.describe()
     finally:
@@ -16,5 +19,5 @@ async def test_from_db_model_config_registers_llm_planning_capability(tmp_path):
 
     assert "db_runtime:db.query.plan" in inspection.capability_ids
     assert "db_runtime:query.plan.proposal" in inspection.evidence_schema_kinds
-    assert inspection.metadata["from_db_options"]["model"] == "mock-model"
+    assert inspection.metadata["from_db_options"]["llm"]["model"] == "mock-model"
     assert "api_key" not in inspection.metadata["from_db_options"]

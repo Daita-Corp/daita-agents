@@ -12,11 +12,11 @@ from daita.db import (
     DbMonitor,
     DbMonitorMutation,
     DbMonitorRun,
-    DbMonitorScheduler,
     DbMonitorState,
     DbRuntime,
-    SQLiteDbMonitorStore,
 )
+from daita.db.monitor_scheduler import DbMonitorScheduler
+from daita.db.monitors import SQLiteDbMonitorStore
 from daita.db.monitor_commands import DbMonitorValidation
 from daita.db.monitor_scheduler.observation import (
     _cursor_updates_from_plan as _observation_cursor_updates_from_plan,

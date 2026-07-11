@@ -170,8 +170,9 @@ class DbRuntimeCacheMixin:
 
 def _schema_cache_ttl(metadata: dict[str, Any]) -> float | None:
     options = _from_db_options(metadata)
-    if "cache_ttl" in options:
-        value = options.get("cache_ttl")
+    source_options = options.get("source_options")
+    if isinstance(source_options, dict) and "cache_ttl" in source_options:
+        value = source_options.get("cache_ttl")
         return None if value is None else float(value)
     return None
 

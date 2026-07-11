@@ -41,6 +41,14 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
     sql_dialect = "postgresql"
     manifest = POSTGRESQL_MANIFEST
 
+    @property
+    def schema(self) -> str:
+        return self._schema
+
+    @schema.setter
+    def schema(self, value: Any) -> None:
+        self._schema = _validate_postgresql_identifier(str(value or "public"))
+
     def __init__(
         self,
         host: str = "localhost",
@@ -97,6 +105,8 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             connection_string=connection_string,
             **kwargs,
         )
+        self.schema = _validate_postgresql_identifier(str(self.schema or "public"))
+        self.config["schema"] = self.schema
 
         logger.debug(f"PostgreSQL plugin configured for {host}:{port}/{database}")
 
@@ -187,6 +197,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         return {
             "database_type": "postgresql",
             "database_name": self.config.get("database") or "",
+            "schema": self.schema,
             "table_count": len(tables),
             "tables": tables,
             "foreign_keys": await self.foreign_keys(),
@@ -255,7 +266,7 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         args = dict(payload or {})
         schema_name, table = _postgresql_table_parts(
             str(args.get("table") or ""),
-            schema=args.get("schema"),
+            schema=args.get("schema") or self.schema,
         )
         column = _validate_postgresql_identifier(str(args.get("column") or ""))
         max_values = max(1, min(int(args.get("max_values") or 25), 100))
@@ -275,7 +286,9 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         blocked_columns = {
             str(item).lower() for item in getattr(self, "blocked_columns", set())
         }
-        profile = {
+        include_sample_values = bool(self.include_sample_values)
+        redact_pii_columns = bool(self.redact_pii_columns)
+        profile: Dict[str, Any] = {
             "table": table_ref,
             "schema": schema_name,
             "column": column,
@@ -302,7 +315,8 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 "max_profile_rows": max_profile_rows,
                 "profile_timeout_seconds": timeout_seconds,
                 "profile_only_readable_tables": True,
-                "redact_pii_columns": True,
+                "include_sample_values": include_sample_values,
+                "redact_pii_columns": redact_pii_columns,
                 "fingerprint_only_supported": True,
                 "include_source_revision": include_source_revision,
             },
@@ -314,12 +328,25 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 "profile_status": "skipped",
                 "skipped_reason": "blocked_table",
             }
-        if column.lower() in blocked_columns or _looks_sensitive_column(column):
+        column_refs = {
+            column.lower(),
+            f"{table}.{column}".lower(),
+            f"{schema_name}.{table}.{column}".lower(),
+        }
+        if blocked_columns & column_refs or (
+            redact_pii_columns and _looks_sensitive_column(column)
+        ):
             return {
                 **profile,
                 "profile_status": "skipped",
                 "redacted": True,
                 "skipped_reason": "sensitive_or_blocked_column",
+            }
+        if not include_sample_values and not fingerprint_only:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "sample_values_disabled",
             }
 
         source_info = (
@@ -609,10 +636,10 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         sql = """
         SELECT table_name
         FROM information_schema.tables
-        WHERE table_schema = 'public'
+        WHERE table_schema = $1
         ORDER BY table_name
         """
-        results = await self.query(sql)
+        results = await self.query(sql, [self.schema])
         return [row["table_name"] for row in results]
 
     async def describe(self, table: str) -> List[Dict[str, Any]]:
@@ -636,11 +663,11 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                       AND kcu.column_name = c.column_name
                 ) AS is_primary_key
             FROM information_schema.columns c
-            WHERE c.table_schema = 'public'
-              AND c.table_name = $1
+            WHERE c.table_schema = $1
+              AND c.table_name = $2
             ORDER BY ordinal_position
         """
-        return await self.query(sql, [table])
+        return await self.query(sql, [self.schema, table])
 
     async def foreign_keys(self) -> List[Dict[str, Any]]:
         """Return declared PostgreSQL foreign key relationships."""
@@ -659,10 +686,10 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
               ON ccu.constraint_name = tc.constraint_name
              AND ccu.table_schema = tc.table_schema
             WHERE tc.constraint_type = 'FOREIGN KEY'
-              AND tc.table_schema = 'public'
+              AND tc.table_schema = $1
             ORDER BY kcu.table_name, kcu.column_name
         """
-        return await self.query(sql)
+        return await self.query(sql, [self.schema])
 
     async def count_rows(self, table: str, filter: Optional[str] = None) -> int:
         """Count rows in a table with an optional WHERE clause."""

@@ -1,20 +1,20 @@
 import pytest
 
 from daita.db import (
-    DbAnswerCitation,
-    DbAnswerSynthesisPayload,
     DbIntent,
     DbIntentKind,
     DbOperationContract,
     DbRequest,
-    DbSynthesizer,
-    DbVerificationResult,
 )
 from daita.db.synthesis import (
+    DbAnswerCitation,
+    DbAnswerSynthesisPayload,
+    DbSynthesizer,
     _apply_schema_db_memory_annotation,
     build_synthesis_context,
     deterministic_synthesis_payload,
 )
+from daita.db.verification import DbVerificationResult
 from daita.runtime import AccessMode, Evidence
 
 

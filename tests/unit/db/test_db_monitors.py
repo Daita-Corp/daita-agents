@@ -7,10 +7,13 @@ from daita.db import (
     DbMonitor,
     DbRuntime,
     DbRuntimeConfig,
-    SQLiteDbMonitorStore,
 )
 from daita.db.runtime.tasks.models import DbTaskSpec
-from daita.db.monitors import DbMonitorMutation, DbMonitorState
+from daita.db.monitors import (
+    DbMonitorMutation,
+    DbMonitorState,
+    SQLiteDbMonitorStore,
+)
 from daita.runtime import (
     ApprovalStatus,
     Operation,

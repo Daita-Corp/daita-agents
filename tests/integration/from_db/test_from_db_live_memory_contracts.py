@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from daita.agents.agent import Agent
+from daita.db import DbMemoryConfig, DbSourceOptions
 from daita.runtime import OperationStatus
 
 from tests.integration.from_db.live_production_helpers import (
@@ -46,7 +47,7 @@ async def test_live_memory_metric_definition_changes_future_planning(tmp_path):
         str(db_path),
         name="LiveMemoryRecognizedRevenueContract",
         memory=_memory_option(tmp_path, "recognized-revenue-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **require_live_openai_kwargs(),
     )
 
@@ -97,15 +98,15 @@ async def test_live_memory_source_scope_and_stale_filters(tmp_path):
     other_source = await Agent.from_db(
         str(other_db_path),
         name="LiveMemoryBucket3OtherSource",
-        memory={"backend": shared_backend, "score_threshold": 0.0},
-        cache_ttl=0,
+        memory=DbMemoryConfig(backend=shared_backend, score_threshold=0.0),
+        source_options=DbSourceOptions(cache_ttl=0),
         **require_live_openai_kwargs(),
     )
     agent = await Agent.from_db(
         str(db_path),
         name="LiveMemoryBucket3SourceScope",
-        memory={"backend": shared_backend, "score_threshold": 0.0},
-        cache_ttl=0,
+        memory=DbMemoryConfig(backend=shared_backend, score_threshold=0.0),
+        source_options=DbSourceOptions(cache_ttl=0),
         **require_live_openai_kwargs(),
     )
 
@@ -217,7 +218,7 @@ async def test_live_memory_pii_candidate_rejected(tmp_path):
         str(db_path),
         name="LiveMemoryBucket3PiiCandidate",
         memory=_memory_option(tmp_path, "bucket3-pii-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **require_live_openai_kwargs(),
     )
     blocked_value = "ada@example.com"

@@ -43,6 +43,7 @@ import sqlite3
 from pathlib import Path
 
 from daita import Agent
+from daita.db import DbMemoryConfig, DbSourceOptions
 
 
 DB_PATH = Path("sales.db")
@@ -70,8 +71,8 @@ async def main() -> None:
     agent = await Agent.from_db(
         str(DB_PATH),
         mode="analyst",
-        read_only=True,
-        memory=False,
+        source_options=DbSourceOptions(read_only=True),
+        memory=DbMemoryConfig(enabled=False),
     )
 
     try:
@@ -101,8 +102,10 @@ export DATABASE_URL=postgresql://user:pass@host:5432/dbname
 agent = await Agent.from_db(
     os.environ["DATABASE_URL"],
     mode="governed",
-    read_only=True,
-    allowed_tables=["orders", "customers", "products"],
+    source_options=DbSourceOptions(
+        read_only=True,
+        allowed_tables=("orders", "customers", "products"),
+    ),
 )
 ```
 
@@ -135,15 +138,33 @@ Use `Agent.from_db()` for agents that answer questions from structured data with
 a durable operation trail.
 
 ```python
+from daita.db import (
+    DbLLMConfig,
+    DbMemoryConfig,
+    DbRuntimeConfig,
+    DbRuntimeOptions,
+    DbSourceOptions,
+)
+
 agent = await Agent.from_db(
     "postgresql://user:pass@localhost/warehouse",
     mode="governed",
-    read_only=True,
-    query_default_limit=50,
-    query_max_rows=200,
-    query_timeout=30,
+    config=DbRuntimeConfig(profile="governed"),
+    source_options=DbSourceOptions(
+        read_only=True,
+        query_default_limit=50,
+        query_max_rows=200,
+        query_timeout=30,
+    ),
+    llm=DbLLMConfig(
+        provider="openai",
+        model="gpt-5.4-mini",
+        api_key=os.environ["OPENAI_API_KEY"],
+        temperature=0,
+    ),
+    runtime=DbRuntimeOptions(store="sqlite", store_path="runtime.sqlite"),
     lineage=True,
-    memory={"enabled": True, "retrieval_mode": "structured"},
+    memory=DbMemoryConfig(enabled=True, retrieval_mode="structured"),
 )
 ```
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from daita.agents.agent import Agent
+from daita.db import DbMemoryConfig, DbSourceOptions
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.base_discoverer import BaseDiscoverer, DiscoveredStore
 
@@ -171,8 +172,8 @@ async def main() -> None:
             str(db_path),
             name="InfrastructureCatalog",
             catalog=catalog,
-            cache_ttl=0,
-            memory=False,
+            source_options=DbSourceOptions(cache_ttl=0),
+            memory=DbMemoryConfig(enabled=False),
         )
         try:
             inspection = await agent.describe()

@@ -647,6 +647,65 @@ async def test_postgresql_column_value_profile_skips_sensitive_columns_without_q
     assert evidence[0].payload["skipped_reason"] == "sensitive_or_blocked_column"
 
 
+async def test_postgresql_column_value_profile_honors_source_value_policy():
+    samples_disabled = PostgreSQLPlugin(
+        connection_string="postgresql://localhost/testdb",
+        include_sample_values=False,
+    )
+
+    async def fail_query(sql, params=None):
+        raise AssertionError("disabled sample values should not be queried")
+
+    samples_disabled.query = fail_query
+    samples_disabled.connect = _noop_connect
+    disabled_runtime = DbRuntime(plugins=(samples_disabled,))
+
+    disabled = await disabled_runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={"table": "orders", "column": "status"},
+    )
+
+    assert disabled[0].payload["profile_status"] == "skipped"
+    assert disabled[0].payload["skipped_reason"] == "sample_values_disabled"
+    assert disabled[0].payload["policy"]["include_sample_values"] is False
+
+    pii_allowed = PostgreSQLPlugin(
+        connection_string="postgresql://localhost/testdb",
+        redact_pii_columns=False,
+    )
+
+    async def fake_query(sql, params=None):
+        if "COUNT(DISTINCT" in sql:
+            return [
+                {
+                    "row_count": 1,
+                    "null_count": 0,
+                    "distinct_count": 1,
+                    "max_value_length": 17,
+                }
+            ]
+        return [{"value": "user@example.com", "count": 1}]
+
+    pii_allowed.query = fake_query
+    pii_allowed.connect = _noop_connect
+    pii_runtime = DbRuntime(plugins=(pii_allowed,))
+    profiled = await pii_runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={"table": "customers", "column": "email"},
+    )
+
+    assert profiled[0].payload["profile_status"] == "profiled"
+    assert profiled[0].payload["redacted"] is False
+    assert profiled[0].payload["top_values"] == [
+        {"value": "user@example.com", "count": 1}
+    ]
+    assert profiled[0].payload["policy"]["redact_pii_columns"] is False
+
+
 async def test_postgresql_column_value_profile_skips_when_row_count_exceeds_limit():
     postgres = _postgres()
     captured = []

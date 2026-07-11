@@ -21,7 +21,13 @@ from dotenv import load_dotenv
 
 from daita.agents.agent import Agent
 from daita.agents.conversation import ConversationHistory
-from daita.db import DbIntentKind, DbRuntimeOptions
+from daita.db import (
+    DbIntentKind,
+    DbLLMConfig,
+    DbMemoryConfig,
+    DbRuntimeOptions,
+    DbSourceOptions,
+)
 from daita.db.session_context import db_session_context_from_request
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.memory.local_backend import LocalMemoryBackend
@@ -40,10 +46,12 @@ def _require_live_openai() -> dict[str, object]:
     if not api_key:
         pytest.skip("OPENAI_API_KEY not set")
     return {
-        "llm_provider": "openai",
-        "model": os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
-        "api_key": api_key,
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
+            api_key=api_key,
+            temperature=0,
+        )
     }
 
 
@@ -74,7 +82,7 @@ async def _seed_sales_db(path: Path) -> None:
     await plugin.disconnect()
 
 
-def _memory_option(tmp_path: Path) -> dict[str, object]:
+def _memory_option(tmp_path: Path) -> DbMemoryConfig:
     embedder = MockEmbeddingProvider(dim=8)
     backend = LocalMemoryBackend(
         workspace="from-db-live-memory",
@@ -83,7 +91,7 @@ def _memory_option(tmp_path: Path) -> dict[str, object]:
         base_dir=tmp_path,
         embedder=embedder,
     )
-    return {"backend": backend, "embedder": embedder}
+    return DbMemoryConfig(backend=backend, embedder=embedder)
 
 
 def _evidence_kinds(result) -> set[str]:
@@ -113,7 +121,7 @@ async def test_from_db_live_query_uses_runtime_tasks_and_evidence(tmp_path):
     agent = await Agent.from_db(
         str(db_path),
         name="LiveFromDbQuery",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -150,7 +158,7 @@ async def test_from_db_live_sqlite_runtime_store_reopens_llm_operation_state(tmp
     first = await Agent.from_db(
         str(db_path),
         name="LiveFromDbRuntimePersistence",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
         **live_openai,
     )
@@ -165,7 +173,7 @@ async def test_from_db_live_sqlite_runtime_store_reopens_llm_operation_state(tmp
     second = await Agent.from_db(
         str(db_path),
         name="LiveFromDbRuntimePersistenceReopened",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
         **live_openai,
     )
@@ -196,7 +204,7 @@ async def test_from_db_live_catalog_assisted_join_records_relationship_path(tmp_
     agent = await Agent.from_db(
         str(db_path),
         name="LiveFromDbJoin",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -229,7 +237,7 @@ async def test_from_db_live_grounds_completed_orders_to_observed_status(tmp_path
     agent = await Agent.from_db(
         str(db_path),
         name="LiveFromDbValueGrounding",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -266,7 +274,7 @@ async def test_from_db_live_plugins_register_and_execute_runtime_capabilities(tm
         quality=True,
         lineage=True,
         memory=_memory_option(tmp_path),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -312,7 +320,7 @@ async def test_from_db_live_resolves_non_descriptive_prompt_without_looping(tmp_
     agent = await Agent.from_db(
         str(db_path),
         name="LiveFromDbAmbiguous",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -348,19 +356,19 @@ async def test_from_db_live_stateful_and_stateless_session_context(tmp_path):
         str(db_path),
         name="LiveFromDbStateful",
         stateful=True,
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai,
     )
     stateless_agent = await Agent.from_db(
         str(db_path),
         name="LiveFromDbStateless",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai,
     )
     explicit_history_agent = await Agent.from_db(
         str(db_path),
         name="LiveFromDbExplicitHistory",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai,
     )
     explicit_history = ConversationHistory(

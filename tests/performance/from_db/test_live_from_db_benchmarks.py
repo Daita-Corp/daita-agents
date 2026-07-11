@@ -26,7 +26,12 @@ import pytest
 from dotenv import load_dotenv
 
 from daita.agents.agent import Agent
-from daita.db import DbOperationResult
+from daita.db import (
+    DbLLMConfig,
+    DbMemoryConfig,
+    DbOperationResult,
+    DbSourceOptions,
+)
 from daita.db.capabilities import (
     QUERY_PLAN_PROPOSAL_EVIDENCE,
     QUERY_PLAN_VALIDATION_EVIDENCE,
@@ -36,7 +41,6 @@ from daita.db.capabilities import (
 )
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.memory.local_backend import LocalMemoryBackend
-from daita.plugins.memory.memory_plugin import MemoryPlugin
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import OperationStatus
 
@@ -76,11 +80,13 @@ def benchmark_agent_kwargs() -> dict[str, Any]:
     if not api_key:
         pytest.fail("Missing OPENAI_API_KEY for live from_db benchmarks.")
     return {
-        "llm_provider": "openai",
-        "model": os.environ.get("DAITA_BENCHMARK_MODEL")
-        or os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
-        "api_key": api_key,
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=os.environ.get("DAITA_BENCHMARK_MODEL")
+            or os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
+            api_key=api_key,
+            temperature=0,
+        )
     }
 
 
@@ -125,7 +131,7 @@ async def test_live_from_db_schema_lookup_latency_cost_and_output(
     agent = await Agent.from_db(
         str(benchmark_db_path),
         name="BenchFromDbSchema",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **benchmark_agent_kwargs,
     )
     try:
@@ -149,7 +155,7 @@ async def test_live_from_db_simple_query_latency_cost_and_output(
     agent = await Agent.from_db(
         str(benchmark_db_path),
         name="BenchFromDbQuery",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **benchmark_agent_kwargs,
     )
     try:
@@ -175,7 +181,7 @@ async def test_live_from_db_relationship_query_latency_cost_and_output(
     agent = await Agent.from_db(
         str(benchmark_db_path),
         name="BenchFromDbRelationship",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **benchmark_agent_kwargs,
     )
     try:
@@ -211,7 +217,7 @@ async def test_live_from_db_ambiguous_prompt_latency_cost_and_output(
     agent = await Agent.from_db(
         str(benchmark_db_path),
         name="BenchFromDbAmbiguous",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **benchmark_agent_kwargs,
     )
     try:
@@ -243,8 +249,8 @@ async def test_live_from_db_data_team_plugin_latency_cost_and_output(
         mode="data_team",
         quality=True,
         lineage=True,
-        memory=_memory_plugin(tmp_path),
-        cache_ttl=0,
+        memory=_memory_config(tmp_path),
+        source_options=DbSourceOptions(cache_ttl=0),
         **benchmark_agent_kwargs,
     )
     try:
@@ -285,7 +291,7 @@ async def test_live_from_db_postgres_simple_query_latency_cost_and_output(
     agent = await Agent.from_db(
         benchmark_postgres_url,
         name="BenchFromDbPostgresQuery",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **benchmark_agent_kwargs,
     )
     try:
@@ -316,7 +322,7 @@ async def test_live_from_db_postgres_relationship_query_latency_cost_and_output(
     agent = await Agent.from_db(
         benchmark_postgres_url,
         name="BenchFromDbPostgresRelationship",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **benchmark_agent_kwargs,
     )
     try:
@@ -352,7 +358,7 @@ async def test_live_from_db_postgres_ambiguous_prompt_latency_cost_and_output(
     agent = await Agent.from_db(
         benchmark_postgres_url,
         name="BenchFromDbPostgresAmbiguous",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **benchmark_agent_kwargs,
     )
     try:
@@ -444,18 +450,18 @@ async def _seed_postgres_benchmark_db(url: str) -> None:
     raise RuntimeError(f"Could not seed Postgres benchmark database: {last_error}")
 
 
-def _memory_plugin(tmp_path: Path) -> MemoryPlugin:
+def _memory_config(tmp_path: Path) -> DbMemoryConfig:
     embedder = MockEmbeddingProvider(dim=8)
-    plugin = MemoryPlugin(workspace="from-db-benchmark-memory", embedder=embedder)
-    plugin.backend = LocalMemoryBackend(
-        workspace="from-db-benchmark-memory",
-        agent_id="from-db-benchmark-memory",
-        scope="project",
-        base_dir=tmp_path,
+    return DbMemoryConfig(
+        backend=LocalMemoryBackend(
+            workspace="from-db-benchmark-memory",
+            agent_id="from-db-benchmark-memory",
+            scope="project",
+            base_dir=tmp_path,
+            embedder=embedder,
+        ),
         embedder=embedder,
     )
-    plugin.environment = "local"
-    return plugin
 
 
 async def _timed_run(agent, prompt: str, **kwargs) -> tuple[DbOperationResult, float]:

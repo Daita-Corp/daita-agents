@@ -1,4 +1,4 @@
-from daita.db import DbQueryPlan
+from daita.db.query_plan import DbQueryPlan
 
 
 def test_query_plan_normalizes_common_llm_operation_aliases():

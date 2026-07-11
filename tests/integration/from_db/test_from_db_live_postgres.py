@@ -27,7 +27,7 @@ asyncpg = pytest.importorskip(
 )
 
 from daita.agents.agent import Agent
-from daita.db import DbIntentKind
+from daita.db import DbIntentKind, DbLLMConfig, DbSourceOptions
 from daita.runtime import OperationStatus
 
 from tests.integration._harness import start_container
@@ -83,10 +83,12 @@ def live_openai_kwargs() -> dict[str, Any]:
     if not api_key:
         pytest.skip("OPENAI_API_KEY not set")
     return {
-        "llm_provider": "openai",
-        "model": os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
-        "api_key": api_key,
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
+            api_key=api_key,
+            temperature=0,
+        )
     }
 
 
@@ -125,7 +127,7 @@ async def test_from_db_live_postgres_query_uses_runtime_tasks_and_evidence(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbPostgresQuery",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
 
@@ -160,7 +162,7 @@ async def test_from_db_live_postgres_catalog_assisted_join_records_relationship_
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbPostgresJoin",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
 
@@ -194,7 +196,7 @@ async def test_from_db_live_postgres_grounds_completed_orders_to_observed_status
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbPostgresValueGrounding",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
 
@@ -224,7 +226,7 @@ async def test_from_db_live_postgres_resolves_non_descriptive_prompt_without_loo
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbPostgresAmbiguous",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
 

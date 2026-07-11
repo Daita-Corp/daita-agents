@@ -2,8 +2,8 @@ from daita.db import (
     DbIntent,
     DbIntentKind,
     DbOperationContract,
-    DbVerifier,
 )
+from daita.db.verification import DbVerifier
 from daita.runtime import AccessMode, Evidence, Task
 
 

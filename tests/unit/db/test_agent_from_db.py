@@ -1,14 +1,20 @@
 import asyncio
 import json
 import importlib.util
-import pkgutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from daita.agents.agent import Agent
-from daita.db.config.policies import SchemaPromptPolicy, ToolResultPolicy
-from daita.db import DbAgent, DbRequest, DbRuntime, DbRuntimeOptions
+from daita.db import (
+    DbAgent,
+    DbLLMConfig,
+    DbMemoryConfig,
+    DbRequest,
+    DbRuntime,
+    DbRuntimeOptions,
+    DbSourceOptions,
+)
 from daita.db.context_projection import (
     ProjectionContext,
     ProjectionMode,
@@ -539,38 +545,6 @@ async def test_agent_from_db_skill_effects_apply_during_run_before_contract_buil
     assert "skill.contract_modified" in diagnostics
 
 
-async def test_legacy_agents_db_public_import_routes_to_db_runtime(tmp_path):
-    from daita.agents.db import from_db
-
-    db_path = tmp_path / "phase13_public_import.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await from_db(str(db_path), name="phase-13-public-import")
-
-    try:
-        assert isinstance(agent, DbAgent)
-        assert isinstance(agent.runtime, DbRuntime)
-        assert agent.name == "phase-13-public-import"
-        inspection = await agent.describe()
-    finally:
-        await agent.stop()
-
-    assert inspection.plugin_ids[:2] == ("catalog", "sqlite")
-
-
-def test_legacy_agents_db_package_exposes_only_from_db_bridge():
-    import daita.agents.db as legacy_db
-    import daita.db as db
-
-    assert legacy_db.from_db is db.from_db
-    assert legacy_db.__all__ == ["from_db"]
-    assert [module.name for module in pkgutil.iter_modules(legacy_db.__path__)] == []
-    assert importlib.util.find_spec("daita.agents.db.builder") is None
-    assert importlib.util.find_spec("daita.agents.db.runtime") is None
-    assert importlib.util.find_spec("daita.agents.db.query") is None
-    assert importlib.util.find_spec("daita.agents.db.config") is None
-
-
 def test_db_runtime_facade_does_not_export_generic_agent_orchestrator():
     import daita.db as db
 
@@ -647,14 +621,15 @@ async def test_agent_from_db_describe_is_runtime_inspection_not_legacy_db_contex
         str(db_path),
         name="Warehouse",
         mode="governed",
-        query_default_limit=25,
-        query_max_rows=100,
-        query_max_chars=1000,
-        query_timeout=12,
-        allowed_tables=["orders"],
-        blocked_tables=["payments"],
-        blocked_columns=["email"],
-        prompt="Revenue is net of tax.",
+        source_options=DbSourceOptions(
+            query_default_limit=25,
+            query_max_rows=100,
+            query_max_chars=1000,
+            query_timeout=12,
+            allowed_tables=("orders",),
+            blocked_tables=("payments",),
+            blocked_columns=("email",),
+        ),
     )
 
     try:
@@ -674,9 +649,18 @@ async def test_agent_from_db_describe_is_runtime_inspection_not_legacy_db_contex
         "max_tasks": 20,
         "max_evidence_items": 50,
     }
-    assert inspection.metadata["from_db_options"]["prompt"] == (
-        "Revenue is net of tax."
-    )
+    assert inspection.metadata["from_db_options"]["source_options"] == {
+        "include_sample_values": True,
+        "redact_pii_columns": True,
+        "read_only": True,
+        "query_default_limit": 25,
+        "query_max_rows": 100,
+        "query_max_chars": 1000,
+        "query_timeout": 12,
+        "allowed_tables": ["orders"],
+        "blocked_tables": ["payments"],
+        "blocked_columns": ["email"],
+    }
     assert inspection.to_dict()["limits"]["max_rows"] == 100
     assert sqlite_plugin.read_only is True
     assert sqlite_plugin.query_default_limit == 25
@@ -730,7 +714,7 @@ async def test_agent_from_db_memory_config_registers_initialized_memory_plugin(
     agent = await Agent.from_db(
         str(db_path),
         name="memory-config-test",
-        memory={"enabled": True},
+        memory=DbMemoryConfig(enabled=True),
     )
 
     try:
@@ -754,7 +738,7 @@ async def test_agent_from_db_memory_config_uses_runtime_setup_not_initialize(tmp
     agent = await Agent.from_db(
         str(db_path),
         name="memory-setup-test",
-        memory={"enabled": True},
+        memory=DbMemoryConfig(enabled=True),
     )
 
     try:
@@ -859,7 +843,7 @@ async def test_agent_from_db_memory_false_opts_out(tmp_path):
     db_path = tmp_path / "phase1_memory_opt_out.sqlite"
     await _seed_sqlite(db_path)
 
-    agent = await Agent.from_db(str(db_path), memory=False)
+    agent = await Agent.from_db(str(db_path), memory=DbMemoryConfig(enabled=False))
 
     try:
         inspection = await agent.describe()
@@ -879,30 +863,34 @@ async def test_agent_from_db_embedding_modes_require_explicit_embedder(tmp_path)
     await _seed_sqlite(db_path)
 
     with pytest.raises(ValueError, match="requires an explicit embedding"):
-        await Agent.from_db(str(db_path), memory={"retrieval_mode": "hybrid"})
+        await Agent.from_db(
+            str(db_path), memory=DbMemoryConfig(retrieval_mode="hybrid")
+        )
 
     with pytest.raises(ValueError, match="requires an explicit embedding"):
-        await Agent.from_db(str(db_path), memory={"retrieval_mode": "embedding"})
+        await Agent.from_db(
+            str(db_path), memory=DbMemoryConfig(retrieval_mode="embedding")
+        )
 
 
-async def test_agent_from_db_rejects_legacy_memory_true(tmp_path):
+async def test_agent_from_db_rejects_boolean_memory_option(tmp_path):
     db_path = tmp_path / "phase1_memory_true_rejected.sqlite"
     await _seed_sqlite(db_path)
 
     with pytest.raises(
-        ValueError,
-        match="memory must be False, a DbMemoryConfig, a config mapping, or None",
+        TypeError,
+        match="memory must be a DbMemoryConfig instance",
     ):
         await Agent.from_db(str(db_path), memory=True)
 
 
-async def test_agent_from_db_rejects_memory_plugin_argument(tmp_path):
+async def test_agent_from_db_rejects_non_config_memory_option(tmp_path):
     db_path = tmp_path / "phase1_memory_plugin_rejected.sqlite"
     await _seed_sqlite(db_path)
 
     with pytest.raises(
-        ValueError,
-        match="memory must be False, a DbMemoryConfig, a config mapping, or None",
+        TypeError,
+        match="memory must be a DbMemoryConfig instance",
     ):
         await Agent.from_db(str(db_path), memory=MemoryPlugin())
 
@@ -912,7 +900,7 @@ async def test_agent_from_db_memory_config_can_provide_backend(tmp_path):
     await _seed_sqlite(db_path)
     backend = MagicMock()
 
-    agent = await Agent.from_db(str(db_path), memory={"backend": backend})
+    agent = await Agent.from_db(str(db_path), memory=DbMemoryConfig(backend=backend))
 
     try:
         memory = agent.runtime.registry.get_plugin("memory")
@@ -933,8 +921,7 @@ async def test_agent_from_db_calibrate_memory_stores_structured_unit_conventions
 
     agent = await Agent.from_db(
         str(db_path),
-        memory={"backend": backend},
-        calibrate_memory=True,
+        memory=DbMemoryConfig(backend=backend, calibrate=True),
     )
 
     try:
@@ -974,8 +961,7 @@ async def test_agent_from_db_calibrate_memory_skips_when_exact_marker_exists(
 
     agent = await Agent.from_db(
         source,
-        memory={"backend": backend},
-        calibrate_memory=True,
+        memory=DbMemoryConfig(backend=backend, calibrate=True),
     )
 
     try:
@@ -995,7 +981,7 @@ async def test_agent_from_db_does_not_register_generic_memory_tools(tmp_path):
     backend.list_by_category = AsyncMock(return_value=[])
     backend.remember = AsyncMock(return_value={"status": "success"})
 
-    agent = await Agent.from_db(str(db_path), memory={"backend": backend})
+    agent = await Agent.from_db(str(db_path), memory=DbMemoryConfig(backend=backend))
 
     try:
         inspection = await agent.describe()
@@ -1024,7 +1010,7 @@ async def test_agent_from_db_mode_defaults_are_owned_by_db_runtime_factory(tmp_p
     assert "data_quality" in inspection.plugin_ids
     assert "lineage" in inspection.plugin_ids
     assert "data_quality:quality.profile" in inspection.capability_ids
-    assert sqlite_plugin.query_timeout == 60
+    assert sqlite_plugin.query_timeout == 30
     assert sqlite_plugin.query_max_rows == 200
 
 
@@ -1065,7 +1051,7 @@ async def test_agent_from_db_mode_quality_override_wins_on_new_path(tmp_path):
     assert inspection.profile == "data_team"
     assert "data_quality" not in inspection.plugin_ids
     assert "lineage" in inspection.plugin_ids
-    assert sqlite_plugin.query_timeout == 60
+    assert sqlite_plugin.query_timeout == 30
 
 
 async def test_agent_from_db_data_team_can_configure_memory_backend(tmp_path):
@@ -1076,7 +1062,7 @@ async def test_agent_from_db_data_team_can_configure_memory_backend(tmp_path):
     agent = await Agent.from_db(
         str(db_path),
         mode="data_team",
-        memory={"backend": backend},
+        memory=DbMemoryConfig(backend=backend),
     )
 
     try:
@@ -1092,45 +1078,47 @@ async def test_agent_from_db_data_team_can_configure_memory_backend(tmp_path):
     assert "memory:memory.context" in inspection.context_provider_ids
 
 
-async def test_agent_from_db_accepts_legacy_construction_metadata_on_new_path(tmp_path):
+async def test_agent_from_db_uses_typed_source_and_llm_configuration(tmp_path):
     db_path = tmp_path / "phase13_metadata.sqlite"
     await _seed_sqlite(db_path)
-    schema_prompt_policy = SchemaPromptPolicy()
-    tool_result_policy = ToolResultPolicy(max_rows_inline=3)
+    llm = DbLLMConfig(
+        provider="openai",
+        model="gpt-4o-mini",
+        api_key="sk-test",
+        temperature=0.2,
+    )
 
     agent = await Agent.from_db(
         str(db_path),
         name="metadata-agent",
-        model="gpt-4o-mini",
-        api_key="sk-test",
-        llm_provider="openai",
-        temperature=0.2,
-        prompt="Revenue is net of tax.",
-        db_schema="analytics",
-        include_sample_values=False,
-        redact_pii_columns=False,
-        cache_ttl=3600,
-        toolkit=None,
-        schema_prompt_policy=schema_prompt_policy,
-        tool_result_policy=tool_result_policy,
+        llm=llm,
+        source_options=DbSourceOptions(
+            schema="main",
+            include_sample_values=False,
+            redact_pii_columns=False,
+            cache_ttl=3600,
+        ),
     )
 
     try:
         metadata = agent.runtime.config.metadata["from_db_options"]
+        service_config = agent.runtime.db_llm_service.config
+        source = agent.runtime.registry.get_plugin("sqlite")
     finally:
         await agent.stop()
 
-    assert metadata["model"] == "gpt-4o-mini"
-    assert metadata["llm_provider"] == "openai"
-    assert metadata["temperature"] == 0.2
-    assert metadata["prompt"] == "Revenue is net of tax."
-    assert metadata["db_schema"] == "analytics"
-    assert metadata["include_sample_values"] is False
-    assert metadata["redact_pii_columns"] is False
-    assert metadata["cache_ttl"] == 3600
-    assert metadata["schema_prompt_policy"]["preferred_strategy"] == "auto"
-    assert metadata["tool_result_policy"]["max_rows_inline"] == 3
-    assert "api_key" not in metadata
+    assert metadata["llm"]["provider"] == "openai"
+    assert metadata["llm"]["model"] == "gpt-4o-mini"
+    assert metadata["llm"]["temperature"] == 0.2
+    assert metadata["source_options"]["schema"] == "main"
+    assert metadata["source_options"]["include_sample_values"] is False
+    assert metadata["source_options"]["redact_pii_columns"] is False
+    assert metadata["source_options"]["cache_ttl"] == 3600
+    assert source.schema == "main"
+    assert source.include_sample_values is False
+    assert source.redact_pii_columns is False
+    assert "sk-test" not in json.dumps(metadata)
+    assert service_config is llm
 
 
 async def test_agent_from_db_does_not_profile_schema_during_construction(tmp_path):
@@ -1150,22 +1138,6 @@ async def test_agent_from_db_does_not_profile_schema_during_construction(tmp_pat
 
     assert "sqlite" in inspection.plugin_ids
     source._execute_schema_inspect.assert_not_awaited()
-
-
-async def test_agent_from_db_toolkit_override_is_runtime_metadata(tmp_path):
-    db_path = tmp_path / "phase13_toolkit_override.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(str(db_path), mode="simple", toolkit="analyst")
-
-    try:
-        metadata = agent.runtime.config.metadata["from_db_options"]
-        inspection = await agent.describe()
-    finally:
-        await agent.stop()
-
-    assert inspection.profile == "simple"
-    assert metadata["toolkit"] == "analyst"
 
 
 async def test_agent_from_db_rejects_unknown_mode_on_new_path(tmp_path):

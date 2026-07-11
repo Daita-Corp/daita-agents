@@ -49,6 +49,17 @@ class SQLitePlugin(BaseDatabasePlugin):
     sql_dialect = "sqlite"
     manifest = SQLITE_MANIFEST
 
+    @property
+    def schema(self) -> str:
+        return self._schema
+
+    @schema.setter
+    def schema(self, value: Any) -> None:
+        schema = str(value or "main").strip().lower()
+        if schema != "main":
+            raise ValueError("SQLite source schema must be 'main'")
+        self._schema = schema
+
     def __init__(
         self,
         path: str = ":memory:",
@@ -304,7 +315,9 @@ class SQLitePlugin(BaseDatabasePlugin):
         blocked_columns = {
             item.lower() for item in getattr(self, "blocked_columns", set())
         }
-        profile = {
+        include_sample_values = bool(self.include_sample_values)
+        redact_pii_columns = bool(self.redact_pii_columns)
+        profile: Dict[str, Any] = {
             "table": table,
             "column": column,
             "profile_kind": "categorical_values",
@@ -331,7 +344,8 @@ class SQLitePlugin(BaseDatabasePlugin):
                 "profile_timeout_seconds": timeout_seconds,
                 "fingerprint_only_supported": True,
                 "include_source_revision": include_source_revision,
-                "redact_pii_columns": True,
+                "include_sample_values": include_sample_values,
+                "redact_pii_columns": redact_pii_columns,
             },
             "profiled_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -341,12 +355,21 @@ class SQLitePlugin(BaseDatabasePlugin):
                 "profile_status": "skipped",
                 "skipped_reason": "blocked_table",
             }
-        if column.lower() in blocked_columns or _looks_sensitive_column(column):
+        column_refs = {column.lower(), f"{table}.{column}".lower()}
+        if blocked_columns & column_refs or (
+            redact_pii_columns and _looks_sensitive_column(column)
+        ):
             return {
                 **profile,
                 "profile_status": "skipped",
                 "redacted": True,
                 "skipped_reason": "sensitive_or_blocked_column",
+            }
+        if not include_sample_values and not fingerprint_only:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "sample_values_disabled",
             }
 
         source_info = (

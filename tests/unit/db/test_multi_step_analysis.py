@@ -3,7 +3,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from daita.agents.agent import Agent
-from daita.db import DbRequest, DbRuntime, DbRuntimeConfig
+from daita.db import DbLLMConfig, DbRequest, DbRuntime, DbRuntimeConfig
 from daita.db.analysis import DbAnalysisPlan, analysis_metadata
 from daita.db.llm_service import DbLLMResponse
 from daita.plugins.catalog import CatalogPlugin
@@ -205,7 +205,9 @@ async def test_from_db_model_config_registers_analysis_capabilities(tmp_path):
     await sqlite.execute_script("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
     await sqlite.disconnect()
 
-    agent = await Agent.from_db(str(db_path), model="mock-model", llm_provider="mock")
+    agent = await Agent.from_db(
+        str(db_path), llm=DbLLMConfig(provider="mock", model="mock-model")
+    )
     try:
         inspection = await agent.describe()
     finally:

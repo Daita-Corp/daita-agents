@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import json
-from typing import Any
+from typing import Any, Iterable
 
 from daita.runtime import Evidence, Operation
 
@@ -375,9 +375,9 @@ class DbPlanningContextBuilder:
                 "query_max_chars": getattr(source, "query_max_chars", None),
             },
             redaction_policy={
-                "redact_pii_columns": bool(options.get("redact_pii_columns", True)),
+                "redact_pii_columns": bool(getattr(source, "redact_pii_columns", True)),
                 "include_sample_values": bool(
-                    options.get("include_sample_values", False)
+                    getattr(source, "include_sample_values", True)
                 ),
             },
             session_context=session_context,
@@ -499,18 +499,20 @@ def _db_memory_contract_diagnostics(artifact: dict[str, Any]) -> dict[str, Any]:
         return {}
     applicability = artifact.get("source_schema_applicability")
     applicability = dict(applicability) if isinstance(applicability, dict) else {}
+    enforced_count = (
+        applicability.get("enforced_count")
+        if "enforced_count" in applicability
+        else len(artifact.get("enforceable_contracts") or ())
+    )
+    advisory_count = (
+        applicability.get("advisory_count")
+        if "advisory_count" in applicability
+        else len(artifact.get("advisory_contracts") or ())
+    )
     return {
         "candidate_count": int(applicability.get("contract_candidate_count") or 0),
-        "enforced_count": int(
-            applicability.get("enforced_count")
-            if "enforced_count" in applicability
-            else len(artifact.get("enforceable_contracts") or ())
-        ),
-        "advisory_count": int(
-            applicability.get("advisory_count")
-            if "advisory_count" in applicability
-            else len(artifact.get("advisory_contracts") or ())
-        ),
+        "enforced_count": int(enforced_count or 0),
+        "advisory_count": int(advisory_count or 0),
         "omitted_count": int(applicability.get("omitted_count") or 0),
         "omitted_reasons": {
             str(reason): int(count)

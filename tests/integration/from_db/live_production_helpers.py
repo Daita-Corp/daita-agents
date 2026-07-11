@@ -14,9 +14,19 @@ import pytest
 from dotenv import load_dotenv
 
 from daita.agents.agent import Agent
-from daita.db import DbRuntimeOptions
+from daita.db import (
+    DbAgent,
+    DbLLMConfig,
+    DbRuntime,
+    DbRuntimeConfig,
+    DbRuntimeOptions,
+    DbSourceOptions,
+)
+from daita.db.llm_service import db_llm_service_from_config
+from daita.plugins.catalog import CatalogPlugin
+from daita.plugins.catalog.persistence import catalog_profile_key
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import OperationStatus
+from daita.runtime import OperationStatus, SQLiteRuntimeStore
 
 load_dotenv(Path.cwd() / ".env")
 load_dotenv(Path.cwd() / ".env.local", override=False)
@@ -219,18 +229,19 @@ def require_live_openai_kwargs() -> dict[str, object]:
     if not api_key:
         pytest.skip("OPENAI_API_KEY not set")
     return {
-        "llm_provider": "openai",
-        "model": os.environ.get("OPENAI_TEST_MODEL", DEFAULT_LIVE_OPENAI_MODEL),
-        "api_key": api_key,
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=os.environ.get("OPENAI_TEST_MODEL", DEFAULT_LIVE_OPENAI_MODEL),
+            api_key=api_key,
+            temperature=0,
+        )
     }
 
 
 async def seed_rich_sqlite_schema(db_path: Path) -> Path:
     """Create the shared rich SQLite fixture used by live from_db tests."""
     plugin = SQLitePlugin(path=str(db_path))
-    await plugin.execute_script(
-        """
+    await plugin.execute_script("""
         PRAGMA foreign_keys = ON;
 
         DROP TABLE IF EXISTS monitor_actions;
@@ -387,8 +398,7 @@ async def seed_rich_sqlite_schema(db_path: Path) -> Path:
 
         INSERT INTO monitor_actions (id, status, note) VALUES
             (1, 'pending', 'fixture row for approval and resume tests');
-    """
-    )
+    """)
     await plugin.disconnect()
     return db_path
 
@@ -434,18 +444,60 @@ async def create_live_sqlite_from_db_agent(
     stateful: bool = False,
 ):
     """Build a live OpenAI ``Agent.from_db`` over SQLite with persisted state."""
+    if read_only is False:
+        return await _create_writable_sqlite_runtime_agent(
+            db_path,
+            runtime_path=runtime_path,
+            name=name,
+        )
     return await Agent.from_db(
         str(db_path),
         name=name,
-        cache_ttl=0,
+        source_options=DbSourceOptions(
+            cache_ttl=0,
+            read_only=read_only,
+            allowed_tables=allowed_tables,
+            blocked_tables=blocked_tables,
+            blocked_columns=blocked_columns,
+        ),
         runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
-        read_only=read_only,
-        allowed_tables=allowed_tables,
-        blocked_tables=blocked_tables,
-        blocked_columns=blocked_columns,
         stateful=stateful,
         **require_live_openai_kwargs(),
     )
+
+
+async def _create_writable_sqlite_runtime_agent(
+    db_path: Path,
+    *,
+    runtime_path: Path,
+    name: str,
+) -> DbAgent:
+    """Build the direct runtime used by write-governance contract tests."""
+    llm = require_live_openai_kwargs()["llm"]
+    assert isinstance(llm, DbLLMConfig)
+    source_options = DbSourceOptions(read_only=False, cache_ttl=0)
+    source_plugin = SQLitePlugin(path=str(db_path), **source_options.to_dict())
+    profile_key = catalog_profile_key(str(db_path))
+    runtime = DbRuntime(
+        source=str(db_path),
+        config=DbRuntimeConfig(
+            source_options=source_options,
+            plugins=(CatalogPlugin(auto_persist=False), source_plugin),
+            metadata={
+                "from_db_options": {
+                    "catalog_profile_key": profile_key,
+                    "catalog_store_id": f"from_db:{profile_key}",
+                    "catalog_keys": [f"from_db:{profile_key}"],
+                    "llm": llm.safe_metadata(),
+                    "source_options": source_options.to_dict(),
+                }
+            },
+        ),
+        store=SQLiteRuntimeStore(runtime_path),
+        db_llm_service=db_llm_service_from_config(llm, agent_id=name),
+    )
+    await runtime.setup(agent_id=name)
+    return DbAgent(runtime=runtime, name=name)
 
 
 async def create_live_postgres_from_db_agent(
@@ -462,12 +514,14 @@ async def create_live_postgres_from_db_agent(
     return await Agent.from_db(
         url,
         name=name,
-        cache_ttl=0,
+        source_options=DbSourceOptions(
+            cache_ttl=0,
+            read_only=read_only,
+            allowed_tables=allowed_tables,
+            blocked_tables=blocked_tables,
+            blocked_columns=blocked_columns,
+        ),
         runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
-        read_only=read_only,
-        allowed_tables=allowed_tables,
-        blocked_tables=blocked_tables,
-        blocked_columns=blocked_columns,
         **require_live_openai_kwargs(),
     )
 

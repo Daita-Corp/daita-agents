@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from daita.agents.agent import Agent
 from daita.core.tracing import TraceType, get_trace_manager
-from daita.db import DbRuntime
+from daita.db import DbRuntime, DbSourceOptions
 from daita.db.llm_service import DbLLMResponse
 from daita.db.models import (
     DbIntent,
@@ -143,7 +143,11 @@ async def test_prompt_monitor_loop_result_has_trace_correlation(tmp_path):
     planner = FakeTraceMonitorPlanner()
     host_context = HostRuntimeContext(services={"db_agent_planner": planner})
     with host_runtime_context(host_context):
-        agent = await Agent.from_db(str(db_path), name="MonitorTraceTest", cache_ttl=0)
+        agent = await Agent.from_db(
+            str(db_path),
+            name="MonitorTraceTest",
+            source_options=DbSourceOptions(cache_ttl=0),
+        )
 
     try:
         result = await agent.run_detailed("List monitors", session_id="monitor-session")
@@ -180,7 +184,11 @@ async def test_blocked_operation_keeps_trace_correlation(tmp_path):
     _reset_traces()
     db_path = tmp_path / "blocked_trace.sqlite"
     await _seed_sqlite(db_path)
-    agent = await Agent.from_db(str(db_path), name="BlockedTraceTest", cache_ttl=0)
+    agent = await Agent.from_db(
+        str(db_path),
+        name="BlockedTraceTest",
+        source_options=DbSourceOptions(cache_ttl=0),
+    )
 
     try:
         result = await agent.run_detailed(

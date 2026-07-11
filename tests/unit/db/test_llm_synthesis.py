@@ -4,7 +4,14 @@ from uuid import uuid4
 import pytest
 
 from daita.agents.agent import Agent
-from daita.db import DbIntent, DbIntentKind, DbOperationContract, DbRequest, DbRuntime
+from daita.db import (
+    DbIntent,
+    DbIntentKind,
+    DbLLMConfig,
+    DbOperationContract,
+    DbRequest,
+    DbRuntime,
+)
 from daita.db.llm_service import DbLLMResponse
 from daita.db.synthesis import build_synthesis_context, validate_synthesis_payload
 from daita.plugins.catalog import CatalogPlugin
@@ -217,7 +224,9 @@ async def test_from_db_model_registers_answer_synthesis_capability(tmp_path):
     await sqlite.execute_script("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
     await sqlite.disconnect()
 
-    agent = await Agent.from_db(str(db_path), model="mock-model", llm_provider="mock")
+    agent = await Agent.from_db(
+        str(db_path), llm=DbLLMConfig(provider="mock", model="mock-model")
+    )
     try:
         inspection = await agent.describe()
     finally:

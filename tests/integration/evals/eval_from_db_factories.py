@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from daita.agents.agent import Agent
+from daita.db import DbLLMConfig, DbMemoryConfig, DbSourceOptions
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.memory.local_backend import LocalMemoryBackend
-from daita.plugins.memory.memory_plugin import MemoryPlugin
 from daita.plugins.sqlite import SQLitePlugin
 
 from tests.integration._harness import start_container
@@ -333,7 +333,7 @@ async def create_sqlite_from_db_eval_agent(
     agent = await Agent.from_db(
         str(path),
         name="EvalFromDbSQLite",
-        cache_ttl=cache_ttl,
+        source_options=DbSourceOptions(cache_ttl=cache_ttl),
         **_openai_kwargs(),
     )
     return FromDbEvalTarget(agent, name="EvalFromDbSQLite")
@@ -353,8 +353,8 @@ async def create_sqlite_data_team_from_db_eval_agent(
         mode="data_team",
         quality=True,
         lineage=True,
-        memory=_memory_plugin(Path(memory_dir)),
-        cache_ttl=cache_ttl,
+        memory=_memory_config(Path(memory_dir)),
+        source_options=DbSourceOptions(cache_ttl=cache_ttl),
         **_openai_kwargs(),
     )
     return FromDbEvalTarget(agent, name="EvalFromDbSQLiteDataTeam")
@@ -370,7 +370,7 @@ async def create_sqlite_rich_from_db_benchmark_agent(
     agent = await Agent.from_db(
         str(path),
         name="BenchmarkFromDbSQLiteRich",
-        cache_ttl=cache_ttl,
+        source_options=DbSourceOptions(cache_ttl=cache_ttl),
         **_openai_kwargs(),
     )
     return FromDbEvalTarget(agent, name="BenchmarkFromDbSQLiteRich")
@@ -399,7 +399,7 @@ async def create_postgres_from_db_eval_agent(
         agent = await Agent.from_db(
             url,
             name="EvalFromDbPostgres",
-            cache_ttl=cache_ttl,
+            source_options=DbSourceOptions(cache_ttl=cache_ttl),
             **_openai_kwargs(),
         )
     except Exception:
@@ -419,7 +419,7 @@ async def create_postgres_rich_from_db_benchmark_agent(
     return await _postgres_agent_from_sql(
         RICH_BENCHMARK_POSTGRES_SQL,
         name="BenchmarkFromDbPostgresRich",
-        cache_ttl=cache_ttl,
+        source_options=DbSourceOptions(cache_ttl=cache_ttl),
         tag_prefix="daita-from-db-rich-eval-pg",
     )
 
@@ -432,7 +432,7 @@ async def create_postgres_wide_from_db_benchmark_agent(
     return await _postgres_agent_from_sql(
         wide_benchmark_postgres_sql(table_count),
         name="BenchmarkFromDbPostgresWide",
-        cache_ttl=cache_ttl,
+        source_options=DbSourceOptions(cache_ttl=cache_ttl),
         tag_prefix="daita-from-db-wide-eval-pg",
     )
 
@@ -463,7 +463,7 @@ async def _postgres_agent_from_sql(
         agent = await Agent.from_db(
             url,
             name=name,
-            cache_ttl=cache_ttl,
+            source_options=DbSourceOptions(cache_ttl=cache_ttl),
             **_openai_kwargs(),
         )
     except Exception:
@@ -512,22 +512,24 @@ async def _seed_postgres_script(url: str, sql: str) -> None:
 
 def _openai_kwargs() -> dict[str, Any]:
     return {
-        "llm_provider": "openai",
-        "model": os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
-        "api_key": os.environ["OPENAI_API_KEY"],
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
+            api_key=os.environ["OPENAI_API_KEY"],
+            temperature=0,
+        )
     }
 
 
-def _memory_plugin(base_dir: Path) -> MemoryPlugin:
+def _memory_config(base_dir: Path) -> DbMemoryConfig:
     embedder = MockEmbeddingProvider(dim=8)
-    plugin = MemoryPlugin(workspace="from-db-eval-memory", embedder=embedder)
-    plugin.backend = LocalMemoryBackend(
-        workspace="from-db-eval-memory",
-        agent_id="from-db-eval-memory",
-        scope="project",
-        base_dir=base_dir,
+    return DbMemoryConfig(
+        backend=LocalMemoryBackend(
+            workspace="from-db-eval-memory",
+            agent_id="from-db-eval-memory",
+            scope="project",
+            base_dir=base_dir,
+            embedder=embedder,
+        ),
         embedder=embedder,
     )
-    plugin.environment = "local"
-    return plugin

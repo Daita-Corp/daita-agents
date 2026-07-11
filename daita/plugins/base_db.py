@@ -19,6 +19,10 @@ from .base import ConnectorPlugin
 logger = logging.getLogger(__name__)
 
 
+def _normalized_identifiers(values: Any) -> set[str]:
+    return {str(value).strip().lower() for value in values or () if str(value).strip()}
+
+
 class BaseDatabasePlugin(ConnectorPlugin):
     """
     Base class for all database plugins with common connection management.
@@ -58,9 +62,13 @@ class BaseDatabasePlugin(ConnectorPlugin):
         self.query_max_rows = kwargs.get("query_max_rows", 200)
         self.query_max_chars = kwargs.get("query_max_chars", 50000)
         self.query_timeout = kwargs.get("query_timeout", self.timeout)
-        self.allowed_tables = set(kwargs.get("allowed_tables") or [])
-        self.blocked_tables = set(kwargs.get("blocked_tables") or [])
-        self.blocked_columns = set(kwargs.get("blocked_columns") or [])
+        self.schema = kwargs.get("schema")
+        self.include_sample_values = kwargs.get("include_sample_values", True)
+        self.redact_pii_columns = kwargs.get("redact_pii_columns", True)
+        self.allowed_tables = _normalized_identifiers(kwargs.get("allowed_tables"))
+        self._allowed_tables_restricted = kwargs.get("allowed_tables") is not None
+        self.blocked_tables = _normalized_identifiers(kwargs.get("blocked_tables"))
+        self.blocked_columns = _normalized_identifiers(kwargs.get("blocked_columns"))
 
         logger.debug(
             f"{self.__class__.__name__} initialized with config keys: {list(kwargs.keys())}"
@@ -214,7 +222,7 @@ class BaseDatabasePlugin(ConnectorPlugin):
                 f"SQL guardrail rejected blocked table(s): {', '.join(sorted(blocked))}",
                 field="sql",
             )
-        if allowed_tables:
+        if getattr(self, "_allowed_tables_restricted", bool(allowed_tables)):
             disallowed = {
                 table.short_key
                 for table in analysis.tables

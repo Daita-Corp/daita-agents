@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from daita.evals import EvalSuite, EvalSuiteConfig
 from daita.evals.analysis import RunEvidence, extract_run_evidence, summarize_stability
 from daita.evals.assertions.runtime import (
@@ -60,6 +62,22 @@ def test_load_json_config(tmp_path):
     )
 
     assert EvalSuiteConfig.from_file(path).name == "json-evals"
+
+
+def test_eval_targets_require_an_explicit_factory_boundary():
+    with pytest.raises(ValueError, match="from_db"):
+        EvalSuiteConfig.model_validate(
+            {
+                "name": "invalid-from-db-bag",
+                "agent": {
+                    "from_db": {
+                        "source": ":memory:",
+                        "kwargs": {"read_only": False},
+                    }
+                },
+                "cases": [{"id": "case-1", "prompt": "hello"}],
+            }
+        )
 
 
 async def test_suite_runs_factory_agent_and_writes_artifacts(tmp_path):

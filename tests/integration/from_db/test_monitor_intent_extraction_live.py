@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 
 from daita.agents.agent import Agent
+from daita.db import DbSourceOptions
 from daita.db.planner_protocol import (
     DbPlannerAction,
     DbPlannerActionKind,
@@ -297,7 +298,7 @@ async def _agent_for_monitor_intent(
         agent = await Agent.from_db(
             source,
             name=f"LiveMonitorIntentExtraction-{case_id}",
-            cache_ttl=0,
+            source_options=DbSourceOptions(cache_ttl=0),
         )
     return agent, planner
 

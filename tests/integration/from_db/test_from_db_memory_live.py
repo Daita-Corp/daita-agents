@@ -19,7 +19,7 @@ import pytest
 from dotenv import load_dotenv
 
 from daita.agents.agent import Agent
-from daita.db import DbRequest
+from daita.db import DbLLMConfig, DbMemoryConfig, DbRequest, DbSourceOptions
 from daita.plugins.memory.local_backend import LocalMemoryBackend
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import OperationStatus, WorkerRuntime, WorkerRuntimeOptions
@@ -37,10 +37,12 @@ def _require_live_openai() -> dict[str, object]:
     if not api_key:
         pytest.skip("OPENAI_API_KEY not set")
     return {
-        "llm_provider": "openai",
-        "model": os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
-        "api_key": api_key,
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
+            api_key=api_key,
+            temperature=0,
+        )
     }
 
 
@@ -164,13 +166,13 @@ def _memory_option(
     limit: int = 3,
     char_budget: int = 800,
     score_threshold: float = 0.0,
-) -> dict[str, Any]:
-    return {
-        "backend": _memory_backend(tmp_path, workspace),
-        "limit": limit,
-        "char_budget": char_budget,
-        "score_threshold": score_threshold,
-    }
+) -> DbMemoryConfig:
+    return DbMemoryConfig(
+        backend=_memory_backend(tmp_path, workspace),
+        limit=limit,
+        char_budget=char_budget,
+        score_threshold=score_threshold,
+    )
 
 
 async def _source_identity(agent) -> str:
@@ -353,7 +355,7 @@ async def test_live_explicit_db_memory_changes_future_planning(tmp_path):
         str(db_path),
         name="LiveMemoryCoreExplicit",
         memory=_memory_option(tmp_path, "core-explicit-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -398,7 +400,7 @@ async def test_live_default_structured_memory_uses_no_embedder_or_vector_recall(
         str(db_path),
         name="LiveMemoryNoEmbedder",
         memory=_memory_option(tmp_path, "structured-no-embedder-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -439,8 +441,8 @@ async def test_live_source_and_activity_filters_apply_before_planning(tmp_path):
     first = await Agent.from_db(
         str(db_path),
         name="LiveMemorySourceA",
-        memory={"backend": shared_backend, "score_threshold": 0.0},
-        cache_ttl=0,
+        memory=DbMemoryConfig(backend=shared_backend, score_threshold=0.0),
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
     other_db = tmp_path / "source-filter-other.sqlite"
@@ -448,8 +450,8 @@ async def test_live_source_and_activity_filters_apply_before_planning(tmp_path):
     second = await Agent.from_db(
         str(other_db),
         name="LiveMemorySourceB",
-        memory={"backend": shared_backend, "score_threshold": 0.0},
-        cache_ttl=0,
+        memory=DbMemoryConfig(backend=shared_backend, score_threshold=0.0),
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -544,7 +546,7 @@ async def test_live_alias_and_schema_ref_memory_ranks_above_broad_match(tmp_path
         str(db_path),
         name="LiveMemoryRanking",
         memory=_memory_option(tmp_path, "ranking-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -587,7 +589,7 @@ async def test_live_unit_convention_memory_affects_answer(tmp_path):
         str(db_path),
         name="LiveMemoryUnitConvention",
         memory=_memory_option(tmp_path, "unit-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -627,7 +629,7 @@ async def test_live_direct_contract_payload_remains_advisory(tmp_path):
         str(db_path),
         name="LiveMemoryRawContractAdvisory",
         memory=_memory_option(tmp_path, "raw-contract-advisory-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -674,7 +676,7 @@ async def test_live_explicit_metric_memory_projects_enforceable_contract(tmp_pat
         str(db_path),
         name="LiveMemoryExplicitContract",
         memory=_memory_option(tmp_path, "explicit-contract-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -704,8 +706,8 @@ async def test_live_policy_blocked_contract_is_not_enforceable(tmp_path):
     writer = await Agent.from_db(
         str(db_path),
         name="LiveMemoryPolicyBlockedWriter",
-        memory={"backend": backend, "score_threshold": 0.0},
-        cache_ttl=0,
+        memory=DbMemoryConfig(backend=backend, score_threshold=0.0),
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
     try:
@@ -716,9 +718,10 @@ async def test_live_policy_blocked_contract_is_not_enforceable(tmp_path):
     agent = await Agent.from_db(
         str(db_path),
         name="LiveMemoryPolicyBlockedContract",
-        memory={"backend": backend, "score_threshold": 0.0},
-        blocked_columns=["refunds.amount"],
-        cache_ttl=0,
+        memory=DbMemoryConfig(backend=backend, score_threshold=0.0),
+        source_options=DbSourceOptions(
+            blocked_columns=("refunds.amount",), cache_ttl=0
+        ),
         **_require_live_openai(),
     )
 
@@ -757,7 +760,7 @@ async def test_live_explicit_unit_convention_projects_and_enforces_conversion(tm
         str(db_path),
         name="LiveMemoryExplicitUnitContract",
         memory=_memory_option(tmp_path, "explicit-unit-contract-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -813,7 +816,7 @@ async def test_live_worker_promotes_unit_convention_from_accepted_evidence(tmp_p
         str(db_path),
         name="LiveMemoryWorkerUnit",
         memory=_memory_option(tmp_path, "worker-unit-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -847,7 +850,7 @@ async def test_live_catalog_cited_value_alias_write_path(tmp_path):
         str(db_path),
         name="LiveMemoryWorkerAlias",
         memory=_memory_option(tmp_path, "worker-alias-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -910,7 +913,7 @@ async def test_live_pii_db_memory_candidate_is_rejected(tmp_path):
         str(db_path),
         name="LiveMemoryPiiRejection",
         memory=_memory_option(tmp_path, "pii-rejection-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -960,7 +963,7 @@ async def test_live_golden_memory_improves_metric_answer(tmp_path):
         str(db_path),
         name="LiveMemoryGoldenImproves",
         memory=_memory_option(tmp_path, "golden-improves-memory"),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -999,7 +1002,7 @@ async def test_live_golden_context_budget_under_memory_load(tmp_path):
             limit=3,
             char_budget=280,
         ),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -1043,17 +1046,17 @@ async def test_live_golden_structured_memory_persists_after_restart(tmp_path):
     first = await Agent.from_db(
         str(db_path),
         name="LiveMemoryGoldenPersistFirst",
-        memory={
-            "backend": LocalMemoryBackend(
+        memory=DbMemoryConfig(
+            backend=LocalMemoryBackend(
                 workspace=workspace,
                 agent_id=workspace,
                 scope="project",
                 base_dir=memory_dir,
                 embedder=None,
             ),
-            "score_threshold": 0.0,
-        },
-        cache_ttl=0,
+            score_threshold=0.0,
+        ),
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 
@@ -1074,17 +1077,17 @@ async def test_live_golden_structured_memory_persists_after_restart(tmp_path):
     second = await Agent.from_db(
         str(db_path),
         name="LiveMemoryGoldenPersistSecond",
-        memory={
-            "backend": LocalMemoryBackend(
+        memory=DbMemoryConfig(
+            backend=LocalMemoryBackend(
                 workspace=workspace,
                 agent_id=workspace,
                 scope="project",
                 base_dir=memory_dir,
                 embedder=None,
             ),
-            "score_threshold": 0.0,
-        },
-        cache_ttl=0,
+            score_threshold=0.0,
+        ),
+        source_options=DbSourceOptions(cache_ttl=0),
         **_require_live_openai(),
     )
 

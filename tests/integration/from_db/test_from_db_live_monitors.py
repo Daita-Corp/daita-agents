@@ -30,7 +30,15 @@ asyncpg = pytest.importorskip(
 )
 
 from daita.agents.agent import Agent
-from daita.db import DbAgent, DbMonitor, DbMonitorScheduler, DbRuntime, DbRuntimeConfig
+from daita.db import (
+    DbAgent,
+    DbLLMConfig,
+    DbMonitor,
+    DbRuntime,
+    DbRuntimeConfig,
+    DbSourceOptions,
+)
+from daita.db.monitor_scheduler import DbMonitorScheduler
 from daita.db.llm_service import db_llm_service_from_config
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
 from daita.plugins.catalog import CatalogPlugin
@@ -115,10 +123,12 @@ def live_openai_kwargs() -> dict[str, Any]:
     if not api_key:
         pytest.skip("OPENAI_API_KEY not set")
     return {
-        "llm_provider": "openai",
-        "model": os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
-        "api_key": api_key,
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
+            api_key=api_key,
+            temperature=0,
+        )
     }
 
 
@@ -157,7 +167,7 @@ async def test_live_monitor_metric_observation_records_runtime_tasks(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorObservation",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -209,7 +219,7 @@ async def test_live_monitor_threshold_trigger_runs_investigation_with_analysis_s
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorInvestigation",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -267,7 +277,7 @@ async def test_live_monitor_scheduled_report_reads_live_db_uses_llm_and_delivers
         seeded_postgres_url,
         name="LiveFromDbMonitorReportDelivery",
         plugins=(delivery_plugin,),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -331,15 +341,15 @@ async def test_live_monitor_scheduled_report_reads_live_db_uses_llm_and_delivers
 
 
 async def test_live_monitor_write_proposal_requires_approval_and_resumes(
+    tmp_path,
     seeded_postgres_url,
     live_openai_kwargs,
 ):
-    agent = await Agent.from_db(
+    agent = await _runtime_agent_with_sqlite_store(
         seeded_postgres_url,
-        name="LiveFromDbMonitorWriteApproval",
+        tmp_path / "monitor-write-runtime.sqlite",
+        live_openai_kwargs,
         read_only=False,
-        cache_ttl=0,
-        **live_openai_kwargs,
     )
     monitor = _monitor(
         "approved_monitor_write",
@@ -386,15 +396,15 @@ async def test_live_monitor_write_proposal_requires_approval_and_resumes(
 
 
 async def test_live_monitor_destructive_write_is_denied_before_execution(
+    tmp_path,
     seeded_postgres_url,
     live_openai_kwargs,
 ):
-    agent = await Agent.from_db(
+    agent = await _runtime_agent_with_sqlite_store(
         seeded_postgres_url,
-        name="LiveFromDbMonitorDestructiveWrite",
+        tmp_path / "monitor-destructive-runtime.sqlite",
+        live_openai_kwargs,
         read_only=False,
-        cache_ttl=0,
-        **live_openai_kwargs,
     )
     monitor = _monitor(
         "destructive_monitor_write",
@@ -440,7 +450,7 @@ async def test_live_monitor_consecutive_match_and_cooldown_state_is_durable(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorCooldown",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -480,7 +490,7 @@ async def test_live_monitor_sql_observation_scope_guard_blocks_cross_table_read(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorScopeGuard",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -528,7 +538,7 @@ async def test_live_monitor_tick_lease_prevents_duplicate_action(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorLease",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -577,7 +587,7 @@ async def test_live_prompt_monitor_control_plane_uses_model_planned_runtime(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorCommands",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         plugins=(delivery_plugin,),
         **live_openai_kwargs,
     )
@@ -786,7 +796,7 @@ async def test_live_monitor_governed_delivery_requests_approval_and_resumes_once
         seeded_postgres_url,
         name="LiveFromDbMonitorGovernedDelivery",
         plugins=(delivery_plugin,),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -846,7 +856,7 @@ async def test_live_monitor_repeated_scheduler_ticks_do_not_duplicate_actions(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorSoak",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -891,7 +901,7 @@ async def test_live_monitor_llm_provider_failure_falls_back_for_report_synthesis
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorLLMFallback",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **broken_llm_kwargs,
     )
     monitor = _monitor(
@@ -928,7 +938,7 @@ async def test_live_multi_monitor_scheduler_mixed_states(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorMixedScheduler",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     active = _monitor(
@@ -1224,6 +1234,8 @@ async def _runtime_agent_with_sqlite_store(
     read_only: bool = True,
     plugins: tuple[Any, ...] = (),
 ) -> DbAgent:
+    llm = live_openai_kwargs["llm"]
+    assert isinstance(llm, DbLLMConfig)
     source_plugin = PostgreSQLPlugin(
         connection_string=url,
         read_only=read_only,
@@ -1242,18 +1254,13 @@ async def _runtime_agent_with_sqlite_store(
             ),
             metadata={
                 "from_db_options": {
-                    "llm_provider": live_openai_kwargs["llm_provider"],
-                    "model": live_openai_kwargs["model"],
-                    "temperature": live_openai_kwargs.get("temperature"),
+                    "llm": llm.safe_metadata(),
                 }
             },
         ),
         store=SQLiteRuntimeStore(store_path),
         db_llm_service=db_llm_service_from_config(
-            llm_provider=str(live_openai_kwargs["llm_provider"]),
-            model=str(live_openai_kwargs["model"]),
-            api_key=str(live_openai_kwargs["api_key"]),
-            temperature=live_openai_kwargs.get("temperature"),
+            llm,
             agent_id="LiveFromDbPersistentMonitor",
         ),
     )

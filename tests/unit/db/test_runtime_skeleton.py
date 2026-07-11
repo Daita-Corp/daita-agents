@@ -11,8 +11,8 @@ from daita.db import (
     DbRuntime,
     DbRuntimeConfig,
     DbRuntimeInspection,
-    DbMonitorScheduler,
 )
+from daita.db.monitor_scheduler import DbMonitorScheduler
 from daita.db.runtime.tasks import DbTaskContext, DbTaskExecutor, DbTaskRuntime
 from daita.db.runtime.tasks import execution as task_execution
 from daita.db.runtime.tasks.models import DbTaskSpec

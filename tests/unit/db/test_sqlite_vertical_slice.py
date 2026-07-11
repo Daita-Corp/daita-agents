@@ -2633,6 +2633,54 @@ async def test_sqlite_column_value_profile_fingerprint_only_respects_sensitive_c
         assert "row_count" not in evidence.payload
 
 
+async def test_sqlite_column_value_profile_honors_source_value_policy():
+    sqlite = SQLitePlugin(path=":memory:", include_sample_values=False)
+    runtime = DbRuntime(plugins=(sqlite,))
+    await runtime.setup(agent_id="db-runtime-test")
+
+    async def fail_query(sql, params=None):
+        raise AssertionError("disabled sample values should not be queried")
+
+    sqlite.query = fail_query
+    try:
+        disabled = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={"table": "orders", "column": "status"},
+        )
+    finally:
+        await runtime.teardown()
+
+    assert disabled[0].payload["profile_status"] == "skipped"
+    assert disabled[0].payload["skipped_reason"] == "sample_values_disabled"
+    assert disabled[0].payload["policy"]["include_sample_values"] is False
+
+    sqlite = SQLitePlugin(path=":memory:", redact_pii_columns=False)
+    runtime = DbRuntime(plugins=(sqlite,))
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script("""
+        CREATE TABLE customers (email TEXT NOT NULL);
+        INSERT INTO customers (email) VALUES ('user@example.com');
+        """)
+    try:
+        profiled = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={"table": "customers", "column": "email"},
+        )
+    finally:
+        await runtime.teardown()
+
+    assert profiled[0].payload["profile_status"] == "profiled"
+    assert profiled[0].payload["redacted"] is False
+    assert profiled[0].payload["top_values"] == [
+        {"value": "user@example.com", "count": 1}
+    ]
+    assert profiled[0].payload["policy"]["redact_pii_columns"] is False
+
+
 async def test_sqlite_column_value_profile_skips_when_row_count_exceeds_limit():
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(sqlite,))

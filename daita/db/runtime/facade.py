@@ -33,7 +33,7 @@ from daita.skills import SkillResolution, SkillResolver
 from ..evidence import evidence_in_task_plan_order
 from ..loop import DbAgentLoop, DbLoopResult
 from ..llm_agent_planner import DbLLMAgentPlanner
-from ..llm_service import DbLLMService, db_llm_service_from_metadata
+from ..llm_service import DbLLMService
 from ..models import (
     DbIntent,
     DbIntentKind,
@@ -125,9 +125,7 @@ class DbRuntime(
         self.runtime_id = runtime_id or f"db-runtime-{uuid4()}"
         self.verifier = DbVerifier()
         self.synthesizer = DbSynthesizer()
-        self.db_llm_service = db_llm_service or db_llm_service_from_metadata(
-            self.config.metadata
-        )
+        self.db_llm_service = db_llm_service or DbLLMService(None)
         self.host_services = dict(host_services or {})
         if "audit_fingerprint_key" in self.host_services:
             audit_fingerprint_key = self.host_services.pop("audit_fingerprint_key")

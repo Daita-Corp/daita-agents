@@ -28,6 +28,27 @@ def make_plugin(**kwargs):
     return plugin
 
 
+async def test_schema_selection_drives_postgresql_introspection_queries():
+    plugin = make_plugin(schema="analytics")
+    calls = []
+
+    async def fake_query(sql, params=None):
+        calls.append((sql, params))
+        return []
+
+    plugin.query = fake_query
+
+    await plugin.tables()
+    await plugin.describe("orders")
+    await plugin.foreign_keys()
+
+    assert plugin.schema == "analytics"
+    assert calls[0][1] == ["analytics"]
+    assert calls[1][1] == ["analytics", "orders"]
+    assert calls[2][1] == ["analytics"]
+    assert all("table_schema = 'public'" not in sql for sql, _ in calls)
+
+
 # ---------------------------------------------------------------------------
 # BaseDatabasePlugin._normalize_sql  (static method, no mock needed)
 # ---------------------------------------------------------------------------

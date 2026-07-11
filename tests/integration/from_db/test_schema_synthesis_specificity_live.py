@@ -16,7 +16,7 @@ import pytest
 from dotenv import load_dotenv
 
 from daita.agents.agent import Agent
-from daita.db import DbRequest, DbRuntime
+from daita.db import DbLLMConfig, DbRequest, DbRuntime, DbSourceOptions
 from daita.db.llm_service import db_llm_service_from_config
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
@@ -39,10 +39,12 @@ def _require_live_openai() -> str:
 
 def _live_openai_kwargs(model: str) -> dict[str, object]:
     return {
-        "llm_provider": "openai",
-        "model": model,
-        "api_key": os.environ["OPENAI_API_KEY"],
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=model,
+            api_key=os.environ["OPENAI_API_KEY"],
+            temperature=0,
+        )
     }
 
 
@@ -94,10 +96,12 @@ async def _runtime_for_specificity_schema(tmp_path, model: str) -> DbRuntime:
     return DbRuntime(
         plugins=(CatalogPlugin(auto_persist=False), sqlite),
         db_llm_service=db_llm_service_from_config(
-            model=model,
-            llm_provider="openai",
-            api_key=os.environ["OPENAI_API_KEY"],
-            temperature=0,
+            DbLLMConfig(
+                provider="openai",
+                model=model,
+                api_key=os.environ["OPENAI_API_KEY"],
+                temperature=0,
+            )
         ),
     )
 
@@ -232,7 +236,7 @@ async def test_live_openai_agent_from_db_schema_query_uses_same_scope(tmp_path):
     agent = await Agent.from_db(
         str(db_path),
         name="LiveSchemaSpecificityAgent",
-        cache_ttl=3600,
+        source_options=DbSourceOptions(cache_ttl=3600),
         **_live_openai_kwargs(model),
     )
 
