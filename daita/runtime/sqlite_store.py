@@ -742,7 +742,7 @@ class SQLiteRuntimeStore(RuntimeStore):
             (
                 request.approval_id,
                 request.operation_id,
-                request.status.value,
+                request.status_value,
                 _json(request.to_dict()),
             ),
         )

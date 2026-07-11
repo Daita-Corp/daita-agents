@@ -70,28 +70,32 @@ class DbLoopTaskBatchExecutor:
         remaining = list(indexed)
         concurrency_disabled = False
         while remaining:
-            cohort, preparations = (
-                ((), ())
-                if concurrency_disabled
-                else self._concurrent_read_cohort(tuple(remaining))
-            )
-            preparing = bool(
-                preparations and await self._task_ready(preparations[0][1], operation)
-            )
-            if preparing:
-                wave = await self._execute_serial((preparations[0],), operation)
+            cohort: tuple[tuple[int, Task], ...]
+            preparations: tuple[tuple[int, Task], ...]
+            if concurrency_disabled:
+                cohort, preparations = (), ()
+            else:
+                cohort, preparations = self._concurrent_read_cohort(tuple(remaining))
+            preparation = next(iter(preparations), None)
+            if preparation is not None and await self._task_ready(
+                preparation[1], operation
+            ):
+                preparing = True
+                wave = await self._execute_serial((preparation,), operation)
             elif (
                 len(cohort) > 1
                 and not preparations
                 and await self._tasks_ready(cohort, operation)
                 and await self._concurrent_batch_eligible(cohort, operation)
             ):
+                preparing = False
                 wave = await self._execute_concurrent(
                     cohort,
                     operation,
                     max_concurrency=max_concurrency,
                 )
             else:
+                preparing = False
                 wave = await self._execute_serial((remaining[0],), operation)
             outcomes.extend(wave)
             if preparing and any(
@@ -255,12 +259,10 @@ class DbLoopTaskBatchExecutor:
         outcomes: list[DbLoopTaskOutcome] = []
         for offset in range(0, len(indexed), max_concurrency):
             chunk = indexed[offset : offset + max_concurrency]
-            async with asyncio.TaskGroup() as group:
-                children = [
-                    group.create_task(self._execute_one(index, task, operation))
-                    for index, task in chunk
-                ]
-            outcomes.extend(child.result() for child in children)
+            chunk_outcomes = await asyncio.gather(
+                *(self._execute_one(index, task, operation) for index, task in chunk)
+            )
+            outcomes.extend(chunk_outcomes)
         return tuple(outcomes)
 
     async def _execute_serial(

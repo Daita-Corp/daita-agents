@@ -422,6 +422,13 @@ def test_planner_evidence_schemas_are_declared_by_runtime_extension_plugin():
     }.issubset(kinds)
 
 
+def test_runtime_extension_plugin_requires_setup_before_executor_access():
+    plugin = DbRuntimePlanningPlugin()
+
+    with pytest.raises(RuntimeError, match="not set up"):
+        _ = plugin.runtime
+
+
 def test_new_protocol_and_loop_code_do_not_construct_raw_tasks_outside_task_owner():
     repo = Path(__file__).parents[3]
     checked = [

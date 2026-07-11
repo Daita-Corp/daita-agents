@@ -85,7 +85,7 @@ class InMemoryApprovalChannel:
                     return request
                 if request.status is not ApprovalStatus.PENDING:
                     raise ValueError(
-                        f"approval {approval_id} is already {request.status.value}; "
+                        f"approval {approval_id} is already {request.status_value}; "
                         "create a new approval request to renew it"
                     )
                 updated = replace(request, status=status)
@@ -101,7 +101,7 @@ class InMemoryApprovalChannel:
                     approval_id=request.approval_id,
                     trace_id=trace_id,
                     span_id=span_id,
-                    message=(f"Approval {approval_id} marked {status.value}."),
+                    message=(f"Approval {approval_id} marked {updated.status_value}."),
                     payload={"approval": updated.to_dict()},
                 )
                 if self._event_committer is not None:

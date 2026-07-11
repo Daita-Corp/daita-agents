@@ -400,6 +400,12 @@ markers = [
 line-length = 88
 target-version = ['py311']
 
+[tool.pyright]
+include = ["daita"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false
+
 [tool.mypy]
 python_version = "3.11"
 check_untyped_defs = true

@@ -58,10 +58,16 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
 
     def __init__(self, *, llm_capable: bool = False) -> None:
         self.llm_capable = llm_capable
-        self.runtime = None
+        self._runtime: Any | None = None
+
+    @property
+    def runtime(self) -> Any:
+        if self._runtime is None:
+            raise RuntimeError("DB runtime planning plugin is not set up")
+        return self._runtime
 
     async def setup(self, context: PluginContext) -> None:
-        self.runtime = context.services.require("db_runtime")
+        self._runtime = context.services.require("db_runtime")
 
     def declare_capabilities(self) -> tuple[Capability, ...]:
         common_schema = {"type": "object"}

@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable, TYPE_CHECKING
 
-from daita.runtime import Evidence, GovernanceResult, Operation, Task, TaskDependency
+from daita.runtime import (
+    Capability,
+    Evidence,
+    GovernanceResult,
+    Operation,
+    OperationSnapshot,
+    Task,
+    TaskDependency,
+)
+
+if TYPE_CHECKING:
+    from daita.plugins import ExtensionRegistry
+
+    from ..types import _AnalysisPlanState
 
 from ...analysis import analysis_metadata
 from ...evidence import DbEvidenceStore
@@ -12,6 +25,69 @@ from ...fingerprints import persisted_fingerprint
 
 
 class DbRuntimeAnalysisCheckpointMixin:
+    if TYPE_CHECKING:
+        registry: ExtensionRegistry
+
+        def _analysis_progress_payload(
+            self,
+            snapshot: OperationSnapshot | None,
+            *,
+            plan_evidence: Evidence | None = None,
+        ) -> dict[str, Any]: ...
+
+        async def inspect_operation(
+            self,
+            operation_id: str,
+        ) -> OperationSnapshot | None: ...
+
+        async def _analysis_task(
+            self,
+            operation: Operation,
+            capability: Capability,
+            *,
+            input: dict[str, Any],
+            metadata: dict[str, Any],
+            dependencies: tuple[TaskDependency, ...],
+            sequence: int,
+        ) -> Task: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
+
+        async def _analysis_plan_state(
+            self,
+            operation_id: str,
+            *,
+            plan_evidence: Evidence,
+            validation_evidence: Evidence,
+        ) -> _AnalysisPlanState: ...
+
+        def _accepted_analysis_step_evidence_map(
+            self,
+            evidence: Iterable[Evidence],
+            *,
+            analysis_id: str,
+        ) -> dict[str, tuple[Evidence, ...]]: ...
+
+        async def _execute_analysis_synthesis_task(
+            self,
+            operation: Operation,
+            tasks: list[Task],
+            evidence_store: DbEvidenceStore,
+            *,
+            analysis_id: str,
+            step_id: str,
+            plan_evidence: Evidence,
+            cited_evidence: tuple[Evidence, ...],
+            partial: bool = False,
+            pause_reason: str | None = None,
+            remaining_step_ids: tuple[str, ...] = (),
+        ) -> Evidence: ...
+
     async def _execute_analysis_checkpoint_task(
         self,
         operation: Operation,

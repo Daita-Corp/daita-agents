@@ -80,6 +80,7 @@ class RuntimeFactProvider(Protocol):
         capability: Capability | None = None,
     ) -> Mapping[str, Any]:
         """Return domain facts for policy evaluation."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -1156,9 +1157,10 @@ class RuntimeKernel:
                 },
             )
         else:
-            operation = await self.store.load_operation(operation_id)
-            if operation is None:
+            loaded_operation = await self.store.load_operation(operation_id)
+            if loaded_operation is None:
                 raise KeyError(operation_id)
+            operation = loaded_operation
         task = await self.plan_task(
             operation_id=operation.id,
             capability_id=capability.id,
@@ -1563,7 +1565,7 @@ class RuntimeKernel:
                     capability=capability,
                     message=(
                         f"Policy {decision.owner}:{decision.policy_id} returned "
-                        f"{decision.effect.value}."
+                        f"{decision.effect_value}."
                     ),
                     payload={"decision": decision.to_dict()},
                     policy_id=decision.policy_id,

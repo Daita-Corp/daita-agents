@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 import time
-from typing import Any
+from typing import Any, Iterable, Mapping, TYPE_CHECKING
 from uuid import uuid4
 
 from daita.runtime import (
@@ -18,6 +18,15 @@ from daita.runtime import (
     TaskDependency,
     TaskStatus,
 )
+
+if TYPE_CHECKING:
+    from daita.runtime import RuntimeStore
+
+    from ...llm_service import DbLLMService
+    from ...models import DbRuntimeConfig
+    from ...verification import DbVerifier
+    from ..tasks.models import DbTaskPlan
+    from ..tasks.runtime import DbTaskRuntime
 
 from ...analysis import (
     DbAnalysisPlan,
@@ -75,6 +84,30 @@ class DbRuntimeAnalysisMixin(
     DbRuntimeAnalysisBudgetMixin,
     DbRuntimeAnalysisResumeMixin,
 ):
+    if TYPE_CHECKING:
+        db_llm_service: DbLLMService
+        tasks: DbTaskRuntime
+        store: RuntimeStore
+        config: DbRuntimeConfig
+        verifier: DbVerifier
+
+        async def _record_operation_result(
+            self,
+            result: DbOperationResult,
+            *,
+            operation: Operation | None = None,
+        ) -> DbOperationResult: ...
+
+        def remember_schema_evidence(self, evidence: Evidence) -> None: ...
+
+        async def plan_task_specs(
+            self,
+            operation: Operation,
+            specs: Iterable[DbTaskSpec],
+            *,
+            contract: DbOperationContract | Mapping[str, Any] | None = None,
+        ) -> DbTaskPlan: ...
+
     def _should_route_multi_step_analysis(
         self,
         request: DbRequest,
@@ -1266,7 +1299,7 @@ class DbRuntimeAnalysisMixin(
 
     def _accepted_analysis_step_evidence_map(
         self,
-        evidence: tuple[Evidence, ...],
+        evidence: Iterable[Evidence],
         *,
         analysis_id: str,
     ) -> dict[str, tuple[Evidence, ...]]:
@@ -1291,7 +1324,7 @@ class DbRuntimeAnalysisMixin(
     @staticmethod
     def _analysis_steps_in_order(plan: DbAnalysisPlan) -> tuple[Any, ...]:
         remaining = {step.id: step for step in plan.steps}
-        ordered = []
+        ordered: list[Any] = []
         while remaining:
             ready = [
                 step

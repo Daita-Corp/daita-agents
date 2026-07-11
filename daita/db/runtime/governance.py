@@ -798,7 +798,7 @@ def _approval_action_summary(action: dict[str, Any]) -> dict[str, Any]:
 
 
 def _metadata_summary(metadata: dict[str, Any]) -> dict[str, Any]:
-    safe_values = {}
+    safe_values: dict[str, Any] = {}
     for key in ("runtime_id", "intent_kind", "access", "governance_stage"):
         if key in metadata:
             safe_values[key] = metadata[key]

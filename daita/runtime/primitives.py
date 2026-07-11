@@ -713,17 +713,20 @@ class PolicyDecision:
                 raise TypeError("policy decision evidence must be Evidence")
         object.__setattr__(self, "metadata", _dict(self.metadata))
 
+    @property
+    def effect_value(self) -> str:
+        """Return the canonical serialized policy effect."""
+        return (
+            self.effect.value if isinstance(self.effect, PolicyEffect) else self.effect
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "policy_id": self.policy_id,
             "owner": self.owner,
             "policy_version": self.policy_version,
             "policy_identity": self.policy_identity,
-            "effect": (
-                self.effect.value
-                if isinstance(self.effect, PolicyEffect)
-                else self.effect
-            ),
+            "effect": self.effect_value,
             "reason": self.reason,
             "severity": self.severity.value,
             "operation_id": self.operation_id,
@@ -958,6 +961,15 @@ class ApprovalRequest:
             _validate_dotted_id(self.owner, "approval owner")
         object.__setattr__(self, "metadata", _dict(self.metadata))
 
+    @property
+    def status_value(self) -> str:
+        """Return the canonical serialized approval status."""
+        return (
+            self.status.value
+            if isinstance(self.status, ApprovalStatus)
+            else self.status
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "approval_id": self.approval_id,
@@ -966,11 +978,7 @@ class ApprovalRequest:
             "proposed_action": self.proposed_action,
             "risk": self.risk.value,
             "evidence_ids": list(self.evidence_ids),
-            "status": (
-                self.status.value
-                if isinstance(self.status, ApprovalStatus)
-                else self.status
-            ),
+            "status": self.status_value,
             "requested_by_policy_id": self.requested_by_policy_id,
             "owner": self.owner,
             "metadata": self.metadata,
@@ -1049,6 +1057,7 @@ class Executor(Protocol):
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         """Execute a task and return typed evidence."""
+        ...
 
 
 @runtime_checkable
@@ -1060,6 +1069,7 @@ class Policy(Protocol):
 
     def applies_to(self, request: Any, operation_type: str) -> bool:
         """Return whether this policy applies to the operation type."""
+        ...
 
     def modify_contract(self, contract: Any) -> Any:
         """Return a modified operation contract."""
@@ -1097,6 +1107,7 @@ class RuntimeStore(Protocol):
 
     async def list_operations(self) -> list[Operation]:
         """Return persisted operation snapshots in creation order."""
+        ...
 
     async def save_task(self, task: Task) -> None:
         """Persist a task snapshot."""
@@ -1106,6 +1117,7 @@ class RuntimeStore(Protocol):
 
     async def list_tasks(self, operation_id: str | None = None) -> list[Task]:
         """Return persisted task snapshots, optionally for one operation."""
+        ...
 
     async def claim_task(
         self,
@@ -1137,6 +1149,7 @@ class RuntimeStore(Protocol):
         lease_id: str | None = None,
     ) -> bool:
         """Atomically persist a blocked task transition and related events."""
+        ...
 
     async def commit_task_started(self, task: Task, event: RuntimeEvent) -> None:
         """Atomically persist a claimed/running task and start event."""
@@ -1150,6 +1163,7 @@ class RuntimeStore(Protocol):
         lease_id: str | None = None,
     ) -> bool:
         """Atomically persist task success, output evidence, and success event."""
+        ...
 
     async def commit_task_failed(
         self,
@@ -1159,6 +1173,7 @@ class RuntimeStore(Protocol):
         lease_id: str | None = None,
     ) -> bool:
         """Atomically persist task failure and failure event."""
+        ...
 
     async def commit_approval_update(
         self,
@@ -1206,21 +1221,26 @@ class RuntimeStore(Protocol):
 
     async def list_evidence(self, operation_id: str) -> list[Evidence]:
         """Return evidence associated with an operation."""
+        ...
 
     async def list_events(self, operation_id: str | None = None) -> list[RuntimeEvent]:
         """Return persisted runtime events, optionally for one operation."""
+        ...
 
     async def list_policy_decisions(
         self, operation_id: str | None = None
     ) -> list[PolicyDecision]:
         """Return persisted policy decisions, optionally for one operation."""
+        ...
 
     async def list_governance_audit_records(
         self, operation_id: str | None = None
     ) -> list[GovernanceAuditRecord]:
         """Return immutable governance audit records, optionally for one operation."""
+        ...
 
     async def list_approval_requests(
         self, operation_id: str | None = None
     ) -> list[ApprovalRequest]:
         """Return persisted approval requests, optionally for one operation."""
+        ...

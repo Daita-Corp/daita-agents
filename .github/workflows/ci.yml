@@ -66,6 +66,40 @@ jobs:
             daita/db/monitors.py \
             daita/db/runtime/monitors.py
 
+  pyright:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Type-check with Pyright
+        # Expand this gate as the existing repository-wide Pyright backlog is resolved.
+        run: |
+          npx --yes pyright@1.1.411 \
+            daita/core/exceptions.py \
+            daita/runtime/primitives.py \
+            daita/runtime/kernel.py \
+            daita/runtime/approvals.py \
+            daita/runtime/store.py \
+            daita/runtime/sqlite_store.py \
+            daita/db/loop/execution.py \
+            daita/db/monitor_scheduler \
+            daita/db/runtime/analysis \
+            daita/db/runtime/extensions/analysis.py \
+            daita/db/runtime/extensions/plugin.py
+
   test:
     runs-on: ubuntu-latest
     strategy:

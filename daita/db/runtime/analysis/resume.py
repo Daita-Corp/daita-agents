@@ -91,6 +91,11 @@ class DbRuntimeAnalysisResumeMixin:
             "analysis.synthesis",
         )
         final_synthesis = _latest_final_analysis_synthesis_from_snapshot(snapshot)
+        approval_task_ids = {
+            event.approval_id: event.task_id
+            for event in snapshot.events
+            if event.approval_id is not None and event.task_id is not None
+        }
         return {
             "operation_id": snapshot.operation.id,
             "operation_status": snapshot.operation.status.value,
@@ -107,8 +112,8 @@ class DbRuntimeAnalysisResumeMixin:
             "approvals": [
                 {
                     "approval_id": approval.approval_id,
-                    "status": approval.status.value,
-                    "task_id": approval.task_id,
+                    "status": approval.to_dict()["status"],
+                    "task_id": approval_task_ids.get(approval.approval_id),
                     "policy_id": approval.requested_by_policy_id,
                 }
                 for approval in snapshot.approval_requests

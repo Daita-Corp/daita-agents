@@ -8,7 +8,18 @@ from daita.db.analysis import DbAnalysisPlan, analysis_metadata
 from daita.db.llm_service import DbLLMResponse
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import Evidence, GovernanceResult, OperationStatus, TaskStatus
+from daita.runtime import (
+    ApprovalRequest,
+    Evidence,
+    GovernanceResult,
+    Operation,
+    OperationSnapshot,
+    OperationStatus,
+    RiskLevel,
+    RuntimeEvent,
+    RuntimeEventType,
+    TaskStatus,
+)
 
 
 class FakeAnalysisLLMService:
@@ -197,6 +208,47 @@ def test_phase3_analysis_materialization_has_no_executor_dependency():
     assert "DbOperationExecutor" not in source
     assert "_execute_sql_validation" not in source
     assert "_execute_validated_read" not in source
+
+
+def test_analysis_progress_projects_approval_status_and_event_task_link():
+    operation = Operation(
+        id="analysis-approval-operation",
+        operation_type="read",
+        status=OperationStatus.BLOCKED,
+    )
+    approval = ApprovalRequest(
+        approval_id="analysis-approval",
+        operation_id=operation.id,
+        reason="Approve analysis query.",
+        proposed_action={"approval": "human"},
+        risk=RiskLevel.MEDIUM,
+        status="pending",
+        requested_by_policy_id="analysis_query_approval",
+    )
+    snapshot = OperationSnapshot(
+        operation=operation,
+        approval_requests=(approval,),
+        events=(
+            RuntimeEvent(
+                type=RuntimeEventType.APPROVAL_REQUESTED,
+                operation_id=operation.id,
+                task_id="analysis-query-task",
+                approval_id=approval.approval_id,
+                message="Approval requested.",
+            ),
+        ),
+    )
+
+    progress = DbRuntime()._analysis_progress_payload(snapshot)
+
+    assert progress["approvals"] == [
+        {
+            "approval_id": approval.approval_id,
+            "status": "pending",
+            "task_id": "analysis-query-task",
+            "policy_id": "analysis_query_approval",
+        }
+    ]
 
 
 async def test_from_db_model_config_registers_analysis_capabilities(tmp_path):
