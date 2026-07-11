@@ -10,14 +10,18 @@ from daita.db import (
     SQLiteDbMonitorStore,
 )
 from daita.db.runtime.tasks.models import DbTaskSpec
+from daita.db.monitors import DbMonitorMutation, DbMonitorState
 from daita.runtime import (
     ApprovalStatus,
+    Operation,
     OperationStatus,
     PolicyDecision,
     PolicyEffect,
     RiskLevel,
     SQLiteRuntimeStore,
     TaskStatus,
+    RuntimeEvent,
+    RuntimeEventType,
 )
 
 
@@ -63,6 +67,44 @@ class SpecSpyRuntime(DbRuntime):
             materialized,
             contract=contract,
         )
+
+
+async def test_runtime_monitor_mutation_persists_and_publishes_once():
+    runtime = DbRuntime(runtime_id="db-monitor-publication")
+    operation = Operation(
+        id="monitor-management-publication",
+        operation_type="monitor.create",
+        status=OperationStatus.SUCCEEDED,
+    )
+    monitor = DbMonitor(
+        id="publication-monitor",
+        name="Publication monitor",
+        observation_plan={"kind": "metric"},
+    )
+    event = RuntimeEvent(
+        type=RuntimeEventType.OPERATION_CREATED,
+        operation_id=operation.id,
+        runtime_id=runtime.runtime_id,
+        runtime_kind=runtime.runtime_kind,
+        message="Monitor operation created.",
+        payload={"operation_type": operation.operation_type},
+    )
+    subscription = runtime.kernel.event_broker.subscribe(operation.id)
+
+    await runtime.commit_monitor_mutation(
+        DbMonitorMutation(
+            action="create",
+            operation=operation,
+            events=(event,),
+            monitor_after=monitor,
+            state_after=DbMonitorState(monitor_id=monitor.id),
+        )
+    )
+
+    persisted = await runtime.store.list_events(operation.id)
+    delivered = [subscription.get_nowait() for _ in range(subscription.pending_count)]
+    assert persisted == [event]
+    assert delivered == persisted
 
 
 async def test_db_agent_typed_monitor_crud_records_runtime_operations():

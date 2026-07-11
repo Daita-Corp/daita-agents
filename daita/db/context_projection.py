@@ -7,7 +7,13 @@ from enum import Enum
 import re
 from typing import Any, Iterable, Mapping
 
-from daita.runtime import Evidence, OperationStatus
+from daita.runtime import (
+    Evidence,
+    OperationStatus,
+    RuntimeEvent,
+    RuntimeEventType,
+    RuntimeStreamEvent,
+)
 
 from .memory import PII_COLUMN_PATTERNS, _detect_pii_value as _memory_detect_pii_value
 from .memory_contracts import (
@@ -43,6 +49,36 @@ _PUBLIC_TRACE_ID_FIELDS = (
 _REDACTED_WARNING_CODE = "db_runtime_warning_redacted"
 _REDACTED_ERROR_CODE = "db_runtime_error_redacted"
 _PUBLIC_MACHINE_CODE_MAX_LENGTH = 128
+_PUBLIC_RUNTIME_MESSAGES = {
+    RuntimeEventType.OPERATION_CREATED: "Operation started.",
+    RuntimeEventType.OPERATION_UPDATED: "Operation updated.",
+    RuntimeEventType.TASK_CREATED: "Task planned.",
+    RuntimeEventType.TASK_UPDATED: "Task updated.",
+    RuntimeEventType.EVIDENCE_ACCEPTED: "Evidence accepted.",
+    RuntimeEventType.POLICY_DECISION: "Policy evaluated.",
+    RuntimeEventType.APPROVAL_REQUESTED: "Approval requested.",
+    RuntimeEventType.APPROVAL_UPDATED: "Approval updated.",
+    RuntimeEventType.LLM_REQUESTED: "Model request started.",
+    RuntimeEventType.LLM_COMPLETED: "Model request completed.",
+    RuntimeEventType.EXECUTOR_STARTED: "Executor started.",
+    RuntimeEventType.EXECUTOR_COMPLETED: "Executor completed.",
+    RuntimeEventType.EXECUTOR_FAILED: "Executor failed.",
+    RuntimeEventType.MONITOR_TICKED: "Monitor ticked.",
+    RuntimeEventType.MONITOR_TRIGGERED: "Monitor triggered.",
+    RuntimeEventType.MONITOR_SKIPPED: "Monitor skipped.",
+    RuntimeEventType.WORKER_HANDOFF: "Worker handoff recorded.",
+    RuntimeEventType.WORKER_DELEGATED: "Work delegated.",
+    RuntimeEventType.WORKER_LEASE_CLAIMED: "Worker lease claimed.",
+    RuntimeEventType.WORKER_HEARTBEAT: "Worker heartbeat recorded.",
+    RuntimeEventType.WORKER_COMPLETED: "Worker completed.",
+    RuntimeEventType.WORKER_FAILED: "Worker failed.",
+    RuntimeEventType.WORKER_TIMEOUT: "Worker timed out.",
+    RuntimeEventType.WORKER_CANCELLED: "Worker cancelled.",
+    RuntimeEventType.OPERATION_RESUMED: "Operation resumed.",
+    RuntimeEventType.TASK_SKIPPED: "Task skipped.",
+    RuntimeEventType.DIAGNOSTIC: "Runtime diagnostic.",
+    RuntimeEventType.ERROR: "Runtime error.",
+}
 
 
 class ProjectionMode(str, Enum):
@@ -449,6 +485,160 @@ def project_operation_result(
         warnings=_public_warning_codes(result.warnings),
         diagnostics=projected_diagnostics,
     )
+
+
+def project_runtime_stream_event(
+    event: RuntimeEvent,
+    projection: ProjectionContext,
+) -> RuntimeStreamEvent:
+    """Build an allowlisted public progress event from one durable event."""
+
+    if projection.mode is not ProjectionMode.PUBLIC_RESULT:
+        raise ValueError("runtime stream events require public_result projection")
+    stream_event = RuntimeStreamEvent.from_runtime_event(event)
+    return replace(
+        stream_event,
+        message=(
+            "Operation stream completed."
+            if event.payload.get("terminal") is True
+            else _PUBLIC_RUNTIME_MESSAGES[event.type]
+        ),
+        policy_id=None,
+        payload=_project_runtime_event_payload(event),
+    )
+
+
+def project_runtime_stream_drop_diagnostic(
+    *,
+    operation_id: str,
+    runtime_id: str,
+    runtime_kind: str,
+    dropped_count: int,
+) -> RuntimeStreamEvent:
+    """Return a bounded-delivery diagnostic without exposing dropped payloads."""
+
+    return RuntimeStreamEvent(
+        type=RuntimeEventType.DIAGNOSTIC,
+        operation_id=operation_id,
+        runtime_id=runtime_id,
+        runtime_kind=runtime_kind,
+        message="Runtime progress events were dropped for a slow consumer.",
+        payload={
+            "diagnostic": "runtime_stream.events_dropped",
+            "dropped_event_count": max(0, int(dropped_count)),
+            "projected": True,
+        },
+    )
+
+
+def project_runtime_stream_terminal(
+    result: DbOperationResult,
+    *,
+    runtime_id: str,
+    runtime_kind: str,
+) -> RuntimeStreamEvent:
+    """Return the single public terminal delivery event for a DB result."""
+
+    return RuntimeStreamEvent(
+        type=RuntimeEventType.OPERATION_UPDATED,
+        operation_id=result.operation_id,
+        runtime_id=runtime_id,
+        runtime_kind=runtime_kind,
+        message="Operation stream completed.",
+        payload=project_runtime_stream_terminal_payload(result),
+    )
+
+
+def project_runtime_stream_terminal_payload(
+    result: DbOperationResult,
+) -> dict[str, Any]:
+    """Build the safe terminal payload persisted on the final runtime event."""
+
+    execution = result.diagnostics.get("execution")
+    execution = execution if isinstance(execution, Mapping) else {}
+    task_count = execution.get("task_count")
+    if not isinstance(task_count, int) or isinstance(task_count, bool):
+        task_count = len(execution.get("task_refs") or ())
+    return {
+        "terminal": True,
+        "answer": result.answer,
+        "result_summary": {
+            "status": result.status.value,
+            "warning_codes": list(_public_warning_codes(result.warnings)),
+            "task_count": max(0, task_count),
+            "evidence_count": len(result.evidence),
+        },
+        "projected": True,
+    }
+
+
+def _project_runtime_event_payload(event: RuntimeEvent) -> dict[str, Any]:
+    payload = event.payload if isinstance(event.payload, Mapping) else {}
+    if payload.get("terminal") is True:
+        return _project_persisted_terminal_payload(payload)
+    projected: dict[str, Any] = {"projected": True}
+
+    for key in ("operation_type", "kind"):
+        code = _public_machine_code(payload.get(key))
+        if code is not None:
+            projected[key] = code
+    status = _public_machine_code(payload.get("status"))
+    if status not in {"succeeded", "failed", "cancelled", "blocked"}:
+        if status is not None:
+            projected["status"] = status
+    for key in ("accepted", "truncated", "success"):
+        if isinstance(payload.get(key), bool):
+            projected[key] = payload[key]
+    for key in (
+        "attempt_count",
+        "payload_size",
+        "row_count",
+        "total_rows",
+        "task_count",
+        "evidence_count",
+    ):
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            projected[key] = max(0, value)
+    warnings = _public_warning_codes(payload.get("warnings"))
+    if warnings:
+        projected["warning_codes"] = list(warnings)
+    return projected
+
+
+def _project_persisted_terminal_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    summary = payload.get("result_summary")
+    summary = summary if isinstance(summary, Mapping) else {}
+    status = _public_machine_code(summary.get("status"))
+    if status not in {
+        "pending",
+        "planning",
+        "running",
+        "verifying",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "blocked",
+    }:
+        status = "failed"
+    projected_summary: dict[str, Any] = {
+        "status": status,
+        "warning_codes": list(_public_warning_codes(summary.get("warning_codes"))),
+    }
+    for key in ("task_count", "evidence_count"):
+        value = summary.get(key)
+        projected_summary[key] = (
+            max(0, value)
+            if isinstance(value, int) and not isinstance(value, bool)
+            else 0
+        )
+    answer = payload.get("answer")
+    return {
+        "terminal": True,
+        "answer": answer if isinstance(answer, str) or answer is None else None,
+        "result_summary": projected_summary,
+        "projected": True,
+    }
 
 
 def _project_result_answer(result: DbOperationResult) -> str | None:

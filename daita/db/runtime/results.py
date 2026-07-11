@@ -21,6 +21,7 @@ from ..context_projection import (
     ProjectionMode,
     policy_summary_from_source,
     project_operation_result,
+    project_runtime_stream_terminal_payload,
 )
 from ..fingerprints import sensitive_fingerprint
 from ..models import DbOperationResult, DbRuntimeConfig
@@ -101,11 +102,29 @@ class DbRuntimeResultsMixin:
             )
         )
         if operation is not None:
+            enqueue_learning = getattr(
+                self,
+                "_enqueue_memory_learning_after_result",
+                None,
+            )
+            if enqueue_learning is not None:
+                try:
+                    await enqueue_learning(raw_result, operation=operation)
+                except Exception:
+                    await self.kernel.append_event(
+                        RuntimeEventType.DIAGNOSTIC,
+                        operation_id=result.operation_id,
+                        message="DB memory learning enqueue was skipped after error.",
+                        payload={"reason": "memory_learning_enqueue_failed"},
+                    )
             message = (
                 f"Operation {result.operation_id} finished with "
                 f"{result.status.value}."
             )
-            payload = {"warnings": list(raw_result.warnings)}
+            payload = {
+                "warnings": list(raw_result.warnings),
+                **project_runtime_stream_terminal_payload(result),
+            }
             if result.status in {
                 OperationStatus.SUCCEEDED,
                 OperationStatus.FAILED,
@@ -130,21 +149,6 @@ class DbRuntimeResultsMixin:
                     message=message,
                     payload=payload,
                 )
-            enqueue_learning = getattr(
-                self,
-                "_enqueue_memory_learning_after_result",
-                None,
-            )
-            if enqueue_learning is not None:
-                try:
-                    await enqueue_learning(raw_result, operation=operation)
-                except Exception:
-                    await self.kernel.append_event(
-                        RuntimeEventType.DIAGNOSTIC,
-                        operation_id=result.operation_id,
-                        message="DB memory learning enqueue was skipped after error.",
-                        payload={"reason": "memory_learning_enqueue_failed"},
-                    )
         return result
 
     async def _persist_trace_correlation(

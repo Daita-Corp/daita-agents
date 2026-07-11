@@ -260,7 +260,7 @@ class DbMonitorCommitCreateExecutor:
         committed_existing = existing is not None
         if existing is None:
             initial_state = dict(proposal.get("initial_state") or {})
-            await runtime.monitor_store.commit_monitor_mutation(
+            await runtime.commit_monitor_mutation(
                 DbMonitorMutation(
                     action="create",
                     operation=operation,

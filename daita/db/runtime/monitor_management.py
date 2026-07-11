@@ -65,7 +65,7 @@ class DbRuntimeMonitorManagementMixin:
             evidence_kind="monitor.definition",
             payload={"monitor": monitor.to_dict()},
         )
-        await self.monitor_store.commit_monitor_mutation(
+        await self.commit_monitor_mutation(
             DbMonitorMutation(
                 action="create",
                 operation=operation,

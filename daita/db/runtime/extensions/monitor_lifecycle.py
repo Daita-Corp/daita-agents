@@ -169,7 +169,7 @@ class DbMonitorCommitLifecycleExecutor:
             action=action,
         )
         if not idempotent_existing:
-            await runtime.monitor_store.commit_monitor_mutation(
+            await runtime.commit_monitor_mutation(
                 DbMonitorMutation(
                     action=_monitor_lifecycle_mutation_action(action),
                     operation=operation,

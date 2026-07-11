@@ -44,7 +44,7 @@ from ..models import (
     DbRuntimeConfig,
     DbRuntimeInspection,
 )
-from ..monitors import DbMonitorStore
+from ..monitors import DbMonitorMutation, DbMonitorStore
 from ..planning import DbContractBuilder, build_safety_frame, classify_db_request
 from ..planner_protocol import DbAgentPlanner
 from ..session_context import (
@@ -230,6 +230,13 @@ class DbRuntime(
     ) -> tuple[Evidence, ...]:
         return await self.tasks.execute_task(task, operation, context)
 
+    async def commit_monitor_mutation(self, mutation: DbMonitorMutation) -> None:
+        """Persist one monitor mutation and publish its committed events."""
+        await self.kernel.commit_events(
+            lambda: self.monitor_store.commit_monitor_mutation(mutation),
+            mutation.events,
+        )
+
     async def execute_capability(
         self,
         capability_id: str,
@@ -400,7 +407,12 @@ class DbRuntime(
         fallback = _db_contract_from_context(operation)
         return _contract_from_latest_loop_snapshot(operation, fallback)
 
-    async def run(self, request: DbRequest | str) -> DbOperationResult:
+    async def run(
+        self,
+        request: DbRequest | str,
+        *,
+        operation_id: str | None = None,
+    ) -> DbOperationResult:
         """Plan and execute a DB operation through typed runtime capabilities."""
         db_request = request if isinstance(request, DbRequest) else DbRequest(request)
         if not self._is_setup:
@@ -416,6 +428,7 @@ class DbRuntime(
             skill_resolution=skill_resolution,
         )
         operation = await self.kernel.create_operation(
+            operation_id=operation_id,
             operation_type="db.run",
             request={
                 "prompt": db_request.prompt,

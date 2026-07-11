@@ -2,11 +2,153 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 from .primitives import RuntimeEvent, RuntimeEventType
+
+_DEFAULT_QUEUE_SIZE = 256
+_MIN_QUEUE_SIZE = 1
+_MAX_QUEUE_SIZE = 10_000
+_SUBSCRIPTION_FINISHED = object()
+
+
+class RuntimeEventSubscription:
+    """One bounded, operation-scoped in-process event subscription."""
+
+    def __init__(
+        self,
+        *,
+        broker: "RuntimeEventBroker",
+        operation_id: str,
+        queue_size: int,
+    ) -> None:
+        self.operation_id = operation_id
+        self._broker = broker
+        self._queue: asyncio.Queue[RuntimeEvent | object] = asyncio.Queue(
+            maxsize=queue_size
+        )
+        self._dropped_count = 0
+        self._closed = False
+
+    @property
+    def queue_size(self) -> int:
+        """Return the configured queue bound."""
+        return self._queue.maxsize
+
+    @property
+    def pending_count(self) -> int:
+        """Return the current bounded queue depth."""
+        return self._queue.qsize()
+
+    @property
+    def dropped_count(self) -> int:
+        """Return the number of events dropped since the last diagnostic read."""
+        return self._dropped_count
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def get(self) -> RuntimeEvent | None:
+        """Wait for the next delivered event."""
+        event = await self._queue.get()
+        return event if isinstance(event, RuntimeEvent) else None
+
+    def get_nowait(self) -> RuntimeEvent | None:
+        """Return the next queued event without waiting."""
+        event = self._queue.get_nowait()
+        return event if isinstance(event, RuntimeEvent) else None
+
+    def take_dropped_count(self) -> int:
+        """Consume the current dropped-event count for one diagnostic."""
+        count = self._dropped_count
+        self._dropped_count = 0
+        return count
+
+    def close(self) -> None:
+        """Remove this subscription from its broker."""
+        if self._closed:
+            return
+        self._closed = True
+        self._broker.unsubscribe(self)
+
+    def finish(self) -> None:
+        """Wake one waiting consumer after its producer has finished."""
+        try:
+            self._queue.put_nowait(_SUBSCRIPTION_FINISHED)
+        except asyncio.QueueFull:
+            # A waiting get already owns an event when the bounded queue is full.
+            pass
+
+    def _deliver(self, event: RuntimeEvent) -> None:
+        if self._closed or event.operation_id != self.operation_id:
+            return
+        try:
+            self._queue.put_nowait(event)
+        except asyncio.QueueFull:
+            self._dropped_count += 1
+
+
+class RuntimeEventBroker:
+    """Bounded in-process delivery for durably persisted runtime events.
+
+    The broker is deliberately non-authoritative and non-distributed. Runtime
+    stores remain the source of truth; subscribers only receive events that the
+    kernel publishes after persistence succeeds.
+    """
+
+    def __init__(self, *, default_queue_size: int = _DEFAULT_QUEUE_SIZE) -> None:
+        self._validate_queue_size(default_queue_size)
+        self.default_queue_size = default_queue_size
+        self._subscriptions: dict[str, set[RuntimeEventSubscription]] = {}
+
+    @property
+    def subscriber_count(self) -> int:
+        """Return the number of active in-process subscriptions."""
+        return sum(len(items) for items in self._subscriptions.values())
+
+    def subscribe(
+        self,
+        operation_id: str,
+        *,
+        queue_size: int | None = None,
+    ) -> RuntimeEventSubscription:
+        """Subscribe to events for exactly one operation ID."""
+        selected_size = self.default_queue_size if queue_size is None else queue_size
+        self._validate_queue_size(selected_size)
+        subscription = RuntimeEventSubscription(
+            broker=self,
+            operation_id=operation_id,
+            queue_size=selected_size,
+        )
+        self._subscriptions.setdefault(operation_id, set()).add(subscription)
+        return subscription
+
+    def unsubscribe(self, subscription: RuntimeEventSubscription) -> None:
+        """Remove one subscription without affecting other operation IDs."""
+        subscriptions = self._subscriptions.get(subscription.operation_id)
+        if subscriptions is None:
+            return
+        subscriptions.discard(subscription)
+        if not subscriptions:
+            self._subscriptions.pop(subscription.operation_id, None)
+
+    async def publish(self, event: RuntimeEvent) -> None:
+        """Deliver without blocking runtime execution on slow consumers."""
+        for subscription in tuple(self._subscriptions.get(event.operation_id, ())):
+            subscription._deliver(event)
+
+    @staticmethod
+    def _validate_queue_size(queue_size: int) -> None:
+        if (
+            not isinstance(queue_size, int)
+            or isinstance(queue_size, bool)
+            or not _MIN_QUEUE_SIZE <= queue_size <= _MAX_QUEUE_SIZE
+        ):
+            raise ValueError("queue_size must be an integer from 1 through 10,000")
 
 
 @dataclass(frozen=True)

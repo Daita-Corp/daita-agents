@@ -29,6 +29,7 @@ from daita.runtime import (
     ToolView,
     Worker,
 )
+from daita.runtime.events import RuntimeEventBroker
 
 
 def test_capability_is_serializable_and_round_trips():
@@ -327,6 +328,37 @@ def test_runtime_stream_event_projects_runtime_event_correlation():
     assert stream_event.capability_id == event.capability_id
     assert stream_event.evidence_id == event.evidence_id
     assert stream_event.to_dict()["trace_id"] == "trace-1"
+
+
+@pytest.mark.parametrize("queue_size", [0, -1, 10_001, True, 1.5])
+def test_runtime_event_broker_rejects_invalid_queue_sizes(queue_size):
+    broker = RuntimeEventBroker()
+
+    with pytest.raises(ValueError, match="1 through 10,000"):
+        broker.subscribe("op-1", queue_size=queue_size)
+
+
+async def test_runtime_event_broker_bounds_slow_consumers_and_reports_drops():
+    broker = RuntimeEventBroker(default_queue_size=1)
+    subscription = broker.subscribe("op-1")
+
+    for index in range(4):
+        await broker.publish(
+            RuntimeEvent(
+                type=RuntimeEventType.DIAGNOSTIC,
+                operation_id="op-1",
+                message=f"event-{index}",
+            )
+        )
+
+    assert subscription.queue_size == 1
+    assert subscription.pending_count == 1
+    assert subscription.get_nowait().message == "event-0"
+    assert subscription.take_dropped_count() == 3
+    assert subscription.take_dropped_count() == 0
+
+    subscription.close()
+    assert broker.subscriber_count == 0
 
 
 def test_policy_decision_round_trips_with_evidence_and_modifications():

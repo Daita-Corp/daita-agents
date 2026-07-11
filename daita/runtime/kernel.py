@@ -7,16 +7,19 @@ runtimes remain responsible for planning and domain facts.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import asyncio
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 import hashlib
 import json
 import time
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
 from uuid import uuid4
 
+from .events import RuntimeEventBroker
 from .governance import PolicyEvaluator
 from .primitives import (
+    ApprovalRequest,
     Capability,
     Evidence,
     GovernanceAuditRecord,
@@ -54,6 +57,7 @@ _TERMINAL_OPERATION_STATUSES = frozenset(
     }
 )
 _DEFAULT_LEASE_SECONDS = 300.0
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -156,6 +160,7 @@ class RuntimeKernel:
         approval_channel: Any | None = None,
         governance: Any | None = None,
         fact_provider: RuntimeFactProvider | Any | None = None,
+        event_broker: RuntimeEventBroker | None = None,
     ) -> None:
         self.runtime_id = runtime_id
         self.runtime_kind = runtime_kind
@@ -164,6 +169,15 @@ class RuntimeKernel:
         self.approval_channel = approval_channel
         self.governance = governance
         self.fact_provider = fact_provider
+        self.event_broker = event_broker or RuntimeEventBroker()
+        self._event_persistence_lock = asyncio.Lock()
+        bind_event_committer = getattr(
+            self.approval_channel,
+            "bind_event_committer",
+            None,
+        )
+        if bind_event_committer is not None:
+            bind_event_committer(self.commit_approval_update)
 
     async def create_operation(
         self,
@@ -189,7 +203,7 @@ class RuntimeKernel:
             },
         )
         await self.store.save_operation(operation)
-        await self.store.append_event(
+        await self._append_event(
             self._event(
                 RuntimeEventType.OPERATION_CREATED,
                 operation=operation,
@@ -220,21 +234,25 @@ class RuntimeKernel:
         governance = governance_persistence.result
         if governance.blocked or governance.pending_approval:
             blocked = replace(operation, status=OperationStatus.BLOCKED)
-            await self.store.commit_governance_blocked(
-                operation=blocked,
-                task=None,
-                decisions=governance.decisions,
-                audit_record=governance_persistence.audit_record,
-                approval_requests=governance_persistence.approvals_to_request,
-                events=(
-                    *governance_persistence.events,
-                    self._event(
-                        RuntimeEventType.OPERATION_UPDATED,
-                        operation=operation,
-                        message=f"Operation {operation.id} blocked by governance policy.",
-                        payload={"governance": governance.to_dict()},
-                    ),
+            events = (
+                *governance_persistence.events,
+                self._event(
+                    RuntimeEventType.OPERATION_UPDATED,
+                    operation=operation,
+                    message=f"Operation {operation.id} blocked by governance policy.",
+                    payload={"governance": governance.to_dict()},
                 ),
+            )
+            await self.commit_events(
+                lambda: self.store.commit_governance_blocked(
+                    operation=blocked,
+                    task=None,
+                    decisions=governance.decisions,
+                    audit_record=governance_persistence.audit_record,
+                    approval_requests=governance_persistence.approvals_to_request,
+                    events=events,
+                ),
+                events,
             )
             raise RuntimeKernelGovernanceBlocked(
                 "Operation blocked by governance policy.",
@@ -276,7 +294,7 @@ class RuntimeKernel:
             },
         )
         await self.store.save_task(task)
-        await self.store.append_event(
+        await self._append_event(
             self._event(
                 RuntimeEventType.TASK_CREATED,
                 operation=operation,
@@ -336,8 +354,55 @@ class RuntimeKernel:
             message=message,
             payload=dict(payload or {}),
         )
-        await self.store.append_event(event)
+        await self._append_event(event)
         return event
+
+    async def _append_event(self, event: RuntimeEvent) -> None:
+        """Persist one event, then publish it once after persistence succeeds."""
+        await self.commit_events(
+            lambda: self.store.append_event(event),
+            (event,),
+        )
+
+    async def commit_events(
+        self,
+        commit: Callable[[], Awaitable[Any]],
+        events: Iterable[RuntimeEvent],
+    ) -> Any:
+        """Atomically persist through an owner, then publish committed events."""
+        async with self._event_persistence_lock:
+            committed, cancelled = await self._await_cancellation_resistant(commit())
+            if committed is not False:
+                for event in events:
+                    await self.event_broker.publish(event)
+            if cancelled:
+                raise asyncio.CancelledError
+            return committed
+
+    async def _await_cancellation_resistant(
+        self,
+        awaitable: Awaitable[_T],
+    ) -> tuple[_T, bool]:
+        task: asyncio.Future[_T] = asyncio.ensure_future(awaitable)
+        cancelled = False
+        while True:
+            try:
+                return await asyncio.shield(task), cancelled
+            except asyncio.CancelledError:
+                if task.done():
+                    return task.result(), True
+                cancelled = True
+
+    async def commit_approval_update(
+        self,
+        request: ApprovalRequest,
+        event: RuntimeEvent,
+    ) -> None:
+        """Persist an approval transition and publish its event after commit."""
+        await self.commit_events(
+            lambda: self.store.commit_approval_update(request, event),
+            (event,),
+        )
 
     async def update_operation(
         self,
@@ -434,10 +499,17 @@ class RuntimeKernel:
         )
         commit = getattr(self.store, "commit_task_blocked", None)
         if commit is not None:
-            await commit(operation=None, task=blocked, events=(event,))
+            committed = await self.commit_events(
+                lambda: commit(operation=None, task=blocked, events=(event,)),
+                (event,),
+            )
+            if not committed:
+                raise RuntimeKernelLeaseLost(
+                    f"Task {task.id} state changed before it could be blocked."
+                )
         else:
             await self.store.save_task(blocked)
-            await self.store.append_event(event)
+            await self._append_event(event)
         return blocked
 
     async def apply_terminal_approval_state(
@@ -567,15 +639,19 @@ class RuntimeKernel:
         claim = getattr(self.store, "claim_task", None)
         if claim is None:
             raise RuntimeKernelTaskNotRunnable("Runtime store cannot claim tasks.")
-        claimed = await claim(
-            task_id,
-            lease_id=lease_id,
-            lease_owner=lease_owner,
-            lease_expires_at=lease_expires_at,
-            worker_id=worker_id,
-            worker_owner=worker_owner,
+        claimed, cancelled = await self._await_cancellation_resistant(
+            claim(
+                task_id,
+                lease_id=lease_id,
+                lease_owner=lease_owner,
+                lease_expires_at=lease_expires_at,
+                worker_id=worker_id,
+                worker_owner=worker_owner,
+            )
         )
         if claimed is None:
+            if cancelled:
+                raise asyncio.CancelledError
             task = await self.store.load_task(task_id)
             result = await self._result_for_task(task) if task is not None else None
             if task is not None and task.status in _TERMINAL_TASK_STATUSES:
@@ -587,7 +663,7 @@ class RuntimeKernel:
                 f"Task {task_id} could not be claimed.",
                 result=result,
             )
-        return TaskLease(
+        lease = TaskLease(
             lease_id=lease_id,
             task_id=claimed.id,
             operation_id=claimed.operation_id,
@@ -597,6 +673,12 @@ class RuntimeKernel:
             worker_id=worker_id,
             worker_owner=worker_owner,
         )
+        if cancelled:
+            await self._await_cancellation_resistant(
+                self._preserve_cancelled_claim_for_resume(lease)
+            )
+            raise asyncio.CancelledError
+        return lease
 
     async def heartbeat_task(
         self,
@@ -621,6 +703,21 @@ class RuntimeKernel:
         return replace(lease, lease_expires_at=lease_expires_at)
 
     async def execute_claimed_task(
+        self,
+        lease: TaskLease,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> TaskExecutionResult:
+        """Execute claimed work and preserve its lease state on cancellation."""
+        try:
+            return await self._execute_claimed_task(lease, context=context)
+        except asyncio.CancelledError:
+            await self._await_cancellation_resistant(
+                self._preserve_cancelled_claim_for_resume(lease)
+            )
+            raise
+
+    async def _execute_claimed_task(
         self,
         lease: TaskLease,
         *,
@@ -688,13 +785,16 @@ class RuntimeKernel:
                     payload={"governance": governance.to_dict()},
                 ),
             )
-            await self.store.commit_governance_blocked(
-                operation=blocked_operation,
-                task=blocked_task,
-                decisions=governance.decisions,
-                audit_record=governance_persistence.audit_record,
-                approval_requests=governance_persistence.approvals_to_request,
-                events=events,
+            await self.commit_events(
+                lambda: self.store.commit_governance_blocked(
+                    operation=blocked_operation,
+                    task=blocked_task,
+                    decisions=governance.decisions,
+                    audit_record=governance_persistence.audit_record,
+                    approval_requests=governance_persistence.approvals_to_request,
+                    events=events,
+                ),
+                events,
             )
             result = TaskExecutionResult(
                 blocked_operation,
@@ -727,11 +827,14 @@ class RuntimeKernel:
                 message=f"Task {task.id} blocked by unsatisfied dependencies.",
                 payload={"readiness": readiness},
             )
-            committed = await self.store.commit_task_blocked(
-                operation=None,
-                task=blocked_task,
-                events=(event,),
-                lease_id=lease.lease_id,
+            committed = await self.commit_events(
+                lambda: self.store.commit_task_blocked(
+                    operation=None,
+                    task=blocked_task,
+                    events=(event,),
+                    lease_id=lease.lease_id,
+                ),
+                (event,),
             )
             result = TaskExecutionResult(
                 operation,
@@ -758,7 +861,10 @@ class RuntimeKernel:
             capability=capability,
             message=f"Task {task.id} started.",
         )
-        await self.store.commit_task_started(task, started_event)
+        await self.commit_events(
+            lambda: self.store.commit_task_started(task, started_event),
+            (started_event,),
+        )
         executor = self.extension_registry.get_executor(task.executor_id)
         from daita.core.tracing import TraceType, get_trace_manager
 
@@ -791,7 +897,7 @@ class RuntimeKernel:
                 trace_id=trace_id,
                 span_id=span_id,
             )
-            await self.store.append_event(executor_started_event)
+            await self._append_event(executor_started_event)
             try:
                 evidence = tuple(
                     await executor.execute(task, operation, dict(context or {}))
@@ -814,10 +920,13 @@ class RuntimeKernel:
                     trace_id=trace_id,
                     span_id=span_id,
                 )
-                committed = await self.store.commit_task_failed(
-                    failed_task,
-                    event,
-                    lease_id=lease.lease_id,
+                committed = await self.commit_events(
+                    lambda: self.store.commit_task_failed(
+                        failed_task,
+                        event,
+                        lease_id=lease.lease_id,
+                    ),
+                    (event,),
                 )
                 executor_failed_event = self._event(
                     RuntimeEventType.EXECUTOR_FAILED,
@@ -848,7 +957,7 @@ class RuntimeKernel:
                         f"Task {task.id} lease was lost before failure commit.",
                         result=result,
                     ) from exc
-                await self.store.append_event(executor_failed_event)
+                await self._append_event(executor_failed_event)
                 result = replace(
                     result,
                     events=(*result.events, executor_failed_event),
@@ -885,11 +994,14 @@ class RuntimeKernel:
                 trace_id=trace_id,
                 span_id=span_id,
             )
-            committed = await self.store.commit_task_succeeded(
-                succeeded_task,
-                accepted_evidence,
-                event,
-                lease_id=lease.lease_id,
+            committed = await self.commit_events(
+                lambda: self.store.commit_task_succeeded(
+                    succeeded_task,
+                    accepted_evidence,
+                    event,
+                    lease_id=lease.lease_id,
+                ),
+                (event,),
             )
             result = TaskExecutionResult(
                 operation,
@@ -934,12 +1046,78 @@ class RuntimeKernel:
                 span_id=span_id,
             )
             for emitted in (*evidence_events, executor_completed_event):
-                await self.store.append_event(emitted)
+                await self._append_event(emitted)
             result = replace(
                 result,
                 events=(*result.events, *evidence_events, executor_completed_event),
             )
             return result
+
+    async def _preserve_cancelled_claim_for_resume(self, lease: TaskLease) -> None:
+        task = await self.store.load_task(lease.task_id)
+        if (
+            task is None
+            or task.status is not TaskStatus.RUNNING
+            or task.metadata.get("lease_id") != lease.lease_id
+        ):
+            return
+        operation = await self.store.load_operation(task.operation_id)
+        if operation is None:
+            return
+        capability = self._capability_for_task(task)
+        blocked_task = replace(
+            task,
+            status=TaskStatus.BLOCKED,
+            metadata={
+                **_metadata_without_active_lease(task.metadata),
+                "cancelled_for_resume": True,
+            },
+        )
+        operation_is_active = operation.status not in {
+            OperationStatus.BLOCKED,
+            *_TERMINAL_OPERATION_STATUSES,
+        }
+        blocked_operation = (
+            replace(operation, status=OperationStatus.BLOCKED)
+            if operation_is_active
+            else None
+        )
+        events = (
+            self._event(
+                RuntimeEventType.TASK_UPDATED,
+                operation=operation,
+                task=blocked_task,
+                capability=capability,
+                message=f"Task {task.id} interrupted and preserved for resume.",
+                payload={"status": TaskStatus.BLOCKED.value},
+            ),
+            *(
+                (
+                    self._event(
+                        RuntimeEventType.OPERATION_UPDATED,
+                        operation=blocked_operation,
+                        task=blocked_task,
+                        capability=capability,
+                        message=(
+                            f"Operation {operation.id} interrupted and preserved "
+                            "for resume."
+                        ),
+                        payload={"status": OperationStatus.BLOCKED.value},
+                    ),
+                )
+                if blocked_operation is not None
+                else ()
+            ),
+        )
+        await self.commit_events(
+            lambda: self.store.commit_task_blocked(
+                operation=blocked_operation,
+                task=blocked_task,
+                events=events,
+                lease_id=lease.lease_id,
+            ),
+            events,
+        )
 
     async def execute_capability(
         self,
@@ -1129,11 +1307,14 @@ class RuntimeKernel:
         self,
         governance_persistence: _KernelGovernancePersistence,
     ) -> None:
-        await self.store.commit_governance_evaluation(
-            decisions=governance_persistence.result.decisions,
-            audit_record=governance_persistence.audit_record,
-            approval_requests=governance_persistence.approvals_to_request,
-            events=governance_persistence.events,
+        await self.commit_events(
+            lambda: self.store.commit_governance_evaluation(
+                decisions=governance_persistence.result.decisions,
+                audit_record=governance_persistence.audit_record,
+                approval_requests=governance_persistence.approvals_to_request,
+                events=governance_persistence.events,
+            ),
+            governance_persistence.events,
         )
 
     async def _task_readiness(

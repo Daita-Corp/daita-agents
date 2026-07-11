@@ -1,3 +1,4 @@
+import asyncio
 import json
 import importlib.util
 import pkgutil
@@ -8,6 +9,17 @@ from unittest.mock import AsyncMock, MagicMock
 from daita.agents.agent import Agent
 from daita.db.config.policies import SchemaPromptPolicy, ToolResultPolicy
 from daita.db import DbAgent, DbRequest, DbRuntime, DbRuntimeOptions
+from daita.db.context_projection import (
+    ProjectionContext,
+    ProjectionMode,
+    project_runtime_stream_event,
+)
+from daita.db.models import (
+    DbIntent,
+    DbIntentKind,
+    DbOperationContract,
+    DbOperationResult,
+)
 from daita.db.runtime.extensions import HostedInAppMonitorDeliveryPlugin
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.catalog.persistence import catalog_profile_key
@@ -19,10 +31,15 @@ from daita.plugins.memory.memory_plugin import MemoryPlugin
 from daita.plugins.postgresql import PostgreSQLPlugin
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import (
+    AccessMode,
     HostRuntimeContext,
     InMemoryRuntimeStore,
     OperationStatus,
+    RuntimeEvent,
+    RuntimeEventType,
     SQLiteRuntimeStore,
+    Task,
+    TaskStatus,
     host_runtime_context,
 )
 from daita.skills import Skill, SkillRuntimeEffects
@@ -112,6 +129,28 @@ def _write_catalog_snapshot(profile_key, schema, *, last_seen=None):
     )
 
 
+def _stream_result(
+    operation_id,
+    prompt,
+    *,
+    answer="streamed answer",
+    status=OperationStatus.SUCCEEDED,
+    diagnostics=None,
+):
+    return DbOperationResult(
+        operation_id=operation_id,
+        request=DbRequest(prompt),
+        intent=DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
+        contract=DbOperationContract(
+            operation_type="db.run",
+            access=AccessMode.READ,
+        ),
+        status=status,
+        answer=answer,
+        diagnostics=dict(diagnostics or {}),
+    )
+
+
 async def test_agent_from_db_returns_db_agent_backed_by_db_runtime(tmp_path):
     db_path = tmp_path / "phase10.sqlite"
     await _seed_sqlite(db_path)
@@ -127,6 +166,221 @@ async def test_agent_from_db_returns_db_agent_backed_by_db_runtime(tmp_path):
         assert not hasattr(agent, "tool_names")
     finally:
         await agent.stop()
+
+
+async def test_db_agent_streams_concurrent_runs_without_cross_operation_events():
+    runtime = DbRuntime()
+    agent = DbAgent(runtime=runtime)
+    both_created = asyncio.Event()
+    created: dict[str, str] = {}
+
+    async def fake_run(prompt, *, history, kwargs, operation_id=None):
+        assert operation_id is not None
+        await runtime.kernel.create_operation(
+            operation_id=operation_id,
+            operation_type="db.run",
+            request={"prompt": prompt},
+            evaluate_governance=False,
+        )
+        created[prompt] = operation_id
+        if len(created) == 2:
+            both_created.set()
+        await both_created.wait()
+        await runtime.kernel.append_event(
+            RuntimeEventType.DIAGNOSTIC,
+            operation_id=operation_id,
+            message=f"diagnostic for {prompt}",
+            payload={"diagnostic": f"run.{prompt}"},
+        )
+        await runtime.kernel.complete_operation(operation_id)
+        return _stream_result(operation_id, prompt, answer=f"answer {prompt}")
+
+    agent._run_detailed = fake_run
+
+    async def collect(prompt):
+        return [event async for event in agent.stream(prompt)]
+
+    first, second = await asyncio.gather(collect("first"), collect("second"))
+
+    assert created["first"] != created["second"]
+    assert {event.operation_id for event in first} == {created["first"]}
+    assert {event.operation_id for event in second} == {created["second"]}
+    assert first[0].type is RuntimeEventType.OPERATION_CREATED
+    assert second[0].type is RuntimeEventType.OPERATION_CREATED
+    for events, answer in ((first, "answer first"), (second, "answer second")):
+        terminal = [event for event in events if event.payload.get("terminal")]
+        assert len(terminal) == 1
+        assert terminal[0].payload["answer"] == answer
+
+
+async def test_db_agent_stream_uses_one_durable_terminal_event():
+    runtime = DbRuntime(runtime_id="db-terminal-stream")
+    agent = DbAgent(runtime=runtime)
+
+    events = [event async for event in agent.stream("terminal contract")]
+    operation_id = events[0].operation_id
+    persisted = await runtime.store.list_events(operation_id)
+    public_terminals = [
+        event for event in events if event.payload.get("terminal") is True
+    ]
+    durable_terminals = [
+        event for event in persisted if event.payload.get("terminal") is True
+    ]
+
+    assert len(public_terminals) == 1
+    assert len(durable_terminals) == 1
+    assert events[-1] == public_terminals[0]
+    assert persisted[-1] == durable_terminals[0]
+    assert public_terminals[0].payload["result_summary"]["status"] == "blocked"
+    assert (
+        public_terminals[0].payload["answer"].startswith("DB LLM service is required")
+    )
+    assert not any(
+        event.payload.get("status") in {"succeeded", "failed", "cancelled", "blocked"}
+        for event in events[:-1]
+    )
+
+
+async def test_db_runtime_run_accepts_internal_operation_id_without_changing_default():
+    runtime = DbRuntime()
+
+    try:
+        selected = await runtime.run("selected", operation_id="db-op-selected")
+        generated = await runtime.run("generated")
+    finally:
+        await runtime.teardown()
+
+    assert selected.operation_id == "db-op-selected"
+    assert generated.operation_id.startswith("db-op-")
+    assert generated.operation_id != selected.operation_id
+
+
+async def test_db_agent_stream_reports_bounded_slow_consumer_drops():
+    runtime = DbRuntime()
+    agent = DbAgent(runtime=runtime)
+    published = asyncio.Event()
+
+    async def fake_run(prompt, *, history, kwargs, operation_id=None):
+        assert operation_id is not None
+        await runtime.kernel.create_operation(
+            operation_id=operation_id,
+            operation_type="db.run",
+            request={"prompt": prompt},
+            evaluate_governance=False,
+        )
+        for index in range(300):
+            await runtime.kernel.append_event(
+                RuntimeEventType.DIAGNOSTIC,
+                operation_id=operation_id,
+                message=f"diagnostic {index}",
+                payload={"diagnostic": "test.progress", "index": index},
+            )
+        await runtime.kernel.complete_operation(operation_id)
+        published.set()
+        return _stream_result(operation_id, prompt)
+
+    agent._run_detailed = fake_run
+
+    stream = agent.stream("slow")
+    first = await anext(stream)
+    await published.wait()
+    events = [first, *[event async for event in stream]]
+    dropped = [
+        event
+        for event in events
+        if event.payload.get("diagnostic") == "runtime_stream.events_dropped"
+    ]
+
+    assert len(dropped) == 1
+    assert dropped[0].payload["dropped_event_count"] > 0
+    assert len([event for event in events if event.payload.get("terminal")]) == 1
+    assert runtime.kernel.event_broker.subscriber_count == 0
+
+
+def test_db_runtime_stream_projection_removes_sensitive_event_content():
+    raw = RuntimeEvent(
+        type=RuntimeEventType.ERROR,
+        operation_id="op-secret",
+        message="password=super-secret raw failure customer@example.com",
+        policy_id="internal.policy.details",
+        payload={
+            "prompt": "show secret customers",
+            "sql": "SELECT * FROM customers WHERE token = 'sql-secret'",
+            "parameters": {"token": "parameter-secret"},
+            "rows": [{"password": "row-secret"}],
+            "credentials": {"password": "credential-secret"},
+            "error": {"message": "exception-secret"},
+            "governance": {"reason": "policy-secret"},
+            "planner": {"diagnostic": "planner-secret"},
+            "executor": {"diagnostic": "executor-secret"},
+        },
+    )
+
+    projected = project_runtime_stream_event(
+        raw,
+        ProjectionContext(mode=ProjectionMode.PUBLIC_RESULT),
+    )
+    encoded = json.dumps(projected.to_dict())
+
+    assert projected.message == "Runtime error."
+    assert projected.policy_id is None
+    assert projected.payload == {"projected": True}
+    for secret in (
+        "super-secret",
+        "customer@example.com",
+        "SELECT *",
+        "sql-secret",
+        "parameter-secret",
+        "row-secret",
+        "credential-secret",
+        "exception-secret",
+        "policy-secret",
+        "planner-secret",
+        "executor-secret",
+    ):
+        assert secret not in encoded
+
+
+async def test_db_agent_stream_close_awaits_run_and_preserves_resumable_state():
+    runtime = DbRuntime()
+    agent = DbAgent(runtime=runtime)
+    run_cancelled = asyncio.Event()
+
+    async def fake_run(prompt, *, history, kwargs, operation_id=None):
+        assert operation_id is not None
+        operation = await runtime.kernel.create_operation(
+            operation_id=operation_id,
+            operation_type="db.run",
+            request={"prompt": prompt},
+            evaluate_governance=False,
+        )
+        await runtime.store.save_task(
+            Task(
+                id=f"task-{operation_id}",
+                operation_id=operation.id,
+                capability_id="db.test.resume",
+                executor_id="db.test.resume.executor",
+                input={"sql": "SELECT secret"},
+                status=TaskStatus.PENDING,
+            )
+        )
+        try:
+            await asyncio.Event().wait()
+        finally:
+            run_cancelled.set()
+
+    agent._run_detailed = fake_run
+    stream = agent.stream("cancel me")
+
+    first = await anext(stream)
+    await stream.aclose()
+
+    operation = await runtime.store.load_operation(first.operation_id)
+    tasks = await runtime.store.list_tasks(first.operation_id)
+    assert run_cancelled.is_set()
+    assert runtime.kernel.event_broker.subscriber_count == 0
+    assert operation.status is OperationStatus.BLOCKED
+    assert tasks[0].status is TaskStatus.PENDING
 
 
 async def test_agent_from_db_defaults_to_in_memory_runtime_store(tmp_path):

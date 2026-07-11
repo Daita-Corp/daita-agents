@@ -209,7 +209,7 @@ class DbRuntimeMonitorActionResumeMixin:
             return
         updated_run = DbMonitorRun.from_dict({**run.to_dict(), "summary": summary})
         state = await self.monitor_store.load_monitor_state(monitor_id)
-        await self.monitor_store.commit_monitor_mutation(
+        await self.commit_monitor_mutation(
             DbMonitorMutation(
                 action="run",
                 operation=operation,

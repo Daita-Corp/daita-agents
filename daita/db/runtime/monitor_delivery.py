@@ -872,7 +872,7 @@ class DbRuntimeMonitorDeliveryMixin:
                     },
                 }
             )
-        await self.monitor_store.commit_monitor_mutation(
+        await self.commit_monitor_mutation(
             DbMonitorMutation(
                 action="run",
                 operation=operation,
