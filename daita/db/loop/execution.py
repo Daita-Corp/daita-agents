@@ -68,34 +68,182 @@ class DbLoopTaskBatchExecutor:
             return await self._execute_serial(indexed, operation)
         outcomes: list[DbLoopTaskOutcome] = []
         remaining = list(indexed)
+        concurrency_disabled = False
         while remaining:
-            try:
-                ready_prefix: list[tuple[int, Task]] = []
-                for index, task in remaining:
-                    readiness = await self.runtime.task_readiness(task, operation)
-                    if not readiness.get("ready"):
-                        break
-                    ready_prefix.append((index, task))
-            except Exception:
-                ready_prefix = []
-            ready = tuple(ready_prefix)
-            if len(ready) > 1 and await self._concurrent_batch_eligible(
-                ready,
-                operation,
+            cohort, preparations = (
+                ((), ())
+                if concurrency_disabled
+                else self._concurrent_read_cohort(tuple(remaining))
+            )
+            preparing = bool(
+                preparations and await self._task_ready(preparations[0][1], operation)
+            )
+            if preparing:
+                wave = await self._execute_serial((preparations[0],), operation)
+            elif (
+                len(cohort) > 1
+                and not preparations
+                and await self._tasks_ready(cohort, operation)
+                and await self._concurrent_batch_eligible(cohort, operation)
             ):
                 wave = await self._execute_concurrent(
-                    ready,
+                    cohort,
                     operation,
                     max_concurrency=max_concurrency,
                 )
             else:
                 wave = await self._execute_serial((remaining[0],), operation)
             outcomes.extend(wave)
+            if preparing and any(
+                outcome.error is not None or outcome.readiness_error is not None
+                for outcome in wave
+            ):
+                concurrency_disabled = True
             executed_ids = {outcome.task.id for outcome in wave}
             remaining = [item for item in remaining if item[1].id not in executed_ids]
             if any(outcome.governance_error is not None for outcome in wave):
                 break
         return tuple(sorted(outcomes, key=lambda item: item.task_index))
+
+    def _concurrent_read_cohort(
+        self,
+        indexed: tuple[tuple[int, Task], ...],
+    ) -> tuple[
+        tuple[tuple[int, Task], ...],
+        tuple[tuple[int, Task], ...],
+    ]:
+        """Return a leading read cohort and its safe pending prerequisites."""
+        try:
+            task_by_id = {task.id: task for _, task in indexed}
+            candidates = tuple(
+                item for item in indexed if self._concurrent_candidate(item[1])
+            )
+            if len(candidates) < 2:
+                return (), ()
+
+            candidate_ids = {task.id for _, task in candidates}
+            ancestors = {
+                task.id: self._task_ancestor_ids(task, task_by_id)
+                for _, task in candidates
+            }
+            if any(ancestor_ids & candidate_ids for ancestor_ids in ancestors.values()):
+                return (), ()
+
+            prerequisite_ids = set().union(*ancestors.values())
+            if any(
+                not self._safe_preparation_task(task_by_id[task_id])
+                for task_id in prerequisite_ids
+            ):
+                return (), ()
+
+            allowed_ids = candidate_ids | prerequisite_ids
+            leading: list[tuple[int, Task]] = []
+            for item in indexed:
+                if item[1].id not in allowed_ids:
+                    break
+                leading.append(item)
+
+            leading_candidate_ids = {
+                task.id for _, task in leading if task.id in candidate_ids
+            }
+            if len(leading_candidate_ids) < 2:
+                return (), ()
+            if any(
+                ancestors[task_id] & leading_candidate_ids
+                for task_id in leading_candidate_ids
+            ):
+                return (), ()
+
+            leading_prerequisite_ids = set().union(
+                *(ancestors[task_id] for task_id in leading_candidate_ids)
+            )
+            selected_ids = leading_candidate_ids | leading_prerequisite_ids
+            last_candidate_position = max(
+                position
+                for position, (_, task) in enumerate(leading)
+                if task.id in leading_candidate_ids
+            )
+            if any(
+                task.id not in selected_ids
+                for _, task in leading[: last_candidate_position + 1]
+            ):
+                return (), ()
+            cohort = tuple(
+                item for item in leading if item[1].id in leading_candidate_ids
+            )
+            preparations = tuple(
+                item for item in leading if item[1].id in leading_prerequisite_ids
+            )
+            return cohort, preparations
+        except Exception:
+            return (), ()
+
+    def _concurrent_candidate(self, task: Task) -> bool:
+        capability = self._capability_for_task(task)
+        return (
+            task.status is TaskStatus.PENDING
+            and capability.concurrent_safe
+            and not capability.side_effecting
+            and capability.access in _CONCURRENT_READ_ACCESS
+            and not any(
+                dependency.kind is TaskDependencyKind.APPROVAL
+                for dependency in task.dependencies
+            )
+        )
+
+    def _safe_preparation_task(self, task: Task) -> bool:
+        capability = self._capability_for_task(task)
+        return (
+            task.status is TaskStatus.PENDING
+            and not capability.side_effecting
+            and capability.access in _CONCURRENT_READ_ACCESS
+            and not any(
+                dependency.kind is TaskDependencyKind.APPROVAL
+                for dependency in task.dependencies
+            )
+        )
+
+    @staticmethod
+    def _task_ancestor_ids(
+        task: Task,
+        task_by_id: dict[str, Task],
+    ) -> set[str]:
+        ancestors: set[str] = set()
+        pending = [
+            dependency.producer_task_id
+            for dependency in task.dependencies
+            if dependency.kind is TaskDependencyKind.EVIDENCE
+            and dependency.producer_task_id in task_by_id
+        ]
+        while pending:
+            task_id = pending.pop()
+            if task_id is None or task_id in ancestors:
+                continue
+            ancestors.add(task_id)
+            pending.extend(
+                dependency.producer_task_id
+                for dependency in task_by_id[task_id].dependencies
+                if dependency.kind is TaskDependencyKind.EVIDENCE
+                and dependency.producer_task_id in task_by_id
+            )
+        return ancestors
+
+    async def _task_ready(self, task: Task, operation: Operation) -> bool:
+        try:
+            readiness = await self.runtime.task_readiness(task, operation)
+        except Exception:
+            return False
+        return bool(readiness.get("ready"))
+
+    async def _tasks_ready(
+        self,
+        indexed: tuple[tuple[int, Task], ...],
+        operation: Operation,
+    ) -> bool:
+        for _, task in indexed:
+            if not await self._task_ready(task, operation):
+                return False
+        return True
 
     async def _execute_concurrent(
         self,

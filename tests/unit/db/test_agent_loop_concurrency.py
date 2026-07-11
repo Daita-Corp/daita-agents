@@ -8,9 +8,20 @@ from daita.db.evidence import evidence_in_task_plan_order
 from daita.db.loop import DbAgentLoop
 from daita.db.loop.execution import DbLoopTaskBatchExecutor
 from daita.db.models import DbExecutionConfig, DbRuntimeConfig
+from daita.db.planner_protocol import (
+    DbPlannerAction,
+    DbPlannerActionKind,
+    DbPlannerDecision,
+    DbPlannerDecisionStatus,
+)
 from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.db.runtime.types import DbRuntimeGovernanceBlocked
-from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
+from daita.plugins import (
+    PluginKind,
+    PluginManifest,
+    RuntimeExtensionPlugin,
+    SQLitePlugin,
+)
 from daita.runtime import (
     AccessMode,
     ApprovalStatus,
@@ -19,6 +30,7 @@ from daita.runtime import (
     EvidenceSchema,
     GovernanceResult,
     Operation,
+    OperationStatus,
     PolicyDecision,
     PolicyEffect,
     RiskLevel,
@@ -240,6 +252,159 @@ class _NeverPlanner:
         raise AssertionError("planner should not run")
 
 
+class _LoopValidationExecutor:
+    id = "loop_concurrency.sql.validate"
+    capability_ids = frozenset({"db.sql.validate"})
+
+    def __init__(self, execution_order: list[tuple[str, str]]) -> None:
+        self.execution_order = execution_order
+
+    async def execute(self, task, operation, context):
+        sql = str(task.input["sql"])
+        self.execution_order.append(("validate", sql))
+        return [
+            Evidence(
+                kind="sql.validation",
+                owner="loop_concurrency",
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={"valid": True, "sql": sql, "operation": "query"},
+            )
+        ]
+
+
+class _LoopReadExecutor:
+    id = "loop_concurrency.sql.execute_read"
+    capability_ids = frozenset({"db.sql.execute_read"})
+
+    def __init__(
+        self,
+        execution_order: list[tuple[str, str]],
+        *,
+        block_for_overlap: bool,
+    ) -> None:
+        self.execution_order = execution_order
+        self.block_for_overlap = block_for_overlap
+        self.active = 0
+        self.maximum = 0
+        self.both_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def execute(self, task, operation, context):
+        sql = str(task.input["sql"])
+        self.execution_order.append(("read", sql))
+        self.active += 1
+        self.maximum = max(self.maximum, self.active)
+        if self.active == 2:
+            self.both_started.set()
+        try:
+            if self.block_for_overlap:
+                await self.release.wait()
+        finally:
+            self.active -= 1
+        return [
+            Evidence(
+                kind="query.result",
+                owner="loop_concurrency",
+                operation_id=operation.id,
+                task_id=task.id,
+                payload={"rows": [{"value": sql}], "total_rows": 1, "sql": sql},
+            )
+        ]
+
+
+class _LoopConcurrencyPlugin(RuntimeExtensionPlugin):
+    manifest = PluginManifest(
+        id="loop_concurrency",
+        display_name="Loop Concurrency",
+        version="1.0.0",
+        kind=PluginKind.RUNTIME_EXTENSION,
+        domains=frozenset({"db"}),
+    )
+
+    def __init__(self, *, block_for_overlap: bool) -> None:
+        self.execution_order: list[tuple[str, str]] = []
+        self.validation = _LoopValidationExecutor(self.execution_order)
+        self.read = _LoopReadExecutor(
+            self.execution_order,
+            block_for_overlap=block_for_overlap,
+        )
+
+    def declare_capabilities(self):
+        common = {
+            "domains": frozenset({"db"}),
+            "operation_types": frozenset({"db.run", "data.query"}),
+            "risk": RiskLevel.LOW,
+            "input_schema": {"type": "object"},
+            "runtime_only": True,
+            "side_effecting": False,
+        }
+        return (
+            Capability(
+                id="db.sql.validate",
+                owner="loop_concurrency",
+                description="Validate controlled SQL.",
+                access=AccessMode.METADATA_READ,
+                output_evidence=frozenset({"sql.validation"}),
+                executor=self.validation.id,
+                **common,
+            ),
+            Capability(
+                id="db.sql.execute_read",
+                owner="loop_concurrency",
+                description="Execute one controlled read.",
+                access=AccessMode.READ,
+                output_evidence=frozenset({"query.result"}),
+                executor=self.read.id,
+                concurrent_safe=True,
+                **common,
+            ),
+        )
+
+    def get_executors(self):
+        return (self.validation, self.read)
+
+    def declare_evidence_schemas(self):
+        return (
+            EvidenceSchema(
+                kind="sql.validation",
+                owner="loop_concurrency",
+                json_schema={"type": "object"},
+            ),
+            EvidenceSchema(
+                kind="query.result",
+                owner="loop_concurrency",
+                json_schema={"type": "object"},
+            ),
+        )
+
+
+class _TwoReadPlanner:
+    def __init__(self, *, owner: str = "loop_concurrency") -> None:
+        self.owner = owner
+        self.calls = 0
+
+    async def plan(self, state):
+        self.calls += 1
+        if self.calls > 1:
+            return DbPlannerDecision(status=DbPlannerDecisionStatus.FINISH)
+        return DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=tuple(
+                DbPlannerAction(
+                    action_id=f"read_{index}",
+                    kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                    input={"owner": self.owner, "sql": sql},
+                )
+                for index, sql in enumerate(
+                    ("select 1 as value", "select 2 as value"),
+                    start=1,
+                )
+            ),
+        )
+
+
 OPERATION = Operation(id="op-1", operation_type="db.run")
 
 
@@ -412,9 +577,8 @@ async def test_serial_validation_wave_unlocks_concurrent_read_wave():
     runtime.task_readiness = readiness
     tasks = (
         _task(0, validation),
-        _task(1, validation),
         _task(
-            2,
+            1,
             read,
             dependencies=(
                 TaskDependency(
@@ -424,6 +588,7 @@ async def test_serial_validation_wave_unlocks_concurrent_read_wave():
                 ),
             ),
         ),
+        _task(2, validation),
         _task(
             3,
             read,
@@ -431,19 +596,380 @@ async def test_serial_validation_wave_unlocks_concurrent_read_wave():
                 TaskDependency(
                     kind=TaskDependencyKind.EVIDENCE,
                     evidence_kind="sql.validation",
-                    producer_task_id="task-1",
+                    producer_task_id="task-2",
                 ),
             ),
         ),
     )
     batch = DbLoopTaskBatchExecutor(runtime)
     running = asyncio.create_task(batch.execute(tasks, OPERATION))
-    await reads_started.wait()
-    assert active_reads == 2
-    release.set()
-    outcomes = await running
-    assert runtime.calls[:2] == ["task-0", "task-1"]
+    try:
+        async with asyncio.timeout(1):
+            await reads_started.wait()
+        assert active_reads == 2
+    finally:
+        release.set()
+    outcomes = await asyncio.wait_for(running, timeout=1)
+    assert runtime.calls[:2] == ["task-0", "task-2"]
     assert [item.task_index for item in outcomes] == [0, 1, 2, 3]
+
+
+def test_read_cohort_includes_transitive_safe_prerequisite_chains():
+    preparation = _capability(
+        "db.query.prepare",
+        access=AccessMode.METADATA_READ,
+        concurrent_safe=False,
+    )
+    validation = _capability(
+        "db.sql.validate",
+        access=AccessMode.METADATA_READ,
+        concurrent_safe=False,
+    )
+    read = _capability()
+
+    def depends_on(task_index, producer_index, capability):
+        return _task(
+            task_index,
+            capability,
+            dependencies=(
+                TaskDependency(
+                    kind=TaskDependencyKind.EVIDENCE,
+                    evidence_kind="test.ready",
+                    producer_task_id=f"task-{producer_index}",
+                ),
+            ),
+        )
+
+    tasks = (
+        _task(0, preparation),
+        depends_on(1, 0, validation),
+        depends_on(2, 1, read),
+        _task(3, preparation),
+        depends_on(4, 3, validation),
+        depends_on(5, 4, read),
+    )
+    runtime = _Runtime((preparation, validation, read), max_concurrency=2)
+
+    cohort, preparations = DbLoopTaskBatchExecutor(runtime)._concurrent_read_cohort(
+        tuple(enumerate(tasks))
+    )
+
+    assert [task.id for _, task in cohort] == ["task-2", "task-5"]
+    assert [task.id for _, task in preparations] == [
+        "task-0",
+        "task-1",
+        "task-3",
+        "task-4",
+    ]
+
+
+def test_prerequisite_for_read_beyond_barrier_cannot_enter_earlier_cohort():
+    preparation = _capability(
+        "db.query.prepare",
+        access=AccessMode.METADATA_READ,
+        concurrent_safe=False,
+    )
+    unrelated = _capability(
+        "db.catalog.inspect",
+        access=AccessMode.METADATA_READ,
+        concurrent_safe=False,
+    )
+    read = _capability()
+
+    def depends_on(task_index, producer_index):
+        return _task(
+            task_index,
+            read,
+            dependencies=(
+                TaskDependency(
+                    kind=TaskDependencyKind.EVIDENCE,
+                    evidence_kind="test.ready",
+                    producer_task_id=f"task-{producer_index}",
+                ),
+            ),
+        )
+
+    tasks = (
+        _task(0, preparation),
+        depends_on(1, 0),
+        _task(2, preparation),
+        _task(3, preparation),
+        depends_on(4, 3),
+        _task(5, unrelated),
+        depends_on(6, 2),
+    )
+    runtime = _Runtime((preparation, unrelated, read), max_concurrency=2)
+
+    cohort, preparations = DbLoopTaskBatchExecutor(runtime)._concurrent_read_cohort(
+        tuple(enumerate(tasks))
+    )
+
+    assert cohort == ()
+    assert preparations == ()
+
+
+async def test_real_db_agent_loop_overlaps_compiled_connector_reads():
+    plugin = _LoopConcurrencyPlugin(block_for_overlap=True)
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            plugins=(plugin,),
+            execution=DbExecutionConfig(max_read_concurrency=2),
+        ),
+        host_services={"db_agent_planner": _TwoReadPlanner()},
+    )
+    running = asyncio.create_task(
+        runtime.run("Compare two independent controlled values.")
+    )
+    try:
+        try:
+            async with asyncio.timeout(1):
+                await plugin.read.both_started.wait()
+        finally:
+            plugin.read.release.set()
+        result = await asyncio.wait_for(running, timeout=2)
+        snapshot = await runtime.inspect_operation(result.operation_id)
+    finally:
+        plugin.read.release.set()
+        if not running.done():
+            running.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await running
+        await runtime.teardown()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert plugin.read.maximum == 2
+    assert plugin.execution_order[:2] == [
+        ("validate", "select 1 as value"),
+        ("validate", "select 2 as value"),
+    ]
+    assert [task.capability_id for task in snapshot.tasks[:4]] == [
+        "db.sql.validate",
+        "db.sql.execute_read",
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    read_task_ids = [
+        task.id
+        for task in snapshot.tasks
+        if task.capability_id == "db.sql.execute_read"
+    ]
+    assert [
+        item.task_id for item in snapshot.evidence if item.kind == "query.result"
+    ] == read_task_ids
+
+
+async def test_real_db_agent_loop_max_one_preserves_interleaved_serial_order():
+    plugin = _LoopConcurrencyPlugin(block_for_overlap=False)
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            plugins=(plugin,),
+            execution=DbExecutionConfig(max_read_concurrency=1),
+        ),
+        host_services={"db_agent_planner": _TwoReadPlanner()},
+    )
+    try:
+        result = await runtime.run("Compare two independent controlled values.")
+    finally:
+        await runtime.teardown()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert plugin.read.maximum == 1
+    assert plugin.execution_order == [
+        ("validate", "select 1 as value"),
+        ("read", "select 1 as value"),
+        ("validate", "select 2 as value"),
+        ("read", "select 2 as value"),
+    ]
+
+
+async def test_real_db_agent_loop_overlaps_actual_sqlite_connector_reads():
+    sqlite = SQLitePlugin(path=":memory:", query_default_limit=10)
+    original_query = sqlite.query
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    maximum = 0
+
+    async def synchronized_query(sql, params=None):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        if active == 2:
+            both_started.set()
+        try:
+            await release.wait()
+            return await original_query(sql, params)
+        finally:
+            active -= 1
+
+    sqlite.query = synchronized_query
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            plugins=(sqlite,),
+            execution=DbExecutionConfig(max_read_concurrency=2),
+        ),
+        host_services={"db_agent_planner": _TwoReadPlanner(owner="sqlite")},
+    )
+    running = asyncio.create_task(runtime.run("Compare two independent SQLite values."))
+    try:
+        try:
+            async with asyncio.timeout(1):
+                await both_started.wait()
+        finally:
+            release.set()
+        result = await asyncio.wait_for(running, timeout=2)
+        snapshot = await runtime.inspect_operation(result.operation_id)
+    finally:
+        release.set()
+        if not running.done():
+            running.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await running
+        await runtime.teardown()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert maximum == 2
+    assert [
+        item.payload["rows"]
+        for item in snapshot.evidence
+        if item.kind == "query.result"
+    ] == [[{"value": 1}], [{"value": 2}]]
+
+
+async def test_unrelated_task_remains_a_plan_order_barrier_for_read_cohort():
+    validation = _capability(
+        "db.sql.validate",
+        access=AccessMode.METADATA_READ,
+        concurrent_safe=False,
+    )
+    unrelated = _capability(
+        "db.catalog.inspect",
+        access=AccessMode.METADATA_READ,
+        concurrent_safe=False,
+    )
+    read = _capability()
+    completed = set()
+    active_reads = 0
+    maximum_reads = 0
+
+    async def execute(task, operation):
+        nonlocal active_reads, maximum_reads
+        if task.capability_id != read.id:
+            completed.add(task.id)
+            return ()
+        active_reads += 1
+        maximum_reads = max(maximum_reads, active_reads)
+        await asyncio.sleep(0)
+        active_reads -= 1
+        return ()
+
+    runtime = _Runtime(
+        (validation, unrelated, read),
+        max_concurrency=2,
+        execute=execute,
+    )
+
+    async def readiness(task, operation):
+        producer_ids = {
+            dependency.producer_task_id
+            for dependency in task.dependencies
+            if dependency.producer_task_id is not None
+        }
+        return {"ready": producer_ids <= completed}
+
+    runtime.task_readiness = readiness
+    tasks = (
+        _task(0, validation),
+        _task(
+            1,
+            read,
+            dependencies=(
+                TaskDependency(
+                    kind=TaskDependencyKind.EVIDENCE,
+                    evidence_kind="sql.validation",
+                    producer_task_id="task-0",
+                ),
+            ),
+        ),
+        _task(2, unrelated),
+        _task(3, validation),
+        _task(
+            4,
+            read,
+            dependencies=(
+                TaskDependency(
+                    kind=TaskDependencyKind.EVIDENCE,
+                    evidence_kind="sql.validation",
+                    producer_task_id="task-3",
+                ),
+            ),
+        ),
+    )
+
+    await DbLoopTaskBatchExecutor(runtime).execute(tasks, OPERATION)
+
+    assert maximum_reads == 1
+    assert runtime.calls == [f"task-{index}" for index in range(5)]
+
+
+async def test_preparation_failure_disables_reordering_for_remaining_tasks():
+    validation = _capability(
+        "db.sql.validate",
+        access=AccessMode.METADATA_READ,
+        concurrent_safe=False,
+    )
+    read = _capability()
+    completed = set()
+
+    async def execute(task, operation):
+        if task.id == "task-0":
+            raise ValueError("validation failed")
+        if task.capability_id == validation.id:
+            completed.add(task.id)
+        return ()
+
+    runtime = _Runtime((validation, read), max_concurrency=2, execute=execute)
+
+    async def readiness(task, operation):
+        producer_ids = {
+            dependency.producer_task_id
+            for dependency in task.dependencies
+            if dependency.producer_task_id is not None
+        }
+        return {"ready": producer_ids <= completed}
+
+    runtime.task_readiness = readiness
+    tasks = (
+        _task(0, validation),
+        _task(
+            1,
+            read,
+            dependencies=(
+                TaskDependency(
+                    kind=TaskDependencyKind.EVIDENCE,
+                    evidence_kind="sql.validation",
+                    producer_task_id="task-0",
+                ),
+            ),
+        ),
+        _task(2, validation),
+        _task(
+            3,
+            read,
+            dependencies=(
+                TaskDependency(
+                    kind=TaskDependencyKind.EVIDENCE,
+                    evidence_kind="sql.validation",
+                    producer_task_id="task-2",
+                ),
+            ),
+        ),
+    )
+
+    outcomes = await DbLoopTaskBatchExecutor(runtime).execute(tasks, OPERATION)
+
+    assert outcomes[0].error is not None
+    assert runtime.calls == ["task-0", "task-1", "task-2", "task-3"]
 
 
 @pytest.mark.parametrize(
