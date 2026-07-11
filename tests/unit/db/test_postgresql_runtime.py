@@ -1,9 +1,11 @@
+import asyncio
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from uuid import UUID
 
 import pytest
 
+from daita.core.exceptions import ValidationError
 from daita.db import DbRequest, DbRuntime
 from daita.db.runtime import DbRuntimeGovernanceBlocked
 from daita.plugins.catalog import CatalogPlugin
@@ -30,6 +32,11 @@ async def test_postgresql_registers_provider_neutral_db_capabilities():
     assert "postgresql.sql.execute_read" in inspection.executor_ids
     assert "postgresql:query.result" in inspection.evidence_schema_kinds
     assert "postgresql:column_values.profile" in inspection.evidence_schema_kinds
+    assert {
+        capability.id
+        for capability in runtime.registry.capabilities
+        if capability.owner == "postgresql" and capability.concurrent_safe
+    } == {"db.sql.execute_read"}
     profile_capability = runtime.registry.get_capability(
         "db.column_values.profile",
         owner="postgresql",
@@ -158,6 +165,81 @@ async def test_postgresql_sql_executors_return_typed_evidence_without_live_db():
     assert plan[0].payload["plan"] == [{"QUERY PLAN": "Seq Scan on orders"}]
     assert write[0].kind == "write.execution"
     assert write[0].payload["affected_rows"] == 3
+
+
+async def test_postgresql_runtime_supports_two_safe_reads_through_one_pool():
+    postgres = _postgres()
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+
+    class Connection:
+        async def fetch(self, sql, *params):
+            nonlocal active
+            active += 1
+            if active == 2:
+                both_started.set()
+            await release.wait()
+            try:
+                value = 1 if "1 AS value" in sql else 2
+                return [{"value": value}]
+            finally:
+                active -= 1
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+        async def close(self):
+            return None
+
+    postgres._pool = Pool()
+    runtime = DbRuntime(plugins=(postgres,))
+    first = asyncio.create_task(
+        runtime.execute_capability(
+            "db.sql.execute_read",
+            owner="postgresql",
+            operation_type="data.query",
+            input={"sql": "SELECT 1 AS value"},
+        )
+    )
+    second = asyncio.create_task(
+        runtime.execute_capability(
+            "db.sql.execute_read",
+            owner="postgresql",
+            operation_type="data.query",
+            input={"sql": "SELECT 2 AS value"},
+        )
+    )
+    try:
+        await both_started.wait()
+        assert active == 2
+        release.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        with pytest.raises(ValidationError):
+            await runtime.execute_capability(
+                "db.sql.execute_read",
+                owner="postgresql",
+                operation_type="data.query",
+                input={"sql": "DELETE FROM orders"},
+            )
+    finally:
+        release.set()
+        await runtime.teardown()
+
+    assert next(item for item in first_result if item.kind == "query.result").payload[
+        "rows"
+    ] == [{"value": 1}]
+    assert next(item for item in second_result if item.kind == "query.result").payload[
+        "rows"
+    ] == [{"value": 2}]
 
 
 def test_postgresql_typed_parameter_coercion_covers_json_restored_values():

@@ -46,6 +46,7 @@ def test_capability_is_serializable_and_round_trips():
         model_visible=False,
         runtime_only=True,
         side_effecting=False,
+        concurrent_safe=True,
         timeout_seconds=10,
     )
 
@@ -55,8 +56,32 @@ def test_capability_is_serializable_and_round_trips():
     assert payload["operation_types"] == ["data.query"]
     assert payload["access"] == "read"
     assert payload["risk"] == "medium"
+    assert payload["concurrent_safe"] is True
     assert json.loads(json.dumps(payload)) == payload
     assert Capability.from_dict(payload) == capability
+
+
+def test_capability_concurrent_safe_defaults_false_for_legacy_payloads():
+    capability = Capability(
+        id="db.sql.execute_read",
+        owner="sqlite",
+        description="Execute a read-only SQL query.",
+        domains=frozenset({"db"}),
+        operation_types=frozenset({"data.query"}),
+        access=AccessMode.READ,
+        risk=RiskLevel.MEDIUM,
+        input_schema={"type": "object"},
+        output_evidence=frozenset({"query.result"}),
+        executor="sqlite.sql.execute_read",
+        side_effecting=False,
+    )
+    payload = capability.to_dict()
+    payload.pop("concurrent_safe")
+
+    restored = Capability.from_dict(payload)
+
+    assert restored.concurrent_safe is False
+    assert restored.to_dict()["concurrent_safe"] is False
 
 
 @pytest.mark.parametrize(

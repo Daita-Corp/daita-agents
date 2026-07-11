@@ -4,9 +4,36 @@ Evidence storage for DB runtime operations.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
-from daita.runtime import Evidence
+from daita.runtime import Evidence, Task
+
+
+def evidence_in_task_plan_order(
+    evidence: Sequence[Evidence],
+    tasks: Sequence[Task],
+) -> tuple[Evidence, ...]:
+    """Order task-backed evidence by persisted task-plan order.
+
+    Non-task evidence retains its exact position, and evidence produced by one
+    task retains executor order. This projects deterministic loop evidence
+    without changing raw store commit semantics.
+    """
+    items = tuple(evidence)
+    task_order = {task.id: index for index, task in enumerate(tasks)}
+    task_positions = [
+        index for index, item in enumerate(items) if item.task_id in task_order
+    ]
+    if len(task_positions) < 2:
+        return items
+    ordered = sorted(
+        ((position, items[position]) for position in task_positions),
+        key=lambda pair: (task_order[pair[1].task_id], pair[0]),
+    )
+    projected = list(items)
+    for position, (_, item) in zip(task_positions, ordered):
+        projected[position] = item
+    return tuple(projected)
 
 
 async def load_evidence(

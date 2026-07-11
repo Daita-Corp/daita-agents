@@ -1,5 +1,7 @@
+import asyncio
 import json
 
+from daita.core.exceptions import ValidationError
 from daita.db import DbRuntime, DbRuntimeConfig
 from daita.db.loop import DbAgentLoop
 from daita.db.llm_service import DbLLMResponse
@@ -605,6 +607,11 @@ async def test_sqlite_registers_provider_neutral_db_capabilities():
     assert "sqlite.sql.execute_read" in inspection.executor_ids
     assert "sqlite:query.result" in inspection.evidence_schema_kinds
     assert "sqlite:column_values.profile" in inspection.evidence_schema_kinds
+    assert {
+        capability.id
+        for capability in runtime.registry.capabilities
+        if capability.owner == "sqlite" and capability.concurrent_safe
+    } == {"db.sql.execute_read"}
     profile_capability = runtime.registry.get_capability(
         "db.column_values.profile",
         owner="sqlite",
@@ -671,6 +678,68 @@ async def test_sqlite_read_query_returns_typed_query_result_through_runtime():
     assert query_result.owner == "sqlite"
     assert query_result.payload["rows"] == [{"order_count": 1}]
     assert query_result.payload["sql"].endswith("LIMIT 10")
+
+
+async def test_sqlite_runtime_supports_two_safe_reads_through_one_plugin():
+    sqlite = SQLitePlugin(path=":memory:", query_default_limit=10)
+    runtime = DbRuntime(plugins=(sqlite,))
+    await runtime.setup()
+    await _seed(sqlite)
+    original_query = sqlite.query
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+
+    async def synchronized_query(sql, params=None):
+        nonlocal active
+        active += 1
+        if active == 2:
+            both_started.set()
+        await release.wait()
+        try:
+            return await original_query(sql, params)
+        finally:
+            active -= 1
+
+    sqlite.query = synchronized_query
+    first = asyncio.create_task(
+        runtime.execute_capability(
+            "db.sql.execute_read",
+            owner="sqlite",
+            operation_type="data.query",
+            input={"sql": "SELECT COUNT(*) AS value FROM customers"},
+        )
+    )
+    second = asyncio.create_task(
+        runtime.execute_capability(
+            "db.sql.execute_read",
+            owner="sqlite",
+            operation_type="data.query",
+            input={"sql": "SELECT COUNT(*) AS value FROM orders"},
+        )
+    )
+    try:
+        await both_started.wait()
+        assert active == 2
+        release.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        with pytest.raises(ValidationError):
+            await runtime.execute_capability(
+                "db.sql.execute_read",
+                owner="sqlite",
+                operation_type="data.query",
+                input={"sql": "DELETE FROM orders"},
+            )
+    finally:
+        release.set()
+        await runtime.teardown()
+
+    assert next(item for item in first_result if item.kind == "query.result").payload[
+        "rows"
+    ] == [{"value": 1}]
+    assert next(item for item in second_result if item.kind == "query.result").payload[
+        "rows"
+    ] == [{"value": 1}]
 
 
 async def test_sqlite_and_catalog_vertical_slice_through_db_runtime():

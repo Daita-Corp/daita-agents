@@ -77,6 +77,7 @@ def postgresql_capabilities() -> tuple[Capability, ...]:
             executor="postgresql.sql.execute_read",
             model_visible=True,
             side_effecting=False,
+            concurrent_safe=True,
         ),
         Capability(
             id="db.sql.execute_write",

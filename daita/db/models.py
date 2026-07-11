@@ -78,11 +78,26 @@ class DbLimits:
 
 
 @dataclass(frozen=True)
+class DbExecutionConfig:
+    """Bounded concurrency settings for DB runtime execution owners."""
+
+    max_read_concurrency: int = 1
+    analysis_max_concurrency: int = 1
+
+    def __post_init__(self) -> None:
+        if self.max_read_concurrency < 1:
+            raise ValueError("max_read_concurrency must be at least 1")
+        if self.analysis_max_concurrency < 1:
+            raise ValueError("analysis_max_concurrency must be at least 1")
+
+
+@dataclass(frozen=True)
 class DbRuntimeConfig:
     """Configuration for a `DbRuntime` instance."""
 
     profile: str = "analyst"
     limits: DbLimits = field(default_factory=DbLimits)
+    execution: DbExecutionConfig = field(default_factory=DbExecutionConfig)
     plugins: tuple[Any, ...] = ()
     policies: tuple[Any, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -92,7 +107,16 @@ class DbRuntimeConfig:
             raise ValueError("profile is required")
         object.__setattr__(self, "plugins", tuple(self.plugins))
         object.__setattr__(self, "policies", tuple(self.policies))
-        object.__setattr__(self, "metadata", _json_dict(self.metadata))
+        metadata = _json_dict(self.metadata)
+        existing_options = metadata.get("from_db_options")
+        from_db_options = (
+            dict(existing_options) if isinstance(existing_options, Mapping) else {}
+        )
+        from_db_options["analysis_max_concurrency"] = (
+            self.execution.analysis_max_concurrency
+        )
+        metadata["from_db_options"] = from_db_options
+        object.__setattr__(self, "metadata", metadata)
 
 
 @dataclass(frozen=True)

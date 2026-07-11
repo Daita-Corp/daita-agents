@@ -30,6 +30,7 @@ from daita.runtime import (
 )
 from daita.skills import SkillResolution, SkillResolver
 
+from ..evidence import evidence_in_task_plan_order
 from ..loop import DbAgentLoop, DbLoopResult
 from ..llm_agent_planner import DbLLMAgentPlanner
 from ..llm_service import DbLLMService, db_llm_service_from_metadata
@@ -547,8 +548,11 @@ class DbRuntime(
             )
 
         current_operation = await self.store.load_operation(operation_id) or operation
-        evidence = tuple(await self.store.list_evidence(operation_id))
         tasks = tuple(await self.store.list_tasks(operation_id))
+        evidence = evidence_in_task_plan_order(
+            await self.store.list_evidence(operation_id),
+            tasks,
+        )
         return await self._record_operation_result(
             DbOperationResult(
                 operation_id=operation_id,
@@ -596,15 +600,21 @@ class DbRuntime(
         operation = await self.store.load_operation(operation_id)
         if operation is None:
             raise KeyError(operation_id)
-        evidence = tuple(await self.store.list_evidence(operation_id))
         tasks = tuple(await self.store.list_tasks(operation_id))
+        evidence = evidence_in_task_plan_order(
+            await self.store.list_evidence(operation_id),
+            tasks,
+        )
         await persist_session_query_scopes(
             self.store,
             operation,
             tasks,
             evidence,
         )
-        evidence = tuple(await self.store.list_evidence(operation_id))
+        evidence = evidence_in_task_plan_order(
+            await self.store.list_evidence(operation_id),
+            tasks,
+        )
         contract = _contract_from_latest_loop_snapshot(operation, fallback_contract)
         intent = _intent_from_loop_contract(contract, fallback_intent)
         diagnostics = dict(base_diagnostics or {})
@@ -660,8 +670,11 @@ class DbRuntime(
             outcome_evidence=(*evidence, verification_evidence),
         )
         refreshed_tasks = tuple(await self.store.list_tasks(operation_id))
-        final_evidence = tuple(await self.store.list_evidence(operation_id))
         final_tasks = refreshed_tasks
+        final_evidence = evidence_in_task_plan_order(
+            await self.store.list_evidence(operation_id),
+            final_tasks,
+        )
         if synthesis_task not in final_tasks:
             final_tasks = (*final_tasks, synthesis_task)
         if synthesis_evidence not in final_evidence:
@@ -711,8 +724,11 @@ class DbRuntime(
         operation = await self.store.load_operation(operation_id)
         if operation is None:
             raise KeyError(operation_id)
-        evidence = tuple(await self.store.list_evidence(operation_id))
         tasks = tuple(await self.store.list_tasks(operation_id))
+        evidence = evidence_in_task_plan_order(
+            await self.store.list_evidence(operation_id),
+            tasks,
+        )
         fallback_contract = fallback_contract or self._db_contract_from_context(
             operation
         )

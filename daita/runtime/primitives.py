@@ -188,6 +188,7 @@ class Capability:
     replay_safe: bool = False
     idempotent: bool = False
     side_effecting: bool = True
+    concurrent_safe: bool = False
     timeout_seconds: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -225,6 +226,7 @@ class Capability:
             "replay_safe": self.replay_safe,
             "idempotent": self.idempotent,
             "side_effecting": self.side_effecting,
+            "concurrent_safe": self.concurrent_safe,
             "timeout_seconds": self.timeout_seconds,
             "metadata": self.metadata,
         }

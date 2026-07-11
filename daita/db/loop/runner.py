@@ -13,6 +13,7 @@ from daita.runtime import (
 )
 
 from ..continuation import DbContinuationResolver
+from ..evidence import evidence_in_task_plan_order
 from ..fingerprints import persisted_fingerprint
 from ..models import DbIntentKind
 from ..planner_protocol import (
@@ -23,16 +24,9 @@ from ..planner_protocol import (
     DbPlannerDecisionStatus,
     DbPlannerObservation,
 )
-from ..runtime.types import DbRuntimeGovernanceBlocked, DbRuntimeTaskNotRunnable
-from ..verification import (
-    db_run_finalization_check,
-)
+from ..verification import db_run_finalization_check
 
-from .actions import (
-    _TERMINAL_TASK_STATUSES,
-    _has_runtime_continuation_block,
-    _has_terminal_compilation_error,
-)
+from .actions import _has_runtime_continuation_block, _has_terminal_compilation_error
 from .compiler import DbActionCompiler
 from .contracts import (
     _contract_from_latest_snapshot,
@@ -44,6 +38,7 @@ from .contracts import (
     _intent_summary,
 )
 from .grounding import _validation_grounding_runtime_continuation_action
+from .execution import DbLoopTaskBatchExecutor
 from .memory import (
     _memory_context_for_state,
     _memory_update_runtime_continuation_action,
@@ -82,6 +77,7 @@ class DbAgentLoop:
         self.planner = planner
         self.continuation_resolver = DbContinuationResolver()
         self.compiler = DbActionCompiler(self.runtime, self.continuation_resolver)
+        self.task_batch = DbLoopTaskBatchExecutor(self.runtime)
 
     async def run(
         self,
@@ -356,17 +352,17 @@ class DbAgentLoop:
             )
             executed: list[Evidence] = []
             execution_errors: list[dict[str, Any]] = []
-            for task in task_plan.tasks:
-                if task.status in _TERMINAL_TASK_STATUSES:
-                    continue
-                try:
-                    executed.extend(await self.runtime.execute_task(task, operation))
-                except DbRuntimeGovernanceBlocked as exc:
+            outcomes = await self.task_batch.execute(task_plan.tasks, operation)
+            for outcome in outcomes:
+                if outcome.governance_error is not None:
+                    governance_error = outcome.governance_error
                     await self._persist_observation(
                         operation,
                         DbPlannerObservation(
                             task_statuses=await self._task_summaries(operation.id),
-                            governance_status=_governance_summary(exc.governance),
+                            governance_status=_governance_summary(
+                                governance_error.governance
+                            ),
                             diagnostics={"status": "task_governance_blocked"},
                         ),
                         turn=turn,
@@ -375,26 +371,37 @@ class DbAgentLoop:
                         operation,
                         "blocked",
                         warnings=warnings,
-                        diagnostics={"task_id": exc.task.id if exc.task else None},
+                        diagnostics={
+                            "task_id": (
+                                governance_error.task.id
+                                if governance_error.task
+                                else None
+                            )
+                        },
                     )
-                except DbRuntimeTaskNotRunnable as exc:
+                if outcome.readiness_error is not None:
+                    readiness_error = outcome.readiness_error
                     execution_errors.append(
                         {
-                            "task_id": exc.task.id,
-                            "capability_id": exc.task.capability_id,
-                            "error": str(exc),
-                            "readiness": exc.readiness,
+                            "task_id": readiness_error.task.id,
+                            "capability_id": readiness_error.task.capability_id,
+                            "error": str(readiness_error),
+                            "readiness": readiness_error.readiness,
                         }
                     )
-                except Exception as exc:
+                    continue
+                if outcome.error is not None:
+                    task_error = outcome.error
                     execution_errors.append(
                         {
-                            "task_id": task.id,
-                            "capability_id": task.capability_id,
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
+                            "task_id": outcome.task.id,
+                            "capability_id": outcome.task.capability_id,
+                            "error": str(task_error),
+                            "error_type": type(task_error).__name__,
                         }
                     )
+                    continue
+                executed.extend(outcome.evidence)
 
             progress_after = await self._progress_snapshot(operation.id)
             progress_facts = self._progress_facts(
@@ -490,7 +497,11 @@ class DbAgentLoop:
         operation = await self._fresh_operation(operation.id)
         metadata = dict(operation.metadata)
         frame = _json_dict(safety_frame or metadata.get("safety_frame") or {})
-        evidence = await self.runtime.store.list_evidence(operation.id)
+        tasks = await self.runtime.store.list_tasks(operation.id)
+        evidence = evidence_in_task_plan_order(
+            await self.runtime.store.list_evidence(operation.id),
+            tasks,
+        )
         accepted = tuple(item for item in evidence if item.accepted)
         rejected = tuple(item for item in evidence if not item.accepted)
         planner_observations = tuple(
@@ -658,7 +669,10 @@ class DbAgentLoop:
 
     async def _progress_snapshot(self, operation_id: str) -> _LoopProgressSnapshot:
         tasks = await self.runtime.store.list_tasks(operation_id)
-        evidence = await self.runtime.store.list_evidence(operation_id)
+        evidence = evidence_in_task_plan_order(
+            await self.runtime.store.list_evidence(operation_id),
+            tasks,
+        )
         return _LoopProgressSnapshot(
             task_statuses={task.id: task.status.value for task in tasks},
             accepted_evidence=tuple(
@@ -862,8 +876,11 @@ class DbAgentLoop:
                 fallback_intent=fallback_intent,
                 fallback_contract=fallback_contract,
             )
-        evidence = tuple(await self.runtime.store.list_evidence(operation_id))
         tasks = tuple(await self.runtime.store.list_tasks(operation_id))
+        evidence = evidence_in_task_plan_order(
+            await self.runtime.store.list_evidence(operation_id),
+            tasks,
+        )
         intent = _intent_from_contract(contract, fallback_intent)
         check = db_run_finalization_check(
             operation=operation,
@@ -893,8 +910,11 @@ class DbAgentLoop:
         warnings: Iterable[str],
         diagnostics: Mapping[str, Any],
     ) -> DbLoopResult:
-        evidence = await self.runtime.store.list_evidence(operation.id)
         tasks = await self.runtime.store.list_tasks(operation.id)
+        evidence = evidence_in_task_plan_order(
+            await self.runtime.store.list_evidence(operation.id),
+            tasks,
+        )
         return DbLoopResult(
             status=status,
             evidence_refs=tuple(_evidence_ref(item) for item in evidence if item.id),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, TYPE_CHECKING
 
 from daita.runtime import (
@@ -17,6 +18,7 @@ from daita.runtime import (
     TaskStatus,
 )
 
+from ..evidence import evidence_in_task_plan_order
 from ..loop import DbAgentLoop, DbLoopResult
 from ..models import (
     DbIntent,
@@ -105,7 +107,16 @@ class DbRuntimeResumeMixin:
         """Inspect persisted state for one operation."""
         inspect = getattr(self.store, "inspect_operation", None)
         if inspect is not None:
-            return await inspect(operation_id)
+            snapshot = await inspect(operation_id)
+            if snapshot is None:
+                return None
+            return replace(
+                snapshot,
+                evidence=evidence_in_task_plan_order(
+                    snapshot.evidence,
+                    snapshot.tasks,
+                ),
+            )
         operation = await self.store.load_operation(operation_id)
         if operation is None:
             return None
@@ -129,7 +140,10 @@ class DbRuntimeResumeMixin:
         return OperationSnapshot(
             operation=operation,
             tasks=tasks,
-            evidence=tuple(await self.store.list_evidence(operation_id)),
+            evidence=evidence_in_task_plan_order(
+                await self.store.list_evidence(operation_id),
+                tasks,
+            ),
             events=tuple(await self.store.list_events(operation_id)),
             policy_decisions=tuple(
                 await self.store.list_policy_decisions(operation_id)
