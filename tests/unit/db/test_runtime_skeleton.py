@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import FrozenInstanceError, dataclass, fields
 import inspect
 from unittest.mock import AsyncMock
@@ -10,6 +11,7 @@ from daita.db import (
     DbRuntime,
     DbRuntimeConfig,
     DbRuntimeInspection,
+    DbMonitorScheduler,
 )
 from daita.db.runtime.tasks import DbTaskContext, DbTaskExecutor, DbTaskRuntime
 from daita.db.runtime.tasks import execution as task_execution
@@ -532,6 +534,36 @@ async def test_db_runtime_setup_passes_plugin_context_and_teardown_runs():
     assert plugin.teardown_called is True
     assert runtime.is_setup is False
     assert runtime.setup_context is None
+
+
+async def test_db_runtime_setup_starts_no_monitor_background_work(monkeypatch):
+    runtime = DbRuntime()
+    created_tasks = []
+    original_create_task = asyncio.create_task
+    scheduler_pass = AsyncMock()
+
+    def capture_create_task(coro, *args, **kwargs):
+        task = original_create_task(coro, *args, **kwargs)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", capture_create_task)
+    monkeypatch.setattr(DbMonitorScheduler, "run_once", scheduler_pass)
+
+    try:
+        await runtime.setup()
+    finally:
+        for task in created_tasks:
+            task.cancel()
+        if created_tasks:
+            await asyncio.gather(*created_tasks, return_exceptions=True)
+
+    assert created_tasks == []
+    scheduler_pass.assert_not_awaited()
+    assert all(
+        "monitor" not in worker.id and "monitor" not in worker.role
+        for worker in runtime.registry.workers
+    )
 
 
 async def test_db_runtime_exposes_runtime_store_to_plugins():

@@ -174,6 +174,13 @@ Built in modes:
 - `monitor(...)`: create durable database observations.
 - `stop()` / `teardown()`: release runtime resources.
 
+Database monitor scheduling is deliberately host-driven. The library provides
+durable one-shot passes through `DbMonitorScheduler.run_once()` (and the
+one-shot `DbRuntime.tick_monitors()` convenience); the application owns
+cadence, retry, metrics, signals, and shutdown. See
+[`docs/MONITOR_HOSTING.md`](docs/MONITOR_HOSTING.md) for the complete hosting
+contract and multi-host lease guidance.
+
 ## Local Tool Agents
 
 The generic `Agent` is useful for non DB assistants, local tool calling,

@@ -8,17 +8,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
 from daita.agents.agent import Agent
-from daita.db import DbRuntimeOptions
+from daita.db import DbMonitorScheduler, DbRuntimeOptions
 
 from local_sqlite_fixtures import seed_sales_sqlite
 
-NOW = "2026-06-25T12:00:00+00:00"
+NOW = datetime(2026, 6, 25, 12, 0, tzinfo=timezone.utc)
+MAX_PASS_ATTEMPTS = 3
+INITIAL_BACKOFF_SECONDS = 0.05
+MAX_BACKOFF_SECONDS = 0.2
 
 
 def llm_options(use_live_llm: bool) -> dict[str, Any]:
@@ -55,6 +59,71 @@ def evidence_kinds(snapshot) -> list[str]:
 
 def task_capability_sequence(snapshot) -> list[str]:
     return [task.capability_id for task in snapshot.tasks]
+
+
+def new_host_metrics() -> dict[str, int]:
+    return {
+        "due": 0,
+        "claimed": 0,
+        "lease_lost": 0,
+        "succeeded": 0,
+        "blocked": 0,
+        "failed": 0,
+        "triggered": 0,
+        "pass_failed": 0,
+    }
+
+
+def record_host_metrics(metrics: dict[str, int], results) -> None:
+    for result in results:
+        reason = result.run.summary.get("reason")
+        if result.claimed or reason == "lease_lost":
+            metrics["due"] += 1
+        if result.claimed:
+            metrics["claimed"] += 1
+        if reason == "lease_lost":
+            metrics["lease_lost"] += 1
+        if result.run.status in {"succeeded", "triggered"}:
+            metrics["succeeded"] += 1
+        elif result.run.status == "blocked":
+            metrics["blocked"] += 1
+        elif result.run.status == "failed":
+            metrics["failed"] += 1
+        if result.run.triggered:
+            metrics["triggered"] += 1
+
+
+async def run_hosted_monitor_pass(scheduler: DbMonitorScheduler, *, now: datetime):
+    """Run one deterministic hosted pass with bounded application retry."""
+    stop = asyncio.Event()  # A recurring host would set this from SIGINT/SIGTERM.
+    metrics = new_host_metrics()
+    backoff = INITIAL_BACKOFF_SECONDS
+    active_pass = None
+    try:
+        for attempt in range(1, MAX_PASS_ATTEMPTS + 1):
+            if stop.is_set():
+                break
+            active_pass = asyncio.create_task(scheduler.run_once(now=now))
+            try:
+                results = await active_pass
+            except Exception:
+                metrics["pass_failed"] += 1
+                if attempt == MAX_PASS_ATTEMPTS:
+                    raise
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+            else:
+                backoff = INITIAL_BACKOFF_SECONDS  # Reset after success.
+                record_host_metrics(metrics, results)
+                return results, metrics
+    finally:
+        stop.set()  # Stop new passes before teardown.
+        if active_pass is not None and not active_pass.done():
+            await active_pass
+    return (), metrics
 
 
 def print_monitor(monitor) -> None:
@@ -130,6 +199,13 @@ async def main() -> None:
             runtime=DbRuntimeOptions(store="sqlite", store_path=store_path),
             **llm_options(args.live_llm),
         )
+        scheduler = DbMonitorScheduler(
+            runtime=agent.runtime,
+            scheduler_id=(
+                os.getenv("DAITA_MONITOR_SCHEDULER_ID")
+                or f"monitor-orders-example-{os.getpid()}"
+            ),
+        )
         try:
             inspection = await agent.describe()
             print(f"SQLite fixture: {db_path}")
@@ -159,7 +235,11 @@ async def main() -> None:
             if args.setup_only:
                 return
 
-            run = (await agent.runtime.tick_monitors(now=NOW))[0]
+            results, metrics = await run_hosted_monitor_pass(scheduler, now=NOW)
+            run = results[0].run
+            print(f"Scheduler: {scheduler.scheduler_id}")
+            print(f"Host metrics: {metrics}")
+            print()
             print_run(run)
 
             tick_snapshot = await agent.runtime.inspect_operation(run.operation_id)

@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import datetime, timezone
+import os
 from pathlib import Path
 import sys
+
+from daita.db import DbMonitorScheduler
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -23,6 +27,10 @@ from agents.data_team_agent import (  # noqa: E402
     seed_local_sqlite,
     task_capability_sequence,
 )
+
+MAX_PASS_ATTEMPTS = 3
+INITIAL_BACKOFF_SECONDS = 0.05
+MAX_BACKOFF_SECONDS = 0.2
 
 
 def print_runtime_summary(inspection) -> None:
@@ -60,6 +68,71 @@ def print_monitor_inspection(label: str, inspection) -> None:
     print()
 
 
+def new_host_metrics() -> dict[str, int]:
+    return {
+        "due": 0,
+        "claimed": 0,
+        "lease_lost": 0,
+        "succeeded": 0,
+        "blocked": 0,
+        "failed": 0,
+        "triggered": 0,
+        "pass_failed": 0,
+    }
+
+
+def record_host_metrics(metrics: dict[str, int], results) -> None:
+    for result in results:
+        reason = result.run.summary.get("reason")
+        if result.claimed or reason == "lease_lost":
+            metrics["due"] += 1
+        if result.claimed:
+            metrics["claimed"] += 1
+        if reason == "lease_lost":
+            metrics["lease_lost"] += 1
+        if result.run.status in {"succeeded", "triggered"}:
+            metrics["succeeded"] += 1
+        elif result.run.status == "blocked":
+            metrics["blocked"] += 1
+        elif result.run.status == "failed":
+            metrics["failed"] += 1
+        if result.run.triggered:
+            metrics["triggered"] += 1
+
+
+async def run_hosted_monitor_pass(scheduler: DbMonitorScheduler, *, now: datetime):
+    """Run one deterministic hosted pass with bounded application retry."""
+    stop = asyncio.Event()  # A recurring host would set this from SIGINT/SIGTERM.
+    metrics = new_host_metrics()
+    backoff = INITIAL_BACKOFF_SECONDS
+    active_pass = None
+    try:
+        for attempt in range(1, MAX_PASS_ATTEMPTS + 1):
+            if stop.is_set():
+                break
+            active_pass = asyncio.create_task(scheduler.run_once(now=now))
+            try:
+                results = await active_pass
+            except Exception:
+                metrics["pass_failed"] += 1
+                if attempt == MAX_PASS_ATTEMPTS:
+                    raise
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+            else:
+                backoff = INITIAL_BACKOFF_SECONDS  # Reset after success.
+                record_host_metrics(metrics, results)
+                return results, metrics
+    finally:
+        stop.set()  # Stop new passes before teardown.
+        if active_pass is not None and not active_pass.done():
+            await active_pass
+    return (), metrics
+
+
 async def run_demo(args: argparse.Namespace) -> None:
     paths = default_paths(args.base_dir)
     await seed_local_sqlite(paths.db_path)
@@ -77,6 +150,12 @@ async def run_demo(args: argparse.Namespace) -> None:
     print()
 
     agent = await create_data_team_agent(paths, use_live_llm=args.live_llm)
+    scheduler = DbMonitorScheduler(
+        runtime=agent.runtime,
+        scheduler_id=(
+            os.getenv("DAITA_MONITOR_SCHEDULER_ID") or f"data-team-agent-{os.getpid()}"
+        ),
+    )
     try:
         inspection = await agent.describe()
         print_runtime_summary(inspection)
@@ -111,12 +190,19 @@ async def run_demo(args: argparse.Namespace) -> None:
         print_operation(f"Catalog-backed query: {CATALOG_QUERY}", query)
 
         if args.tick_monitor:
-            run = (await agent.runtime.tick_monitors(now=DEMO_NOW))[0]
+            demo_now = datetime.fromisoformat(DEMO_NOW).astimezone(timezone.utc)
+            results, metrics = await run_hosted_monitor_pass(
+                scheduler,
+                now=demo_now,
+            )
+            run = results[0].run
             print("Monitor tick")
+            print(f"  scheduler: {scheduler.scheduler_id}")
             print(f"  run id: {run.id}")
             print(f"  operation id: {run.operation_id}")
             print(f"  status: {run.status}")
             print(f"  triggered: {run.triggered}")
+            print(f"  host metrics: {metrics}")
             print()
             after = await agent.inspect_monitor(monitor.id)
             print_monitor_inspection("Monitor after tick", after)
@@ -146,7 +232,6 @@ def parse_args() -> argparse.Namespace:
         help="Use OpenAI synthesis only when OPENAI_API_KEY is also set.",
     )
     args = parser.parse_args()
-    import os
 
     args.openai_configured = bool(os.getenv("OPENAI_API_KEY"))
     return args
