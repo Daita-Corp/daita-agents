@@ -749,7 +749,7 @@ class ChatRuntime:
             if audience not in provider.audiences:
                 continue
             try:
-                provider_context = {
+                provider_context: dict[str, Any] = {
                     "prompt": prompt,
                     "runtime_id": self.runtime_id,
                     "agent_id": self.runtime_id,

@@ -10,7 +10,7 @@ This abstraction is provider-agnostic and supports both prompt-based
 and native function calling (OpenAI, Anthropic, etc).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Callable,
     Dict,
@@ -127,7 +127,7 @@ def _type_hint_to_json_schema(hint: Any) -> Dict[str, Any]:
 
     # Handle List types
     if origin is list or origin is List:
-        schema = {"type": "array"}
+        schema: Dict[str, Any] = {"type": "array"}
         if args:
             schema["items"] = _type_hint_to_json_schema(args[0])
         return schema
@@ -259,7 +259,7 @@ def tool(
     operation_types: Iterable[str] = ("chat.tool_call",),
     model_visible: bool = True,
     runtime_only: bool = False,
-    timeout_seconds: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
     category: Optional[str] = None,
     focus: Optional[str] = None,
     retry_safe: bool = False,
@@ -312,6 +312,7 @@ def tool(
         )
         tool_parameters = _extract_parameters_from_function(f)
         handler = _make_async_handler(f)
+        evidence_kinds: Tuple[str, ...]
         if output_evidence is None:
             evidence_kinds = (f"{capability_id}.result",)
         elif isinstance(output_evidence, str):
@@ -395,10 +396,10 @@ class LocalTool:
     operation_types: Tuple[str, ...] = ("chat.tool_call",)
     model_visible: bool = True
     runtime_only: bool = False
-    metadata: Dict[str, Any] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     # Safety features
-    timeout_seconds: Optional[int] = None  # Execution timeout
+    timeout_seconds: Optional[float] = None  # Execution timeout
     retry_safe: bool = False  # Safe to retry the tool operation itself
     replay_safe: bool = False  # Safe to replay during whole-run retry
     idempotent: bool = False  # Side-effecting but protected against duplicates

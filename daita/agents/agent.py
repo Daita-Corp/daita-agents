@@ -261,7 +261,11 @@ class Agent(ChatAgentFacadeMixin, BaseAgent):
         This defers API key validation until the LLM is actually needed,
         improving developer experience when loading .env files.
         """
-        if self._llm is None and self._llm_provider_name is not None:
+        if (
+            self._llm is None
+            and self._llm_provider_name is not None
+            and self._llm_model is not None
+        ):
             # Try to get API key
             api_key = self._llm_api_key or settings.get_llm_api_key(
                 self._llm_provider_name
@@ -308,6 +312,68 @@ class Agent(ChatAgentFacadeMixin, BaseAgent):
             logger.warning(f"Failed to setup decision display: {e}")
             self.display_reasoning = False
             self._decision_display = None
+
+    async def stop(self) -> None:
+        """Stop agent and clean up runtime extension resources."""
+        await self.teardown_extensions()
+
+        # Call parent stop for standard cleanup
+        await super().stop()
+
+    @property
+    def health(self) -> Dict[str, Any]:
+        """Enhanced health information for Agent."""
+        base_health = super().health
+        llm = self.llm
+
+        # Add Agent-specific health info
+        base_health.update(
+            {
+                "tools": {
+                    "count": len(self.available_tools),
+                    "setup": self._tools_setup,
+                    "names": self.tool_names,
+                },
+                "extensions": {
+                    "plugin_ids": list(self.extension_registry.plugin_ids),
+                    "manifest_ids": [manifest.id for manifest in self.plugin_manifests],
+                    "capability_ids": [
+                        capability.id for capability in self.capabilities
+                    ],
+                    "capability_count": len(self.capabilities),
+                    "tool_view_names": [view.name for view in self.tool_views],
+                    "tool_view_count": len(self.tool_views),
+                    "context_provider_ids": [
+                        provider.id for provider in self.context_providers
+                    ],
+                    "context_provider_count": len(self.context_providers),
+                    "executor_ids": [executor.id for executor in self.executors],
+                    "executor_count": len(self.executors),
+                    "policy_ids": [policy.id for policy in self.policies],
+                    "policy_count": len(self.policies),
+                    "evidence_schema_kinds": [
+                        schema.kind for schema in self.evidence_schemas
+                    ],
+                    "evidence_schema_count": len(self.evidence_schemas),
+                    "worker_ids": [worker.id for worker in self.workers],
+                    "worker_count": len(self.workers),
+                    "diagnostic_ids": [
+                        diagnostic.declaration_id
+                        for diagnostic in self.extension_diagnostics
+                    ],
+                    "diagnostic_count": len(self.extension_diagnostics),
+                    "setup_plugin_ids": self.extension_setup_plugin_ids,
+                    "pending_setup_plugin_ids": self.pending_extension_setup_plugin_ids,
+                    "setup_complete": self.extensions_setup_complete,
+                },
+                "llm": {
+                    "available": llm is not None,
+                    "provider": getattr(llm, "provider_name", None),
+                },
+            }
+        )
+
+        return base_health
 
     # ========================================================================
     # USER API - What developers call directly

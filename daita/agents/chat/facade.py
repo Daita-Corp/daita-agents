@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, Union
+from functools import partial
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 from daita.core.exceptions import SkillError
 from daita.core.tools import LocalTool
@@ -23,11 +24,38 @@ from daita.runtime import (
 )
 from daita.skills.base import BaseSkill
 
+if TYPE_CHECKING:
+    from daita.core.interfaces import LLMProvider
+    from daita.core.tools import LocalToolCatalog
+    from daita.plugins.registry import ExtensionRegistry
+    from daita.runtime import InMemoryRuntimeStore, RuntimeKernel
+
+    from .runtime import ChatRuntime
+
 logger = logging.getLogger(__name__)
 
 
 class ChatAgentFacadeMixin:
     """Public chat-agent projections backed by registry and ChatRuntime owners."""
+
+    if TYPE_CHECKING:
+        agent_id: str
+        name: str
+        local_tool_catalog: LocalToolCatalog
+        extension_registry: ExtensionRegistry
+        runtime_store: InMemoryRuntimeStore
+        runtime_kernel: RuntimeKernel
+        _extension_setup_plugin_ids: set[str]
+        _local_tool_sources: list[Any]
+        _tools_setup: bool
+
+        @property
+        def runtime(self) -> ChatRuntime: ...
+
+        @property
+        def llm(self) -> LLMProvider | None: ...
+
+        async def stop(self) -> None: ...
 
     def _register_tool_source(self, source) -> None:
         """Register a local LocalTool source into the compatibility registry."""
@@ -534,10 +562,7 @@ class ChatAgentFacadeMixin:
                     name=view.name,
                     description=view.description,
                     parameters=view.parameters,
-                    handler=lambda arguments, tool_name=view.name: self.call_tool(
-                        tool_name,
-                        arguments,
-                    ),
+                    handler=partial(self.call_tool, view.name),
                     source="plugin",
                     plugin_name=owner,
                     capability_ids=(view.capability_id,),
@@ -576,16 +601,11 @@ class ChatAgentFacadeMixin:
             logger.error("Error during agent stop: %s", e, exc_info=True)
         return False
 
-    async def stop(self) -> None:
-        """Stop agent and clean up runtime extension resources."""
-        await self.teardown_extensions()
-
-        # Call parent stop for standard cleanup
-        await super().stop()
-
-    def get_token_usage(self) -> Dict[str, int]:
+    def get_token_usage(self) -> Dict[str, Any]:
         """Get token usage statistics from automatic tracing."""
-        if not self.llm or not hasattr(self.llm, "get_token_stats"):
+        llm = self.llm
+        get_token_stats = getattr(llm, "get_token_stats", None)
+        if not callable(get_token_stats):
             # Fallback for agents without LLM or tracing
             return {
                 "total_tokens": 0,
@@ -594,62 +614,7 @@ class ChatAgentFacadeMixin:
                 "requests": 0,
             }
 
-        return self.llm.get_token_stats()
-
-    @property
-    def health(self) -> Dict[str, Any]:
-        """Enhanced health information for Agent."""
-        base_health = super().health
-
-        # Add Agent-specific health info
-        base_health.update(
-            {
-                "tools": {
-                    "count": len(self.available_tools),
-                    "setup": self._tools_setup,
-                    "names": self.tool_names,
-                },
-                "extensions": {
-                    "plugin_ids": list(self.extension_registry.plugin_ids),
-                    "manifest_ids": [manifest.id for manifest in self.plugin_manifests],
-                    "capability_ids": [
-                        capability.id for capability in self.capabilities
-                    ],
-                    "capability_count": len(self.capabilities),
-                    "tool_view_names": [view.name for view in self.tool_views],
-                    "tool_view_count": len(self.tool_views),
-                    "context_provider_ids": [
-                        provider.id for provider in self.context_providers
-                    ],
-                    "context_provider_count": len(self.context_providers),
-                    "executor_ids": [executor.id for executor in self.executors],
-                    "executor_count": len(self.executors),
-                    "policy_ids": [policy.id for policy in self.policies],
-                    "policy_count": len(self.policies),
-                    "evidence_schema_kinds": [
-                        schema.kind for schema in self.evidence_schemas
-                    ],
-                    "evidence_schema_count": len(self.evidence_schemas),
-                    "worker_ids": [worker.id for worker in self.workers],
-                    "worker_count": len(self.workers),
-                    "diagnostic_ids": [
-                        diagnostic.declaration_id
-                        for diagnostic in self.extension_diagnostics
-                    ],
-                    "diagnostic_count": len(self.extension_diagnostics),
-                    "setup_plugin_ids": self.extension_setup_plugin_ids,
-                    "pending_setup_plugin_ids": self.pending_extension_setup_plugin_ids,
-                    "setup_complete": self.extensions_setup_complete,
-                },
-                "llm": {
-                    "available": self.llm is not None,
-                    "provider": (
-                        self.llm.provider_name
-                        if self.llm and hasattr(self.llm, "provider_name")
-                        else None
-                    ),
-                },
-            }
-        )
-
-        return base_health
+        token_stats = get_token_stats()
+        if not isinstance(token_stats, dict):
+            raise TypeError("LLM provider get_token_stats() must return a dictionary")
+        return token_stats

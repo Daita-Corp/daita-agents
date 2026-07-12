@@ -89,6 +89,7 @@ jobs:
         run: |
           npx --yes pyright@1.1.411 \
             daita/core/exceptions.py \
+            daita/core/tools.py \
             daita/runtime/primitives.py \
             daita/runtime/kernel.py \
             daita/runtime/approvals.py \
@@ -96,7 +97,9 @@ jobs:
             daita/runtime/sqlite_store.py \
             daita/db/loop/execution.py \
             daita/db/monitor_scheduler \
-            daita/db/runtime
+            daita/db/runtime \
+            daita/agents/agent.py \
+            daita/agents/chat
 
   test:
     runs-on: ubuntu-latest
