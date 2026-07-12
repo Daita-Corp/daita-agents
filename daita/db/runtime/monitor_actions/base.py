@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from daita.runtime import AccessMode, Operation, OperationStatus
 
@@ -20,6 +20,9 @@ from .results import DbRuntimeMonitorActionResultsMixin
 from .resume import DbRuntimeMonitorActionResumeMixin
 from .writes import DbRuntimeMonitorActionWritesMixin
 
+if TYPE_CHECKING:
+    from ...models import DbRuntimeConfig
+
 
 class DbRuntimeMonitorActionsMixin(
     DbRuntimeMonitorActionResumeMixin,
@@ -27,6 +30,12 @@ class DbRuntimeMonitorActionsMixin(
     DbRuntimeMonitorActionWritesMixin,
     DbRuntimeMonitorActionResultsMixin,
 ):
+    if TYPE_CHECKING:
+        config: DbRuntimeConfig
+        _is_setup: bool
+
+        async def setup(self, *, agent_id: str | None = None) -> None: ...
+
     async def execute_monitor_action(
         self,
         operation_id: str,

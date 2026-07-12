@@ -690,6 +690,12 @@ class DbRuntime(
             final_tasks = (*final_tasks, synthesis_task)
         if synthesis_evidence not in final_evidence:
             final_evidence = (*final_evidence, synthesis_evidence)
+        raw_synthesis_warnings = synthesis_evidence.payload.get("warnings")
+        synthesis_warnings = (
+            tuple(str(item) for item in raw_synthesis_warnings)
+            if isinstance(raw_synthesis_warnings, list)
+            else ()
+        )
         return await self._record_operation_result(
             DbOperationResult(
                 operation_id=operation_id,
@@ -699,18 +705,7 @@ class DbRuntime(
                 status=OperationStatus.SUCCEEDED,
                 answer=_answer_from_synthesis_evidence(synthesis_evidence),
                 evidence=final_evidence,
-                warnings=tuple(
-                    (
-                        *loop_warnings,
-                        *(
-                            synthesis_evidence.payload.get("warnings")
-                            if isinstance(
-                                synthesis_evidence.payload.get("warnings"), list
-                            )
-                            else ()
-                        ),
-                    )
-                ),
+                warnings=(*loop_warnings, *synthesis_warnings),
                 diagnostics={
                     **diagnostics,
                     "execution": _execution_diagnostics(

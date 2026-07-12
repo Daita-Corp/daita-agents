@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from daita.runtime import (
@@ -42,8 +42,88 @@ from ..monitor_scheduler.scheduler import DbMonitorScheduler
 from .tasks.models import DbTaskSpec
 from .types import DbRuntimeGovernanceBlocked
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from daita.runtime import (
+        InMemoryApprovalChannel,
+        OperationSnapshot,
+        RuntimeKernel,
+        Task,
+    )
+
+    from .tasks.models import DbTaskPlan
+    from .tasks.runtime import DbTaskRuntime
+
 
 class DbRuntimeMonitorManagementMixin:
+    if TYPE_CHECKING:
+        tasks: DbTaskRuntime
+        monitor_store: DbMonitorStore
+        _is_setup: bool
+        kernel: RuntimeKernel
+        runtime_id: str
+        runtime_kind: str
+        store: RuntimeStore
+        approval_channel: InMemoryApprovalChannel
+
+        async def setup(self, *, agent_id: str | None = None) -> None: ...
+
+        async def commit_monitor_mutation(
+            self,
+            mutation: DbMonitorMutation,
+        ) -> None: ...
+
+        async def plan_task_specs(
+            self,
+            operation: Operation,
+            specs: Iterable[DbTaskSpec],
+            *,
+            contract: DbOperationContract | Mapping[str, Any] | None = None,
+        ) -> DbTaskPlan: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
+
+        async def inspect_operation(
+            self,
+            operation_id: str,
+        ) -> OperationSnapshot | None: ...
+
+        async def _record_operation_result(
+            self,
+            result: DbOperationResult,
+            *,
+            operation: Operation | None = None,
+        ) -> DbOperationResult: ...
+
+        async def _persist_trace_correlation(
+            self,
+            operation: Operation,
+            *,
+            intent_kind: str | None = None,
+        ) -> Operation: ...
+
+        async def _monitor_approval_context(
+            self,
+            approval: ApprovalRequest,
+        ) -> dict[str, Any]: ...
+
+        def _current_trace_metadata(self) -> dict[str, str]: ...
+
+        def _record_active_span_correlation(
+            self,
+            operation: Operation,
+            *,
+            intent_kind: str | None = None,
+        ) -> None: ...
+
+        def _current_trace_ids(self) -> tuple[str | None, str | None]: ...
+
     async def _latest_monitor_action_result(
         self,
         operation_id: str,
@@ -485,7 +565,7 @@ class DbRuntimeMonitorManagementMixin:
                     "approval_id": approval.approval_id,
                     "operation_id": approval.operation_id,
                     "task_id": getattr(approval, "task_id", None),
-                    "status": approval.status.value,
+                    "status": approval.status_value,
                     "reason": approval.reason,
                     "risk": approval.risk.value,
                     "requested_by_policy_id": approval.requested_by_policy_id,

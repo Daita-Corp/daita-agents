@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from daita.runtime import Evidence, Operation
@@ -15,8 +15,25 @@ from ...analysis import (
 from ...fingerprints import persisted_fingerprint
 from ..monitor_helpers import _monitor_action_budget_usage
 
+if TYPE_CHECKING:
+    from daita.runtime import RuntimeKernel, RuntimeStore
+
+    from ..tasks.runtime import DbTaskRuntime
+
 
 class DbRuntimeMonitorActionResultsMixin:
+    if TYPE_CHECKING:
+        tasks: DbTaskRuntime
+        store: RuntimeStore
+        kernel: RuntimeKernel
+
+        async def _latest_monitor_action_result(
+            self,
+            operation_id: str,
+            *,
+            action_plan_fingerprint: str,
+        ) -> Evidence | None: ...
+
     async def _persist_monitor_action_plan_evidence(
         self,
         operation: Operation,

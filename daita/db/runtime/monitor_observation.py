@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from daita.runtime import Operation
 
@@ -14,8 +14,40 @@ from ..monitor_plugin_planning import (
 )
 from .types import DbRuntimeGovernanceBlocked
 
+if TYPE_CHECKING:
+    from daita.plugins import ExtensionRegistry
+    from daita.runtime import ApprovalRequest, Capability, Evidence, Task
+
 
 class DbRuntimeMonitorObservationMixin:
+    if TYPE_CHECKING:
+        registry: ExtensionRegistry
+        _is_setup: bool
+
+        async def setup(self, *, agent_id: str | None = None) -> None: ...
+
+        async def _plan_monitor_plugin_task_for_capability(
+            self,
+            operation: Operation,
+            capability: Capability,
+            *,
+            input_payload: dict[str, Any],
+            input_hash: str,
+            idempotency_key: str,
+            reason: str,
+            sequence: int,
+            metadata: dict[str, Any],
+            approval_requests: tuple[ApprovalRequest, ...] = (),
+        ) -> Task: ...
+
+        async def _execute_or_reuse_monitor_plugin_task(
+            self,
+            task: Task,
+            operation: Operation,
+            *,
+            context: dict[str, Any],
+        ) -> tuple[Evidence, ...]: ...
+
     async def execute_monitor_source_observation(
         self,
         operation: Operation,

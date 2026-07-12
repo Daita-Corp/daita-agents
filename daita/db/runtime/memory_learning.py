@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from daita.runtime import Operation, OperationStatus
+from daita.runtime import Evidence, Operation, OperationStatus, Task
 
 from ..fingerprints import persisted_fingerprint
 from ..memory import db_memory_options_from_runtime_metadata
-from ..models import DbOperationResult
-from .tasks.models import DbTaskSpec
+from ..models import DbOperationContract, DbOperationResult, DbRuntimeConfig
+from .tasks.models import DbTaskPlan, DbTaskSpec
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from daita.plugins import ExtensionRegistry
+    from daita.runtime import RuntimeKernel, RuntimeStore
 
 _ELIGIBLE_OPERATION_TYPES = frozenset(
     {
@@ -25,6 +31,27 @@ _ELIGIBLE_OPERATION_TYPES = frozenset(
 
 class DbRuntimeMemoryLearningMixin:
     """Enqueue cold-path DB memory learning after verified operations."""
+
+    if TYPE_CHECKING:
+        config: DbRuntimeConfig
+        kernel: RuntimeKernel
+        registry: ExtensionRegistry
+        store: RuntimeStore
+
+        async def plan_task_specs(
+            self,
+            operation: Operation,
+            specs: Iterable[DbTaskSpec],
+            *,
+            contract: DbOperationContract | Mapping[str, Any] | None = None,
+        ) -> DbTaskPlan: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
 
     async def _enqueue_memory_learning_after_result(
         self,

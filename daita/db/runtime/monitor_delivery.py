@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from daita.runtime import (
@@ -41,11 +41,66 @@ from .types import (
     DbRuntimeGovernanceBlocked,
 )
 
-
 from .monitor_helpers import _terminal_monitor_approval_reason
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from daita.plugins import ExtensionRegistry
+    from daita.runtime import RuntimeKernel, RuntimeStore
+
+    from ..models import DbOperationContract
+    from ..monitors import DbMonitorStore
+    from .governance import _MonitorEffectGovernanceDecision
+    from .tasks.models import DbTaskPlan
+    from .tasks.runtime import DbTaskRuntime
 
 
 class DbRuntimeMonitorDeliveryMixin:
+    if TYPE_CHECKING:
+        registry: ExtensionRegistry
+        store: RuntimeStore
+        monitor_store: DbMonitorStore
+        kernel: RuntimeKernel
+        tasks: DbTaskRuntime
+        runtime_id: str
+        runtime_kind: str
+        _is_setup: bool
+
+        async def setup(self, *, agent_id: str | None = None) -> None: ...
+
+        async def evaluate_monitor_effect_governance(
+            self,
+            operation: Operation,
+            *,
+            capability: Capability,
+            task: Task | None = None,
+            intent: dict[str, Any],
+            phase: str,
+            mutate_approvals: bool = False,
+            operation_override: dict[str, Any] | None = None,
+        ) -> _MonitorEffectGovernanceDecision: ...
+
+        async def plan_task_specs(
+            self,
+            operation: Operation,
+            specs: Iterable[DbTaskSpec],
+            *,
+            contract: DbOperationContract | Mapping[str, Any] | None = None,
+        ) -> DbTaskPlan: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
+
+        async def commit_monitor_mutation(
+            self,
+            mutation: DbMonitorMutation,
+        ) -> None: ...
+
     async def execute_monitor_delivery(
         self,
         operation_id: str,

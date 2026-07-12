@@ -266,6 +266,8 @@ def test_enum_or_string_records_normalize_and_preserve_wire_values():
     )
 
     assert dependency.kind is TaskDependencyKind.EVIDENCE
+    assert dependency.kind_value == "evidence"
+    assert dependency.approval_status_value is None
     assert decision.effect is PolicyEffect.WARN
     assert trace.effect is PolicyEffect.WARN
     assert approval.status is ApprovalStatus.PENDING

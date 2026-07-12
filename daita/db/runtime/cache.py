@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from daita.runtime import Evidence
 
 from ..fingerprints import persisted_fingerprint
 from .types import _SourcePreparationSnapshot
 
+if TYPE_CHECKING:
+    from ..models import DbRuntimeConfig
+
 
 class DbRuntimeCacheMixin:
+    if TYPE_CHECKING:
+        config: DbRuntimeConfig
+        _schema_profile_cache: dict[str, Any] | None
+        _catalog_source_cache: _SourcePreparationSnapshot | None
+
     def cached_schema_evidence(self, *, operation_id: str) -> Evidence | None:
         """Return cached schema profile evidence when the runtime cache is fresh."""
         cached = self._schema_profile_cache

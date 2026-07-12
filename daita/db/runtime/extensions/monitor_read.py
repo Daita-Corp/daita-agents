@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, TYPE_CHECKING
 
 from daita.runtime import Evidence, Operation, Task
 
 from ...fingerprints import persisted_fingerprint
 from ...monitor_commands.resolver import DbMonitorResolver
 from ...monitor_commands.types import DbMonitorCommand, DbMonitorResolution
+
+if TYPE_CHECKING:
+    from .plugin import DbRuntimePlanningPlugin
 
 
 @dataclass(frozen=True)
@@ -127,9 +130,12 @@ class DbMonitorResolveApprovalExecutor:
             raise ValueError(f"unsupported monitor approval action: {action!r}")
         approval_id = _optional_string(task.input.get("approval_id"))
         monitor_id = _optional_string(task.input.get("monitor_id"))
-        approvals = await runtime.list_monitor_approvals(
-            monitor_id=monitor_id,
-            pending_only=True,
+        approvals: tuple[dict[str, Any], ...] = tuple(
+            dict(item)
+            for item in await runtime.list_monitor_approvals(
+                monitor_id=monitor_id,
+                pending_only=True,
+            )
         )
         if approval_id is not None:
             approvals = tuple(
@@ -143,7 +149,8 @@ class DbMonitorResolveApprovalExecutor:
             "monitor_id": monitor_id,
             "matched_approvals": [dict(item) for item in approvals],
         }
-        if not approvals:
+        matched_approval = next(iter(approvals), None)
+        if matched_approval is None:
             payload["status"] = "not_found"
             return [
                 _monitor_evidence(
@@ -164,7 +171,7 @@ class DbMonitorResolveApprovalExecutor:
                 )
             ]
 
-        resolved_id = str(approvals[0]["approval_id"])
+        resolved_id = str(matched_approval["approval_id"])
         if action == "reject":
             approval = await runtime.reject_monitor_approval(resolved_id)
         elif action == "cancel":
@@ -175,7 +182,7 @@ class DbMonitorResolveApprovalExecutor:
             {
                 "status": "resolved",
                 "approval_id": approval.approval_id,
-                "approval_status": approval.status.value,
+                "approval_status": approval.status_value,
                 "operation_id": approval.operation_id,
             }
         )

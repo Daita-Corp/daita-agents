@@ -18,10 +18,10 @@ async def task_readiness(
     """Return DB-owned dependency readiness for kernel task execution."""
     unsatisfied: list[dict[str, Any]] = []
     for dependency in task.dependencies:
-        if dependency.kind.value == "evidence":
+        if dependency.kind_value == "evidence":
             if not await _evidence_dependency_satisfied(context, dependency, operation):
                 unsatisfied.append(dependency.to_dict())
-        elif dependency.kind.value == "approval":
+        elif dependency.kind_value == "approval":
             if not await _approval_dependency_satisfied(context, dependency, operation):
                 unsatisfied.append(dependency.to_dict())
     return {

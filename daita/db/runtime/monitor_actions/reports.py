@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from daita.runtime import Evidence, Operation, OperationStatus, Task
 
@@ -22,8 +22,146 @@ from ..resume import (
 from ..tasks.models import DbTaskSpec
 from ..types import DbRuntimeGovernanceBlocked
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from daita.plugins import ExtensionRegistry
+    from daita.runtime import GovernanceResult, RuntimeKernel, RuntimeStore
+
+    from ...models import (
+        DbIntent,
+        DbOperationContract,
+        DbOperationResult,
+        DbRequest,
+    )
+    from ..tasks.models import DbTaskPlan
+    from ..tasks.runtime import DbTaskRuntime
+
 
 class DbRuntimeMonitorActionReportsMixin:
+    if TYPE_CHECKING:
+        registry: ExtensionRegistry
+        store: RuntimeStore
+        kernel: RuntimeKernel
+        tasks: DbTaskRuntime
+        runtime_id: str
+
+        async def _persist_monitor_report_evidence(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_plan: dict[str, Any],
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            produced_evidence: tuple[Evidence, ...],
+        ) -> Evidence: ...
+
+        async def _persist_monitor_action_result(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_kind: str,
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            plan_evidence: Evidence,
+            status: str,
+            block_reason: str | None = None,
+            extra_produced_evidence: tuple[Evidence, ...] = (),
+            supersede_approval_block: bool = False,
+        ) -> dict[str, Any]: ...
+
+        async def _seed_monitor_analysis_plan(
+            self,
+            operation: Operation,
+            *,
+            analysis_plan: DbAnalysisPlan,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+        ) -> Evidence: ...
+
+        async def _run_multi_step_analysis(
+            self,
+            request: DbRequest,
+            intent: DbIntent,
+            contract: DbOperationContract,
+            operation: Operation,
+            *,
+            base_diagnostics: dict[str, Any],
+            reuse_existing_plan: bool = False,
+        ) -> DbOperationResult: ...
+
+        async def _execute_analysis_validation_task(
+            self,
+            operation: Operation,
+            tasks: list[Task],
+            evidence_store: DbEvidenceStore,
+            *,
+            plan_evidence: Evidence,
+        ) -> Evidence: ...
+
+        async def _block_monitor_action(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_plan: dict[str, Any],
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            plan_evidence: Evidence,
+            reason: str,
+        ) -> dict[str, Any]: ...
+
+        async def _execute_analysis_synthesis_task(
+            self,
+            operation: Operation,
+            tasks: list[Task],
+            evidence_store: DbEvidenceStore,
+            *,
+            analysis_id: str,
+            step_id: str,
+            plan_evidence: Evidence,
+            cited_evidence: tuple[Evidence, ...],
+            partial: bool = False,
+            pause_reason: str | None = None,
+            remaining_step_ids: tuple[str, ...] = (),
+        ) -> Evidence: ...
+
+        async def _checkpoint_blocked_analysis_state(
+            self,
+            operation: Operation,
+            tasks: list[Task],
+            evidence_store: DbEvidenceStore,
+            *,
+            governance: GovernanceResult,
+            evidence: tuple[Evidence, ...],
+        ) -> tuple[Evidence | None, Evidence | None]: ...
+
+        async def plan_task_specs(
+            self,
+            operation: Operation,
+            specs: Iterable[DbTaskSpec],
+            *,
+            contract: DbOperationContract | Mapping[str, Any] | None = None,
+        ) -> DbTaskPlan: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
+
     async def _execute_monitor_notification_action(
         self,
         operation: Operation,

@@ -33,7 +33,7 @@ def _has_sql_validation_dependency(
     dependencies: tuple[TaskDependency, ...],
 ) -> bool:
     return any(
-        dependency.kind.value == "evidence"
+        dependency.kind_value == "evidence"
         and dependency.evidence_kind == "sql.validation"
         for dependency in dependencies
     )

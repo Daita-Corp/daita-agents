@@ -133,7 +133,7 @@ async def authoritative_validation_evidence(
         (
             dependency
             for dependency in task.dependencies
-            if dependency.kind.value == "evidence"
+            if dependency.kind_value == "evidence"
             and dependency.evidence_kind == "sql.validation"
         ),
         None,

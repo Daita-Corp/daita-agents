@@ -517,13 +517,25 @@ class TaskDependency:
         if self.kind is TaskDependencyKind.APPROVAL and self.approval_status is None:
             raise ValueError("approval dependencies require approval_status")
 
+    @property
+    def kind_value(self) -> str:
+        """Return the canonical serialized dependency kind."""
+        return (
+            self.kind.value if isinstance(self.kind, TaskDependencyKind) else self.kind
+        )
+
+    @property
+    def approval_status_value(self) -> str | None:
+        """Return the canonical serialized approval status, when present."""
+        return (
+            self.approval_status.value
+            if isinstance(self.approval_status, ApprovalStatus)
+            else self.approval_status
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "kind": (
-                self.kind.value
-                if isinstance(self.kind, TaskDependencyKind)
-                else self.kind
-            ),
+            "kind": self.kind_value,
             "evidence_kind": self.evidence_kind,
             "evidence_id": self.evidence_id,
             "evidence_owner": self.evidence_owner,
@@ -538,11 +550,7 @@ class TaskDependency:
             "approval_policy_id": self.approval_policy_id,
             "approval_name": self.approval_name,
             "approval_version": self.approval_version,
-            "approval_status": (
-                self.approval_status.value
-                if isinstance(self.approval_status, ApprovalStatus)
-                else self.approval_status
-            ),
+            "approval_status": self.approval_status_value,
             "operation_id": self.operation_id,
             "metadata": self.metadata,
         }

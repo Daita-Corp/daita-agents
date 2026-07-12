@@ -21,7 +21,7 @@ async def load_monitor_proposal_evidence(
         return explicit
     evidence = await runtime.store.list_evidence(operation.id)
     for dependency in task.dependencies:
-        if dependency.kind.value != "evidence":
+        if dependency.kind_value != "evidence":
             continue
         if dependency.evidence_kind != "monitor.proposal":
             continue

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from daita.runtime import (
@@ -14,6 +14,7 @@ from daita.runtime import (
     OperationSnapshot,
     Task,
     TaskDependency,
+    TaskDependencyKind,
     TaskStatus,
 )
 
@@ -31,8 +32,83 @@ from ..governance import (
 from ..monitor_helpers import _terminal_monitor_approval_reason
 from ..tasks.models import DbTaskSpec
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from daita.plugins import ExtensionRegistry
+    from daita.runtime import Capability, RuntimeKernel, RuntimeStore
+
+    from ...models import DbOperationContract
+    from ..governance import _MonitorEffectGovernanceDecision
+    from ..tasks.models import DbTaskPlan
+    from ..tasks.runtime import DbTaskRuntime
+
 
 class DbRuntimeMonitorActionWritesMixin:
+    if TYPE_CHECKING:
+        registry: ExtensionRegistry
+        tasks: DbTaskRuntime
+        store: RuntimeStore
+        kernel: RuntimeKernel
+
+        async def _block_monitor_action(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_plan: dict[str, Any],
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            plan_evidence: Evidence,
+            reason: str,
+        ) -> dict[str, Any]: ...
+
+        async def _persist_monitor_action_result(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_kind: str,
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            plan_evidence: Evidence,
+            status: str,
+            block_reason: str | None = None,
+            extra_produced_evidence: tuple[Evidence, ...] = (),
+            supersede_approval_block: bool = False,
+        ) -> dict[str, Any]: ...
+
+        async def plan_task_specs(
+            self,
+            operation: Operation,
+            specs: Iterable[DbTaskSpec],
+            *,
+            contract: DbOperationContract | Mapping[str, Any] | None = None,
+        ) -> DbTaskPlan: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
+
+        async def evaluate_monitor_effect_governance(
+            self,
+            operation: Operation,
+            *,
+            capability: Capability,
+            task: Task | None = None,
+            intent: dict[str, Any],
+            phase: str,
+            mutate_approvals: bool = False,
+            operation_override: dict[str, Any] | None = None,
+        ) -> _MonitorEffectGovernanceDecision: ...
+
     async def _execute_monitor_write_proposal_action(
         self,
         operation: Operation,
@@ -287,7 +363,7 @@ class DbRuntimeMonitorActionWritesMixin:
                 dependency
                 for dependency in write_task.dependencies
                 if not (
-                    dependency.kind.value == "approval"
+                    dependency.kind == TaskDependencyKind.APPROVAL
                     and dependency.approval_id is None
                     and dependency.approval_policy_id == "approval_required_for_writes"
                 )

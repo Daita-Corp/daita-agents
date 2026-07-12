@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
+from typing import Any, Mapping, TYPE_CHECKING
 
 from daita.runtime import Evidence, Operation, Task
 
@@ -12,6 +12,9 @@ from ...plan_validation import DbQueryPlanValidator
 from ...planning_context import DbPlanningContextBuilder, _evidence_ref
 from ...query_plan import DbQueryPlan
 from ...session_context import session_scope_binding_evidence_for
+
+if TYPE_CHECKING:
+    from .plugin import DbRuntimePlanningPlugin
 
 
 @dataclass(frozen=True)
@@ -215,7 +218,7 @@ async def _load_dependency_evidence(
     kind: str,
 ) -> Evidence | None:
     for dependency in reversed(task.dependencies):
-        if dependency.kind.value != "evidence":
+        if dependency.kind_value != "evidence":
             continue
         if dependency.evidence_kind != kind:
             continue

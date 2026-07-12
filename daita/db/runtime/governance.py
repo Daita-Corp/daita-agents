@@ -240,7 +240,7 @@ class DbRuntimeGovernanceMixin:
                     capability=capability,
                     message=(
                         f"Policy {decision.owner}:{decision.policy_id} returned "
-                        f"{decision.effect.value}."
+                        f"{decision.effect_value}."
                     ),
                     policy_id=decision.policy_id,
                     payload={"decision": decision.to_dict()},
@@ -453,13 +453,13 @@ class DbRuntimeGovernanceMixin:
                 approvals_to_request.append(approval)
                 approval_statuses[approval.approval_id] = ApprovalStatus.PENDING.value
                 continue
-            approval_statuses[approval.approval_id] = existing.status.value
+            approval_statuses[approval.approval_id] = existing.status_value
             if existing.status is ApprovalStatus.APPROVED:
                 continue
             if existing.status is ApprovalStatus.PENDING:
                 pending_requests.append(existing)
                 continue
-            terminal_blocking_statuses[existing.approval_id] = existing.status.value
+            terminal_blocking_statuses[existing.approval_id] = existing.status_value
 
         blocked = result.blocked or bool(terminal_blocking_statuses)
         pending_approval = bool(pending_requests)
@@ -499,7 +499,7 @@ def _approval_governance_facts(
             if approval.status is ApprovalStatus.APPROVED
         ],
         "statuses": {
-            approval.approval_id: approval.status.value for approval in approvals
+            approval.approval_id: approval.status_value for approval in approvals
         },
         "policy_ids": sorted(
             {
@@ -672,7 +672,7 @@ def _approval_trace_summary(request: ApprovalRequest) -> dict[str, Any]:
     return {
         "approval_id": request.approval_id,
         "operation_id": request.operation_id,
-        "status": request.status.value,
+        "status": request.status_value,
         "requested_by_policy_id": request.requested_by_policy_id,
         "owner": request.owner,
         "risk": request.risk.value,
@@ -711,10 +711,10 @@ def _governance_evaluation_trace(
     elif result.pending_approval:
         effect = "require_approval"
         reason = "At least one policy required approval before execution."
-    elif any(decision.effect.value == "modify" for decision in result.decisions):
+    elif any(decision.effect_value == "modify" for decision in result.decisions):
         effect = "modify"
         reason = "Policy modifications were applied and execution was allowed."
-    elif any(decision.effect.value == "warn" for decision in result.decisions):
+    elif any(decision.effect_value == "warn" for decision in result.decisions):
         effect = "warn"
         reason = "Policy warnings were recorded and execution was allowed."
     else:
@@ -810,12 +810,10 @@ def _metadata_summary(metadata: dict[str, Any]) -> dict[str, Any]:
 
 def _actor_context(operation: Operation) -> dict[str, Any]:
     request = operation.request
-    metadata = (
-        request.get("metadata") if isinstance(request.get("metadata"), dict) else {}
-    )
-    input_payload = (
-        request.get("input") if isinstance(request.get("input"), dict) else {}
-    )
+    raw_metadata = request.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    raw_input = request.get("input")
+    input_payload = raw_input if isinstance(raw_input, dict) else {}
     actor = _dict_without_none(
         {
             "user_id": request.get("user_id")
@@ -838,12 +836,10 @@ def _actor_context(operation: Operation) -> dict[str, Any]:
 
 def _tenant_context(operation: Operation) -> dict[str, Any]:
     request = operation.request
-    metadata = (
-        request.get("metadata") if isinstance(request.get("metadata"), dict) else {}
-    )
-    input_payload = (
-        request.get("input") if isinstance(request.get("input"), dict) else {}
-    )
+    raw_metadata = request.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    raw_input = request.get("input")
+    input_payload = raw_input if isinstance(raw_input, dict) else {}
     tenant = _dict_without_none(
         {
             "tenant_id": request.get("tenant_id")
@@ -884,7 +880,7 @@ def _resource_context(
     source: Any,
     capability: Capability | None,
 ) -> dict[str, Any]:
-    resource = {
+    resource: dict[str, Any] = {
         "source_type": type(source).__name__ if source is not None else "none",
         "source_repr": _safe_source_repr(source),
         "operation_type": operation.operation_type,
@@ -1112,18 +1108,14 @@ def _task_governance_facts(task: Task | None) -> dict[str, Any]:
         "input": _task_input_summary(task.input),
         "dependencies": [
             {
-                "kind": dependency.kind.value,
+                "kind": dependency.kind_value,
                 "evidence_kind": dependency.evidence_kind,
                 "producer_task_id": dependency.producer_task_id,
                 "producer_capability_id": dependency.producer_capability_id,
                 "producer_executor_id": dependency.producer_executor_id,
                 "approval_policy_id": dependency.approval_policy_id,
                 "approval_name": dependency.approval_name,
-                "approval_status": (
-                    dependency.approval_status.value
-                    if dependency.approval_status is not None
-                    else None
-                ),
+                "approval_status": dependency.approval_status_value,
                 "payload_fingerprint": dependency.payload_fingerprint,
                 "evidence_payload_keys": sorted(
                     str(key) for key in dependency.evidence_payload

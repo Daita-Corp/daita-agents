@@ -96,9 +96,7 @@ jobs:
             daita/runtime/sqlite_store.py \
             daita/db/loop/execution.py \
             daita/db/monitor_scheduler \
-            daita/db/runtime/analysis \
-            daita/db/runtime/extensions/analysis.py \
-            daita/db/runtime/extensions/plugin.py
+            daita/db/runtime
 
   test:
     runs-on: ubuntu-latest

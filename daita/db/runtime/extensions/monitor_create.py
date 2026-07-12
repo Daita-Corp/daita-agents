@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, TYPE_CHECKING
 from uuid import uuid4
 
 from daita.runtime import Evidence, Operation, Task
@@ -18,6 +18,9 @@ from ...monitor_commands.types import DbMonitorCommand, DbMonitorValidation
 from ...monitors import DbMonitorMutation, DbMonitorState
 from ..tasks.models import DbTaskSpec
 from .monitor_evidence import load_monitor_proposal_evidence
+
+if TYPE_CHECKING:
+    from .plugin import DbRuntimePlanningPlugin
 
 
 @dataclass(frozen=True)
@@ -54,11 +57,12 @@ class DbMonitorPlanCreateExecutor:
         intent = None
         if proposal_input is None and isinstance(task_input.get("intent"), dict):
             intent = monitor_create_intent_from_dict(dict(task_input["intent"]))
-        target = (
-            str(proposal_input.get("target_name") or proposal_input.get("target") or "")
+        raw_target = (
+            proposal_input.get("target_name") or proposal_input.get("target")
             if proposal_input is not None
-            else (intent.target.name if intent is not None else "")
+            else (intent.target.name if intent is not None else None)
         )
+        target = str(raw_target or "")
         schema_evidence = await _inspect_monitor_target_schema(
             runtime,
             operation,

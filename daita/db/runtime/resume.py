@@ -625,7 +625,14 @@ def _resume_context(operation: Operation) -> dict[str, Any]:
 
 
 def _db_request_from_context(operation: Operation) -> DbRequest:
-    context = _resume_context(operation).get("request") or operation.request
+    raw_context = _resume_context(operation).get("request")
+    context: dict[str, Any] = (
+        raw_context if isinstance(raw_context, dict) else operation.request
+    )
+    raw_session_context = context.get("session_context")
+    session_context = (
+        dict(raw_session_context) if isinstance(raw_session_context, dict) else None
+    )
     return DbRequest(
         prompt=str(context.get("prompt") or ""),
         user_id=context.get("user_id"),
@@ -635,11 +642,7 @@ def _db_request_from_context(operation: Operation) -> DbRequest:
         requested_capabilities=tuple(context.get("requested_capabilities") or ()),
         constraints=dict(context.get("constraints") or {}),
         metadata=dict(context.get("metadata") or {}),
-        session_context=(
-            dict(context.get("session_context"))
-            if isinstance(context.get("session_context"), dict)
-            else None
-        ),
+        session_context=session_context,
     )
 
 

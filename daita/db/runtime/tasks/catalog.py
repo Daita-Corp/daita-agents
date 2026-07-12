@@ -104,7 +104,7 @@ class DbTaskCatalog:
     ) -> Evidence | None:
         for dependency in parent_task.dependencies:
             if (
-                dependency.kind.value == "evidence"
+                dependency.kind_value == "evidence"
                 and dependency.evidence_kind == "catalog.value_grounding.plan"
             ):
                 evidence = await accepted_evidence_for_dependency(

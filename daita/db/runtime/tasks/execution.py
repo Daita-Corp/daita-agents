@@ -209,9 +209,17 @@ class DbTaskExecutor:
                 evaluate_governance=False,
             )
         except RuntimeKernelGovernanceBlocked as exc:
+            blocked_operation = (
+                exc.operation
+                or await self.context.store.load_operation(operation_id or "")
+            )
+            if blocked_operation is None:
+                raise RuntimeError(
+                    "governance blocked direct capability execution without a "
+                    "persisted operation"
+                ) from exc
             raise DbRuntimeGovernanceBlocked(
-                operation=exc.operation
-                or await self.context.store.load_operation(operation_id or ""),
+                operation=blocked_operation,
                 task=None,
                 governance=exc.governance or GovernanceResult(False, True, False),
             ) from exc

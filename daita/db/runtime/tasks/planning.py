@@ -233,7 +233,7 @@ def _task_for_spec(
             dependency
             for dependency in default_dependencies
             if not (
-                dependency.kind.value == "evidence"
+                dependency.kind_value == "evidence"
                 and dependency.evidence_kind == "sql.validation"
             )
         )
