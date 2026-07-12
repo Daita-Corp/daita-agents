@@ -33,7 +33,6 @@ from .actions import (
     _same_turn_repair_execute_deferral,
     _source_capability_owner,
     _task_input_for_action,
-    _validated_sql_action_requires_query_plan_proposal,
     _with_deterministic_task_id,
     _with_spec_dependencies,
 )

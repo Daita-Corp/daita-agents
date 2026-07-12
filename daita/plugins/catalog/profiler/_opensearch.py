@@ -14,13 +14,6 @@ class OpenSearchProfiler(BaseProfiler):
 
     async def profile(self, store: DiscoveredStore) -> NormalizedSchema:
         """Connect to an OpenSearch domain and extract index mappings."""
-        try:
-            from opensearchpy import OpenSearch
-        except ImportError:
-            raise ImportError(
-                "opensearch-py is required. Install with: pip install 'daita-agents[opensearch]'"
-            )
-
         from ..discovery import discover_opensearch
 
         conn_hint = store.connection_hint

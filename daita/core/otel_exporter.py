@@ -12,7 +12,6 @@ import logging
 import os
 import threading
 import urllib.request
-import urllib.error
 from typing import Any, Dict, List, Optional, Sequence
 
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult

@@ -413,6 +413,7 @@ include = ["daita"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false
+reportUnusedImport = "error"
 
 [tool.mypy]
 python_version = "3.11"

@@ -32,7 +32,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from inspect import iscoroutinefunction
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional
 
 from .base import BasePlugin, PluginContext
 from .data_quality_extensions import (
@@ -41,10 +41,6 @@ from .data_quality_extensions import (
     data_quality_capabilities,
     data_quality_evidence_schemas,
 )
-
-if TYPE_CHECKING:
-    from ..core.tools import LocalTool
-    from .base_db import BaseDatabasePlugin
 
 logger = logging.getLogger(__name__)
 

@@ -37,7 +37,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 from daita.runtime import (
     AccessMode,
@@ -52,11 +52,6 @@ from daita.runtime import (
 
 from .base import PluginContext, RuntimeExtensionPlugin
 from .manifest import PluginKind, PluginManifest
-
-if TYPE_CHECKING:
-    from ..core.tools import LocalTool
-    from .base_db import BaseDatabasePlugin
-    from .lineage import LineagePlugin
 
 logger = logging.getLogger(__name__)
 

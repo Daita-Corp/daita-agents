@@ -35,8 +35,6 @@ from .bigquery_extensions import (
 if TYPE_CHECKING:
     from google.cloud.bigquery import Client
 
-    from ..core.tools import LocalTool
-
 logger = logging.getLogger(__name__)
 
 

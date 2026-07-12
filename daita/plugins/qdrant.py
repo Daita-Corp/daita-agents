@@ -21,8 +21,6 @@ from .qdrant_extensions import (
 if TYPE_CHECKING:
     from qdrant_client import QdrantClient
 
-    from ..core.tools import LocalTool
-
 logger = logging.getLogger(__name__)
 
 

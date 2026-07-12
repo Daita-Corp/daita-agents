@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-import json
 from typing import Any, Iterable
 
 from daita.runtime import Evidence, Operation
@@ -997,6 +996,7 @@ def _session_filter_text(value: Any) -> str:
 
 def _compact_session_context(request: DbRequest) -> dict[str, Any]:
     session_context = db_session_context_from_request(request)
+    context: object
     if session_context is not None:
         context = session_context.to_request_dict()
     else:

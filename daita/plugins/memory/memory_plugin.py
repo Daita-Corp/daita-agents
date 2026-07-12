@@ -9,9 +9,8 @@ import logging
 import inspect
 import os
 import re
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from ..base import DomainServicePlugin
-from ...core.tools import LocalTool, tool
 from .extensions import (
     MEMORY_MANIFEST,
     MemoryContextProvider,

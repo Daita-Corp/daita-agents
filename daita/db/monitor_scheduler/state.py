@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 import re
 from typing import Any, Mapping
 
-from .types import DbMonitorObservationResult
 from ..monitor_commands.types import DbMonitorValidation
 from ..monitors import DbMonitor, DbMonitorState
 

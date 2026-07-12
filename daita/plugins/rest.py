@@ -7,7 +7,7 @@ Simple REST API client - no over-engineering.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Mapping, Optional, TYPE_CHECKING
+from typing import Any, Dict, Mapping, Optional, TYPE_CHECKING
 
 from daita.runtime import (
     AccessMode,
@@ -25,8 +25,6 @@ from .manifest import PluginKind, PluginManifest
 
 if TYPE_CHECKING:
     from aiohttp import ClientSession
-
-    from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 

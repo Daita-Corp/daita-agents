@@ -72,12 +72,6 @@ class LocalGraphBackend:
 
     def _load(self) -> nx.MultiDiGraph:
         """Load graph from disk into memory. Returns empty graph if file missing."""
-        try:
-            import networkx as nx
-        except ImportError:
-            raise ImportError(
-                "networkx is required for graph features. Install with: pip install 'daita-agents[lineage]'"
-            )
         if self._graph is not None:
             return self._graph
         self._graph = self._read_from_disk()
@@ -89,7 +83,12 @@ class LocalGraphBackend:
         Used by flush() to get the current disk state before merging, and by
         _load() on first access.
         """
-        import networkx as nx
+        try:
+            import networkx as nx
+        except ImportError:
+            raise ImportError(
+                "networkx is required for graph features. Install with: pip install 'daita-agents[lineage]'"
+            )
 
         if not self._graph_path.exists():
             return nx.MultiDiGraph()

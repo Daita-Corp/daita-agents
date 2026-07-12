@@ -14,13 +14,6 @@ class DynamoDBProfiler(BaseProfiler):
 
     async def profile(self, store: DiscoveredStore) -> NormalizedSchema:
         """Describe a DynamoDB table and sample its items."""
-        try:
-            import boto3
-        except ImportError:
-            raise ImportError(
-                "boto3 is required. Install with: pip install 'daita-agents[aws]'"
-            )
-
         from ..discovery import discover_dynamodb
 
         conn_hint = store.connection_hint

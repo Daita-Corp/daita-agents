@@ -22,8 +22,6 @@ from ..core.exceptions import ValidationError
 if TYPE_CHECKING:
     from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
-    from ..core.tools import LocalTool
-
 logger = logging.getLogger(__name__)
 
 

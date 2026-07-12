@@ -35,8 +35,6 @@ if TYPE_CHECKING:
     from imaplib import IMAP4_SSL
     from smtplib import SMTP
 
-    from ..core.tools import LocalTool
-
 logger = logging.getLogger(__name__)
 
 

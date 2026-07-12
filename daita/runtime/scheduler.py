@@ -11,7 +11,6 @@ from .kernel import (
     RuntimeKernelGovernanceBlocked,
     RuntimeKernelTaskAlreadyTerminal,
     RuntimeKernelTaskNotRunnable,
-    TaskExecutionResult,
 )
 from .primitives import RuntimeEventType, TaskStatus
 from .status import TERMINAL_TASK_STATUSES, reconcile_operation_status

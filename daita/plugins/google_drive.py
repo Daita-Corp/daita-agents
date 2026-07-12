@@ -47,8 +47,6 @@ from ..core.exceptions import (
 if TYPE_CHECKING:
     from googleapiclient.http import HttpRequest
 
-    from ..core.tools import LocalTool
-
 logger = logging.getLogger(__name__)
 
 # Google Drive MIME types for native formats

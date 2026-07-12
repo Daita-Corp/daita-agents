@@ -25,8 +25,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from types import TracebackType
 
-    from ..core.tools import LocalTool
-
     class _MySQLCursor(Protocol):
         description: Sequence[Sequence[object]]
         rowcount: int

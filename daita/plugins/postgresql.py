@@ -29,8 +29,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
     from types import TracebackType
 
-    from ..core.tools import LocalTool
-
     class _PostgreSQLConnection(Protocol):
         async def fetch(
             self, query: str, *args: object

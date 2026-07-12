@@ -8,7 +8,6 @@ from daita.db.fingerprints import persisted_fingerprint
 from daita.db.memory import (
     DB_MEMORY_SEMANTIC_CONTRACT_KEY,
     DB_SEMANTIC_MEMORY_KINDS,
-    DBMemoryRecord,
     db_memory_pii_error,
     normalize_db_memory_record,
 )

@@ -21,8 +21,6 @@ from ..core.exceptions import PluginError
 if TYPE_CHECKING:
     from elasticsearch import AsyncElasticsearch
 
-    from ..core.tools import LocalTool
-
 logger = logging.getLogger(__name__)
 
 

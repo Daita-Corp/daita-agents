@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import os
 import logging
-from typing import List, Dict, Any, Literal, Mapping, Optional, TYPE_CHECKING
+from typing import Dict, Any, Literal, Mapping, Optional, TYPE_CHECKING
 
 from daita.runtime import (
     AccessMode,
@@ -81,7 +81,6 @@ from ..core.exceptions import (
     ConnectionError as DaitaConnectionError,
     AuthenticationError,
 )
-from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 

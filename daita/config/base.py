@@ -4,7 +4,7 @@ Configuration models for Daita Agents.
 
 import asyncio
 from enum import Enum
-from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 

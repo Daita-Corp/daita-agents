@@ -14,13 +14,6 @@ class MongoDBProfiler(BaseProfiler):
 
     async def profile(self, store: DiscoveredStore) -> NormalizedSchema:
         """Connect to a MongoDB store and extract its schema."""
-        try:
-            from motor.motor_asyncio import AsyncIOMotorClient
-        except ImportError:
-            raise ImportError(
-                "motor is required. Install with: pip install 'daita-agents[mongodb]'"
-            )
-
         from ..discovery import discover_mongodb
 
         conn_hint = store.connection_hint

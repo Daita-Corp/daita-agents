@@ -26,8 +26,6 @@ from .snowflake_extensions import (
 if TYPE_CHECKING:
     from snowflake.connector import SnowflakeConnection
 
-    from ..core.tools import LocalTool
-
 logger = logging.getLogger(__name__)
 
 

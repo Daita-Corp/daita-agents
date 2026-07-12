@@ -33,8 +33,6 @@ from ..core.exceptions import ValidationError
 if TYPE_CHECKING:
     from redis.asyncio import Redis
 
-    from ..core.tools import LocalTool
-
 logger = logging.getLogger(__name__)
 
 

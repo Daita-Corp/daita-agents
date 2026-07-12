@@ -21,8 +21,6 @@ from .pinecone_extensions import (
 if TYPE_CHECKING:
     from pinecone import GrpcIndex, Index, Pinecone
 
-    from ..core.tools import LocalTool
-
 logger = logging.getLogger(__name__)
 
 

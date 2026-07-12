@@ -14,13 +14,6 @@ class PostgresProfiler(BaseProfiler):
 
     async def profile(self, store: DiscoveredStore) -> NormalizedSchema:
         """Connect to a PostgreSQL store and extract its schema."""
-        try:
-            import asyncpg
-        except ImportError:
-            raise ImportError(
-                "asyncpg is required. Install with: pip install 'daita-agents[postgresql]'"
-            )
-
         from ..discovery import discover_postgres
 
         conn_hint = store.connection_hint

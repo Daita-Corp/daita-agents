@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Optional
 
 from .base_discoverer import BaseDiscoverer, DiscoveredStore
-from .discovery._gcp_common import _GCP_INSTALL_HINT, gcp_credentials
+from .discovery._gcp_common import gcp_credentials
 
 logger = logging.getLogger(__name__)
 

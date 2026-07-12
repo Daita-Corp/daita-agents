@@ -22,8 +22,6 @@ from .sqlite_extensions import (
 if TYPE_CHECKING:
     from aiosqlite import Connection
 
-    from ..core.tools import LocalTool
-
 logger = logging.getLogger(__name__)
 
 

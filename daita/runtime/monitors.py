@@ -7,9 +7,8 @@ import time
 from typing import Any, Mapping
 from uuid import uuid4
 
-from .kernel import RuntimeKernel, RuntimeKernelExecutionError, TaskExecutionResult
+from .kernel import RuntimeKernel, RuntimeKernelExecutionError
 from .primitives import (
-    Capability,
     ContextAudience,
     Operation,
     RuntimeEvent,

@@ -41,8 +41,6 @@ if TYPE_CHECKING:
         PutObjectOutputTypeDef,
     )
 
-    from ..core.tools import LocalTool
-
 logger = logging.getLogger(__name__)
 
 

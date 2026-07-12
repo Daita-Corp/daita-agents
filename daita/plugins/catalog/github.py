@@ -9,7 +9,7 @@ import hashlib
 import logging
 import re
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, AsyncIterator, List, Optional, Tuple
 
 from .base_discoverer import BaseDiscoverer, DiscoveredStore
 

@@ -56,7 +56,6 @@ from .lineage_extensions import (
 )
 
 if TYPE_CHECKING:
-    from ..core.tools import LocalTool
     from ..core.graph.models import EdgeType
     from ..core.graph.resolution import AmbiguousReferencePolicy
 

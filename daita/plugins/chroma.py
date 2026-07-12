@@ -23,8 +23,6 @@ if TYPE_CHECKING:
     from chromadb.api.models.Collection import Collection
     from chromadb.api.types import Include, Metadata, PyEmbedding
 
-    from ..core.tools import LocalTool
-
 logger = logging.getLogger(__name__)
 
 

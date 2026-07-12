@@ -77,7 +77,6 @@ from ..core.exceptions import (
     ConnectionError as DaitaConnectionError,
     AuthenticationError,
 )
-from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
 

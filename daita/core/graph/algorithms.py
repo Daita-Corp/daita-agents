@@ -18,7 +18,6 @@ from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
-    AsyncIterator,
     Dict,
     Iterable,
     List,
@@ -30,8 +29,6 @@ if TYPE_CHECKING:
     import networkx as nx
 
     from .backend import GraphBackend, GraphEdgeType
-    from .models import AgentGraphEdge, AgentGraphNode
-
 from .models import EdgeType
 
 # Default edge-type set for lineage-semantic traversals. Excludes structural

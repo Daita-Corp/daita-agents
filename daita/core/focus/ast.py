@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import ast as pyast
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 # Matches already-parsed aggregate expressions stored in FocusQuery.aggregates,

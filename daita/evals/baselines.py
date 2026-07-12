@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .config import BaselineConfig, EvalSuiteConfig
+from .config import EvalSuiteConfig
 from .models import EvalReport
 
 

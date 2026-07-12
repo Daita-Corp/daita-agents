@@ -35,7 +35,6 @@ from .state import FinalAnswerReadiness, RunPhase, RunState
 from .tools import json_serializer
 
 if TYPE_CHECKING:
-    from daita.core.tools import LocalTool
     from daita.plugins.registry import ExtensionRegistry
     from daita.runtime import RuntimeKernel, RuntimeStore
 

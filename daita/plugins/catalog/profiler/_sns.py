@@ -14,13 +14,6 @@ class SNSProfiler(BaseProfiler):
 
     async def profile(self, store: DiscoveredStore) -> NormalizedSchema:
         """Inspect an SNS topic and its subscriptions."""
-        try:
-            import boto3
-        except ImportError:
-            raise ImportError(
-                "boto3 is required. Install with: pip install 'daita-agents[aws]'"
-            )
-
         from ..discovery import discover_sns
 
         conn_hint = store.connection_hint
