@@ -6,12 +6,18 @@ Supports gemini-embedding-001 with configurable output dimensions
 Uses the google-genai SDK.
 """
 
+from __future__ import annotations
+
 import asyncio
 import os
 import logging
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 
 from .base import BaseEmbeddingProvider
+
+if TYPE_CHECKING:
+    from google.genai import Client
+    from google.genai.types import ContentUnion, EmbedContentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +42,7 @@ class GeminiEmbeddingProvider(BaseEmbeddingProvider):
         api_key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         super().__init__(model=model, api_key=api_key, **kwargs)
         self._output_dimensionality = output_dimensionality
-        self._client = None
+        self._client: Client | None = None
 
     @property
     def client(self):
@@ -59,28 +65,40 @@ class GeminiEmbeddingProvider(BaseEmbeddingProvider):
     def dimensions(self) -> int:
         return self._output_dimensionality
 
-    async def _embed_text_impl(self, text: str) -> List[float]:
-        from google.genai import types
+    @property
+    def _embedding_config(self) -> EmbedContentConfig:
+        try:
+            from google.genai import types
+        except ImportError as exc:
+            raise ImportError(
+                "google-genai is required for Gemini embeddings. "
+                "Install with: pip install 'daita-agents[google]'"
+            ) from exc
+        return types.EmbedContentConfig(
+            output_dimensionality=self._output_dimensionality
+        )
 
+    async def _embed_text_impl(self, text: str) -> List[float]:
         result = await asyncio.to_thread(
             self.client.models.embed_content,
             model=self.model,
             contents=text,
-            config=types.EmbedContentConfig(
-                output_dimensionality=self._output_dimensionality
-            ),
+            config=self._embedding_config,
         )
-        return list(result.embeddings[0].values)
+        embeddings = result.embeddings
+        if not embeddings or embeddings[0].values is None:
+            raise ValueError("Gemini embedding response did not contain values")
+        return list(embeddings[0].values)
 
     async def _embed_texts_impl(self, texts: List[str]) -> List[List[float]]:
-        from google.genai import types
-
+        contents: List[ContentUnion] = [text for text in texts]
         result = await asyncio.to_thread(
             self.client.models.embed_content,
             model=self.model,
-            contents=texts,
-            config=types.EmbedContentConfig(
-                output_dimensionality=self._output_dimensionality
-            ),
+            contents=contents,
+            config=self._embedding_config,
         )
-        return [list(e.values) for e in result.embeddings]
+        embeddings = result.embeddings or []
+        if any(embedding.values is None for embedding in embeddings):
+            raise ValueError("Gemini embedding response did not contain values")
+        return [list(embedding.values or []) for embedding in embeddings]

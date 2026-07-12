@@ -291,6 +291,7 @@ class DbMonitorStore(Protocol):
         self, *, status: str | None = None
     ) -> tuple[DbMonitor, ...]:
         """List persisted monitors, optionally filtered by status."""
+        ...
 
     async def delete_monitor(self, monitor_id: str) -> None:
         """Delete a monitor and its DB monitor control-plane records."""
@@ -306,6 +307,7 @@ class DbMonitorStore(Protocol):
 
     async def list_monitor_runs(self, monitor_id: str) -> tuple[DbMonitorRun, ...]:
         """List run summaries for one monitor."""
+        ...
 
     async def claim_monitor_tick_lease(
         self,
@@ -316,6 +318,7 @@ class DbMonitorStore(Protocol):
         expires_at: str,
     ) -> bool:
         """Claim a durable tick lease if no unexpired lease is held."""
+        ...
 
     async def release_monitor_tick_lease(
         self,

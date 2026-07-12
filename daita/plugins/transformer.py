@@ -899,7 +899,8 @@ class TransformerPlugin(RuntimeExtensionPlugin):
         filter_tag: Optional[str] = None,
     ) -> Dict[str, Any]:
         """List all known transformations with their metadata."""
-        if not self._definitions and not self._graph_backend:
+        graph_backend = self._graph_backend
+        if not self._definitions and graph_backend is None:
             return {"success": False, "error": "No graph backend available"}
 
         transformations = []
@@ -912,7 +913,9 @@ class TransformerPlugin(RuntimeExtensionPlugin):
                 transformations.append(_make_tx_entry(tx_name, props))
         else:
             # Cold-start: _definitions empty, fall back to graph
-            graph = await self._graph_backend.load_graph()
+            if graph_backend is None:
+                return {"success": False, "error": "No graph backend available"}
+            graph = await graph_backend.load_graph()
             from daita.core.graph.models import NodeType
 
             for node_id, node_data in graph.nodes(data=True):

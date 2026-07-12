@@ -157,7 +157,7 @@ class DbLLMRepairExecutor:
             failure=failure,
             prior_plan=prior_plan,
         )
-        if required_inputs["missing_input_evidence"]:
+        if planning_context is None or failure is None or prior_plan is None:
             return _missing_repair_input_evidence(
                 owner=self.owner,
                 operation=operation,
@@ -166,8 +166,8 @@ class DbLLMRepairExecutor:
             )
         messages = _repair_messages(
             planning_context.payload,
-            prior_plan.payload if prior_plan is not None else {},
-            failure.payload if failure is not None else {},
+            prior_plan.payload,
+            failure.payload,
         )
         response = await service.generate_json(messages)
         parsed, diagnostics = _parse_plan_response(response.content)
@@ -181,9 +181,9 @@ class DbLLMRepairExecutor:
                 "valid": parsed is not None,
                 "parse_succeeded": parsed is not None,
                 "repair_inputs_present": True,
-                "failure_evidence_id": getattr(failure, "id", None),
-                "prior_plan_evidence_id": getattr(prior_plan, "id", None),
-                "planning_context_evidence_id": getattr(planning_context, "id", None),
+                "failure_evidence_id": failure.id,
+                "prior_plan_evidence_id": prior_plan.id,
+                "planning_context_evidence_id": planning_context.id,
                 "raw_model_response": response.content,
                 "parse_diagnostics": diagnostics,
                 "planner_diagnostics": response.diagnostics,
@@ -194,7 +194,7 @@ class DbLLMRepairExecutor:
         plan = DbQueryPlan.from_mapping(parsed)
         prior_sql = _sql_from_plan_payload(prior_plan.payload)
         context_changed = _repair_failure_context_changed(
-            failure.payload if failure is not None else {},
+            failure.payload,
             planning_context=planning_context,
         )
         repeated = _same_sql(plan.selected_sql, prior_sql)
@@ -209,7 +209,7 @@ class DbLLMRepairExecutor:
                 parse_diagnostics=diagnostics,
             ),
             "repair_attempt": int(task.input.get("repair_attempt") or 1),
-            "repaired_failure_evidence_id": getattr(failure, "id", None),
+            "repaired_failure_evidence_id": failure.id,
             "repeated_sql_blocked": repeated_blocked,
             "repair_context_changed": context_changed,
             "repair_inputs_present": True,

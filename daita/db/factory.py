@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from dataclasses import replace
+from pathlib import Path
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -342,7 +343,9 @@ def _resolve_runtime_store(options: DbRuntimeOptions | None) -> RuntimeStore | N
     if options.store is None:
         return None
     if options.store == "sqlite":
-        return SQLiteRuntimeStore(options.store_path)
+        if options.store_path is None:
+            raise ValueError("store_path is required when store='sqlite'")
+        return SQLiteRuntimeStore(Path(options.store_path))
     return options.store
 
 

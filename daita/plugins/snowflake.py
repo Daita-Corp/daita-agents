@@ -5,6 +5,8 @@ Provides Snowflake data warehouse connection and querying capabilities.
 Supports key-pair authentication, warehouse management, and stage operations.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
@@ -22,9 +24,19 @@ from .snowflake_extensions import (
 )
 
 if TYPE_CHECKING:
+    from snowflake.connector import SnowflakeConnection
+
     from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
+
+
+def _required_string_arg(args: Dict[str, Any], field: str) -> str:
+    """Return one required non-empty string tool argument."""
+    value = args.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
 
 
 class SnowflakePlugin(BaseDatabasePlugin):
@@ -75,6 +87,9 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
     sql_dialect = "snowflake"
     manifest = SNOWFLAKE_MANIFEST
+
+    if TYPE_CHECKING:
+        _connection: SnowflakeConnection | None
 
     def __init__(
         self,
@@ -278,6 +293,8 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
     def _load_private_key(self):
         """Load and decode private key for key-pair authentication."""
+        if self.private_key_path is None:
+            raise ValueError("private_key_path is required for key-pair authentication")
         try:
             from cryptography.hazmat.backends import default_backend
             from cryptography.hazmat.primitives import serialization
@@ -349,9 +366,10 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
             # Create connection (synchronous — wrap in executor to avoid blocking event loop)
             loop = asyncio.get_running_loop()
-            self._connection = await loop.run_in_executor(
+            connection = await loop.run_in_executor(
                 None, lambda: snowflake.connector.connect(**config)
             )
+            self._connection = connection
 
             logger.info(
                 f"Connected to Snowflake: {self.account}/{self.database_name}.{self.schema} (warehouse: {self.warehouse})"
@@ -382,9 +400,15 @@ class SnowflakePlugin(BaseDatabasePlugin):
                 logger.warning(f"Error during disconnect: {str(e)}")
                 self._connection = None
 
+    @property
+    def _connected_connection(self) -> SnowflakeConnection:
+        if self._connection is None:
+            raise RuntimeError("Snowflake plugin is not connected")
+        return self._connection
+
     def _run_query(self, sql: str, params=None) -> List[Dict[str, Any]]:
         """Synchronous query execution — called via run_in_executor."""
-        cursor = self._connection.cursor()
+        cursor = self._connected_connection.cursor()
         try:
             cursor.execute(sql, params) if params else cursor.execute(sql)
             rows = cursor.fetchall()
@@ -397,18 +421,19 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
     def _run_execute(self, sql: str, params=None) -> int:
         """Synchronous execute — called via run_in_executor."""
-        cursor = self._connection.cursor()
+        connection = self._connected_connection
+        cursor = connection.cursor()
         try:
             cursor.execute(sql, params) if params else cursor.execute(sql)
             rowcount = cursor.rowcount
-            self._connection.commit()
-            return rowcount
+            connection.commit()
+            return rowcount if rowcount is not None else 0
         finally:
             cursor.close()
 
     def _run_show(self, sql: str, name_col: Optional[str] = None) -> List:
         """Synchronous SHOW command — called via run_in_executor."""
-        cursor = self._connection.cursor()
+        cursor = self._connected_connection.cursor()
         try:
             cursor.execute(sql)
             rows = cursor.fetchall()
@@ -523,6 +548,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
         """
         if self._connection is None:
             await self.connect()
+        connection = self._connected_connection
 
         # Validate warehouse name to prevent injection
         if not re.match(r"^[A-Za-z0-9_]+$", warehouse):
@@ -532,7 +558,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
             )
 
         def _switch():
-            cursor = self._connection.cursor()
+            cursor = connection.cursor()
             try:
                 cursor.execute(f"USE WAREHOUSE {warehouse}")
             finally:
@@ -755,7 +781,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
     async def _tool_get_table_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Kept for backward compat."""
-        table = args.get("table")
+        table = _required_string_arg(args, "table")
         columns = await self.describe(table)
         return {
             "table": table,
@@ -797,7 +823,7 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
     async def _tool_switch_warehouse(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for snowflake_switch_warehouse"""
-        warehouse = args.get("warehouse")
+        warehouse = _required_string_arg(args, "warehouse")
         await self.switch_warehouse(warehouse)
         return {"warehouse": warehouse}
 
@@ -820,15 +846,15 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
     async def _tool_load_from_stage(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for snowflake_load_from_stage"""
-        table = args.get("table")
-        stage = args.get("stage")
+        table = _required_string_arg(args, "table")
+        stage = _required_string_arg(args, "stage")
         file_format = args.get("file_format", "CSV")
         pattern = args.get("pattern")
         return await self.load_from_stage(table, stage, file_format, pattern)
 
     async def _tool_create_stage(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for snowflake_create_stage"""
-        name = args.get("name")
+        name = _required_string_arg(args, "name")
         url = args.get("url")
         storage_integration = args.get("storage_integration")
         await self.create_stage(name, url, storage_integration)
@@ -836,14 +862,14 @@ class SnowflakePlugin(BaseDatabasePlugin):
 
     async def _tool_count(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for snowflake_count"""
-        table = args.get("table")
+        table = _required_string_arg(args, "table")
         filter_clause = args.get("filter")
         count = await self.count_rows(table, filter_clause)
         return {"table": table, "count": count}
 
     async def _tool_sample(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for snowflake_sample"""
-        table = args.get("table")
+        table = _required_string_arg(args, "table")
         n = args.get("n", 5)
         rows = await self.sample_rows(table, n)
         return {"table": table, "rows": rows}

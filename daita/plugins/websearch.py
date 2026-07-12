@@ -48,9 +48,11 @@ Cost:
     - Paid tier: $0.002/search ($2 per 1000)
 """
 
+from __future__ import annotations
+
 import os
 import logging
-from typing import List, Dict, Any, Mapping, Optional
+from typing import List, Dict, Any, Literal, Mapping, Optional, TYPE_CHECKING
 
 from daita.runtime import (
     AccessMode,
@@ -65,6 +67,11 @@ from daita.runtime import (
 
 from .base import ConnectorPlugin
 from .manifest import PluginKind, PluginManifest
+
+if TYPE_CHECKING:
+    from aiohttp import ClientSession
+    from bs4 import BeautifulSoup
+    from tavily import TavilyClient
 from ..core.exceptions import (
     TransientError,
     RetryableError,
@@ -77,6 +84,13 @@ from ..core.exceptions import (
 from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
+
+
+def _required_string_arg(args: Dict[str, Any], field: str) -> str:
+    value = args.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
 
 
 def _search_web_parameters(max_results: int, include_answer: bool) -> Dict[str, Any]:
@@ -280,21 +294,24 @@ class WebSearchPlugin(ConnectorPlugin):
             )
 
         # Validate search depth
-        if search_depth not in ["basic", "advanced"]:
+        if search_depth == "basic":
+            self._search_depth: Literal["basic", "advanced"] = "basic"
+        elif search_depth == "advanced":
+            self._search_depth = "advanced"
+        else:
             raise ValueError(
                 f"search_depth must be 'basic' or 'advanced', got: {search_depth}"
             )
 
         # Store configuration
         self._max_results = max_results
-        self._search_depth = search_depth
         self._include_answer = include_answer
         self._include_raw_content = include_raw_content
         self._max_page_length = max_page_length
 
         # Initialize state
-        self._client = None
-        self._session = None  # For fetch_page
+        self._client: TavilyClient | None = None
+        self._session: ClientSession | None = None  # For fetch_page
         self._executor = _WebSearchExecutor(self)
 
         logger.info(
@@ -305,6 +322,29 @@ class WebSearchPlugin(ConnectorPlugin):
     def is_connected(self) -> bool:
         """Whether Tavily and fetch-page clients are initialized."""
         return self._client is not None and self._session is not None
+
+    @property
+    def client(self) -> TavilyClient:
+        if self._client is None:
+            raise RuntimeError("WebSearch plugin is not connected")
+        return self._client
+
+    @property
+    def session(self) -> ClientSession:
+        if self._session is None:
+            raise RuntimeError("WebSearch plugin is not connected")
+        return self._session
+
+    @property
+    def page_parser(self) -> type[BeautifulSoup]:
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError as exc:
+            raise ImportError(
+                "beautifulsoup4 is required for page fetching. "
+                "Install with: pip install 'daita-agents[websearch]'"
+            ) from exc
+        return BeautifulSoup
 
     async def teardown(self) -> None:
         """Release runtime-owned WebSearch resources."""
@@ -393,12 +433,14 @@ class WebSearchPlugin(ConnectorPlugin):
             from tavily import TavilyClient
 
             # Initialize Tavily client
-            self._client = TavilyClient(api_key=self._api_key)
+            client = TavilyClient(api_key=self._api_key)
 
             # Initialize aiohttp session for fetch_page
             import aiohttp
 
-            self._session = aiohttp.ClientSession()
+            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+            self._client = client
+            self._session = session
 
             logger.info("Connected to Tavily Search API")
         except ImportError as e:
@@ -458,7 +500,7 @@ class WebSearchPlugin(ConnectorPlugin):
 
         try:
             # Call Tavily search API
-            response = self._client.search(
+            response = self.client.search(
                 query=query,
                 max_results=max_results,
                 search_depth=self._search_depth,
@@ -512,7 +554,7 @@ class WebSearchPlugin(ConnectorPlugin):
 
         try:
             # Call Tavily search API with news topic
-            response = self._client.search(
+            response = self.client.search(
                 query=query,
                 topic="news",
                 days=days,
@@ -562,14 +604,12 @@ class WebSearchPlugin(ConnectorPlugin):
 
         try:
             # Fetch URL
-            async with self._session.get(url, timeout=30) as response:
+            async with self.session.get(url) as response:
                 response.raise_for_status()
                 html = await response.text()
 
             # Parse HTML and extract text
-            from bs4 import BeautifulSoup
-
-            soup = BeautifulSoup(html, "lxml")
+            soup = self.page_parser(html, "lxml")
 
             # Remove script and style elements
             for script in soup(["script", "style", "nav", "footer", "header"]):
@@ -676,7 +716,7 @@ class WebSearchPlugin(ConnectorPlugin):
     # Tool handlers
     async def _tool_search_web(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for search_web."""
-        query = args.get("query")
+        query = _required_string_arg(args, "query")
         max_results = args.get("max_results")
         include_answer = args.get("include_answer")
 
@@ -684,7 +724,7 @@ class WebSearchPlugin(ConnectorPlugin):
 
     async def _tool_search_news(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for search_news."""
-        query = args.get("query")
+        query = _required_string_arg(args, "query")
         days = args.get("days", 7)
         max_results = args.get("max_results")
 
@@ -692,7 +732,7 @@ class WebSearchPlugin(ConnectorPlugin):
 
     async def _tool_fetch_page(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for fetch_page."""
-        url = args.get("url")
+        url = _required_string_arg(args, "url")
         return await self.fetch_page(url)
 
     def _definition_for_tool(self, name: str) -> Dict[str, Any]:

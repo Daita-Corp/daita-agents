@@ -6,7 +6,7 @@ Simplified settings system focused on essential configuration.
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -82,7 +82,7 @@ class Settings(BaseModel):
 
     def __init__(self, **data):
         # Override with environment variables
-        env_overrides = {}
+        env_overrides: Dict[str, Any] = {}
 
         # Lambda environment detection - use /tmp for cache
         if (
@@ -143,10 +143,9 @@ class Settings(BaseModel):
             env_overrides["grok_api_key"] = os.getenv("GROK_API_KEY")
 
         # General settings
-        if os.getenv("DAITA_LOCAL_MODE"):
-            env_overrides["local_mode"] = (
-                os.getenv("DAITA_LOCAL_MODE").lower() == "true"
-            )
+        local_mode = os.getenv("DAITA_LOCAL_MODE")
+        if local_mode:
+            env_overrides["local_mode"] = local_mode.lower() == "true"
 
         if os.getenv("DAITA_LOG_LEVEL"):
             env_overrides["log_level"] = os.getenv("DAITA_LOG_LEVEL")
@@ -157,11 +156,10 @@ class Settings(BaseModel):
         if os.getenv("DAITA_DEFAULT_PROVIDER"):
             env_overrides["default_provider"] = os.getenv("DAITA_DEFAULT_PROVIDER")
 
-        if os.getenv("DAITA_DEFAULT_TEMPERATURE"):
+        default_temperature = os.getenv("DAITA_DEFAULT_TEMPERATURE")
+        if default_temperature:
             try:
-                env_overrides["default_temperature"] = float(
-                    os.getenv("DAITA_DEFAULT_TEMPERATURE")
-                )
+                env_overrides["default_temperature"] = float(default_temperature)
             except (ValueError, TypeError):
                 pass  # Use default if invalid
 

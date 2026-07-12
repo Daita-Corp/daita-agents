@@ -281,7 +281,7 @@ class DbContractBuilder:
             required_evidence=tuple(required_evidence),
             access=access,
             limits=self.config.limits,
-            policy_ids=policy_ids,
+            policy_ids=tuple(policy_ids),
             metadata=metadata,
         )
 
@@ -482,12 +482,9 @@ def _merge_skill_metadata(values: Iterable[dict]) -> dict[str, object]:
     merged: dict[str, object] = {}
     for value in values:
         for key, item in dict(value).items():
-            if (
-                key in merged
-                and isinstance(merged[key], dict)
-                and isinstance(item, dict)
-            ):
-                merged[key] = {**merged[key], **item}
+            existing = merged.get(key)
+            if isinstance(existing, dict) and isinstance(item, dict):
+                merged[key] = {**existing, **item}
             else:
                 merged[key] = item
     return merged

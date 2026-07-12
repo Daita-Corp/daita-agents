@@ -8,7 +8,7 @@ support for all database plugins in the Daita framework.
 import asyncio
 import logging
 from abc import abstractmethod
-from typing import Any, Dict
+from typing import Any, Dict, TYPE_CHECKING
 from ..core.exceptions import (
     PluginError,
     ConnectionError as DaitaConnectionError,
@@ -39,6 +39,12 @@ class BaseDatabasePlugin(ConnectorPlugin):
 
     # Subclasses set this to their dialect: "postgresql", "mysql", "snowflake", "sqlite"
     sql_dialect: str = "standard"
+
+    if TYPE_CHECKING:
+
+        async def query(self, sql: str, params: Any = None) -> list: ...
+
+        async def execute(self, sql: str, params: Any = None) -> int: ...
 
     def __init__(self, **kwargs):
         """
@@ -303,12 +309,17 @@ class BaseDatabasePlugin(ConnectorPlugin):
 
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
         sql = args.get("sql")
+        if not isinstance(sql, str):
+            raise ValidationError("SQL must be a string", field="sql")
         params = args.get("params") or []
         focus_dsl = args.get("focus")
         return await self._run_guarded_tool_query(sql, params, focus_dsl)
 
     async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        sql = self._prepare_tool_execute_sql(args.get("sql"))
+        raw_sql = args.get("sql")
+        if not isinstance(raw_sql, str):
+            raise ValidationError("SQL must be a string", field="sql")
+        sql = self._prepare_tool_execute_sql(raw_sql)
         params = args.get("params")
         affected_rows = await self.execute(sql, params)
         return {"affected_rows": affected_rows}

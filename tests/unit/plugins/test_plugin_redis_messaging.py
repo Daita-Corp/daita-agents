@@ -1,7 +1,12 @@
 """Unit tests for RedisMessagingPlugin extension declarations."""
 
+import json
+from unittest.mock import MagicMock
+
+import pytest
+
 from daita.plugins.manifest import PluginKind
-from daita.plugins.redis_messaging import RedisMessagingPlugin
+from daita.plugins.redis_messaging import RedisEncodable, RedisMessagingPlugin
 from daita.plugins.registry import ExtensionRegistry
 from daita.runtime import AccessMode, Operation, RiskLevel, Task
 
@@ -53,7 +58,7 @@ def test_redis_messaging_capabilities_are_runtime_only():
     assert clear.risk is RiskLevel.HIGH
 
 
-async def test_redis_messaging_executor_returns_typed_operation_evidence():
+async def test_redis_messaging_executor_returns_typed_operation_evidence(monkeypatch):
     plugin = make_plugin()
 
     async def fake_publish(channel, message, publisher=None):
@@ -62,7 +67,7 @@ async def test_redis_messaging_executor_returns_typed_operation_evidence():
         assert publisher == "agent-a"
         return "msg-123"
 
-    plugin.publish = fake_publish
+    monkeypatch.setattr(plugin, "publish", fake_publish)
     registry = ExtensionRegistry()
     registry.register(plugin)
 
@@ -95,22 +100,24 @@ async def test_redis_messaging_executor_returns_typed_operation_evidence():
     assert evidence[0].metadata["capability_id"] == ("redis_messaging.message.publish")
 
 
-async def test_redis_messaging_registry_setup_and_teardown_use_connector_lifecycle():
+async def test_redis_messaging_registry_setup_and_teardown_use_connector_lifecycle(
+    monkeypatch,
+):
     plugin = make_plugin()
     calls = []
 
     async def fake_connect():
         calls.append("connect")
         plugin._running = True
-        plugin._redis_pool = object()
+        plugin._redis_pool = MagicMock()
 
     async def fake_disconnect():
         calls.append("disconnect")
         plugin._running = False
         plugin._redis_pool = None
 
-    plugin.connect = fake_connect
-    plugin.disconnect = fake_disconnect
+    monkeypatch.setattr(plugin, "connect", fake_connect)
+    monkeypatch.setattr(plugin, "disconnect", fake_disconnect)
     registry = ExtensionRegistry()
     registry.register(plugin)
 
@@ -121,3 +128,67 @@ async def test_redis_messaging_registry_setup_and_teardown_use_connector_lifecyc
 
     assert calls == ["connect", "disconnect"]
     assert plugin.is_connected is False
+
+
+async def test_publish_encodes_stream_fields_for_redis(monkeypatch):
+    plugin = make_plugin()
+    plugin._running = True
+
+    class FakeRedis:
+        fields: dict[RedisEncodable, RedisEncodable] = {}
+
+        async def xadd(self, stream_key, fields, **kwargs):
+            self.fields = fields
+
+        async def expire(self, stream_key, ttl):
+            return True
+
+        async def publish(self, channel, message):
+            return 1
+
+        async def close(self):
+            return None
+
+    redis_client = FakeRedis()
+
+    async def fake_get_redis():
+        return redis_client
+
+    monkeypatch.setattr(plugin, "_get_redis", fake_get_redis)
+
+    await plugin.publish("orders", {"order_id": 42})
+
+    stored_data = redis_client.fields["data"]
+    assert isinstance(stored_data, (str, bytes, bytearray))
+    assert json.loads(stored_data) == {"order_id": 42}
+    assert redis_client.fields["publisher"] == ""
+    assert all(
+        isinstance(value, (bytes, bytearray, memoryview, str, int, float))
+        for value in redis_client.fields.values()
+    )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {b"data": b'{"order_id": 42}'},
+        {"data": '{"order_id": 42}'},
+    ],
+)
+async def test_get_latest_decodes_bytes_and_text_payloads(monkeypatch, fields):
+    plugin = make_plugin()
+    plugin._running = True
+
+    class FakeRedis:
+        async def xrevrange(self, stream_key, count):
+            return [(b"1-0", fields)]
+
+        async def close(self):
+            return None
+
+    async def fake_get_redis():
+        return FakeRedis()
+
+    monkeypatch.setattr(plugin, "_get_redis", fake_get_redis)
+
+    assert await plugin.get_latest("orders") == [{"order_id": 42}]

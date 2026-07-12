@@ -15,13 +15,16 @@ Responsibilities:
 import asyncio
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ..config.base import AgentConfig
 from ..core.interfaces import LLMProvider
 
 from ..core.tracing import get_trace_manager, TraceType
 from ..core.decision_tracing import record_decision_point, DecisionType
+
+if TYPE_CHECKING:
+    from ..display.console import ConsoleDecisionDisplay
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +72,8 @@ class BaseAgent:
 
         # Runtime state
         self._running = False
-        self._tasks = []
+        self._tasks: List[asyncio.Task[Any]] = []
+        self._decision_display: ConsoleDecisionDisplay | None = None
 
         # Get trace manager for automatic tracing
         self.trace_manager = get_trace_manager()
@@ -94,7 +98,7 @@ class BaseAgent:
             return
 
         # Start decision display if enabled
-        if hasattr(self, "_decision_display") and self._decision_display:
+        if self._decision_display is not None:
             self._decision_display.start()
 
         # Automatically trace agent lifecycle
@@ -115,7 +119,7 @@ class BaseAgent:
             return
 
         # Stop decision display if enabled
-        if hasattr(self, "_decision_display") and self._decision_display:
+        if self._decision_display is not None:
             self._decision_display.stop()
             # Cleanup decision streaming registration
             try:
@@ -166,6 +170,8 @@ class BaseAgent:
             parent_span_id: Optional parent span ID for trace hierarchy.
         """
         retry_policy = self.config.retry_policy
+        if retry_policy is None:
+            return await execute_fn(1, 1)
         max_attempts = retry_policy.max_retries + 1
         last_exception = None
 

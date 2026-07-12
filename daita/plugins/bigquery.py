@@ -14,6 +14,8 @@ Example:
     ```
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
@@ -31,6 +33,8 @@ from .bigquery_extensions import (
 )
 
 if TYPE_CHECKING:
+    from google.cloud.bigquery import Client
+
     from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
@@ -46,6 +50,9 @@ class BigQueryPlugin(BaseDatabasePlugin):
 
     sql_dialect = "bigquery"
     manifest = BIGQUERY_MANIFEST
+
+    if TYPE_CHECKING:
+        _client: Client | None
 
     def __init__(
         self,
@@ -154,6 +161,12 @@ class BigQueryPlugin(BaseDatabasePlugin):
             logger.warning(f"Error during BigQuery disconnect: {e}")
             self._client = None
 
+    @property
+    def client(self) -> Client:
+        if self._client is None:
+            raise RuntimeError("BigQuery plugin is not connected")
+        return self._client
+
     # ── Sync helpers (called via run_in_executor) ─────────────────────
 
     def _prepare_job(self, sql: str, params: Optional[List]):
@@ -192,12 +205,12 @@ class BigQueryPlugin(BaseDatabasePlugin):
         self, sql: str, params: Optional[List] = None
     ) -> List[Dict[str, Any]]:
         sql, job_config = self._prepare_job(sql, params)
-        job = self._client.query(sql, job_config=job_config, timeout=self.timeout)
+        job = self.client.query(sql, job_config=job_config, timeout=self.timeout)
         return [dict(row) for row in job.result(timeout=self.timeout)]
 
     def _run_execute(self, sql: str, params: Optional[List] = None) -> int:
         sql, job_config = self._prepare_job(sql, params)
-        job = self._client.query(sql, job_config=job_config, timeout=self.timeout)
+        job = self.client.query(sql, job_config=job_config, timeout=self.timeout)
         job.result(timeout=self.timeout)
         return job.num_dml_affected_rows or 0
 
@@ -227,11 +240,10 @@ class BigQueryPlugin(BaseDatabasePlugin):
             )
         if self._client is None:
             await self.connect()
+        client = self.client
 
         def _list():
-            return [
-                t.table_id for t in self._client.list_tables(f"{self.project}.{ds}")
-            ]
+            return [t.table_id for t in client.list_tables(f"{self.project}.{ds}")]
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _list)
@@ -240,9 +252,10 @@ class BigQueryPlugin(BaseDatabasePlugin):
         if self._client is None:
             await self.connect()
         ref = self._fqn(table)
+        client = self.client
 
         def _describe():
-            schema = self._client.get_table(ref).schema
+            schema = client.get_table(ref).schema
             return [
                 {
                     "column_name": field.name,
@@ -258,9 +271,10 @@ class BigQueryPlugin(BaseDatabasePlugin):
     async def datasets(self) -> List[str]:
         if self._client is None:
             await self.connect()
+        client = self.client
 
         def _list():
-            return [ds.dataset_id for ds in self._client.list_datasets()]
+            return [ds.dataset_id for ds in client.list_datasets()]
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _list)

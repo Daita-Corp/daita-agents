@@ -420,7 +420,8 @@ class DataQualityPlugin(BasePlugin):
             columns = []
             for row in rows:
                 col = row.get("column_name") if isinstance(row, dict) else row[0]
-                columns.append(col)
+                if isinstance(col, str) and col:
+                    columns.append(col)
 
         if not columns:
             return {"success": False, "error": f"No columns found for table {table}"}
@@ -574,7 +575,7 @@ class DataQualityPlugin(BasePlugin):
 
         import numpy as np
 
-        arr = np.array(values)
+        arr = np.asarray(values, dtype=float)
 
         if method == "iqr":
             q1 = np.percentile(arr, 25)

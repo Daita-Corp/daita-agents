@@ -12,6 +12,8 @@ Features:
 - Community detection and graph analytics
 """
 
+from __future__ import annotations
+
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -29,9 +31,27 @@ from .manifest import PluginKind, PluginManifest
 from ..core.exceptions import PluginError
 
 if TYPE_CHECKING:
+    from neo4j import AsyncDriver
+
     from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
+
+
+def _required_string_arg(args: Dict[str, Any], field: str) -> str:
+    """Return one required non-empty string tool argument."""
+    value = args.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
+def _required_mapping_arg(args: Dict[str, Any], field: str) -> Dict[str, Any]:
+    """Return one required object tool argument with normalized string keys."""
+    value = args.get(field)
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object")
+    return {str(key): item for key, item in value.items()}
 
 
 _NEO4J_OPERATION_DEFINITIONS = (
@@ -298,7 +318,7 @@ class Neo4jPlugin(ConnectorPlugin):
         else:
             self._auth = ("neo4j", "password")  # Default
 
-        self._driver = None
+        self._driver: AsyncDriver | None = None
         self._driver_config = kwargs
         self._executor = _Neo4jExecutor(self)
 
@@ -308,6 +328,12 @@ class Neo4jPlugin(ConnectorPlugin):
     def is_connected(self) -> bool:
         """Whether the Neo4j driver has been initialized."""
         return self._driver is not None
+
+    @property
+    def _connected_driver(self) -> AsyncDriver:
+        if self._driver is None:
+            raise PluginError("Neo4j plugin is not connected", plugin_name="Neo4j")
+        return self._driver
 
     async def teardown(self) -> None:
         """Release runtime-owned Neo4j resources."""
@@ -526,32 +552,38 @@ class Neo4jPlugin(ConnectorPlugin):
         if self._driver is not None:
             return  # Already connected
 
+        driver: AsyncDriver | None = None
         try:
             from neo4j import AsyncGraphDatabase
 
-            self._driver = AsyncGraphDatabase.driver(
+            driver = AsyncGraphDatabase.driver(
                 self._uri, auth=self._auth, **self._driver_config
             )
 
             # Verify connectivity
-            await self._driver.verify_connectivity()
+            await driver.verify_connectivity()
+            self._driver = driver
 
             logger.info(f"Connected to Neo4j at {self._uri}")
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
                 "neo4j driver not installed. Install with: pip install 'daita-agents[neo4j]'"
-            )
+            ) from exc
         except PluginError:
             raise
         except Exception as e:
+            if driver is not None:
+                await driver.close()
+            self._driver = None
             logger.error(f"Failed to connect to Neo4j: {e}")
             raise PluginError(f"Failed to connect to Neo4j: {e}", plugin_name="Neo4j")
 
     async def disconnect(self):
         """Disconnect from Neo4j database."""
-        if self._driver:
-            await self._driver.close()
-            self._driver = None
+        driver = self._driver
+        self._driver = None
+        if driver is not None:
+            await driver.close()
             logger.info("Disconnected from Neo4j")
 
     async def __aenter__(self):
@@ -642,7 +674,9 @@ class Neo4jPlugin(ConnectorPlugin):
             await self.connect()
 
         try:
-            async with self._driver.session(database=self._database) as session:
+            async with self._connected_driver.session(
+                database=self._database
+            ) as session:
                 result = await session.run(cypher, parameters or {})
                 records = await result.data()
 
@@ -655,8 +689,8 @@ class Neo4jPlugin(ConnectorPlugin):
 
     async def _tool_create_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for create_node"""
-        label = args.get("label")
-        properties = args.get("properties")
+        label = _required_string_arg(args, "label")
+        properties = _required_mapping_arg(args, "properties")
 
         result = await self.create_node(label, properties)
         return result
@@ -688,11 +722,11 @@ class Neo4jPlugin(ConnectorPlugin):
 
     async def _tool_create_relationship(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for create_relationship"""
-        from_label = args.get("from_label")
-        from_properties = args.get("from_properties")
-        to_label = args.get("to_label")
-        to_properties = args.get("to_properties")
-        relationship_type = args.get("relationship_type")
+        from_label = _required_string_arg(args, "from_label")
+        from_properties = _required_mapping_arg(args, "from_properties")
+        to_label = _required_string_arg(args, "to_label")
+        to_properties = _required_mapping_arg(args, "to_properties")
+        relationship_type = _required_string_arg(args, "relationship_type")
         relationship_properties = args.get("relationship_properties", {})
 
         result = await self.create_relationship(
@@ -765,7 +799,7 @@ class Neo4jPlugin(ConnectorPlugin):
 
     async def _tool_find_nodes(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for find_nodes"""
-        label = args.get("label")
+        label = _required_string_arg(args, "label")
         properties = args.get("properties", {})
         limit = args.get("limit", 50)
 
@@ -799,10 +833,10 @@ class Neo4jPlugin(ConnectorPlugin):
 
     async def _tool_find_path(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for find_path"""
-        from_label = args.get("from_label")
-        from_properties = args.get("from_properties")
-        to_label = args.get("to_label")
-        to_properties = args.get("to_properties")
+        from_label = _required_string_arg(args, "from_label")
+        from_properties = _required_mapping_arg(args, "from_properties")
+        to_label = _required_string_arg(args, "to_label")
+        to_properties = _required_mapping_arg(args, "to_properties")
         max_length = args.get("max_length", 5)
 
         result = await self.find_path(
@@ -858,8 +892,8 @@ class Neo4jPlugin(ConnectorPlugin):
 
     async def _tool_get_neighbors(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for get_neighbors"""
-        label = args.get("label")
-        properties = args.get("properties")
+        label = _required_string_arg(args, "label")
+        properties = _required_mapping_arg(args, "properties")
         relationship_type = args.get("relationship_type")
         direction = args.get("direction", "both")
 
@@ -920,8 +954,8 @@ class Neo4jPlugin(ConnectorPlugin):
 
     async def _tool_delete_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for delete_node"""
-        label = args.get("label")
-        properties = args.get("properties")
+        label = _required_string_arg(args, "label")
+        properties = _required_mapping_arg(args, "properties")
 
         result = await self.delete_node(label, properties)
         return result

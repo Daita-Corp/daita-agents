@@ -21,17 +21,19 @@ def evidence_in_task_plan_order(
     """
     items = tuple(evidence)
     task_order = {task.id: index for index, task in enumerate(tasks)}
-    task_positions = [
-        index for index, item in enumerate(items) if item.task_id in task_order
+    task_items = [
+        (index, item, task_order[item.task_id])
+        for index, item in enumerate(items)
+        if item.task_id is not None and item.task_id in task_order
     ]
-    if len(task_positions) < 2:
+    if len(task_items) < 2:
         return items
     ordered = sorted(
-        ((position, items[position]) for position in task_positions),
-        key=lambda pair: (task_order[pair[1].task_id], pair[0]),
+        task_items,
+        key=lambda entry: (entry[2], entry[0]),
     )
     projected = list(items)
-    for position, (_, item) in zip(task_positions, ordered):
+    for (position, _, _), (_, item, _) in zip(task_items, ordered):
         projected[position] = item
     return tuple(projected)
 

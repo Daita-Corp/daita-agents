@@ -240,10 +240,11 @@ class DbContinuationResolver:
                 stale_dependencies=stale_dependencies,
                 error=role.ambiguous_error or f"ambiguous_continuation:{role.role}",
             )
+        candidate = next(iter(candidates))
         return self._resolved_action(
             action,
             role=role,
-            candidate=candidates[0],
+            candidate=candidate,
             current_action_ids=current_action_ids,
             source=("stale_dependency" if stale_dependencies else "single_candidate"),
             bind_candidate=True,

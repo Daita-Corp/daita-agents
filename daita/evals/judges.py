@@ -277,11 +277,8 @@ def _weighted_score(
     total_weight = 0.0
     total = 0.0
     for result in criteria_results:
-        weight = (
-            criteria_config.get(result.id).weight
-            if result.id in criteria_config
-            else 1.0
-        )
+        criterion = criteria_config.get(result.id)
+        weight = criterion.weight if criterion is not None else 1.0
         total_weight += weight
         total += result.score * weight
     return total / total_weight if total_weight else 0.0

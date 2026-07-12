@@ -72,7 +72,7 @@ def _native_groupby(df: Any, query: FocusQuery) -> Any:
     agg_spec: dict = {}
     count_star_alias: str | None = None
 
-    for alias, expr in query.aggregates.items():
+    for alias, expr in (query.aggregates or {}).items():
         m = _AGG_RE.match(expr.strip())
         if not m:
             raise ValueError(f"Cannot parse aggregate: {expr}")

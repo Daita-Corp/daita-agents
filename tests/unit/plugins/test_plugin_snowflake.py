@@ -214,7 +214,9 @@ async def test_snowflake_admin_executor_uses_existing_tool_handler():
     assert evidence[0].payload["result"] == {"warehouses": [{"name": "COMPUTE_WH"}]}
 
 
-async def test_snowflake_registry_setup_and_teardown_use_connector_lifecycle():
+async def test_snowflake_registry_setup_and_teardown_use_connector_lifecycle(
+    monkeypatch,
+):
     plugin = SnowflakePlugin(
         account="xy12345",
         user="u",
@@ -232,8 +234,8 @@ async def test_snowflake_registry_setup_and_teardown_use_connector_lifecycle():
         calls.append("disconnect")
         plugin._connection = None
 
-    plugin.connect = fake_connect
-    plugin.disconnect = fake_disconnect
+    monkeypatch.setattr(plugin, "connect", fake_connect)
+    monkeypatch.setattr(plugin, "disconnect", fake_disconnect)
     registry = ExtensionRegistry()
     registry.register(plugin)
 
@@ -265,6 +267,34 @@ async def test_connect_missing_connector_raises_import_error_with_extra_hint():
         with pytest.MonkeyPatch.context() as monkeypatch:
             monkeypatch.setattr("builtins.__import__", fake_import)
             await plugin.connect()
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "args", "field"),
+    [
+        ("_tool_get_table_schema", {}, "table"),
+        ("_tool_switch_warehouse", {}, "warehouse"),
+        ("_tool_load_from_stage", {"stage": "@uploads"}, "table"),
+        ("_tool_load_from_stage", {"table": "events"}, "stage"),
+        ("_tool_create_stage", {}, "name"),
+        ("_tool_count", {}, "table"),
+        ("_tool_sample", {}, "table"),
+    ],
+)
+async def test_required_tool_inputs_are_rejected(handler_name, args, field):
+    plugin = make_admin_plugin()
+
+    with pytest.raises(ValueError, match=field):
+        await getattr(plugin, handler_name)(args)
+
+
+def test_execute_normalizes_missing_sdk_rowcount_to_zero():
+    plugin = make_plugin()
+    cursor = plugin._connection.cursor.return_value
+    cursor.rowcount = None
+
+    assert plugin._run_execute("DELETE FROM events") == 0
+    plugin._connection.commit.assert_called_once_with()
 
 
 def test_key_pair_missing_crypto_raises_import_error_with_extra_hint():

@@ -170,8 +170,8 @@ class LineagePlugin(BasePlugin):
         self._ambiguity_policy = ambiguity_policy or AmbiguousReferencePolicy.STRICT
 
         # In-memory storage for standalone mode
-        self._flows = []  # List of registered flows
-        self._pipelines = {}  # Dict of pipeline definitions
+        self._flows: List[Dict[str, Any]] = []  # List of registered flows
+        self._pipelines: Dict[str, Dict[str, Any]] = {}  # Pipeline definitions
 
         logger.debug(f"LineagePlugin initialized (storage: {storage is not None})")
 
@@ -247,8 +247,7 @@ class LineagePlugin(BasePlugin):
 
         max_age_seconds = int(max_age_hours * 3600)
         summary = await self._graph_backend.prune_stale(max_age_seconds)
-        if hasattr(self._graph_backend, "flush"):
-            await self._graph_backend.flush()
+        await self._graph_backend.flush()
         return {
             "removed_node_count": len(summary["removed_nodes"]),
             "removed_edge_count": len(summary["removed_edges"]),
@@ -505,6 +504,10 @@ class LineagePlugin(BasePlugin):
         """Tool handler for register_flow"""
         source_id = args.get("source_id")
         target_id = args.get("target_id")
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        if not isinstance(target_id, str) or not target_id:
+            raise ValueError("target_id must be a non-empty string")
         flow_type = args.get("flow_type", "FLOWS_TO")
         transformation = args.get("transformation")
         schedule = args.get("schedule")
@@ -753,6 +756,8 @@ class LineagePlugin(BasePlugin):
     async def _tool_export_lineage(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for export_lineage"""
         entity_id = args.get("entity_id")
+        if not isinstance(entity_id, str) or not entity_id:
+            raise ValueError("entity_id must be a non-empty string")
         format = args.get("format", "mermaid")
         direction = args.get("direction", "both")
         max_depth = int(args.get("max_depth") or 5)
@@ -970,8 +975,7 @@ class LineagePlugin(BasePlugin):
         # Flush once at the end of the logical unit (2 nodes + 1 edge) rather
         # than after each individual mutation — reduces JSON serializations from
         # 3 per flow to 1.
-        if hasattr(self._graph_backend, "flush"):
-            await self._graph_backend.flush()
+        await self._graph_backend.flush()
         logger.debug(
             f"Persisted lineage flow {flow['flow_id']} "
             f"({source_id} --[{edge_type.value}]--> {target_id})"

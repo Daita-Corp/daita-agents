@@ -15,10 +15,12 @@ MCP Protocol:
     MCP client support for Daita agents.
 """
 
+from __future__ import annotations
+
 import logging
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from daita.runtime import (
     AccessMode,
@@ -31,6 +33,9 @@ from daita.runtime import (
 
 from .base import PluginContext
 from .manifest import PluginKind, PluginManifest
+
+if TYPE_CHECKING:
+    from mcp import ClientSession
 
 logger = logging.getLogger(__name__)
 
@@ -86,12 +91,14 @@ class MCPServer:
         self.server_name = server_name or f"mcp_{command}"
 
         # Connection state
-        self._session = None
+        self._session: ClientSession | None = None
         self._read = None
         self._write = None
         self._tools: List[MCPTool] = []
         self._connected = False
-        self._stdio_context_task = None  # Background task keeping context alive
+        self._stdio_context_task: asyncio.Task[None] | None = (
+            None  # Background task keeping context alive
+        )
         self._session_lock = (
             asyncio.Lock()
         )  # Protects session access from concurrent calls
@@ -217,7 +224,7 @@ class MCPServer:
         """Discover available tools from the MCP server"""
         try:
             # List available tools from server
-            tools_response = await self._session.list_tools()
+            tools_response = await self.session.list_tools()
 
             # Convert to MCPTool objects
             self._tools = []
@@ -317,7 +324,7 @@ class MCPServer:
 
             try:
                 # Call the tool via MCP session (protected by lock)
-                result = await self._session.call_tool(tool_name, arguments=arguments)
+                result = await self.session.call_tool(tool_name, arguments=arguments)
 
                 # Extract content from result
                 if hasattr(result, "content"):
@@ -325,7 +332,7 @@ class MCPServer:
                     if isinstance(result.content, list) and len(result.content) > 0:
                         first_content = result.content[0]
                         # Text content
-                        if hasattr(first_content, "text"):
+                        if first_content.type == "text":
                             return first_content.text
                         # Other content types
                         return str(first_content)
@@ -344,6 +351,12 @@ class MCPServer:
     def is_connected(self) -> bool:
         """Check if server is connected"""
         return self._connected
+
+    @property
+    def session(self) -> ClientSession:
+        if self._session is None:
+            raise RuntimeError(f"MCP server {self.server_name} not connected")
+        return self._session
 
     @property
     def tool_names(self) -> List[str]:

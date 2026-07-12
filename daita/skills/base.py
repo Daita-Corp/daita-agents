@@ -55,7 +55,7 @@ class _SkillInstructionContextProvider:
 
     async def render(
         self,
-        context: dict,
+        context: Mapping[str, Any],
         audience: ContextAudience,
         token_budget: int,
     ) -> ContextBlock | None:

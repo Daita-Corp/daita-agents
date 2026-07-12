@@ -44,7 +44,7 @@ class DbQueryPlanValidator:
             "passed": True,
             "errors": [],
         }
-        session_scope_validation = {
+        session_scope_validation: dict[str, Any] = {
             "checked": False,
             "source_scope_id": None,
             "source_operation_id": None,
@@ -789,8 +789,11 @@ def _catalog_relationship_edges(
         if detail.get("payload_fingerprint"):
             ref["payload_fingerprint"] = str(detail["payload_fingerprint"])
         refs.append(ref)
-        payload = (
-            detail.get("payload") if isinstance(detail.get("payload"), dict) else detail
+        raw_payload = detail.get("payload")
+        payload: dict[str, Any] = (
+            {str(key): value for key, value in raw_payload.items()}
+            if isinstance(raw_payload, dict)
+            else {str(key): value for key, value in detail.items()}
         )
         if payload.get("reachable") is False:
             continue
@@ -1005,7 +1008,7 @@ def _session_scope_binding_metadata(
     planning_context: dict[str, Any],
 ) -> dict[str, Any]:
     binding = planning_context.get("session_scope_binding")
-    metadata = {
+    metadata: dict[str, Any] = {
         "checked": isinstance(binding, dict),
         "source_scope_id": None,
         "source_operation_id": None,

@@ -38,6 +38,7 @@ from .models import (
     EvalReport,
     ReportSummary,
     RunResult,
+    Status,
 )
 
 
@@ -258,7 +259,7 @@ def _to_run_result(
     run_id: str,
     evidence: RunEvidence,
     assertions,
-    status: str,
+    status: Status,
     judges: list[JudgeEvaluation] | None = None,
 ) -> RunResult:
     judge_results = []

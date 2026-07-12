@@ -30,12 +30,13 @@ def evaluate_remaining(data: Any, query: FocusQuery, applied: Set[str]) -> Any:
         return _from_rows(rows, original)
 
     if "order_by" not in applied and query.order_by:
+        order_by = query.order_by
         reverse = query.order_dir == "DESC"
         rows = sorted(
             rows,
             key=lambda r: (
-                _get_field(r, query.order_by) is None,
-                _get_field(r, query.order_by),
+                _get_field(r, order_by) is None,
+                _get_field(r, order_by),
             ),
             reverse=reverse,
         )
@@ -164,7 +165,7 @@ def _eval_node(row: Dict, node: pyast.expr) -> Any:
 def _flatten_attr(node: pyast.Attribute) -> Optional[List[str]]:
     """Flatten nested Attribute nodes into a list of name parts."""
     parts: List[str] = []
-    current = node
+    current: pyast.expr = node
     while isinstance(current, pyast.Attribute):
         parts.append(current.attr)
         current = current.value
@@ -200,11 +201,19 @@ def _coerce_for_cmp(left: Any, right: Any):
         and isinstance(left, str)
     ):
         return date.fromisoformat(left), right
-    # Generic fallback: try to cast right to left's type (e.g. int/float mixing)
-    if isinstance(right, str):
-        return left, type(left)(right)
-    if isinstance(left, str):
-        return type(right)(left), right
+    # Numeric fallback for the common string/number mismatch.
+    if isinstance(right, str) and isinstance(left, bool):
+        return left, right.strip().lower() in {"1", "true", "yes"}
+    if isinstance(right, str) and isinstance(left, int):
+        return left, int(right)
+    if isinstance(right, str) and isinstance(left, float):
+        return left, float(right)
+    if isinstance(left, str) and isinstance(right, bool):
+        return left.strip().lower() in {"1", "true", "yes"}, right
+    if isinstance(left, str) and isinstance(right, int):
+        return int(left), right
+    if isinstance(left, str) and isinstance(right, float):
+        return float(left), right
     return left, right
 
 
@@ -273,14 +282,15 @@ def _parse_agg_expr(expr: str):
 
 
 def _apply_group_by(rows: List[Dict], query: FocusQuery) -> List[Dict]:
+    group_by = query.group_by or []
     groups: Dict = defaultdict(list)
     for row in rows:
-        key = tuple(_get_field(row, f) for f in query.group_by)
+        key = tuple(_get_field(row, f) for f in group_by)
         groups[key].append(row)
 
     result = []
     for key, group_rows in groups.items():
-        out = {field: val for field, val in zip(query.group_by, key)}
+        out = {field: val for field, val in zip(group_by, key)}
 
         if query.aggregates:
             for alias, expr in query.aggregates.items():
@@ -296,12 +306,13 @@ def _apply_group_by(rows: List[Dict], query: FocusQuery) -> List[Dict]:
         result.append(out)
 
     if query.order_by:
+        order_by = query.order_by
         reverse = query.order_dir == "DESC"
         result = sorted(
             result,
             key=lambda r: (
-                _get_field(r, query.order_by) is None,
-                _get_field(r, query.order_by),
+                _get_field(r, order_by) is None,
+                _get_field(r, order_by),
             ),
             reverse=reverse,
         )

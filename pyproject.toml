@@ -119,7 +119,7 @@ google = ["google-genai>=0.3.0"]
 otlp = ["opentelemetry-exporter-otlp>=1.20.0"]
 
 # Data quality plugin — advanced anomaly detection (z-score via scipy)
-data-quality = ["scipy>=1.10.0"]
+data-quality = ["scipy>=1.10.0", "scipy-stubs>=1.17.0.0"]
 transformers = ["transformers>=4.51.0"]  # Local models (LARGE: 2GB+)
 
 # Convenience bundle - all LLM providers
@@ -214,7 +214,7 @@ google-drive = [
 ]
 slack = ["slack-sdk>=3.31.0"]
 mcp = ["mcp>=1.0.0"]  # Model Context Protocol
-neo4j = ["neo4j>=5.0.0"]
+neo4j = ["neo4j>=5.0.0,<5.3.0"]
 redis = ["redis>=4.0.0"]
 lineage = ["networkx>=3.0"]
 
@@ -266,7 +266,11 @@ api-server = [
 ]
 
 # Web search capabilities (AI-optimized search with Tavily)
-websearch = ["tavily-python>=0.3.0"]
+websearch = [
+    "tavily-python>=0.3.0",
+    "beautifulsoup4>=4.13.0",
+    "lxml>=5.4.0",
+]
 
 # Exa AI-powered search
 exa = ["exa-py>=2.0.0"]
@@ -342,7 +346,7 @@ all = [
     "python-docx>=1.0.0",
     "slack-sdk>=3.31.0",
     "mcp>=1.0.0",
-    "neo4j>=5.0.0",
+    "neo4j>=5.0.0,<5.3.0",
     "redis>=4.0.0",
     "networkx>=3.0",
     # Data processing
@@ -416,3 +420,4 @@ check_untyped_defs = true
 no_implicit_optional = true
 warn_unused_ignores = true
 follow_imports = "skip"
+mypy_path = "typings"

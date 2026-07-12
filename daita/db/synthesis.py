@@ -242,11 +242,16 @@ def _schema_answer(scope: SchemaAnswerScope) -> str:
             if len(scope.requested_assets) == 1
             else ""
         )
-        matches = tuple(scope.diagnostics.get("closest_matches") or ())
+        closest_matches = scope.diagnostics.get("closest_matches")
+        matches = (
+            tuple(str(item) for item in closest_matches)
+            if isinstance(closest_matches, (list, tuple))
+            else ()
+        )
         if matches:
             return (
                 f"I could not find an exact table{requested}. "
-                f"Closest matches: {', '.join(str(item) for item in matches)}."
+                f"Closest matches: {', '.join(matches)}."
             )
         return (
             f"I could not find an exact table{requested}. "
@@ -344,7 +349,11 @@ def _schema_answer_scope(
     if asset_tables:
         return SchemaAnswerScope(
             mode="asset",
-            requested_assets=tuple(table.get("name") for table, _ in asset_tables),
+            requested_assets=tuple(
+                str(name)
+                for table, _ in asset_tables
+                if (name := table.get("name")) is not None
+            ),
             selected_tables=tuple(table for table, _ in asset_tables),
             evidence_refs=tuple(
                 dict.fromkeys(ref for _, refs in asset_tables for ref in refs if ref)
@@ -363,7 +372,7 @@ def _schema_answer_scope(
 
 
 def _schema_relationship_answer(evidence: tuple[Evidence, ...]) -> str:
-    relationship = next(
+    relationship: dict[str, Any] = next(
         (item.payload for item in evidence if item.kind == "schema.relationship_path"),
         {},
     )
@@ -768,7 +777,9 @@ def derive_answer_facts(
             )
             for label, value in row.items()
         )
-        result_shape = "scalar" if len(row) == 1 else "record"
+        result_shape: Literal["scalar", "record"] = (
+            "scalar" if len(row) == 1 else "record"
+        )
         return DbAnswerFacts(
             result_shape=result_shape,
             row_count=row_count,
@@ -886,11 +897,18 @@ def _answer_facts_from_mapping(value: Any) -> DbAnswerFacts | None:
     )
     if primary is None and value.get("result_shape") == "scalar" and scalars:
         primary = scalars[0]
-    result_shape = str(value.get("result_shape") or "empty")
-    if result_shape not in {"empty", "scalar", "record", "table"}:
+    raw_result_shape = value.get("result_shape")
+    if raw_result_shape == "scalar":
+        result_shape: Literal["empty", "scalar", "record", "table"] = "scalar"
+    elif raw_result_shape == "record":
+        result_shape = "record"
+    elif raw_result_shape == "table":
+        result_shape = "table"
+    else:
         result_shape = "empty"
+    raw_diagnostics = value.get("diagnostics")
     return DbAnswerFacts(
-        result_shape=result_shape,  # type: ignore[arg-type]
+        result_shape=result_shape,
         row_count=_safe_int(value.get("row_count"), 0),
         sampled_row_count=_safe_int(value.get("sampled_row_count"), 0),
         columns=tuple(str(item) for item in value.get("columns") or ()),
@@ -908,8 +926,8 @@ def _answer_facts_from_mapping(value: Any) -> DbAnswerFacts | None:
             else None
         ),
         diagnostics=(
-            dict(value.get("diagnostics"))
-            if isinstance(value.get("diagnostics"), dict)
+            {str(key): item for key, item in raw_diagnostics.items()}
+            if isinstance(raw_diagnostics, dict)
             else {}
         ),
     )
@@ -1682,7 +1700,7 @@ async def _accepted_dependency_evidence(
 ) -> tuple[Evidence, ...]:
     evidence: list[Evidence] = []
     for dependency in task.dependencies:
-        if dependency.kind.value != "evidence":
+        if dependency.kind_value != "evidence":
             continue
         item = await runtime.tasks.accepted_evidence_for_dependency(
             operation.id, dependency
@@ -1882,8 +1900,11 @@ def _catalog_semantics(
             None,
         )
     payload = planning.payload if planning is not None else {}
-    schema = (
-        payload.get("schema") if isinstance(payload.get("schema"), dict) else payload
+    raw_schema = payload.get("schema")
+    schema: dict[str, Any] = (
+        {str(key): value for key, value in raw_schema.items()}
+        if isinstance(raw_schema, dict)
+        else payload
     )
     tables = []
     source_tables = (
@@ -2007,7 +2028,7 @@ def _required_caveats(
 
 
 def _parse_citations(
-    value: Any, accepted_by_id: dict[str | None, Evidence]
+    value: Any, accepted_by_id: dict[str, Evidence]
 ) -> list[DbAnswerCitation]:
     if not isinstance(value, list):
         raise ValueError("synthesis_citations_not_list")
@@ -2050,15 +2071,14 @@ def _validate_required_citations(
 def _validate_caveats_preserved(
     parsed: dict[str, Any], context_metadata: dict[str, Any]
 ) -> None:
-    required = tuple(context_metadata.get("required_caveats") or ())
+    required = _string_tuple(context_metadata.get("required_caveats"))
     if not required:
         return
     provided = " ".join(
-        str(item)
-        for item in (
-            *(parsed.get("limitations") or ()),
-            *(parsed.get("warnings") or ()),
-            *(parsed.get("assumptions") or ()),
+        (
+            *_string_tuple(parsed.get("limitations")),
+            *_string_tuple(parsed.get("warnings")),
+            *_string_tuple(parsed.get("assumptions")),
         )
     )
     for caveat in required:
@@ -2139,7 +2159,7 @@ def _normalized_sufficiency(
 def _validate_relationship_claims(
     answer: str,
     citations: list[DbAnswerCitation],
-    accepted_by_id: dict[str | None, Evidence],
+    accepted_by_id: dict[str, Evidence],
 ) -> None:
     lowered = answer.lower()
     if not any(
@@ -2173,8 +2193,11 @@ def _requests_db_work(parsed: dict[str, Any]) -> bool:
 
 
 def _diagnostics_from_llm(diagnostics: dict[str, Any]) -> dict[str, Any]:
-    tokens = (
-        diagnostics.get("tokens") if isinstance(diagnostics.get("tokens"), dict) else {}
+    raw_tokens = diagnostics.get("tokens")
+    tokens: dict[str, Any] = (
+        {str(key): value for key, value in raw_tokens.items()}
+        if isinstance(raw_tokens, dict)
+        else {}
     )
     input_tokens = db_optional_int(
         diagnostics.get("input_tokens")

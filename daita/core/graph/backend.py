@@ -158,6 +158,10 @@ class GraphBackend(Protocol):
         """
         ...
 
+    async def flush(self) -> None:
+        """Persist pending graph mutations at a logical-unit boundary."""
+        ...
+
     def iter_nodes(
         self,
         node_type: GraphNodeType,

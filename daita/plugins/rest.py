@@ -4,6 +4,8 @@ REST API plugin for Daita Agents.
 Simple REST API client - no over-engineering.
 """
 
+from __future__ import annotations
+
 import logging
 from typing import Any, Dict, List, Mapping, Optional, TYPE_CHECKING
 
@@ -22,9 +24,19 @@ from .base import ConnectorPlugin
 from .manifest import PluginKind, PluginManifest
 
 if TYPE_CHECKING:
+    from aiohttp import ClientSession
+
     from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
+
+
+def _required_endpoint(args: Dict[str, Any]) -> str:
+    endpoint = args.get("endpoint")
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise ValueError("endpoint must be a non-empty string")
+    return endpoint
+
 
 _HTTP_GET_PARAMETERS = {
     "type": "object",
@@ -251,7 +263,7 @@ class RESTPlugin(ConnectorPlugin):
             else:
                 self.default_headers[self.auth_header] = self.api_key
 
-        self._session = None
+        self._session: ClientSession | None = None
         self._executor = _RestHttpExecutor(self)
         logger.debug(f"REST plugin configured for {self.base_url}")
 
@@ -259,6 +271,12 @@ class RESTPlugin(ConnectorPlugin):
     def is_connected(self) -> bool:
         """Whether an HTTP session is currently open."""
         return self._session is not None
+
+    @property
+    def session(self) -> ClientSession:
+        if self._session is None:
+            raise RuntimeError("REST plugin is not connected")
+        return self._session
 
     async def teardown(self) -> None:
         """Release runtime-owned HTTP resources."""
@@ -507,7 +525,7 @@ class RESTPlugin(ConnectorPlugin):
             request_kwargs["data"] = data
 
         try:
-            async with self._session.request(method, url, **request_kwargs) as response:
+            async with self.session.request(method, url, **request_kwargs) as response:
 
                 # Log request
                 logger.debug(f"{method} {url} -> {response.status}")
@@ -538,7 +556,7 @@ class RESTPlugin(ConnectorPlugin):
                 elif "text/" in content_type:
                     text_content = await response.text()
                     truncated = len(text_content) > _MAX_CHARS
-                    result = {
+                    result: Dict[str, Any] = {
                         "content": text_content[:_MAX_CHARS],
                         "content_type": content_type,
                     }
@@ -601,7 +619,7 @@ class RESTPlugin(ConnectorPlugin):
                     data.add_field(key, str(value))
 
             # Make request
-            async with self._session.post(url, data=data) as response:
+            async with self.session.post(url, data=data) as response:
                 if response.status >= 400:
                     error_text = await response.text()
                     raise RuntimeError(
@@ -634,7 +652,7 @@ class RESTPlugin(ConnectorPlugin):
 
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
 
-        async with self._session.get(url, params=params) as response:
+        async with self.session.get(url, params=params) as response:
             if response.status >= 400:
                 error_text = await response.text()
                 raise RuntimeError(
@@ -665,35 +683,35 @@ class RESTPlugin(ConnectorPlugin):
 
     async def _tool_get(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for http_get"""
-        endpoint = args.get("endpoint")
+        endpoint = _required_endpoint(args)
         params = args.get("params")
         result = await self.get(endpoint, params=params)
         return {**result, "endpoint": endpoint}
 
     async def _tool_post(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for http_post"""
-        endpoint = args.get("endpoint")
+        endpoint = _required_endpoint(args)
         data = args.get("data")
         result = await self.post(endpoint, json_data=data)
         return {**result, "endpoint": endpoint}
 
     async def _tool_put(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for http_put"""
-        endpoint = args.get("endpoint")
+        endpoint = _required_endpoint(args)
         data = args.get("data")
         result = await self.put(endpoint, json_data=data)
         return {**result, "endpoint": endpoint}
 
     async def _tool_patch(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for http_patch"""
-        endpoint = args.get("endpoint")
+        endpoint = _required_endpoint(args)
         data = args.get("data")
         result = await self.patch(endpoint, json_data=data)
         return {**result, "endpoint": endpoint}
 
     async def _tool_delete(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for http_delete"""
-        endpoint = args.get("endpoint")
+        endpoint = _required_endpoint(args)
         params = args.get("params")
         result = await self.delete(endpoint, params=params)
         return {**result, "endpoint": endpoint}

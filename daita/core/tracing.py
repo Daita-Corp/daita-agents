@@ -406,6 +406,7 @@ class TraceManager:
 
         # Live OTel spans keyed by hex span_id (for manual start/end pattern)
         self._otel_spans: Dict[str, otel_trace.Span] = {}
+        self._otel_span_attributes: Dict[str, Dict[str, Any]] = {}
         self._otel_spans_lock = threading.Lock()
 
         # Lightweight counters (not span-derived, stay in-process)
@@ -464,6 +465,7 @@ class TraceManager:
 
             with self._otel_spans_lock:
                 self._otel_spans[hex_span_id] = span
+                self._otel_span_attributes[hex_span_id] = dict(attrs)
 
             if metadata.get("input_data") is not None:
                 _add_data_event(span, "daita.input", metadata["input_data"])
@@ -494,6 +496,7 @@ class TraceManager:
         try:
             with self._otel_spans_lock:
                 span = self._otel_spans.pop(span_id, None)
+                attrs = self._otel_span_attributes.pop(span_id, {})
             if span is None:
                 logger.debug(f"Unknown or already completed span: {span_id}")
                 return
@@ -507,6 +510,7 @@ class TraceManager:
             for k, v in extra_attrs.items():
                 if k not in ("daita.trace.type", "daita.agent.id"):  # already set
                     span.set_attribute(k, v)
+                    attrs[k] = v
 
             # Record input/output as span events (they can be large)
             if metadata.get("input_data") is not None:
@@ -519,13 +523,13 @@ class TraceManager:
                 span.set_status(Status(StatusCode.ERROR, error_message or ""))
                 if error_message:
                     span.set_attribute("error.message", error_message)
+                    attrs["error.message"] = error_message
             else:
                 span.set_status(Status(StatusCode.OK))
 
             span.end()
 
             # Update counters
-            attrs = span.attributes or {}
             trace_type_val = attrs.get("daita.trace.type", "")
             if trace_type_val == TraceType.LLM_CALL.value:
                 self._metrics["total_llm_calls"] += 1
@@ -1140,14 +1144,14 @@ def _serialize_trace_data(data: Any) -> Tuple[str, bool, int]:
     try:
         if isinstance(data, str):
             preview = data
-        elif dataclasses.is_dataclass(data):
-            preview = json.dumps(
-                dataclasses.asdict(data), default=str, separators=(",", ":")
-            )
         elif hasattr(data, "model_dump"):
             preview = json.dumps(data.model_dump(), default=str, separators=(",", ":"))
         elif hasattr(data, "dict") and callable(data.dict):
             preview = json.dumps(data.dict(), default=str, separators=(",", ":"))
+        elif dataclasses.is_dataclass(data) and not isinstance(data, type):
+            preview = json.dumps(
+                dataclasses.asdict(data), default=str, separators=(",", ":")
+            )
         elif isinstance(data, (dict, list, tuple)):
             preview = json.dumps(data, default=str, separators=(",", ":"))
         else:

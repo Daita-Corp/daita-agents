@@ -92,7 +92,7 @@ class DbSessionQueryScope:
     schema_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        result = {
+        result: dict[str, Any] = {
             **(
                 {"scope_id": _clip(self.scope_id, _MAX_IDENTIFIER_CHARS)}
                 if self.scope_id
@@ -618,7 +618,7 @@ def _session_query_scope_facts_for_task(
         if related_task is None:
             continue
         for dependency in related_task.dependencies:
-            if dependency.kind.value != "evidence":
+            if dependency.kind_value != "evidence":
                 continue
             if dependency.evidence_id:
                 related_evidence_ids.add(dependency.evidence_id)
