@@ -6,8 +6,10 @@ LIMIT injection edge cases, specific exception types from injection validation,
 and connection state helpers — without requiring a live PostgreSQL connection.
 """
 
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
+from types import TracebackType
 from uuid import UUID
 
 import pytest
@@ -22,10 +24,116 @@ from tests.unit.plugins.projection_helpers import projected_tool_names
 # ---------------------------------------------------------------------------
 
 
+class FakePostgreSQLConnection:
+    async def fetch(self, query: str, *args: object) -> Sequence[Mapping[str, object]]:
+        return []
+
+    async def execute(self, command: str, *args: object) -> str:
+        return ""
+
+    async def executemany(self, command: str, args: Iterable[Sequence[object]]) -> None:
+        return None
+
+    async def fetchrow(self, query: str, *args: object) -> Mapping[str, object] | None:
+        return None
+
+
+class FakePoolAcquireContext:
+    async def __aenter__(self) -> FakePostgreSQLConnection:
+        return FakePostgreSQLConnection()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        return None
+
+
+class FakePool:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def acquire(self, *, timeout: float | None = None) -> FakePoolAcquireContext:
+        return FakePoolAcquireContext()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def make_plugin(**kwargs):
     plugin = PostgreSQLPlugin(host="localhost", database="testdb", **kwargs)
     plugin._connection = object()  # truthy sentinel — skips connect()
     return plugin
+
+
+def test_pool_access_requires_connection():
+    plugin = PostgreSQLPlugin(host="localhost", database="testdb")
+
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.pool
+
+
+async def test_pool_access_tracks_connection_lifecycle(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    pool = FakePool()
+
+    async def fake_create_pool(*args, **kwargs):
+        return pool
+
+    monkeypatch.setitem(
+        sys.modules, "asyncpg", SimpleNamespace(create_pool=fake_create_pool)
+    )
+    plugin = PostgreSQLPlugin(host="localhost", database="testdb")
+
+    await plugin.connect()
+    assert plugin.pool is pool
+
+    await plugin.disconnect()
+    assert pool.closed is True
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.pool
+
+
+async def test_missing_asyncpg_raises_import_error_with_extra_hint(monkeypatch):
+    import importlib
+
+    real_import_module = importlib.import_module
+
+    def mock_import_module(name, *args, **kwargs):
+        if name == "asyncpg":
+            raise ImportError("asyncpg not installed")
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", mock_import_module)
+    plugin = PostgreSQLPlugin(host="localhost", database="testdb")
+
+    with pytest.raises(ImportError, match="pip install 'daita-agents\\[postgresql\\]'"):
+        await plugin.connect()
+
+
+async def test_schema_selection_drives_postgresql_introspection_queries():
+    plugin = make_plugin(schema="analytics")
+    calls = []
+
+    async def fake_query(sql, params=None):
+        calls.append((sql, params))
+        return []
+
+    plugin.query = fake_query
+
+    await plugin.tables()
+    await plugin.describe("orders")
+    await plugin.foreign_keys()
+
+    assert plugin.schema == "analytics"
+    assert calls[0][1] == ["analytics"]
+    assert calls[1][1] == ["analytics", "orders"]
+    assert calls[2][1] == ["analytics"]
+    assert all("table_schema = 'public'" not in sql for sql, _ in calls)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +243,18 @@ class TestSqlGuardrails:
         plugin = make_plugin(blocked_columns=["email"])
         with pytest.raises(ValidationError, match="blocked column"):
             plugin._prepare_tool_query_sql("SELECT email FROM users")
+
+    def test_rejects_qualified_blocked_column(self):
+        plugin = make_plugin(blocked_columns=["customers.email"])
+        with pytest.raises(ValidationError, match="customers.email"):
+            plugin._prepare_tool_query_sql(
+                "SELECT c.email FROM customers c JOIN orders o ON o.customer_id = c.id"
+            )
+
+    def test_rejects_unqualified_column_matching_single_qualified_table(self):
+        plugin = make_plugin(blocked_columns=["customers.email"])
+        with pytest.raises(ValidationError, match="customers.email"):
+            plugin._prepare_tool_query_sql("SELECT email FROM customers")
 
     async def test_tool_query_returns_sql_and_uses_configured_caps(self):
         plugin = make_plugin(query_default_limit=7, query_max_rows=1)
@@ -277,7 +397,7 @@ class TestValidateConnection:
 
     def test_no_error_when_pool_set(self):
         plugin = PostgreSQLPlugin(host="localhost", database="testdb")
-        plugin._pool = object()
+        plugin._pool = FakePool()
         plugin._validate_connection()  # should not raise
 
 
@@ -322,7 +442,7 @@ class TestIsConnected:
 
     def test_true_when_pool_set(self):
         plugin = PostgreSQLPlugin(host="localhost", database="testdb")
-        plugin._pool = object()
+        plugin._pool = FakePool()
         assert plugin.is_connected is True
 
     def test_true_when_client_set(self):

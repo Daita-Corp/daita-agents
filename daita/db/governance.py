@@ -6,6 +6,8 @@ from collections.abc import Mapping
 import re
 from typing import Any
 
+from .models import DbIntentKind
+
 from daita.runtime import (
     AccessMode,
     Operation,
@@ -14,7 +16,14 @@ from daita.runtime import (
     RiskLevel,
 )
 
-_WRITE_OPERATION_TYPES = frozenset({"write.propose", "write.execute", "admin"})
+_WRITE_OPERATION_TYPES = frozenset(
+    {
+        DbIntentKind.WRITE_PROPOSE.value,
+        DbIntentKind.WRITE_EXECUTE.value,
+        DbIntentKind.ADMIN.value,
+    }
+)
+_WRITE_MODE_ALIASES = frozenset({*_WRITE_OPERATION_TYPES, "write", "write_execute"})
 _DESTRUCTIVE_PATTERNS = tuple(
     re.compile(pattern)
     for pattern in (
@@ -23,6 +32,7 @@ _DESTRUCTIVE_PATTERNS = tuple(
         r"\balter\s+(table|database|schema|view|index)\b",
         r"\bdelete\s+from\b",
         r"\bdelete\s+all\b",
+        r"\bdelete\b",
         r"\bwipe\b",
         r"\bpurge\b",
         r"\bdestroy\b",
@@ -219,6 +229,8 @@ def _narrow_prompt_fallback_allowed(
 ) -> bool:
     if bool(planned.get("write_or_admin_context")):
         return True
+    if _explicit_write_mode(request, metadata):
+        return True
     access = _request_access(request) or _metadata_access_mode(metadata)
     if access in {AccessMode.WRITE, AccessMode.ADMIN}:
         return True
@@ -233,7 +245,37 @@ def _narrow_prompt_fallback_allowed(
 
 def _metadata_access(request: Any, metadata: Mapping[str, Any] | None) -> str | None:
     access = _request_access(request) or _metadata_access_mode(metadata)
+    if access not in {AccessMode.WRITE, AccessMode.ADMIN} and _explicit_write_mode(
+        request,
+        metadata,
+    ):
+        access = AccessMode.WRITE
     return access.value if access is not None else None
+
+
+def _explicit_write_mode(
+    request: Any,
+    metadata: Mapping[str, Any] | None,
+) -> bool:
+    modes: list[str] = []
+    if isinstance(request, Mapping):
+        modes.append(str(request.get("mode") or "").lower())
+        request_metadata = request.get("metadata")
+        if isinstance(request_metadata, Mapping):
+            modes.append(str(request_metadata.get("mode") or "").lower())
+        safety_frame = request.get("safety_frame")
+        if isinstance(safety_frame, Mapping):
+            modes.append(str(safety_frame.get("explicit_mode") or "").lower())
+    if isinstance(metadata, Mapping):
+        modes.append(str(metadata.get("mode") or "").lower())
+        safety_frame = metadata.get("safety_frame")
+        if isinstance(safety_frame, Mapping):
+            modes.append(str(safety_frame.get("explicit_mode") or "").lower())
+    return any(_normalized_mode(mode) in _WRITE_MODE_ALIASES for mode in modes)
+
+
+def _normalized_mode(mode: str) -> str:
+    return str(mode or "").strip().lower().replace("-", "_")
 
 
 def _metadata_access_mode(metadata: Mapping[str, Any] | None) -> AccessMode | None:

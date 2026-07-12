@@ -5,16 +5,23 @@ Provides a hierarchy of exceptions with built-in retry behavior hints
 to help agents make intelligent retry decisions.
 """
 
+from typing import Any
+
 
 class DaitaError(Exception):
     """Base exception for all Daita errors."""
 
-    def __init__(self, message: str, retry_hint: str = "unknown", context: dict = None):
+    def __init__(
+        self,
+        message: str,
+        retry_hint: str = "unknown",
+        context: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.retry_hint = retry_hint
         self.context = context or {}
 
-    def _enrich(self, context: dict | None, **fields) -> dict:
+    def _enrich(self, context: dict[str, Any] | None, **fields: Any) -> dict[str, Any]:
         """Merge caller-supplied context with named fields, skipping None values."""
         ctx = context or {}
         ctx.update({k: v for k, v in fields.items() if v is not None})
@@ -39,10 +46,10 @@ class AgentError(DaitaError):
     def __init__(
         self,
         message: str,
-        agent_id: str = None,
-        task: str = None,
+        agent_id: str | None = None,
+        task: str | None = None,
         retry_hint: str = "retryable",
-        context: dict = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(
             message, retry_hint, self._enrich(context, agent_id=agent_id, task=task)
@@ -54,7 +61,12 @@ class AgentError(DaitaError):
 class ConfigError(DaitaError):
     """Exception raised for configuration issues."""
 
-    def __init__(self, message: str, config_section: str = None, context: dict = None):
+    def __init__(
+        self,
+        message: str,
+        config_section: str | None = None,
+        context: dict[str, Any] | None = None,
+    ):
         super().__init__(
             message, "permanent", self._enrich(context, config_section=config_section)
         )
@@ -67,10 +79,10 @@ class LLMError(DaitaError):
     def __init__(
         self,
         message: str,
-        provider: str = None,
-        model: str = None,
+        provider: str | None = None,
+        model: str | None = None,
         retry_hint: str = "retryable",
-        context: dict = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(
             message, retry_hint, self._enrich(context, provider=provider, model=model)
@@ -85,9 +97,9 @@ class PluginError(DaitaError):
     def __init__(
         self,
         message: str,
-        plugin_name: str = None,
+        plugin_name: str | None = None,
         retry_hint: str = "retryable",
-        context: dict = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(
             message, retry_hint, self._enrich(context, plugin_name=plugin_name)
@@ -107,10 +119,10 @@ class RoutingError(DaitaError):
     def __init__(
         self,
         message: str,
-        task: str = None,
-        available_agents: list = None,
+        task: str | None = None,
+        available_agents: list[str] | None = None,
         retry_hint: str = "retryable",
-        context: dict = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(message, retry_hint, self._enrich(context, task=task))
         self.task = task
@@ -123,21 +135,21 @@ class RoutingError(DaitaError):
 class TransientError(DaitaError):
     """Temporary issues likely to resolve quickly (timeouts, rate limits)."""
 
-    def __init__(self, message: str, context: dict = None):
+    def __init__(self, message: str, context: dict[str, Any] | None = None):
         super().__init__(message, retry_hint="transient", context=context)
 
 
 class RetryableError(DaitaError):
     """Issues that might resolve with a different approach or after delay."""
 
-    def __init__(self, message: str, context: dict = None):
+    def __init__(self, message: str, context: dict[str, Any] | None = None):
         super().__init__(message, retry_hint="retryable", context=context)
 
 
 class PermanentError(DaitaError):
     """Issues that will not be resolved by retrying."""
 
-    def __init__(self, message: str, context: dict = None):
+    def __init__(self, message: str, context: dict[str, Any] | None = None):
         super().__init__(message, retry_hint="permanent", context=context)
 
 
@@ -150,8 +162,8 @@ class RateLimitError(TransientError):
     def __init__(
         self,
         message: str = "Rate limit exceeded",
-        retry_after: int = None,
-        context: dict = None,
+        retry_after: int | None = None,
+        context: dict[str, Any] | None = None,
     ):
         if retry_after:
             message = f"{message} (retry after {retry_after}s)"
@@ -165,8 +177,8 @@ class TimeoutError(TransientError):
     def __init__(
         self,
         message: str = "Operation timed out",
-        timeout_duration: float = None,
-        context: dict = None,
+        timeout_duration: float | None = None,
+        context: dict[str, Any] | None = None,
     ):
         if timeout_duration:
             message = f"{message} (after {timeout_duration}s)"
@@ -182,9 +194,9 @@ class ConnectionError(TransientError):
     def __init__(
         self,
         message: str = "Connection failed",
-        host: str = None,
-        port: int = None,
-        context: dict = None,
+        host: str | None = None,
+        port: int | None = None,
+        context: dict[str, Any] | None = None,
     ):
         if port:
             message = (
@@ -201,8 +213,8 @@ class ServiceUnavailableError(TransientError):
     def __init__(
         self,
         message: str = "Service temporarily unavailable",
-        service_name: str = None,
-        context: dict = None,
+        service_name: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         if service_name:
             message = f"{message}: {service_name}"
@@ -222,8 +234,8 @@ class TooManyRequestsError(TransientError):
     def __init__(
         self,
         message: str = "Too many requests",
-        retry_after: int = None,
-        context: dict = None,
+        retry_after: int | None = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(message, self._enrich(context, retry_after=retry_after))
         self.retry_after = retry_after
@@ -238,8 +250,8 @@ class ResourceBusyError(RetryableError):
     def __init__(
         self,
         message: str = "Resource is busy",
-        resource_name: str = None,
-        context: dict = None,
+        resource_name: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         if resource_name:
             message = f"{message}: {resource_name}"
@@ -253,8 +265,8 @@ class DataInconsistencyError(RetryableError):
     def __init__(
         self,
         message: str = "Data inconsistency detected",
-        data_source: str = None,
-        context: dict = None,
+        data_source: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(message, self._enrich(context, data_source=data_source))
         self.data_source = data_source
@@ -266,8 +278,8 @@ class ProcessingQueueFullError(RetryableError):
     def __init__(
         self,
         message: str = "Processing queue is full",
-        queue_name: str = None,
-        context: dict = None,
+        queue_name: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(message, self._enrich(context, queue_name=queue_name))
         self.queue_name = queue_name
@@ -282,8 +294,8 @@ class AuthenticationError(PermanentError):
     def __init__(
         self,
         message: str = "Authentication failed",
-        provider: str = None,
-        context: dict = None,
+        provider: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(message, self._enrich(context, provider=provider))
         self.provider = provider
@@ -295,9 +307,9 @@ class PermissionError(PermanentError):
     def __init__(
         self,
         message: str = "Permission denied",
-        resource: str = None,
-        action: str = None,
-        context: dict = None,
+        resource: str | None = None,
+        action: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(
             message, self._enrich(context, resource=resource, action=action)
@@ -312,9 +324,9 @@ class ValidationError(PermanentError):
     def __init__(
         self,
         message: str = "Validation failed",
-        field: str = None,
-        value: str = None,
-        context: dict = None,
+        field: str | None = None,
+        value: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         ctx = self._enrich(context, field=field)
         if value is not None:
@@ -330,9 +342,9 @@ class InvalidDataError(PermanentError):
     def __init__(
         self,
         message: str = "Invalid data format",
-        data_type: str = None,
-        expected_format: str = None,
-        context: dict = None,
+        data_type: str | None = None,
+        expected_format: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(
             message,
@@ -345,7 +357,11 @@ class InvalidDataError(PermanentError):
 class FocusDSLError(PermanentError):
     """Exception for Focus DSL parse or execution errors."""
 
-    def __init__(self, message: str = "Focus DSL error", context: dict = None):
+    def __init__(
+        self,
+        message: str = "Focus DSL error",
+        context: dict[str, Any] | None = None,
+    ):
         super().__init__(message, context)
 
 
@@ -355,9 +371,9 @@ class DataQualityError(PermanentError):
     def __init__(
         self,
         message: str = "Data quality violation",
-        violations: list = None,
-        table: str = None,
-        context: dict = None,
+        violations: list[dict[str, Any]] | None = None,
+        table: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(
             message, self._enrich(context, table=table, violations=violations)
@@ -372,9 +388,9 @@ class NotFoundError(PermanentError):
     def __init__(
         self,
         message: str = "Resource not found",
-        resource_type: str = None,
-        resource_id: str = None,
-        context: dict = None,
+        resource_type: str | None = None,
+        resource_id: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(
             message,
@@ -390,8 +406,8 @@ class BadRequestError(PermanentError):
     def __init__(
         self,
         message: str = "Bad request",
-        request_type: str = None,
-        context: dict = None,
+        request_type: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(message, self._enrich(context, request_type=request_type))
         self.request_type = request_type
@@ -406,9 +422,9 @@ class CircuitBreakerOpenError(PermanentError):
     def __init__(
         self,
         message: str = "Circuit breaker is open",
-        agent_name: str = None,
-        failure_count: int = None,
-        context: dict = None,
+        agent_name: str | None = None,
+        failure_count: int | None = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(
             message,
@@ -427,9 +443,9 @@ class BackpressureError(RetryableError):
     def __init__(
         self,
         message: str = "Backpressure limit exceeded",
-        agent_id: str = None,
-        queue_size: int = None,
-        context: dict = None,
+        agent_id: str | None = None,
+        queue_size: int | None = None,
+        context: dict[str, Any] | None = None,
     ):
         if queue_size is not None:
             message = f"{message} (queue size: {queue_size})"
@@ -446,9 +462,9 @@ class TaskTimeoutError(TransientError):
     def __init__(
         self,
         message: str = "Task execution timed out",
-        task_id: str = None,
-        timeout_duration: float = None,
-        context: dict = None,
+        task_id: str | None = None,
+        timeout_duration: float | None = None,
+        context: dict[str, Any] | None = None,
     ):
         if timeout_duration:
             message = f"{message} after {timeout_duration}s"
@@ -466,9 +482,9 @@ class AcknowledgmentTimeoutError(TransientError):
     def __init__(
         self,
         message: str = "Message acknowledgment timed out",
-        message_id: str = None,
-        timeout_duration: float = None,
-        context: dict = None,
+        message_id: str | None = None,
+        timeout_duration: float | None = None,
+        context: dict[str, Any] | None = None,
     ):
         super().__init__(
             message,
@@ -484,7 +500,10 @@ class TaskNotFoundError(PermanentError):
     """Exception when a referenced task cannot be found."""
 
     def __init__(
-        self, message: str = "Task not found", task_id: str = None, context: dict = None
+        self,
+        message: str = "Task not found",
+        task_id: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         if task_id:
             message = f"{message}: {task_id}"
@@ -498,8 +517,8 @@ class ReliabilityConfigurationError(PermanentError):
     def __init__(
         self,
         message: str = "Invalid reliability configuration",
-        config_key: str = None,
-        context: dict = None,
+        config_key: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         if config_key:
             message = f"{message}: {config_key}"
@@ -513,8 +532,8 @@ class DeadLetterQueueError(RetryableError):
     def __init__(
         self,
         message: str = "Dead letter queue operation failed",
-        operation: str = None,
-        context: dict = None,
+        operation: str | None = None,
+        context: dict[str, Any] | None = None,
     ):
         if operation:
             message = f"{message}: {operation}"
@@ -568,7 +587,9 @@ def classify_exception(exception: Exception) -> str:
 
 
 def create_contextual_error(
-    base_exception: Exception, context: dict = None, retry_hint: str = None
+    base_exception: Exception,
+    context: dict[str, Any] | None = None,
+    retry_hint: str | None = None,
 ) -> DaitaError:
     """Wrap a standard exception in a Daita exception with context."""
     message = str(base_exception)

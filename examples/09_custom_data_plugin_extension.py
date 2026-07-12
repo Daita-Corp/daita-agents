@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from daita.agents.agent import Agent
+from daita.db import DbMemoryConfig, DbSourceOptions
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
 from daita.runtime import (
     AccessMode,
@@ -150,8 +151,8 @@ async def main() -> None:
             str(db_path),
             name="CustomDataPluginExtension",
             plugins=[plugin],
-            cache_ttl=0,
-            memory=False,
+            source_options=DbSourceOptions(cache_ttl=0),
+            memory=DbMemoryConfig(enabled=False),
         )
         try:
             inspection = await agent.describe()

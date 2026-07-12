@@ -12,7 +12,7 @@ import time
 import functools
 from typing import Dict, Any, Optional, List, Union, Callable, Tuple
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 logger = logging.getLogger(__name__)
@@ -70,17 +70,9 @@ class DecisionContext:
     decision_point: str
     decision_type: DecisionType
     confidence_score: float = 0.0
-    reasoning_chain: List[str] = None
-    alternatives: List[str] = None
-    factors: Dict[str, Any] = None
-
-    def __post_init__(self):
-        if self.reasoning_chain is None:
-            self.reasoning_chain = []
-        if self.alternatives is None:
-            self.alternatives = []
-        if self.factors is None:
-            self.factors = {}
+    reasoning_chain: List[str] = field(default_factory=list)
+    alternatives: List[str] = field(default_factory=list)
+    factors: Dict[str, Any] = field(default_factory=dict)
 
 
 class DecisionRecorder:
@@ -105,7 +97,7 @@ class DecisionRecorder:
             else decision_type
         )
         self.agent_id = agent_id
-        self.span_id = None
+        self.span_id: Optional[str] = None
         self.context = DecisionContext(decision_point, self.decision_type)
         self.stream_callback = stream_callback
 
@@ -141,10 +133,12 @@ class DecisionRecorder:
     async def __aenter__(self):
         """Start decision tracing."""
         try:
+            from .tracing import TraceType
+
             # Start the decision span
             self.span_id = self.trace_manager.start_span(
                 operation_name=f"decision_{self.decision_point}",
-                trace_type="decision_trace",  # Use string to avoid enum import issues
+                trace_type=TraceType.DECISION_TRACE,
                 agent_id=self.agent_id,
                 decision_point=self.decision_point,
                 decision_type=self.decision_type.value,
@@ -749,7 +743,7 @@ def get_decision_stats(
         avg_confidence = sum(confidences) / len(confidences) if confidences else 0
 
         # Decision type distribution
-        type_counts = {}
+        type_counts: Dict[str, int] = {}
         for decision in decisions:
             dec_type = decision.get("metadata", {}).get("decision_type", "unknown")
             type_counts[dec_type] = type_counts.get(dec_type, 0) + 1

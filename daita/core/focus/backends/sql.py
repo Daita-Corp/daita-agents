@@ -110,7 +110,7 @@ class _SQLFilterCompiler:
         if isinstance(node.value, bool):
             return "TRUE" if node.value else "FALSE"
         ph = self._placeholder()
-        value = node.value
+        value: Any = node.value
         # Coerce ISO date/datetime strings to Python datetime objects so that
         # database drivers (e.g. asyncpg) can bind them correctly against
         # TIMESTAMP / DATE columns without a type-mismatch error.
@@ -297,7 +297,7 @@ def compile_focus_to_sql(
     # ── Assemble outer SELECT list ────────────────────────────────────────────
     if group_sql:
         outer_select = ", ".join(
-            [_quote_id(c, dialect) for c in fq.group_by] + agg_select_parts
+            [_quote_id(c, dialect) for c in (fq.group_by or [])] + agg_select_parts
         )
     elif select_parts:
         outer_select = ", ".join(select_parts)

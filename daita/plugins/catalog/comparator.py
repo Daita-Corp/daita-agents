@@ -5,7 +5,7 @@ Compares two normalized schema dicts and returns added, removed, and modified
 elements useful for migration planning.
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Tuple
 
 
 def _extract_tables(schema: Dict[str, Any]) -> Dict[str, Dict]:

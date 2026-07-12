@@ -14,13 +14,6 @@ class DocumentDBProfiler(BaseProfiler):
 
     async def profile(self, store: DiscoveredStore) -> NormalizedSchema:
         """Connect to a DocumentDB cluster and infer schema from samples."""
-        try:
-            from motor.motor_asyncio import AsyncIOMotorClient
-        except ImportError:
-            raise ImportError(
-                "motor is required. Install with: pip install 'daita-agents[mongodb]'"
-            )
-
         from ..discovery import discover_documentdb
 
         conn_hint = store.connection_hint

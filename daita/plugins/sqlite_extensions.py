@@ -71,6 +71,7 @@ def sqlite_capabilities() -> tuple[Capability, ...]:
             executor="sqlite.sql.execute_read",
             model_visible=True,
             side_effecting=False,
+            concurrent_safe=True,
         ),
         Capability(
             id="db.sql.execute_write",

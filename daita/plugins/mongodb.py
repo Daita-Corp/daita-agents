@@ -17,9 +17,10 @@ from .mongodb_extensions import (
     mongodb_operation_definitions,
     mongodb_tool_views,
 )
+from ..core.exceptions import ValidationError
 
 if TYPE_CHECKING:
-    from ..core.tools import LocalTool
+    from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -93,9 +94,31 @@ class MongoDBPlugin(BaseDatabasePlugin):
             connection_string=connection_string,
             **kwargs,
         )
+        self._client: Optional["AsyncIOMotorClient"] = None
+        self._db: Optional["AsyncIOMotorDatabase"] = None
         self._executor = MongoDBExecutor(self)
 
         logger.debug(f"MongoDB plugin configured for {host}:{port}/{database}")
+
+    @property
+    def client(self) -> "AsyncIOMotorClient":
+        """Return the active MongoDB client owned by this plugin."""
+        if self._client is None:
+            raise ValidationError(
+                "MongoDBPlugin is not connected to database",
+                field="connection_state",
+            )
+        return self._client
+
+    @property
+    def database(self) -> "AsyncIOMotorDatabase":
+        """Return the active MongoDB database owned by this plugin."""
+        if self._db is None:
+            raise ValidationError(
+                "MongoDBPlugin is not connected to database",
+                field="connection_state",
+            )
+        return self._db
 
     async def setup(self, context: PluginContext) -> None:
         """Set up the MongoDB connector for a runtime."""
@@ -140,32 +163,31 @@ class MongoDBPlugin(BaseDatabasePlugin):
 
         try:
             import motor.motor_asyncio
+        except ImportError as exc:
+            raise ImportError(
+                "motor is required. Install with: pip install 'daita-agents[mongodb]'"
+            ) from exc
 
-            self._client = motor.motor_asyncio.AsyncIOMotorClient(
+        try:
+            client = motor.motor_asyncio.AsyncIOMotorClient(
                 self.connection_string, **self.client_config
             )
-
-            # Test connection
-            await self._client.admin.command("ping")
-
-            # Get database
-            self._db = self._client[self.database_name]
-
-            logger.info(f"Connected to MongoDB database '{self.database_name}'")
-        except ImportError:
-            self._handle_connection_error(
-                ImportError(
-                    "motor not installed. Install with: pip install 'daita-agents[mongodb]'"
-                ),
-                "connection",
-            )
+            await client.admin.command("ping")
+            database = client[self.database_name]
         except Exception as e:
+            self._client = None
+            self._db = None
             self._handle_connection_error(e, "connection")
+
+        self._client = client
+        self._db = database
+        logger.info(f"Connected to MongoDB database '{self.database_name}'")
 
     async def disconnect(self):
         """Disconnect from MongoDB."""
-        if self._client:
-            self._client.close()
+        client = self._client
+        if client is not None:
+            client.close()
             self._client = None
             self._db = None
             logger.info("Disconnected from MongoDB")
@@ -211,7 +233,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
 
         filter_doc = filter_doc or {}
 
-        cursor = self._db[collection].find(filter_doc)
+        database = self.database
+        cursor = database[collection].find(filter_doc)
 
         # Apply cursor modifications - these return the cursor object
         if sort:
@@ -246,7 +269,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
         if self._client is None or self._db is None:
             await self.connect()
 
-        result = await self._db[collection].insert_one(document)
+        database = self.database
+        result = await database[collection].insert_one(document)
         return str(result.inserted_id)
 
     async def insert_many(
@@ -269,7 +293,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
         if self._client is None or self._db is None:
             await self.connect()
 
-        result = await self._db[collection].insert_many(documents)
+        database = self.database
+        result = await database[collection].insert_many(documents)
         return [str(doc_id) for doc_id in result.inserted_ids]
 
     async def update(
@@ -300,7 +325,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
         if self._client is None or self._db is None:
             await self.connect()
 
-        result = await self._db[collection].update_many(
+        database = self.database
+        result = await database[collection].update_many(
             filter_doc, update_doc, upsert=upsert
         )
 
@@ -325,7 +351,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
         if self._client is None or self._db is None:
             await self.connect()
 
-        result = await self._db[collection].delete_many(filter_doc)
+        database = self.database
+        result = await database[collection].delete_many(filter_doc)
         return result.deleted_count
 
     async def count(
@@ -346,7 +373,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
             await self.connect()
 
         filter_doc = filter_doc or {}
-        return await self._db[collection].count_documents(filter_doc)
+        database = self.database
+        return await database[collection].count_documents(filter_doc)
 
     async def collections(self) -> List[str]:
         """List all collections in the database."""
@@ -354,7 +382,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
         if self._client is None or self._db is None:
             await self.connect()
 
-        collections = await self._db.list_collection_names()
+        database = self.database
+        collections = await database.list_collection_names()
         return sorted(collections)
 
     async def aggregate(
@@ -381,7 +410,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
         if self._client is None or self._db is None:
             await self.connect()
 
-        cursor = self._db[collection].aggregate(pipeline)
+        database = self.database
+        cursor = database[collection].aggregate(pipeline)
         results = await cursor.to_list(length=None)
 
         # Convert ObjectId to string
@@ -394,6 +424,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
     async def _tool_find(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mongodb_find"""
         collection = args.get("collection")
+        if not isinstance(collection, str) or not collection:
+            raise ValidationError("collection is required", field="collection")
         filter_doc = args.get("filter", {})
         limit = args.get("limit", 50)
         projection = args.get("projection")
@@ -402,7 +434,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
         if self._client is None or self._db is None:
             await self.connect()
 
-        cursor = self._db[collection].find(filter_doc, projection)
+        database = self.database
+        cursor = database[collection].find(filter_doc, projection)
         cursor = cursor.limit(limit)
         results = await cursor.to_list(length=None)
         for doc in results:
@@ -414,7 +447,11 @@ class MongoDBPlugin(BaseDatabasePlugin):
     async def _tool_insert(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mongodb_insert"""
         collection = args.get("collection")
+        if not isinstance(collection, str) or not collection:
+            raise ValidationError("collection is required", field="collection")
         document = args.get("document")
+        if not isinstance(document, dict):
+            raise ValidationError("document is required", field="document")
 
         inserted_id = await self.insert(collection, document)
 
@@ -423,8 +460,14 @@ class MongoDBPlugin(BaseDatabasePlugin):
     async def _tool_update(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mongodb_update"""
         collection = args.get("collection")
+        if not isinstance(collection, str) or not collection:
+            raise ValidationError("collection is required", field="collection")
         filter_doc = args.get("filter")
+        if not isinstance(filter_doc, dict):
+            raise ValidationError("filter is required", field="filter")
         update_doc = args.get("update")
+        if not isinstance(update_doc, dict):
+            raise ValidationError("update is required", field="update")
 
         result = await self.update(collection, filter_doc, update_doc)
 
@@ -437,7 +480,11 @@ class MongoDBPlugin(BaseDatabasePlugin):
     async def _tool_delete(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mongodb_delete"""
         collection = args.get("collection")
+        if not isinstance(collection, str) or not collection:
+            raise ValidationError("collection is required", field="collection")
         filter_doc = args.get("filter")
+        if not isinstance(filter_doc, dict):
+            raise ValidationError("filter is required", field="filter")
 
         deleted_count = await self.delete(collection, filter_doc)
 
@@ -454,6 +501,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
     async def _tool_aggregate(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mongodb_aggregate"""
         collection = args.get("collection")
+        if not isinstance(collection, str) or not collection:
+            raise ValidationError("collection is required", field="collection")
         pipeline = args.get("pipeline") or []
 
         # Inject a $limit safety cap if the pipeline has no $limit stage
@@ -467,6 +516,8 @@ class MongoDBPlugin(BaseDatabasePlugin):
     async def _tool_count(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mongodb_count"""
         collection = args.get("collection")
+        if not isinstance(collection, str) or not collection:
+            raise ValidationError("collection is required", field="collection")
         filter_doc = args.get("filter")
 
         n = await self.count(collection, filter_doc)

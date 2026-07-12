@@ -14,13 +14,6 @@ class S3Profiler(BaseProfiler):
 
     async def profile(self, store: DiscoveredStore) -> NormalizedSchema:
         """Sample an S3 bucket to infer its structure."""
-        try:
-            import boto3
-        except ImportError:
-            raise ImportError(
-                "boto3 is required. Install with: pip install 'daita-agents[aws]'"
-            )
-
         from ..discovery import discover_s3
 
         conn_hint = store.connection_hint

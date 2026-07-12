@@ -42,6 +42,20 @@ def make_dq(db=None, backend=None):
     return plugin
 
 
+class GuardedQueryDbFake:
+    sql_dialect = "postgresql"
+
+    def __init__(self):
+        self.guarded_query_calls = []
+
+    async def _run_guarded_tool_query(self, sql, params=None):
+        self.guarded_query_calls.append((sql, params))
+        return {
+            "rows": [{"amount": 1.0}, {"amount": 2.0}],
+            "truncated": False,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Factory function
 # ---------------------------------------------------------------------------
@@ -442,18 +456,15 @@ async def test_detect_anomaly_insufficient_data():
 
 
 async def test_detect_anomaly_uses_db_guarded_query_when_available():
-    db = MagicMock()
-    db.sql_dialect = "postgresql"
-    db._run_guarded_tool_query = AsyncMock(
-        return_value={"rows": [{"amount": 1.0}, {"amount": 2.0}], "truncated": False}
-    )
+    db = GuardedQueryDbFake()
     plugin = make_dq(db=db)
 
     result = await plugin.detect_anomaly(db, "orders", "amount")
 
     assert result["success"] is True
-    db._run_guarded_tool_query.assert_awaited_once()
-    guarded_sql = db._run_guarded_tool_query.await_args.args[0]
+    assert len(db.guarded_query_calls) == 1
+    guarded_sql, params = db.guarded_query_calls[0]
+    assert params == []
     assert '"orders"' in guarded_sql
     assert '"amount"' in guarded_sql
 

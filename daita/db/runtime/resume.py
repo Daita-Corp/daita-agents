@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import replace
+from typing import Any, TYPE_CHECKING
 
 from daita.runtime import (
     AccessMode,
@@ -11,10 +12,14 @@ from daita.runtime import (
     OperationSnapshot,
     OperationStatus,
     RuntimeEventType,
+    RuntimeKernel,
+    RuntimeStore,
     Task,
     TaskStatus,
 )
 
+from ..evidence import evidence_in_task_plan_order
+from ..loop import DbAgentLoop, DbLoopResult
 from ..models import (
     DbIntent,
     DbIntentKind,
@@ -23,15 +28,95 @@ from ..models import (
     DbOperationResult,
     DbRequest,
 )
+from ..planner_protocol import DbAgentPlanner
+from .tasks.runtime import DbTaskRuntime
 from .types import DbRuntimeGovernanceBlocked, DbRuntimeTaskNotRunnable
 
 
 class DbRuntimeResumeMixin:
+    if TYPE_CHECKING:
+        store: RuntimeStore
+        kernel: RuntimeKernel
+        tasks: DbTaskRuntime
+        runtime_id: str
+        _is_setup: bool
+
+        async def setup(self, *, agent_id: str | None = None) -> None: ...
+
+        def _analysis_progress_payload(
+            self,
+            snapshot: OperationSnapshot | None,
+            *,
+            plan_evidence: Evidence | None = None,
+        ) -> dict[str, Any]: ...
+
+        async def _finalize_resumed_monitor_action(
+            self,
+            snapshot: OperationSnapshot,
+        ) -> None: ...
+
+        async def _finalize_resumed_monitor_delivery(
+            self,
+            snapshot: OperationSnapshot,
+        ) -> None: ...
+
+        def _has_pending_approvals(self, snapshot: OperationSnapshot) -> bool: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
+
+        async def _run_multi_step_analysis(
+            self,
+            request: DbRequest,
+            intent: DbIntent,
+            contract: DbOperationContract,
+            operation: Operation,
+            *,
+            base_diagnostics: dict[str, Any],
+            reuse_existing_plan: bool = False,
+        ) -> DbOperationResult: ...
+
+        async def _try_finalize_run_operation_from_snapshot(
+            self,
+            snapshot: OperationSnapshot,
+            *,
+            request: DbRequest,
+            fallback_intent: DbIntent,
+            fallback_contract: DbOperationContract,
+            base_diagnostics: dict[str, Any] | None = None,
+        ) -> OperationSnapshot | None: ...
+
+        def _select_db_agent_planner(self) -> DbAgentPlanner | None: ...
+
+        async def _finalize_run_operation(
+            self,
+            *,
+            operation_id: str,
+            request: DbRequest,
+            fallback_intent: DbIntent,
+            fallback_contract: DbOperationContract,
+            loop_result: DbLoopResult | None = None,
+            base_diagnostics: dict[str, Any] | None = None,
+        ) -> DbOperationResult: ...
+
     async def inspect_operation(self, operation_id: str) -> OperationSnapshot | None:
         """Inspect persisted state for one operation."""
         inspect = getattr(self.store, "inspect_operation", None)
         if inspect is not None:
-            return await inspect(operation_id)
+            snapshot = await inspect(operation_id)
+            if snapshot is None:
+                return None
+            return replace(
+                snapshot,
+                evidence=evidence_in_task_plan_order(
+                    snapshot.evidence,
+                    snapshot.tasks,
+                ),
+            )
         operation = await self.store.load_operation(operation_id)
         if operation is None:
             return None
@@ -55,7 +140,10 @@ class DbRuntimeResumeMixin:
         return OperationSnapshot(
             operation=operation,
             tasks=tasks,
-            evidence=tuple(await self.store.list_evidence(operation_id)),
+            evidence=evidence_in_task_plan_order(
+                await self.store.list_evidence(operation_id),
+                tasks,
+            ),
             events=tuple(await self.store.list_events(operation_id)),
             policy_decisions=tuple(
                 await self.store.list_policy_decisions(operation_id)
@@ -99,7 +187,7 @@ class DbRuntimeResumeMixin:
                     RuntimeEventType.TASK_SKIPPED,
                     operation_id=operation_id,
                     task=task,
-                    capability=self._capability_for_task(task),
+                    capability=self.tasks.capability_for_task(task),
                     message=f"Task {task.id} already completed; not re-running.",
                 )
 
@@ -299,7 +387,7 @@ class DbRuntimeResumeMixin:
             return resumed
 
         if _operation_has_run_context(completed.operation):
-            await self._complete_resumed_run_operation(completed)
+            return await self._resume_run_operation_through_agent_loop(completed)
         elif (
             completed.tasks
             and completed.operation.status is not OperationStatus.SUCCEEDED
@@ -313,65 +401,119 @@ class DbRuntimeResumeMixin:
             raise KeyError(operation_id)
         return resumed
 
-    async def _complete_resumed_run_operation(
+    async def _resume_run_operation_through_agent_loop(
         self,
         snapshot: OperationSnapshot,
-    ) -> None:
+    ) -> OperationSnapshot:
+        operation_id = snapshot.operation.id
+        base_diagnostics = {
+            "runtime_id": self.runtime_id,
+            "resume": {
+                "operation_id": operation_id,
+                "completed_task_ids": list(snapshot.completed_task_ids),
+            },
+        }
         request = _db_request_from_context(snapshot.operation)
         intent = _db_intent_from_context(snapshot.operation)
         contract = _db_contract_from_context(snapshot.operation)
-        evidence = tuple(await self.store.list_evidence(snapshot.operation.id))
-        tasks = tuple(await self.store.list_tasks(snapshot.operation.id))
-        verification = self.verifier.verify(contract, intent, evidence, tasks)
-        if not verification.passed:
-            await self._record_operation_result(
-                DbOperationResult(
-                    operation_id=snapshot.operation.id,
-                    request=request,
-                    intent=intent,
-                    contract=contract,
-                    status=OperationStatus.FAILED,
-                    answer="DB operation could not be verified against required evidence.",
-                    evidence=evidence,
-                    warnings=verification.warnings,
-                    diagnostics={"verification": verification.to_dict()},
-                ),
-                operation=snapshot.operation,
-            )
-            return
+        finalized = await self._try_finalize_run_operation_from_snapshot(
+            snapshot,
+            request=request,
+            fallback_intent=intent,
+            fallback_contract=contract,
+            base_diagnostics=base_diagnostics,
+        )
+        if finalized is not None:
+            return finalized
 
-        verification_evidence = await self._persist_verification_result_evidence(
-            snapshot.operation,
-            verification,
-            evidence,
-        )
-        synthesis_evidence, synthesis_task = await self._execute_answer_synthesis(
-            operation=snapshot.operation,
-            intent=intent,
-            outcome_evidence=(*evidence, verification_evidence),
-        )
-        final_evidence = (*evidence, verification_evidence, synthesis_evidence)
-        final_tasks = (*tasks, synthesis_task) if synthesis_task not in tasks else tasks
-        await self._record_operation_result(
-            DbOperationResult(
-                operation_id=snapshot.operation.id,
-                request=request,
-                intent=intent,
-                contract=contract,
-                status=OperationStatus.SUCCEEDED,
-                answer=_answer_from_synthesis_evidence(synthesis_evidence),
-                evidence=final_evidence,
-                diagnostics={
-                    "verification": verification.to_dict(),
-                    "synthesis": synthesis_evidence.payload,
-                    "execution": {
-                        "task_count": len(final_tasks),
-                        "tasks": [task.to_dict() for task in final_tasks],
-                    },
+        refreshed = await self.inspect_operation(operation_id)
+        if refreshed is None:
+            raise KeyError(operation_id)
+        if self._has_pending_approvals(refreshed):
+            await self.kernel.block_operation(operation_id)
+            blocked = await self.inspect_operation(operation_id)
+            if blocked is None:
+                raise KeyError(operation_id)
+            return blocked
+        if refreshed.resumable_task_ids:
+            return refreshed
+        snapshot = refreshed
+
+        planner = self._select_db_agent_planner()
+        if planner is None:
+            await self.kernel.block_operation(
+                operation_id,
+                message=(
+                    f"Operation {operation_id} requires semantic DB planning "
+                    "before resume can continue."
+                ),
+                payload={
+                    "warnings": ["db_runtime_llm_configuration_required"],
+                    "configuration_required": True,
                 },
-            ),
-            operation=snapshot.operation,
+            )
+            blocked = await self.inspect_operation(operation_id)
+            if blocked is None:
+                raise KeyError(operation_id)
+            return blocked
+
+        operation = await self.kernel.update_operation(
+            operation_id,
+            OperationStatus.RUNNING,
+            message=f"Operation {operation_id} resumed DB agent loop.",
         )
+        safety_frame = operation.metadata.get("safety_frame")
+        loop_result = await DbAgentLoop(self, planner).run(
+            operation,
+            safety_frame=safety_frame if isinstance(safety_frame, dict) else None,
+        )
+        if loop_result.status == "finished":
+            await self._finalize_run_operation(
+                operation_id=operation_id,
+                request=request,
+                fallback_intent=intent,
+                fallback_contract=contract,
+                loop_result=loop_result,
+                base_diagnostics=base_diagnostics,
+            )
+        else:
+            payload = {
+                "loop_status": loop_result.status,
+                "warnings": list(loop_result.warnings),
+            }
+            if loop_result.status in {
+                "blocked",
+                "configuration_required",
+                "clarification_required",
+            }:
+                await self.kernel.block_operation(
+                    operation_id,
+                    message=(
+                        f"Operation {operation_id} blocked after DB agent loop resume."
+                    ),
+                    payload=payload,
+                )
+            elif loop_result.status == "budget_exhausted":
+                await self.kernel.block_operation(
+                    operation_id,
+                    message=(
+                        f"Operation {operation_id} exhausted planner turns after resume."
+                    ),
+                    payload=payload,
+                )
+            else:
+                await self.kernel.complete_operation(
+                    operation_id,
+                    status=OperationStatus.FAILED,
+                    message=(
+                        f"Operation {operation_id} failed after DB agent loop resume."
+                    ),
+                    payload=payload,
+                )
+        resumed = await self.inspect_operation(operation_id)
+        if resumed is None:
+            raise KeyError(operation_id)
+        return resumed
 
 
 def _tasks_in_resume_order(tasks: tuple[Task, ...]) -> tuple[Task, ...]:
@@ -387,7 +529,9 @@ def _tasks_in_resume_order(tasks: tuple[Task, ...]) -> tuple[Task, ...]:
 
 
 def _operation_has_run_context(operation: Operation) -> bool:
-    return isinstance(operation.metadata.get("resume_context"), dict)
+    return operation.operation_type == "db.run" and isinstance(
+        operation.metadata.get("resume_context"), dict
+    )
 
 
 def _monitor_create_context(operation: Operation) -> bool:
@@ -481,7 +625,14 @@ def _resume_context(operation: Operation) -> dict[str, Any]:
 
 
 def _db_request_from_context(operation: Operation) -> DbRequest:
-    context = _resume_context(operation).get("request") or operation.request
+    raw_context = _resume_context(operation).get("request")
+    context: dict[str, Any] = (
+        raw_context if isinstance(raw_context, dict) else operation.request
+    )
+    raw_session_context = context.get("session_context")
+    session_context = (
+        dict(raw_session_context) if isinstance(raw_session_context, dict) else None
+    )
     return DbRequest(
         prompt=str(context.get("prompt") or ""),
         user_id=context.get("user_id"),
@@ -491,6 +642,7 @@ def _db_request_from_context(operation: Operation) -> DbRequest:
         requested_capabilities=tuple(context.get("requested_capabilities") or ()),
         constraints=dict(context.get("constraints") or {}),
         metadata=dict(context.get("metadata") or {}),
+        session_context=session_context,
     )
 
 
@@ -533,6 +685,7 @@ def _db_request_context(request: DbRequest) -> dict[str, Any]:
         "requested_capabilities": list(request.requested_capabilities),
         "constraints": request.constraints,
         "metadata": request.metadata,
+        "session_context": request.session_context,
     }
 
 

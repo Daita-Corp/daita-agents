@@ -20,7 +20,7 @@ from .sqlite_extensions import (
 )
 
 if TYPE_CHECKING:
-    from ..core.tools import LocalTool
+    from aiosqlite import Connection
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,17 @@ class SQLitePlugin(BaseDatabasePlugin):
     sql_dialect = "sqlite"
     manifest = SQLITE_MANIFEST
 
+    @property
+    def schema(self) -> str:
+        return self._schema
+
+    @schema.setter
+    def schema(self, value: Any) -> None:
+        schema = str(value or "main").strip().lower()
+        if schema != "main":
+            raise ValueError("SQLite source schema must be 'main'")
+        self._schema = schema
+
     def __init__(
         self,
         path: str = ":memory:",
@@ -76,7 +87,7 @@ class SQLitePlugin(BaseDatabasePlugin):
         super().__init__(path=path, wal_mode=wal_mode, **kwargs)
 
         # aiosqlite connection — overrides _connection from base
-        self._db = None
+        self._db: Optional["Connection"] = None
 
         logger.debug(f"SQLitePlugin configured for path={path!r}")
 
@@ -87,6 +98,18 @@ class SQLitePlugin(BaseDatabasePlugin):
     @property
     def is_connected(self) -> bool:
         return self._db is not None
+
+    @property
+    def db(self) -> "Connection":
+        """Return the active connection owned by this plugin."""
+        if self._db is None:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError(
+                "SQLitePlugin is not connected to database",
+                field="connection_state",
+            )
+        return self._db
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -107,13 +130,10 @@ class SQLitePlugin(BaseDatabasePlugin):
 
         try:
             import aiosqlite
-        except ImportError:
-            self._handle_connection_error(
-                ImportError(
-                    "aiosqlite is required. Install with: pip install 'daita-agents[sqlite]'"
-                ),
-                "connection",
-            )
+        except ImportError as exc:
+            raise ImportError(
+                "aiosqlite is required. Install with: pip install 'daita-agents[sqlite]'"
+            ) from exc
 
         try:
             self._db = await aiosqlite.connect(
@@ -304,7 +324,9 @@ class SQLitePlugin(BaseDatabasePlugin):
         blocked_columns = {
             item.lower() for item in getattr(self, "blocked_columns", set())
         }
-        profile = {
+        include_sample_values = bool(self.include_sample_values)
+        redact_pii_columns = bool(self.redact_pii_columns)
+        profile: Dict[str, Any] = {
             "table": table,
             "column": column,
             "profile_kind": "categorical_values",
@@ -331,7 +353,8 @@ class SQLitePlugin(BaseDatabasePlugin):
                 "profile_timeout_seconds": timeout_seconds,
                 "fingerprint_only_supported": True,
                 "include_source_revision": include_source_revision,
-                "redact_pii_columns": True,
+                "include_sample_values": include_sample_values,
+                "redact_pii_columns": redact_pii_columns,
             },
             "profiled_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -341,12 +364,21 @@ class SQLitePlugin(BaseDatabasePlugin):
                 "profile_status": "skipped",
                 "skipped_reason": "blocked_table",
             }
-        if column.lower() in blocked_columns or _looks_sensitive_column(column):
+        column_refs = {column.lower(), f"{table}.{column}".lower()}
+        if blocked_columns & column_refs or (
+            redact_pii_columns and _looks_sensitive_column(column)
+        ):
             return {
                 **profile,
                 "profile_status": "skipped",
                 "redacted": True,
                 "skipped_reason": "sensitive_or_blocked_column",
+            }
+        if not include_sample_values and not fingerprint_only:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "sample_values_disabled",
             }
 
         source_info = (
@@ -492,7 +524,8 @@ class SQLitePlugin(BaseDatabasePlugin):
         if self._db is None:
             await self.connect()
 
-        async with self._db.execute(sql, params or []) as cursor:
+        db = self.db
+        async with db.execute(sql, params or []) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
@@ -514,8 +547,9 @@ class SQLitePlugin(BaseDatabasePlugin):
         if self._db is None:
             await self.connect()
 
-        async with self._db.execute(sql, params or []) as cursor:
-            await self._db.commit()
+        db = self.db
+        async with db.execute(sql, params or []) as cursor:
+            await db.commit()
             return cursor.rowcount if cursor.rowcount >= 0 else 0
 
     async def execute_script(self, sql: str) -> None:
@@ -541,9 +575,10 @@ class SQLitePlugin(BaseDatabasePlugin):
         if self._db is None:
             await self.connect()
 
-        await self._db.executescript(sql)
+        db = self.db
+        await db.executescript(sql)
         # executescript issues a COMMIT internally, but commit again for safety
-        await self._db.commit()
+        await db.commit()
 
     async def insert_many(self, table: str, data: List[Dict[str, Any]]) -> int:
         """
@@ -567,8 +602,9 @@ class SQLitePlugin(BaseDatabasePlugin):
         sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})"
         rows = [[row[col] for col in columns] for row in data]
 
-        await self._db.executemany(sql, rows)
-        await self._db.commit()
+        db = self.db
+        await db.executemany(sql, rows)
+        await db.commit()
         return len(data)
 
     # ------------------------------------------------------------------
@@ -656,8 +692,9 @@ class SQLitePlugin(BaseDatabasePlugin):
                 return list(rows[0].values())[0]
             return None
         else:
-            await self._db.execute(f"PRAGMA {key} = {value}")
-            await self._db.commit()
+            db = self.db
+            await db.execute(f"PRAGMA {key} = {value}")
+            await db.commit()
             return None
 
     async def count_rows(self, table: str, filter: Optional[str] = None) -> int:
@@ -707,6 +744,10 @@ class SQLitePlugin(BaseDatabasePlugin):
     async def _tool_get_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Kept for backward compatibility."""
         table_name = args.get("table_name")
+        if not isinstance(table_name, str) or not table_name:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError("table_name is required", field="table_name")
         columns = await self.describe(table_name)
         return {
             "table": table_name,
@@ -739,12 +780,20 @@ class SQLitePlugin(BaseDatabasePlugin):
 
     async def _tool_count(self, args: Dict[str, Any]) -> Dict[str, Any]:
         table = args.get("table")
+        if not isinstance(table, str) or not table:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError("table is required", field="table")
         filter_clause = args.get("filter")
         count = await self.count_rows(table, filter_clause)
         return {"table": table, "count": count}
 
     async def _tool_sample(self, args: Dict[str, Any]) -> Dict[str, Any]:
         table = args.get("table")
+        if not isinstance(table, str) or not table:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError("table is required", field="table")
         n = args.get("n", 5)
         rows = await self.sample_rows(table, n)
         return {"table": table, "rows": rows}

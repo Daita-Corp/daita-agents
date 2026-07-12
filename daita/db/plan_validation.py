@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
-from typing import Any
+from typing import Any, Iterable
 
+from .fingerprints import persisted_fingerprint
 from .planning_context import planner_eligible_column_value_hint
 from .query_plan import DbQueryPlan, DbQueryPlanValidation
 from .query_sql_validation import sql_fingerprint
@@ -23,11 +23,13 @@ class DbQueryPlanValidator:
     ) -> DbQueryPlanValidation:
         errors: list[str] = []
         warnings: list[str] = []
+        validation_facts: list[dict[str, Any]] = []
         schema = dict(planning_context.get("schema") or {})
         dialect = str(
             planning_context.get("dialect") or schema.get("database_type") or ""
         )
-        table_columns = _table_columns(schema)
+        schema_columns = _schema_columns(schema)
+        table_columns = _table_columns_from_schema_columns(schema_columns)
         value_profiles = _value_profiles(planning_context)
         db_memory_validation = {
             "checked": bool(planning_context.get("db_memory_semantics")),
@@ -35,7 +37,25 @@ class DbQueryPlanValidator:
             "passed": True,
             "errors": [],
         }
+        catalog_relationship_validation = {
+            "checked": False,
+            "required_joins": [],
+            "relationship_evidence_refs": [],
+            "passed": True,
+            "errors": [],
+        }
+        session_scope_validation: dict[str, Any] = {
+            "checked": False,
+            "source_scope_id": None,
+            "source_operation_id": None,
+            "binding_status": None,
+            "required_filter_count": 0,
+            "required_join_count": 0,
+            "passed": True,
+            "errors": [],
+        }
         sql = plan.selected_sql
+        analysis_for_relationships: Any | None = None
 
         if plan.confidence < 0 or plan.confidence > 1:
             errors.append("confidence_out_of_bounds")
@@ -73,11 +93,15 @@ class DbQueryPlanValidator:
                 _validate_column(table_columns, table, column, errors, label="filter")
             _validate_filter_literal(
                 value_profiles,
+                schema_columns,
+                plan.selected_tables,
                 table,
                 column,
                 filter_spec.operator,
                 filter_spec.value,
+                None,
                 errors,
+                validation_facts,
             )
 
         if sql:
@@ -86,6 +110,7 @@ class DbQueryPlanValidator:
             except SqlAnalysisError as exc:
                 errors.append(f"sql_parse_failed:{exc.error_type}")
             else:
+                analysis_for_relationships = analysis
                 if analysis.has_multiple_statements:
                     errors.append("sql_multiple_statements")
                 if plan.operation == "read" and (
@@ -128,17 +153,23 @@ class DbQueryPlanValidator:
                     errors,
                 )
                 for predicate in analysis.literal_predicates:
+                    predicate_values = list(predicate.values)
+                    predicate_kinds = list(getattr(predicate, "value_kinds", ()) or ())
                     _validate_filter_literal(
                         value_profiles,
+                        schema_columns,
+                        sql_tables,
                         predicate.column.table or None,
                         predicate.column.name,
                         predicate.operator,
                         (
-                            list(predicate.values)
+                            predicate_values
                             if predicate.operator == "in"
-                            else predicate.values[0]
+                            else predicate_values[0]
                         ),
+                        predicate_kinds,
                         errors,
+                        validation_facts,
                     )
                 memory_errors = _validate_db_memory_semantics(
                     plan,
@@ -154,35 +185,81 @@ class DbQueryPlanValidator:
                     for item in planning_context.get("db_memory_semantics", []) or []
                     if isinstance(item, dict) and item.get("enforceable")
                 ]
+                session_errors, session_facts, session_metadata = (
+                    _validate_session_scope_binding(
+                        plan,
+                        planning_context,
+                        analysis,
+                        sql_tables,
+                    )
+                )
+                if session_errors:
+                    errors.extend(session_errors)
+                    validation_facts.extend(session_facts)
+                session_scope_validation.update(session_metadata)
+        elif plan.clarification_question:
+            session_metadata = _session_scope_binding_metadata(planning_context)
+            if session_metadata["checked"]:
+                session_metadata["binding_status"] = "clarification_requested"
+                session_scope_validation.update(session_metadata)
 
-        fingerprint = _fingerprint(plan.to_dict())
+        relationship_errors, relationship_facts, relationship_metadata = (
+            _validate_catalog_relationships(
+                plan,
+                planning_context,
+                analysis_for_relationships,
+            )
+        )
+        if relationship_errors:
+            errors.extend(relationship_errors)
+            validation_facts.extend(relationship_facts)
+        catalog_relationship_validation.update(relationship_metadata)
+
+        fingerprint = persisted_fingerprint(plan.to_dict())
         return DbQueryPlanValidation(
             valid=not errors,
             accepted_sql=sql if not errors else None,
             sql_fingerprint=sql_fingerprint(sql) if sql else None,
             errors=tuple(errors),
             warnings=tuple(warnings),
+            validation_facts=tuple(_dedupe_validation_facts(validation_facts)),
             plan_fingerprint=fingerprint,
             metadata={
                 "validator": "deterministic",
                 "schema_fingerprint": planning_context.get("schema_fingerprint"),
                 "db_memory_contract_validation": db_memory_validation,
+                "catalog_relationship_validation": catalog_relationship_validation,
+                "session_scope_binding_validation": session_scope_validation,
             },
         )
 
 
-def _table_columns(schema: dict[str, Any]) -> dict[str, set[str]]:
-    tables: dict[str, set[str]] = {}
+def _schema_columns(schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    tables: dict[str, dict[str, Any]] = {}
     for table in schema.get("tables", []) or []:
         name = str(table.get("name") or "")
         if not name:
             continue
-        tables[name.lower()] = {
-            str(column.get("name") or "").lower()
+        columns = {
+            str(column.get("name") or "").lower(): dict(column)
             for column in table.get("columns", []) or []
-            if column.get("name")
+            if isinstance(column, dict) and column.get("name")
         }
+        tables[name.lower()] = {"name": name, "columns": columns}
     return tables
+
+
+def _table_columns_from_schema_columns(
+    schema_columns: dict[str, dict[str, Any]],
+) -> dict[str, set[str]]:
+    return {
+        table_key: set(table.get("columns", {}))
+        for table_key, table in schema_columns.items()
+    }
+
+
+def _table_columns(schema: dict[str, Any]) -> dict[str, set[str]]:
+    return _table_columns_from_schema_columns(_schema_columns(schema))
 
 
 def _validate_column(
@@ -221,11 +298,15 @@ def _validate_join_column(
 
 def _validate_filter_literal(
     value_profiles: dict[tuple[str | None, str], set[str]],
+    schema_columns: dict[str, dict[str, Any]],
+    sql_tables: Iterable[str],
     table: str | None,
     column: str,
     operator: str,
     value: Any,
+    literal_kinds: Iterable[str] | None,
     errors: list[str],
+    validation_facts: list[dict[str, Any]],
 ) -> None:
     normalized_operator = str(operator or "").strip().lower()
     if normalized_operator not in {"=", "==", "eq", "in"}:
@@ -233,25 +314,72 @@ def _validate_filter_literal(
     if value is None:
         return
     if normalized_operator == "in" and isinstance(value, (list, tuple, set)):
-        for item in value:
+        kinds = list(literal_kinds or ())
+        for index, item in enumerate(value):
             _validate_filter_literal(
                 value_profiles,
+                schema_columns,
+                sql_tables,
                 table,
                 column,
                 "=",
                 item,
+                (kinds[index],) if index < len(kinds) else None,
                 errors,
+                validation_facts,
             )
         return
     literal = str(value)
     candidates = _observed_values(value_profiles, table, column)
-    if not candidates or literal.lower() in candidates:
+    if candidates and literal.lower() in candidates:
+        return
+    if not candidates:
+        if not _is_string_literal(value, literal_kinds):
+            return
+        resolved = _resolve_filter_literal_column(
+            schema_columns,
+            table=table,
+            column=column,
+            sql_tables=sql_tables,
+        )
+        if resolved is None:
+            return
+        table_label, column_label, column_metadata = resolved
+        if not _column_eligible_for_value_grounding(column_metadata):
+            return
+        errors.append(
+            "filter_literal_requires_grounding:"
+            f"{table_label}.{column_label}={literal}"
+        )
+        validation_facts.append(
+            {
+                "kind": "filter_literal_requires_grounding",
+                "table": table_label,
+                "column": column_label,
+                "operator": _normalize_operator(normalized_operator),
+                "literal": literal,
+                "source": "query.plan.validation",
+                "reason": (
+                    "proposed_sql_filter_literal_without_accepted_value_evidence"
+                ),
+            }
+        )
         return
     table_label = table or _single_table_for_column(value_profiles, column) or "unknown"
+    sorted_candidates = sorted(candidates)
     errors.append(
         "unobserved_filter_literal:"
         f"{table_label}.{column}={literal};"
-        f"candidates={','.join(sorted(candidates))}"
+        f"candidates={','.join(sorted_candidates)}"
+    )
+    validation_facts.append(
+        {
+            "kind": "unobserved_filter_literal",
+            "table": table_label,
+            "column": column,
+            "literal": literal,
+            "candidates": sorted_candidates,
+        }
     )
 
 
@@ -368,6 +496,77 @@ def _observed_values(
     return set()
 
 
+def _is_string_literal(value: Any, literal_kinds: Iterable[str] | None) -> bool:
+    kinds = [str(kind).lower() for kind in literal_kinds or () if str(kind)]
+    if kinds:
+        return all(kind == "string" for kind in kinds)
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _resolve_filter_literal_column(
+    schema_columns: dict[str, dict[str, Any]],
+    *,
+    table: str | None,
+    column: str,
+    sql_tables: Iterable[str],
+) -> tuple[str, str, dict[str, Any]] | None:
+    column_key = str(column or "").lower()
+    if not column_key:
+        return None
+    requested_tables = [str(item) for item in sql_tables if str(item or "").strip()]
+    if table:
+        requested_tables = [str(table), *requested_tables]
+
+    table_items = list(schema_columns.items())
+    if requested_tables:
+        requested_keys = {str(item).lower() for item in requested_tables}
+        requested_short_keys = {
+            _short_table_key(item)
+            for item in requested_tables
+            if _short_table_key(item)
+        }
+        table_items = [
+            (table_key, table_info)
+            for table_key, table_info in table_items
+            if table_key in requested_keys
+            or _short_table_key(str(table_info.get("name") or table_key))
+            in requested_keys
+            or table_key in requested_short_keys
+            or _short_table_key(str(table_info.get("name") or table_key))
+            in requested_short_keys
+        ]
+
+    matches: list[tuple[str, str, dict[str, Any]]] = []
+    for table_key, table_info in table_items:
+        columns = table_info.get("columns")
+        if not isinstance(columns, dict) or column_key not in columns:
+            continue
+        column_metadata = dict(columns[column_key])
+        table_name = str(table_info.get("name") or table_key)
+        column_name = str(column_metadata.get("name") or column)
+        matches.append((table_name, column_name, column_metadata))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _column_eligible_for_value_grounding(column: dict[str, Any]) -> bool:
+    data_type = str(
+        column.get("data_type") or column.get("type") or column.get("db_type") or ""
+    ).lower()
+    if not data_type:
+        return False
+    return any(
+        token in data_type
+        for token in (
+            "char",
+            "clob",
+            "enum",
+            "string",
+            "text",
+            "uuid",
+        )
+    )
+
+
 def _single_table_for_column(
     value_profiles: dict[tuple[str | None, str], set[str]],
     column: str,
@@ -422,6 +621,251 @@ def _split_column_ref(value: str) -> tuple[str | None, str]:
 def _looks_aggregated(sql: str) -> bool:
     lowered = sql.lower()
     return any(token in lowered for token in ("count(", "sum(", "avg(", "min(", "max("))
+
+
+def _validate_catalog_relationships(
+    plan: DbQueryPlan,
+    planning_context: dict[str, Any],
+    analysis: Any | None,
+) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    required = _required_join_edges(plan, analysis)
+    evidence_edges, relationship_refs = _catalog_relationship_edges(planning_context)
+    metadata = {
+        "checked": bool(required),
+        "required_joins": [dict(item) for item in required],
+        "relationship_evidence_refs": relationship_refs,
+        "passed": True,
+        "errors": [],
+    }
+    if plan.operation != "read" or not required:
+        return [], [], metadata
+
+    errors: list[str] = []
+    facts: list[dict[str, Any]] = []
+    for edge in required:
+        if any(
+            _relationship_edge_matches(edge, evidence) for evidence in evidence_edges
+        ):
+            continue
+        label = _join_edge_label(edge)
+        error = f"missing_catalog_relationship_path:{label}"
+        errors.append(error)
+        fact = {
+            "kind": "missing_catalog_relationship_path",
+            "left_table": edge["left_table"],
+            "right_table": edge["right_table"],
+            "source": edge.get("source") or "query.plan.validation",
+            "reason": "joined_data_query_without_catalog_relationship_evidence",
+        }
+        if edge.get("left_column"):
+            fact["left_column"] = edge["left_column"]
+        if edge.get("right_column"):
+            fact["right_column"] = edge["right_column"]
+        facts.append(fact)
+    if errors:
+        metadata["passed"] = False
+        metadata["errors"] = list(errors)
+    return errors, facts, metadata
+
+
+def _required_join_edges(
+    plan: DbQueryPlan,
+    analysis: Any | None,
+) -> tuple[dict[str, str], ...]:
+    edges: list[dict[str, str]] = []
+    for join in plan.joins:
+        edge = _join_edge(
+            join.left_table,
+            join.left_column,
+            join.right_table,
+            join.right_column,
+            source="query_plan_join",
+        )
+        if edge is not None:
+            edges.append(edge)
+
+    if analysis is not None:
+        for predicate in getattr(analysis, "column_predicates", ()) or ():
+            if str(getattr(predicate, "operator", "") or "") != "=":
+                continue
+            left = getattr(predicate, "left", None)
+            right = getattr(predicate, "right", None)
+            edge = _join_edge(
+                getattr(left, "table", "") if left is not None else "",
+                getattr(left, "name", "") if left is not None else "",
+                getattr(right, "table", "") if right is not None else "",
+                getattr(right, "name", "") if right is not None else "",
+                source="sql_column_predicate",
+            )
+            if edge is not None:
+                edges.append(edge)
+
+    if not edges:
+        tables = _join_candidate_tables(plan, analysis)
+        if len(tables) > 1:
+            first = tables[0]
+            for table in tables[1:]:
+                edge = _join_edge(first, "", table, "", source="multi_table_plan")
+                if edge is not None:
+                    edges.append(edge)
+    return _dedupe_join_edges(edges)
+
+
+def _join_candidate_tables(
+    plan: DbQueryPlan,
+    analysis: Any | None,
+) -> list[str]:
+    tables: list[str] = []
+    if analysis is not None:
+        tables.extend(
+            str(table.short_key)
+            for table in getattr(analysis, "tables", ()) or ()
+            if not getattr(table, "is_cte", False) and str(table.short_key)
+        )
+    tables.extend(str(table) for table in plan.selected_tables if str(table).strip())
+    return list(
+        dict.fromkeys(_short_table_key(table) or str(table) for table in tables)
+    )
+
+
+def _join_edge(
+    left_table: Any,
+    left_column: Any,
+    right_table: Any,
+    right_column: Any,
+    *,
+    source: str,
+) -> dict[str, str] | None:
+    left_table_key = _short_table_key(str(left_table or ""))
+    right_table_key = _short_table_key(str(right_table or ""))
+    if not left_table_key or not right_table_key or left_table_key == right_table_key:
+        return None
+    return {
+        "left_table": left_table_key,
+        "left_column": str(left_column or "").strip().lower(),
+        "right_table": right_table_key,
+        "right_column": str(right_column or "").strip().lower(),
+        "source": source,
+    }
+
+
+def _dedupe_join_edges(edges: Iterable[dict[str, str]]) -> tuple[dict[str, str], ...]:
+    seen: set[tuple[str, str, str, str]] = set()
+    out: list[dict[str, str]] = []
+    for edge in edges:
+        key = (
+            edge.get("left_table", ""),
+            edge.get("left_column", ""),
+            edge.get("right_table", ""),
+            edge.get("right_column", ""),
+        )
+        reverse = (key[2], key[3], key[0], key[1])
+        if key in seen or reverse in seen:
+            continue
+        seen.add(key)
+        out.append(edge)
+    return tuple(out)
+
+
+def _catalog_relationship_edges(
+    planning_context: dict[str, Any],
+) -> tuple[tuple[dict[str, str], ...], list[dict[str, str]]]:
+    edges: list[dict[str, str]] = []
+    refs: list[dict[str, str]] = []
+    for detail in planning_context.get("relationship_evidence_details", []) or []:
+        if not isinstance(detail, dict):
+            continue
+        if detail.get("accepted", True) is not True:
+            continue
+        if detail.get("owner") != "catalog":
+            continue
+        if detail.get("kind", "schema.relationship_path") != "schema.relationship_path":
+            continue
+        ref = {
+            "id": str(detail.get("id") or ""),
+            "kind": "schema.relationship_path",
+            "owner": "catalog",
+        }
+        if detail.get("payload_fingerprint"):
+            ref["payload_fingerprint"] = str(detail["payload_fingerprint"])
+        refs.append(ref)
+        raw_payload = detail.get("payload")
+        payload: dict[str, Any] = (
+            {str(key): value for key, value in raw_payload.items()}
+            if isinstance(raw_payload, dict)
+            else {str(key): value for key, value in detail.items()}
+        )
+        if payload.get("reachable") is False:
+            continue
+        for path in payload.get("paths", []) or []:
+            if not isinstance(path, dict):
+                continue
+            for join in path.get("joins", []) or path.get("relationships", []) or []:
+                if not isinstance(join, dict):
+                    continue
+                edge = _join_edge(
+                    join.get("left_table")
+                    or join.get("left_asset")
+                    or join.get("source_table")
+                    or join.get("source_asset"),
+                    join.get("left_column")
+                    or join.get("left_field")
+                    or join.get("source_column")
+                    or join.get("source_field"),
+                    join.get("right_table")
+                    or join.get("right_asset")
+                    or join.get("target_table")
+                    or join.get("target_asset"),
+                    join.get("right_column")
+                    or join.get("right_field")
+                    or join.get("target_column")
+                    or join.get("target_field"),
+                    source="schema.relationship_path",
+                )
+                if edge is not None:
+                    edges.append(edge)
+    return _dedupe_join_edges(edges), refs
+
+
+def _relationship_edge_matches(
+    required: dict[str, str],
+    evidence: dict[str, str],
+) -> bool:
+    if _relationship_edge_matches_direction(required, evidence):
+        return True
+    reversed_required = {
+        "left_table": required["right_table"],
+        "left_column": required.get("right_column", ""),
+        "right_table": required["left_table"],
+        "right_column": required.get("left_column", ""),
+    }
+    return _relationship_edge_matches_direction(reversed_required, evidence)
+
+
+def _relationship_edge_matches_direction(
+    required: dict[str, str],
+    evidence: dict[str, str],
+) -> bool:
+    if required["left_table"] != evidence["left_table"]:
+        return False
+    if required["right_table"] != evidence["right_table"]:
+        return False
+    left_column = required.get("left_column", "")
+    right_column = required.get("right_column", "")
+    if left_column and left_column != evidence.get("left_column", ""):
+        return False
+    if right_column and right_column != evidence.get("right_column", ""):
+        return False
+    return True
+
+
+def _join_edge_label(edge: dict[str, str]) -> str:
+    left = edge["left_table"]
+    right = edge["right_table"]
+    if edge.get("left_column") and edge.get("right_column"):
+        left = f"{left}.{edge['left_column']}"
+        right = f"{right}.{edge['right_column']}"
+    return f"{left}->{right}"
 
 
 def _validate_db_memory_semantics(
@@ -495,6 +939,195 @@ def _validate_metric_contract(
                 f"missing_db_memory_required_result_shape:"
                 f"{memory_key}:single_aggregate"
             )
+
+
+def _validate_session_scope_binding(
+    plan: DbQueryPlan,
+    planning_context: dict[str, Any],
+    analysis: Any,
+    sql_tables: list[str],
+) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    metadata = _session_scope_binding_metadata(planning_context)
+    if not metadata["checked"]:
+        return [], [], metadata
+    binding = planning_context.get("session_scope_binding")
+    if not isinstance(binding, dict):
+        return [], [], metadata
+    status = str(binding.get("binding_status") or "").strip().lower()
+    if status and status not in {"bound", "accepted", "enforced", "required"}:
+        return [], [], metadata
+    if plan.operation != "read":
+        return [], [], metadata
+
+    errors: list[str] = []
+    facts: list[dict[str, Any]] = []
+    for required in _binding_required_filters(binding):
+        if _sql_contains_scope_filter(required, analysis, sql_tables):
+            continue
+        label = _scope_filter_label(required)
+        error = f"missing_session_scope_filter:{label}"
+        errors.append(error)
+        facts.append(
+            {
+                "kind": "missing_session_scope_filter",
+                "column": str(required.get("column") or required.get("ref") or ""),
+                "operator": _normalize_operator(required.get("operator")),
+                "values": list(_binding_filter_values(required)),
+                "source": "session.scope_binding",
+                "reason": "follow_up_sql_missing_bound_scope_filter",
+            }
+        )
+
+    sql_edges = _required_join_edges(plan, analysis)
+    for required in _binding_required_joins(binding):
+        if any(_relationship_edge_matches(required, edge) for edge in sql_edges):
+            continue
+        label = _join_edge_label(required)
+        error = f"missing_session_scope_join:{label}"
+        errors.append(error)
+        fact = {
+            "kind": "missing_session_scope_join",
+            "left_table": required["left_table"],
+            "right_table": required["right_table"],
+            "source": "session.scope_binding",
+            "reason": "follow_up_sql_missing_bound_scope_join",
+        }
+        if required.get("left_column"):
+            fact["left_column"] = required["left_column"]
+        if required.get("right_column"):
+            fact["right_column"] = required["right_column"]
+        facts.append(fact)
+
+    if errors:
+        metadata["passed"] = False
+        metadata["errors"] = list(errors)
+    return errors, facts, metadata
+
+
+def _session_scope_binding_metadata(
+    planning_context: dict[str, Any],
+) -> dict[str, Any]:
+    binding = planning_context.get("session_scope_binding")
+    metadata: dict[str, Any] = {
+        "checked": isinstance(binding, dict),
+        "source_scope_id": None,
+        "source_operation_id": None,
+        "binding_status": None,
+        "required_filter_count": 0,
+        "required_join_count": 0,
+        "passed": True,
+        "errors": [],
+    }
+    if not isinstance(binding, dict):
+        return metadata
+    metadata.update(
+        {
+            "source_scope_id": binding.get("source_scope_id"),
+            "source_operation_id": binding.get("source_operation_id"),
+            "binding_status": binding.get("binding_status"),
+            "required_filter_count": len(_binding_required_filters(binding)),
+            "required_join_count": len(_binding_required_joins(binding)),
+        }
+    )
+    return metadata
+
+
+def _binding_required_filters(binding: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    filters = []
+    for item in binding.get("required_filters", ()) or ():
+        if not isinstance(item, dict):
+            continue
+        column = str(item.get("column") or item.get("ref") or "").strip()
+        operator = str(item.get("operator") or item.get("op") or "").strip()
+        values = _binding_filter_values(item)
+        if column and operator and values:
+            filters.append(
+                {
+                    "column": column,
+                    "operator": operator,
+                    "values": list(values),
+                }
+            )
+    return tuple(filters)
+
+
+def _binding_required_joins(binding: dict[str, Any]) -> tuple[dict[str, str], ...]:
+    joins = []
+    for item in binding.get("required_joins", ()) or ():
+        if not isinstance(item, dict):
+            continue
+        edge = _join_edge(
+            item.get("left_table") or item.get("source_table"),
+            item.get("left_column") or item.get("source_column"),
+            item.get("right_table") or item.get("target_table"),
+            item.get("right_column") or item.get("target_column"),
+            source="session.scope_binding",
+        )
+        if edge is not None:
+            joins.append(edge)
+    return _dedupe_join_edges(joins)
+
+
+def _sql_contains_scope_filter(
+    required: dict[str, Any],
+    analysis: Any,
+    sql_tables: list[str],
+) -> bool:
+    required_table, required_column = _split_column_ref(str(required.get("column")))
+    required_operator = _normalize_operator(required.get("operator"))
+    required_values = set(_binding_filter_values(required))
+    if not required_values:
+        return False
+    for predicate in getattr(analysis, "literal_predicates", ()) or ():
+        predicate_column = getattr(predicate, "column", None)
+        predicate_table = str(getattr(predicate_column, "table", "") or "") or None
+        predicate_column_name = str(getattr(predicate_column, "name", "") or "")
+        if required_column.lower() != predicate_column_name.lower():
+            continue
+        if not _tables_match(required_table, predicate_table, sql_tables):
+            continue
+        predicate_operator = _normalize_operator(getattr(predicate, "operator", ""))
+        if not _scope_operator_matches(required_operator, predicate_operator):
+            continue
+        predicate_values = {
+            str(value).lower() for value in getattr(predicate, "values", ()) or ()
+        }
+        if {value.lower() for value in required_values} <= predicate_values:
+            return True
+    return False
+
+
+def _scope_operator_matches(required: str, actual: str) -> bool:
+    if required == actual:
+        return True
+    if required == "=" and actual == "in":
+        return True
+    if required == "in" and actual == "=":
+        return True
+    return False
+
+
+def _binding_filter_values(filter_spec: dict[str, Any]) -> tuple[str, ...]:
+    raw = (
+        filter_spec.get("values")
+        if "values" in filter_spec
+        else filter_spec.get("value")
+    )
+    if raw is None:
+        return ()
+    if isinstance(raw, (list, tuple, set)):
+        values = raw
+    else:
+        values = (raw,)
+    return tuple(str(item).lower() for item in values if item is not None)
+
+
+def _scope_filter_label(filter_spec: dict[str, Any]) -> str:
+    values = ",".join(_binding_filter_values(filter_spec))
+    return (
+        f"{filter_spec.get('column')}"
+        f"{_normalize_operator(filter_spec.get('operator'))}{values}"
+    )
 
 
 def _validate_unit_contract(
@@ -663,6 +1296,15 @@ def _memory_key(contract: dict[str, Any]) -> str:
     return str(contract.get("memory_key") or contract.get("key") or "db_memory")
 
 
-def _fingerprint(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+def _dedupe_validation_facts(
+    facts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for fact in facts:
+        key = json.dumps(fact, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(fact)
+    return deduped

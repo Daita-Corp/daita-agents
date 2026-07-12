@@ -476,17 +476,33 @@ def _normalize_record(
     importance = _float_clamped(record.get("importance", 0.7), 0.7)
     expires_at = record.get("expires_at") or metadata.get("expires_at")
     category = str(record.get("category") or DB_SEMANTIC_CATEGORY)
+    normalized_source_identity = str(source_identity) if source_identity else None
+    normalized_workspace_scope = str(workspace_scope or "source")
+    normalized_schema_refs = [str(item) for item in schema_refs if str(item).strip()]
+    normalized_catalog_refs = [str(item) for item in catalog_refs if str(item).strip()]
+    normalized_aliases = [str(item) for item in aliases if str(item).strip()]
+    metadata.setdefault("source_identity", normalized_source_identity)
+    metadata.setdefault("workspace_scope", normalized_workspace_scope)
+    metadata.setdefault("active", bool(active))
+    metadata.setdefault("stale", bool(stale))
+    metadata.setdefault("confidence", confidence)
+    if normalized_schema_refs:
+        metadata.setdefault("schema_refs", normalized_schema_refs)
+    if normalized_catalog_refs:
+        metadata.setdefault("catalog_refs", normalized_catalog_refs)
+    if normalized_aliases:
+        metadata.setdefault("aliases", normalized_aliases)
 
     normalized = {
         "kind": kind,
         "key": key,
         "text": text,
         "category": category,
-        "source_identity": str(source_identity) if source_identity else None,
-        "workspace_scope": str(workspace_scope or "source"),
-        "schema_refs": [str(item) for item in schema_refs if str(item).strip()],
-        "catalog_refs": [str(item) for item in catalog_refs if str(item).strip()],
-        "aliases": [str(item) for item in aliases if str(item).strip()],
+        "source_identity": normalized_source_identity,
+        "workspace_scope": normalized_workspace_scope,
+        "schema_refs": normalized_schema_refs,
+        "catalog_refs": normalized_catalog_refs,
+        "aliases": normalized_aliases,
         "confidence": confidence,
         "importance": importance,
         "active": bool(active),
@@ -494,17 +510,6 @@ def _normalize_record(
         "expires_at": str(expires_at) if expires_at else None,
         "metadata": metadata,
     }
-    normalized["metadata"].setdefault("source_identity", normalized["source_identity"])
-    normalized["metadata"].setdefault("workspace_scope", normalized["workspace_scope"])
-    normalized["metadata"].setdefault("active", normalized["active"])
-    normalized["metadata"].setdefault("stale", normalized["stale"])
-    normalized["metadata"].setdefault("confidence", normalized["confidence"])
-    if normalized["schema_refs"]:
-        normalized["metadata"].setdefault("schema_refs", normalized["schema_refs"])
-    if normalized["catalog_refs"]:
-        normalized["metadata"].setdefault("catalog_refs", normalized["catalog_refs"])
-    if normalized["aliases"]:
-        normalized["metadata"].setdefault("aliases", normalized["aliases"])
     return normalized
 
 
@@ -807,9 +812,8 @@ def _has_structured_query_match(record: dict[str, Any], query: str) -> bool:
 
 
 def _lexical_document(record: dict[str, Any]) -> str:
-    metadata = (
-        record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    )
+    raw_metadata = record.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     parts = [
         record.get("kind"),
         record.get("key"),

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from daita.runtime import Evidence, Operation, OperationStatus, Task
 
@@ -19,10 +19,149 @@ from ..resume import (
     _db_intent_from_context,
     _db_request_from_context,
 )
+from ..tasks.models import DbTaskSpec
 from ..types import DbRuntimeGovernanceBlocked
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from daita.plugins import ExtensionRegistry
+    from daita.runtime import GovernanceResult, RuntimeKernel, RuntimeStore
+
+    from ...models import (
+        DbIntent,
+        DbOperationContract,
+        DbOperationResult,
+        DbRequest,
+    )
+    from ..tasks.models import DbTaskPlan
+    from ..tasks.runtime import DbTaskRuntime
 
 
 class DbRuntimeMonitorActionReportsMixin:
+    if TYPE_CHECKING:
+        registry: ExtensionRegistry
+        store: RuntimeStore
+        kernel: RuntimeKernel
+        tasks: DbTaskRuntime
+        runtime_id: str
+
+        async def _persist_monitor_report_evidence(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_plan: dict[str, Any],
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            produced_evidence: tuple[Evidence, ...],
+        ) -> Evidence: ...
+
+        async def _persist_monitor_action_result(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_kind: str,
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            plan_evidence: Evidence,
+            status: str,
+            block_reason: str | None = None,
+            extra_produced_evidence: tuple[Evidence, ...] = (),
+            supersede_approval_block: bool = False,
+        ) -> dict[str, Any]: ...
+
+        async def _seed_monitor_analysis_plan(
+            self,
+            operation: Operation,
+            *,
+            analysis_plan: DbAnalysisPlan,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+        ) -> Evidence: ...
+
+        async def _run_multi_step_analysis(
+            self,
+            request: DbRequest,
+            intent: DbIntent,
+            contract: DbOperationContract,
+            operation: Operation,
+            *,
+            base_diagnostics: dict[str, Any],
+            reuse_existing_plan: bool = False,
+        ) -> DbOperationResult: ...
+
+        async def _execute_analysis_validation_task(
+            self,
+            operation: Operation,
+            tasks: list[Task],
+            evidence_store: DbEvidenceStore,
+            *,
+            plan_evidence: Evidence,
+        ) -> Evidence: ...
+
+        async def _block_monitor_action(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_plan: dict[str, Any],
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            plan_evidence: Evidence,
+            reason: str,
+        ) -> dict[str, Any]: ...
+
+        async def _execute_analysis_synthesis_task(
+            self,
+            operation: Operation,
+            tasks: list[Task],
+            evidence_store: DbEvidenceStore,
+            *,
+            analysis_id: str,
+            step_id: str,
+            plan_evidence: Evidence,
+            cited_evidence: tuple[Evidence, ...],
+            partial: bool = False,
+            pause_reason: str | None = None,
+            remaining_step_ids: tuple[str, ...] = (),
+        ) -> Evidence: ...
+
+        async def _checkpoint_blocked_analysis_state(
+            self,
+            operation: Operation,
+            tasks: list[Task],
+            evidence_store: DbEvidenceStore,
+            *,
+            governance: GovernanceResult,
+            evidence: tuple[Evidence, ...],
+        ) -> tuple[Evidence | None, Evidence | None]: ...
+
+        async def plan_task_specs(
+            self,
+            operation: Operation,
+            specs: Iterable[DbTaskSpec],
+            *,
+            contract: DbOperationContract | Mapping[str, Any] | None = None,
+        ) -> DbTaskPlan: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
+
     async def _execute_monitor_notification_action(
         self,
         operation: Operation,
@@ -362,29 +501,61 @@ class DbRuntimeMonitorActionReportsMixin:
         sequence: int,
         tasks: list[Task],
     ) -> tuple[Evidence, ...]:
-        validation_task, read_task = self.plan_validated_read_tasks(
-            operation,
-            sql=str(step.get("sql") or ""),
-            params=list(step.get("parameters") or step.get("params") or ()),
-            owner=(
-                str(step.get("capability_owner"))
-                if step.get("capability_owner")
-                else None
-            ),
-            reason="monitor_report_read",
-            sequence=sequence,
-            metadata={
-                "monitor_id": monitor_id,
-                "monitor_run_id": monitor_run_id,
-                "tick_operation_id": tick_operation_id,
-                "monitor_action_kind": "scheduled_report",
-                "monitor_action_fingerprint": action_plan_fingerprint,
-                "monitor_report_step_id": step.get("id"),
-                "monitor_report_step_kind": step.get("kind"),
-            },
+        owner = (
+            str(step.get("capability_owner")) if step.get("capability_owner") else None
         )
-        validation_task = await self._plan_kernel_task(validation_task)
-        read_task = await self._plan_kernel_task(read_task)
+        read_capability = self.registry.get_capability(
+            "db.sql.execute_read",
+            owner=owner,
+        )
+        validation_capability = self.tasks.validation_capability_for_sql_execute(
+            read_capability
+        )
+        if validation_capability is None:
+            raise KeyError("db.sql.validate")
+        plan = await self.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id=validation_capability.id,
+                    owner=validation_capability.owner,
+                    input={"sql": str(step.get("sql") or ""), "operation": "query"},
+                    reason="monitor_report_read_validation",
+                    sequence=sequence,
+                    metadata={
+                        "monitor_id": monitor_id,
+                        "monitor_run_id": monitor_run_id,
+                        "tick_operation_id": tick_operation_id,
+                        "monitor_action_kind": "scheduled_report",
+                        "monitor_action_fingerprint": action_plan_fingerprint,
+                        "monitor_report_step_id": step.get("id"),
+                        "monitor_report_step_kind": step.get("kind"),
+                    },
+                ),
+                DbTaskSpec(
+                    capability_id=read_capability.id,
+                    owner=read_capability.owner,
+                    input={
+                        "sql_ref": "sql.validation",
+                        "params": list(
+                            step.get("parameters") or step.get("params") or ()
+                        ),
+                    },
+                    reason="monitor_report_read",
+                    sequence=sequence + 1,
+                    metadata={
+                        "monitor_id": monitor_id,
+                        "monitor_run_id": monitor_run_id,
+                        "tick_operation_id": tick_operation_id,
+                        "monitor_action_kind": "scheduled_report",
+                        "monitor_action_fingerprint": action_plan_fingerprint,
+                        "monitor_report_step_id": step.get("id"),
+                        "monitor_report_step_kind": step.get("kind"),
+                    },
+                ),
+            ),
+        )
+        validation_task, read_task = plan.tasks
         tasks.extend([validation_task, read_task])
         validation_evidence = await self.execute_task(
             validation_task,

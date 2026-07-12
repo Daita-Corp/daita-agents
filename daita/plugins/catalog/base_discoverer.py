@@ -75,7 +75,7 @@ class BaseDiscoverer(ABC):
         pass
 
     @abstractmethod
-    async def enumerate(self) -> AsyncIterator[DiscoveredStore]:
+    def enumerate(self) -> AsyncIterator[DiscoveredStore]:
         """Yield discovered stores. Handles pagination internally."""
         ...
 

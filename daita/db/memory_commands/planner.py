@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from daita.db.analysis import stable_fingerprint
+from daita.db.fingerprints import persisted_fingerprint
 from daita.db.memory import (
     DB_MEMORY_SEMANTIC_CONTRACT_KEY,
     DB_SEMANTIC_MEMORY_KINDS,
-    DBMemoryRecord,
     db_memory_pii_error,
     normalize_db_memory_record,
 )
@@ -141,7 +140,7 @@ class DbMemoryProposalPlanner:
             "record": record.to_dict() if record is not None else record_payload,
             "validation": validation.to_dict(),
         }
-        proposal["proposal_fingerprint"] = stable_fingerprint(proposal)
+        proposal["proposal_fingerprint"] = persisted_fingerprint(proposal)
         return proposal, validation
 
 

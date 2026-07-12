@@ -92,7 +92,10 @@ class AgentEvent:
 
         Useful for sending over WebSocket or storing in database.
         """
-        data = {"type": self.type.value, "timestamp": self.timestamp.isoformat()}
+        data: Dict[str, Any] = {
+            "type": self.type.value,
+            "timestamp": self.timestamp.isoformat(),
+        }
 
         # Add populated fields
         if self.content is not None:

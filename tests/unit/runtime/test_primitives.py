@@ -24,10 +24,12 @@ from daita.runtime import (
     RuntimeStreamEvent,
     Task,
     TaskDependency,
+    TaskDependencyKind,
     TaskStatus,
     ToolView,
     Worker,
 )
+from daita.runtime.events import RuntimeEventBroker
 
 
 def test_capability_is_serializable_and_round_trips():
@@ -45,6 +47,7 @@ def test_capability_is_serializable_and_round_trips():
         model_visible=False,
         runtime_only=True,
         side_effecting=False,
+        concurrent_safe=True,
         timeout_seconds=10,
     )
 
@@ -54,8 +57,32 @@ def test_capability_is_serializable_and_round_trips():
     assert payload["operation_types"] == ["data.query"]
     assert payload["access"] == "read"
     assert payload["risk"] == "medium"
+    assert payload["concurrent_safe"] is True
     assert json.loads(json.dumps(payload)) == payload
     assert Capability.from_dict(payload) == capability
+
+
+def test_capability_concurrent_safe_defaults_false_for_legacy_payloads():
+    capability = Capability(
+        id="db.sql.execute_read",
+        owner="sqlite",
+        description="Execute a read-only SQL query.",
+        domains=frozenset({"db"}),
+        operation_types=frozenset({"data.query"}),
+        access=AccessMode.READ,
+        risk=RiskLevel.MEDIUM,
+        input_schema={"type": "object"},
+        output_evidence=frozenset({"query.result"}),
+        executor="sqlite.sql.execute_read",
+        side_effecting=False,
+    )
+    payload = capability.to_dict()
+    payload.pop("concurrent_safe")
+
+    restored = Capability.from_dict(payload)
+
+    assert restored.concurrent_safe is False
+    assert restored.to_dict()["concurrent_safe"] is False
 
 
 @pytest.mark.parametrize(
@@ -206,6 +233,54 @@ def test_operation_and_task_statuses_are_explicit_and_serializable():
     assert task.to_dict()["dependencies"][0]["evidence_kind"] == "sql.validation"
 
 
+def test_enum_or_string_records_normalize_and_preserve_wire_values():
+    dependency = TaskDependency(
+        kind="evidence",
+        evidence_kind="sql.validation",
+    )
+    decision = PolicyDecision(
+        policy_id="governance.warn",
+        owner="governance",
+        effect="warn",
+        reason="Review the operation.",
+        severity=RiskLevel.LOW,
+    )
+    trace = PolicyDecisionTrace(
+        trace_id="trace-string-effect",
+        operation_id="op-1",
+        policy_id=decision.policy_id,
+        owner=decision.owner,
+        policy_version=decision.policy_version,
+        policy_identity=str(decision.policy_identity),
+        effect="warn",
+        reason=decision.reason,
+        stage="task",
+    )
+    approval = ApprovalRequest(
+        approval_id="approval-string-status",
+        operation_id="op-1",
+        reason="Approval is required.",
+        proposed_action={"operation_type": "data.write"},
+        risk=RiskLevel.HIGH,
+        status="pending",
+    )
+
+    assert dependency.kind is TaskDependencyKind.EVIDENCE
+    assert dependency.kind_value == "evidence"
+    assert dependency.approval_status_value is None
+    assert decision.effect is PolicyEffect.WARN
+    assert trace.effect is PolicyEffect.WARN
+    assert approval.status is ApprovalStatus.PENDING
+    assert dependency.to_dict()["kind"] == "evidence"
+    assert decision.to_dict()["effect"] == "warn"
+    assert trace.to_dict()["effect"] == "warn"
+    assert approval.to_dict()["status"] == "pending"
+    assert TaskDependency.from_dict(dependency.to_dict()) == dependency
+    assert PolicyDecision.from_dict(decision.to_dict()) == decision
+    assert PolicyDecisionTrace.from_dict(trace.to_dict()) == trace
+    assert ApprovalRequest.from_dict(approval.to_dict()) == approval
+
+
 def test_runtime_event_round_trips():
     event = RuntimeEvent(
         id="event-1",
@@ -255,6 +330,37 @@ def test_runtime_stream_event_projects_runtime_event_correlation():
     assert stream_event.capability_id == event.capability_id
     assert stream_event.evidence_id == event.evidence_id
     assert stream_event.to_dict()["trace_id"] == "trace-1"
+
+
+@pytest.mark.parametrize("queue_size", [0, -1, 10_001, True, 1.5])
+def test_runtime_event_broker_rejects_invalid_queue_sizes(queue_size):
+    broker = RuntimeEventBroker()
+
+    with pytest.raises(ValueError, match="1 through 10,000"):
+        broker.subscribe("op-1", queue_size=queue_size)
+
+
+async def test_runtime_event_broker_bounds_slow_consumers_and_reports_drops():
+    broker = RuntimeEventBroker(default_queue_size=1)
+    subscription = broker.subscribe("op-1")
+
+    for index in range(4):
+        await broker.publish(
+            RuntimeEvent(
+                type=RuntimeEventType.DIAGNOSTIC,
+                operation_id="op-1",
+                message=f"event-{index}",
+            )
+        )
+
+    assert subscription.queue_size == 1
+    assert subscription.pending_count == 1
+    assert subscription.get_nowait().message == "event-0"
+    assert subscription.take_dropped_count() == 3
+    assert subscription.take_dropped_count() == 0
+
+    subscription.close()
+    assert broker.subscriber_count == 0
 
 
 def test_policy_decision_round_trips_with_evidence_and_modifications():

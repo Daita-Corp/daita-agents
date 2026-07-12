@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 from daita.agents.agent import Agent
 from daita.core.tracing import TraceType, get_trace_manager
+from daita.db import DbLLMConfig, DbSourceOptions
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import OperationStatus
 
@@ -120,11 +121,13 @@ async def test_live_openai_from_db_trace_presentation(tmp_path):
     agent = await Agent.from_db(
         str(db_path),
         name="LiveTraceTelemetryAgent",
-        cache_ttl=0,
-        llm_provider="openai",
-        model=model,
-        api_key=os.environ["OPENAI_API_KEY"],
-        temperature=0,
+        source_options=DbSourceOptions(cache_ttl=0),
+        llm=DbLLMConfig(
+            provider="openai",
+            model=model,
+            api_key=os.environ["OPENAI_API_KEY"],
+            temperature=0,
+        ),
     )
 
     try:

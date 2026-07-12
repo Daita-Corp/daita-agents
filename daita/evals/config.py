@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 RunMode = Literal["sequential_same_agent"]
 PassRule = Literal["all_runs"]
@@ -20,26 +20,12 @@ class EvalConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class FromDbConfig(EvalConfigModel):
-    """First-class ``daita.db.from_db`` target configuration."""
-
-    source: str
-    kwargs: dict[str, Any] = Field(default_factory=dict)
-
-
 class AgentConfig(EvalConfigModel):
     """Runtime-native target configuration."""
 
-    factory: str | None = None
+    factory: str
     kwargs: dict[str, Any] = Field(default_factory=dict)
-    from_db: FromDbConfig | None = None
     label: str | None = None
-
-    @model_validator(mode="after")
-    def validate_target(self) -> "AgentConfig":
-        if bool(self.factory) == bool(self.from_db):
-            raise ValueError("agent must configure exactly one of factory or from_db")
-        return self
 
 
 class SuiteDefaults(EvalConfigModel):

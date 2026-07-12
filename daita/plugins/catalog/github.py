@@ -9,11 +9,14 @@ import hashlib
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, AsyncIterator, List, Optional, Tuple
 
 from .base_discoverer import BaseDiscoverer, DiscoveredStore
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    import httpx
 
 # Patterns for connection string extraction with confidence scores
 _CONN_PATTERNS: List[Tuple[str, re.Pattern, float]] = [
@@ -115,6 +118,12 @@ class GitHubScanner(BaseDiscoverer):
         self._org = org
         self._client = None
 
+    @property
+    def client(self) -> "httpx.AsyncClient":
+        if self._client is None:
+            raise RuntimeError("GitHubScanner must authenticate before scanning")
+        return self._client
+
     async def authenticate(self) -> None:
         """Set up httpx client with GitHub auth headers."""
         try:
@@ -166,7 +175,7 @@ class GitHubScanner(BaseDiscoverer):
         """Verify GitHub token is valid."""
         try:
             await self.authenticate()
-            resp = await self._client.get("/user")
+            resp = await self.client.get("/user")
             return resp.status_code == 200
         except Exception:
             return False
@@ -179,10 +188,10 @@ class GitHubScanner(BaseDiscoverer):
 
     async def _list_org_repos(self) -> List[str]:
         """List all repos in the configured organization."""
-        repos = []
+        repos: List[str] = []
         page = 1
         while True:
-            resp = await self._client.get(
+            resp = await self.client.get(
                 f"/orgs/{self._org}/repos",
                 params={"per_page": 100, "page": page, "type": "all"},
             )
@@ -254,7 +263,7 @@ class GitHubScanner(BaseDiscoverer):
     async def _get_file_content(self, repo: str, path: str) -> Optional[str]:
         """Fetch file content from GitHub. Returns None if not found."""
         try:
-            resp = await self._client.get(
+            resp = await self.client.get(
                 f"/repos/{repo}/contents/{path}",
                 headers={"Accept": "application/vnd.github.v3.raw"},
             )

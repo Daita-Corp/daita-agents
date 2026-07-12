@@ -37,7 +37,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 from daita.runtime import (
     AccessMode,
@@ -52,11 +52,6 @@ from daita.runtime import (
 
 from .base import PluginContext, RuntimeExtensionPlugin
 from .manifest import PluginKind, PluginManifest
-
-if TYPE_CHECKING:
-    from ..core.tools import LocalTool
-    from .base_db import BaseDatabasePlugin
-    from .lineage import LineagePlugin
 
 logger = logging.getLogger(__name__)
 
@@ -899,7 +894,8 @@ class TransformerPlugin(RuntimeExtensionPlugin):
         filter_tag: Optional[str] = None,
     ) -> Dict[str, Any]:
         """List all known transformations with their metadata."""
-        if not self._definitions and not self._graph_backend:
+        graph_backend = self._graph_backend
+        if not self._definitions and graph_backend is None:
             return {"success": False, "error": "No graph backend available"}
 
         transformations = []
@@ -912,7 +908,9 @@ class TransformerPlugin(RuntimeExtensionPlugin):
                 transformations.append(_make_tx_entry(tx_name, props))
         else:
             # Cold-start: _definitions empty, fall back to graph
-            graph = await self._graph_backend.load_graph()
+            if graph_backend is None:
+                return {"success": False, "error": "No graph backend available"}
+            graph = await graph_backend.load_graph()
             from daita.core.graph.models import NodeType
 
             for node_id, node_data in graph.nodes(data=True):

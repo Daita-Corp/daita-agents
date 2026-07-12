@@ -28,11 +28,17 @@ from .redis_extensions import (
     redis_operation_definitions,
     redis_tool_views,
 )
+from ..core.exceptions import ValidationError
 
 if TYPE_CHECKING:
-    from ..core.tools import LocalTool
+    from redis.asyncio import Redis
 
 logger = logging.getLogger(__name__)
+
+
+def _redis_text(value: bytes | str) -> str:
+    """Normalize a decoded-or-binary Redis response at the SDK boundary."""
+    return value.decode() if isinstance(value, bytes) else value
 
 
 class RedisPlugin(BaseDatabasePlugin):
@@ -61,8 +67,19 @@ class RedisPlugin(BaseDatabasePlugin):
         self.key_prefix = key_prefix or os.getenv("REDIS_KEY_PREFIX", "")
 
         super().__init__(**kwargs)
+        self._client: Optional["Redis"] = None
         self._executor = RedisExecutor(self)
         logger.debug(f"RedisPlugin configured (url: {self.url}, db: {self.db})")
+
+    @property
+    def client(self) -> "Redis":
+        """Return the active Redis client owned by this plugin."""
+        if self._client is None:
+            raise ValidationError(
+                "RedisPlugin is not connected to data store",
+                field="connection_state",
+            )
+        return self._client
 
     async def setup(self, context: PluginContext) -> None:
         """Set up the Redis connector for a runtime."""
@@ -108,9 +125,10 @@ class RedisPlugin(BaseDatabasePlugin):
             return key[len(self.key_prefix) :]
         return key
 
-    async def _ensure_connected(self):
+    async def _ensure_connected(self) -> "Redis":
         if self._client is None:
             await self.connect()
+        return self.client
 
     async def connect(self) -> None:
         if self._client is not None:
@@ -118,11 +136,10 @@ class RedisPlugin(BaseDatabasePlugin):
 
         try:
             import redis.asyncio as aioredis
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
-                "redis package required for RedisPlugin. "
-                "Install with: pip install 'daita-agents[redis]'"
-            )
+                "redis is required. Install with: pip install 'daita-agents[redis]'"
+            ) from exc
 
         self._client = aioredis.Redis.from_url(
             self.url,
@@ -134,10 +151,11 @@ class RedisPlugin(BaseDatabasePlugin):
         logger.info(f"Connected to Redis at {self.url} (db={self.db})")
 
     async def disconnect(self) -> None:
-        if self._client is None:
+        client = self._client
+        if client is None:
             return
         try:
-            await self._client.close()
+            await client.close()
         except Exception as e:
             logger.warning(f"Error closing Redis connection: {e}")
         self._client = None
@@ -146,31 +164,32 @@ class RedisPlugin(BaseDatabasePlugin):
     # ── Key-value operations ──────────────────────────────────────────
 
     async def get(self, key: str) -> Optional[str]:
-        await self._ensure_connected()
-        return await self._client.get(self._pk(key))
+        client = await self._ensure_connected()
+        value = await client.get(self._pk(key))
+        return _redis_text(value) if value is not None else None
 
     async def set(self, key: str, value: str, ttl: Optional[int] = None) -> bool:
-        await self._ensure_connected()
-        return await self._client.set(self._pk(key), value, ex=ttl)
+        client = await self._ensure_connected()
+        return bool(await client.set(self._pk(key), value, ex=ttl))
 
     async def delete(self, *keys: str) -> int:
-        await self._ensure_connected()
+        client = await self._ensure_connected()
         if not keys:
             return 0
-        return await self._client.delete(*(self._pk(k) for k in keys))
+        return await client.delete(*(self._pk(k) for k in keys))
 
     async def exists(self, *keys: str) -> int:
-        await self._ensure_connected()
+        client = await self._ensure_connected()
         if not keys:
             return 0
-        return await self._client.exists(*(self._pk(k) for k in keys))
+        return await client.exists(*(self._pk(k) for k in keys))
 
     async def keys(self, pattern: str = "*", count: int = 1000) -> List[str]:
         """Scan keys matching pattern. Uses SCAN (non-blocking)."""
-        await self._ensure_connected()
+        client = await self._ensure_connected()
         result = []
-        async for key in self._client.scan_iter(match=self._pk(pattern), count=100):
-            result.append(self._upk(key))
+        async for key in client.scan_iter(match=self._pk(pattern), count=100):
+            result.append(self._upk(_redis_text(key)))
             if len(result) >= count:
                 break
         return result
@@ -178,52 +197,58 @@ class RedisPlugin(BaseDatabasePlugin):
     # ── TTL operations ────────────────────────────────────────────────
 
     async def ttl(self, key: str) -> int:
-        await self._ensure_connected()
-        return await self._client.ttl(self._pk(key))
+        client = await self._ensure_connected()
+        return await client.ttl(self._pk(key))
 
     async def expire(self, key: str, seconds: int) -> bool:
-        await self._ensure_connected()
-        return await self._client.expire(self._pk(key), seconds)
+        client = await self._ensure_connected()
+        return await client.expire(self._pk(key), seconds)
 
     # ── Hash operations ───────────────────────────────────────────────
 
     async def hset(self, key: str, mapping: Dict[str, str]) -> int:
-        await self._ensure_connected()
-        return await self._client.hset(self._pk(key), mapping=mapping)
+        client = await self._ensure_connected()
+        items = [item for pair in mapping.items() for item in pair]
+        return await client.hset(self._pk(key), items=items)
 
     async def hgetall(self, key: str) -> Dict[str, str]:
-        await self._ensure_connected()
-        return await self._client.hgetall(self._pk(key))
+        client = await self._ensure_connected()
+        fields = await client.hgetall(self._pk(key))
+        return {
+            _redis_text(field): _redis_text(value) for field, value in fields.items()
+        }
 
     # ── List operations ───────────────────────────────────────────────
 
     async def lpush(self, key: str, *values: str) -> int:
-        await self._ensure_connected()
-        return await self._client.lpush(self._pk(key), *values)
+        client = await self._ensure_connected()
+        return await client.lpush(self._pk(key), *values)
 
     async def rpush(self, key: str, *values: str) -> int:
-        await self._ensure_connected()
-        return await self._client.rpush(self._pk(key), *values)
+        client = await self._ensure_connected()
+        return await client.rpush(self._pk(key), *values)
 
     async def lrange(self, key: str, start: int = 0, stop: int = -1) -> List[str]:
-        await self._ensure_connected()
-        return await self._client.lrange(self._pk(key), start, stop)
+        client = await self._ensure_connected()
+        values = await client.lrange(self._pk(key), start, stop)
+        return [_redis_text(value) for value in values]
 
     # ── Set operations ────────────────────────────────────────────────
 
     async def sadd(self, key: str, *members: str) -> int:
-        await self._ensure_connected()
-        return await self._client.sadd(self._pk(key), *members)
+        client = await self._ensure_connected()
+        return await client.sadd(self._pk(key), *members)
 
     async def smembers(self, key: str) -> List[str]:
-        await self._ensure_connected()
-        return list(await self._client.smembers(self._pk(key)))
+        client = await self._ensure_connected()
+        members = await client.smembers(self._pk(key))
+        return [_redis_text(member) for member in members]
 
     # ── Info ──────────────────────────────────────────────────────────
 
     async def dbsize(self) -> int:
-        await self._ensure_connected()
-        return await self._client.dbsize()
+        client = await self._ensure_connected()
+        return await client.dbsize()
 
     # ── Tools ─────────────────────────────────────────────────────────
 

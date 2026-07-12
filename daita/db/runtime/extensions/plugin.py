@@ -34,10 +34,13 @@ from .monitor_lifecycle import (
     DbMonitorLocalDeliveryExecutor,
     DbMonitorPlanLifecycleExecutor,
 )
+from .monitor_read import (
+    DbMonitorReadExecutor,
+    DbMonitorResolveApprovalExecutor,
+)
 from .query import (
     DbPlanningContextExecutor,
     DbQueryPlanValidationExecutor,
-    DbQueryPrepareReadExecutor,
 )
 
 
@@ -55,10 +58,16 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
 
     def __init__(self, *, llm_capable: bool = False) -> None:
         self.llm_capable = llm_capable
-        self.runtime = None
+        self._runtime: Any | None = None
+
+    @property
+    def runtime(self) -> Any:
+        if self._runtime is None:
+            raise RuntimeError("DB runtime planning plugin is not set up")
+        return self._runtime
 
     async def setup(self, context: PluginContext) -> None:
-        self.runtime = context.services.require("db_runtime")
+        self._runtime = context.services.require("db_runtime")
 
     def declare_capabilities(self) -> tuple[Capability, ...]:
         common_schema = {"type": "object"}
@@ -79,26 +88,14 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 access=AccessMode.METADATA_READ,
                 risk=RiskLevel.LOW,
                 input_schema=common_schema,
-                output_evidence=frozenset({"planning.context"}),
-                executor="db_runtime.planning.context.build",
-                runtime_only=True,
-                side_effecting=False,
-                replay_safe=True,
-                idempotent=True,
-            ),
-            Capability(
-                id="db.query.prepare_read",
-                owner="db_runtime",
-                description="Prepare and compactly validate a deterministic DB read plan.",
-                domains=frozenset({"db"}),
-                operation_types=frozenset({"data.query", "query.plan"}),
-                access=AccessMode.METADATA_READ,
-                risk=RiskLevel.LOW,
-                input_schema=common_schema,
                 output_evidence=frozenset(
-                    {"query.plan.proposal", "query.plan.validation"}
+                    {
+                        "planning.context",
+                        "db.memory.selection",
+                        "db.memory.contracts",
+                    }
                 ),
-                executor="db_runtime.query.prepare_read",
+                executor="db_runtime.planning.context.build",
                 runtime_only=True,
                 side_effecting=False,
                 replay_safe=True,
@@ -312,6 +309,8 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                         "monitor.definition",
                         "monitor.deleted",
                         "monitor.disabled",
+                        "monitor.paused",
+                        "monitor.resumed",
                     }
                 ),
                 executor="db_runtime.monitor.commit_lifecycle",
@@ -319,6 +318,52 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 side_effecting=True,
                 replay_safe=True,
                 idempotent=True,
+            ),
+            Capability(
+                id="db.monitor.read",
+                owner="db_runtime",
+                description="Read DB monitor definitions, inspections, run summaries, or approvals.",
+                domains=frozenset({"db", "monitor"}),
+                operation_types=frozenset(
+                    {
+                        "monitor.list",
+                        "monitor.inspect",
+                        "monitor.explain_run",
+                        "monitor.approvals",
+                    }
+                ),
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.LOW,
+                input_schema=common_schema,
+                output_evidence=frozenset(
+                    {
+                        "monitor.listing",
+                        "monitor.inspection",
+                        "monitor.run_summary",
+                        "monitor.approval_state",
+                    }
+                ),
+                executor="db_runtime.monitor.read",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
+                id="db.monitor.resolve_approval",
+                owner="db_runtime",
+                description="Resolve a pending monitor approval through the runtime approval channel.",
+                domains=frozenset({"db", "monitor"}),
+                operation_types=frozenset({"monitor.approval"}),
+                access=AccessMode.WRITE,
+                risk=RiskLevel.MEDIUM,
+                input_schema=common_schema,
+                output_evidence=frozenset({"monitor.approval_resolution"}),
+                executor="db_runtime.monitor.resolve_approval",
+                runtime_only=True,
+                side_effecting=True,
+                replay_safe=False,
+                idempotent=False,
             ),
             Capability(
                 id="monitor.delivery.local",
@@ -484,7 +529,6 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
     def get_executors(self) -> tuple[Any, ...]:
         executors: list[Any] = [
             DbPlanningContextExecutor(self),
-            DbQueryPrepareReadExecutor(self),
             DbQueryPlanValidationExecutor(self),
             DbAnswerSynthesisExecutor(runtime=self),
             DbAnalysisPlanExecutor(self),
@@ -500,6 +544,8 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
             DbMemoryLearningRunExecutor(self),
             DbMonitorPlanLifecycleExecutor(self),
             DbMonitorCommitLifecycleExecutor(self),
+            DbMonitorReadExecutor(self),
+            DbMonitorResolveApprovalExecutor(self),
             DbMonitorLocalDeliveryExecutor(self),
         ]
         if self.llm_capable:
@@ -515,6 +561,48 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 json_schema=object_schema,
                 description="Evidence-backed context used by DB planners.",
+            ),
+            EvidenceSchema(
+                kind="db.memory.selection",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="DB memory selection refs, omissions, and budget facts.",
+            ),
+            EvidenceSchema(
+                kind="db.memory.contracts",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="DB memory semantic contracts and omission facts.",
+            ),
+            EvidenceSchema(
+                kind="session.query_scope",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Durable normalized scope from a successful session query.",
+            ),
+            EvidenceSchema(
+                kind="session.scope_binding",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Durable binding of a follow-up query to prior session scope.",
+            ),
+            EvidenceSchema(
+                kind="planner.decision",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Persisted DB agent planner decision.",
+            ),
+            EvidenceSchema(
+                kind="planner.observation",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Compact runtime observation returned to the DB planner.",
+            ),
+            EvidenceSchema(
+                kind="planner.compilation",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Runtime compilation of planner actions to governed tasks.",
             ),
             EvidenceSchema(
                 kind="query.plan.proposal",
@@ -593,6 +681,66 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 owner="db_runtime",
                 json_schema=object_schema,
                 description="Accepted DB monitor definition committed from a proposal.",
+            ),
+            EvidenceSchema(
+                kind="monitor.listing",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor listing produced by monitor read.",
+            ),
+            EvidenceSchema(
+                kind="monitor.inspection",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor inspection produced by monitor read.",
+            ),
+            EvidenceSchema(
+                kind="monitor.run_summary",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor run summary produced by monitor read.",
+            ),
+            EvidenceSchema(
+                kind="monitor.approval_state",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted monitor approval state produced by monitor read.",
+            ),
+            EvidenceSchema(
+                kind="monitor.approval_resolution",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Monitor approval resolution evidence.",
+            ),
+            EvidenceSchema(
+                kind="monitor.state_update",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor lifecycle update evidence.",
+            ),
+            EvidenceSchema(
+                kind="monitor.deleted",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor delete evidence.",
+            ),
+            EvidenceSchema(
+                kind="monitor.disabled",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor disable evidence.",
+            ),
+            EvidenceSchema(
+                kind="monitor.paused",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor pause evidence.",
+            ),
+            EvidenceSchema(
+                kind="monitor.resumed",
+                owner="db_runtime",
+                json_schema=object_schema,
+                description="Accepted DB monitor resume evidence.",
             ),
             EvidenceSchema(
                 kind="db.memory.proposal",

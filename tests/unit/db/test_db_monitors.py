@@ -1,20 +1,30 @@
 from collections.abc import Mapping
+from dataclasses import asdict
+import json
 
 from daita.db import (
     DbAgent,
     DbMonitor,
     DbRuntime,
     DbRuntimeConfig,
+)
+from daita.db.runtime.tasks.models import DbTaskSpec
+from daita.db.monitors import (
+    DbMonitorMutation,
+    DbMonitorState,
     SQLiteDbMonitorStore,
 )
 from daita.runtime import (
     ApprovalStatus,
+    Operation,
     OperationStatus,
     PolicyDecision,
     PolicyEffect,
     RiskLevel,
     SQLiteRuntimeStore,
     TaskStatus,
+    RuntimeEvent,
+    RuntimeEventType,
 )
 
 
@@ -45,6 +55,59 @@ class MonitorLifecycleApprovalPolicy:
             required_approvals=("human",),
             metadata={"operation_type": operation.operation_type},
         )
+
+
+class SpecSpyRuntime(DbRuntime):
+    def __init__(self) -> None:
+        super().__init__(runtime_id="db-monitor-spec-spy")
+        self.spec_batches: list[tuple[DbTaskSpec, ...]] = []
+
+    async def plan_task_specs(self, operation, specs, *, contract=None):
+        materialized = tuple(specs)
+        self.spec_batches.append(materialized)
+        return await super().plan_task_specs(
+            operation,
+            materialized,
+            contract=contract,
+        )
+
+
+async def test_runtime_monitor_mutation_persists_and_publishes_once():
+    runtime = DbRuntime(runtime_id="db-monitor-publication")
+    operation = Operation(
+        id="monitor-management-publication",
+        operation_type="monitor.create",
+        status=OperationStatus.SUCCEEDED,
+    )
+    monitor = DbMonitor(
+        id="publication-monitor",
+        name="Publication monitor",
+        observation_plan={"kind": "metric"},
+    )
+    event = RuntimeEvent(
+        type=RuntimeEventType.OPERATION_CREATED,
+        operation_id=operation.id,
+        runtime_id=runtime.runtime_id,
+        runtime_kind=runtime.runtime_kind,
+        message="Monitor operation created.",
+        payload={"operation_type": operation.operation_type},
+    )
+    subscription = runtime.kernel.event_broker.subscribe(operation.id)
+
+    await runtime.commit_monitor_mutation(
+        DbMonitorMutation(
+            action="create",
+            operation=operation,
+            events=(event,),
+            monitor_after=monitor,
+            state_after=DbMonitorState(monitor_id=monitor.id),
+        )
+    )
+
+    persisted = await runtime.store.list_events(operation.id)
+    delivered = [subscription.get_nowait() for _ in range(subscription.pending_count)]
+    assert persisted == [event]
+    assert delivered == persisted
 
 
 async def test_db_agent_typed_monitor_crud_records_runtime_operations():
@@ -98,6 +161,16 @@ async def test_db_agent_typed_monitor_crud_records_runtime_operations():
         assert "monitor id cannot be changed" in str(exc)
     else:
         raise AssertionError("monitor id update should fail")
+    rejected_result = runtime.operation_results[-1]
+    assert rejected_result.status is OperationStatus.BLOCKED
+    assert rejected_result.answer == (
+        "Monitor update proposal is incomplete or unsupported."
+    )
+    assert "monitor id cannot be changed" not in json.dumps(
+        asdict(rejected_result),
+        default=str,
+        sort_keys=True,
+    )
 
     paused = await agent.pause_monitor(
         "orders_backlog",
@@ -162,6 +235,52 @@ async def test_db_agent_typed_monitor_crud_records_runtime_operations():
         "monitor.proposal",
         "monitor.deleted",
     ]
+
+
+async def test_monitor_lifecycle_tasks_materialize_from_task_specs():
+    runtime = SpecSpyRuntime()
+    agent = DbAgent(runtime=runtime, name="monitor-spec-test")
+    monitor = await agent.monitor(
+        name="Spec Monitor",
+        schedule="*/10 * * * *",
+        watch="orders",
+        observation_plan={
+            "kind": "metric_sql",
+            "sql": "select 1 as value",
+            "value_path": "rows.0.value",
+        },
+        trigger="value > 0",
+        then="notify",
+    )
+
+    await agent.update_monitor(monitor.id, {"description": "updated"})
+    lifecycle_specs = [spec for batch in runtime.spec_batches for spec in batch]
+    tasks = await runtime.store.list_tasks()
+    plan_task = next(
+        task for task in tasks if task.capability_id == "db.monitor.plan_lifecycle"
+    )
+    commit_task = next(
+        task for task in tasks if task.capability_id == "db.monitor.commit_lifecycle"
+    )
+
+    assert [spec.capability_id for spec in lifecycle_specs] == [
+        "db.monitor.plan_lifecycle",
+        "db.monitor.commit_lifecycle",
+    ]
+    assert all(isinstance(spec, DbTaskSpec) for spec in lifecycle_specs)
+    assert plan_task.metadata["reason"] == "monitor_update_planning"
+    assert commit_task.metadata["reason"] == "monitor_update_commit"
+    assert (
+        commit_task.metadata["idempotency_key"]
+        == commit_task.input["proposal_fingerprint"]
+    )
+    dependency = next(
+        dependency
+        for dependency in commit_task.dependencies
+        if dependency.kind.value == "evidence"
+    )
+    assert dependency.evidence_kind == "monitor.proposal"
+    assert dependency.producer_task_id == plan_task.id
 
 
 async def test_sqlite_db_monitor_store_shares_runtime_store_database(tmp_path):

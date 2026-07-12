@@ -11,6 +11,7 @@ curator-generated human-readable summary, never written by the agent directly.
 
 import json
 import sqlite3
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import aiofiles
@@ -21,6 +22,7 @@ from .utils import build_where_clause, parse_metadata_json
 
 if TYPE_CHECKING:
     from ...embeddings.base import BaseEmbeddingProvider
+    from .search import SQLiteVectorSearch
 
 
 def _find_project_root(start_path: Optional[Path] = None) -> Optional[Path]:
@@ -196,12 +198,13 @@ class LocalMemoryBackend:
             conn.commit()
         conn.close()
 
-    def _require_vector_search(self) -> None:
+    def _require_vector_search(self) -> "SQLiteVectorSearch":
         if self.search is None:
             raise RuntimeError(
                 "Generic memory recall requires an embedding provider. "
                 "Structured DB semantic memory is available for category='db_semantics'."
             )
+        return self.search
 
     async def remember(
         self,
@@ -226,7 +229,7 @@ class LocalMemoryBackend:
         await self.storage.append_to_daily_log(content, category)
 
         # Store directly in vector DB for immediate recall
-        self._require_vector_search()
+        search = self._require_vector_search()
         if metadata is None:
             metadata = MemoryMetadata(
                 content=content,
@@ -235,7 +238,7 @@ class LocalMemoryBackend:
                 category=category,
             )
 
-        chunk_id = await self.search.store_chunk(
+        chunk_id = await search.store_chunk(
             content,
             metadata,
             extra_metadata=extra_metadata,
@@ -256,6 +259,7 @@ class LocalMemoryBackend:
         Find memories matching query, delete them, and store updated content.
         Use when a fact has changed, been resolved, or needs correction.
         """
+        search = self._require_vector_search()
         matches = await self.recall(query, limit=5, score_threshold=0.7)
         if not matches:
             return {
@@ -287,7 +291,7 @@ class LocalMemoryBackend:
         metadata = MemoryMetadata(
             content=new_content, importance=importance, source="agent_inferred"
         )
-        await self.search.store_chunk(new_content, metadata)
+        await search.store_chunk(new_content, metadata)
 
         return {
             "status": "success",
@@ -371,8 +375,8 @@ class LocalMemoryBackend:
         since: Optional[str] = None,
         before: Optional[str] = None,
     ) -> List[Dict]:
-        self._require_vector_search()
-        results = await self.search.search(
+        search = self._require_vector_search()
+        results = await search.search(
             query, limit, score_threshold, category=category, since=since, before=before
         )
         return [
@@ -406,7 +410,7 @@ class LocalMemoryBackend:
         from .text_utils import extract_keywords
 
         keywords = extract_keywords(query)
-        self._require_vector_search()
+        search = self._require_vector_search()
 
         conn = sqlite3.connect(str(self.vector_db))
         cursor = conn.cursor()
@@ -439,9 +443,7 @@ class LocalMemoryBackend:
             metadata_dict = parse_metadata_json(metadata_json)
 
             keyword_score = normalized_scores[i]
-            adjusted = self.search._apply_score_adjustments(
-                keyword_score, metadata_dict
-            )
+            adjusted = search._apply_score_adjustments(keyword_score, metadata_dict)
 
             if adjusted >= score_threshold:
                 results.append(
@@ -473,7 +475,7 @@ class LocalMemoryBackend:
         from .query_router import QueryRouter
         import numpy as np
 
-        self._require_vector_search()
+        search = self._require_vector_search()
         route = QueryRouter.classify(query)
         # Use the caller's threshold if stricter, otherwise let the route loosen it
         effective_threshold = min(score_threshold, route.score_threshold)
@@ -504,7 +506,7 @@ class LocalMemoryBackend:
         documents = [c[2] for c in chunks]
         bm25 = BM25Scorer(documents)
         bm25_scores = bm25.score_all_normalized(keywords)
-        query_embedding = await self.search.embed_text(query)
+        query_embedding = await search.embed_text(query)
         query_vec = np.array(query_embedding)
 
         # Batch vectorized cosine similarity
@@ -560,7 +562,7 @@ class LocalMemoryBackend:
             raw_score = min(
                 base_score + phrase_bonus + consensus_bonus + temporal_bonus, 1.0
             )
-            adjusted = self.search._apply_score_adjustments(raw_score, metadata_dict)
+            adjusted = search._apply_score_adjustments(raw_score, metadata_dict)
 
             if adjusted >= effective_threshold:
                 results.append(
@@ -629,7 +631,7 @@ class LocalMemoryBackend:
     async def remember_batch(
         self,
         items: List[Dict[str, Any]],
-        extra_metadata_list: Optional[List[Optional[Dict[str, Any]]]] = None,
+        extra_metadata_list: Optional[Sequence[Optional[Mapping[str, object]]]] = None,
     ) -> Dict[str, Any]:
         """Store multiple memories in a single batch with one embedding API call.
 
@@ -643,7 +645,7 @@ class LocalMemoryBackend:
         """
         if not items:
             return {"status": "success", "stored": 0, "skipped": 0, "items": []}
-        self._require_vector_search()
+        search = self._require_vector_search()
 
         prepared = []
         for i, item in enumerate(items):
@@ -656,11 +658,12 @@ class LocalMemoryBackend:
                 source="agent_inferred",
                 category=category,
             )
-            extra = (
+            raw_extra = (
                 extra_metadata_list[i]
                 if extra_metadata_list and i < len(extra_metadata_list)
                 else None
             )
+            extra = dict(raw_extra) if raw_extra is not None else None
             prepared.append(
                 {
                     "content": content,
@@ -676,7 +679,7 @@ class LocalMemoryBackend:
             )
 
         # Batch store in vector DB
-        results = await self.search.store_chunks_batch(prepared)
+        results = await search.store_chunks_batch(prepared)
 
         stored = sum(1 for r in results if r["status"] == "stored")
         skipped = sum(1 for r in results if r["status"] == "skipped")
@@ -701,7 +704,7 @@ class LocalMemoryBackend:
         stored in chunk metadata.
         """
         where_clauses = []
-        params = []
+        params: list[str | int] = []
         self._require_vector_search()
         if entity is not None:
             where_clauses.append(
@@ -850,7 +853,7 @@ class LocalMemoryBackend:
             for chunk_id, content, metadata_json in rows
         ]
 
-    async def regenerate_memory_md(self, min_importance: float = 0.4) -> str:
+    async def regenerate_memory_md(self, min_importance: float = 0.4) -> str | None:
         """
         Regenerate MEMORY.md from the vector DB.
 

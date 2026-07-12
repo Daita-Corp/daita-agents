@@ -5,15 +5,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from daita.runtime import Evidence, Operation, Task
+from daita.runtime import Evidence, Operation, Task, TaskDependency, TaskStatus
 
-from ...analysis import stable_fingerprint, structural_schema_fingerprint
+from ...analysis import structural_schema_fingerprint
+from ...evidence import load_evidence
+from ...fingerprints import persisted_fingerprint
 from ...memory import (
     db_memory_options_from_runtime_metadata,
     db_memory_record_chunk_ids_by_key,
 )
 from ...memory_commands import DbMemoryCommandService
 from ...models import DbRequest
+from ..tasks.models import DbTaskSpec
+
+_COMPLETED_TASK_STATUSES = {
+    TaskStatus.SUCCEEDED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+    TaskStatus.SKIPPED,
+}
 
 
 @dataclass(frozen=True)
@@ -64,7 +74,7 @@ class DbMemoryPlanUpdateExecutor:
                 }
             )
             proposal["validation"] = validation_payload
-            proposal["proposal_fingerprint"] = stable_fingerprint(
+            proposal["proposal_fingerprint"] = persisted_fingerprint(
                 {
                     key: value
                     for key, value in proposal.items()
@@ -110,7 +120,7 @@ class DbMemoryCommitUpdateExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        proposal_evidence = await _load_evidence(
+        proposal_evidence = await load_evidence(
             runtime,
             operation.id,
             task.input.get("proposal_evidence_id"),
@@ -124,8 +134,8 @@ class DbMemoryCommitUpdateExecutor:
         expected_fingerprint = task.input.get("proposal_fingerprint")
         actual_fingerprint = str(proposal.get("proposal_fingerprint") or "")
         if not actual_fingerprint:
-            actual_fingerprint = stable_fingerprint(proposal)
-        recomputed_fingerprint = stable_fingerprint(
+            actual_fingerprint = persisted_fingerprint(proposal)
+        recomputed_fingerprint = persisted_fingerprint(
             {
                 key: value
                 for key, value in proposal.items()
@@ -155,29 +165,59 @@ class DbMemoryCommitUpdateExecutor:
             "memory.semantic.write",
             owner="memory",
         )
-        write_task = await runtime.kernel.plan_task(
-            operation_id=operation.id,
-            capability_id=memory_capability.id,
-            owner=memory_capability.owner,
-            input={
-                "db_memory_payload": record,
-                "db_memory_prompt": str(record.get("text") or ""),
-            },
-            metadata={
-                "owner": memory_capability.owner,
-                "reason": "db_memory_commit_update",
-                "proposal_evidence_id": proposal_evidence.id,
-                "proposal_fingerprint": actual_fingerprint,
-                "source_identity": proposal_source_identity,
-            },
-        )
-        write_evidence = await runtime.execute_task(
-            write_task,
+        write_plan = await runtime.plan_task_specs(
             operation,
-            context={"capability_owner": memory_capability.owner},
+            (
+                DbTaskSpec(
+                    capability_id=memory_capability.id,
+                    owner=memory_capability.owner,
+                    input={
+                        "db_memory_payload": record,
+                        "db_memory_prompt": str(record.get("text") or ""),
+                    },
+                    reason="db_memory_commit_update",
+                    sequence=1,
+                    dependencies=(
+                        TaskDependency(
+                            kind="evidence",
+                            evidence_kind="db.memory.proposal",
+                            evidence_id=proposal_evidence.id,
+                            evidence_owner="db_runtime",
+                            producer_task_id=proposal_evidence.task_id,
+                            evidence_payload={
+                                "proposal_fingerprint": actual_fingerprint,
+                            },
+                            evidence_accepted=True,
+                            operation_id=operation.id,
+                        ),
+                    ),
+                    metadata={
+                        "proposal_evidence_id": proposal_evidence.id,
+                        "proposal_fingerprint": actual_fingerprint,
+                        "source_identity": proposal_source_identity,
+                    },
+                    deterministic_key=actual_fingerprint,
+                ),
+            ),
         )
+        write_task = write_plan.tasks[0]
+        write_evidence_reused = write_task.status in _COMPLETED_TASK_STATUSES
+        if write_evidence_reused:
+            write_evidence = await _task_evidence(
+                runtime,
+                operation.id,
+                write_task.id,
+                evidence_kind="memory.semantic.write",
+            )
+        else:
+            write_evidence = await runtime.execute_task(
+                write_task,
+                operation,
+                context={"capability_owner": memory_capability.owner},
+            )
         write_success = bool(write_evidence) and all(
-            item.payload.get("success") is not False for item in write_evidence
+            item.accepted and item.payload.get("success") is not False
+            for item in write_evidence
         )
         definition_payload = {
             "action": proposal.get("action"),
@@ -196,12 +236,14 @@ class DbMemoryCommitUpdateExecutor:
             accepted=write_success,
             payload=definition_payload,
             metadata={
-                "payload_fingerprint": stable_fingerprint(definition_payload),
+                "payload_fingerprint": persisted_fingerprint(definition_payload),
                 "proposal_evidence_id": proposal_evidence.id,
                 "proposal_fingerprint": actual_fingerprint,
                 "source_identity": proposal_source_identity,
             },
         )
+        if write_evidence_reused:
+            return [definition]
         return [definition, *write_evidence]
 
 
@@ -219,17 +261,18 @@ def _request_from_task(runtime: Any, operation: Operation, task: Task) -> DbRequ
     return runtime._db_request_from_operation(operation)
 
 
-async def _load_evidence(
+async def _task_evidence(
     runtime: Any,
     operation_id: str,
-    evidence_id: Any,
-) -> Evidence | None:
-    if not evidence_id:
-        return None
-    for evidence in await runtime.store.list_evidence(operation_id):
-        if evidence.id == evidence_id:
-            return evidence
-    return None
+    task_id: str,
+    *,
+    evidence_kind: str,
+) -> tuple[Evidence, ...]:
+    return tuple(
+        evidence
+        for evidence in await runtime.store.list_evidence(operation_id)
+        if evidence.task_id == task_id and evidence.kind == evidence_kind
+    )
 
 
 def _first_capability(runtime: Any, capability_id: str, *, owner: str | None = None):
@@ -272,7 +315,7 @@ async def _annotate_duplicate_behavior(runtime: Any, proposal: dict[str, Any]) -
         proposal["existing_chunk_ids"] = list(existing_chunk_ids)
         proposal["commit_behavior"] = "update" if existing_chunk_ids else "create"
         accepted = True
-    proposal["proposal_fingerprint"] = stable_fingerprint(
+    proposal["proposal_fingerprint"] = persisted_fingerprint(
         {key: value for key, value in proposal.items() if key != "proposal_fingerprint"}
     )
     return accepted

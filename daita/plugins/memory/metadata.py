@@ -90,7 +90,10 @@ class MemoryMetadata:
             return False
 
         # Calculate age
-        age_days = (datetime.now() - self.created_at).days
+        created_at = self.created_at
+        if created_at is None:
+            raise RuntimeError("MemoryMetadata.created_at was not initialized")
+        age_days = (datetime.now() - created_at).days
 
         # TTL expiry — hard cutoff regardless of importance or access
         if self.ttl_days is not None and age_days > self.ttl_days:

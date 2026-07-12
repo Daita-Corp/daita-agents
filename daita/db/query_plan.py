@@ -366,12 +366,18 @@ class DbQueryPlanValidation:
     sql_fingerprint: str | None = None
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    validation_facts: tuple[dict[str, Any], ...] = ()
     plan_fingerprint: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "errors", _tuple_strings(self.errors))
         object.__setattr__(self, "warnings", _tuple_strings(self.warnings))
+        object.__setattr__(
+            self,
+            "validation_facts",
+            tuple(_json_dict(item) for item in self.validation_facts),
+        )
         object.__setattr__(self, "metadata", _json_dict(self.metadata))
 
     def to_dict(self) -> dict[str, Any]:
@@ -382,6 +388,7 @@ class DbQueryPlanValidation:
             "sql_fingerprint": self.sql_fingerprint,
             "errors": list(self.errors),
             "warnings": list(self.warnings),
+            "validation_facts": [dict(item) for item in self.validation_facts],
             "plan_fingerprint": self.plan_fingerprint,
             "metadata": self.metadata,
         }

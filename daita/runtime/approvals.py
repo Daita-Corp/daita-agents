@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 
 from .primitives import (
@@ -16,8 +17,23 @@ from .primitives import (
 class InMemoryApprovalChannel:
     """Small approval channel backed by the active runtime store."""
 
-    def __init__(self, store: RuntimeStore) -> None:
+    def __init__(
+        self,
+        store: RuntimeStore,
+        *,
+        event_committer: (
+            Callable[[ApprovalRequest, RuntimeEvent], Awaitable[None]] | None
+        ) = None,
+    ) -> None:
         self.store = store
+        self._event_committer = event_committer
+
+    def bind_event_committer(
+        self,
+        committer: Callable[[ApprovalRequest, RuntimeEvent], Awaitable[None]],
+    ) -> None:
+        """Bind approval event persistence to the active runtime kernel."""
+        self._event_committer = committer
 
     async def request(self, approval: ApprovalRequest) -> ApprovalRequest:
         """Persist a pending approval request.
@@ -69,7 +85,7 @@ class InMemoryApprovalChannel:
                     return request
                 if request.status is not ApprovalStatus.PENDING:
                     raise ValueError(
-                        f"approval {approval_id} is already {request.status.value}; "
+                        f"approval {approval_id} is already {request.status_value}; "
                         "create a new approval request to renew it"
                     )
                 updated = replace(request, status=status)
@@ -85,15 +101,13 @@ class InMemoryApprovalChannel:
                     approval_id=request.approval_id,
                     trace_id=trace_id,
                     span_id=span_id,
-                    message=(f"Approval {approval_id} marked {status.value}."),
+                    message=(f"Approval {approval_id} marked {updated.status_value}."),
                     payload={"approval": updated.to_dict()},
                 )
-                commit = getattr(self.store, "commit_approval_update", None)
-                if commit is not None:
-                    await commit(updated, event)
+                if self._event_committer is not None:
+                    await self._event_committer(updated, event)
                 else:
-                    await self.store.save_approval_request(updated)
-                    await self.store.append_event(event)
+                    await self.store.commit_approval_update(updated, event)
                 return updated
         raise KeyError(approval_id)
 

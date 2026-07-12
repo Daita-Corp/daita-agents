@@ -11,6 +11,16 @@ from daita.runtime import Evidence, Task
 
 from .models import DbIntent, DbIntentKind, DbOperationContract
 
+DB_FINALIZATION_CONTROL_EVIDENCE_KINDS = frozenset(
+    {
+        "planner.decision",
+        "planner.compilation",
+        "planner.observation",
+        "verification.result",
+        "answer.synthesis",
+    }
+)
+
 
 @dataclass(frozen=True)
 class DbVerificationResult:
@@ -29,6 +39,28 @@ class DbVerificationResult:
             "warnings": list(self.warnings),
             "diagnostics": self.diagnostics,
             "evidence_refs": list(self.evidence_refs),
+        }
+
+
+@dataclass(frozen=True)
+class DbFinalizationCheck:
+    """Final DB run readiness using shared verification and support evidence."""
+
+    finalizable: bool
+    verification: DbVerificationResult
+    query_result_required: bool
+    query_result_present: bool
+    supporting_evidence: tuple[Evidence, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "finalizable": self.finalizable,
+            "verification": self.verification.to_dict(),
+            "query_result_required": self.query_result_required,
+            "query_result_present": self.query_result_present,
+            "synthesis_supporting_evidence": tuple(
+                _evidence_refs(self.supporting_evidence)
+            ),
         }
 
 
@@ -61,6 +93,10 @@ class DbVerifier:
             DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
         }:
             warnings.extend(_verify_data_query(evidence, tasks, diagnostics))
+        elif intent.kind is DbIntentKind.WRITE_EXECUTE:
+            warnings.extend(_verify_write_execute(evidence, tasks))
+        elif intent.kind is DbIntentKind.WRITE_PROPOSE:
+            warnings.extend(_verify_write_proposal(evidence))
         elif intent.kind in {
             DbIntentKind.SCHEMA_QUERY,
             DbIntentKind.SCHEMA_RELATIONSHIP_QUERY,
@@ -79,6 +115,64 @@ class DbVerifier:
             diagnostics=diagnostics,
             evidence_refs=_evidence_refs(evidence),
         )
+
+
+def db_accepted_synthesis_support_evidence(
+    evidence: tuple[Evidence, ...],
+) -> tuple[Evidence, ...]:
+    """Return accepted evidence that can support final answer synthesis."""
+    return tuple(
+        item
+        for item in evidence
+        if item.accepted and item.kind not in DB_FINALIZATION_CONTROL_EVIDENCE_KINDS
+    )
+
+
+def db_operation_requires_query_result(operation: Any, intent: DbIntent) -> bool:
+    """Return whether a DB operation needs data evidence before finalization."""
+    mode = str(getattr(operation, "request", {}).get("mode") or "").lower()
+    operation_type = str(getattr(operation, "operation_type", "") or "").lower()
+    return (
+        intent.kind
+        in {
+            DbIntentKind.DATA_QUERY,
+            DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
+            DbIntentKind.METRIC_QUERY,
+        }
+        or mode in {"data", "data.query", "query", "read"}
+        or operation_type
+        in {"data.query", "data.query.catalog_assisted", "metric.query"}
+    )
+
+
+def db_run_finalization_check(
+    *,
+    operation: Any,
+    verifier: DbVerifier,
+    contract: DbOperationContract,
+    intent: DbIntent,
+    evidence: tuple[Evidence, ...],
+    tasks: tuple[Task, ...],
+) -> DbFinalizationCheck:
+    """Check whether accepted evidence is sufficient to finalize a DB run."""
+    verification = verifier.verify(contract, intent, evidence, tasks)
+    supporting_evidence = db_accepted_synthesis_support_evidence(evidence)
+    query_result_required = db_operation_requires_query_result(operation, intent)
+    query_result_present = any(
+        item.accepted and item.kind == "query.result" for item in evidence
+    )
+    finalizable = (
+        verification.passed
+        and bool(supporting_evidence)
+        and (not query_result_required or query_result_present)
+    )
+    return DbFinalizationCheck(
+        finalizable=finalizable,
+        verification=verification,
+        query_result_required=query_result_required,
+        query_result_present=query_result_present,
+        supporting_evidence=supporting_evidence,
+    )
 
 
 def _verify_data_query(
@@ -115,7 +209,7 @@ def _verify_data_query(
             warnings.append("query_result_sql_missing")
 
     if validation is not None and query_result is not None:
-        if not _validation_precedes_query_result(validation, query_result, tasks):
+        if not _validation_precedes_evidence(validation, query_result, tasks):
             warnings.append("sql_validation_did_not_precede_query_result")
 
     return tuple(warnings)
@@ -132,6 +226,22 @@ def _verify_memory_update(evidence: tuple[Evidence, ...]) -> tuple[str, ...]:
             else []
         )
         return tuple(["memory_proposal_not_accepted", *[str(item) for item in reasons]])
+    if proposal is not None and proposal.accepted:
+        definition = next(
+            (item for item in evidence if item.kind == "db.memory.definition"),
+            None,
+        )
+        memory_write = next(
+            (item for item in evidence if item.kind == "memory.semantic.write"),
+            None,
+        )
+        if (
+            definition is None
+            or not definition.accepted
+            or memory_write is None
+            or not memory_write.accepted
+        ):
+            return ("memory_update_not_committed",)
     memory_write = next(
         (item for item in evidence if item.kind == "memory.semantic.write"), None
     )
@@ -142,15 +252,51 @@ def _verify_memory_update(evidence: tuple[Evidence, ...]) -> tuple[str, ...]:
     return ()
 
 
-def _validation_precedes_query_result(
-    validation: Evidence, query_result: Evidence, tasks: tuple[Task, ...]
+def _verify_write_proposal(evidence: tuple[Evidence, ...]) -> tuple[str, ...]:
+    validation = next(
+        (item for item in evidence if item.kind == "sql.validation" and item.accepted),
+        None,
+    )
+    if validation is None:
+        return ("sql_validation_missing_for_write_proposal",)
+    if validation.payload.get("valid") is not True:
+        return ("sql_validation_not_valid",)
+    return ()
+
+
+def _verify_write_execute(
+    evidence: tuple[Evidence, ...],
+    tasks: tuple[Task, ...],
+) -> tuple[str, ...]:
+    warnings = list(_verify_write_proposal(evidence))
+    validation = next(
+        (item for item in evidence if item.kind == "sql.validation" and item.accepted),
+        None,
+    )
+    write_execution = next(
+        (item for item in evidence if item.kind == "write.execution" and item.accepted),
+        None,
+    )
+    if write_execution is None:
+        warnings.append("write_execution_missing")
+    elif validation is not None and not _validation_precedes_evidence(
+        validation,
+        write_execution,
+        tasks,
+    ):
+        warnings.append("sql_validation_did_not_precede_write_execution")
+    return tuple(warnings)
+
+
+def _validation_precedes_evidence(
+    validation: Evidence, evidence: Evidence, tasks: tuple[Task, ...]
 ) -> bool:
     order = {task.id: index for index, task in enumerate(tasks)}
     validation_index = order.get(str(validation.task_id))
-    query_index = order.get(str(query_result.task_id))
-    if validation_index is None or query_index is None:
+    evidence_index = order.get(str(evidence.task_id))
+    if validation_index is None or evidence_index is None:
         return False
-    return validation_index < query_index
+    return validation_index < evidence_index
 
 
 def _evidence_refs(evidence: tuple[Evidence, ...]) -> tuple[dict[str, str | None], ...]:

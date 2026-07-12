@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-import re
 from typing import Any, Mapping
 from uuid import uuid4
 
 from daita.runtime import Evidence
+
+from .fingerprints import persisted_fingerprint
+from .json_normalization import strip_json_fence
 
 CAPABILITY_ANALYSIS_STEP_CONTRACTS = {
     "catalog_search": {
@@ -43,6 +45,7 @@ CAPABILITY_ANALYSIS_STEP_CONTRACTS = {
 ANALYSIS_STEP_KINDS = frozenset(
     {"query", "checkpoint", "synthesis", *CAPABILITY_ANALYSIS_STEP_CONTRACTS}
 )
+_RegisteredCapabilities = set[str] | Mapping[str | tuple[str | None, str], Any] | None
 
 
 @dataclass(frozen=True)
@@ -136,6 +139,7 @@ class DbAnalysisStep:
         purpose = str(data.get("purpose") or "").strip()
         if not purpose:
             raise ValueError(f"analysis_step_purpose_required:{step_id}")
+        raw_input = data.get("input")
         return cls(
             id=step_id,
             kind=kind,
@@ -157,11 +161,7 @@ class DbAnalysisStep:
                 if data.get("capability_owner")
                 else None
             ),
-            input=(
-                dict(data.get("input"))
-                if isinstance(data.get("input"), Mapping)
-                else {}
-            ),
+            input=dict(raw_input) if isinstance(raw_input, Mapping) else {},
             context_evidence_refs=tuple(
                 dict(item)
                 for item in data.get("context_evidence_refs") or ()
@@ -251,7 +251,7 @@ class DbAnalysisPlanValidation:
 
 def parse_analysis_plan_json(content: str) -> DbAnalysisPlan:
     """Parse strict JSON analysis plan output."""
-    raw = _strip_json_fence(content)
+    raw = strip_json_fence(content)
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise ValueError("analysis_plan_json_not_object")
@@ -262,7 +262,7 @@ def validate_analysis_plan_payload(
     payload: Mapping[str, Any],
     *,
     plan_evidence: Evidence | None = None,
-    registered_capabilities: set[str] | Mapping[str, Any] | None = None,
+    registered_capabilities: _RegisteredCapabilities = None,
 ) -> DbAnalysisPlanValidation:
     """Validate DAG shape, step kinds, dependency refs, and budgets."""
     errors: list[str] = []
@@ -332,7 +332,7 @@ def validate_analysis_plan_payload(
         errors=tuple(dict.fromkeys(errors)),
         warnings=tuple(warnings),
         accepted_step_ids=tuple(ids) if not errors else (),
-        plan_fingerprint=stable_fingerprint(plan.to_dict()),
+        plan_fingerprint=persisted_fingerprint(plan.to_dict()),
         diagnostics={
             "step_count": len(plan.steps),
             "query_step_count": query_count,
@@ -350,7 +350,7 @@ def capability_contract_for_step_kind(kind: str) -> Mapping[str, Any] | None:
 def _validate_capability_step(
     step: DbAnalysisStep,
     *,
-    registered_capabilities: set[str] | Mapping[str, Any] | None,
+    registered_capabilities: _RegisteredCapabilities,
     errors: list[str],
 ) -> None:
     contract = CAPABILITY_ANALYSIS_STEP_CONTRACTS[step.kind]
@@ -389,7 +389,7 @@ def _validate_capability_step(
 
 
 def _registered_capability_ids(
-    registered_capabilities: set[str] | Mapping[str, Any] | None,
+    registered_capabilities: _RegisteredCapabilities,
 ) -> set[str] | None:
     if registered_capabilities is None:
         return None
@@ -402,18 +402,11 @@ def _registered_capability_ids(
     return ids
 
 
-def stable_fingerprint(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    import hashlib
-
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def structural_schema_fingerprint(schema: Mapping[str, Any] | None) -> str | None:
     """Fingerprint catalog-owned schema structure without incidental metadata."""
     if not schema:
         return None
-    return stable_fingerprint(_structural_schema_payload(schema))
+    return persisted_fingerprint(_structural_schema_payload(schema))
 
 
 def _structural_schema_payload(schema: Mapping[str, Any]) -> dict[str, Any]:
@@ -424,7 +417,7 @@ def _structural_schema_payload(schema: Mapping[str, Any]) -> dict[str, Any]:
         table_name = str(table.get("name") or "").strip()
         if not table_name:
             continue
-        columns = []
+        columns: list[dict[str, Any]] = []
         for column in table.get("columns", []) or []:
             if not isinstance(column, Mapping):
                 continue
@@ -438,10 +431,11 @@ def _structural_schema_payload(schema: Mapping[str, Any]) -> dict[str, Any]:
                     "is_primary_key": bool(column.get("is_primary_key")),
                 }
             )
+        columns.sort(key=lambda column: str(column.get("name") or ""))
         tables.append(
             {
                 "name": table_name,
-                "columns": sorted(columns, key=lambda item: item["name"]),
+                "columns": columns,
             }
         )
 
@@ -522,7 +516,7 @@ def evidence_ref(evidence: Evidence) -> dict[str, Any]:
         "task_id": evidence.task_id,
         "operation_id": evidence.operation_id,
         "payload_fingerprint": evidence.metadata.get("payload_fingerprint")
-        or stable_fingerprint(evidence.payload),
+        or persisted_fingerprint(evidence.payload),
         "analysis_step_id": evidence.metadata.get("analysis_step_id"),
         "analysis_step_kind": evidence.metadata.get("analysis_step_kind"),
     }
@@ -552,12 +546,6 @@ def _cycle_errors(steps: tuple[DbAnalysisStep, ...]) -> list[str]:
     for step in steps:
         visit(step.id, ())
     return errors
-
-
-def _strip_json_fence(content: str) -> str:
-    stripped = content.strip()
-    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, flags=re.DOTALL)
-    return match.group(1).strip() if match else stripped
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:

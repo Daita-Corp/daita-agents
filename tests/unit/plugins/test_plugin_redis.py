@@ -1,5 +1,10 @@
 """Unit tests for RedisPlugin extension declarations."""
 
+import builtins
+
+import pytest
+
+from daita.core.exceptions import ValidationError
 from daita.plugins import ExtensionRegistry
 from daita.plugins.redis import RedisPlugin
 from daita.runtime import AccessMode, Operation, RiskLevel, Task
@@ -15,11 +20,11 @@ class MockRedisPlugin(RedisPlugin):
 
     async def connect(self):
         self.connected = True
-        self._client = object()
+        self._connection = object()
 
     async def disconnect(self):
         self.connected = False
-        self._client = None
+        self._connection = None
 
     async def get(self, key):
         return self.values.get(key)
@@ -85,6 +90,52 @@ def _operation_and_task(capability, input_payload):
         required_evidence=capability.output_evidence,
     )
     return operation, task
+
+
+def test_redis_client_access_requires_connection():
+    plugin = RedisPlugin(url="redis://localhost:6379/9")
+
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.client
+
+
+async def test_redis_client_access_tracks_connection_lifecycle(module_stub):
+    class FakeClient:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    client = FakeClient()
+    redis_class = type(
+        "Redis", (), {"from_url": staticmethod(lambda *args, **kwargs: client)}
+    )
+    module_stub("redis.asyncio", Redis=redis_class)
+    plugin = RedisPlugin(url="redis://localhost:6379/9")
+
+    await plugin.connect()
+    assert plugin.client is client
+
+    await plugin.disconnect()
+    assert client.closed is True
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.client
+
+
+async def test_redis_missing_sdk_raises_import_error_with_extra_hint(monkeypatch):
+    real_import = builtins.__import__
+
+    def mock_import(name, *args, **kwargs):
+        if name == "redis.asyncio":
+            raise ImportError("redis not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+    plugin = RedisPlugin(url="redis://localhost:6379/9")
+
+    with pytest.raises(ImportError, match="pip install 'daita-agents\\[redis\\]'"):
+        await plugin.connect()
 
 
 def test_redis_plugin_declares_extension_first_contract():

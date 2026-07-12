@@ -5,9 +5,10 @@ Public factory for `Agent.from_db()` on the new DB runtime path.
 from __future__ import annotations
 
 from contextlib import suppress
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import replace
+from pathlib import Path
 import re
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlparse
 
 from daita.agents.conversation import ConversationHistory
@@ -21,51 +22,67 @@ from daita.runtime import RuntimeStore, SQLiteRuntimeStore, current_host_runtime
 
 from .agent import DbAgent
 from .memory import calibrate_db_memory
-from .llm_service import db_llm_service_from_config
-from .models import DbLimits, DbMemoryConfig, DbRuntimeConfig, DbRuntimeOptions
+from .llm_service import DbLLMConfig, db_llm_service_from_config
+from .models import (
+    DbLimits,
+    DbMemoryConfig,
+    DbRuntimeConfig,
+    DbRuntimeOptions,
+    DbSourceOptions,
+)
 from .runtime import DbRuntime
 
-_DbMemoryOption = DbMemoryConfig | dict[str, Any] | Literal[False] | None
-
-_MODE_DEFAULTS: dict[str, dict[str, Any]] = {
-    "simple": {
-        "read_only": True,
-        "query_default_limit": 50,
-        "query_max_rows": 100,
-        "query_max_chars": 25000,
-        "quality": False,
-        "lineage": False,
-        "memory": None,
-    },
-    "analyst": {
-        "read_only": True,
-        "query_default_limit": 50,
-        "query_max_rows": 200,
-        "query_max_chars": 50000,
-        "quality": False,
-        "lineage": False,
-        "memory": None,
-    },
-    "governed": {
-        "read_only": True,
-        "query_default_limit": 25,
-        "query_max_rows": 100,
-        "query_max_chars": 25000,
-        "query_timeout": 30,
-        "quality": False,
-        "lineage": True,
-        "memory": None,
-    },
-    "data_team": {
-        "read_only": True,
-        "query_default_limit": 50,
-        "query_max_rows": 200,
-        "query_max_chars": 50000,
-        "query_timeout": 60,
-        "quality": True,
-        "lineage": True,
-        "memory": None,
-    },
+_MODE_DEFAULTS: dict[str, tuple[DbSourceOptions, bool, bool]] = {
+    "simple": (
+        DbSourceOptions(
+            include_sample_values=True,
+            redact_pii_columns=True,
+            read_only=True,
+            query_default_limit=50,
+            query_max_rows=100,
+            query_max_chars=25000,
+        ),
+        False,
+        False,
+    ),
+    "analyst": (
+        DbSourceOptions(
+            include_sample_values=True,
+            redact_pii_columns=True,
+            read_only=True,
+            query_default_limit=50,
+            query_max_rows=200,
+            query_max_chars=50000,
+        ),
+        False,
+        False,
+    ),
+    "governed": (
+        DbSourceOptions(
+            include_sample_values=True,
+            redact_pii_columns=True,
+            read_only=True,
+            query_default_limit=25,
+            query_max_rows=100,
+            query_max_chars=25000,
+            query_timeout=30,
+        ),
+        True,
+        False,
+    ),
+    "data_team": (
+        DbSourceOptions(
+            include_sample_values=True,
+            redact_pii_columns=True,
+            read_only=True,
+            query_default_limit=50,
+            query_max_rows=200,
+            query_max_chars=50000,
+            query_timeout=60,
+        ),
+        True,
+        True,
+    ),
 }
 
 
@@ -75,104 +92,58 @@ async def from_db(
     name: str | None = None,
     mode: str | None = None,
     config: DbRuntimeConfig | None = None,
+    source_options: DbSourceOptions | None = None,
+    llm: DbLLMConfig | None = None,
+    runtime: DbRuntimeOptions | None = None,
+    memory: DbMemoryConfig | None = None,
     catalog: CatalogPlugin | None | bool = None,
     lineage: Any | bool | None = None,
-    memory: _DbMemoryOption = None,
     quality: Any | bool | None = None,
-    model: str | None = None,
-    api_key: str | None = None,
-    llm_provider: str | None = None,
-    temperature: float | None = None,
-    prompt: str | None = None,
-    db_schema: str | None = None,
-    include_sample_values: bool | None = None,
-    redact_pii_columns: bool = True,
-    history: Any | bool | None = None,
-    cache_ttl: int | None = None,
-    toolkit: str | None = None,
-    calibrate_memory: bool | None = None,
-    budget: Any | None = None,
-    schema_prompt_policy: Any | None = None,
-    tool_result_policy: Any | None = None,
+    history: ConversationHistory | bool | None = None,
     stateful: bool = False,
-    runtime: DbRuntimeOptions | None = None,
     plugins: tuple[Any, ...] | list[Any] = (),
     skills: tuple[Any, ...] | list[Any] = (),
-    read_only: bool | None = None,
-    query_default_limit: int | None = None,
-    query_max_rows: int | None = None,
-    query_max_chars: int | None = None,
-    query_timeout: float | None = None,
-    allowed_tables: list[str] | tuple[str, ...] | None = None,
-    blocked_tables: list[str] | tuple[str, ...] | None = None,
-    blocked_columns: list[str] | tuple[str, ...] | None = None,
-    **kwargs: Any,
 ) -> DbAgent:
-    """Create a `DbAgent` backed by `DbRuntime`.
-
-    Phase 10 intentionally moved the public `Agent.from_db()` classmethod to
-    the new operation runtime. Phase 13 keeps moving DB-adjacent services onto
-    this path by resolving Memory, Lineage, and DataQuality options into
-    extension-first plugins.
-    """
-    if kwargs:
-        unexpected = ", ".join(sorted(kwargs))
-        raise TypeError(
-            "Agent.from_db() on the DB runtime path received unsupported "
-            f"argument(s): {unexpected}"
-        )
+    """Create a `DbAgent` from typed binding records."""
 
     db_config = config or DbRuntimeConfig()
-    mode_name, resolved_options = _resolve_factory_options(
+    if not isinstance(db_config, DbRuntimeConfig):
+        raise TypeError("config must be a DbRuntimeConfig instance")
+    (
+        mode_name,
+        effective_source_options,
+        resolved_lineage,
+        resolved_quality,
+    ) = _resolve_factory_options(
         db_config,
         mode=mode,
-        read_only=read_only,
-        query_default_limit=query_default_limit,
-        query_max_rows=query_max_rows,
-        query_max_chars=query_max_chars,
-        query_timeout=query_timeout,
+        source_options=source_options,
         lineage=lineage,
-        memory=memory,
         quality=quality,
+    )
+    effective_limits = _limits_for_options(db_config.limits, effective_source_options)
+    effective_source_options = replace(
+        effective_source_options,
+        query_max_rows=effective_limits.max_rows,
+        query_timeout=effective_limits.timeout_seconds,
     )
     source_plugin = _resolve_runtime_source(
         source,
-        read_only=resolved_options["read_only"],
-        query_default_limit=resolved_options["query_default_limit"],
-        query_max_rows=resolved_options["query_max_rows"],
-        query_max_chars=resolved_options["query_max_chars"],
-        query_timeout=resolved_options.get("query_timeout"),
-        allowed_tables=allowed_tables,
-        blocked_tables=blocked_tables,
-        blocked_columns=blocked_columns,
+        options=effective_source_options,
     )
     _ensure_converted_plugin(source_plugin)
-    profile_key = catalog_profile_key(source, db_schema=db_schema)
+    profile_key = catalog_profile_key(source, db_schema=effective_source_options.schema)
     source_identity = _source_identity(source_plugin, profile_key)
     memory_config = _resolve_memory_config(
-        resolved_options["memory"],
+        memory,
         source_identity=source_identity,
     )
     host_context = current_host_runtime_context()
     runtime_metadata = _runtime_metadata(
         db_config,
         mode=mode_name,
-        prompt=prompt,
-        db_schema=db_schema,
-        model=model,
-        api_key=api_key,
-        llm_provider=llm_provider,
-        temperature=temperature,
-        include_sample_values=include_sample_values,
-        redact_pii_columns=redact_pii_columns,
-        history=history if not isinstance(history, ConversationHistory) else None,
-        stateful=stateful,
-        cache_ttl=cache_ttl,
-        toolkit=toolkit,
-        calibrate_memory=calibrate_memory,
-        budget=budget,
-        schema_prompt_policy=schema_prompt_policy,
-        tool_result_policy=tool_result_policy,
+        source_options=effective_source_options.to_dict(),
+        llm=llm.safe_metadata() if llm is not None else None,
         catalog_profile_key=profile_key,
         catalog_store_id=f"from_db:{profile_key}",
         catalog_keys=[f"from_db:{profile_key}"],
@@ -187,10 +158,9 @@ async def from_db(
     catalog_plugin = CatalogPlugin(auto_persist=False) if catalog is None else catalog
     service_plugins = _resolve_service_plugins(
         source_plugin,
-        lineage=resolved_options["lineage"],
-        memory=resolved_options["memory"],
+        lineage=resolved_lineage,
         memory_config=memory_config,
-        quality=resolved_options["quality"],
+        quality=resolved_quality,
     )
     host_plugins = tuple(host_context.runtime_extensions) if host_context else ()
     host_services = dict(host_context.services) if host_context else {}
@@ -211,19 +181,15 @@ async def from_db(
     )
     runtime_config = DbRuntimeConfig(
         profile=mode_name,
-        limits=_limits_for_options(db_config.limits, resolved_options),
+        limits=effective_limits,
+        execution=db_config.execution,
+        source_options=effective_source_options,
         plugins=runtime_plugins,
         policies=db_config.policies,
         metadata=runtime_metadata,
     )
-    db_llm_service = db_llm_service_from_config(
-        model=model,
-        llm_provider=llm_provider,
-        api_key=api_key,
-        temperature=temperature,
-        agent_id=name,
-    )
-    runtime = DbRuntime(
+    db_llm_service = db_llm_service_from_config(llm, agent_id=name)
+    db_runtime = DbRuntime(
         source=source,
         config=runtime_config,
         store=runtime_store,
@@ -231,10 +197,10 @@ async def from_db(
         host_services=host_services,
     )
     try:
-        await runtime.setup(agent_id=name)
-        if calibrate_memory:
+        await db_runtime.setup(agent_id=name)
+        if memory_config.enabled and memory_config.calibrate:
             await calibrate_db_memory(
-                runtime,
+                db_runtime,
                 source_owner=source_plugin.manifest.id,
                 marker_key=(
                     "numeric_unit_calibration:"
@@ -243,7 +209,7 @@ async def from_db(
             )
     except Exception as exc:
         with suppress(Exception):
-            await runtime.teardown()
+            await db_runtime.teardown()
         raise AgentError(
             f"Failed to initialize database runtime: {exc}",
             retry_hint=getattr(exc, "retry_hint", "retryable"),
@@ -252,14 +218,16 @@ async def from_db(
     default_history = history if isinstance(history, ConversationHistory) else None
     if default_history is None and stateful:
         default_history = ConversationHistory(workspace=name)
-    return DbAgent(runtime=runtime, name=name, default_history=default_history)
+    return DbAgent(runtime=db_runtime, name=name, default_history=default_history)
 
 
 def _resolve_runtime_source(
     source: str | BaseDatabasePlugin,
-    **options: Any,
+    *,
+    options: DbSourceOptions,
 ) -> BaseDatabasePlugin:
     if isinstance(source, BaseDatabasePlugin):
+        _apply_source_options(source, options)
         return source
     if not isinstance(source, str):
         raise ValueError(
@@ -275,7 +243,7 @@ def _resolve_runtime_source(
         ):
             return SQLitePlugin(path=source, **_plugin_options(options))
         raise ValueError(
-            f"Unsupported source: {source!r}. Phase 10 supports sqlite:// "
+            f"Unsupported source: {source!r}. Supported bindings are sqlite:// "
             "sources, SQLite file paths, and converted database plugins."
         )
 
@@ -288,12 +256,83 @@ def _resolve_runtime_source(
         return PostgreSQLPlugin(connection_string=source, **_plugin_options(options))
     raise ValueError(
         f"Unsupported scheme for new DbRuntime path: {scheme!r}. "
-        "Additional DB connectors are converted in later roadmap phases."
+        "Use a converted BaseDatabasePlugin for another connector."
     )
 
 
-def _plugin_options(options: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in options.items() if value is not None}
+def _plugin_options(options: DbSourceOptions) -> dict[str, Any]:
+    values = options.to_dict()
+    return {
+        key: value
+        for key, value in values.items()
+        if key
+        in {
+            "schema",
+            "include_sample_values",
+            "redact_pii_columns",
+            "read_only",
+            "query_default_limit",
+            "query_max_rows",
+            "query_max_chars",
+            "query_timeout",
+            "allowed_tables",
+            "blocked_tables",
+            "blocked_columns",
+        }
+    }
+
+
+def _apply_source_options(plugin: BaseDatabasePlugin, options: DbSourceOptions) -> None:
+    plugin.read_only = bool(getattr(plugin, "read_only", False) or options.read_only)
+    plugin.config["read_only"] = plugin.read_only
+    if options.schema is not None:
+        plugin.schema = options.schema
+        plugin.config["schema"] = options.schema
+    if options.include_sample_values is not None:
+        plugin.include_sample_values = options.include_sample_values
+        plugin.config["include_sample_values"] = options.include_sample_values
+    if options.redact_pii_columns is not None:
+        plugin.redact_pii_columns = options.redact_pii_columns
+        plugin.config["redact_pii_columns"] = options.redact_pii_columns
+    if options.query_default_limit is not None:
+        plugin.query_default_limit = options.query_default_limit
+        plugin.config["query_default_limit"] = options.query_default_limit
+    if options.query_max_rows is not None:
+        plugin.query_max_rows = min(
+            int(getattr(plugin, "query_max_rows", options.query_max_rows)),
+            options.query_max_rows,
+        )
+        plugin.config["query_max_rows"] = plugin.query_max_rows
+    if options.query_max_chars is not None:
+        plugin.query_max_chars = options.query_max_chars
+        plugin.config["query_max_chars"] = options.query_max_chars
+    if options.query_timeout is not None:
+        plugin.query_timeout = min(
+            float(getattr(plugin, "query_timeout", options.query_timeout)),
+            options.query_timeout,
+        )
+        plugin.config["query_timeout"] = plugin.query_timeout
+    current_allowed = set(getattr(plugin, "allowed_tables", set()) or set())
+    requested_allowed = set(options.allowed_tables or ())
+    if options.allowed_tables is not None:
+        current_restricted = bool(
+            getattr(plugin, "_allowed_tables_restricted", bool(current_allowed))
+        )
+        plugin.allowed_tables = (
+            current_allowed & requested_allowed
+            if current_restricted
+            else requested_allowed
+        )
+        plugin._allowed_tables_restricted = True
+        plugin.config["allowed_tables"] = tuple(sorted(plugin.allowed_tables))
+    plugin.blocked_tables = set(
+        getattr(plugin, "blocked_tables", set()) or set()
+    ) | set(options.blocked_tables or ())
+    plugin.blocked_columns = set(
+        getattr(plugin, "blocked_columns", set()) or set()
+    ) | set(options.blocked_columns or ())
+    plugin.config["blocked_tables"] = tuple(sorted(plugin.blocked_tables))
+    plugin.config["blocked_columns"] = tuple(sorted(plugin.blocked_columns))
 
 
 def _resolve_runtime_store(options: DbRuntimeOptions | None) -> RuntimeStore | None:
@@ -304,7 +343,9 @@ def _resolve_runtime_store(options: DbRuntimeOptions | None) -> RuntimeStore | N
     if options.store is None:
         return None
     if options.store == "sqlite":
-        return SQLiteRuntimeStore(options.store_path)
+        if options.store_path is None:
+            raise ValueError("store_path is required when store='sqlite'")
+        return SQLiteRuntimeStore(Path(options.store_path))
     return options.store
 
 
@@ -312,61 +353,92 @@ def _resolve_factory_options(
     config: DbRuntimeConfig,
     *,
     mode: str | None,
-    read_only: bool | None,
-    query_default_limit: int | None,
-    query_max_rows: int | None,
-    query_max_chars: int | None,
-    query_timeout: float | None,
+    source_options: DbSourceOptions | None,
     lineage: Any | bool | None,
-    memory: _DbMemoryOption,
     quality: Any | bool | None,
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, DbSourceOptions, Any | bool | None, Any | bool | None]:
     mode_name = (mode or config.profile or "analyst").lower()
     if mode_name not in _MODE_DEFAULTS:
         valid = ", ".join(sorted(_MODE_DEFAULTS))
         raise ValueError(f"Unknown from_db mode {mode!r}. Valid modes: {valid}")
 
-    defaults = dict(_MODE_DEFAULTS[mode_name])
-    explicit = {
-        "read_only": read_only,
-        "query_default_limit": query_default_limit,
-        "query_max_rows": query_max_rows,
-        "query_max_chars": query_max_chars,
-        "query_timeout": query_timeout,
-        "lineage": lineage,
-        "memory": memory,
-        "quality": quality,
-    }
-    for key, value in explicit.items():
-        if value is not None:
-            defaults[key] = value
-    return mode_name, defaults
+    if source_options is not None and not isinstance(source_options, DbSourceOptions):
+        raise TypeError("source_options must be a DbSourceOptions instance")
+    mode_source_options, default_lineage, default_quality = _MODE_DEFAULTS[mode_name]
+    effective_source_options = _merge_source_options(
+        mode_source_options,
+        config.source_options,
+        source_options,
+    )
+    resolved_lineage = default_lineage if lineage is None else lineage
+    resolved_quality = default_quality if quality is None else quality
+    return mode_name, effective_source_options, resolved_lineage, resolved_quality
 
 
-def _limits_for_options(limits: DbLimits, options: dict[str, Any]) -> DbLimits:
+def _merge_source_options(*owners: DbSourceOptions | None) -> DbSourceOptions:
+    field_names = (
+        "schema",
+        "include_sample_values",
+        "redact_pii_columns",
+        "query_default_limit",
+        "query_max_rows",
+        "query_max_chars",
+        "query_timeout",
+        "cache_ttl",
+    )
+    values: dict[str, Any] = {}
+    applicable = tuple(owner for owner in owners if owner is not None)
+    for name in field_names:
+        populated = [getattr(owner, name) for owner in applicable]
+        values[name] = next(
+            (value for value in reversed(populated) if value is not None), None
+        )
+    read_only_values = [
+        owner.read_only for owner in applicable if owner.read_only is not None
+    ]
+    values["read_only"] = any(read_only_values) if read_only_values else None
+    allowed_sets = [
+        set(owner.allowed_tables)
+        for owner in applicable
+        if owner.allowed_tables is not None
+    ]
+    values["allowed_tables"] = (
+        tuple(sorted(set.intersection(*allowed_sets))) if allowed_sets else None
+    )
+    for name in ("blocked_tables", "blocked_columns"):
+        sets = [
+            set(getattr(owner, name))
+            for owner in applicable
+            if getattr(owner, name) is not None
+        ]
+        values[name] = tuple(sorted(set().union(*sets))) if sets else None
+    return DbSourceOptions(**values)
+
+
+def _limits_for_options(limits: DbLimits, options: DbSourceOptions) -> DbLimits:
+    max_rows = (
+        min(limits.max_rows, options.query_max_rows)
+        if options.query_max_rows is not None
+        else limits.max_rows
+    )
+    timeout_seconds = (
+        min(limits.timeout_seconds, options.query_timeout)
+        if options.query_timeout is not None
+        else limits.timeout_seconds
+    )
     return replace(
         limits,
-        max_rows=options.get("query_max_rows") or limits.max_rows,
-        timeout_seconds=options.get("query_timeout") or limits.timeout_seconds,
+        max_rows=max_rows,
+        timeout_seconds=timeout_seconds,
     )
 
 
 def _runtime_metadata(config: DbRuntimeConfig, **values: Any) -> dict[str, Any]:
     metadata = dict(config.metadata)
-    construction = {
-        key: _metadata_value(value)
-        for key, value in values.items()
-        if value is not None and key not in {"api_key"}
-    }
+    construction = {key: value for key, value in values.items() if value is not None}
     if construction:
         metadata["from_db_options"] = construction
     return metadata
-
-
-def _metadata_value(value: Any) -> Any:
-    if is_dataclass(value) and not isinstance(value, type):
-        return asdict(value)
-    return value
 
 
 def _ensure_converted_plugin(plugin: BaseDatabasePlugin) -> None:
@@ -381,14 +453,13 @@ def _resolve_service_plugins(
     source_plugin: BaseDatabasePlugin,
     *,
     lineage: Any | bool | None,
-    memory: _DbMemoryOption,
     memory_config: DbMemoryConfig,
     quality: Any | bool | None,
 ) -> tuple[Any, ...]:
     resolved: list[Any] = []
     quality_plugin = _resolve_quality_plugin(quality, source_plugin)
     lineage_plugin = _resolve_lineage_plugin(lineage)
-    memory_plugin = _resolve_memory_plugin(memory, memory_config)
+    memory_plugin = _resolve_memory_plugin(memory_config)
     for plugin in (quality_plugin, lineage_plugin, memory_plugin):
         if plugin is not None:
             resolved.append(plugin)
@@ -409,7 +480,7 @@ def _resolve_quality_plugin(
         raise ValueError("quality must be True, False, None, or a converted plugin")
     if getattr(quality, "_db", None) is None:
         try:
-            quality._db = source_plugin
+            setattr(quality, "_db", source_plugin)
         except Exception:
             pass
     return quality
@@ -428,13 +499,11 @@ def _resolve_lineage_plugin(lineage: Any | bool | None) -> Any | None:
 
 
 def _resolve_memory_plugin(
-    memory: _DbMemoryOption,
     memory_config: DbMemoryConfig,
 ) -> Any | None:
     if not memory_config.enabled:
         return None
 
-    _ensure_supported_memory_option(memory)
     from daita.plugins.memory import MemoryPlugin
 
     plugin = MemoryPlugin(
@@ -443,82 +512,45 @@ def _resolve_memory_plugin(
         auto_curate="manual",
         db_memory_mode=True,
         db_memory_retrieval_mode=memory_config.retrieval_mode,
-        **_memory_plugin_kwargs(memory),
+        **_memory_plugin_kwargs(memory_config),
     )
-    backend = _memory_backend(memory)
-    if backend is not None:
-        plugin.backend = backend
+    if not isinstance(memory_config.backend, str):
+        plugin.backend = memory_config.backend
     return plugin
 
 
 def _resolve_memory_config(
-    memory: _DbMemoryOption,
+    memory: DbMemoryConfig | None,
     *,
     source_identity: str,
 ) -> DbMemoryConfig:
-    if memory is False:
-        return DbMemoryConfig(
-            enabled=False,
-            recall="off",
-            learning="off",
-            source_identity=source_identity,
-        )
-    if isinstance(memory, DbMemoryConfig):
-        config = replace(
-            memory, source_identity=memory.source_identity or source_identity
-        )
-        if not config.enabled:
-            return replace(config, recall="off", learning="off")
-        _validate_embedding_mode_config(config, memory)
-        return config
-    if isinstance(memory, dict):
-        values = dict(memory)
-        embedding_available = _memory_embedding_explicit(memory)
-        backend = values.get("backend")
-        if values.get("enabled") is False:
-            values.setdefault("recall", "off")
-            values.setdefault("learning", "off")
-        for key in (
-            "backend",
-            "embedding_provider",
-            "embedding_model",
-            "embedder",
-            "max_chunks",
-            "default_ttl_days",
-        ):
-            values.pop(key, None)
-        if backend is not None:
-            values.setdefault("backend", _memory_backend_name(backend))
-            values.setdefault(
-                "structured_index",
-                str(getattr(backend, "structured_index", "custom") or "custom"),
-            )
-            embedding_available = bool(
-                getattr(backend, "embedding_available", embedding_available)
-            )
-        values["embedding_available"] = embedding_available
-        values["source_identity"] = values.get("source_identity") or source_identity
-        config = DbMemoryConfig(**values)
-        _validate_embedding_mode_config(config, memory)
-        return config
-    _ensure_supported_memory_option(memory)
-    return DbMemoryConfig(source_identity=source_identity)
-
-
-def _ensure_supported_memory_option(memory: Any) -> None:
-    if memory is None or memory is False:
-        return
-    if isinstance(memory, (DbMemoryConfig, dict)):
-        return
-    raise ValueError(
-        "memory must be False, a DbMemoryConfig, a config mapping, or None"
+    if memory is not None and not isinstance(memory, DbMemoryConfig):
+        raise TypeError("memory must be a DbMemoryConfig instance")
+    config = memory or DbMemoryConfig()
+    backend = config.backend
+    embedding_available = bool(
+        config.embedding_available
+        or config.embedding_provider
+        or config.embedding_model
+        or config.embedder
+        or getattr(backend, "embedding_available", False)
     )
+    structured_index = str(
+        getattr(backend, "structured_index", config.structured_index)
+        or config.structured_index
+    )
+    config = replace(
+        config,
+        embedding_available=embedding_available,
+        structured_index=structured_index,
+        source_identity=config.source_identity or source_identity,
+    )
+    _validate_embedding_mode_config(config)
+    return config
 
 
-def _memory_plugin_kwargs(memory: _DbMemoryOption) -> dict[str, Any]:
-    if not isinstance(memory, dict):
-        return {}
-    kwargs = {}
+def _memory_plugin_kwargs(memory: DbMemoryConfig) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
     for key in (
         "embedding_provider",
         "embedding_model",
@@ -526,48 +558,31 @@ def _memory_plugin_kwargs(memory: _DbMemoryOption) -> dict[str, Any]:
         "max_chunks",
         "default_ttl_days",
     ):
-        if key in memory:
-            kwargs[key] = memory[key]
+        value = getattr(memory, key)
+        if value is not None:
+            kwargs[key] = value
     return kwargs
-
-
-def _memory_embedding_explicit(memory: _DbMemoryOption) -> bool:
-    if not isinstance(memory, dict):
-        return False
-    return any(
-        memory.get(key) is not None
-        for key in ("embedding_provider", "embedding_model", "embedder")
-    )
-
-
-def _memory_backend_name(backend: Any) -> str:
-    name = type(backend).__name__.lower()
-    if "supabase" in name:
-        return "supabase"
-    if "local" in name:
-        return "local"
-    return name or "custom"
 
 
 def _validate_embedding_mode_config(
     memory_config: DbMemoryConfig,
-    memory: _DbMemoryOption,
 ) -> None:
     if not memory_config.enabled:
         return
     if memory_config.retrieval_mode == "structured":
         return
-    if not _memory_embedding_explicit(memory):
+    if not any(
+        value is not None
+        for value in (
+            memory_config.embedding_provider,
+            memory_config.embedding_model,
+            memory_config.embedder,
+        )
+    ):
         raise ValueError(
             "memory.retrieval_mode='hybrid' or 'embedding' requires an explicit "
             "embedding_provider, embedding_model, or embedder"
         )
-
-
-def _memory_backend(memory: _DbMemoryOption) -> Any | None:
-    if not isinstance(memory, dict):
-        return None
-    return memory.get("backend")
 
 
 def _memory_workspace(memory_config: DbMemoryConfig) -> str:

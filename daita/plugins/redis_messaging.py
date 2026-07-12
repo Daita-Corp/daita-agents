@@ -18,12 +18,14 @@ Example:
     ```
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import time
 import uuid
-from typing import Dict, Any, Optional, List, Callable
+from typing import Dict, Any, Optional, List, Callable, TYPE_CHECKING
 import weakref
 
 from daita.runtime import AccessMode, Capability, Evidence, EvidenceSchema, RiskLevel
@@ -31,7 +33,12 @@ from daita.runtime import AccessMode, Capability, Evidence, EvidenceSchema, Risk
 from .base import ConnectorPlugin
 from .manifest import PluginKind, PluginManifest
 
+if TYPE_CHECKING:
+    from redis.asyncio import ConnectionPool
+
 logger = logging.getLogger(__name__)
+
+RedisEncodable = bytes | bytearray | memoryview | str | int | float
 
 
 _REDIS_MESSAGING_OPERATIONS = (
@@ -198,7 +205,7 @@ class RedisMessagingPlugin(ConnectorPlugin):
         self.extra_params = kwargs
 
         # Redis connections (lazy initialization)
-        self._redis_pool = None
+        self._redis_pool: ConnectionPool | None = None
         self._pubsub_connections: Dict[str, Any] = {}
 
         # Subscribers: channel_name -> weak set of callbacks
@@ -328,14 +335,25 @@ class RedisMessagingPlugin(ConnectorPlugin):
 
         logger.info("RedisMessagingPlugin stopped")
 
+    @property
+    def client(self):
+        """Create a Redis client from the connected pool."""
+        try:
+            import redis.asyncio as redis
+        except ImportError as exc:
+            raise ImportError(
+                "redis package required for RedisMessagingPlugin. "
+                "Install with: pip install 'daita-agents[redis]'"
+            ) from exc
+        if self._redis_pool is None:
+            raise RuntimeError("Redis messaging plugin is not connected")
+        return redis.Redis(connection_pool=self._redis_pool)
+
     async def _get_redis(self):
         """Get Redis client from pool."""
         if not self._running:
             await self.connect()
-
-        import redis.asyncio as redis
-
-        return redis.Redis(connection_pool=self._redis_pool)
+        return self.client
 
     async def _execute_publish(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         message_id = await self.publish(
@@ -384,11 +402,11 @@ class RedisMessagingPlugin(ConnectorPlugin):
 
         try:
             # Prepare message for storage
-            stored_message = {
+            stored_message: Dict[RedisEncodable, RedisEncodable] = {
                 "id": message_id,
-                "data": message,
-                "publisher": publisher,
-                "timestamp": time.time(),
+                "data": json.dumps(message),
+                "publisher": publisher or "",
+                "timestamp": str(time.time()),
             }
 
             # Store in Redis Stream for persistence
@@ -555,10 +573,20 @@ class RedisMessagingPlugin(ConnectorPlugin):
 
             # Extract message data
             result = []
-            for message_id, fields in messages:
+            for message_id, fields in messages or ():
                 try:
                     # Parse the stored message data
-                    data = fields.get(b"data", b"{}").decode()
+                    if fields is None:
+                        continue
+                    stored_data = fields.get(b"data")
+                    if stored_data is None:
+                        stored_data = fields.get("data", "{}")
+                    if isinstance(stored_data, bytes):
+                        data = stored_data.decode()
+                    elif isinstance(stored_data, str):
+                        data = stored_data
+                    else:
+                        raise ValueError("stored Redis message data must be text")
                     message_data = json.loads(data) if data != "{}" else {}
                     result.append(message_data)
                 except Exception as e:

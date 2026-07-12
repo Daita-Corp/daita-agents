@@ -10,6 +10,7 @@ import time
 from typing import Any, Iterable
 
 from daita.agents.agent import Agent
+from daita.db import DbLLMConfig, DbSourceOptions
 from daita.runtime import Task
 
 from tests.integration._harness import start_container
@@ -52,7 +53,7 @@ async def create_postgres_scale_agent(
         harness.agent = await Agent.from_db(
             harness.url,
             name=name,
-            cache_ttl=cache_ttl,
+            source_options=DbSourceOptions(cache_ttl=cache_ttl),
             **kwargs,
         )
     except Exception:
@@ -468,10 +469,12 @@ def large_operational_schema_sql(
 
 def live_llm_kwargs() -> dict[str, Any]:
     return {
-        "llm_provider": "openai",
-        "model": os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
-        "api_key": os.environ["OPENAI_API_KEY"],
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
+            api_key=os.environ["OPENAI_API_KEY"],
+            temperature=0,
+        )
     }
 
 

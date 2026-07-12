@@ -1,6 +1,9 @@
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import inspect
+import sqlite3
+import threading
 
 import pytest
 
@@ -11,9 +14,17 @@ from daita.db import (
     DbMonitorRun,
     DbMonitorState,
     DbRuntime,
-    SQLiteDbMonitorStore,
 )
+from daita.db.monitor_scheduler import DbMonitorScheduler
+from daita.db.monitors import SQLiteDbMonitorStore
 from daita.db.monitor_commands import DbMonitorValidation
+from daita.db.monitor_scheduler.observation import (
+    _cursor_updates_from_plan as _observation_cursor_updates_from_plan,
+)
+from daita.db.monitor_scheduler.state import (
+    _cursor_updates_from_plan as _state_cursor_updates_from_plan,
+)
+from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.plugins import RuntimeExtensionPlugin, PluginKind, PluginManifest
 from daita.runtime import (
     AccessMode,
@@ -35,8 +46,106 @@ from daita.runtime import (
 NOW = datetime(2026, 6, 12, 12, 0, tzinfo=timezone.utc)
 
 
+async def test_sqlite_monitor_store_does_not_block_the_event_loop(
+    tmp_path, monkeypatch
+):
+    store = SQLiteDbMonitorStore(tmp_path / "monitor-responsive.sqlite")
+    monitor = DbMonitor(id="responsive-monitor", name="Responsive monitor")
+    helper_started = threading.Event()
+    helper_released = threading.Event()
+    helper_finished = threading.Event()
+    release_timed_out = threading.Event()
+    save_monitor_sync = store._save_monitor_sync
+
+    def blocking_save_monitor_sync(value):
+        helper_started.set()
+        if not helper_released.wait(timeout=5):
+            release_timed_out.set()
+        try:
+            return save_monitor_sync(value)
+        finally:
+            helper_finished.set()
+
+    monkeypatch.setattr(store, "_save_monitor_sync", blocking_save_monitor_sync)
+    store_task = asyncio.create_task(store.save_monitor(monitor))
+    loop_advanced = asyncio.Event()
+
+    async def advance_loop():
+        loop_advanced.set()
+
+    try:
+        assert await asyncio.to_thread(helper_started.wait, 5)
+        progress_task = asyncio.create_task(advance_loop())
+        await progress_task
+
+        assert loop_advanced.is_set()
+        assert not helper_released.is_set()
+        assert not helper_finished.is_set()
+        assert not release_timed_out.is_set()
+    finally:
+        helper_released.set()
+        await store_task
+
+    assert await store.load_monitor(monitor.id) == monitor
+
+
+async def test_sqlite_monitor_store_closes_read_connection_before_return(
+    tmp_path, monkeypatch
+):
+    store = SQLiteDbMonitorStore(tmp_path / "monitor-read-close.sqlite")
+    monitor = DbMonitor(id="read-close-monitor", name="Read close monitor")
+    await store.save_monitor(monitor)
+    connections = []
+
+    class ConnectionProbe:
+        def __init__(self):
+            self.connection = sqlite3.connect(store.path)
+            self.connection.row_factory = sqlite3.Row
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self.connection.__exit__(exc_type, exc, tb)
+
+        def execute(self, *args, **kwargs):
+            return self.connection.execute(*args, **kwargs)
+
+        def close(self):
+            self.closed = True
+            self.connection.close()
+
+    def connect():
+        connection = ConnectionProbe()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", connect)
+
+    assert await store.load_monitor(monitor.id) == monitor
+    assert len(connections) == 1
+    assert connections[0].closed is True
+
+
 def _validation(accepted=True, **kwargs):
     return DbMonitorValidation(accepted=accepted, **kwargs).to_dict()
+
+
+def test_cursor_updates_capture_non_null_values_once_before_max():
+    class PopOnceRow(dict):
+        def get(self, key, default=None):
+            if key == "id":
+                return self.pop(key, default)
+            return super().get(key, default)
+
+    plan = {"cursor_update": {"last_id": "max(rows.id)"}}
+
+    def payload():
+        return {"rows": [PopOnceRow(id=41), {"id": None}, {"id": 42}]}
+
+    assert _observation_cursor_updates_from_plan(plan, payload()) == {"last_id": 42}
+    assert _state_cursor_updates_from_plan(plan, payload()) == {"last_id": 42}
 
 
 class MonitorReadProbeExecutor:
@@ -376,6 +485,48 @@ class MonitorDeliveryApprovalPolicy:
         )
 
 
+class TaskSpecSpyRuntime(DbRuntime):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.spec_batches: list[tuple[DbTaskSpec, ...]] = []
+        self.planned_task_batches: list[tuple[Task, ...]] = []
+        self.write_governance_task_ids: list[str] = []
+
+    async def plan_task_specs(self, operation, specs, *, contract=None):
+        materialized = tuple(specs)
+        self.spec_batches.append(materialized)
+        plan = await super().plan_task_specs(
+            operation,
+            materialized,
+            contract=contract,
+        )
+        self.planned_task_batches.append(plan.tasks)
+        return plan
+
+    async def evaluate_monitor_effect_governance(
+        self,
+        operation,
+        *,
+        capability,
+        task=None,
+        intent,
+        phase,
+        mutate_approvals=False,
+        operation_override=None,
+    ):
+        if phase == "write_execution" and task is not None:
+            self.write_governance_task_ids.append(task.id)
+        return await super().evaluate_monitor_effect_governance(
+            operation,
+            capability=capability,
+            task=task,
+            intent=intent,
+            phase=phase,
+            mutate_approvals=mutate_approvals,
+            operation_override=operation_override,
+        )
+
+
 class MonitorCapabilityProbePlugin(RuntimeExtensionPlugin):
     def __init__(
         self,
@@ -570,6 +721,83 @@ async def _create_monitor(runtime, monitor_id, **kwargs):
     return await runtime.create_monitor(monitor)
 
 
+async def test_observation_materializes_validation_and_read_via_task_specs():
+    plugin = MonitorReadProbePlugin(rows=[{"pending_count": 4}])
+    runtime = TaskSpecSpyRuntime(
+        runtime_id="db-monitor-observation-specs",
+        plugins=(plugin,),
+    )
+    await _create_monitor(
+        runtime,
+        "observation_specs_monitor",
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+    )
+
+    run = (await runtime.tick_monitors(now=NOW))[0]
+    observation_batches = [
+        batch
+        for batch in runtime.spec_batches
+        if [spec.reason for spec in batch]
+        == ["monitor_observation_read_validation", "monitor_observation_read"]
+    ]
+    tasks = await runtime.store.list_tasks(run.operation_id)
+    validation_task, read_task = tasks
+    validation_dependency = next(
+        dependency
+        for dependency in read_task.dependencies
+        if dependency.evidence_kind == "sql.validation"
+    )
+
+    assert observation_batches
+    assert all(isinstance(spec, DbTaskSpec) for spec in observation_batches[0])
+    assert [spec.capability_id for spec in observation_batches[0]] == [
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    assert validation_dependency.producer_task_id == validation_task.id
+    assert read_task.input["validated_task_id"] == validation_task.id
+
+
+async def test_monitor_write_governance_uses_task_from_plan_task_specs():
+    read_plugin = MonitorReadProbePlugin(rows=[{"pending_count": 12}])
+    write_plugin = MonitorWriteProbePlugin()
+    runtime = TaskSpecSpyRuntime(
+        runtime_id="db-monitor-write-governance-specs",
+        plugins=(read_plugin, write_plugin),
+    )
+    await _create_monitor(
+        runtime,
+        "write_governance_specs_monitor",
+        schedule={"interval_seconds": 0},
+        source_scope=("orders",),
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+        action_plan=_write_proposal_action(),
+    )
+
+    run = (await runtime.tick_monitors(now=NOW))[0]
+    snapshot = await runtime.inspect_operation(run.summary["triggered_operation_id"])
+    write_task = next(
+        task for task in snapshot.tasks if task.capability_id == "db.sql.execute_write"
+    )
+    planned_write_task_ids = {
+        task.id
+        for batch in runtime.planned_task_batches
+        for task in batch
+        if task.capability_id == "db.sql.execute_write"
+    }
+
+    assert write_task.id in planned_write_task_ids
+    assert runtime.write_governance_task_ids == [write_task.id]
+    assert any(
+        batch
+        and batch[-1].capability_id == "db.sql.execute_write"
+        and batch[-1].reason == "monitor_write_execution"
+        for batch in runtime.spec_batches
+    )
+
+
 async def test_scheduler_records_due_observation_and_not_due_decisions():
     plugin = MonitorReadProbePlugin(rows=[{"pending_count": 4}])
     runtime = DbRuntime(runtime_id="db-monitor-scheduler-due", plugins=(plugin,))
@@ -619,6 +847,168 @@ async def test_scheduler_records_due_observation_and_not_due_decisions():
     assert tasks[1].input["sql_ref"] == "sql.validation"
     assert tasks[1].input["validated_evidence_id"]
     assert tasks[1].input["validated_task_id"] == tasks[0].id
+
+
+async def test_tick_monitors_runs_exactly_one_scheduler_pass(monkeypatch):
+    plugin = MonitorReadProbePlugin(rows=[{"pending_count": 4}])
+    runtime = DbRuntime(runtime_id="db-monitor-one-shot", plugins=(plugin,))
+    await _create_monitor(
+        runtime,
+        "one_shot_monitor",
+        schedule={"interval_seconds": 0},
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+    )
+    original_run_once = DbMonitorScheduler.run_once
+    pass_scheduler_ids = []
+
+    async def count_run_once(scheduler, *, now=None):
+        pass_scheduler_ids.append(scheduler.scheduler_id)
+        return await original_run_once(scheduler, now=now)
+
+    monkeypatch.setattr(DbMonitorScheduler, "run_once", count_run_once)
+
+    runs = await runtime.tick_monitors(now=NOW)
+
+    assert len(runs) == 1
+    assert len(pass_scheduler_ids) == 1
+    assert plugin.validate_executor.calls == 1
+    assert plugin.read_executor.calls == 1
+
+
+async def test_two_schedulers_share_one_lease_and_only_one_triggers(monkeypatch):
+    plugin = MonitorReadProbePlugin(rows=[{"pending_count": 12}])
+    runtime = DbRuntime(runtime_id="db-monitor-multi-host", plugins=(plugin,))
+    monitor = await _create_monitor(
+        runtime,
+        "multi_host_monitor",
+        schedule={"interval_seconds": 0},
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+    )
+    scheduler_a = DbMonitorScheduler(
+        runtime=runtime,
+        monitor_store=runtime.monitor_store,
+        scheduler_id="monitor-host-a",
+    )
+    scheduler_b = DbMonitorScheduler(
+        runtime=runtime,
+        monitor_store=runtime.monitor_store,
+        scheduler_id="monitor-host-b",
+    )
+    first_tick_started = asyncio.Event()
+    release_first_tick = asyncio.Event()
+    original_tick_monitor = scheduler_a.runner.tick_monitor
+
+    async def block_after_claim(monitor_id, *, now=None, lease_id=None):
+        first_tick_started.set()
+        await release_first_tick.wait()
+        return await original_tick_monitor(
+            monitor_id,
+            now=now,
+            lease_id=lease_id,
+        )
+
+    monkeypatch.setattr(scheduler_a.runner, "tick_monitor", block_after_claim)
+    first_pass = asyncio.create_task(scheduler_a.run_once(now=NOW))
+    try:
+        await first_tick_started.wait()
+        losing_results = await scheduler_b.run_once(now=NOW)
+    finally:
+        release_first_tick.set()
+    winning_results = await first_pass
+
+    all_results = (*winning_results, *losing_results)
+    persisted_runs = await runtime.monitor_store.list_monitor_runs(monitor.id)
+
+    assert sum(result.claimed for result in all_results) == 1
+    assert sum(result.run.triggered for result in all_results) == 1
+    assert sum(run.triggered for run in persisted_runs) == 1
+    assert losing_results[0].claimed is False
+    assert losing_results[0].run.status == "skipped"
+    assert losing_results[0].run.summary["reason"] == "lease_lost"
+    assert plugin.validate_executor.calls == 1
+    assert plugin.read_executor.calls == 1
+
+
+async def test_scheduler_identity_and_utc_clock_stay_stable_across_passes():
+    plugin = MonitorReadProbePlugin(rows=[{"pending_count": 4}])
+    runtime = DbRuntime(runtime_id="db-monitor-stable-host", plugins=(plugin,))
+    monitor = await _create_monitor(
+        runtime,
+        "stable_host_monitor",
+        schedule={"interval_seconds": 0},
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+    )
+    scheduler = DbMonitorScheduler(
+        runtime=runtime,
+        scheduler_id="stable-monitor-host",
+    )
+    second_tick = NOW + timedelta(seconds=1)
+
+    first_results = await scheduler.run_once(now=NOW)
+    second_results = await scheduler.run_once(now=second_tick)
+    state = await runtime.monitor_store.load_monitor_state(monitor.id)
+
+    assert scheduler.scheduler_id == "stable-monitor-host"
+    assert first_results[0].claimed is True
+    assert second_results[0].claimed is True
+    assert state.last_tick_at == second_tick.isoformat()
+    assert datetime.fromisoformat(state.last_tick_at).utcoffset() == timedelta(0)
+    assert plugin.validate_executor.calls == 2
+    assert plugin.read_executor.calls == 2
+
+
+async def test_scheduler_releases_lease_after_success_and_runner_failure(
+    monkeypatch,
+):
+    plugin = MonitorReadProbePlugin(rows=[{"pending_count": 4}])
+    runtime = DbRuntime(runtime_id="db-monitor-lease-release", plugins=(plugin,))
+    monitor = await _create_monitor(
+        runtime,
+        "lease_release_monitor",
+        schedule={"interval_seconds": 0},
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+    )
+    scheduler = DbMonitorScheduler(
+        runtime=runtime,
+        scheduler_id="lease-release-success",
+    )
+
+    results = await scheduler.run_once(now=NOW)
+    assert results[0].claimed is True
+    assert await runtime.monitor_store.claim_monitor_tick_lease(
+        monitor.id,
+        lease_id="after-success",
+        now=(NOW + timedelta(seconds=1)).isoformat(),
+        expires_at=(NOW + timedelta(minutes=1)).isoformat(),
+    )
+    await runtime.monitor_store.release_monitor_tick_lease(
+        monitor.id,
+        lease_id="after-success",
+    )
+
+    failing_scheduler = DbMonitorScheduler(
+        runtime=runtime,
+        scheduler_id="lease-release-failure",
+    )
+
+    async def fail_tick(*args, **kwargs):
+        raise RuntimeError("scheduler runner failed")
+
+    monkeypatch.setattr(failing_scheduler.runner, "tick_monitor", fail_tick)
+
+    with pytest.raises(RuntimeError, match="scheduler runner failed"):
+        await failing_scheduler.run_once(now=NOW + timedelta(seconds=2))
+
+    assert await runtime.monitor_store.claim_monitor_tick_lease(
+        monitor.id,
+        lease_id="after-failure",
+        now=(NOW + timedelta(seconds=3)).isoformat(),
+        expires_at=(NOW + timedelta(minutes=1)).isoformat(),
+    )
 
 
 async def test_scheduler_prevents_tick_lease_collisions():
@@ -2763,9 +3153,13 @@ async def test_write_proposal_blocks_missing_ambiguous_or_scope_drift(
 
     assert action_result.payload["status"] == "blocked"
     assert action_result.payload["block_reason"] == reason
-    assert not any(
+    has_write_task = any(
         task.capability_id == "db.sql.execute_write" for task in snapshot.tasks
     )
+    if reason == "write_source_scope_blocked":
+        assert has_write_task
+    else:
+        assert not has_write_task
 
 
 def test_phase7_monitor_runtime_boundaries_do_not_add_direct_paths():

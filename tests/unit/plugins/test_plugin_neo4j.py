@@ -7,6 +7,9 @@ _build_match_condition, read_only gating, and PluginError propagation.
 No real Neo4j connection is needed.
 """
 
+import sys
+import types
+
 import pytest
 from daita.plugins.manifest import PluginKind
 from daita.plugins.neo4j_graph import Neo4jPlugin
@@ -21,11 +24,9 @@ from tests.unit.plugins.projection_helpers import projected_tools, projected_too
 
 
 def make_plugin(read_only=False):
-    plugin = Neo4jPlugin(
+    return Neo4jPlugin(
         uri="bolt://localhost:7687", auth=("neo4j", "test"), read_only=read_only
     )
-    plugin._driver = object()  # truthy sentinel — skips connect()
-    return plugin
 
 
 def stub_query(plugin, records_by_cypher=None, default_records=None):
@@ -429,6 +430,58 @@ class TestErrorPropagation:
 
         with pytest.raises(PluginError):
             await plugin._tool_list_labels({})
+
+
+class TestInputAndConnectionBoundaries:
+    @pytest.mark.parametrize(
+        ("handler_name", "args", "field"),
+        [
+            ("_tool_create_node", {"properties": {}}, "label"),
+            ("_tool_create_node", {"label": "Person"}, "properties"),
+            ("_tool_find_path", {"from_label": "Person"}, "from_properties"),
+            ("_tool_get_neighbors", {"properties": {}}, "label"),
+            ("_tool_delete_node", {"label": "Person"}, "properties"),
+        ],
+    )
+    async def test_required_tool_inputs_are_rejected(self, handler_name, args, field):
+        plugin = make_plugin()
+
+        with pytest.raises(ValueError, match=field):
+            await getattr(plugin, handler_name)(args)
+
+    async def test_failed_connect_does_not_publish_driver(self, monkeypatch):
+        plugin = Neo4jPlugin(uri="bolt://example.invalid:7687")
+
+        class FailingDriver:
+            closed = False
+
+            async def verify_connectivity(self):
+                raise OSError("unreachable")
+
+            async def close(self):
+                self.closed = True
+
+        driver = FailingDriver()
+
+        class FakeAsyncGraphDatabase:
+            @staticmethod
+            def driver(*args, **kwargs):
+                return driver
+
+        fake_neo4j = types.ModuleType("neo4j")
+        monkeypatch.setattr(
+            fake_neo4j,
+            "AsyncGraphDatabase",
+            FakeAsyncGraphDatabase,
+            raising=False,
+        )
+        monkeypatch.setitem(sys.modules, "neo4j", fake_neo4j)
+
+        with pytest.raises(PluginError, match="unreachable"):
+            await plugin.connect()
+
+        assert driver.closed is True
+        assert plugin.is_connected is False
 
 
 # ---------------------------------------------------------------------------

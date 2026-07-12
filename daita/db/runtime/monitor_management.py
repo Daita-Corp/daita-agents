@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-import hashlib
-import json
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from daita.runtime import (
@@ -22,6 +20,7 @@ from daita.runtime import (
     TaskDependency,
 )
 
+from ..fingerprints import persisted_fingerprint
 from ..models import (
     DbIntent,
     DbIntentKind,
@@ -40,17 +39,98 @@ from ..monitors import (
     SQLiteDbMonitorStore,
 )
 from ..monitor_scheduler.scheduler import DbMonitorScheduler
+from .tasks.models import DbTaskSpec
 from .types import DbRuntimeGovernanceBlocked
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from daita.runtime import (
+        InMemoryApprovalChannel,
+        OperationSnapshot,
+        RuntimeKernel,
+        Task,
+    )
+
+    from .tasks.models import DbTaskPlan
+    from .tasks.runtime import DbTaskRuntime
 
 
 class DbRuntimeMonitorManagementMixin:
+    if TYPE_CHECKING:
+        tasks: DbTaskRuntime
+        monitor_store: DbMonitorStore
+        _is_setup: bool
+        kernel: RuntimeKernel
+        runtime_id: str
+        runtime_kind: str
+        store: RuntimeStore
+        approval_channel: InMemoryApprovalChannel
+
+        async def setup(self, *, agent_id: str | None = None) -> None: ...
+
+        async def commit_monitor_mutation(
+            self,
+            mutation: DbMonitorMutation,
+        ) -> None: ...
+
+        async def plan_task_specs(
+            self,
+            operation: Operation,
+            specs: Iterable[DbTaskSpec],
+            *,
+            contract: DbOperationContract | Mapping[str, Any] | None = None,
+        ) -> DbTaskPlan: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
+
+        async def inspect_operation(
+            self,
+            operation_id: str,
+        ) -> OperationSnapshot | None: ...
+
+        async def _record_operation_result(
+            self,
+            result: DbOperationResult,
+            *,
+            operation: Operation | None = None,
+        ) -> DbOperationResult: ...
+
+        async def _persist_trace_correlation(
+            self,
+            operation: Operation,
+            *,
+            intent_kind: str | None = None,
+        ) -> Operation: ...
+
+        async def _monitor_approval_context(
+            self,
+            approval: ApprovalRequest,
+        ) -> dict[str, Any]: ...
+
+        def _current_trace_metadata(self) -> dict[str, str]: ...
+
+        def _record_active_span_correlation(
+            self,
+            operation: Operation,
+            *,
+            intent_kind: str | None = None,
+        ) -> None: ...
+
+        def _current_trace_ids(self) -> tuple[str | None, str | None]: ...
+
     async def _latest_monitor_action_result(
         self,
         operation_id: str,
         *,
         action_plan_fingerprint: str,
     ) -> Evidence | None:
-        return await self._latest_evidence(
+        return await self.tasks.latest_evidence(
             operation_id,
             "monitor.action_result",
             payload={"action_plan_fingerprint": action_plan_fingerprint},
@@ -65,7 +145,7 @@ class DbRuntimeMonitorManagementMixin:
             evidence_kind="monitor.definition",
             payload={"monitor": monitor.to_dict()},
         )
-        await self.monitor_store.commit_monitor_mutation(
+        await self.commit_monitor_mutation(
             DbMonitorMutation(
                 action="create",
                 operation=operation,
@@ -102,14 +182,20 @@ class DbRuntimeMonitorManagementMixin:
         patch: dict[str, Any],
     ) -> DbMonitor:
         """Patch a durable monitor definition through runtime lifecycle tasks."""
-        result = await self.execute_monitor_lifecycle_operation(
-            {
-                "operation_type": "monitor.update",
-                "monitor_id": monitor_id,
-                "patch": dict(patch),
-            }
+        result, monitor, validation_errors = (
+            await self._execute_monitor_lifecycle_operation(
+                {
+                    "operation_type": "monitor.update",
+                    "monitor_id": monitor_id,
+                    "patch": dict(patch),
+                }
+            )
         )
-        return _monitor_from_lifecycle_result(result)
+        return _monitor_from_lifecycle_outcome(
+            result,
+            monitor=monitor,
+            validation_errors=validation_errors,
+        )
 
     async def pause_monitor(
         self,
@@ -118,34 +204,52 @@ class DbRuntimeMonitorManagementMixin:
         paused_until: str | None = None,
     ) -> DbMonitor:
         """Pause a monitor through runtime lifecycle tasks."""
-        result = await self.execute_monitor_lifecycle_operation(
-            {
-                "operation_type": "monitor.pause",
-                "monitor_id": monitor_id,
-                "paused_until": paused_until,
-            }
+        result, monitor, validation_errors = (
+            await self._execute_monitor_lifecycle_operation(
+                {
+                    "operation_type": "monitor.pause",
+                    "monitor_id": monitor_id,
+                    "paused_until": paused_until,
+                }
+            )
         )
-        return _monitor_from_lifecycle_result(result)
+        return _monitor_from_lifecycle_outcome(
+            result,
+            monitor=monitor,
+            validation_errors=validation_errors,
+        )
 
     async def resume_monitor(self, monitor_id: str) -> DbMonitor:
         """Resume a monitor through runtime lifecycle tasks."""
-        result = await self.execute_monitor_lifecycle_operation(
-            {
-                "operation_type": "monitor.resume",
-                "monitor_id": monitor_id,
-            }
+        result, monitor, validation_errors = (
+            await self._execute_monitor_lifecycle_operation(
+                {
+                    "operation_type": "monitor.resume",
+                    "monitor_id": monitor_id,
+                }
+            )
         )
-        return _monitor_from_lifecycle_result(result)
+        return _monitor_from_lifecycle_outcome(
+            result,
+            monitor=monitor,
+            validation_errors=validation_errors,
+        )
 
     async def delete_monitor(self, monitor_id: str) -> DbMonitor:
         """Delete a monitor through runtime lifecycle tasks."""
-        result = await self.execute_monitor_lifecycle_operation(
-            {
-                "operation_type": "monitor.delete",
-                "monitor_id": monitor_id,
-            }
+        result, monitor, validation_errors = (
+            await self._execute_monitor_lifecycle_operation(
+                {
+                    "operation_type": "monitor.delete",
+                    "monitor_id": monitor_id,
+                }
+            )
         )
-        return _monitor_from_lifecycle_result(result)
+        return _monitor_from_lifecycle_outcome(
+            result,
+            monitor=monitor,
+            validation_errors=validation_errors,
+        )
 
     async def execute_monitor_lifecycle_operation(
         self,
@@ -155,7 +259,24 @@ class DbRuntimeMonitorManagementMixin:
         operation_id: str | None = None,
         source: str = "runtime",
     ) -> DbOperationResult:
-        """Run update/delete/pause/resume through proposal and commit tasks."""
+        """Run a monitor lifecycle operation and return its public result."""
+        result, _, _ = await self._execute_monitor_lifecycle_operation(
+            request,
+            context=context,
+            operation_id=operation_id,
+            source=source,
+        )
+        return result
+
+    async def _execute_monitor_lifecycle_operation(
+        self,
+        request: dict[str, Any],
+        *,
+        context: dict[str, Any] | None = None,
+        operation_id: str | None = None,
+        source: str = "runtime",
+    ) -> tuple[DbOperationResult, DbMonitor | None, tuple[str, ...]]:
+        """Run lifecycle tasks while retaining owner-local typed outcomes."""
 
         if not self._is_setup:
             await self.setup()
@@ -211,29 +332,32 @@ class DbRuntimeMonitorManagementMixin:
             operation,
             intent_kind=DbIntentKind.ADMIN.value,
         )
-        plan_task = await self.kernel.plan_task(
-            operation_id=operation.id,
-            capability_id="db.monitor.plan_lifecycle",
-            owner="db_runtime",
-            input={
-                "action": action,
-                "monitor_id": monitor_id,
-                "patch": patch,
-                "paused_until": paused_until,
-            },
-            metadata={
-                "reason": f"monitor_{action}_planning",
-                "sequence": 1,
-                "idempotency_key": _stable_monitor_lifecycle_hash(
-                    {
-                        "operation_type": operation_type,
+        plan = await self.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.monitor.plan_lifecycle",
+                    owner="db_runtime",
+                    input={
+                        "action": action,
                         "monitor_id": monitor_id,
                         "patch": patch,
                         "paused_until": paused_until,
-                    }
+                    },
+                    reason=f"monitor_{action}_planning",
+                    sequence=1,
+                    idempotency_key=persisted_fingerprint(
+                        {
+                            "operation_type": operation_type,
+                            "monitor_id": monitor_id,
+                            "patch": patch,
+                            "paused_until": paused_until,
+                        }
+                    ),
                 ),
-            },
+            ),
         )
+        plan_task = plan.tasks[0]
         plan_evidence = await self.execute_task(plan_task, operation)
         proposal_evidence = next(
             (item for item in plan_evidence if item.kind == "monitor.proposal"),
@@ -251,12 +375,12 @@ class DbRuntimeMonitorManagementMixin:
                 message="Monitor lifecycle proposal is incomplete or unsupported.",
                 payload={"validation": validation.to_dict()},
             )
-            return await self._record_monitor_lifecycle_result(
+            result = await self._record_monitor_lifecycle_result(
                 request=request,
                 operation=operation,
                 action=action,
                 status=OperationStatus.BLOCKED,
-                answer=_monitor_lifecycle_validation_answer(action, validation),
+                answer=_monitor_lifecycle_validation_answer(action),
                 evidence=tuple(plan_evidence),
                 warnings=("db_monitor_validation_failed", *validation.warnings),
                 diagnostics={
@@ -264,37 +388,43 @@ class DbRuntimeMonitorManagementMixin:
                     "validation": validation.to_dict(),
                 },
             )
+            return result, None, tuple(str(item) for item in validation.errors)
 
-        commit_task = await self.kernel.plan_task(
-            operation_id=operation.id,
-            capability_id="db.monitor.commit_lifecycle",
-            owner="db_runtime",
-            input={
-                "proposal_evidence_id": proposal_evidence.id,
-                "proposal_fingerprint": proposal["proposal_fingerprint"],
-            },
-            metadata={
-                "reason": f"monitor_{action}_commit",
-                "sequence": 2,
-                "idempotency_key": proposal["proposal_fingerprint"],
-            },
-            dependencies=(
-                TaskDependency(
-                    kind="evidence",
-                    evidence_kind="monitor.proposal",
-                    evidence_id=proposal_evidence.id,
-                    evidence_owner="db_runtime",
-                    producer_task_id=plan_task.id,
-                    producer_capability_id=plan_task.capability_id,
-                    producer_executor_id=plan_task.executor_id,
-                    evidence_payload={
+        commit_plan = await self.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.monitor.commit_lifecycle",
+                    owner="db_runtime",
+                    input={
+                        "proposal_evidence_id": proposal_evidence.id,
                         "proposal_fingerprint": proposal["proposal_fingerprint"],
                     },
-                    evidence_accepted=True,
-                    operation_id=operation.id,
+                    reason=f"monitor_{action}_commit",
+                    sequence=2,
+                    dependencies=(
+                        TaskDependency(
+                            kind="evidence",
+                            evidence_kind="monitor.proposal",
+                            evidence_id=proposal_evidence.id,
+                            evidence_owner="db_runtime",
+                            producer_task_id=plan_task.id,
+                            producer_capability_id=plan_task.capability_id,
+                            producer_executor_id=plan_task.executor_id,
+                            evidence_payload={
+                                "proposal_fingerprint": proposal[
+                                    "proposal_fingerprint"
+                                ],
+                            },
+                            evidence_accepted=True,
+                            operation_id=operation.id,
+                        ),
+                    ),
+                    idempotency_key=proposal["proposal_fingerprint"],
                 ),
             ),
         )
+        commit_task = commit_plan.tasks[0]
         try:
             commit_evidence = await self.execute_task(commit_task, operation)
         except DbRuntimeGovernanceBlocked as exc:
@@ -302,7 +432,7 @@ class DbRuntimeMonitorManagementMixin:
             evidence = tuple(plan_evidence)
             if snapshot is not None:
                 evidence = tuple(snapshot.evidence)
-            return await self._record_monitor_lifecycle_result(
+            result = await self._record_monitor_lifecycle_result(
                 request=request,
                 operation=exc.operation,
                 action=action,
@@ -316,6 +446,7 @@ class DbRuntimeMonitorManagementMixin:
                     "governance": exc.governance.to_dict(),
                 },
             )
+            return result, None, ()
 
         lifecycle_evidence = next(
             (
@@ -345,7 +476,7 @@ class DbRuntimeMonitorManagementMixin:
             message=f"Monitor {monitor_id} {action} committed.",
             payload={"monitor_id": monitor_id, "action": action},
         )
-        return await self._record_monitor_lifecycle_result(
+        result = await self._record_monitor_lifecycle_result(
             request=request,
             operation=operation,
             action=action,
@@ -358,6 +489,7 @@ class DbRuntimeMonitorManagementMixin:
                 "monitor": None if monitor is None else monitor.to_dict(),
             },
         )
+        return result, monitor, ()
 
     async def _record_monitor_lifecycle_result(
         self,
@@ -433,7 +565,7 @@ class DbRuntimeMonitorManagementMixin:
                     "approval_id": approval.approval_id,
                     "operation_id": approval.operation_id,
                     "task_id": getattr(approval, "task_id", None),
-                    "status": approval.status.value,
+                    "status": approval.status_value,
                     "reason": approval.reason,
                     "risk": approval.risk.value,
                     "requested_by_policy_id": approval.requested_by_policy_id,
@@ -467,144 +599,6 @@ class DbRuntimeMonitorManagementMixin:
         scheduler = DbMonitorScheduler(runtime=self)
         results = await scheduler.run_once(now=now)
         return tuple(result.run for result in results)
-
-    async def record_monitor_command_result(
-        self,
-        *,
-        request: DbRequest,
-        kind: str,
-        command: dict[str, Any],
-        status: OperationStatus,
-        answer: str,
-        operation_id: str | None = None,
-        evidence: tuple[Evidence, ...] = (),
-        evidence_kind: str | None = None,
-        payload: dict[str, Any] | None = None,
-        warnings: tuple[str, ...] = (),
-        diagnostics: dict[str, Any] | None = None,
-        persist_operation: bool = True,
-    ) -> DbOperationResult:
-        """Record a prompt-level monitor command result through runtime audit.
-
-        This is a control-plane audit path only. It persists operation/evidence/
-        event records for monitor management commands without planning SQL,
-        creating tasks, invoking executors, or evaluating governance.
-        """
-        command_payload = dict(command)
-        operation_id = operation_id or f"monitor-command-{kind}-{uuid4()}"
-        persisted_evidence = tuple(evidence)
-        if persist_operation:
-            operation = Operation(
-                id=operation_id,
-                operation_type=f"monitor.{kind}",
-                status=status,
-                request={
-                    "kind": f"monitor.{kind}",
-                    "prompt": request.prompt,
-                    "user_id": request.user_id,
-                    "session_id": request.session_id,
-                    "source_scope": list(request.source_scope),
-                    "metadata": request.metadata,
-                    "command": command_payload,
-                },
-                required_evidence=(
-                    frozenset({evidence_kind})
-                    if evidence_kind is not None
-                    else frozenset()
-                ),
-                metadata={
-                    "runtime_id": self.runtime_id,
-                    "runtime_kind": self.runtime_kind,
-                    "control_plane": "db.monitor",
-                    "monitor_id": command_payload.get("monitor_id"),
-                    "command_kind": kind,
-                    "user_id": request.user_id,
-                    "session_id": request.session_id,
-                    "source_scope": list(request.source_scope),
-                    "request_metadata": request.metadata,
-                },
-            )
-            operation = await self._persist_trace_correlation(
-                operation=operation,
-                intent_kind=DbIntentKind.ADMIN.value,
-            )
-            if evidence_kind is not None:
-                persisted_evidence = (
-                    Evidence(
-                        id=f"monitor-command-evidence-{uuid4()}",
-                        kind=evidence_kind,
-                        owner="db.monitor",
-                        operation_id=operation_id,
-                        payload=dict(payload or {}),
-                        accepted=status is OperationStatus.SUCCEEDED,
-                    ),
-                )
-            trace_id, span_id = self._current_trace_ids()
-            created_event = RuntimeEvent(
-                id=f"monitor-command-event-{uuid4()}",
-                type=RuntimeEventType.OPERATION_CREATED,
-                operation_id=operation_id,
-                runtime_id=self.runtime_id,
-                runtime_kind=self.runtime_kind,
-                trace_id=trace_id,
-                span_id=span_id,
-                message=f"Monitor command operation {operation_id} created.",
-                payload={"operation_type": operation.operation_type},
-            )
-            completed_event = RuntimeEvent(
-                id=f"monitor-command-event-{uuid4()}",
-                type=RuntimeEventType.OPERATION_UPDATED,
-                operation_id=operation_id,
-                runtime_id=self.runtime_id,
-                runtime_kind=self.runtime_kind,
-                evidence_id=(persisted_evidence[0].id if persisted_evidence else None),
-                trace_id=trace_id,
-                span_id=span_id,
-                message=f"Monitor command {kind} finished with {status.value}.",
-                payload={
-                    "status": status.value,
-                    "command_kind": kind,
-                    "monitor_id": command_payload.get("monitor_id"),
-                    "warnings": list(warnings),
-                },
-            )
-            await self.store.save_operation(operation)
-            for item in persisted_evidence:
-                await self.store.save_evidence(item)
-            await self.store.append_event(created_event)
-            await self.store.append_event(completed_event)
-
-        result = DbOperationResult(
-            operation_id=operation_id,
-            request=request,
-            intent=DbIntent(
-                kind=DbIntentKind.ADMIN,
-                confidence=float(command_payload.get("confidence") or 0.0),
-                access=AccessMode.NONE,
-                diagnostics={
-                    "command_kind": kind,
-                    **dict(command_payload.get("diagnostics") or {}),
-                },
-            ),
-            contract=DbOperationContract(
-                operation_type=f"monitor.{kind}",
-                required_evidence=tuple(item.kind for item in persisted_evidence),
-                access=AccessMode.NONE,
-                metadata={
-                    "control_plane": "db.monitor",
-                    "command": command_payload,
-                },
-            ),
-            status=status,
-            answer=answer,
-            evidence=persisted_evidence,
-            warnings=warnings,
-            diagnostics={
-                "command": command_payload,
-                **dict(diagnostics or {}),
-            },
-        )
-        return await self._record_operation_result(result)
 
     def _monitor_management_artifacts(
         self,
@@ -690,22 +684,25 @@ def _raise_if_non_executable_active_monitor(monitor: DbMonitor) -> None:
         )
 
 
-def _monitor_from_lifecycle_result(result: DbOperationResult) -> DbMonitor:
+def _monitor_from_lifecycle_outcome(
+    result: DbOperationResult,
+    *,
+    monitor: DbMonitor | None,
+    validation_errors: tuple[str, ...],
+) -> DbMonitor:
     if result.status is OperationStatus.BLOCKED:
         if "db_monitor_validation_failed" in result.warnings:
-            validation = result.diagnostics.get("validation")
-            if isinstance(validation, dict) and validation.get("errors"):
-                message = ", ".join(str(item) for item in validation["errors"])
+            if validation_errors:
+                message = ", ".join(validation_errors)
                 message = message.replace("monitor.lifecycle:", "")
                 raise ValueError(message)
             raise ValueError(result.answer or "Monitor lifecycle proposal is invalid.")
         raise PermissionError(
             result.answer or "Monitor lifecycle operation is blocked."
         )
-    monitor = result.diagnostics.get("monitor")
-    if not isinstance(monitor, dict):
+    if monitor is None:
         raise RuntimeError("monitor lifecycle operation did not return a monitor")
-    return DbMonitor.from_dict(monitor)
+    return monitor
 
 
 def _monitor_lifecycle_action(operation_type: str) -> str:
@@ -738,11 +735,8 @@ def _validation_from_lifecycle_proposal(proposal: dict[str, Any]) -> Any:
     return DbMonitorValidation(accepted=bool(proposal.get("accepted", True)))
 
 
-def _monitor_lifecycle_validation_answer(action: str, validation: Any) -> str:
-    errors = ", ".join(str(item) for item in validation.errors)
-    return f"Monitor {action} proposal is incomplete or unsupported" + (
-        f": {errors}" if errors else "."
-    )
+def _monitor_lifecycle_validation_answer(action: str) -> str:
+    return f"Monitor {action} proposal is incomplete or unsupported."
 
 
 def _monitor_lifecycle_answer(action: str, monitor_id: str) -> str:
@@ -754,11 +748,6 @@ def _monitor_lifecycle_answer(action: str, monitor_id: str) -> str:
         "disable": "Disabled",
     }.get(action, "Updated")
     return f"{verb} monitor {monitor_id}."
-
-
-def _stable_monitor_lifecycle_hash(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _non_executable_observation_plan_reason(plan: dict[str, Any]) -> str | None:

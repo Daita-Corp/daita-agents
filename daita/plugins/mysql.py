@@ -6,7 +6,7 @@ Simple MySQL connection and querying - no over-engineering.
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Protocol, TYPE_CHECKING
 from urllib.parse import urlparse, quote
 
 from .base import PluginContext
@@ -19,9 +19,54 @@ from .mysql_extensions import (
     mysql_tool_views,
 )
 from .sql_params import coerce_sql_params, param_specs_from_payload
+from ..core.exceptions import ValidationError
 
 if TYPE_CHECKING:
-    from ..core.tools import LocalTool
+    from collections.abc import Sequence
+    from types import TracebackType
+
+    class _MySQLCursor(Protocol):
+        description: Sequence[Sequence[object]]
+        rowcount: int
+
+        async def execute(self, query: str, args: object = ...) -> object: ...
+
+        async def executemany(
+            self, query: str, args: Sequence[Sequence[object]]
+        ) -> object: ...
+
+        async def fetchall(self) -> Sequence[Sequence[object]]: ...
+
+    class _MySQLCursorContext(Protocol):
+        async def __aenter__(self) -> _MySQLCursor: ...
+
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None: ...
+
+    class _MySQLConnection(Protocol):
+        def cursor(self) -> _MySQLCursorContext: ...
+
+    class _MySQLConnectionContext(Protocol):
+        async def __aenter__(self) -> _MySQLConnection: ...
+
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None: ...
+
+    class _MySQLPool(Protocol):
+        def acquire(self) -> _MySQLConnectionContext: ...
+
+        def close(self) -> None: ...
+
+        async def wait_closed(self) -> None: ...
+
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +135,19 @@ class MySQLPlugin(BaseDatabasePlugin):
             connection_string=connection_string,
             **kwargs,
         )
+        self._pool: Optional["_MySQLPool"] = None
 
         logger.debug(f"MySQL plugin configured for {host}:{port}/{database}")
+
+    @property
+    def pool(self) -> "_MySQLPool":
+        """Return the active connection pool owned by this plugin."""
+        if self._pool is None:
+            raise ValidationError(
+                "MySQLPlugin is not connected to database",
+                field="connection_state",
+            )
+        return self._pool
 
     async def setup(self, context: PluginContext) -> None:
         """Set up the MySQL connector for a runtime."""
@@ -246,9 +302,11 @@ class MySQLPlugin(BaseDatabasePlugin):
             return  # Already connected
 
         try:
-            import aiomysql
+            from importlib import import_module
 
-            self._pool = await aiomysql.create_pool(
+            aiomysql = import_module("aiomysql")
+            create_pool = getattr(aiomysql, "create_pool")
+            self._pool = await create_pool(
                 host=self.host,
                 port=self.port,
                 user=self.user,
@@ -257,13 +315,10 @@ class MySQLPlugin(BaseDatabasePlugin):
                 **self.pool_config,
             )
             logger.info("Connected to MySQL")
-        except ImportError:
-            self._handle_connection_error(
-                ImportError(
-                    "aiomysql not installed. Install with: pip install 'daita-agents[mysql]'"
-                ),
-                "connection",
-            )
+        except ImportError as exc:
+            raise ImportError(
+                "aiomysql is required. Install with: pip install 'daita-agents[mysql]'"
+            ) from exc
         except Exception as e:
             self._handle_connection_error(e, "connection")
 
@@ -296,7 +351,8 @@ class MySQLPlugin(BaseDatabasePlugin):
         if self._pool is None:
             await self.connect()
 
-        async with self._pool.acquire() as conn:
+        pool = self.pool
+        async with pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 if params:
                     await cursor.execute(sql, params)
@@ -304,7 +360,7 @@ class MySQLPlugin(BaseDatabasePlugin):
                     await cursor.execute(sql)
 
                 rows = await cursor.fetchall()
-                columns = [desc[0] for desc in cursor.description]
+                columns = [str(desc[0]) for desc in cursor.description]
 
                 return [dict(zip(columns, row)) for row in rows]
 
@@ -324,7 +380,8 @@ class MySQLPlugin(BaseDatabasePlugin):
         if self._pool is None:
             await self.connect()
 
-        async with self._pool.acquire() as conn:
+        pool = self.pool
+        async with pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 if params:
                     await cursor.execute(sql, params)
@@ -360,7 +417,8 @@ class MySQLPlugin(BaseDatabasePlugin):
         # Convert to list of tuples for executemany
         rows = [tuple(row[col] for col in columns) for row in data]
 
-        async with self._pool.acquire() as conn:
+        pool = self.pool
+        async with pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.executemany(sql, rows)
                 return cursor.rowcount
@@ -449,6 +507,8 @@ class MySQLPlugin(BaseDatabasePlugin):
     async def _tool_get_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mysql_get_schema (kept for backward compat)"""
         table_name = args.get("table_name")
+        if not isinstance(table_name, str) or not table_name:
+            raise ValidationError("table_name is required", field="table_name")
         columns = await self.describe(table_name)
         return {
             "table": table_name,
@@ -485,6 +545,8 @@ class MySQLPlugin(BaseDatabasePlugin):
     async def _tool_count(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mysql_count"""
         table = args.get("table")
+        if not isinstance(table, str) or not table:
+            raise ValidationError("table is required", field="table")
         filter_clause = args.get("filter")
         count = await self.count_rows(table, filter_clause)
         return {"table": table, "count": count}
@@ -492,6 +554,8 @@ class MySQLPlugin(BaseDatabasePlugin):
     async def _tool_sample(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for mysql_sample"""
         table = args.get("table")
+        if not isinstance(table, str) or not table:
+            raise ValidationError("table is required", field="table")
         n = args.get("n", 5)
         rows = await self.sample_rows(table, n)
         return {"table": table, "rows": rows}

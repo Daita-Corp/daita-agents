@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from daita.runtime import Evidence, Operation, Task
+from typing import Any, TYPE_CHECKING
+
+from daita.runtime import Capability, Evidence, Operation, Task, TaskDependency
+
+if TYPE_CHECKING:
+    from daita.plugins import ExtensionRegistry
+    from daita.runtime import RuntimeStore
 
 from ...analysis import analysis_metadata
 from ...evidence import DbEvidenceStore
@@ -11,6 +17,28 @@ from .materialization import _dependency_for_evidence
 
 
 class DbRuntimeAnalysisSynthesisMixin:
+    if TYPE_CHECKING:
+        registry: ExtensionRegistry
+        store: RuntimeStore
+
+        async def _analysis_task(
+            self,
+            operation: Operation,
+            capability: Capability,
+            *,
+            input: dict[str, Any],
+            metadata: dict[str, Any],
+            dependencies: tuple[TaskDependency, ...],
+            sequence: int,
+        ) -> Task: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
+
     async def _execute_analysis_synthesis_task(
         self,
         operation: Operation,
@@ -39,7 +67,7 @@ class DbRuntimeAnalysisSynthesisMixin:
             step_kind="synthesis",
             plan_evidence_id=plan_evidence.id,
         )
-        task = self._analysis_task(
+        task = await self._analysis_task(
             operation,
             capability,
             input={

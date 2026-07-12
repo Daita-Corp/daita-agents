@@ -38,6 +38,7 @@ from .models import (
     EvalReport,
     ReportSummary,
     RunResult,
+    Status,
 )
 
 
@@ -58,11 +59,6 @@ async def run_suite(
 
     agent_info = {
         "factory": config.agent.factory,
-        "from_db": (
-            config.agent.from_db.model_dump(mode="json")
-            if config.agent.from_db is not None
-            else None
-        ),
         "agent_id": getattr(target, "agent_id", None),
         "agent_name": config.agent.label or getattr(target, "name", None),
         "model": _get_model(target),
@@ -118,10 +114,8 @@ async def run_suite(
 
 
 async def load_target(config: AgentConfig) -> Any:
-    if config.from_db is not None:
-        return await load_from_db(config.from_db.source, config.from_db.kwargs)
     if config.factory is None:
-        raise ValueError("agent.factory is required when agent.from_db is not set")
+        raise ValueError("agent.factory is required")
     return await load_factory(config.factory, config.kwargs)
 
 
@@ -135,12 +129,6 @@ async def load_factory(factory_path: str, kwargs: dict[str, Any]) -> Any:
     if inspect.isawaitable(result):
         result = await result
     return result
-
-
-async def load_from_db(source: str, kwargs: dict[str, Any]) -> Any:
-    from daita.db import from_db
-
-    return await from_db(source, **kwargs)
 
 
 class RunnableAdapter:
@@ -271,7 +259,7 @@ def _to_run_result(
     run_id: str,
     evidence: RunEvidence,
     assertions,
-    status: str,
+    status: Status,
     judges: list[JudgeEvaluation] | None = None,
 ) -> RunResult:
     judge_results = []

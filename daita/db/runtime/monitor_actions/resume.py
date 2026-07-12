@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from daita.runtime import (
@@ -21,8 +21,90 @@ from ..monitor_helpers import (
 )
 from ..resume import _monitor_action_context
 
+if TYPE_CHECKING:
+    from daita.runtime import Evidence, RuntimeStore
+
+    from ...monitors import DbMonitorStore
+    from ..tasks.runtime import DbTaskRuntime
+
 
 class DbRuntimeMonitorActionResumeMixin:
+    if TYPE_CHECKING:
+        tasks: DbTaskRuntime
+        store: RuntimeStore
+        monitor_store: DbMonitorStore
+        runtime_id: str
+        runtime_kind: str
+
+        async def _latest_monitor_action_result(
+            self,
+            operation_id: str,
+            *,
+            action_plan_fingerprint: str,
+        ) -> Evidence | None: ...
+
+        def _has_pending_approvals(self, snapshot: OperationSnapshot) -> bool: ...
+
+        async def _persist_monitor_action_plan_evidence(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_plan: dict[str, Any],
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+        ) -> Evidence: ...
+
+        async def _finalize_resumed_monitor_write_action(
+            self,
+            snapshot: OperationSnapshot,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_plan: dict[str, Any],
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            plan_evidence: Evidence,
+        ) -> dict[str, Any]: ...
+
+        async def _persist_monitor_report_evidence(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_plan: dict[str, Any],
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            produced_evidence: tuple[Evidence, ...],
+        ) -> Evidence: ...
+
+        async def _persist_monitor_action_result(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_kind: str,
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            plan_evidence: Evidence,
+            status: str,
+            block_reason: str | None = None,
+            extra_produced_evidence: tuple[Evidence, ...] = (),
+            supersede_approval_block: bool = False,
+        ) -> dict[str, Any]: ...
+
+        async def commit_monitor_mutation(
+            self,
+            mutation: DbMonitorMutation,
+        ) -> None: ...
+
     async def _finalize_resumed_monitor_action(
         self,
         snapshot: OperationSnapshot,
@@ -66,7 +148,7 @@ class DbRuntimeMonitorActionResumeMixin:
             for item in context.get("cited_tick_evidence_refs") or ()
             if isinstance(item, dict)
         )
-        plan_evidence = await self._latest_evidence(
+        plan_evidence = await self.tasks.latest_evidence(
             snapshot.operation.id,
             "monitor.action_plan",
             payload={"action_plan_fingerprint": fingerprint},
@@ -101,7 +183,7 @@ class DbRuntimeMonitorActionResumeMixin:
 
         status = _monitor_action_status_from_operation(snapshot.operation)
         if action_plan.get("kind") == "scheduled_report":
-            report = await self._latest_evidence(
+            report = await self.tasks.latest_evidence(
                 snapshot.operation.id,
                 "monitor.report",
                 payload={"action_plan_fingerprint": fingerprint},
@@ -209,7 +291,7 @@ class DbRuntimeMonitorActionResumeMixin:
             return
         updated_run = DbMonitorRun.from_dict({**run.to_dict(), "summary": summary})
         state = await self.monitor_store.load_monitor_state(monitor_id)
-        await self.monitor_store.commit_monitor_mutation(
+        await self.commit_monitor_mutation(
             DbMonitorMutation(
                 action="run",
                 operation=operation,

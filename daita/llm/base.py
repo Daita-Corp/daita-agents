@@ -8,7 +8,7 @@ configuration required. Subclass this to add a new LLM provider.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List
+from typing import Any, AsyncIterator, Dict, List, Optional
 from contextlib import asynccontextmanager
 import logging
 
@@ -235,12 +235,12 @@ class BaseLLMProvider(LLMProvider, ABC):
         pass
 
     @abstractmethod
-    async def _stream_impl(
+    def _stream_impl(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
         **kwargs,
-    ):
+    ) -> AsyncIterator[Any]:
         """
         Provider-specific streaming implementation.
 
@@ -252,7 +252,7 @@ class BaseLLMProvider(LLMProvider, ABC):
         Yields:
             LLMChunk objects with type "text" or "tool_call_complete"
         """
-        pass
+        ...
 
     @staticmethod
     def _extract_tokens(usage) -> Dict[str, int]:
@@ -269,11 +269,15 @@ class BaseLLMProvider(LLMProvider, ABC):
         if isinstance(usage, dict):
             prompt_details = usage.get("prompt_tokens_details") or {}
             completion_details = usage.get("completion_tokens_details") or {}
-            prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
-            completion_tokens = usage.get(
-                "completion_tokens", usage.get("output_tokens", 0)
+            prompt_tokens = (
+                usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
             )
-            total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+            completion_tokens = (
+                usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+            )
+            total_tokens = (
+                usage.get("total_tokens") or prompt_tokens + completion_tokens
+            )
             return {
                 "total_tokens": total_tokens,
                 "prompt_tokens": prompt_tokens,
@@ -601,7 +605,10 @@ def _tool_to_openai_function(tool: Any) -> Dict[str, Any]:
     """Convert LocalTool or ModelToolSpec-like objects to OpenAI tool format."""
     converter = getattr(tool, "to_openai_function", None)
     if callable(converter):
-        return converter()
+        converted = converter()
+        if not isinstance(converted, dict):
+            raise TypeError("OpenAI tool conversion must return a dictionary")
+        return {str(key): value for key, value in converted.items()}
     return {
         "type": "function",
         "function": {
@@ -616,7 +623,10 @@ def _tool_to_anthropic_tool(tool: Any) -> Dict[str, Any]:
     """Convert LocalTool or ModelToolSpec-like objects to Anthropic tool format."""
     converter = getattr(tool, "to_anthropic_tool", None)
     if callable(converter):
-        return converter()
+        converted = converter()
+        if not isinstance(converted, dict):
+            raise TypeError("Anthropic tool conversion must return a dictionary")
+        return {str(key): value for key, value in converted.items()}
     return {
         "name": tool.name,
         "description": tool.description,

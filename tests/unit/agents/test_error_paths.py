@@ -51,10 +51,8 @@ class TestJsonSerializer:
 
     def test_object_with_no_serialization_path_raises_type_error(self):
         """Objects with neither to_dict nor __dict__ (unlikely but possible) raise TypeError."""
-        import ctypes
 
-        # A ctypes instance has no __dict__ and no to_dict
-        # Use a simpler approach: create a class that blocks __dict__
+        # Use a class that blocks __dict__.
         class NoDict:
             __slots__ = ()
 

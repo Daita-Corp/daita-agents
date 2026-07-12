@@ -946,7 +946,7 @@ class TestTokenReduction:
     real-world scenarios. These numbers represent approximate token savings.
     """
 
-    def test_print_reduction_summary(self, capsys):
+    def test_print_reduction_summary(self):
         """Print a human-readable reduction table for each scenario."""
         scenarios = [
             (

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from daita.evals import EvalSuite, EvalSuiteConfig
 from daita.evals.analysis import RunEvidence, extract_run_evidence, summarize_stability
 from daita.evals.assertions.runtime import (
@@ -60,6 +62,22 @@ def test_load_json_config(tmp_path):
     )
 
     assert EvalSuiteConfig.from_file(path).name == "json-evals"
+
+
+def test_eval_targets_require_an_explicit_factory_boundary():
+    with pytest.raises(ValueError, match="from_db"):
+        EvalSuiteConfig.model_validate(
+            {
+                "name": "invalid-from-db-bag",
+                "agent": {
+                    "from_db": {
+                        "source": ":memory:",
+                        "kwargs": {"read_only": False},
+                    }
+                },
+                "cases": [{"id": "case-1", "prompt": "hello"}],
+            }
+        )
 
 
 async def test_suite_runs_factory_agent_and_writes_artifacts(tmp_path):
@@ -579,7 +597,8 @@ def test_exact_capability_sequence_assertion_fails_on_order_drift():
                 "expectations": {
                     "capabilities": {
                         "exact_sequence": [
-                            "db.query.prepare_read",
+                            "db.query.plan",
+                            "db.query.plan.validate",
                             "db.sql.validate",
                             "db.sql.execute_read",
                             "db.answer.synthesize",
@@ -591,9 +610,10 @@ def test_exact_capability_sequence_assertion_fails_on_order_drift():
     )
     evidence = _run_evidence(
         capabilities=[
-            "db.query.prepare_read",
             "db.sql.execute_read",
+            "db.query.plan",
             "db.sql.validate",
+            "db.query.plan.validate",
             "db.answer.synthesize",
         ]
     )
@@ -619,7 +639,8 @@ def test_allowed_capability_sequences_accept_only_declared_traces():
                     "capabilities": {
                         "allowed_sequences": [
                             [
-                                "db.query.prepare_read",
+                                "db.query.plan",
+                                "db.query.plan.validate",
                                 "db.sql.validate",
                                 "db.sql.execute_read",
                                 "db.answer.synthesize",
@@ -632,7 +653,6 @@ def test_allowed_capability_sequences_accept_only_declared_traces():
     )
     evidence = _run_evidence(
         capabilities=[
-            "db.query.prepare_read",
             "db.query.plan",
             "db.sql.validate",
             "db.sql.execute_read",

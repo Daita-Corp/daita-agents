@@ -6,12 +6,24 @@ Use this generic Agent for non-DB chat, local tools, skills, and lightweight
 runtime-extension experiments.
 """
 
+from __future__ import annotations
+
 import logging
 import time
 from typing import TYPE_CHECKING, Dict, Any, Optional, List, Union, Callable
 
 if TYPE_CHECKING:
     from .conversation import ConversationHistory
+    from daita.db.agent import DbAgent
+    from daita.db.llm_service import DbLLMConfig
+    from daita.db.models import (
+        DbMemoryConfig,
+        DbRuntimeConfig,
+        DbRuntimeOptions,
+        DbSourceOptions,
+    )
+    from daita.plugins.base_db import BaseDatabasePlugin
+    from daita.plugins.catalog import CatalogPlugin
 
 import asyncio
 
@@ -64,40 +76,45 @@ class Agent(ChatAgentFacadeMixin, BaseAgent):
             setattr(cls, f"_default_{key}", value)
 
     @classmethod
-    async def from_db(cls, source, **kwargs):
-        """Create a DB-aware agent from a database source.
-
-        This public entry point is backed by the operation-centric DB runtime.
-        It returns a ``DbAgent`` facade instead of a patched generic ``Agent``.
-
-        Args:
-            source: Connection string (e.g. "postgresql://user:pass@host/db") or
-                    a BaseDatabasePlugin instance.
-            **kwargs: Common options:
-                name: Agent name override.
-                model, api_key, llm_provider: LLM configuration.
-                prompt: User context prepended to auto-generated schema prompt.
-                db_schema: DB schema name override (e.g. "public" for PostgreSQL).
-                lineage: True to auto-create LineagePlugin, or pass an instance.
-                    Seeds FK relationships into a persistent graph.
-                memory: Optional DB memory configuration mapping or DbMemoryConfig.
-                    Pass False to disable planning-time memory recall.
-                skills: Skill instances registered before DbRuntime setup.
-                cache_ttl: Schema cache TTL in seconds. None disables caching.
-                Additional kwargs forwarded to Agent.__init__.
-
-        Example:
-            agent = await Agent.from_db(
-                "postgresql://localhost/mydb",
-                lineage=True,
-                memory={"enabled": True},
-                cache_ttl=3600,
-            )
-            result = await agent.run("What are our top customers?")
-        """
+    async def from_db(
+        cls,
+        source: str | BaseDatabasePlugin,
+        *,
+        name: str | None = None,
+        mode: str | None = None,
+        config: DbRuntimeConfig | None = None,
+        source_options: DbSourceOptions | None = None,
+        llm: DbLLMConfig | None = None,
+        runtime: DbRuntimeOptions | None = None,
+        memory: DbMemoryConfig | None = None,
+        catalog: CatalogPlugin | None | bool = None,
+        lineage: Any | bool | None = None,
+        quality: Any | bool | None = None,
+        history: ConversationHistory | bool | None = None,
+        stateful: bool = False,
+        plugins: tuple[Any, ...] | list[Any] = (),
+        skills: tuple[Any, ...] | list[Any] = (),
+    ) -> DbAgent:
+        """Create a DB-aware agent from typed binding records."""
         from daita.db import from_db
 
-        return await from_db(source, **kwargs)
+        return await from_db(
+            source,
+            name=name,
+            mode=mode,
+            config=config,
+            source_options=source_options,
+            llm=llm,
+            runtime=runtime,
+            memory=memory,
+            catalog=catalog,
+            lineage=lineage,
+            quality=quality,
+            history=history,
+            stateful=stateful,
+            plugins=plugins,
+            skills=skills,
+        )
 
     def __init__(
         self,
@@ -129,6 +146,11 @@ class Agent(ChatAgentFacadeMixin, BaseAgent):
         """Initialize Agent with smart constructor auto-configuration."""
         # Store LLM provider config for lazy initialization
         self._llm_kwargs = kwargs
+        self._llm_provider_name: str | None
+        self._llm_model: str | None
+        self._llm_api_key: str | None
+        self._llm: LLMProvider | None
+        llm_provider_to_pass: LLMProvider | None
         if llm_provider is None or isinstance(llm_provider, str):
             # Defer LLM provider creation until first use
             self._llm_provider_name = llm_provider or self._default_llm_provider
@@ -168,7 +190,7 @@ class Agent(ChatAgentFacadeMixin, BaseAgent):
 
         # Decision display setup
         self.display_reasoning = display_reasoning
-        self._decision_display = None
+        self._decision_display: Any | None = None
 
         if display_reasoning:
             self._setup_decision_display()
@@ -185,7 +207,7 @@ class Agent(ChatAgentFacadeMixin, BaseAgent):
         )
         self._runtime: ChatRuntime | None = None
         self._extension_setup_plugin_ids: set[str] = set()
-        self._local_tool_sources = []
+        self._local_tool_sources: list[Any] = []
         self._tools_setup = False
         for plugin in plugins or []:
             self.add_plugin(plugin)
@@ -239,7 +261,11 @@ class Agent(ChatAgentFacadeMixin, BaseAgent):
         This defers API key validation until the LLM is actually needed,
         improving developer experience when loading .env files.
         """
-        if self._llm is None and self._llm_provider_name is not None:
+        if (
+            self._llm is None
+            and self._llm_provider_name is not None
+            and self._llm_model is not None
+        ):
             # Try to get API key
             api_key = self._llm_api_key or settings.get_llm_api_key(
                 self._llm_provider_name
@@ -286,6 +312,68 @@ class Agent(ChatAgentFacadeMixin, BaseAgent):
             logger.warning(f"Failed to setup decision display: {e}")
             self.display_reasoning = False
             self._decision_display = None
+
+    async def stop(self) -> None:
+        """Stop agent and clean up runtime extension resources."""
+        await self.teardown_extensions()
+
+        # Call parent stop for standard cleanup
+        await super().stop()
+
+    @property
+    def health(self) -> Dict[str, Any]:
+        """Enhanced health information for Agent."""
+        base_health = super().health
+        llm = self.llm
+
+        # Add Agent-specific health info
+        base_health.update(
+            {
+                "tools": {
+                    "count": len(self.available_tools),
+                    "setup": self._tools_setup,
+                    "names": self.tool_names,
+                },
+                "extensions": {
+                    "plugin_ids": list(self.extension_registry.plugin_ids),
+                    "manifest_ids": [manifest.id for manifest in self.plugin_manifests],
+                    "capability_ids": [
+                        capability.id for capability in self.capabilities
+                    ],
+                    "capability_count": len(self.capabilities),
+                    "tool_view_names": [view.name for view in self.tool_views],
+                    "tool_view_count": len(self.tool_views),
+                    "context_provider_ids": [
+                        provider.id for provider in self.context_providers
+                    ],
+                    "context_provider_count": len(self.context_providers),
+                    "executor_ids": [executor.id for executor in self.executors],
+                    "executor_count": len(self.executors),
+                    "policy_ids": [policy.id for policy in self.policies],
+                    "policy_count": len(self.policies),
+                    "evidence_schema_kinds": [
+                        schema.kind for schema in self.evidence_schemas
+                    ],
+                    "evidence_schema_count": len(self.evidence_schemas),
+                    "worker_ids": [worker.id for worker in self.workers],
+                    "worker_count": len(self.workers),
+                    "diagnostic_ids": [
+                        diagnostic.declaration_id
+                        for diagnostic in self.extension_diagnostics
+                    ],
+                    "diagnostic_count": len(self.extension_diagnostics),
+                    "setup_plugin_ids": self.extension_setup_plugin_ids,
+                    "pending_setup_plugin_ids": self.pending_extension_setup_plugin_ids,
+                    "setup_complete": self.extensions_setup_complete,
+                },
+                "llm": {
+                    "available": llm is not None,
+                    "provider": getattr(llm, "provider_name", None),
+                },
+            }
+        )
+
+        return base_health
 
     # ========================================================================
     # USER API - What developers call directly

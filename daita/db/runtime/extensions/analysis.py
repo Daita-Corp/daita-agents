@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any, Mapping
+from typing import Any, Mapping, TYPE_CHECKING
 
 from daita.runtime import Evidence, Operation, Task
 
@@ -14,9 +14,13 @@ from ...analysis import (
     analysis_metadata,
     evidence_ref,
     parse_analysis_plan_json,
-    stable_fingerprint,
     validate_analysis_plan_payload,
 )
+from ...evidence import load_evidence
+from ...fingerprints import persisted_fingerprint
+
+if TYPE_CHECKING:
+    from .plugin import DbRuntimePlanningPlugin
 
 
 async def _analysis_context_ref_errors(
@@ -52,9 +56,9 @@ async def _analysis_context_ref_errors(
                 )
                 continue
             fingerprint = ref.get("payload_fingerprint")
-            actual = evidence.metadata.get("payload_fingerprint") or stable_fingerprint(
-                evidence.payload
-            )
+            actual = evidence.metadata.get(
+                "payload_fingerprint"
+            ) or persisted_fingerprint(evidence.payload)
             if fingerprint is not None and str(fingerprint) != actual:
                 errors.append(
                     f"context_evidence_fingerprint_mismatch:{step_id}:{evidence_id}"
@@ -79,7 +83,7 @@ class DbAnalysisPlanExecutor:
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
         analysis_id = str(task.input.get("analysis_id") or f"analysis-{operation.id}")
-        planning_context = await _load_evidence(
+        planning_context = await load_evidence(
             runtime,
             operation.id,
             task.input.get("planning_context_evidence_id"),
@@ -186,7 +190,7 @@ class DbAnalysisPlanExecutor:
                         plan_evidence_id=evidence_id,
                         phase="plan",
                     ),
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                 },
             )
         ]
@@ -208,7 +212,7 @@ class DbAnalysisPlanValidationExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        plan_evidence = await _load_evidence(
+        plan_evidence = await load_evidence(
             runtime,
             operation.id,
             task.input.get("analysis_plan_evidence_id"),
@@ -239,7 +243,7 @@ class DbAnalysisPlanValidationExecutor:
                 ],
             }
         if not plan_evidence.accepted:
-            errors = list(payload.get("errors") or ())
+            errors: list[str] = [str(item) for item in payload.get("errors") or ()]
             errors.append(
                 str(
                     (plan_evidence.payload.get("diagnostics") or {}).get("failure")
@@ -272,7 +276,7 @@ class DbAnalysisPlanValidationExecutor:
                 payload=payload,
                 metadata={
                     **metadata,
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                     "analysis_plan_fingerprint": validation.plan_fingerprint,
                 },
             )
@@ -331,7 +335,7 @@ class DbAnalysisCheckpointExecutor:
                         step_kind="checkpoint",
                         plan_evidence_id=task.metadata.get("analysis_plan_evidence_id"),
                     ),
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                 },
             )
         ]
@@ -429,7 +433,7 @@ class DbAnalysisSummarizeExecutor:
                     ),
                     "cited_evidence_refs": [item.id for item in cited if item.id],
                     "partial": bool(task.input.get("partial")),
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                 },
             )
         ]
@@ -451,7 +455,7 @@ class DbAnalysisReplanExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        parent = await _load_evidence(
+        parent = await load_evidence(
             runtime,
             operation.id,
             task.input.get("parent_plan_evidence_id"),
@@ -462,7 +466,7 @@ class DbAnalysisReplanExecutor:
         triggers = tuple(
             item
             for item in [
-                await _load_evidence(runtime, operation.id, evidence_id)
+                await load_evidence(runtime, operation.id, evidence_id)
                 for evidence_id in trigger_ids
             ]
             if item is not None
@@ -554,24 +558,11 @@ class DbAnalysisReplanExecutor:
                         phase="replan",
                         plan_evidence_id=parent.id if parent is not None else None,
                     ),
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                     "analysis_revision_number": payload["revision_number"],
                 },
             )
         ]
-
-
-async def _load_evidence(
-    runtime: Any,
-    operation_id: str,
-    evidence_id: Any,
-) -> Evidence | None:
-    if not evidence_id:
-        return None
-    for evidence in await runtime.store.list_evidence(operation_id):
-        if evidence.id == evidence_id:
-            return evidence
-    return None
 
 
 async def _accepted_dependency_evidence(
@@ -581,9 +572,11 @@ async def _accepted_dependency_evidence(
 ) -> tuple[Evidence, ...]:
     evidence = []
     for dependency in task.dependencies:
-        if dependency.kind.value != "evidence":
+        if dependency.kind != "evidence":
             continue
-        item = await runtime._accepted_evidence_for_dependency(operation.id, dependency)
+        item = await runtime.tasks.accepted_evidence_for_dependency(
+            operation.id, dependency
+        )
         if item is not None and item.accepted and item.operation_id == operation.id:
             evidence.append(item)
     return tuple(evidence)
@@ -734,8 +727,9 @@ def _row_count(evidence: Evidence) -> int:
 
 def _compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
     compact = {key: payload.get(key) for key in ("rows", "total_rows", "sql", "valid")}
-    if isinstance(compact.get("rows"), list):
-        compact["rows"] = compact["rows"][:10]
+    rows = compact.get("rows")
+    if isinstance(rows, list):
+        compact["rows"] = rows[:10]
     return {key: value for key, value in compact.items() if value is not None}
 
 
@@ -757,4 +751,4 @@ def _predicted_evidence_id(
     kind: str,
     payload: dict[str, Any],
 ) -> str:
-    return f"evidence-{stable_fingerprint({'operation_id': operation.id, 'task_id': task.id, 'kind': kind, 'payload': payload})}"
+    return f"evidence-{persisted_fingerprint({'operation_id': operation.id, 'task_id': task.id, 'kind': kind, 'payload': payload})}"

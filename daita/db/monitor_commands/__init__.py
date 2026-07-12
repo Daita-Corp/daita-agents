@@ -1,9 +1,5 @@
-"""Prompt routing and planning for DB monitor management commands."""
+"""Structured planning records for DB monitor management."""
 
-from .extractor import (
-    DeterministicMonitorIntentExtractor,
-    MonitorIntentExtractionStrategy,
-)
 from .intent import (
     MonitorActionIntent,
     MonitorBudgetIntent,
@@ -16,10 +12,8 @@ from .intent import (
     MonitorTargetIntent,
 )
 from .naming import monitor_display_name, monitor_display_name_from_proposal
-from .planner import DbMonitorPlanner
+from .planner import DbMonitorPlanner, monitor_create_intent_from_dict
 from .resolver import DbMonitorResolver
-from .router import DbCommandRouter
-from .service import DbMonitorCommandService
 from .types import (
     DbMonitorCommand,
     DbMonitorCommandKind,
@@ -28,25 +22,22 @@ from .types import (
 )
 
 __all__ = [
-    "DbCommandRouter",
     "DbMonitorCommand",
     "DbMonitorCommandKind",
-    "DbMonitorCommandService",
     "DbMonitorPlanner",
     "DbMonitorResolution",
     "DbMonitorResolver",
     "DbMonitorValidation",
-    "DeterministicMonitorIntentExtractor",
     "MonitorActionIntent",
     "MonitorBudgetIntent",
     "MonitorConditionIntent",
     "MonitorCreateIntent",
     "MonitorDeliveryRequest",
     "MonitorDisplayIntent",
-    "MonitorIntentExtractionStrategy",
     "MonitorPolicyIntent",
     "MonitorScheduleIntent",
     "MonitorTargetIntent",
+    "monitor_create_intent_from_dict",
     "monitor_display_name",
     "monitor_display_name_from_proposal",
 ]

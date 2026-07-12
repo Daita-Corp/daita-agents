@@ -175,8 +175,10 @@ class GeminiProvider(BaseLLMProvider):
 
             # Check for function calls - collect ALL of them
             tool_calls = []
-            if response.candidates and response.candidates[0].content.parts:
-                for idx, part in enumerate(response.candidates[0].content.parts):
+            candidate = response.candidates[0] if response.candidates else None
+            content = candidate.content if candidate is not None else None
+            if content is not None and content.parts:
+                for idx, part in enumerate(content.parts):
                     if hasattr(part, "function_call") and part.function_call:
                         fc = part.function_call
                         # Only collect tool calls with valid names
@@ -244,8 +246,10 @@ class GeminiProvider(BaseLLMProvider):
                     yield LLMChunk(type="text", content=chunk.text, model=self.model)
 
                 # Function calls
-                if chunk.candidates and chunk.candidates[0].content.parts:
-                    for idx, part in enumerate(chunk.candidates[0].content.parts):
+                candidate = chunk.candidates[0] if chunk.candidates else None
+                content = candidate.content if candidate is not None else None
+                if content is not None and content.parts:
+                    for idx, part in enumerate(content.parts):
                         if hasattr(part, "function_call") and part.function_call:
                             fc = part.function_call
                             # Only yield if function call has a valid name

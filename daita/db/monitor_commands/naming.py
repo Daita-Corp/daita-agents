@@ -6,7 +6,6 @@ import re
 from typing import Any, Mapping
 
 from .intent import MonitorCreateIntent
-from .prompt_parsing import _monitor_id_from_phrase
 
 MAX_MONITOR_DISPLAY_NAME_LENGTH = 64
 MAX_MONITOR_ID_LENGTH = 48
@@ -120,3 +119,9 @@ def _cap_monitor_id(value: str) -> str:
     if "_" in clipped:
         clipped = clipped.rsplit("_", 1)[0].rstrip("_")
     return clipped or text[:MAX_MONITOR_ID_LENGTH].rstrip("_") or "db_monitor"
+
+
+def _monitor_id_from_phrase(phrase: Any) -> str:
+    text = str(phrase or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return text.strip("_")

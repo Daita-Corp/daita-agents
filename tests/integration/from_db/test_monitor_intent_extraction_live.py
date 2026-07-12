@@ -1,4 +1,4 @@
-"""Live DB integration test for prompt-created monitor intent extraction.
+"""Live DB integration test for prompt-planned monitor creation.
 
 Run:
     pytest tests/integration/from_db/test_monitor_intent_extraction_live.py \
@@ -8,11 +8,10 @@ Set ``DAITA_MONITOR_INTENT_POSTGRES_URL`` to run against a dedicated external
 Postgres test database. Without that, the test uses Docker Postgres when Docker
 is available and falls back to a real SQLite database file otherwise.
 
-This test intentionally does not require a live LLM. Prompt-created monitor
-extraction is deterministic today; the live assertion here is that the
-framework path works end-to-end against a real database schema and still flows
-through proposal evidence, approval/resume, validation, and
-``db.monitor.commit_create``.
+This test intentionally does not require a live LLM. It injects a structured
+planner action and verifies that prompt-created monitor work flows end-to-end
+against a real database schema through ``DbAgentLoop``, proposal evidence,
+validation, and ``db.monitor.commit_create``.
 """
 
 from __future__ import annotations
@@ -27,10 +26,16 @@ from typing import Any
 import pytest
 
 from daita.agents.agent import Agent
+from daita.db import DbSourceOptions
+from daita.db.planner_protocol import (
+    DbPlannerAction,
+    DbPlannerActionKind,
+    DbPlannerDecision,
+    DbPlannerDecisionStatus,
+)
 from daita.db.runtime.extensions import HostedInAppMonitorDeliveryPlugin
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import (
-    ApprovalStatus,
     HostRuntimeContext,
     OperationStatus,
     host_runtime_context,
@@ -191,65 +196,68 @@ def live_db_source(tmp_path):
         container.remove()
 
 
-async def test_live_db_prompt_monitor_create_uses_normalized_intent_and_resume(
+class StructuredMonitorPlanner:
+    def __init__(self, case: dict[str, Any]):
+        self.case = case
+        self.states = []
+
+    async def plan(self, state):
+        self.states.append(state)
+        return DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "monitor.create"},
+            actions=(
+                DbPlannerAction(
+                    action_id="plan_create",
+                    kind=DbPlannerActionKind.PLAN_MONITOR_CREATE,
+                    input={
+                        "prompt": self.case["prompt"],
+                        "monitor_id": self.case["monitor_id"],
+                        "source_scope": [self.case["target"]],
+                        "intent": _intent_payload(self.case),
+                    },
+                ),
+                DbPlannerAction(
+                    action_id="commit_create",
+                    kind=DbPlannerActionKind.COMMIT_MONITOR_CREATE,
+                    input={},
+                    depends_on=("plan_create",),
+                ),
+            ),
+        )
+
+
+async def test_live_db_prompt_monitor_create_uses_structured_planner_actions(
     live_db_source,
 ):
     case = CREATE_CASES[0]
     result = await _create_prompt_monitor(live_db_source, case)
 
-    assert result["created"].status in {
-        OperationStatus.BLOCKED,
-        OperationStatus.SUCCEEDED,
-    }
+    assert result["created"].status is OperationStatus.SUCCEEDED
+    assert len(result["planner"].states) == 1
     assert result["proposal_evidence"].accepted is True
     assert result["validation"]["accepted"] is True
     _assert_proposal_matches_case(result["proposal"], case)
-    _assert_operation_and_approval_match_case(result, case)
+    _assert_operation_matches_case(result)
     _assert_committed_monitor_matches_case(result, case)
 
 
 @pytest.mark.parametrize(
     "case", CREATE_CASES, ids=[case["id"] for case in CREATE_CASES]
 )
-async def test_live_db_prompt_monitor_create_variants_extract_expected_intent(
+async def test_live_db_prompt_monitor_create_variants_plan_expected_monitor(
     live_db_source,
     case,
 ):
     result = await _create_prompt_monitor(live_db_source, case)
 
-    assert result["created"].status in {
-        OperationStatus.BLOCKED,
-        OperationStatus.SUCCEEDED,
-    }
+    assert result["created"].status is OperationStatus.SUCCEEDED
+    assert len(result["planner"].states) == 1
     assert result["proposal_evidence"].accepted is True
     assert result["validation"]["accepted"] is True
     _assert_proposal_matches_case(result["proposal"], case)
-    _assert_operation_and_approval_match_case(result, case)
+    _assert_operation_matches_case(result)
     _assert_committed_monitor_matches_case(result, case)
-
-
-async def test_live_db_prompt_monitor_create_blocks_ambiguous_target(live_db_source):
-    prompt = (
-        "Create a monitor when new rows are added. Notify me in app every 5 minutes."
-    )
-    agent = await _agent_for_monitor_intent(live_db_source, "ambiguous_target")
-
-    try:
-        result = await agent.run_detailed(prompt)
-        evidence = await agent.runtime.store.list_evidence(result.operation_id)
-        proposal_evidence = _latest(evidence, "monitor.proposal")
-        proposal = proposal_evidence.payload
-    finally:
-        await agent.stop()
-
-    assert result.status is OperationStatus.BLOCKED
-    assert proposal_evidence.accepted is False
-    assert proposal["name"] == "DB Monitor"
-    assert proposal["monitor_id"] == "new_rows_every_300_seconds"
-    assert proposal["target_name"] == ""
-    assert proposal["metadata"]["prompt"] == prompt
-    assert "monitor.proposal_incomplete:source" in proposal["validation"]["errors"]
-    assert "create_monitor_when_new_rows_added" not in proposal["monitor_id"]
 
 
 async def _seed_postgres(url: str) -> None:
@@ -270,26 +278,33 @@ async def _seed_postgres(url: str) -> None:
     raise RuntimeError(f"Could not seed Postgres monitor intent test DB: {last_error}")
 
 
-async def _agent_for_monitor_intent(source: str, case_id: str):
+async def _agent_for_monitor_intent(
+    source: str,
+    case_id: str,
+    case: dict[str, Any],
+) -> tuple[Any, StructuredMonitorPlanner]:
     delivery_plugin = HostedInAppMonitorDeliveryPlugin(
         service=lambda payload: {"id": f"live-test-{case_id}"}
     )
+    planner = StructuredMonitorPlanner(case)
     with host_runtime_context(
         HostRuntimeContext(
             surface="web_app",
             delivery_defaults=("in_app",),
+            services={"db_agent_planner": planner},
             runtime_extensions=(delivery_plugin,),
         )
     ):
-        return await Agent.from_db(
+        agent = await Agent.from_db(
             source,
             name=f"LiveMonitorIntentExtraction-{case_id}",
-            cache_ttl=0,
+            source_options=DbSourceOptions(cache_ttl=0),
         )
+    return agent, planner
 
 
 async def _create_prompt_monitor(source: str, case: dict[str, Any]) -> dict[str, Any]:
-    agent = await _agent_for_monitor_intent(source, str(case["id"]))
+    agent, planner = await _agent_for_monitor_intent(source, str(case["id"]), case)
     try:
         created = await agent.run_detailed(str(case["prompt"]))
         evidence = await agent.runtime.store.list_evidence(created.operation_id)
@@ -300,26 +315,19 @@ async def _create_prompt_monitor(source: str, case: dict[str, Any]) -> dict[str,
         approvals = await agent.runtime.store.list_approval_requests(
             created.operation_id
         )
-        if approvals:
-            await agent.runtime.approval_channel.approve(approvals[0].approval_id)
-            resumed = await agent.runtime.resume_operation(created.operation_id)
-            final_status = resumed.operation.status
-        else:
-            resumed = None
-            final_status = created.status
         monitors = await agent.list_monitors()
         committed_evidence = await agent.runtime.store.list_evidence(
             created.operation_id
         )
         return {
             "created": created,
+            "planner": planner,
             "proposal_evidence": proposal_evidence,
             "proposal": proposal,
             "validation": validation,
             "operation": operation,
             "approvals": approvals,
-            "resumed": resumed,
-            "final_status": final_status,
+            "final_status": created.status,
             "monitors": monitors,
             "definition": _latest(committed_evidence, "monitor.definition"),
         }
@@ -363,7 +371,9 @@ def _assert_proposal_matches_case(
         proposal["metadata"]["intent"]["delivery"]["delivery_kind"]
         == case["delivery_kind"]
     )
-    assert proposal["metadata"]["extraction"]["extractor"] == "deterministic"
+    assert proposal["metadata"]["intent"]["diagnostics"]["source"] == (
+        "structured_test_planner"
+    )
     assert proposal["observation_plan"]["kind"] == "planned_read"
     assert proposal["observation_plan"]["target_name"] == case["target"]
     assert f"select * from {case['target']}" in proposal["observation_plan"]["sql"]
@@ -374,23 +384,12 @@ def _assert_proposal_matches_case(
     assert validation["diagnostics"]["delivery_validation"]["accepted"] is True
 
 
-def _assert_operation_and_approval_match_case(
-    result: dict[str, Any],
-    case: dict[str, Any],
-) -> None:
+def _assert_operation_matches_case(result: dict[str, Any]) -> None:
     operation = result["operation"]
     approvals = result["approvals"]
     assert operation is not None
-    assert operation.metadata["monitor_id"] == case["monitor_id"]
-    assert operation.metadata["monitor_name"] == case["name"]
-    if case["prompt"].lower().startswith(("create", "i want you to create")):
-        assert len(approvals) == 1
-        assert approvals[0].status is ApprovalStatus.PENDING
-        assert approvals[0].proposed_action["operation_type"] == "monitor.create"
-        assert approvals[0].proposed_action["monitor"]["id"] == case["monitor_id"]
-        assert approvals[0].proposed_action["monitor"]["name"] == case["name"]
-    else:
-        assert approvals == []
+    assert operation.operation_type == "db.run"
+    assert approvals == []
 
 
 def _assert_committed_monitor_matches_case(
@@ -411,6 +410,44 @@ def _assert_committed_monitor_matches_case(
     assert result["definition"].payload["proposal_evidence_id"] == (
         result["proposal_evidence"].id
     )
+
+
+def _intent_payload(case: dict[str, Any]) -> dict[str, Any]:
+    condition: dict[str, Any] = {"kind": case["condition"]}
+    if case["condition"] == "new_rows":
+        condition.update({"path": "rows", "operator": "count_gt", "value": 0})
+    elif case["condition"] == "threshold":
+        condition.update({"path": "rows", "operator": "gt", "value": 10})
+    return {
+        "target": {
+            "target_type": "table",
+            "name": case["target"],
+            "source_scope": [case["target"]],
+            "confidence": 1.0,
+        },
+        "condition": condition,
+        "schedule": {
+            "kind": "interval",
+            "interval_seconds": case["schedule"]["interval_seconds"],
+        },
+        "delivery": {
+            "delivery_kind": case["delivery_kind"],
+            "target": {"type": "requesting_user"},
+            "explicit": True,
+            "payload_source": {"type": "monitor.report"},
+            "template": "New rows were observed for the monitored table.",
+            "include_observed_rows": True,
+        },
+        "display": {
+            "explicit_name": case["name"],
+            "description": case["prompt"],
+        },
+        "action": {"actions": (), "steps": ()},
+        "policy": {},
+        "budget": {},
+        "confidence": 1.0,
+        "diagnostics": {"source": "structured_test_planner"},
+    }
 
 
 async def _seed_sqlite(path: Path) -> None:

@@ -9,8 +9,9 @@ Google API calls.
 import csv
 import io
 import json
+import builtins
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from daita.plugins.google_drive import (
     GoogleDrivePlugin,
     google_drive,
@@ -42,6 +43,13 @@ def make_plugin(read_only: bool = True) -> GoogleDrivePlugin:
     return plugin
 
 
+def _mock_service(plugin: GoogleDrivePlugin) -> MagicMock:
+    service = plugin._service
+    if not isinstance(service, MagicMock):
+        raise AssertionError("test plugin does not have a mock Drive service")
+    return service
+
+
 def _drive_file(
     id="file1",
     name="test.csv",
@@ -67,27 +75,27 @@ def _wire_files_list(plugin, files):
     """Mock service.files().list().execute() to return the given file list."""
     mock_list = MagicMock()
     mock_list.execute.return_value = {"files": files, "nextPageToken": None}
-    plugin._service.files.return_value.list.return_value = mock_list
+    _mock_service(plugin).files.return_value.list.return_value = mock_list
 
 
 def _wire_files_get(plugin, file_meta):
     """Mock service.files().get().execute() to return the given metadata."""
     mock_get = MagicMock()
     mock_get.execute.return_value = file_meta
-    plugin._service.files.return_value.get.return_value = mock_get
+    _mock_service(plugin).files.return_value.get.return_value = mock_get
 
 
 def _wire_files_export(plugin, content: bytes):
     """Mock service.files().export().execute() to return bytes."""
     mock_export = MagicMock()
     mock_export.execute.return_value = content
-    plugin._service.files.return_value.export.return_value = mock_export
+    _mock_service(plugin).files.return_value.export.return_value = mock_export
 
 
 def _wire_files_download(plugin, content: bytes):
     """Mock MediaIoBaseDownload-based download to return bytes."""
     mock_request = MagicMock()
-    plugin._service.files.return_value.get_media.return_value = mock_request
+    _mock_service(plugin).files.return_value.get_media.return_value = mock_request
 
     def fake_download_side_effect(buf, request):
         mock_dl = MagicMock()
@@ -218,7 +226,9 @@ async def test_google_drive_executor_returns_typed_operation_evidence():
     assert evidence[0].metadata["capability_id"] == "google_drive.file.search"
 
 
-async def test_google_drive_write_executor_uses_existing_tool_handler(tmp_path):
+async def test_google_drive_write_executor_uses_existing_tool_handler(
+    tmp_path, monkeypatch
+):
     plugin = make_plugin(read_only=False)
     local_file = tmp_path / "upload.txt"
     local_file.write_text("hello")
@@ -235,7 +245,7 @@ async def test_google_drive_write_executor_uses_existing_tool_handler(tmp_path):
             "web_link": "https://drive.example/new-file",
         }
 
-    plugin.upload = fake_upload
+    monkeypatch.setattr(plugin, "upload", fake_upload)
     registry = ExtensionRegistry()
     registry.register(plugin)
     capability = registry.get_capability(
@@ -254,20 +264,22 @@ async def test_google_drive_write_executor_uses_existing_tool_handler(tmp_path):
     assert evidence[0].payload["result"]["name"] == "renamed.txt"
 
 
-async def test_google_drive_registry_setup_and_teardown_use_connector_lifecycle():
+async def test_google_drive_registry_setup_and_teardown_use_connector_lifecycle(
+    monkeypatch,
+):
     plugin = GoogleDrivePlugin()
     calls = []
 
     async def fake_connect():
         calls.append("connect")
-        plugin._service = object()
+        plugin._service = MagicMock()
 
     async def fake_disconnect():
         calls.append("disconnect")
         plugin._service = None
 
-    plugin.connect = fake_connect
-    plugin.disconnect = fake_disconnect
+    monkeypatch.setattr(plugin, "connect", fake_connect)
+    monkeypatch.setattr(plugin, "disconnect", fake_disconnect)
     registry = ExtensionRegistry()
     registry.register(plugin)
 
@@ -309,6 +321,102 @@ def test_custom_scopes_override():
 def test_token_path_expands_home():
     plugin = GoogleDrivePlugin(token_path="~/.daita/token.json")
     assert not plugin.token_path.startswith("~")
+
+
+# ---------------------------------------------------------------------------
+# Connection lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_service_requires_a_connected_plugin():
+    plugin = GoogleDrivePlugin()
+
+    with pytest.raises(PluginError, match="not connected"):
+        _ = plugin.service
+
+
+async def test_connect_verifies_service_before_publishing(module_stub):
+    plugin = GoogleDrivePlugin(credentials=object())
+    service = MagicMock()
+    service.files.return_value.list.return_value.execute.return_value = {"files": []}
+    build = MagicMock(return_value=service)
+    module_stub("googleapiclient.discovery", build=build)
+
+    await plugin.connect()
+
+    assert plugin.service is service
+    assert plugin.is_connected is True
+    service.files.return_value.list.return_value.execute.assert_called_once_with()
+
+    await plugin.disconnect()
+
+    assert plugin.is_connected is False
+    with pytest.raises(PluginError, match="not connected"):
+        _ = plugin.service
+
+
+async def test_connect_does_not_publish_service_when_verification_fails(module_stub):
+    plugin = GoogleDrivePlugin(credentials=object())
+    service = MagicMock()
+    service.files.return_value.list.return_value.execute.side_effect = RuntimeError(
+        "unavailable"
+    )
+    module_stub("googleapiclient.discovery", build=MagicMock(return_value=service))
+
+    with pytest.raises(PluginError, match="connect"):
+        await plugin.connect()
+
+    assert plugin.is_connected is False
+
+
+async def test_connect_reports_missing_google_sdk(monkeypatch):
+    plugin = GoogleDrivePlugin(credentials=object())
+    real_import = builtins.__import__
+
+    def import_without_google_client(name, *args, **kwargs):
+        if name == "googleapiclient.discovery":
+            raise ImportError("missing")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_google_client)
+
+    with pytest.raises(ImportError, match=r"daita-agents\[google-drive\]"):
+        await plugin.connect()
+
+    assert plugin.is_connected is False
+
+
+async def test_resolve_credentials_reports_missing_adc(module_stub):
+    class DefaultCredentialsError(Exception):
+        pass
+
+    plugin = GoogleDrivePlugin()
+
+    def no_default_credentials(*, scopes):
+        raise DefaultCredentialsError("missing")
+
+    module_stub(
+        "google.auth.exceptions", DefaultCredentialsError=DefaultCredentialsError
+    )
+    module_stub("google.auth", default=no_default_credentials)
+
+    with pytest.raises(AuthenticationError, match="credentials were not found"):
+        await plugin._resolve_credentials()
+
+
+def test_parse_xlsx_without_active_sheet_returns_empty_rows():
+    plugin = make_plugin()
+    workbook = MagicMock()
+    workbook.active = None
+    workbook.sheetnames = []
+    openpyxl = MagicMock()
+    openpyxl.load_workbook.return_value = workbook
+
+    with patch.dict("sys.modules", {"openpyxl": openpyxl}):
+        result = plugin._parse_xlsx(b"fake", "empty.xlsx")
+
+    assert result["rows"] == []
+    assert result["total_rows"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -648,14 +756,15 @@ async def test_search_builds_query():
         "report", file_type="pdf", modified_after="2024-01-01"
     )
 
-    call_args = plugin._service.files.return_value.list.call_args
+    service = _mock_service(plugin)
+    call_args = service.files.return_value.list.call_args
     q = (
         call_args.kwargs.get("q") or call_args[1].get("q") or call_args[0][0]
         if call_args[0]
         else ""
     )
     # Check the query was called (we may not be able to inspect kwargs easily across mock versions)
-    assert plugin._service.files.return_value.list.called
+    assert service.files.return_value.list.called
     assert len(results) == 1
     assert results[0]["id"] == "file1"
 
@@ -744,11 +853,12 @@ async def test_organize_rename_calls_update():
     updated_file = _drive_file(id="file1", name="new_name.pdf")
     mock_update = MagicMock()
     mock_update.execute.return_value = updated_file
-    plugin._service.files.return_value.update.return_value = mock_update
+    service = _mock_service(plugin)
+    service.files.return_value.update.return_value = mock_update
 
     result = await plugin.organize("file1", action="rename", new_name="new_name.pdf")
     assert result["action"] == "renamed"
-    assert plugin._service.files.return_value.update.called
+    assert service.files.return_value.update.called
 
 
 async def test_organize_copy_calls_copy():
@@ -756,7 +866,7 @@ async def test_organize_copy_calls_copy():
     copied_file = _drive_file(id="file2", name="copy.pdf")
     mock_copy = MagicMock()
     mock_copy.execute.return_value = copied_file
-    plugin._service.files.return_value.copy.return_value = mock_copy
+    _mock_service(plugin).files.return_value.copy.return_value = mock_copy
 
     result = await plugin.organize(
         "file1", action="copy", new_name="copy.pdf", dest_folder_id="folder2"
@@ -901,13 +1011,13 @@ async def test_tool_upload_handler(tmp_path):
     created_file = _drive_file(id="new_file", name="test.txt")
     mock_create = MagicMock()
     mock_create.execute.return_value = created_file
-    plugin._service.files.return_value.create.return_value = mock_create
+    _mock_service(plugin).files.return_value.create.return_value = mock_create
 
     import sys
     from types import ModuleType
 
     fake_http = ModuleType("googleapiclient.http")
-    fake_http.MediaFileUpload = MagicMock(return_value=MagicMock())
+    setattr(fake_http, "MediaFileUpload", MagicMock(return_value=MagicMock()))
     fake_googleapiclient = ModuleType("googleapiclient")
     with patch.dict(
         sys.modules,
@@ -938,7 +1048,7 @@ def test_import_without_google_packages():
 # ---------------------------------------------------------------------------
 
 
-async def test_context_manager_connects_and_disconnects():
+async def test_context_manager_connects_and_disconnects(monkeypatch):
     plugin = GoogleDrivePlugin()
 
     connected = []
@@ -952,8 +1062,8 @@ async def test_context_manager_connects_and_disconnects():
         disconnected.append(True)
         plugin._service = None
 
-    plugin.connect = mock_connect
-    plugin.disconnect = mock_disconnect
+    monkeypatch.setattr(plugin, "connect", mock_connect)
+    monkeypatch.setattr(plugin, "disconnect", mock_disconnect)
 
     async with plugin as p:
         assert p is plugin

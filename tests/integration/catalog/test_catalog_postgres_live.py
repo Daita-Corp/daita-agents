@@ -153,11 +153,7 @@ def seeded_postgres(postgres_url) -> str:
                 await asyncio.sleep(0.5)
         raise RuntimeError(f"Could not seed Postgres: {last_err}")
 
-    (
-        asyncio.get_event_loop().run_until_complete(_seed())
-        if False
-        else asyncio.run(_seed())
-    )
+    asyncio.run(_seed())
     return postgres_url
 
 

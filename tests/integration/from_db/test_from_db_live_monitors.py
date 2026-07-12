@@ -30,7 +30,15 @@ asyncpg = pytest.importorskip(
 )
 
 from daita.agents.agent import Agent
-from daita.db import DbAgent, DbMonitor, DbMonitorScheduler, DbRuntime, DbRuntimeConfig
+from daita.db import (
+    DbAgent,
+    DbLLMConfig,
+    DbMonitor,
+    DbRuntime,
+    DbRuntimeConfig,
+    DbSourceOptions,
+)
+from daita.db.monitor_scheduler import DbMonitorScheduler
 from daita.db.llm_service import db_llm_service_from_config
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
 from daita.plugins.catalog import CatalogPlugin
@@ -78,7 +86,7 @@ CREATE TABLE customers (
 );
 
 CREATE TABLE orders (
-    order_id INTEGER PRIMARY KEY,
+    order_id SERIAL PRIMARY KEY,
     customer_id INTEGER NOT NULL REFERENCES customers(customer_id),
     total NUMERIC(10, 2) NOT NULL,
     status TEXT NOT NULL,
@@ -115,10 +123,12 @@ def live_openai_kwargs() -> dict[str, Any]:
     if not api_key:
         pytest.skip("OPENAI_API_KEY not set")
     return {
-        "llm_provider": "openai",
-        "model": os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
-        "api_key": api_key,
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
+            api_key=api_key,
+            temperature=0,
+        )
     }
 
 
@@ -157,7 +167,7 @@ async def test_live_monitor_metric_observation_records_runtime_tasks(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorObservation",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -209,7 +219,7 @@ async def test_live_monitor_threshold_trigger_runs_investigation_with_analysis_s
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorInvestigation",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -267,7 +277,7 @@ async def test_live_monitor_scheduled_report_reads_live_db_uses_llm_and_delivers
         seeded_postgres_url,
         name="LiveFromDbMonitorReportDelivery",
         plugins=(delivery_plugin,),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -331,15 +341,15 @@ async def test_live_monitor_scheduled_report_reads_live_db_uses_llm_and_delivers
 
 
 async def test_live_monitor_write_proposal_requires_approval_and_resumes(
+    tmp_path,
     seeded_postgres_url,
     live_openai_kwargs,
 ):
-    agent = await Agent.from_db(
+    agent = await _runtime_agent_with_sqlite_store(
         seeded_postgres_url,
-        name="LiveFromDbMonitorWriteApproval",
+        tmp_path / "monitor-write-runtime.sqlite",
+        live_openai_kwargs,
         read_only=False,
-        cache_ttl=0,
-        **live_openai_kwargs,
     )
     monitor = _monitor(
         "approved_monitor_write",
@@ -386,15 +396,15 @@ async def test_live_monitor_write_proposal_requires_approval_and_resumes(
 
 
 async def test_live_monitor_destructive_write_is_denied_before_execution(
+    tmp_path,
     seeded_postgres_url,
     live_openai_kwargs,
 ):
-    agent = await Agent.from_db(
+    agent = await _runtime_agent_with_sqlite_store(
         seeded_postgres_url,
-        name="LiveFromDbMonitorDestructiveWrite",
+        tmp_path / "monitor-destructive-runtime.sqlite",
+        live_openai_kwargs,
         read_only=False,
-        cache_ttl=0,
-        **live_openai_kwargs,
     )
     monitor = _monitor(
         "destructive_monitor_write",
@@ -440,7 +450,7 @@ async def test_live_monitor_consecutive_match_and_cooldown_state_is_durable(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorCooldown",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -480,7 +490,7 @@ async def test_live_monitor_sql_observation_scope_guard_blocks_cross_table_read(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorScopeGuard",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -512,7 +522,13 @@ async def test_live_monitor_sql_observation_scope_guard_blocks_cross_table_read(
     observation = _latest(tick_snapshot.evidence, "monitor.observation")
     assert observation.accepted is False
     assert observation.payload["reason"] == "observation_source_scope_blocked"
-    assert [task.capability_id for task in tick_snapshot.tasks] == ["db.sql.validate"]
+    assert [task.capability_id for task in tick_snapshot.tasks] == [
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    assert tick_snapshot.tasks[0].status is TaskStatus.SUCCEEDED
+    assert tick_snapshot.tasks[1].status is TaskStatus.PENDING
+    assert "query.result" not in _evidence_kinds(tick_snapshot.evidence)
 
 
 async def test_live_monitor_tick_lease_prevents_duplicate_action(
@@ -522,7 +538,7 @@ async def test_live_monitor_tick_lease_prevents_duplicate_action(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorLease",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -563,46 +579,144 @@ async def test_live_monitor_tick_lease_prevents_duplicate_action(
     assert len(lease_lost) <= 1
 
 
-async def test_live_prompt_monitor_control_plane_audits_without_runtime_tasks(
+async def test_live_prompt_monitor_control_plane_uses_model_planned_runtime(
     seeded_postgres_url,
     live_openai_kwargs,
 ):
+    delivery_plugin = MonitorDeliveryProbePlugin()
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorCommands",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
+        plugins=(delivery_plugin,),
         **live_openai_kwargs,
+    )
+    prompts = {
+        "create": (
+            "Create a monitor named Orders Activity that checks the orders table "
+            "every 15 minutes. Trigger when the number of newly inserted rows is "
+            "greater than 0, and send notifications to Slack channel #ops."
+        ),
+        "list": "List all active monitors.",
+    }
+    planner_vocabulary = (
+        "action_id",
+        "depends_on",
+        "intent.operation_type",
+        "plan_monitor_",
+        "commit_monitor_",
+    )
+    assert not any(
+        token in prompt for prompt in prompts.values() for token in planner_vocabulary
     )
 
     try:
-        created = await agent.run_detailed(
-            "Monitor pending orders every 15 minutes. If pending orders exceed 500."
+        created = await agent.run_detailed(prompts["create"])
+        created_snapshot = await agent.runtime.store.inspect_operation(
+            created.operation_id
         )
-        listed = await agent.run_detailed("List active monitors.")
-        inspected = await agent.run_detailed("Inspect monitor pending_orders.")
-        paused = await agent.run_detailed("Pause pending_orders monitor.")
-        resumed = await agent.run_detailed("Resume pending_orders monitor.")
-        deleted = await agent.run_detailed("Delete pending_orders monitor.")
+        assert created.status is OperationStatus.SUCCEEDED
+        assert created_snapshot is not None
+        created_definition = _latest(created_snapshot.evidence, "monitor.definition")
+        monitor_id = str(created_definition.payload["monitor"]["id"])
+        prompts.update(
+            {
+                "inspect": (
+                    f"Inspect the monitor with ID {monitor_id} and show its current "
+                    "configuration and state."
+                ),
+                "pause": f"Pause the monitor with ID {monitor_id}.",
+                "resume": f"Resume the monitor with ID {monitor_id}.",
+                "delete": (
+                    f"Permanently delete the monitor with ID {monitor_id}. "
+                    "I confirm this deletion."
+                ),
+            }
+        )
+        assert not any(
+            token in prompt
+            for prompt in prompts.values()
+            for token in planner_vocabulary
+        )
+        listed = await agent.run_detailed(prompts["list"])
+        inspected = await agent.run_detailed(prompts["inspect"])
+        paused = await agent.run_detailed(prompts["pause"])
+        resumed = await agent.run_detailed(prompts["resume"])
+        deleted = await agent.run_detailed(prompts["delete"])
+        results = {
+            "create": created,
+            "list": listed,
+            "inspect": inspected,
+            "pause": paused,
+            "resume": resumed,
+            "delete": deleted,
+        }
         operations = await agent.runtime.store.list_operations()
-        tasks = await agent.runtime.store.list_tasks()
+        result_operation_ids = {result.operation_id for result in results.values()}
+        top_level_operations = [
+            operation
+            for operation in operations
+            if operation.id in result_operation_ids
+            and operation.operation_type == "db.run"
+        ]
+        snapshots = {
+            action: await agent.runtime.store.inspect_operation(result.operation_id)
+            for action, result in results.items()
+        }
     finally:
         await agent.stop()
 
-    assert created.status is OperationStatus.SUCCEEDED
-    assert listed.status is OperationStatus.SUCCEEDED
-    assert inspected.status is OperationStatus.SUCCEEDED
-    assert paused.status is OperationStatus.SUCCEEDED
-    assert resumed.status is OperationStatus.SUCCEEDED
-    assert deleted.status is OperationStatus.SUCCEEDED
-    assert [operation.operation_type for operation in operations] == [
-        "monitor.create",
-        "monitor.list",
-        "monitor.inspect",
-        "monitor.pause",
-        "monitor.resume",
-        "monitor.delete",
-    ]
-    assert tasks == []
+    expected_capabilities = {
+        "create": {"db.monitor.plan_create", "db.monitor.commit_create"},
+        "list": {"db.monitor.read"},
+        "inspect": {"db.monitor.read"},
+        "pause": {"db.monitor.plan_lifecycle", "db.monitor.commit_lifecycle"},
+        "resume": {"db.monitor.plan_lifecycle", "db.monitor.commit_lifecycle"},
+        "delete": {"db.monitor.plan_lifecycle", "db.monitor.commit_lifecycle"},
+    }
+    expected_monitor_evidence = {
+        "create": {"monitor.proposal", "monitor.definition"},
+        "list": {"monitor.listing"},
+        "inspect": {"monitor.inspection"},
+        "pause": {"monitor.proposal", "monitor.paused"},
+        "resume": {"monitor.proposal", "monitor.resumed"},
+        "delete": {"monitor.proposal", "monitor.deleted"},
+    }
+
+    assert len(top_level_operations) == 6
+    assert {operation.id for operation in top_level_operations} == {
+        result.operation_id for result in results.values()
+    }
+    for action, result in results.items():
+        snapshot = snapshots[action]
+        assert result.status is OperationStatus.SUCCEEDED
+        assert snapshot is not None
+        assert snapshot.operation.operation_type == "db.run"
+        assert snapshot.operation.status is OperationStatus.SUCCEEDED
+
+        task_capabilities = {task.capability_id for task in snapshot.tasks}
+        assert expected_capabilities[action] <= task_capabilities, action
+        assert "db.answer.synthesize" in task_capabilities
+        for capability_id in (*expected_capabilities[action], "db.answer.synthesize"):
+            assert any(
+                task.capability_id == capability_id
+                and task.status is TaskStatus.SUCCEEDED
+                for task in snapshot.tasks
+            )
+
+        evidence_kinds = _evidence_kinds(snapshot.evidence)
+        assert {
+            "planner.decision",
+            "planner.compilation",
+            "verification.result",
+            "answer.synthesis",
+        } <= evidence_kinds
+        assert expected_monitor_evidence[action] <= evidence_kinds
+        verification = _latest(snapshot.evidence, "verification.result")
+        synthesis = _latest(snapshot.evidence, "answer.synthesis")
+        assert verification.accepted is True
+        assert verification.payload["passed"] is True
+        assert synthesis.accepted is True
 
 
 async def test_live_monitor_resume_after_runtime_restart_with_persistent_store(
@@ -682,7 +796,7 @@ async def test_live_monitor_governed_delivery_requests_approval_and_resumes_once
         seeded_postgres_url,
         name="LiveFromDbMonitorGovernedDelivery",
         plugins=(delivery_plugin,),
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -742,7 +856,7 @@ async def test_live_monitor_repeated_scheduler_ticks_do_not_duplicate_actions(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorSoak",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     monitor = _monitor(
@@ -787,7 +901,7 @@ async def test_live_monitor_llm_provider_failure_falls_back_for_report_synthesis
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorLLMFallback",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **broken_llm_kwargs,
     )
     monitor = _monitor(
@@ -824,7 +938,7 @@ async def test_live_multi_monitor_scheduler_mixed_states(
     agent = await Agent.from_db(
         seeded_postgres_url,
         name="LiveFromDbMonitorMixedScheduler",
-        cache_ttl=0,
+        source_options=DbSourceOptions(cache_ttl=0),
         **live_openai_kwargs,
     )
     active = _monitor(
@@ -1120,6 +1234,8 @@ async def _runtime_agent_with_sqlite_store(
     read_only: bool = True,
     plugins: tuple[Any, ...] = (),
 ) -> DbAgent:
+    llm = live_openai_kwargs["llm"]
+    assert isinstance(llm, DbLLMConfig)
     source_plugin = PostgreSQLPlugin(
         connection_string=url,
         read_only=read_only,
@@ -1138,18 +1254,13 @@ async def _runtime_agent_with_sqlite_store(
             ),
             metadata={
                 "from_db_options": {
-                    "llm_provider": live_openai_kwargs["llm_provider"],
-                    "model": live_openai_kwargs["model"],
-                    "temperature": live_openai_kwargs.get("temperature"),
+                    "llm": llm.safe_metadata(),
                 }
             },
         ),
         store=SQLiteRuntimeStore(store_path),
         db_llm_service=db_llm_service_from_config(
-            llm_provider=str(live_openai_kwargs["llm_provider"]),
-            model=str(live_openai_kwargs["model"]),
-            api_key=str(live_openai_kwargs["api_key"]),
-            temperature=live_openai_kwargs.get("temperature"),
+            llm,
             agent_id="LiveFromDbPersistentMonitor",
         ),
     )

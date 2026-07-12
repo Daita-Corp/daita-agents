@@ -45,13 +45,13 @@ class VoyageEmbeddingProvider(BaseEmbeddingProvider):
                     "VOYAGE_API_KEY environment variable required for Voyage embeddings"
                 )
             try:
-                import voyageai
+                from voyageai.client_async import AsyncClient
             except ImportError:
                 raise ImportError(
                     "voyageai is required for Voyage embeddings. "
                     "Install with: pip install 'daita-agents[voyage]'"
                 )
-            self._client = voyageai.AsyncClient(api_key=self.api_key)
+            self._client = AsyncClient(api_key=self.api_key)
         return self._client
 
     @property
@@ -65,8 +65,10 @@ class VoyageEmbeddingProvider(BaseEmbeddingProvider):
 
     async def _embed_text_impl(self, text: str) -> List[float]:
         result = await self.client.embed(texts=[text], model=self.model)
-        return result.embeddings[0]
+        return [float(value) for value in result.embeddings[0]]
 
     async def _embed_texts_impl(self, texts: List[str]) -> List[List[float]]:
         result = await self.client.embed(texts=texts, model=self.model)
-        return result.embeddings
+        return [
+            [float(value) for value in embedding] for embedding in result.embeddings
+        ]

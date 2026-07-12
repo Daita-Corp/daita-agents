@@ -9,7 +9,7 @@ from daita.db import (
     DbRuntime,
     DbRuntimeConfig,
 )
-from daita.db.analysis import stable_fingerprint
+from daita.db.fingerprints import persisted_fingerprint
 from daita.plugins.memory.memory_plugin import MemoryPlugin
 from daita.runtime import (
     AccessMode,
@@ -20,6 +20,7 @@ from daita.runtime import (
     WorkerRuntime,
     WorkerRuntimeOptions,
 )
+from daita.db.runtime.memory_learning import _learner_task_id_from_operation
 
 SOURCE_IDENTITY = "sqlite:from_db:learning-source"
 
@@ -93,7 +94,7 @@ def _schema_evidence(
         accepted=True,
         payload=schema,
         metadata={
-            "payload_fingerprint": stable_fingerprint(schema),
+            "payload_fingerprint": persisted_fingerprint(schema),
             **({"source_identity": source_identity} if source_identity else {}),
         },
     )
@@ -234,7 +235,11 @@ async def test_successful_eligible_operation_enqueues_child_learning_operation()
         "db.memory.learning.enqueue",
         "db.memory.learning.run",
     ]
+    assert child_tasks[1].id == _learner_task_id_from_operation(child.id)
     assert child_tasks[1].metadata["queue"] == "memory_learning"
+    assert child_tasks[1].metadata["reason"] == "db_memory_learning_run"
+    assert child_tasks[1].metadata["source_operation_id"] == source_operation.id
+    assert child_tasks[1].metadata["idempotency_key"]
     assert child_tasks[1].status is TaskStatus.PENDING
     assert enqueue_evidence[0].kind == "db.memory.learning.enqueue"
 
@@ -283,6 +288,7 @@ async def test_learner_promotes_safe_unit_candidate_through_memory_write():
     backend = _memory_backend()
     runtime = _runtime(backend=backend)
     source_operation, _ = await _record_successful_source(runtime)
+    runtime.execute_task = AsyncMock(wraps=runtime.execute_task)
     worker = WorkerRuntime(
         kernel=runtime.kernel,
         options=WorkerRuntimeOptions(
@@ -295,6 +301,9 @@ async def test_learner_promotes_safe_unit_candidate_through_memory_write():
     run = await worker.run_once()
     child_snapshot = await runtime.inspect_operation(run.handoff.operation_id)
     evidence = await runtime.store.list_evidence(run.handoff.operation_id)
+    governance_audits = await runtime.store.list_governance_audit_records(
+        run.handoff.operation_id
+    )
 
     assert child_snapshot.operation.status is OperationStatus.SUCCEEDED
     assert {item.kind for item in evidence} >= {
@@ -308,6 +317,14 @@ async def test_learner_promotes_safe_unit_candidate_through_memory_write():
     assert promotion.payload["promoted"] is True
     assert write.payload["success"] is True
     assert write.payload["kind"] == "unit_convention"
+    assert any(
+        audit.stage == "task" and audit.task_id == run.handoff.task_id
+        for audit in governance_audits
+    )
+    assert not any(item.kind == "session.query_scope" for item in evidence)
+    assert run.handoff.task_id not in {
+        call.args[0].id for call in runtime.execute_task.await_args_list
+    }
     backend.remember.assert_awaited_once()
 
 

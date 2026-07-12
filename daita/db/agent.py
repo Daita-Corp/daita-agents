@@ -4,14 +4,25 @@ User-facing facade for the new database runtime.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import suppress
 import re
 from dataclasses import replace
 from typing import Any
+from uuid import uuid4
 
 from daita.agents.conversation import ConversationHistory
 from daita.core.tracing import TraceType, get_trace_manager
+from daita.runtime import OperationStatus, RuntimeEvent, RuntimeStreamEvent
 
-from .monitor_commands.service import DbMonitorCommandService
+from .context_projection import (
+    ProjectionContext,
+    ProjectionMode,
+    project_runtime_stream_drop_diagnostic,
+    project_runtime_stream_event,
+    project_runtime_stream_terminal,
+)
 from .models import DbOperationResult, DbRequest, DbRuntimeInspection
 from .monitors import DbMonitor, DbMonitorInspection
 from .runtime import DbRuntime
@@ -31,7 +42,6 @@ class DbAgent:
         self.runtime = runtime
         self.name = name
         self._default_history = default_history
-        self._monitor_commands = DbMonitorCommandService(runtime)
 
     @property
     def operations(self) -> tuple[DbOperationResult, ...]:
@@ -62,6 +72,20 @@ class DbAgent:
         **kwargs,
     ) -> DbOperationResult:
         """Run a DB request and return the typed operation result."""
+        return await self._run_detailed(
+            prompt,
+            history=history,
+            kwargs=kwargs,
+        )
+
+    async def _run_detailed(
+        self,
+        prompt: str,
+        *,
+        history: ConversationHistory | None,
+        kwargs: dict[str, Any],
+        operation_id: str | None = None,
+    ) -> DbOperationResult:
         active_history = self._resolve_history(history, kwargs)
         if active_history is not None:
             active_history._set_workspace(self._history_workspace())
@@ -83,12 +107,13 @@ class DbAgent:
             mode=request.mode,
             stateful_history=active_history is not None,
         ):
-            monitor_result = await self._monitor_commands.run(request)
-            result = (
-                monitor_result
-                if monitor_result is not None
-                else await self.runtime.run(request)
-            )
+            if operation_id is None:
+                result = await self.runtime.run(request)
+            else:
+                result = await self.runtime.run(
+                    request,
+                    operation_id=operation_id,
+                )
             if active_history is not None:
                 await active_history.add_turn(prompt, result.answer or "")
             return result
@@ -221,10 +246,121 @@ class DbAgent:
         *,
         history: ConversationHistory | None = None,
         **kwargs,
-    ):
-        """Streaming will be implemented once DB synthesis exists."""
-        result = await self.run_detailed(prompt, history=history, **kwargs)
-        yield result
+    ) -> AsyncIterator[RuntimeStreamEvent]:
+        """Stream bounded, projected runtime progress for one DB operation."""
+        operation_id = f"db-op-{uuid4()}"
+        subscription = self.runtime.kernel.event_broker.subscribe(operation_id)
+        projection = ProjectionContext(mode=ProjectionMode.PUBLIC_RESULT)
+        run_task = asyncio.create_task(
+            self._run_detailed(
+                prompt,
+                history=history,
+                kwargs=dict(kwargs),
+                operation_id=operation_id,
+            ),
+            name=f"db-stream-run:{operation_id}",
+        )
+        event_waiter: asyncio.Task[Any] | None = None
+        cancelled_by_consumer = False
+        terminal_delivered = False
+
+        def project_event(event: RuntimeEvent) -> RuntimeStreamEvent:
+            nonlocal terminal_delivered
+            projected = project_runtime_stream_event(event, projection)
+            terminal_delivered = (
+                terminal_delivered or projected.payload.get("terminal") is True
+            )
+            return projected
+
+        try:
+            while not run_task.done():
+                event_waiter = asyncio.create_task(subscription.get())
+                done, _ = await asyncio.wait(
+                    (run_task, event_waiter),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if event_waiter in done:
+                    event = event_waiter.result()
+                    event_waiter = None
+                    if event is None:
+                        break
+                    yield project_event(event)
+                    if subscription.pending_count == 0:
+                        dropped_count = subscription.take_dropped_count()
+                        if dropped_count:
+                            yield project_runtime_stream_drop_diagnostic(
+                                operation_id=operation_id,
+                                runtime_id=self.runtime.runtime_id,
+                                runtime_kind=self.runtime.runtime_kind,
+                                dropped_count=dropped_count,
+                            )
+                    continue
+                subscription.finish()
+                event = await event_waiter
+                event_waiter = None
+                if event is not None:
+                    yield project_event(event)
+                    if subscription.pending_count == 0:
+                        dropped_count = subscription.take_dropped_count()
+                        if dropped_count:
+                            yield project_runtime_stream_drop_diagnostic(
+                                operation_id=operation_id,
+                                runtime_id=self.runtime.runtime_id,
+                                runtime_kind=self.runtime.runtime_kind,
+                                dropped_count=dropped_count,
+                            )
+
+            while subscription.pending_count:
+                event = subscription.get_nowait()
+                if event is not None:
+                    yield project_event(event)
+            dropped_count = subscription.take_dropped_count()
+            if dropped_count:
+                yield project_runtime_stream_drop_diagnostic(
+                    operation_id=operation_id,
+                    runtime_id=self.runtime.runtime_id,
+                    runtime_kind=self.runtime.runtime_kind,
+                    dropped_count=dropped_count,
+                )
+
+            result = await run_task
+            if not terminal_delivered:
+                yield project_runtime_stream_terminal(
+                    result,
+                    runtime_id=self.runtime.runtime_id,
+                    runtime_kind=self.runtime.runtime_kind,
+                )
+        except (asyncio.CancelledError, GeneratorExit):
+            cancelled_by_consumer = True
+            raise
+        finally:
+            if event_waiter is not None and not event_waiter.done():
+                event_waiter.cancel()
+                with suppress(asyncio.CancelledError):
+                    await event_waiter
+            if not run_task.done():
+                run_task.cancel()
+            with suppress(BaseException):
+                await run_task
+            if cancelled_by_consumer:
+                with suppress(Exception):
+                    await self._preserve_stream_operation_for_resume(operation_id)
+            subscription.close()
+
+    async def _preserve_stream_operation_for_resume(self, operation_id: str) -> None:
+        operation = await self.runtime.store.load_operation(operation_id)
+        if operation is None or operation.status in {
+            OperationStatus.BLOCKED,
+            OperationStatus.SUCCEEDED,
+            OperationStatus.FAILED,
+            OperationStatus.CANCELLED,
+        }:
+            return
+        await self.runtime.kernel.block_operation(
+            operation_id,
+            message="Operation interrupted and preserved for resume.",
+            payload={"status": OperationStatus.BLOCKED.value},
+        )
 
     def _resolve_history(
         self,

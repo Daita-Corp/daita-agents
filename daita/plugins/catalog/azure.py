@@ -502,7 +502,7 @@ class AzureDiscoverer(BaseDiscoverer):
 
         try:
             client = EventHubManagementClient(self._credential, subscription_id)
-            namespaces = list(client.namespaces.list())
+            namespaces = list(getattr(client.namespaces, "list")())
         except Exception as exc:
             logger.warning(
                 "Event Hubs namespace list failed for %s: %s", subscription_id, exc
@@ -518,7 +518,9 @@ class AzureDiscoverer(BaseDiscoverer):
             resource_group = resource_group_from_id(ns_id)
             try:
                 hubs = list(
-                    client.event_hubs.list_by_namespace(resource_group, ns_name)
+                    getattr(client.event_hubs, "list_by_namespace")(
+                        resource_group, ns_name
+                    )
                 )
             except Exception as exc:
                 logger.warning("Event Hubs list failed for %s: %s", ns_name, exc)

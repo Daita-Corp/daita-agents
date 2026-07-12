@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import closing
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -15,6 +17,7 @@ from .primitives import (
     Evidence,
     GovernanceAuditRecord,
     Operation,
+    OperationStatus,
     PolicyDecision,
     RuntimeEvent,
     RuntimeStore,
@@ -34,6 +37,9 @@ class SQLiteRuntimeStore(RuntimeStore):
         self._initialize()
 
     async def save_operation(self, operation: Operation) -> None:
+        return await asyncio.to_thread(self._save_operation_sync, operation)
+
+    def _save_operation_sync(self, operation: Operation) -> None:
         with self._transaction() as conn:
             conn.execute(
                 """
@@ -45,18 +51,27 @@ class SQLiteRuntimeStore(RuntimeStore):
             )
 
     async def load_operation(self, operation_id: str) -> Operation | None:
-        with self._connect() as conn:
+        return await asyncio.to_thread(self._load_operation_sync, operation_id)
+
+    def _load_operation_sync(self, operation_id: str) -> Operation | None:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "select data from operations where id = ?", (operation_id,)
             ).fetchone()
         return Operation.from_dict(_loads(row["data"])) if row else None
 
     async def list_operations(self) -> list[Operation]:
-        with self._connect() as conn:
+        return await asyncio.to_thread(self._list_operations_sync)
+
+    def _list_operations_sync(self) -> list[Operation]:
+        with closing(self._connect()) as conn:
             rows = conn.execute("select data from operations order by rowid").fetchall()
         return [Operation.from_dict(_loads(row["data"])) for row in rows]
 
     async def save_task(self, task: Task) -> None:
+        return await asyncio.to_thread(self._save_task_sync, task)
+
+    def _save_task_sync(self, task: Task) -> None:
         with self._transaction() as conn:
             conn.execute(
                 """
@@ -76,24 +91,50 @@ class SQLiteRuntimeStore(RuntimeStore):
             )
 
     async def load_task(self, task_id: str) -> Task | None:
-        with self._connect() as conn:
+        return await asyncio.to_thread(self._load_task_sync, task_id)
+
+    def _load_task_sync(self, task_id: str) -> Task | None:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "select data from tasks where id = ?", (task_id,)
             ).fetchone()
         return Task.from_dict(_loads(row["data"])) if row else None
 
     async def list_tasks(self, operation_id: str | None = None) -> list[Task]:
+        return await asyncio.to_thread(self._list_tasks_sync, operation_id)
+
+    def _list_tasks_sync(self, operation_id: str | None = None) -> list[Task]:
         sql = "select data from tasks"
         params: tuple[Any, ...] = ()
         if operation_id is not None:
             sql += " where operation_id = ?"
             params = (operation_id,)
         sql += " order by rowid"
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
         return [Task.from_dict(_loads(row["data"])) for row in rows]
 
     async def claim_task(
+        self,
+        task_id: str,
+        *,
+        lease_id: str | None = None,
+        lease_owner: str,
+        lease_expires_at: float | None = None,
+        worker_id: str | None = None,
+        worker_owner: str | None = None,
+    ) -> Task | None:
+        return await asyncio.to_thread(
+            self._claim_task_sync,
+            task_id,
+            lease_id=lease_id,
+            lease_owner=lease_owner,
+            lease_expires_at=lease_expires_at,
+            worker_id=worker_id,
+            worker_owner=worker_owner,
+        )
+
+    def _claim_task_sync(
         self,
         task_id: str,
         *,
@@ -156,6 +197,20 @@ class SQLiteRuntimeStore(RuntimeStore):
         lease_id: str,
         lease_expires_at: float,
     ) -> Task | None:
+        return await asyncio.to_thread(
+            self._heartbeat_task_sync,
+            task_id,
+            lease_id=lease_id,
+            lease_expires_at=lease_expires_at,
+        )
+
+    def _heartbeat_task_sync(
+        self,
+        task_id: str,
+        *,
+        lease_id: str,
+        lease_expires_at: float,
+    ) -> Task | None:
         with self._transaction() as conn:
             row = conn.execute(
                 "select data from tasks where id = ?", (task_id,)
@@ -191,6 +246,22 @@ class SQLiteRuntimeStore(RuntimeStore):
         events: tuple[RuntimeEvent, ...],
         lease_id: str | None = None,
     ) -> bool:
+        return await asyncio.to_thread(
+            self._commit_task_blocked_sync,
+            operation=operation,
+            task=task,
+            events=events,
+            lease_id=lease_id,
+        )
+
+    def _commit_task_blocked_sync(
+        self,
+        *,
+        operation: Operation | None,
+        task: Task,
+        events: tuple[RuntimeEvent, ...],
+        lease_id: str | None = None,
+    ) -> bool:
         with self._transaction() as conn:
             if not self._lease_matches(conn, task.id, lease_id):
                 return False
@@ -202,11 +273,30 @@ class SQLiteRuntimeStore(RuntimeStore):
             return True
 
     async def commit_task_started(self, task: Task, event: RuntimeEvent) -> None:
+        return await asyncio.to_thread(self._commit_task_started_sync, task, event)
+
+    def _commit_task_started_sync(self, task: Task, event: RuntimeEvent) -> None:
         with self._transaction() as conn:
             self._upsert_task(conn, task)
             self._insert_event(conn, event)
 
     async def commit_task_succeeded(
+        self,
+        task: Task,
+        evidence: tuple[Evidence, ...],
+        event: RuntimeEvent,
+        *,
+        lease_id: str | None = None,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._commit_task_succeeded_sync,
+            task,
+            evidence,
+            event,
+            lease_id=lease_id,
+        )
+
+    def _commit_task_succeeded_sync(
         self,
         task: Task,
         evidence: tuple[Evidence, ...],
@@ -230,6 +320,20 @@ class SQLiteRuntimeStore(RuntimeStore):
         *,
         lease_id: str | None = None,
     ) -> bool:
+        return await asyncio.to_thread(
+            self._commit_task_failed_sync,
+            task,
+            event,
+            lease_id=lease_id,
+        )
+
+    def _commit_task_failed_sync(
+        self,
+        task: Task,
+        event: RuntimeEvent,
+        *,
+        lease_id: str | None = None,
+    ) -> bool:
         with self._transaction() as conn:
             if not self._lease_matches(conn, task.id, lease_id):
                 return False
@@ -242,19 +346,37 @@ class SQLiteRuntimeStore(RuntimeStore):
         request: ApprovalRequest,
         event: RuntimeEvent,
     ) -> None:
+        return await asyncio.to_thread(
+            self._commit_approval_update_sync, request, event
+        )
+
+    def _commit_approval_update_sync(
+        self,
+        request: ApprovalRequest,
+        event: RuntimeEvent,
+    ) -> None:
         with self._transaction() as conn:
             self._upsert_approval_request(conn, request)
             self._insert_event(conn, event)
 
     async def save_evidence(self, evidence: Evidence) -> None:
+        return await asyncio.to_thread(self._save_evidence_sync, evidence)
+
+    def _save_evidence_sync(self, evidence: Evidence) -> None:
         with self._transaction() as conn:
             self._insert_evidence(conn, evidence)
 
     async def append_event(self, event: RuntimeEvent) -> None:
+        return await asyncio.to_thread(self._append_event_sync, event)
+
+    def _append_event_sync(self, event: RuntimeEvent) -> None:
         with self._transaction() as conn:
             self._insert_event(conn, event)
 
     async def save_policy_decision(self, decision: PolicyDecision) -> None:
+        return await asyncio.to_thread(self._save_policy_decision_sync, decision)
+
+    def _save_policy_decision_sync(self, decision: PolicyDecision) -> None:
         with self._transaction() as conn:
             conn.execute(
                 """
@@ -265,10 +387,29 @@ class SQLiteRuntimeStore(RuntimeStore):
             )
 
     async def save_governance_audit_record(self, record: GovernanceAuditRecord) -> None:
+        return await asyncio.to_thread(self._save_governance_audit_record_sync, record)
+
+    def _save_governance_audit_record_sync(self, record: GovernanceAuditRecord) -> None:
         with self._transaction() as conn:
             self._insert_governance_audit_record(conn, record)
 
     async def commit_governance_evaluation(
+        self,
+        *,
+        decisions: tuple[PolicyDecision, ...],
+        audit_record: GovernanceAuditRecord,
+        approval_requests: tuple[ApprovalRequest, ...],
+        events: tuple[RuntimeEvent, ...],
+    ) -> None:
+        return await asyncio.to_thread(
+            self._commit_governance_evaluation_sync,
+            decisions=decisions,
+            audit_record=audit_record,
+            approval_requests=approval_requests,
+            events=events,
+        )
+
+    def _commit_governance_evaluation_sync(
         self,
         *,
         decisions: tuple[PolicyDecision, ...],
@@ -301,6 +442,26 @@ class SQLiteRuntimeStore(RuntimeStore):
         approval_requests: tuple[ApprovalRequest, ...],
         events: tuple[RuntimeEvent, ...],
     ) -> None:
+        return await asyncio.to_thread(
+            self._commit_governance_blocked_sync,
+            operation=operation,
+            task=task,
+            decisions=decisions,
+            audit_record=audit_record,
+            approval_requests=approval_requests,
+            events=events,
+        )
+
+    def _commit_governance_blocked_sync(
+        self,
+        *,
+        operation: Operation,
+        task: Task | None,
+        decisions: tuple[PolicyDecision, ...],
+        audit_record: GovernanceAuditRecord,
+        approval_requests: tuple[ApprovalRequest, ...],
+        events: tuple[RuntimeEvent, ...],
+    ) -> None:
         with self._transaction() as conn:
             self._upsert_operation(conn, operation)
             if task is not None:
@@ -320,11 +481,17 @@ class SQLiteRuntimeStore(RuntimeStore):
                 self._insert_event(conn, event)
 
     async def save_approval_request(self, request: ApprovalRequest) -> None:
+        return await asyncio.to_thread(self._save_approval_request_sync, request)
+
+    def _save_approval_request_sync(self, request: ApprovalRequest) -> None:
         with self._transaction() as conn:
             self._upsert_approval_request(conn, request)
 
     async def list_evidence(self, operation_id: str) -> list[Evidence]:
-        with self._connect() as conn:
+        return await asyncio.to_thread(self._list_evidence_sync, operation_id)
+
+    def _list_evidence_sync(self, operation_id: str) -> list[Evidence]:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 "select data from evidence where operation_id = ? order by rowid",
                 (operation_id,),
@@ -332,17 +499,25 @@ class SQLiteRuntimeStore(RuntimeStore):
         return [Evidence.from_dict(_loads(row["data"])) for row in rows]
 
     async def list_events(self, operation_id: str | None = None) -> list[RuntimeEvent]:
+        return await asyncio.to_thread(self._list_events_sync, operation_id)
+
+    def _list_events_sync(self, operation_id: str | None = None) -> list[RuntimeEvent]:
         sql = "select data from events"
         params: tuple[Any, ...] = ()
         if operation_id is not None:
             sql += " where operation_id = ?"
             params = (operation_id,)
         sql += " order by rowid"
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
         return [RuntimeEvent.from_dict(_loads(row["data"])) for row in rows]
 
     async def list_policy_decisions(
+        self, operation_id: str | None = None
+    ) -> list[PolicyDecision]:
+        return await asyncio.to_thread(self._list_policy_decisions_sync, operation_id)
+
+    def _list_policy_decisions_sync(
         self, operation_id: str | None = None
     ) -> list[PolicyDecision]:
         sql = "select data from policy_decisions"
@@ -351,11 +526,18 @@ class SQLiteRuntimeStore(RuntimeStore):
             sql += " where operation_id = ?"
             params = (operation_id,)
         sql += " order by rowid"
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
         return [PolicyDecision.from_dict(_loads(row["data"])) for row in rows]
 
     async def list_governance_audit_records(
+        self, operation_id: str | None = None
+    ) -> list[GovernanceAuditRecord]:
+        return await asyncio.to_thread(
+            self._list_governance_audit_records_sync, operation_id
+        )
+
+    def _list_governance_audit_records_sync(
         self, operation_id: str | None = None
     ) -> list[GovernanceAuditRecord]:
         sql = "select data from governance_audit_records"
@@ -364,11 +546,16 @@ class SQLiteRuntimeStore(RuntimeStore):
             sql += " where operation_id = ?"
             params = (operation_id,)
         sql += " order by rowid"
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
         return [GovernanceAuditRecord.from_dict(_loads(row["data"])) for row in rows]
 
     async def list_approval_requests(
+        self, operation_id: str | None = None
+    ) -> list[ApprovalRequest]:
+        return await asyncio.to_thread(self._list_approval_requests_sync, operation_id)
+
+    def _list_approval_requests_sync(
         self, operation_id: str | None = None
     ) -> list[ApprovalRequest]:
         sql = "select data from approval_requests"
@@ -377,31 +564,52 @@ class SQLiteRuntimeStore(RuntimeStore):
             sql += " where operation_id = ?"
             params = (operation_id,)
         sql += " order by rowid"
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(sql, params).fetchall()
         return [ApprovalRequest.from_dict(_loads(row["data"])) for row in rows]
 
     async def inspect_operation(self, operation_id: str) -> OperationSnapshot | None:
-        from .store import InMemoryRuntimeStore
+        return await asyncio.to_thread(self._inspect_operation_sync, operation_id)
 
-        operation = await self.load_operation(operation_id)
+    def _inspect_operation_sync(self, operation_id: str) -> OperationSnapshot | None:
+        operation = self._load_operation_sync(operation_id)
         if operation is None:
             return None
-        mirror = InMemoryRuntimeStore()
-        await mirror.save_operation(operation)
-        for task in await self.list_tasks(operation_id):
-            await mirror.save_task(task)
-        for evidence in await self.list_evidence(operation_id):
-            await mirror.save_evidence(evidence)
-        for decision in await self.list_policy_decisions(operation_id):
-            await mirror.save_policy_decision(decision)
-        for record in await self.list_governance_audit_records(operation_id):
-            await mirror.save_governance_audit_record(record)
-        for approval in await self.list_approval_requests(operation_id):
-            await mirror.save_approval_request(approval)
-        for event in await self.list_events(operation_id):
-            await mirror.append_event(event)
-        return await mirror.inspect_operation(operation_id)
+        tasks = tuple(self._list_tasks_sync(operation_id))
+        completed_task_ids = tuple(
+            task.id
+            for task in tasks
+            if task.status
+            in {
+                TaskStatus.SUCCEEDED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.SKIPPED,
+            }
+        )
+        resumable_task_ids = tuple(
+            task.id
+            for task in tasks
+            if task.status in {TaskStatus.PENDING, TaskStatus.BLOCKED}
+        )
+        return OperationSnapshot(
+            operation=operation,
+            tasks=tasks,
+            evidence=tuple(self._list_evidence_sync(operation_id)),
+            events=tuple(self._list_events_sync(operation_id)),
+            policy_decisions=tuple(self._list_policy_decisions_sync(operation_id)),
+            governance_audit_records=tuple(
+                self._list_governance_audit_records_sync(operation_id)
+            ),
+            approval_requests=tuple(self._list_approval_requests_sync(operation_id)),
+            resumable_task_ids=resumable_task_ids,
+            completed_task_ids=completed_task_ids,
+            metadata={
+                "operation_status": operation.status.value,
+                "resumable": operation.status
+                in {OperationStatus.BLOCKED, OperationStatus.RUNNING},
+            },
+        )
 
     def _initialize(self) -> None:
         with self._transaction() as conn:
@@ -449,7 +657,7 @@ class SQLiteRuntimeStore(RuntimeStore):
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _transaction(self) -> sqlite3.Connection:
+    def _transaction(self) -> _Transaction:
         return _Transaction(self)
 
     @staticmethod
@@ -534,7 +742,7 @@ class SQLiteRuntimeStore(RuntimeStore):
             (
                 request.approval_id,
                 request.operation_id,
-                request.status.value,
+                request.status_value,
                 _json(request.to_dict()),
             ),
         )

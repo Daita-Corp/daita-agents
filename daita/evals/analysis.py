@@ -323,7 +323,7 @@ def _snapshot_answer(result: Mapping[str, Any]) -> str | None:
 def _jsonable(value: Any) -> Any:
     if hasattr(value, "to_dict"):
         return value.to_dict()
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return _jsonable(asdict(value))
     if isinstance(value, Mapping):
         return {str(key): _jsonable(child) for key, child in value.items()}
@@ -340,7 +340,7 @@ def _mapping(value: Any) -> dict[str, Any]:
         return {}
     if hasattr(value, "to_dict"):
         value = value.to_dict()
-    elif is_dataclass(value):
+    elif is_dataclass(value) and not isinstance(value, type):
         value = asdict(value)
     if isinstance(value, Mapping):
         return dict(value)

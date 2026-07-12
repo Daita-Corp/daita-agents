@@ -4,11 +4,11 @@ Slack plugin for Daita Agents.
 Simple Slack messaging and collaboration - no over-engineering.
 """
 
+import asyncio
+import json
 import logging
 import os
-import json
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
-from datetime import datetime
+from typing import Any, Dict, List, Optional, TYPE_CHECKING, TypedDict
 
 from daita.runtime import (
     AccessMode,
@@ -24,7 +24,7 @@ from .manifest import PluginKind, PluginManifest
 from ..core.exceptions import AuthenticationError, PluginError
 
 if TYPE_CHECKING:
-    from ..core.tools import LocalTool
+    from slack_sdk.web.async_client import AsyncWebClient
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +128,14 @@ _SLACK_TOOL_DEFINITIONS = (
 )
 
 
+class _SlackUserInfo(TypedDict):
+    user_id: Optional[str]
+    team_id: Optional[str]
+    team: Optional[str]
+    user: Optional[str]
+    bot_id: Optional[str]
+
+
 class _SlackExecutor:
     """Execute Slack runtime capabilities and return typed evidence."""
 
@@ -206,9 +214,10 @@ class SlackPlugin(ConnectorPlugin):
         # Store additional config
         self.config = kwargs
 
-        self._client = None
-        self._user_info = None
+        self._client: Optional["AsyncWebClient"] = None
+        self._user_info: Optional[_SlackUserInfo] = None
         self._executor = _SlackExecutor(self)
+        self._connect_lock = asyncio.Lock()
 
         logger.debug(f"Slack plugin configured with token: {token[:12]}...")
 
@@ -216,6 +225,13 @@ class SlackPlugin(ConnectorPlugin):
     def is_connected(self) -> bool:
         """Whether the Slack client has been initialized."""
         return self._client is not None
+
+    @property
+    def client(self) -> "AsyncWebClient":
+        """Return the authenticated Slack client."""
+        if self._client is None:
+            raise PluginError("Slack is not connected", plugin_name="Slack")
+        return self._client
 
     async def teardown(self) -> None:
         """Release runtime-owned Slack resources."""
@@ -289,56 +305,54 @@ class SlackPlugin(ConnectorPlugin):
 
     async def connect(self):
         """Initialize Slack client and validate connection."""
-        if self._client is not None:
-            return  # Already connected
+        async with self._connect_lock:
+            if self._client is not None:
+                return
 
-        try:
-            from slack_sdk.web.async_client import AsyncWebClient
-            from slack_sdk.errors import SlackApiError
-
-            # Create Slack client
-            self._client = AsyncWebClient(token=self.token)
-
-            # Test connection and get bot info
             try:
-                auth_response = await self._client.auth_test()
-                self._user_info = {
+                from slack_sdk.errors import SlackApiError
+                from slack_sdk.web.async_client import AsyncWebClient
+
+                client = AsyncWebClient(token=self.token)
+                try:
+                    auth_response = await client.auth_test()
+                except SlackApiError as error:
+                    error_code = error.response.get("error", "unknown_error")
+                    if error_code == "invalid_auth":
+                        message = "Invalid Slack token. Please check your bot token."
+                    elif error_code == "account_inactive":
+                        message = "Slack account is inactive."
+                    else:
+                        message = f"Slack authentication failed: {error_code}"
+                    raise AuthenticationError(message, provider="Slack") from error
+
+                user_info: _SlackUserInfo = {
                     "user_id": auth_response.get("user_id"),
                     "team_id": auth_response.get("team_id"),
                     "team": auth_response.get("team"),
                     "user": auth_response.get("user"),
                     "bot_id": auth_response.get("bot_id"),
                 }
+                self._client = client
+                self._user_info = user_info
 
                 logger.info(
-                    f"Connected to Slack as {self._user_info['user']} on team {self._user_info['team']}"
+                    "Connected to Slack as %s on team %s",
+                    user_info["user"],
+                    user_info["team"],
                 )
 
-            except SlackApiError as e:
-                if e.response["error"] == "invalid_auth":
-                    raise AuthenticationError(
-                        "Invalid Slack token. Please check your bot token.",
-                        provider="Slack",
-                    )
-                elif e.response["error"] == "account_inactive":
-                    raise AuthenticationError(
-                        "Slack account is inactive.",
-                        provider="Slack",
-                    )
-                else:
-                    raise AuthenticationError(
-                        f"Slack authentication failed: {e.response['error']}",
-                        provider="Slack",
-                    )
-
-        except ImportError:
-            raise ImportError(
-                "slack-sdk not installed. Install with: pip install 'daita-agents[slack]'"
-            )
-        except (AuthenticationError, PluginError):
-            raise
-        except Exception as e:
-            raise PluginError(f"Failed to connect to Slack: {e}", plugin_name="Slack")
+            except ImportError as error:
+                raise ImportError(
+                    "slack-sdk is required. Install with: "
+                    "pip install 'daita-agents[slack]'"
+                ) from error
+            except (AuthenticationError, PluginError):
+                raise
+            except Exception as error:
+                raise PluginError(
+                    f"Failed to connect to Slack: {error}", plugin_name="Slack"
+                ) from error
 
     async def disconnect(self):
         """Close Slack connection."""
@@ -409,7 +423,7 @@ class SlackPlugin(ConnectorPlugin):
                 message_args["attachments"] = attachments
 
             # Send message
-            response = await self._client.chat_postMessage(**message_args)
+            response = await self.client.chat_postMessage(**message_args)
 
             result = {
                 "ok": response["ok"],
@@ -455,7 +469,7 @@ class SlackPlugin(ConnectorPlugin):
 
         try:
             # Create formatted blocks for agent results
-            blocks = self._format_agent_results(agent_results, title)
+            blocks = self._format_agent_results(agent_results, title or "Agent Results")
 
             # Send message with blocks
             return await self.send_message(
@@ -507,7 +521,7 @@ class SlackPlugin(ConnectorPlugin):
             file_title = title or file_name
 
             # Upload file
-            response = await self._client.files_upload_v2(
+            response = await self.client.files_upload_v2(
                 channel=channel,
                 file=file_path,
                 title=file_title,
@@ -561,7 +575,7 @@ class SlackPlugin(ConnectorPlugin):
 
         try:
             # Get conversation history
-            response = await self._client.conversations_history(
+            response = await self.client.conversations_history(
                 channel=channel,
                 limit=limit,
                 cursor=cursor,
@@ -616,7 +630,7 @@ class SlackPlugin(ConnectorPlugin):
 
         try:
             # Get conversations list
-            response = await self._client.conversations_list(types=types)
+            response = await self.client.conversations_list(types=types)
 
             channels = response.get("channels", [])
 
@@ -646,7 +660,7 @@ class SlackPlugin(ConnectorPlugin):
         self, agent_results: Dict[str, Any], title: str
     ) -> List[Dict[str, Any]]:
         """Format agent results as Slack Block Kit blocks."""
-        blocks = []
+        blocks: List[Dict[str, Any]] = []
 
         # Header block
         blocks.append({"type": "header", "text": {"type": "plain_text", "text": title}})
@@ -717,6 +731,16 @@ class SlackPlugin(ConnectorPlugin):
         channel = args.get("channel")
         text = args.get("text")
 
+        if not isinstance(channel, str) or not channel:
+            raise PluginError(
+                "send_slack_message requires a non-empty channel",
+                plugin_name="Slack",
+            )
+        if not isinstance(text, str) or not text:
+            raise PluginError(
+                "send_slack_message requires non-empty text", plugin_name="Slack"
+            )
+
         result = await self.send_message(channel, text)
 
         return {
@@ -730,6 +754,21 @@ class SlackPlugin(ConnectorPlugin):
         channel = args.get("channel")
         summary = args.get("summary")
         results = args.get("results", {})
+
+        if not isinstance(channel, str) or not channel:
+            raise PluginError(
+                "send_slack_summary requires a non-empty channel",
+                plugin_name="Slack",
+            )
+        if not isinstance(summary, str) or not summary:
+            raise PluginError(
+                "send_slack_summary requires a non-empty summary",
+                plugin_name="Slack",
+            )
+        if not isinstance(results, dict):
+            raise PluginError(
+                "send_slack_summary results must be an object", plugin_name="Slack"
+            )
 
         await self.send_agent_summary(
             channel=channel, agent_results={"summary": summary, "data": results}
@@ -758,6 +797,17 @@ class SlackPlugin(ConnectorPlugin):
         """Tool handler for read_slack_messages"""
         channel = args.get("channel")
         limit = args.get("limit", 20)
+
+        if not isinstance(channel, str) or not channel:
+            raise PluginError(
+                "read_slack_messages requires a non-empty channel",
+                plugin_name="Slack",
+            )
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise PluginError(
+                "read_slack_messages limit must be a positive integer",
+                plugin_name="Slack",
+            )
 
         messages = await self.get_channel_history(channel=channel, limit=limit)
 

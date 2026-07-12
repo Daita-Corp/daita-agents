@@ -195,12 +195,14 @@ class AnthropicProvider(BaseLLMProvider):
                 async for event in stream:
                     # Text content deltas
                     if event.type == "content_block_delta":
-                        if hasattr(event.delta, "text"):
+                        if event.delta.type == "text_delta":
                             yield LLMChunk(
                                 type="text", content=event.delta.text, model=self.model
                             )
                         # Accumulate tool input deltas
-                        elif hasattr(event.delta, "partial_json") and current_tool_use:
+                        elif (
+                            event.delta.type == "input_json_delta" and current_tool_use
+                        ):
                             # Anthropic streams tool arguments as partial JSON
                             if "partial_json" not in current_tool_use:
                                 current_tool_use["partial_json"] = ""
@@ -272,20 +274,33 @@ class AnthropicProvider(BaseLLMProvider):
         try:
             # Merge parameters
             params = self._merge_params(kwargs)
+            max_tokens = params.get("max_tokens")
+            if not isinstance(max_tokens, int):
+                raise ValueError("max_tokens must be an integer")
+            temperature = params.get("temperature")
+            if temperature is not None and not isinstance(temperature, (int, float)):
+                raise ValueError("temperature must be numeric")
 
             # Make API call with system parameter
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=params.get("max_tokens"),
-                temperature=params.get("temperature"),
-                system=system_message,
-                messages=[{"role": "user", "content": prompt}],
-                timeout=params.get("timeout"),
-            )
+            request_params: Dict[str, Any] = {
+                "model": self.model,
+                "max_tokens": max_tokens,
+                "system": system_message,
+                "messages": [{"role": "user", "content": prompt}],
+                "timeout": params.get("timeout"),
+            }
+            if temperature is not None:
+                request_params["temperature"] = float(temperature)
+            response = await self.client.messages.create(**request_params)
 
             self._record_usage(response.usage)
 
-            return response.content[0].text
+            text_block = next(
+                (block for block in response.content if block.type == "text"), None
+            )
+            if text_block is None:
+                raise ValueError("Anthropic response did not contain text")
+            return text_block.text
 
         except Exception as e:
             logger.error(f"Anthropic generation with system message failed: {str(e)}")

@@ -1,4 +1,4 @@
-"""Governed reads and approval-gated write proposals with Agent.from_db().
+"""Governed reads and source-safe write blocking with Agent.from_db().
 
 Run:
     python examples/03_governed_reads_and_writes.py
@@ -12,6 +12,7 @@ import os
 from typing import Any
 
 from daita.agents.agent import Agent
+from daita.db import DbLLMConfig, DbMemoryConfig, DbSourceOptions
 
 from local_sqlite_fixtures import temporary_sales_sqlite
 
@@ -29,10 +30,12 @@ def llm_options(use_live_llm: bool) -> dict[str, Any]:
         print("OPENAI_API_KEY is not set; using deterministic DB runtime output.\n")
         return {}
     return {
-        "llm_provider": "openai",
-        "model": os.getenv("OPENAI_MODEL", "gpt-5.4-mini"),
-        "api_key": api_key,
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=os.getenv("OPENAI_MODEL", "gpt-5.4-mini"),
+            api_key=api_key,
+            temperature=0,
+        )
     }
 
 
@@ -98,10 +101,9 @@ async def main() -> None:
         agent = await Agent.from_db(
             str(db_path),
             name="GovernedReadsAndWrites",
-            mode="governed",
-            read_only=False,
-            cache_ttl=0,
-            memory=False,
+            lineage=True,
+            source_options=DbSourceOptions(cache_ttl=0),
+            memory=DbMemoryConfig(enabled=False),
             **options,
         )
         try:
@@ -126,21 +128,7 @@ async def main() -> None:
                 write_result.operation_id
             )
             print(f"Write proposal: {WRITE_PROPOSAL}")
-            print_snapshot("Blocked operation", write_snapshot)
-
-            approval_id = first_approval_id(write_snapshot)
-            if approval_id is None:
-                print("No approval was requested; nothing to resume.")
-                return
-
-            await agent.runtime.approval_channel.approve(approval_id)
-            resumed = await agent.runtime.resume_operation(write_result.operation_id)
-            print_snapshot("Resumed operation", resumed)
-
-            resume_check = await agent.runtime.resume_operation(
-                write_result.operation_id
-            )
-            print_snapshot("Resume check", resume_check)
+            print_snapshot("Read-only operation", write_snapshot)
         finally:
             await agent.stop()
 

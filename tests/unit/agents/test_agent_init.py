@@ -589,7 +589,9 @@ class TestPluginAndToolManagement:
         assert agent.get_plugin_manifest("missing") is None
         assert agent.get_capability("agent.lookup").owner == "tool_view_plugin"
         assert agent.get_executor("tool_view_plugin.lookup") is plugin.executor
-        assert agent.get_tool_view("registry_lookup").capability_id == "agent.lookup"
+        tool_view = agent.get_tool_view("registry_lookup")
+        assert tool_view is not None
+        assert tool_view.capability_id == "agent.lookup"
         assert agent.get_tool_view("missing") is None
         assert agent.get_tool_view_owner("registry_lookup") == "tool_view_plugin"
 
@@ -1247,3 +1249,10 @@ class TestGetTokenUsage:
         # Before any LLM calls, all values should be zero
         usage = agent.get_token_usage()
         assert usage["total_tokens"] == 0
+
+    def test_rejects_non_mapping_provider_stats(self, mock_llm):
+        mock_llm.get_token_stats = lambda: "invalid"
+        agent = Agent(name="X", llm_provider=mock_llm)
+
+        with pytest.raises(TypeError, match="must return a dictionary"):
+            agent.get_token_usage()

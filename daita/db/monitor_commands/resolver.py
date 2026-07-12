@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..monitors import DbMonitor
-from .prompt_parsing import _monitor_id_from_phrase
+from .naming import _monitor_id_from_phrase
 from .types import DbMonitorCommand, DbMonitorResolution
 
 

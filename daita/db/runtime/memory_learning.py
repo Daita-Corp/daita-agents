@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from daita.runtime import Operation, OperationStatus
+from daita.runtime import Evidence, Operation, OperationStatus, Task
 
-from ..analysis import stable_fingerprint
+from ..fingerprints import persisted_fingerprint
 from ..memory import db_memory_options_from_runtime_metadata
-from ..models import DbOperationResult
+from ..models import DbOperationContract, DbOperationResult, DbRuntimeConfig
+from .tasks.models import DbTaskPlan, DbTaskSpec
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from daita.plugins import ExtensionRegistry
+    from daita.runtime import RuntimeKernel, RuntimeStore
 
 _ELIGIBLE_OPERATION_TYPES = frozenset(
     {
@@ -24,6 +31,27 @@ _ELIGIBLE_OPERATION_TYPES = frozenset(
 
 class DbRuntimeMemoryLearningMixin:
     """Enqueue cold-path DB memory learning after verified operations."""
+
+    if TYPE_CHECKING:
+        config: DbRuntimeConfig
+        kernel: RuntimeKernel
+        registry: ExtensionRegistry
+        store: RuntimeStore
+
+        async def plan_task_specs(
+            self,
+            operation: Operation,
+            specs: Iterable[DbTaskSpec],
+            *,
+            contract: DbOperationContract | Mapping[str, Any] | None = None,
+        ) -> DbTaskPlan: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
 
     async def _enqueue_memory_learning_after_result(
         self,
@@ -73,28 +101,33 @@ class DbRuntimeMemoryLearningMixin:
             "db.memory.learning.enqueue",
             owner="db_runtime",
         )
-        enqueue_task = await self.kernel.plan_task(
-            operation_id=child.id,
-            capability_id=enqueue_capability.id,
-            owner=enqueue_capability.owner,
-            input={
-                "source_operation_id": operation.id,
-                "source_operation_type": operation.operation_type,
-                "source_identity": source_identity,
-                "source_schema_fingerprint": source_schema_fingerprint,
-                "source_evidence_ids": evidence_refs,
-                "learning_mode": learning_mode,
-            },
-            metadata={
-                "owner": enqueue_capability.owner,
-                "reason": "db_memory_learning_enqueue",
-                "queue": "memory_learning",
-                "source_operation_id": operation.id,
-                "source_identity": source_identity,
-                "learning_mode": learning_mode,
-            },
+        plan = await self.plan_task_specs(
+            child,
+            (
+                DbTaskSpec(
+                    capability_id=enqueue_capability.id,
+                    owner=enqueue_capability.owner,
+                    input={
+                        "source_operation_id": operation.id,
+                        "source_operation_type": operation.operation_type,
+                        "source_identity": source_identity,
+                        "source_schema_fingerprint": source_schema_fingerprint,
+                        "source_evidence_ids": evidence_refs,
+                        "learning_mode": learning_mode,
+                    },
+                    reason="db_memory_learning_enqueue",
+                    sequence=1,
+                    metadata={
+                        "queue": "memory_learning",
+                        "source_operation_id": operation.id,
+                        "source_identity": source_identity,
+                        "learning_mode": learning_mode,
+                    },
+                    deterministic_key=f"{operation.id}:db.memory.learning.enqueue",
+                ),
+            ),
         )
-        await self.execute_task(enqueue_task, child)
+        await self.execute_task(plan.tasks[0], child)
 
     def _memory_learning_result_eligible(self, result: DbOperationResult) -> bool:
         if result.status is not OperationStatus.SUCCEEDED:
@@ -148,7 +181,7 @@ def _schema_fingerprint_from_result(result: DbOperationResult) -> str | None:
                     return str(value)
     for evidence in result.evidence:
         if evidence.kind in {"schema.asset_profile", "catalog.source"}:
-            return stable_fingerprint(evidence.payload)
+            return persisted_fingerprint(evidence.payload)
     return None
 
 

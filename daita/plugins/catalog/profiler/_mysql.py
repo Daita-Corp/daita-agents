@@ -14,13 +14,6 @@ class MySQLProfiler(BaseProfiler):
 
     async def profile(self, store: DiscoveredStore) -> NormalizedSchema:
         """Connect to a MySQL store and extract its schema."""
-        try:
-            import aiomysql
-        except ImportError:
-            raise ImportError(
-                "aiomysql is required. Install with: pip install 'daita-agents[mysql]'"
-            )
-
         from ..discovery import discover_mysql
 
         conn_hint = store.connection_hint

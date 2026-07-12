@@ -32,7 +32,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from inspect import iscoroutinefunction
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional
 
 from .base import BasePlugin, PluginContext
 from .data_quality_extensions import (
@@ -41,10 +41,6 @@ from .data_quality_extensions import (
     data_quality_capabilities,
     data_quality_evidence_schemas,
 )
-
-if TYPE_CHECKING:
-    from ..core.tools import LocalTool
-    from .base_db import BaseDatabasePlugin
 
 logger = logging.getLogger(__name__)
 
@@ -420,7 +416,8 @@ class DataQualityPlugin(BasePlugin):
             columns = []
             for row in rows:
                 col = row.get("column_name") if isinstance(row, dict) else row[0]
-                columns.append(col)
+                if isinstance(col, str) and col:
+                    columns.append(col)
 
         if not columns:
             return {"success": False, "error": f"No columns found for table {table}"}
@@ -574,7 +571,7 @@ class DataQualityPlugin(BasePlugin):
 
         import numpy as np
 
-        arr = np.array(values)
+        arr = np.asarray(values, dtype=float)
 
         if method == "iqr":
             q1 = np.percentile(arr, 25)

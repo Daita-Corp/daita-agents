@@ -4,12 +4,16 @@ Configuration models for Daita Agents.
 
 import asyncio
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class YamlSerializableMixin:
     """Mixin for YAML serialization support."""
+
+    if TYPE_CHECKING:
+
+        def model_dump(self, **kwargs: Any) -> Dict[str, Any]: ...
 
     def model_dump_yaml_safe(self) -> Dict[str, Any]:
         """Export to YAML-safe dictionary."""
@@ -125,6 +129,8 @@ class RetryPolicy(YamlSerializableMixin, BaseModel):
                     break
 
         # If we get here, all retries failed
+        if last_error is None:
+            raise RuntimeError("retry loop completed without an attempt")
         raise last_error
 
 

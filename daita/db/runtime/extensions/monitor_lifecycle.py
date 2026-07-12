@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping, TYPE_CHECKING
 
 from daita.runtime import Evidence, Operation, Task
 
-from ...analysis import stable_fingerprint
+from ...evidence import load_evidence
+from ...fingerprints import persisted_fingerprint
 from ...monitor_commands.types import DbMonitorValidation
 from ...monitors import (
     DbMonitor,
     DbMonitorMutation,
+    DbMonitorMutationAction,
     DbMonitorState,
     monitor_with_updates,
 )
+from .monitor_evidence import load_monitor_proposal_evidence
+
+if TYPE_CHECKING:
+    from .plugin import DbRuntimePlanningPlugin
+
+DbMonitorLifecycleAction = Literal["update", "pause", "resume", "delete", "disable"]
 
 
 @dataclass(frozen=True)
@@ -90,7 +98,7 @@ class DbMonitorPlanLifecycleExecutor:
             "paused_until": paused_until,
             "validation": validation.to_dict(),
         }
-        fingerprint = stable_fingerprint(proposal)
+        fingerprint = persisted_fingerprint(proposal)
         proposal["proposal_fingerprint"] = fingerprint
         return [
             Evidence(
@@ -126,9 +134,10 @@ class DbMonitorCommitLifecycleExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        proposal_evidence = await _load_evidence(
+        proposal_evidence = await load_monitor_proposal_evidence(
             runtime,
-            operation.id,
+            operation,
+            task,
             task.input.get("proposal_evidence_id"),
         )
         if proposal_evidence is None:
@@ -137,9 +146,9 @@ class DbMonitorCommitLifecycleExecutor:
             raise RuntimeError("monitor lifecycle proposal evidence was not accepted")
         proposal = dict(proposal_evidence.payload)
         expected_fingerprint = task.input.get("proposal_fingerprint")
-        actual_fingerprint = proposal.get("proposal_fingerprint") or stable_fingerprint(
-            proposal
-        )
+        actual_fingerprint = proposal.get(
+            "proposal_fingerprint"
+        ) or persisted_fingerprint(proposal)
         if expected_fingerprint and expected_fingerprint != actual_fingerprint:
             raise RuntimeError("monitor lifecycle proposal fingerprint mismatch")
 
@@ -148,12 +157,12 @@ class DbMonitorCommitLifecycleExecutor:
         before_payload = proposal.get("before")
         after_payload = proposal.get("after")
         before = (
-            DbMonitor.from_dict(before_payload)
+            DbMonitor.from_dict(dict(before_payload))
             if isinstance(before_payload, Mapping)
             else None
         )
         after = (
-            DbMonitor.from_dict(after_payload)
+            DbMonitor.from_dict(dict(after_payload))
             if isinstance(after_payload, Mapping)
             else None
         )
@@ -166,7 +175,7 @@ class DbMonitorCommitLifecycleExecutor:
             action=action,
         )
         if not idempotent_existing:
-            await runtime.monitor_store.commit_monitor_mutation(
+            await runtime.commit_monitor_mutation(
                 DbMonitorMutation(
                     action=_monitor_lifecycle_mutation_action(action),
                     operation=operation,
@@ -246,7 +255,7 @@ class DbMonitorLocalDeliveryExecutor:
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
         payload_source = dict(task.input.get("payload_source") or {})
-        report = await _load_evidence(
+        report = await load_evidence(
             runtime,
             operation.id,
             payload_source.get("report_evidence_id"),
@@ -298,29 +307,24 @@ class DbMonitorLocalDeliveryExecutor:
                     "monitor_report_fingerprint": payload["report_fingerprint"],
                     "monitor_action_fingerprint": payload["action_plan_fingerprint"],
                     "idempotency_key": payload["idempotency_key"],
-                    "payload_fingerprint": stable_fingerprint(payload),
+                    "payload_fingerprint": persisted_fingerprint(payload),
                 },
             )
         ]
 
 
-async def _load_evidence(
-    runtime: Any,
-    operation_id: str,
-    evidence_id: Any,
-) -> Evidence | None:
-    if not evidence_id:
-        return None
-    for evidence in await runtime.store.list_evidence(operation_id):
-        if evidence.id == evidence_id:
-            return evidence
-    return None
-
-
-def _monitor_lifecycle_action(value: str) -> str:
+def _monitor_lifecycle_action(value: str) -> DbMonitorLifecycleAction:
     normalized = value.removeprefix("monitor.").replace("_", ".").lower()
-    if normalized in {"update", "pause", "resume", "delete", "disable"}:
-        return normalized
+    if normalized == "update":
+        return "update"
+    if normalized == "pause":
+        return "pause"
+    if normalized == "resume":
+        return "resume"
+    if normalized == "delete":
+        return "delete"
+    if normalized == "disable":
+        return "disable"
     if normalized == "disabled":
         return "disable"
     raise ValueError(f"unsupported monitor lifecycle action: {value!r}")
@@ -358,7 +362,9 @@ def _monitor_lifecycle_commit_evidence_kind(action: str) -> str:
     return "monitor.state_update"
 
 
-def _monitor_lifecycle_mutation_action(action: str) -> str:
+def _monitor_lifecycle_mutation_action(
+    action: DbMonitorLifecycleAction,
+) -> DbMonitorMutationAction:
     if action == "disable":
         return "update"
     return action

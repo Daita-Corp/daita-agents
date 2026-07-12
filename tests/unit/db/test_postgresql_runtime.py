@@ -1,9 +1,11 @@
+import asyncio
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from uuid import UUID
 
 import pytest
 
+from daita.core.exceptions import ValidationError
 from daita.db import DbRequest, DbRuntime
 from daita.db.runtime import DbRuntimeGovernanceBlocked
 from daita.plugins.catalog import CatalogPlugin
@@ -30,6 +32,11 @@ async def test_postgresql_registers_provider_neutral_db_capabilities():
     assert "postgresql.sql.execute_read" in inspection.executor_ids
     assert "postgresql:query.result" in inspection.evidence_schema_kinds
     assert "postgresql:column_values.profile" in inspection.evidence_schema_kinds
+    assert {
+        capability.id
+        for capability in runtime.registry.capabilities
+        if capability.owner == "postgresql" and capability.concurrent_safe
+    } == {"db.sql.execute_read"}
     profile_capability = runtime.registry.get_capability(
         "db.column_values.profile",
         owner="postgresql",
@@ -38,23 +45,6 @@ async def test_postgresql_registers_provider_neutral_db_capabilities():
     assert policy["bounded_aggregate"] is True
     assert policy["fingerprint_only_supported"] is True
     assert policy["profile_only_readable_tables"] is True
-
-
-def test_db_runtime_selects_postgresql_owned_capabilities_for_postgresql_source():
-    runtime = DbRuntime(plugins=(CatalogPlugin(auto_persist=False), _postgres()))
-
-    contract = runtime.build_contract(DbRequest("How many orders are there?"))
-
-    selected = {
-        item["id"]: item
-        for item in contract.metadata["selected_capabilities"]
-        if item["id"].startswith("db.")
-    }
-    assert selected["db.sql.validate"]["owner"] == "postgresql"
-    assert selected["db.sql.execute_read"]["owner"] == "postgresql"
-    assert selected["db.sql.execute_read"]["executor"] == (
-        "postgresql.sql.execute_read"
-    )
 
 
 async def test_postgresql_schema_inspect_returns_typed_evidence_through_runtime():
@@ -175,6 +165,81 @@ async def test_postgresql_sql_executors_return_typed_evidence_without_live_db():
     assert plan[0].payload["plan"] == [{"QUERY PLAN": "Seq Scan on orders"}]
     assert write[0].kind == "write.execution"
     assert write[0].payload["affected_rows"] == 3
+
+
+async def test_postgresql_runtime_supports_two_safe_reads_through_one_pool():
+    postgres = _postgres()
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+
+    class Connection:
+        async def fetch(self, sql, *params):
+            nonlocal active
+            active += 1
+            if active == 2:
+                both_started.set()
+            await release.wait()
+            try:
+                value = 1 if "1 AS value" in sql else 2
+                return [{"value": value}]
+            finally:
+                active -= 1
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+        async def close(self):
+            return None
+
+    postgres._pool = Pool()
+    runtime = DbRuntime(plugins=(postgres,))
+    first = asyncio.create_task(
+        runtime.execute_capability(
+            "db.sql.execute_read",
+            owner="postgresql",
+            operation_type="data.query",
+            input={"sql": "SELECT 1 AS value"},
+        )
+    )
+    second = asyncio.create_task(
+        runtime.execute_capability(
+            "db.sql.execute_read",
+            owner="postgresql",
+            operation_type="data.query",
+            input={"sql": "SELECT 2 AS value"},
+        )
+    )
+    try:
+        await both_started.wait()
+        assert active == 2
+        release.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        with pytest.raises(ValidationError):
+            await runtime.execute_capability(
+                "db.sql.execute_read",
+                owner="postgresql",
+                operation_type="data.query",
+                input={"sql": "DELETE FROM orders"},
+            )
+    finally:
+        release.set()
+        await runtime.teardown()
+
+    assert next(item for item in first_result if item.kind == "query.result").payload[
+        "rows"
+    ] == [{"value": 1}]
+    assert next(item for item in second_result if item.kind == "query.result").payload[
+        "rows"
+    ] == [{"value": 2}]
 
 
 def test_postgresql_typed_parameter_coercion_covers_json_restored_values():
@@ -580,6 +645,65 @@ async def test_postgresql_column_value_profile_skips_sensitive_columns_without_q
     assert evidence[0].payload["profile_status"] == "skipped"
     assert evidence[0].payload["redacted"] is True
     assert evidence[0].payload["skipped_reason"] == "sensitive_or_blocked_column"
+
+
+async def test_postgresql_column_value_profile_honors_source_value_policy():
+    samples_disabled = PostgreSQLPlugin(
+        connection_string="postgresql://localhost/testdb",
+        include_sample_values=False,
+    )
+
+    async def fail_query(sql, params=None):
+        raise AssertionError("disabled sample values should not be queried")
+
+    samples_disabled.query = fail_query
+    samples_disabled.connect = _noop_connect
+    disabled_runtime = DbRuntime(plugins=(samples_disabled,))
+
+    disabled = await disabled_runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={"table": "orders", "column": "status"},
+    )
+
+    assert disabled[0].payload["profile_status"] == "skipped"
+    assert disabled[0].payload["skipped_reason"] == "sample_values_disabled"
+    assert disabled[0].payload["policy"]["include_sample_values"] is False
+
+    pii_allowed = PostgreSQLPlugin(
+        connection_string="postgresql://localhost/testdb",
+        redact_pii_columns=False,
+    )
+
+    async def fake_query(sql, params=None):
+        if "COUNT(DISTINCT" in sql:
+            return [
+                {
+                    "row_count": 1,
+                    "null_count": 0,
+                    "distinct_count": 1,
+                    "max_value_length": 17,
+                }
+            ]
+        return [{"value": "user@example.com", "count": 1}]
+
+    pii_allowed.query = fake_query
+    pii_allowed.connect = _noop_connect
+    pii_runtime = DbRuntime(plugins=(pii_allowed,))
+    profiled = await pii_runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={"table": "customers", "column": "email"},
+    )
+
+    assert profiled[0].payload["profile_status"] == "profiled"
+    assert profiled[0].payload["redacted"] is False
+    assert profiled[0].payload["top_values"] == [
+        {"value": "user@example.com", "count": 1}
+    ]
+    assert profiled[0].payload["policy"]["redact_pii_columns"] is False
 
 
 async def test_postgresql_column_value_profile_skips_when_row_count_exceeds_limit():

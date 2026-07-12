@@ -7,13 +7,12 @@ task input mapping. Runtime execution remains owned by ``DbRuntime``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import json
 from typing import Any, Mapping
 
 from daita.runtime import AccessMode, Capability, Evidence
 
 from .analysis import evidence_ref
+from .fingerprints import persisted_fingerprint
 
 
 @dataclass(frozen=True)
@@ -68,7 +67,7 @@ class MonitorPluginTaskPlan:
 
     @property
     def input_hash(self) -> str:
-        return stable_monitor_fingerprint(self.input_payload)
+        return persisted_fingerprint(self.input_payload)
 
 
 class MonitorPluginPlanner:
@@ -111,7 +110,7 @@ class MonitorPluginPlanner:
             role="source",
             capability=capability,
             input_payload=input_payload,
-            idempotency_key=stable_monitor_fingerprint(
+            idempotency_key=persisted_fingerprint(
                 {
                     "role": "source",
                     "monitor_id": monitor_id,
@@ -163,7 +162,7 @@ class MonitorPluginPlanner:
             input_payload=None,
         )
         _validate_delivery_format(intent, capability)
-        idempotency_key = stable_monitor_fingerprint(
+        idempotency_key = persisted_fingerprint(
             {
                 "monitor_id": monitor_id,
                 "monitor_run_id": monitor_run_id,
@@ -358,7 +357,7 @@ class MonitorPluginPlanner:
 def monitor_report_fingerprint(report: Evidence) -> str:
     return str(
         report.metadata.get("payload_fingerprint") or ""
-    ) or stable_monitor_fingerprint(report.payload)
+    ) or persisted_fingerprint(report.payload)
 
 
 def monitor_delivery_source_refs(
@@ -392,11 +391,6 @@ def monitor_source_observed_value(
     if isinstance(value, Mapping) and "body" in value:
         return value.get("body")
     return value
-
-
-def stable_monitor_fingerprint(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _source_intent(

@@ -34,7 +34,7 @@ async def discover_azure_eventhub(
 
     try:
         groups = list(
-            client.consumer_groups.list_by_event_hub(
+            getattr(client.consumer_groups, "list_by_event_hub")(
                 resource_group, namespace, eventhub
             )
         )

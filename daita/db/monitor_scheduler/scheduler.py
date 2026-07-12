@@ -31,6 +31,7 @@ from .state import (
     _error_backoff_seconds,
     _is_due,
     _iso,
+    _parse_iso,
     _state_for_blocked_decision,
     _state_for_scheduler_decision,
     _state_value_summary,
@@ -562,7 +563,7 @@ class DbMonitorRunner:
             message=f"Monitor tick operation {operation_id} created.",
             payload={"operation_type": "monitor.tick", "monitor_id": monitor.id},
         )
-        await self.monitor_store.commit_monitor_mutation(
+        await self.runtime.commit_monitor_mutation(
             DbMonitorMutation(
                 action="tick",
                 operation=operation,
@@ -719,7 +720,7 @@ class DbMonitorRunner:
             if operation_precreated
             else (created_event, ticked_event, final_event, completed_event)
         )
-        await self.monitor_store.commit_monitor_mutation(
+        await self.runtime.commit_monitor_mutation(
             DbMonitorMutation(
                 action="run",
                 operation=operation,

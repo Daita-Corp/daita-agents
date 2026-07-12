@@ -13,8 +13,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Mapping, Optional, Union, TYPE_CHECKING
+from email.utils import formatdate, parsedate_to_datetime
+from typing import Any, Dict, List, Mapping, Optional, TypedDict, Union, TYPE_CHECKING
 from datetime import datetime
 
 from daita.runtime import (
@@ -32,13 +32,22 @@ from .base import ConnectorPlugin
 from .manifest import PluginKind, PluginManifest
 
 if TYPE_CHECKING:
-    from ..core.tools import LocalTool
+    from imaplib import IMAP4_SSL
+    from smtplib import SMTP
 
 logger = logging.getLogger(__name__)
 
 
+class _EmailProviderPreset(TypedDict):
+    imap_host: str
+    imap_port: int
+    smtp_host: str
+    smtp_port: int
+    use_tls: bool
+
+
 # Provider presets for common email services
-EMAIL_PROVIDERS = {
+EMAIL_PROVIDERS: Dict[str, _EmailProviderPreset] = {
     "gmail": {
         "imap_host": "imap.gmail.com",
         "imap_port": 993,
@@ -342,11 +351,11 @@ class EmailPlugin(ConnectorPlugin):
                     f"Supported providers: {', '.join(EMAIL_PROVIDERS.keys())}"
                 )
             preset = EMAIL_PROVIDERS[provider.lower()]
-            self.imap_host = imap_host or preset["imap_host"]
-            self.imap_port = imap_port if imap_host else preset["imap_port"]
-            self.smtp_host = smtp_host or preset["smtp_host"]
-            self.smtp_port = smtp_port if smtp_host else preset["smtp_port"]
-            self.use_tls = preset["use_tls"]
+            self.imap_host: str = str(imap_host or preset["imap_host"])
+            self.imap_port: int = imap_port if imap_host else int(preset["imap_port"])
+            self.smtp_host: str = str(smtp_host or preset["smtp_host"])
+            self.smtp_port: int = smtp_port if smtp_host else int(preset["smtp_port"])
+            self.use_tls: bool = bool(preset["use_tls"])
         else:
             if not imap_host or not smtp_host:
                 raise ValueError(
@@ -358,8 +367,8 @@ class EmailPlugin(ConnectorPlugin):
             self.smtp_port = smtp_port
             self.use_tls = use_tls
 
-        self._imap = None
-        self._smtp = None
+        self._imap: Optional["IMAP4_SSL"] = None
+        self._smtp: Optional["SMTP"] = None
         self._executor = _EmailExecutor(self)
 
         logger.debug(
@@ -371,6 +380,20 @@ class EmailPlugin(ConnectorPlugin):
     def is_connected(self) -> bool:
         """Whether both IMAP and SMTP connections are open."""
         return self._imap is not None and self._smtp is not None
+
+    @property
+    def imap(self) -> "IMAP4_SSL":
+        """Return the active IMAP connection owned by this plugin."""
+        if self._imap is None:
+            raise RuntimeError("EmailPlugin IMAP connection is not established")
+        return self._imap
+
+    @property
+    def smtp(self) -> "SMTP":
+        """Return the active SMTP connection owned by this plugin."""
+        if self._smtp is None:
+            raise RuntimeError("EmailPlugin SMTP connection is not established")
+        return self._smtp
 
     async def teardown(self) -> None:
         """Release runtime-owned email resources."""
@@ -457,12 +480,16 @@ class EmailPlugin(ConnectorPlugin):
                 imap = imaplib.IMAP4_SSL(imap_host, imap_port)
                 imap.login(email_address, password)
 
-                logger.debug(f"Connecting to SMTP server: {smtp_host}:{smtp_port}")
-                smtp = smtplib.SMTP(smtp_host, smtp_port)
-                if use_tls:
-                    smtp.starttls()
-                smtp.login(email_address, password)
-                return imap, smtp
+                try:
+                    logger.debug(f"Connecting to SMTP server: {smtp_host}:{smtp_port}")
+                    smtp = smtplib.SMTP(smtp_host, smtp_port)
+                    if use_tls:
+                        smtp.starttls()
+                    smtp.login(email_address, password)
+                    return imap, smtp
+                except Exception:
+                    imap.logout()
+                    raise
 
             loop = asyncio.get_running_loop()
             self._imap, self._smtp = await loop.run_in_executor(None, _connect)
@@ -544,7 +571,7 @@ class EmailPlugin(ConnectorPlugin):
             await self.connect()
 
         try:
-            imap = self._imap
+            imap = self.imap
 
             def _list():
                 imap.select(folder, readonly=True)
@@ -560,21 +587,29 @@ class EmailPlugin(ConnectorPlugin):
                 if status != "OK":
                     raise RuntimeError(f"Failed to search emails: {status}")
 
-                email_ids = messages[0].split()
+                email_ids = messages[0].split() if messages else []
                 email_ids = email_ids[-limit:] if len(email_ids) > limit else email_ids
                 email_ids = list(reversed(email_ids))
 
                 emails = []
                 for email_id in email_ids:
-                    status, msg_data = imap.fetch(email_id, "(RFC822.HEADER)")
+                    message_id = email_id.decode()
+                    status, msg_data = imap.fetch(message_id, "(RFC822.HEADER)")
                     if status != "OK":
                         continue
 
-                    raw_email = msg_data[0][1]
+                    first_item = msg_data[0] if msg_data else None
+                    if (
+                        not isinstance(first_item, tuple)
+                        or len(first_item) < 2
+                        or not isinstance(first_item[1], bytes)
+                    ):
+                        continue
+                    raw_email = first_item[1]
                     msg = email_lib.message_from_bytes(raw_email)
 
                     email_info = {
-                        "id": email_id.decode(),
+                        "id": message_id,
                         "subject": msg.get("Subject", ""),
                         "from": msg.get("From", ""),
                         "to": msg.get("To", ""),
@@ -624,17 +659,24 @@ class EmailPlugin(ConnectorPlugin):
             await self.connect()
 
         try:
-            imap = self._imap
+            imap = self.imap
 
             def _read():
                 readonly = not mark_as_read
                 imap.select(folder, readonly=readonly)
 
-                status, msg_data = imap.fetch(email_id.encode(), "(RFC822)")
+                status, msg_data = imap.fetch(email_id, "(RFC822)")
                 if status != "OK":
                     raise RuntimeError(f"Failed to fetch email: {status}")
 
-                raw_email = msg_data[0][1]
+                first_item = msg_data[0] if msg_data else None
+                if (
+                    not isinstance(first_item, tuple)
+                    or len(first_item) < 2
+                    or not isinstance(first_item[1], bytes)
+                ):
+                    raise RuntimeError("Email response did not contain message bytes")
+                raw_email = first_item[1]
                 msg = email_lib.message_from_bytes(raw_email)
 
                 body = ""
@@ -650,53 +692,77 @@ class EmailPlugin(ConnectorPlugin):
                             content_type == "text/plain"
                             and "attachment" not in content_disposition
                         ):
-                            body = part.get_payload(decode=True).decode(errors="ignore")
+                            payload = part.get_payload(decode=True)
+                            body = (
+                                payload.decode(errors="ignore")
+                                if isinstance(payload, bytes)
+                                else ""
+                            )
                         elif (
                             content_type == "text/html"
                             and "attachment" not in content_disposition
                         ):
-                            body_html = part.get_payload(decode=True).decode(
-                                errors="ignore"
+                            payload = part.get_payload(decode=True)
+                            body_html = (
+                                payload.decode(errors="ignore")
+                                if isinstance(payload, bytes)
+                                else ""
                             )
                         elif "attachment" in content_disposition:
                             filename = part.get_filename()
                             if filename:
+                                payload = part.get_payload(decode=True)
                                 attachments.append(
                                     {
                                         "filename": filename,
                                         "content_type": content_type,
-                                        "size": len(part.get_payload(decode=True)),
+                                        "size": (
+                                            len(payload)
+                                            if isinstance(payload, bytes)
+                                            else 0
+                                        ),
                                     }
                                 )
                 else:
                     content_type = msg.get_content_type()
                     if content_type == "text/plain":
-                        body = msg.get_payload(decode=True).decode(errors="ignore")
+                        payload = msg.get_payload(decode=True)
+                        body = (
+                            payload.decode(errors="ignore")
+                            if isinstance(payload, bytes)
+                            else ""
+                        )
                     elif content_type == "text/html":
-                        body_html = msg.get_payload(decode=True).decode(errors="ignore")
+                        payload = msg.get_payload(decode=True)
+                        body_html = (
+                            payload.decode(errors="ignore")
+                            if isinstance(payload, bytes)
+                            else ""
+                        )
 
-                email_data = {
+                date_header = str(msg.get("Date", "") or "")
+                email_data: Dict[str, object] = {
                     "id": email_id,
                     "subject": msg.get("Subject", ""),
                     "from": msg.get("From", ""),
                     "to": msg.get("To", ""),
                     "cc": msg.get("Cc", ""),
-                    "date": msg.get("Date", ""),
+                    "date": date_header,
                     "body": body,
                     "body_html": body_html,
                     "attachments": attachments,
                 }
 
-                if email_data["date"]:
+                if date_header:
                     try:
                         email_data["date_parsed"] = parsedate_to_datetime(
-                            email_data["date"]
+                            date_header
                         ).isoformat()
                     except Exception:
                         email_data["date_parsed"] = None
 
                 if mark_as_read:
-                    imap.store(email_id.encode(), "+FLAGS", "\\Seen")
+                    imap.store(email_id, "+FLAGS", "\\Seen")
 
                 return email_data
 
@@ -772,7 +838,7 @@ class EmailPlugin(ConnectorPlugin):
                     recipients.append(bcc)
 
             msg["Subject"] = subject
-            msg["Date"] = email_lib.utils.formatdate(localtime=True)
+            msg["Date"] = formatdate(localtime=True)
 
             # Attach body
             body_type = "html" if html else "plain"
@@ -798,7 +864,7 @@ class EmailPlugin(ConnectorPlugin):
 
             # Send email (synchronous — wrapped in executor)
             msg_str = msg.as_string()
-            smtp = self._smtp
+            smtp = self.smtp
             sender = self.email_address
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
@@ -850,7 +916,10 @@ class EmailPlugin(ConnectorPlugin):
 
         # Extract reply address
         reply_to = original.get("from")
-        subject = original.get("subject", "")
+        if not isinstance(reply_to, str) or not reply_to:
+            raise RuntimeError("Original email does not contain a reply address")
+        raw_subject = original.get("subject", "")
+        subject = raw_subject if isinstance(raw_subject, str) else str(raw_subject)
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
 
@@ -899,11 +968,11 @@ class EmailPlugin(ConnectorPlugin):
             await self.connect()
 
         try:
-            imap = self._imap
+            imap = self.imap
 
             def _delete():
                 imap.select(folder, readonly=False)
-                imap.store(email_id.encode(), "+FLAGS", "\\Deleted")
+                imap.store(email_id, "+FLAGS", "\\Deleted")
                 if permanent:
                     imap.expunge()
 
@@ -943,6 +1012,8 @@ class EmailPlugin(ConnectorPlugin):
     async def _tool_read_email(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for read_email"""
         email_id = args.get("email_id")
+        if not isinstance(email_id, str) or not email_id:
+            raise ValueError("email_id is required")
         folder = args.get("folder", "INBOX")
         mark_as_read = args.get("mark_as_read", False)
 
@@ -974,7 +1045,11 @@ class EmailPlugin(ConnectorPlugin):
         """Tool handler for send_email"""
         to = self._parse_recipients(args.get("to"))
         subject = args.get("subject")
+        if not isinstance(subject, str):
+            raise ValueError("subject is required")
         body = args.get("body")
+        if not isinstance(body, str):
+            raise ValueError("body is required")
         html = args.get("html", False)
         cc = self._parse_recipients(args.get("cc")) or None
 
@@ -985,7 +1060,11 @@ class EmailPlugin(ConnectorPlugin):
     async def _tool_reply_to_email(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for reply_to_email"""
         email_id = args.get("email_id")
+        if not isinstance(email_id, str) or not email_id:
+            raise ValueError("email_id is required")
         body = args.get("body")
+        if not isinstance(body, str):
+            raise ValueError("body is required")
         html = args.get("html", False)
 
         return await self.reply_to_email(email_id=email_id, body=body, html=html)
@@ -993,6 +1072,8 @@ class EmailPlugin(ConnectorPlugin):
     async def _tool_search_emails(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for search_emails"""
         query = args.get("query")
+        if not isinstance(query, str) or not query:
+            raise ValueError("query is required")
         limit = args.get("limit", 10)
 
         emails = await self.search_emails(query=query, limit=limit)

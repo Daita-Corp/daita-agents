@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Mapping
+from dataclasses import dataclass, replace
+from typing import Any, Mapping, TYPE_CHECKING
 
 from daita.runtime import Evidence, Operation, Task
 
-from ...analysis import stable_fingerprint, structural_schema_fingerprint
+from ...evidence import load_evidence, load_evidence_refs_or_latest
 from ...plan_validation import DbQueryPlanValidator
-from ...planning_context import DbPlanningContextBuilder
+from ...planning_context import DbPlanningContextBuilder, _evidence_ref
 from ...query_plan import DbQueryPlan
-from ...query_planning import DbQueryPlanner
+from ...session_context import session_scope_binding_evidence_for
+
+if TYPE_CHECKING:
+    from .plugin import DbRuntimePlanningPlugin
 
 
 @dataclass(frozen=True)
@@ -34,37 +37,43 @@ class DbPlanningContextExecutor:
         base_request = runtime._db_request_from_operation(operation)
         prompt = task.input.get("prompt")
         if isinstance(prompt, str) and prompt.strip():
-            from dataclasses import replace
-
             base_request = replace(base_request, prompt=prompt)
-        schema_evidence = await _load_evidence(
+        schema_evidence = await load_evidence(
             runtime,
             operation.id,
             task.input.get("schema_evidence_id"),
         )
-        catalog_evidence = tuple(
-            item
-            for item in [
-                await _load_evidence(runtime, operation.id, evidence_id)
-                for evidence_id in task.input.get("catalog_evidence_ids", ())
-            ]
-            if item is not None
+        if schema_evidence is None:
+            schema_evidence = await _latest_accepted_schema_evidence(
+                runtime,
+                operation.id,
+            )
+        catalog_evidence = await _load_catalog_evidence_refs_or_latest(
+            runtime,
+            operation.id,
+            task.input.get("catalog_evidence_ids", ()),
+            kinds=(
+                "catalog.source_registered",
+                "catalog.profile",
+                "schema.asset_profile",
+                "schema.search_result",
+                "schema.column_value_profile",
+                "schema.column_value_search_result",
+                "schema.column_value_hint",
+                "catalog.value_grounding.plan",
+            ),
         )
-        relationship_evidence = tuple(
-            item
-            for item in [
-                await _load_evidence(runtime, operation.id, evidence_id)
-                for evidence_id in task.input.get("relationship_evidence_ids", ())
-            ]
-            if item is not None
+        relationship_evidence = await load_evidence_refs_or_latest(
+            runtime,
+            operation.id,
+            task.input.get("relationship_evidence_ids", ()),
+            kinds=("schema.relationship_path",),
         )
-        memory_recall_evidence = tuple(
-            item
-            for item in [
-                await _load_evidence(runtime, operation.id, evidence_id)
-                for evidence_id in task.input.get("memory_recall_evidence_ids", ())
-            ]
-            if item is not None
+        memory_recall_evidence = await load_evidence_refs_or_latest(
+            runtime,
+            operation.id,
+            task.input.get("memory_recall_evidence_ids", ()),
+            kinds=("memory.semantic.recall",),
         )
         memory_recall_diagnostics = task.input.get("memory_recall_diagnostics")
         planning_context = builder.build(
@@ -83,111 +92,40 @@ class DbPlanningContextExecutor:
             capability_summaries=_planner_capability_summaries(runtime),
             source=_runtime_source_plugin(runtime),
         )
-        return [builder.evidence_for(planning_context)]
-
-
-@dataclass(frozen=True)
-class DbQueryPrepareReadExecutor:
-    """Executor that prepares deterministic read evidence without full context."""
-
-    plugin: DbRuntimePlanningPlugin
-    id: str = "db_runtime.query.prepare_read"
-    owner: str = "db_runtime"
-    capability_ids: frozenset[str] = frozenset({"db.query.prepare_read"})
-
-    async def execute(
-        self,
-        task: Task,
-        operation: Operation,
-        context: Mapping[str, Any],
-    ) -> list[Evidence]:
-        runtime = self.plugin.runtime
-        base_request = runtime._db_request_from_operation(operation)
-        prompt = task.input.get("prompt")
-        if isinstance(prompt, str) and prompt.strip():
-            from dataclasses import replace
-
-            base_request = replace(base_request, prompt=prompt)
-        schema_evidence = await _load_evidence(
-            runtime,
-            operation.id,
-            task.input.get("schema_evidence_id"),
-        )
-        planning_context_evidence = await _load_evidence(
-            runtime,
-            operation.id,
-            task.input.get("planning_context_evidence_id"),
-        )
-        schema = dict(schema_evidence.payload) if schema_evidence is not None else {}
-        plan = DbQueryPlanner().plan_read_query(
-            base_request,
-            runtime._db_intent_from_operation(operation),
-            operation,
-            schema,
-            planning_context=(
-                dict(planning_context_evidence.payload)
-                if planning_context_evidence is not None
-                else None
-            ),
-        )
-        plan_payload = dict(plan.evidence.payload)
-        plan_evidence_id = _predicted_evidence_id(
-            operation,
-            task,
-            "query.plan.proposal",
-            plan_payload,
-        )
-        plan_evidence = Evidence(
-            id=plan_evidence_id,
-            kind="query.plan.proposal",
-            owner="db_runtime",
-            operation_id=operation.id,
-            task_id=task.id,
-            payload=plan_payload,
-            metadata={
-                **plan.evidence.metadata,
-                "prepare_read": True,
-                "payload_fingerprint": stable_fingerprint(plan_payload),
-            },
-        )
-        compact_context = (
-            planning_context_evidence.payload
-            if planning_context_evidence is not None
-            else _compact_prepare_context(
-                runtime=runtime,
-                operation=operation,
-                schema_evidence=schema_evidence,
-                schema=schema,
+        validation_repair = task.input.get("validation_grounding_repair")
+        if isinstance(validation_repair, Mapping):
+            planning_context = replace(
+                planning_context,
+                diagnostics={
+                    **planning_context.diagnostics,
+                    "validation_grounding_repair_attempted": True,
+                    "validation_grounding_repair": dict(validation_repair),
+                },
             )
-        )
-        structured = DbQueryPlan.from_mapping(
-            plan_evidence.payload.get("structured_plan") or plan_evidence.payload
-        )
-        validation = DbQueryPlanValidator().validate(structured, compact_context)
-        validation_evidence = Evidence(
-            kind="query.plan.validation",
-            owner="db_runtime",
-            operation_id=operation.id,
+        memory_selection = builder.memory_selection_evidence_for(
+            planning_context,
             task_id=task.id,
-            accepted=validation.valid,
-            payload={
-                **validation.to_dict(),
-                "plan_evidence_id": plan_evidence_id,
-                "planning_context_evidence_id": (
-                    planning_context_evidence.id
-                    if planning_context_evidence is not None
-                    else None
-                ),
-                "schema_fingerprint": compact_context.get("schema_fingerprint"),
-                "prepare_read": True,
-            },
-            metadata={
-                "prepare_read": True,
-                "payload_fingerprint": validation.plan_fingerprint,
-                "sql_fingerprint": validation.sql_fingerprint,
-            },
         )
-        return [plan_evidence, validation_evidence]
+        memory_selection_ref = (
+            _evidence_ref(memory_selection) if memory_selection is not None else None
+        )
+        memory_contracts = builder.memory_contracts_evidence_for(
+            planning_context,
+            selection_evidence_ref=memory_selection_ref,
+            task_id=task.id,
+        )
+        planning_context = builder.with_memory_artifact_refs(
+            planning_context,
+            selection_evidence=memory_selection,
+            contracts_evidence=memory_contracts,
+        )
+        evidence: list[Evidence] = []
+        if memory_selection is not None:
+            evidence.append(memory_selection)
+        if memory_contracts is not None:
+            evidence.append(memory_contracts)
+        evidence.append(builder.evidence_for(planning_context))
+        return evidence
 
 
 @dataclass(frozen=True)
@@ -206,29 +144,55 @@ class DbQueryPlanValidationExecutor:
         context: Mapping[str, Any],
     ) -> list[Evidence]:
         runtime = self.plugin.runtime
-        plan_evidence = await _load_evidence(
+        plan_evidence = await load_evidence(
             runtime,
             operation.id,
             task.input.get("plan_evidence_id"),
         )
-        context_evidence = await _load_evidence(
+        context_evidence = await load_evidence(
             runtime,
             operation.id,
             task.input.get("planning_context_evidence_id"),
         )
+        if context_evidence is None:
+            context_evidence = await _load_dependency_evidence(
+                runtime,
+                operation.id,
+                task,
+                "planning.context",
+            )
         if plan_evidence is None or context_evidence is None:
             raise RuntimeError("plan and planning context evidence are required")
-        plan = DbQueryPlan.from_mapping(
+        plan_payload = (
             plan_evidence.payload.get("structured_plan") or plan_evidence.payload
         )
-        validation = DbQueryPlanValidator().validate(plan, context_evidence.payload)
+        plan = DbQueryPlan.from_mapping(plan_payload)
+        binding = session_scope_binding_evidence_for(
+            operation,
+            plan,
+            context_evidence.payload,
+            plan_payload=plan_payload if isinstance(plan_payload, Mapping) else None,
+            task_id=task.id,
+        )
+        validation_context = dict(context_evidence.payload)
+        if binding is not None:
+            validation_context["session_scope_binding"] = dict(binding.payload)
+        validation = DbQueryPlanValidator().validate(plan, validation_context)
         payload = {
             **validation.to_dict(),
             "plan_evidence_id": plan_evidence.id,
             "planning_context_evidence_id": context_evidence.id,
             "schema_fingerprint": context_evidence.payload.get("schema_fingerprint"),
         }
-        return [
+        if binding is not None:
+            payload["session_scope_binding_evidence_id"] = binding.id
+            payload["session_scope_binding_fingerprint"] = binding.metadata.get(
+                "payload_fingerprint"
+            )
+        evidence = []
+        if binding is not None:
+            evidence.append(binding)
+        evidence.append(
             Evidence(
                 kind="query.plan.validation",
                 owner="db_runtime",
@@ -243,70 +207,89 @@ class DbQueryPlanValidationExecutor:
                     "sql_fingerprint": validation.sql_fingerprint,
                 },
             )
-        ]
+        )
+        return evidence
 
 
-async def _load_evidence(
+async def _load_dependency_evidence(
     runtime: Any,
     operation_id: str,
-    evidence_id: Any,
+    task: Task,
+    kind: str,
 ) -> Evidence | None:
-    if not evidence_id:
-        return None
-    for evidence in await runtime.store.list_evidence(operation_id):
-        if evidence.id == evidence_id:
-            return evidence
+    for dependency in reversed(task.dependencies):
+        if dependency.kind_value != "evidence":
+            continue
+        if dependency.evidence_kind != kind:
+            continue
+        matches = [
+            evidence
+            for evidence in await runtime.store.list_evidence(operation_id)
+            if evidence.kind == kind
+            and evidence.accepted is dependency.evidence_accepted
+            and (
+                dependency.evidence_id is None or evidence.id == dependency.evidence_id
+            )
+            and (
+                dependency.evidence_owner is None
+                or evidence.owner == dependency.evidence_owner
+            )
+            and (
+                dependency.producer_task_id is None
+                or evidence.task_id == dependency.producer_task_id
+            )
+        ]
+        if matches:
+            return matches[-1]
     return None
 
 
-def _compact_prepare_context(
-    *,
+async def _latest_accepted_evidence(
     runtime: Any,
-    operation: Operation,
-    schema_evidence: Evidence | None,
-    schema: dict[str, Any],
-) -> dict[str, Any]:
-    source = _runtime_source_plugin(runtime)
-    dialect = (
-        str(schema.get("database_type") or getattr(source, "sql_dialect", "")) or None
+    operation_id: str,
+    kind: str,
+) -> Evidence | None:
+    matches = [
+        evidence
+        for evidence in await runtime.store.list_evidence(operation_id)
+        if evidence.kind == kind and evidence.accepted
+    ]
+    return matches[-1] if matches else None
+
+
+async def _latest_accepted_schema_evidence(
+    runtime: Any,
+    operation_id: str,
+) -> Evidence | None:
+    evidence = [
+        item
+        for item in await runtime.store.list_evidence(operation_id)
+        if item.kind == "schema.asset_profile" and item.accepted
+    ]
+    catalog = [item for item in evidence if item.owner == "catalog"]
+    if catalog:
+        return catalog[-1]
+    return evidence[-1] if evidence else None
+
+
+async def _load_catalog_evidence_refs_or_latest(
+    runtime: Any,
+    operation_id: str,
+    evidence_ids: Any,
+    *,
+    kinds: tuple[str, ...],
+) -> tuple[Evidence, ...]:
+    evidence = await load_evidence_refs_or_latest(
+        runtime,
+        operation_id,
+        evidence_ids,
+        kinds=kinds,
     )
-    return {
-        "operation_id": operation.id,
-        "prompt": operation.request.get("prompt"),
-        "intent_kind": runtime._db_intent_from_operation(operation).kind.value,
-        "dialect": dialect,
-        "schema": {
-            "database_type": schema.get("database_type"),
-            "database_name": schema.get("database_name"),
-            "table_count": schema.get("table_count")
-            or len(schema.get("tables", []) or []),
-            "tables": [
-                {
-                    "name": table.get("name"),
-                    "columns": [
-                        {
-                            "name": column.get("name"),
-                            "data_type": column.get("data_type"),
-                            "is_primary_key": column.get("is_primary_key"),
-                        }
-                        for column in table.get("columns", []) or []
-                        if column.get("name")
-                    ],
-                }
-                for table in schema.get("tables", []) or []
-                if table.get("name")
-            ],
-            "foreign_keys": list(schema.get("foreign_keys", []) or []),
-        },
-        "schema_evidence_refs": [schema_evidence.id] if schema_evidence else [],
-        "catalog_evidence_refs": [],
-        "relationship_evidence_refs": [],
-        "column_value_evidence_refs": [],
-        "column_value_hints": [],
-        "included_sections": ["schema"],
-        "schema_fingerprint": structural_schema_fingerprint(schema),
-        "diagnostics": {"mode": "prepare_read_compact"},
-    }
+    return tuple(
+        item
+        for item in evidence
+        if item.owner == "catalog" or item.kind.startswith("catalog.")
+    )
 
 
 def _planner_capability_summaries(runtime: Any) -> tuple[dict[str, Any], ...]:
@@ -338,12 +321,3 @@ def _runtime_source_plugin(runtime: Any) -> Any:
         if getattr(plugin, "sql_dialect", None) and hasattr(plugin, "query"):
             return plugin
     return getattr(runtime, "source", None)
-
-
-def _predicted_evidence_id(
-    operation: Operation,
-    task: Task,
-    kind: str,
-    payload: dict[str, Any],
-) -> str:
-    return f"evidence-{stable_fingerprint({'operation_id': operation.id, 'task_id': task.id, 'kind': kind, 'payload': payload})}"

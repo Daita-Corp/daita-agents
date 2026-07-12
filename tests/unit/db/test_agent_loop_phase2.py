@@ -1,0 +1,3356 @@
+import json
+
+from daita.db import DbRuntime, DbRuntimeConfig
+from daita.db.loop import DbAgentLoop
+from daita.db.llm_agent_planner import DbLLMAgentPlanner
+from daita.db.llm_planner import DbLLMPlannerExecutor, DbLLMRepairExecutor
+from daita.db.llm_service import DbLLMResponse, DbLLMService
+from daita.db.planner_protocol import (
+    DbLoopState,
+    DbPlannerAction,
+    DbPlannerActionKind,
+    DbPlannerDecision,
+    DbPlannerDecisionStatus,
+)
+from daita.db.runtime.tasks.models import DbTaskSpec
+from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
+from daita.runtime import (
+    AccessMode,
+    ApprovalRequest,
+    ApprovalStatus,
+    Capability,
+    Evidence,
+    EvidenceSchema,
+    RiskLevel,
+    Task,
+    TaskDependency,
+)
+from daita.plugins import MemoryPlugin
+from daita.plugins.catalog import CatalogPlugin
+from daita.plugins.sqlite import SQLitePlugin
+
+import pytest
+
+from tests.db_evidence_helpers import assert_no_invalid_accepted_query_plans
+
+
+class PhaseTwoExecutor:
+    def __init__(self, executor_id, capability_ids):
+        self.id = executor_id
+        self.capability_ids = frozenset(capability_ids)
+
+    async def execute(self, task, operation, context):
+        assert operation.metadata["latest_compiled_contract_snapshot"]
+        if task.capability_id == "db.schema.inspect":
+            return [
+                Evidence(
+                    kind="database.schema",
+                    owner="phase_two",
+                    payload={"tables": [{"name": "orders"}]},
+                )
+            ]
+        if task.capability_id == "db.sql.validate":
+            sql = task.input["sql"]
+            return [
+                Evidence(
+                    kind="sql.validation",
+                    owner="phase_two",
+                    accepted=True,
+                    payload={"valid": True, "sql": sql, "operation": "query"},
+                )
+            ]
+        if task.capability_id == "db.sql.execute_read":
+            return [
+                Evidence(
+                    kind="query.result",
+                    owner="phase_two",
+                    payload={
+                        "rows": [{"answer": 1}],
+                        "sql": task.input.get("sql"),
+                        "validated_evidence_id": task.input.get(
+                            "validated_evidence_id"
+                        ),
+                    },
+                )
+            ]
+        if task.capability_id == "db.sql.execute_write":
+            return [
+                Evidence(
+                    kind="write.execution",
+                    owner="phase_two",
+                    payload={"status": "executed"},
+                )
+            ]
+        if task.capability_id == "db.memory.commit_update":
+            return [
+                Evidence(
+                    kind="db.memory.definition",
+                    owner="phase_two",
+                    payload={"status": "committed"},
+                )
+            ]
+        raise AssertionError(f"unexpected capability: {task.capability_id}")
+
+
+class PhaseTwoPlugin(RuntimeExtensionPlugin):
+    manifest = PluginManifest(
+        id="phase_two",
+        display_name="Phase Two",
+        version="1.0.0",
+        kind=PluginKind.RUNTIME_EXTENSION,
+        domains=frozenset({"db"}),
+    )
+
+    def declare_capabilities(self):
+        return [
+            Capability(
+                id="db.schema.inspect",
+                owner="phase_two",
+                description="Inspect schema.",
+                domains=frozenset({"db"}),
+                operation_types=frozenset({"db.run"}),
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.LOW,
+                input_schema={"type": "object"},
+                output_evidence=frozenset({"database.schema"}),
+                executor="phase_two.schema.inspect",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
+                id="db.sql.validate",
+                owner="phase_two",
+                description="Validate SQL.",
+                domains=frozenset({"db"}),
+                operation_types=frozenset({"db.run"}),
+                access=AccessMode.METADATA_READ,
+                risk=RiskLevel.LOW,
+                input_schema={"type": "object"},
+                output_evidence=frozenset({"sql.validation"}),
+                executor="phase_two.sql.validate",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
+                id="db.sql.execute_read",
+                owner="phase_two",
+                description="Execute read.",
+                domains=frozenset({"db"}),
+                operation_types=frozenset({"db.run"}),
+                access=AccessMode.READ,
+                risk=RiskLevel.LOW,
+                input_schema={"type": "object"},
+                output_evidence=frozenset({"query.result"}),
+                executor="phase_two.sql.execute_read",
+                runtime_only=True,
+                side_effecting=False,
+                replay_safe=True,
+                idempotent=True,
+            ),
+            Capability(
+                id="db.sql.execute_write",
+                owner="phase_two",
+                description="Execute write.",
+                domains=frozenset({"db"}),
+                operation_types=frozenset({"db.run"}),
+                access=AccessMode.WRITE,
+                risk=RiskLevel.HIGH,
+                input_schema={"type": "object"},
+                output_evidence=frozenset({"write.execution"}),
+                executor="phase_two.sql.execute_write",
+                runtime_only=True,
+                side_effecting=True,
+                replay_safe=False,
+                idempotent=False,
+            ),
+            Capability(
+                id="db.memory.commit_update",
+                owner="phase_two",
+                description="Commit a memory update.",
+                domains=frozenset({"db"}),
+                operation_types=frozenset({"memory.update"}),
+                access=AccessMode.WRITE,
+                risk=RiskLevel.MEDIUM,
+                input_schema={"type": "object"},
+                output_evidence=frozenset({"db.memory.definition"}),
+                executor="phase_two.memory.commit_update",
+                runtime_only=True,
+                side_effecting=True,
+                replay_safe=False,
+                idempotent=False,
+            ),
+        ]
+
+    def get_executors(self):
+        return [
+            PhaseTwoExecutor("phase_two.schema.inspect", {"db.schema.inspect"}),
+            PhaseTwoExecutor("phase_two.sql.validate", {"db.sql.validate"}),
+            PhaseTwoExecutor("phase_two.sql.execute_read", {"db.sql.execute_read"}),
+            PhaseTwoExecutor("phase_two.sql.execute_write", {"db.sql.execute_write"}),
+            PhaseTwoExecutor(
+                "phase_two.memory.commit_update",
+                {"db.memory.commit_update"},
+            ),
+        ]
+
+    def declare_evidence_schemas(self):
+        return [
+            EvidenceSchema(
+                kind="database.schema",
+                owner="phase_two",
+                json_schema={"type": "object"},
+            ),
+            EvidenceSchema(
+                kind="sql.validation",
+                owner="phase_two",
+                json_schema={"type": "object"},
+            ),
+            EvidenceSchema(
+                kind="query.result",
+                owner="phase_two",
+                json_schema={"type": "object"},
+            ),
+            EvidenceSchema(
+                kind="write.execution",
+                owner="phase_two",
+                json_schema={"type": "object"},
+            ),
+            EvidenceSchema(
+                kind="db.memory.definition",
+                owner="phase_two",
+                json_schema={"type": "object"},
+            ),
+        ]
+
+
+class FakePlanner:
+    def __init__(self, *decisions):
+        self.decisions = list(decisions)
+        self.states = []
+
+    async def plan(self, state):
+        self.states.append(state)
+        return self.decisions.pop(0)
+
+
+class FakeLLMService:
+    available = True
+    safe_metadata = {"provider": "fake", "model": "phase-two"}
+
+    def __init__(self, content):
+        self.content = content
+        self.messages = None
+
+    async def generate_json(self, messages):
+        self.messages = messages
+        return DbLLMResponse(
+            content=self.content,
+            diagnostics={"provider": "fake", "model": "phase-two"},
+        )
+
+
+async def test_llm_query_plan_normalizes_sql_alias_and_accepts_executable_plan():
+    sql = "select count(*) as order_count from orders"
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-llm-plan-sql-alias",
+        db_llm_service=FakeLLMService(
+            json.dumps(
+                {
+                    "operation": "read",
+                    "sql": sql,
+                    "selected_tables": ["orders"],
+                    "confidence": 0.91,
+                }
+            )
+        ),
+    )
+    try:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+        evidence = await DbLLMPlannerExecutor(runtime=runtime).execute(
+            _llm_task(
+                operation,
+                capability_id="db.query.plan",
+                executor_id="db_runtime.query.plan.llm",
+                task_input={"planning_context_evidence_id": "planning-context"},
+            ),
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    proposal = evidence[0]
+    assert proposal.accepted is True
+    assert proposal.payload["valid"] is True
+    assert proposal.payload["sql"] == sql
+    assert proposal.payload["structured_plan"]["selected_sql"] == sql
+    assert "sql" not in proposal.payload["structured_plan"]
+    assert proposal.payload["parse_diagnostics"]["normalized_aliases"] == {
+        "sql": "selected_sql"
+    }
+
+
+async def test_llm_query_plan_without_sql_or_clarification_is_rejected():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-llm-plan-no-sql",
+        db_llm_service=FakeLLMService(
+            json.dumps(
+                {
+                    "operation": "read",
+                    "selected_tables": ["orders"],
+                    "confidence": 0.31,
+                }
+            )
+        ),
+    )
+    try:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+        evidence = await DbLLMPlannerExecutor(runtime=runtime).execute(
+            _llm_task(
+                operation,
+                capability_id="db.query.plan",
+                executor_id="db_runtime.query.plan.llm",
+                task_input={"planning_context_evidence_id": "planning-context"},
+            ),
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    proposal = evidence[0]
+    assert proposal.accepted is False
+    assert proposal.payload["valid"] is False
+    assert proposal.payload["sql"] is None
+    assert proposal.payload["raw_model_response"]
+
+
+async def test_llm_query_plan_clarification_only_is_not_executable_evidence():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-llm-plan-clarification",
+        db_llm_service=FakeLLMService(
+            json.dumps(
+                {
+                    "operation": "read",
+                    "clarification_question": "Which customer segment?",
+                    "confidence": 0.25,
+                }
+            )
+        ),
+    )
+    try:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+        evidence = await DbLLMPlannerExecutor(runtime=runtime).execute(
+            _llm_task(
+                operation,
+                capability_id="db.query.plan",
+                executor_id="db_runtime.query.plan.llm",
+                task_input={"planning_context_evidence_id": "planning-context"},
+            ),
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    proposal = evidence[0]
+    assert proposal.accepted is False
+    assert proposal.payload["valid"] is False
+    assert proposal.payload["sql"] is None
+    assert proposal.payload["structured_plan"]["clarification_question"] == (
+        "Which customer segment?"
+    )
+
+
+async def test_llm_repair_without_executable_sql_is_rejected():
+    runtime, operation = await _repair_runtime_and_operation(
+        "phase-two-llm-repair-no-sql",
+        json.dumps({"operation": "read", "confidence": 0.4}),
+    )
+    try:
+        task = _llm_task(
+            operation,
+            capability_id="db.query.repair",
+            executor_id="db_runtime.query.repair.llm",
+            task_input={
+                "planning_context_evidence_id": "planning-context",
+                "failure_evidence_id": "failure-validation",
+                "prior_plan_evidence_id": "prior-plan",
+            },
+        )
+        evidence = await DbLLMRepairExecutor(runtime=runtime).execute(
+            task,
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    repair, proposal = evidence
+    assert repair.accepted is False
+    assert repair.payload["valid"] is True
+    assert repair.payload["parse_succeeded"] is True
+    assert repair.payload["proposal_accepted"] is False
+    assert proposal.accepted is False
+    assert proposal.payload["valid"] is False
+    assert proposal.payload["sql"] is None
+
+
+async def test_llm_repair_analysis_only_output_is_rejected_as_non_executable():
+    runtime, operation = await _repair_runtime_and_operation(
+        "phase-two-llm-repair-analysis-only",
+        json.dumps(
+            {
+                "operation": "analysis",
+                "revised_plan": {"steps": ["explain why the query failed"]},
+                "confidence": 0.4,
+            }
+        ),
+    )
+    try:
+        task = _llm_task(
+            operation,
+            capability_id="db.query.repair",
+            executor_id="db_runtime.query.repair.llm",
+            task_input={
+                "planning_context_evidence_id": "planning-context",
+                "failure_evidence_id": "failure-validation",
+                "prior_plan_evidence_id": "prior-plan",
+            },
+        )
+        evidence = await DbLLMRepairExecutor(runtime=runtime).execute(
+            task,
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    repair, proposal = evidence
+    assert repair.accepted is False
+    assert repair.payload["failure"] == "repair_non_executable_plan"
+    assert repair.payload["repair_rejection_reason"] == "operation_not_read:analysis"
+    assert repair.payload["proposal_accepted"] is False
+    assert proposal.accepted is False
+    assert proposal.payload["failure"] == "repair_non_executable_plan"
+    assert proposal.payload["valid"] is False
+
+
+async def test_llm_repair_repeated_sql_is_rejected():
+    sql = "select 1 as answer"
+    runtime, operation = await _repair_runtime_and_operation(
+        "phase-two-llm-repair-repeat",
+        json.dumps(
+            {
+                "operation": "read",
+                "selected_sql": sql,
+                "confidence": 0.9,
+            }
+        ),
+        prior_sql=sql,
+    )
+    try:
+        task = _llm_task(
+            operation,
+            capability_id="db.query.repair",
+            executor_id="db_runtime.query.repair.llm",
+            task_input={
+                "planning_context_evidence_id": "planning-context",
+                "failure_evidence_id": "failure-validation",
+                "prior_plan_evidence_id": "prior-plan",
+            },
+        )
+        evidence = await DbLLMRepairExecutor(runtime=runtime).execute(
+            task,
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    repair, proposal = evidence
+    assert repair.accepted is False
+    assert repair.payload["valid"] is True
+    assert repair.payload["proposal_accepted"] is False
+    assert repair.payload["repeated_sql_blocked"] is True
+    assert proposal.accepted is False
+    assert proposal.payload["valid"] is True
+    assert proposal.payload["repeated_sql_blocked"] is True
+
+
+async def test_llm_repair_repeated_sql_allowed_when_failure_context_changed():
+    sql = "select 1 as answer"
+    runtime, operation = await _repair_runtime_and_operation(
+        "phase-two-llm-repair-repeat-context-changed",
+        json.dumps(
+            {
+                "operation": "read",
+                "selected_sql": sql,
+                "confidence": 0.9,
+            }
+        ),
+        prior_sql=sql,
+        failure_payload={
+            "valid": False,
+            "planning_context_evidence_id": "previous-planning-context",
+            "validation_facts": [
+                {
+                    "kind": "filter_literal_requires_grounding",
+                    "table": "orders",
+                    "column": "status",
+                    "literal": "completed",
+                }
+            ],
+        },
+    )
+    try:
+        task = _llm_task(
+            operation,
+            capability_id="db.query.repair",
+            executor_id="db_runtime.query.repair.llm",
+            task_input={
+                "planning_context_evidence_id": "planning-context",
+                "failure_evidence_id": "failure-validation",
+                "prior_plan_evidence_id": "prior-plan",
+            },
+        )
+        evidence = await DbLLMRepairExecutor(runtime=runtime).execute(
+            task,
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    repair, proposal = evidence
+    assert repair.accepted is True
+    assert repair.payload["repeated_sql_blocked"] is False
+    assert repair.payload["repeated_sql_allowed_context_changed"] is True
+    assert proposal.accepted is True
+    assert proposal.payload["repair_context_changed"] is True
+    assert proposal.payload["repeated_sql_allowed_context_changed"] is True
+
+
+async def test_llm_repair_missing_input_ids_produces_rejected_diagnostics():
+    service = FakeLLMService(json.dumps({"operation": "read"}))
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-llm-repair-missing-inputs",
+        db_llm_service=service,
+    )
+    try:
+        evidence = await DbLLMRepairExecutor(runtime=runtime).execute(
+            _llm_task(
+                operation,
+                capability_id="db.query.repair",
+                executor_id="db_runtime.query.repair.llm",
+                task_input={},
+            ),
+            operation,
+            {},
+        )
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    repair, proposal = evidence
+    assert service.messages is None
+    assert repair.accepted is False
+    assert proposal.accepted is False
+    assert repair.payload["failure"] == "repair_inputs_missing"
+    assert proposal.payload["failure"] == "repair_inputs_missing"
+    assert set(repair.payload["missing_input_ids"]) == {
+        "planning_context_evidence_id",
+        "failure_evidence_id",
+        "prior_plan_evidence_id",
+    }
+
+
+async def test_repair_query_plan_missing_input_ids_rejected_before_task_creation():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-repair-missing-input-compile",
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "read"},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=(
+            DbPlannerAction(
+                action_id="repair",
+                kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+                input={"owner": "db_runtime"},
+            ),
+        ),
+    )
+
+    try:
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.task_specs == ()
+    assert (
+        compilation.rejected_action_summaries[0]["error"]
+        == "missing_repair_failure_evidence"
+    )
+
+
+async def test_repair_query_plan_binds_durable_inputs_and_dependencies():
+    action = DbPlannerAction(
+        action_id="repair",
+        kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+        input={"owner": "db_runtime"},
+        depends_on=("a3",),
+    )
+
+    compilation, runtime, _ = await _compile_single_action(
+        "phase-three-repair-durable-inputs",
+        action,
+        plan_evidence=(
+            {
+                "evidence_id": "prior-plan",
+                "sql": "select count(*) from orders where status = 'completed'",
+            },
+        ),
+        query_plan_validation_evidence=(
+            {
+                "evidence_id": "failed-plan-validation",
+                "plan_evidence_id": "prior-plan",
+            },
+        ),
+        planning_context=True,
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    repair = next(
+        spec
+        for spec in compilation.task_specs
+        if spec.capability_id == "db.query.repair"
+    )
+    assert repair.capability_id == "db.query.repair"
+    assert repair.input["planning_context_evidence_id"] == "planning-context"
+    assert repair.input["prior_plan_evidence_id"] == "prior-plan"
+    assert repair.input["failure_evidence_id"] == "failed-plan-validation"
+    assert "query_plan_ref" not in repair.input
+    assert "plan_evidence_id" not in repair.input
+    assert [dependency.evidence_id for dependency in repair.dependencies] == [
+        "planning-context",
+        "prior-plan",
+        "failed-plan-validation",
+    ]
+    assert [dependency.evidence_kind for dependency in repair.dependencies] == [
+        "planning.context",
+        "query.plan.proposal",
+        "query.plan.validation",
+    ]
+    assert [dependency.evidence_accepted for dependency in repair.dependencies] == [
+        True,
+        True,
+        False,
+    ]
+
+
+async def test_same_decision_repair_execute_defers_until_repaired_plan_is_durable():
+    stale_sql = "select count(*) from orders where status = 'completed'"
+    runtime, operation = await _runtime_and_operation(
+        "phase-seven-same-turn-repair-defers",
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    try:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+        await runtime.store.save_evidence(
+            _query_plan_evidence(
+                operation.id,
+                evidence_id="prior-plan",
+                sql=stale_sql,
+            )
+        )
+        await runtime.store.save_evidence(
+            _query_plan_validation_evidence(
+                operation.id,
+                evidence_id="failed-plan-validation",
+                plan_evidence_id="prior-plan",
+                validation_facts=False,
+            )
+        )
+        loop = DbAgentLoop(runtime, FakePlanner())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = _same_turn_repair_execute_decision()
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.query.repair"
+    ]
+    repair = compilation.task_specs[0]
+    assert repair.input["prior_plan_evidence_id"] == "prior-plan"
+    assert repair.input["failure_evidence_id"] == "failed-plan-validation"
+    rejected = compilation.rejected_action_summaries
+    assert len(rejected) == 1
+    assert rejected[0]["action_id"] == "execute_repair"
+    assert rejected[0]["error"] == "deferred_until_query_plan_proposal_available"
+    assert rejected[0]["deferred"]["producer_action_ids"] == ["repair_plan"]
+    assert rejected[0]["deferred"]["non_terminal"] is True
+    assert not any(
+        spec.capability_id in {"db.query.plan.validate", "db.sql.validate"}
+        for spec in compilation.task_specs
+    )
+    dumped_specs = json.dumps(
+        [spec.to_dict() for spec in compilation.task_specs],
+        sort_keys=True,
+    )
+    assert stale_sql not in dumped_specs
+
+
+async def test_same_turn_repair_deferral_continues_after_repair_evidence():
+    stale_sql = "select count(*) as order_count from orders where status = 'completed'"
+    repaired_sql = (
+        "select count(*) as order_count from orders where status = 'complete'"
+    )
+    runtime, operation = await _runtime_and_operation(
+        "phase-seven-same-turn-repair-continues",
+        db_llm_service=FakeLLMService(
+            json.dumps(
+                {
+                    "operation": "read",
+                    "selected_sql": repaired_sql,
+                    "selected_tables": ["orders"],
+                    "confidence": 0.92,
+                }
+            )
+        ),
+        required_evidence={"query.result"},
+    )
+    try:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+        await runtime.store.save_evidence(
+            _query_plan_evidence(
+                operation.id,
+                evidence_id="prior-plan",
+                sql=stale_sql,
+            )
+        )
+        await runtime.store.save_evidence(
+            _query_plan_validation_evidence(
+                operation.id,
+                evidence_id="failed-plan-validation",
+                plan_evidence_id="prior-plan",
+                validation_facts=False,
+            )
+        )
+        result = await DbAgentLoop(
+            runtime,
+            FakePlanner(
+                _same_turn_repair_execute_decision(),
+                _planner_decision(
+                    DbPlannerAction(
+                        action_id="execute_repaired_durable_plan",
+                        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                        input={
+                            "owner": "phase_two",
+                            "query_plan_ref": "latest_accepted_query_plan",
+                        },
+                    )
+                ),
+            ),
+        ).run(
+            operation,
+            safety_frame={"max_access": "read"},
+            max_turns=3,
+        )
+        evidence = await runtime.store.list_evidence(operation.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert_no_invalid_accepted_query_plans(evidence)
+    assert result.status == "finished"
+    compilation = next(
+        item
+        for item in evidence
+        if item.kind == "planner.compilation"
+        and any(
+            rejected["error"] == "deferred_until_query_plan_proposal_available"
+            for rejected in item.payload["compilation"]["rejected_action_summaries"]
+        )
+    )
+    assert compilation.accepted is False
+    assert [
+        spec["capability_id"]
+        for spec in compilation.payload["compilation"]["task_specs"]
+    ] == ["db.query.repair"]
+    sql_validation_tasks = [
+        task for task in tasks if task.capability_id == "db.sql.validate"
+    ]
+    assert [task.input["sql"] for task in sql_validation_tasks] == [repaired_sql]
+    assert all(task.input["sql"] != stale_sql for task in sql_validation_tasks)
+
+
+async def test_repair_query_plan_falls_back_to_failed_sql_validation():
+    action = DbPlannerAction(
+        action_id="repair",
+        kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+        input={"owner": "db_runtime"},
+    )
+
+    compilation, runtime, _ = await _compile_single_action(
+        "phase-three-repair-failed-sql-validation",
+        action,
+        plan_evidence=(
+            {"evidence_id": "prior-plan", "sql": "select * from missing_table"},
+        ),
+        sql_validation_evidence=(
+            {
+                "evidence_id": "failed-sql-validation",
+                "sql": "select * from missing_table",
+                "valid": False,
+                "accepted": False,
+            },
+        ),
+        planning_context=True,
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    repair = compilation.task_specs[0]
+    assert repair.input["failure_evidence_id"] == "failed-sql-validation"
+    assert repair.dependencies[-1].evidence_id == "failed-sql-validation"
+    assert repair.dependencies[-1].evidence_kind == "sql.validation"
+    assert repair.dependencies[-1].evidence_accepted is False
+
+
+async def test_repair_query_plan_blocks_without_failed_validation_evidence():
+    action = DbPlannerAction(
+        action_id="repair",
+        kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+        input={"owner": "db_runtime"},
+    )
+
+    compilation, runtime, _ = await _compile_single_action(
+        "phase-three-repair-no-failure-evidence",
+        action,
+        plan_evidence=({"evidence_id": "prior-plan", "sql": "select 1"},),
+        planning_context=True,
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.teardown()
+
+    assert compilation.task_specs == ()
+    assert (
+        compilation.rejected_action_summaries[0]["error"]
+        == "missing_repair_failure_evidence"
+    )
+
+
+async def test_repair_query_plan_blocks_ambiguous_failure_evidence_id():
+    action = DbPlannerAction(
+        action_id="repair",
+        kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+        input={
+            "owner": "db_runtime",
+            "failure_evidence_id": "ambiguous-failure",
+        },
+    )
+
+    compilation, runtime, _ = await _compile_single_action(
+        "phase-three-repair-ambiguous-failure",
+        action,
+        plan_evidence=({"evidence_id": "prior-plan", "sql": "select 1"},),
+        query_plan_validation_evidence=(
+            {
+                "evidence_id": "ambiguous-failure",
+                "plan_evidence_id": "prior-plan",
+                "validation_facts": False,
+            },
+        ),
+        sql_validation_evidence=(
+            {
+                "evidence_id": "ambiguous-failure",
+                "sql": "select 1",
+                "valid": False,
+                "accepted": False,
+            },
+        ),
+        planning_context=True,
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.teardown()
+
+    assert compilation.task_specs == ()
+    assert (
+        compilation.rejected_action_summaries[0]["error"]
+        == "ambiguous_repair_failure_evidence"
+    )
+
+
+async def test_propose_sql_read_without_context_compiles_context_prerequisite():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-propose-builds-context",
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    try:
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "metadata_read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="plan",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={"owner": "db_runtime"},
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.schema.inspect",
+        "db.planning.context.build",
+        "db.query.plan",
+    ]
+    context, query_plan = compilation.task_specs[1:]
+    assert "planning_context_evidence_id" not in query_plan.input
+    assert len(query_plan.dependencies) == 1
+    dependency = query_plan.dependencies[0]
+    assert dependency.evidence_kind == "planning.context"
+    assert dependency.evidence_owner == "db_runtime"
+    assert dependency.producer_task_id == context.task_id
+    assert dependency.producer_capability_id == "db.planning.context.build"
+    assert dependency.producer_executor_id == "db_runtime.planning.context.build"
+    assert dependency.evidence_accepted is True
+    assert dependency.evidence_id is None
+
+
+async def test_propose_sql_read_strips_unsupported_plan_refs_before_query_plan():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-propose-strips-refs",
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    try:
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "metadata_read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="plan",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={
+                        "owner": "db_runtime",
+                        "query_plan_ref": "latest_accepted_query_plan",
+                        "plan_evidence_id": "prior-plan",
+                    },
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.schema.inspect",
+        "db.planning.context.build",
+        "db.query.plan",
+    ]
+    query_plan = compilation.task_specs[-1]
+    assert "query_plan_ref" not in query_plan.input
+    assert "plan_evidence_id" not in query_plan.input
+    assert query_plan.dependencies[0].evidence_kind == "planning.context"
+    assert query_plan.dependencies[0].producer_task_id == (
+        compilation.task_specs[-2].task_id
+    )
+
+
+async def test_propose_sql_read_with_existing_context_injects_context_evidence_id():
+    action = DbPlannerAction(
+        action_id="plan",
+        kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+        input={
+            "owner": "db_runtime",
+            "query_plan_ref": "latest_accepted_query_plan",
+            "plan_evidence_id": "prior-plan",
+        },
+    )
+
+    compilation, runtime, _ = await _compile_single_action(
+        "phase-two-propose-existing-context",
+        action,
+        planning_context=True,
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == ["db.query.plan"]
+    query_plan = compilation.task_specs[0]
+    assert query_plan.input == {"planning_context_evidence_id": "planning-context"}
+    assert query_plan.dependencies == ()
+
+
+async def test_propose_sql_read_does_not_reuse_catalog_hint_only_context():
+    runtime, operation = await _catalog_runtime_and_operation(
+        "phase-two-catalog-hint-context"
+    )
+    try:
+        await runtime.store.save_evidence(
+            Evidence(
+                id="hint-only-context",
+                kind="planning.context",
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "schema": {
+                        "database_type": "sqlite",
+                        "tables": [
+                            {
+                                "name": "orders",
+                                "columns": [{"name": "status"}],
+                            }
+                        ],
+                    },
+                    "catalog_evidence_refs": ["catalog-status-hints"],
+                    "diagnostics": {
+                        "structural_schema_source": "connector",
+                        "catalog_structural_evidence_refs": [],
+                    },
+                },
+                metadata={"payload_fingerprint": "fp-hint-only-context"},
+            )
+        )
+        loop = DbAgentLoop(runtime, FakePlanner())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "metadata_read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="plan",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={"owner": "db_runtime"},
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.schema.inspect",
+        "catalog.schema.search",
+        "db.planning.context.build",
+        "db.query.plan",
+    ]
+    query_plan = compilation.task_specs[-1]
+    assert "planning_context_evidence_id" not in query_plan.input
+    assert query_plan.dependencies[0].producer_task_id == (
+        compilation.task_specs[-2].task_id
+    )
+
+
+async def test_propose_sql_read_inserts_catalog_search_and_asset_prerequisites():
+    runtime, operation = await _catalog_runtime_and_operation(
+        "phase-two-catalog-prereqs"
+    )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    try:
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "metadata_read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="plan",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={
+                        "owner": "db_runtime",
+                        "source_owner": "sqlite",
+                        "tables": ["orders"],
+                    },
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.schema.inspect",
+        "catalog.schema.search",
+        "catalog.asset.inspect",
+        "db.planning.context.build",
+        "db.query.plan",
+    ]
+    search = compilation.task_specs[1]
+    asset = compilation.task_specs[2]
+    context = compilation.task_specs[3]
+    query_plan = compilation.task_specs[4]
+    assert search.input["query"] == "phase two catalog"
+    assert asset.input["asset_ref"] == "orders"
+    assert asset.dependencies[0].producer_task_id == search.task_id
+    assert {dependency.evidence_kind for dependency in context.dependencies} == {
+        "schema.asset_profile",
+        "schema.search_result",
+    }
+    assert query_plan.dependencies[0].producer_task_id == context.task_id
+
+
+async def test_relationship_path_action_does_not_guess_assets_from_prompt_text():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="agent-phase-two")
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_id="phase-two-no-prompt-relationship-guessing",
+            operation_type="data.query",
+            request={
+                "prompt": "Join orders to customers using their relationship",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"source_scope": ["sqlite"]},
+            evaluate_governance=False,
+        )
+        loop = DbAgentLoop(runtime, FakePlanner())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "metadata_read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="relationships",
+                    kind=DbPlannerActionKind.FIND_RELATIONSHIP_PATHS,
+                    input={"owner": "catalog"},
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.task_specs == ()
+    assert [item["error"] for item in compilation.rejected_action_summaries] == [
+        "missing_from_assets",
+        "missing_to_assets",
+    ]
+
+
+async def test_execute_joined_query_plan_inserts_relationship_path_prerequisite():
+    sql = (
+        "SELECT o.id, c.email FROM orders o " "JOIN customers c ON o.customer_id = c.id"
+    )
+    runtime, operation = await _catalog_runtime_and_operation(
+        "phase-two-relationship-prereq"
+    )
+    try:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+        await runtime.store.save_evidence(
+            Evidence(
+                id="join-plan",
+                kind="query.plan.proposal",
+                owner="db_runtime",
+                operation_id=operation.id,
+                task_id="task-join-plan",
+                accepted=True,
+                payload={
+                    "valid": True,
+                    "sql": sql,
+                    "structured_plan": {
+                        "operation": "read",
+                        "selected_sql": sql,
+                        "selected_tables": ["orders", "customers"],
+                        "joins": [
+                            {
+                                "left_table": "orders",
+                                "left_column": "customer_id",
+                                "right_table": "customers",
+                                "right_column": "id",
+                            }
+                        ],
+                        "confidence": 0.95,
+                    },
+                },
+                metadata={"payload_fingerprint": "fp-join-plan"},
+            )
+        )
+        loop = DbAgentLoop(runtime, FakePlanner())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = _planner_decision(
+            DbPlannerAction(
+                action_id="execute_join",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "sqlite",
+                    "plan_evidence_id": "join-plan",
+                },
+            )
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "catalog.schema.search",
+        "catalog.relationship_paths.find",
+        "db.planning.context.build",
+        "db.query.plan.validate",
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    relationship = compilation.task_specs[1]
+    refreshed_context = compilation.task_specs[2]
+    plan_validation = compilation.task_specs[3]
+    assert relationship.input["from_assets"] == ["orders"]
+    assert relationship.input["to_assets"] == ["customers"]
+    assert refreshed_context.dependencies[-1].producer_task_id == relationship.task_id
+    assert "planning_context_evidence_id" not in plan_validation.input
+    assert any(
+        dependency.evidence_kind == "planning.context"
+        and dependency.producer_task_id == refreshed_context.task_id
+        for dependency in plan_validation.dependencies
+    )
+
+
+async def test_propose_sql_read_context_prerequisite_uses_memory_recall_chain():
+    runtime = DbRuntime(
+        plugins=(MemoryPlugin(),),
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "memory": {
+                        "enabled": True,
+                        "recall": "auto",
+                        "limit": 3,
+                        "char_budget": 800,
+                        "score_threshold": 0.0,
+                        "retrieval_mode": "structured",
+                        "source_identity": "sqlite:from_db:propose-memory",
+                    }
+                }
+            }
+        ),
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.setup(agent_id="agent-phase-two")
+    try:
+        state = DbLoopState(
+            operation_id="op-propose-memory-context",
+            normalized_user_request={
+                "prompt": "Calculate recognized revenue from orders.total."
+            },
+            safety_frame={"max_access": "metadata_read"},
+            available_action_kinds=tuple(DbPlannerActionKind),
+            accepted_evidence_summaries=(
+                {
+                    "id": "schema-existing",
+                    "kind": "schema.asset_profile",
+                    "owner": "sqlite",
+                    "accepted": True,
+                    "task_id": "schema-task",
+                },
+            ),
+            memory_context={
+                "enabled": True,
+                "source_identity": "sqlite:from_db:propose-memory",
+                "retrieval_mode": "structured",
+                "limit": 3,
+                "score_threshold": 0.0,
+                "recall_decision": {
+                    "recall": True,
+                    "reason": "semantic_prompt",
+                    "query": "recognized revenue orders.total complete",
+                },
+            },
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="plan",
+                    kind=DbPlannerActionKind.PROPOSE_SQL_READ,
+                    input={"owner": "db_runtime"},
+                ),
+            ),
+        )
+
+        compilation = DbAgentLoop(runtime, FakePlanner()).compile_actions(
+            decision,
+            state,
+        )
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "memory.semantic.recall",
+        "db.planning.context.build",
+        "db.query.plan",
+    ]
+    recall, context, query_plan = compilation.task_specs
+    assert context.dependencies[0].evidence_kind == "memory.semantic.recall"
+    assert context.dependencies[0].producer_task_id == recall.task_id
+    assert context.input["memory_recall_diagnostics"]["queried"] is True
+    assert query_plan.dependencies[0].evidence_kind == "planning.context"
+    assert query_plan.dependencies[0].producer_task_id == context.task_id
+
+
+async def test_agent_loop_runs_schema_and_read_flow_through_task_specs():
+    runtime, operation = await _runtime_and_operation("phase-two-read")
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "db.run"},
+        actions=(
+            DbPlannerAction(
+                action_id="schema",
+                kind=DbPlannerActionKind.INSPECT_SCHEMA,
+                input={"owner": "phase_two"},
+            ),
+            DbPlannerAction(
+                action_id="read",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={"owner": "phase_two", "sql": "select 1 as answer"},
+            ),
+        ),
+    )
+
+    result = await DbAgentLoop(runtime, FakePlanner(decision)).run(
+        operation,
+        safety_frame={"max_access": "read"},
+        max_turns=1,
+    )
+
+    assert result.status == "finished"
+    tasks = await runtime.store.list_tasks(operation.id)
+    assert [task.capability_id for task in tasks] == [
+        "db.schema.inspect",
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    assert [task.status.value for task in tasks] == [
+        "succeeded",
+        "succeeded",
+        "succeeded",
+    ]
+    read_task = tasks[-1]
+    assert read_task.dependencies[0].producer_task_id == tasks[1].id
+    evidence = await runtime.store.list_evidence(operation.id)
+    kinds = [item.kind for item in evidence]
+    assert kinds.index("planner.decision") < kinds.index("database.schema")
+    assert {"planner.decision", "planner.compilation", "planner.observation"} <= set(
+        kinds
+    )
+    query_result = next(item for item in evidence if item.kind == "query.result")
+    assert query_result.payload["sql"] == "select 1 as answer"
+
+
+async def test_direct_sql_compiles_validation_and_read_task_specs():
+    sql = "select 1 as answer"
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two", "sql": sql},
+    )
+
+    compilation, _, _ = await _compile_single_action("phase-four-direct", action)
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    validation, read = compilation.task_specs
+    assert validation.input == {"sql": sql, "operation": "query"}
+    assert validation.dependencies == ()
+    assert validation.metadata["sql_provenance"]["provenance"] == "direct"
+    assert "sql_ref" not in read.input
+    assert read.input["params"] == []
+    assert read.input["sql_fingerprint"]
+    assert read.input["sql_validation_task_id"] == validation.task_id
+    assert read.input["sql_validation_input_hash"]
+    sql_dependency = next(
+        dependency
+        for dependency in read.dependencies
+        if dependency.evidence_kind == "sql.validation"
+    )
+    assert sql_dependency.producer_task_id == validation.task_id
+    assert sql_dependency.input_hash == read.input["sql_validation_input_hash"]
+
+
+async def test_explicit_plan_evidence_id_attaches_dependency_to_validation():
+    sql = "select count(*) as count from orders"
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two", "plan_evidence_id": "plan-explicit"},
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-explicit-plan",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-explicit", "sql": sql, "task_id": "plan-task"},
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation, read = compilation.task_specs
+    assert validation.input == {"sql": sql, "operation": "query"}
+    assert "sql_ref" not in read.input
+    assert read.input["plan_evidence_id"] == "plan-explicit"
+    assert read.input["plan_payload_fingerprint"] == "fp-plan-explicit"
+    assert read.input["sql_validation_task_id"] == validation.task_id
+    assert len(validation.dependencies) == 1
+    dependency = validation.dependencies[0]
+    assert dependency.evidence_kind == "query.plan.proposal"
+    assert dependency.evidence_id == "plan-explicit"
+    assert dependency.evidence_owner == "phase_two"
+    assert dependency.producer_task_id == "plan-task"
+    assert dependency.payload_fingerprint == "fp-plan-explicit"
+    provenance = validation.metadata["sql_provenance"]
+    assert provenance["provenance"] == "plan_evidence_id"
+    assert provenance["source_evidence_id"] == "plan-explicit"
+    assert provenance["source_evidence_kind"] == "query.plan.proposal"
+    assert provenance["source_evidence_owner"] == "phase_two"
+    assert provenance["source_task_id"] == "plan-task"
+    assert provenance["source_payload_fingerprint"] == "fp-plan-explicit"
+    assert provenance["sql_fingerprint"]
+
+
+async def test_latest_accepted_query_plan_ref_selects_latest_accepted_plan():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-latest-plan",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-old", "sql": "select 1 as answer"},
+            {"evidence_id": "plan-new", "sql": "select 2 as answer"},
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 2 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-new"
+    assert (
+        validation.metadata["sql_provenance"]["provenance"]
+        == "latest_accepted_query_plan"
+    )
+    continuation = validation.metadata["continuation_resolution"]
+    assert continuation["source"] == "explicit_role"
+    assert continuation["role"] == "latest_accepted_query_plan"
+    assert continuation["evidence_id"] == "plan-new"
+
+
+async def test_explicit_plan_id_matching_latest_plan_ref_is_not_ambiguous():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "plan_evidence_id": "plan-new",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-explicit-plan-and-latest-ref",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-old", "sql": "select 1 as answer"},
+            {"evidence_id": "plan-new", "sql": "select 2 as answer"},
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 2 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-new"
+    provenance = validation.metadata["sql_provenance"]
+    assert provenance["provenance"] == "plan_evidence_id"
+    assert provenance["source_evidence_id"] == "plan-new"
+
+
+async def test_explicit_plan_id_conflicting_with_latest_plan_ref_is_ambiguous():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "plan_evidence_id": "plan-old",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-explicit-plan-conflicts-with-latest-ref",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-old", "sql": "select 1 as answer"},
+            {"evidence_id": "plan-new", "sql": "select 2 as answer"},
+        ),
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == "ambiguous_sql_input"
+
+
+async def test_prior_turn_query_plan_dependency_recovers_to_latest_plan():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two"},
+        depends_on=("plan_previous_turn",),
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-prior-turn-plan-dependency",
+        action,
+        plan_evidence=({"evidence_id": "plan-accepted", "sql": "select 1 as answer"},),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-accepted"
+    assert (
+        validation.metadata["continuation_resolution"]["evidence_id"] == "plan-accepted"
+    )
+    assert (
+        validation.metadata["sql_provenance"]["provenance"]
+        == "latest_accepted_query_plan"
+    )
+
+
+async def test_prior_turn_latest_plan_ref_dependency_recovers_to_latest_plan():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+        depends_on=("plan_previous_turn",),
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-prior-turn-plan-ref-dependency",
+        action,
+        plan_evidence=({"evidence_id": "plan-accepted", "sql": "select 1 as answer"},),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-accepted"
+    assert (
+        validation.metadata["sql_provenance"]["provenance"]
+        == "latest_accepted_query_plan"
+    )
+    assert validation.metadata["dependency_recovery"] == "latest_accepted_query_plan"
+    continuation = validation.metadata["continuation_resolution"]
+    assert continuation["source"] == "explicit_role"
+    assert continuation["stale_dependency_ids"] == ["plan_previous_turn"]
+
+
+async def test_prior_turn_dependency_with_explicit_plan_evidence_id_preserves_id():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two", "plan_evidence_id": "plan-explicit"},
+        depends_on=("plan_previous_turn",),
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-five-explicit-id-continuation",
+        action,
+        plan_evidence=(
+            {
+                "evidence_id": "plan-explicit",
+                "sql": "select 1 as answer",
+                "task_id": "plan-task",
+            },
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-explicit"
+    provenance = validation.metadata["sql_provenance"]
+    assert provenance["provenance"] == "plan_evidence_id"
+    assert provenance["source_evidence_id"] == "plan-explicit"
+    continuation = validation.metadata["continuation_resolution"]
+    assert continuation["source"] == "explicit_evidence_id"
+    assert continuation["evidence_id"] == "plan-explicit"
+    assert continuation["stale_dependency_ids"] == ["plan_previous_turn"]
+
+
+async def test_prior_turn_query_plan_dependency_blocks_ambiguous_candidates():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two"},
+        depends_on=("plan_previous_turn",),
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-five-ambiguous-plan-continuation",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-one", "sql": "select 1 as answer"},
+            {"evidence_id": "plan-two", "sql": "select 2 as answer"},
+        ),
+    )
+
+    assert compilation.task_specs == ()
+    rejected = compilation.rejected_action_summaries[0]
+    assert rejected["error"] == "ambiguous_continuation:latest_accepted_query_plan"
+    assert rejected["continuation"]["status"] == "blocked"
+    assert rejected["continuation"]["candidate_ids"] == ["plan-one", "plan-two"]
+    assert rejected["continuation"]["stale_dependency_ids"] == ["plan_previous_turn"]
+
+
+async def test_memory_proposal_role_ref_resolves_to_latest_accepted_proposal():
+    action = DbPlannerAction(
+        action_id="commit",
+        kind=DbPlannerActionKind.COMMIT_MEMORY_UPDATE,
+        input={
+            "owner": "phase_two",
+            "proposal_ref": "latest_accepted_memory_proposal",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-five-memory-role-ref",
+        action,
+        memory_proposal_evidence=(
+            {
+                "evidence_id": "proposal-old",
+                "proposal_fingerprint": "proposal-fp-old",
+            },
+            {
+                "evidence_id": "proposal-new",
+                "proposal_fingerprint": "proposal-fp-new",
+            },
+        ),
+        explicit_mode="memory.update",
+        max_access="write",
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    commit = compilation.task_specs[0]
+    assert commit.input == {
+        "proposal_evidence_id": "proposal-new",
+        "proposal_fingerprint": "proposal-fp-new",
+    }
+    assert commit.dependencies[0].evidence_id == "proposal-new"
+    continuation = commit.metadata["continuation_resolution"]
+    assert continuation["source"] == "explicit_role"
+    assert continuation["role"] == "latest_accepted_memory_proposal"
+    assert continuation["evidence_id"] == "proposal-new"
+
+
+async def test_memory_commit_without_role_blocks_ambiguous_proposals():
+    action = DbPlannerAction(
+        action_id="commit",
+        kind=DbPlannerActionKind.COMMIT_MEMORY_UPDATE,
+        input={"owner": "phase_two"},
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-five-memory-ambiguous",
+        action,
+        memory_proposal_evidence=(
+            {"evidence_id": "proposal-one"},
+            {"evidence_id": "proposal-two"},
+        ),
+        explicit_mode="memory.update",
+        max_access="write",
+    )
+
+    assert compilation.task_specs == ()
+    rejected = compilation.rejected_action_summaries[0]
+    assert rejected["error"] == "ambiguous_continuation:latest_accepted_memory_proposal"
+    assert rejected["continuation"]["candidate_ids"] == [
+        "proposal-one",
+        "proposal-two",
+    ]
+
+
+async def test_memory_update_runtime_continuation_compiles_commit_without_action():
+    runtime, operation = await _runtime_and_operation(
+        "phase-six-memory-runtime-continuation",
+        mode="memory.update",
+    )
+    await runtime.store.save_evidence(
+        _memory_proposal_evidence(
+            operation.id,
+            evidence_id="proposal-runtime",
+            proposal_fingerprint="proposal-fp-runtime",
+        )
+    )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "write"},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "memory.update"},
+        actions=(),
+    )
+
+    compilation = loop.compile_actions(decision, state)
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.memory.commit_update"
+    ]
+    commit = compilation.task_specs[0]
+    assert commit.input == {
+        "proposal_evidence_id": "proposal-runtime",
+        "proposal_fingerprint": "proposal-fp-runtime",
+    }
+    assert commit.dependencies[0].evidence_id == "proposal-runtime"
+    assert commit.metadata["runtime_continuation"] is True
+    continuation = commit.metadata["continuation_resolution"]
+    assert continuation["source"] == "runtime_continuation"
+    assert continuation["role"] == "latest_uncommitted_memory_proposal"
+    assert continuation["evidence_id"] == "proposal-runtime"
+
+
+async def test_memory_update_runtime_continuation_skips_committed_proposal():
+    runtime, operation = await _runtime_and_operation(
+        "phase-six-memory-runtime-committed",
+        mode="memory.update",
+    )
+    await runtime.store.save_evidence(
+        _memory_proposal_evidence(
+            operation.id,
+            evidence_id="proposal-committed",
+            proposal_fingerprint="proposal-fp-committed",
+        )
+    )
+    await runtime.store.save_evidence(
+        _memory_definition_evidence(
+            operation.id,
+            evidence_id="definition-committed",
+            proposal_evidence_id="proposal-committed",
+            proposal_fingerprint="proposal-fp-committed",
+        )
+    )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "write"},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "memory.update"},
+        actions=(),
+    )
+
+    compilation = loop.compile_actions(decision, state)
+
+    assert compilation.rejected_action_summaries == ()
+    assert compilation.task_specs == ()
+
+
+async def test_memory_update_runtime_continuation_blocks_multiple_proposals():
+    runtime, operation = await _runtime_and_operation(
+        "phase-six-memory-runtime-ambiguous",
+        mode="memory.update",
+    )
+    for evidence_id in ("proposal-one", "proposal-two"):
+        await runtime.store.save_evidence(
+            _memory_proposal_evidence(operation.id, evidence_id=evidence_id)
+        )
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": "write"},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "memory.update"},
+        actions=(),
+    )
+
+    compilation = loop.compile_actions(decision, state)
+
+    assert compilation.task_specs == ()
+    rejected = compilation.rejected_action_summaries[0]
+    assert (
+        rejected["error"] == "ambiguous_continuation:latest_uncommitted_memory_proposal"
+    )
+    assert rejected["continuation"]["source"] == "runtime_continuation"
+    assert rejected["continuation"]["status"] == "blocked"
+    assert rejected["continuation"]["candidate_ids"] == [
+        "proposal-one",
+        "proposal-two",
+    ]
+
+
+async def test_direct_sql_matching_latest_plan_ref_uses_plan_provenance():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "sql": "select 1 as answer;",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-direct-sql-matching-latest-plan",
+        action,
+        plan_evidence=({"evidence_id": "plan-accepted", "sql": "select 1 as answer"},),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-accepted"
+    assert (
+        validation.metadata["sql_provenance"]["provenance"]
+        == "latest_accepted_query_plan"
+    )
+
+
+async def test_direct_sql_mismatching_latest_plan_ref_is_ambiguous():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "sql": "select 2 as answer",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-direct-sql-mismatching-latest-plan",
+        action,
+        plan_evidence=({"evidence_id": "plan-accepted", "sql": "select 1 as answer"},),
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == "ambiguous_sql_input"
+
+
+async def test_write_execute_with_direct_sql_and_plan_ref_uses_matching_validation():
+    sql = "UPDATE orders SET status = 'approved' WHERE order_id = 101"
+    action = DbPlannerAction(
+        action_id="write",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_WRITE,
+        input={
+            "owner": "phase_two",
+            "sql": f"{sql};",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-write-from-validation",
+        action,
+        sql_validation_evidence=(
+            {
+                "evidence_id": "validation-write",
+                "sql": sql,
+                "operation": "write",
+                "task_id": "validation-task",
+            },
+        ),
+        explicit_mode="write.execute",
+        max_access="write",
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.sql.execute_write",
+    ]
+    (write,) = compilation.task_specs
+    assert "sql_ref" not in write.input
+    assert write.input["sql_validation_evidence_id"] == "validation-write"
+    assert write.input["sql_validation_payload_fingerprint"] == "fp-validation-write"
+    dependency = write.dependencies[0]
+    assert dependency.evidence_kind == "sql.validation"
+    assert dependency.evidence_id == "validation-write"
+    assert dependency.payload_fingerprint == "fp-validation-write"
+    assert dependency.producer_task_id == "validation-task"
+    provenance = write.metadata["sql_provenance"]
+    assert provenance["provenance"] == "latest_accepted_sql_validation"
+    assert provenance["source_evidence_id"] == "validation-write"
+    assert provenance["source_evidence_kind"] == "sql.validation"
+    assert provenance["source_task_id"] == "validation-task"
+
+
+async def test_write_execute_plan_evidence_id_can_reference_sql_validation():
+    sql = "UPDATE orders SET status = 'approved' WHERE order_id = 101"
+    action = DbPlannerAction(
+        action_id="write",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_WRITE,
+        input={
+            "owner": "phase_two",
+            "sql": sql,
+            "plan_evidence_id": "validation-write",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-write-validation-id",
+        action,
+        sql_validation_evidence=(
+            {
+                "evidence_id": "validation-write",
+                "sql": sql,
+                "operation": "write",
+                "task_id": "validation-task",
+            },
+        ),
+        explicit_mode="write.execute",
+        max_access="write",
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    (write,) = compilation.task_specs
+    assert "sql_ref" not in write.input
+    assert write.input["sql_validation_evidence_id"] == "validation-write"
+    dependency = write.dependencies[0]
+    assert dependency.evidence_kind == "sql.validation"
+    assert dependency.evidence_id == "validation-write"
+    provenance = write.metadata["sql_provenance"]
+    assert provenance["provenance"] == "validation_evidence_id"
+    assert provenance["source_evidence_id"] == "validation-write"
+    assert provenance["source_evidence_kind"] == "sql.validation"
+
+
+async def test_repaired_sql_validation_creates_distinct_execute_task():
+    old_sql = "select count(*) from orders where status = 'completed'"
+    repaired_sql = "select count(*) from orders where status = 'complete'"
+    runtime, operation = await _runtime_and_operation(
+        "phase-one-distinct-repaired-execute"
+    )
+    try:
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(
+                operation.id,
+                evidence_id="validation-old",
+                sql=old_sql,
+                task_id="validation-task-old",
+            )
+        )
+        old_compilation = await _compile_action_for_runtime(
+            runtime,
+            operation,
+            DbPlannerAction(
+                action_id="execute_repaired",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "phase_two",
+                    "plan_evidence_id": "validation-old",
+                },
+            ),
+        )
+        old_plan = await runtime.plan_task_specs(
+            operation,
+            old_compilation.task_specs,
+        )
+
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(
+                operation.id,
+                evidence_id="validation-repaired",
+                sql=repaired_sql,
+                task_id="validation-task-repaired",
+            )
+        )
+        repaired_compilation = await _compile_action_for_runtime(
+            runtime,
+            operation,
+            DbPlannerAction(
+                action_id="execute_repaired",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "phase_two",
+                    "plan_evidence_id": "validation-repaired",
+                },
+            ),
+        )
+        repaired_plan = await runtime.plan_task_specs(
+            operation,
+            repaired_compilation.task_specs,
+        )
+    finally:
+        await runtime.teardown()
+
+    old_execute = old_plan.tasks[0]
+    repaired_execute = repaired_plan.tasks[0]
+    assert old_execute.id != repaired_execute.id
+    assert old_execute.input["sql_validation_evidence_id"] == "validation-old"
+    assert repaired_execute.input["sql_validation_evidence_id"] == "validation-repaired"
+    assert (
+        old_execute.input["sql_fingerprint"]
+        != repaired_execute.input["sql_fingerprint"]
+    )
+    assert old_execute.dependencies[0].evidence_id == "validation-old"
+    assert repaired_execute.dependencies[0].evidence_id == "validation-repaired"
+
+
+async def test_stale_blocked_execute_does_not_block_repaired_execution():
+    old_sql = "select count(*) from orders where status = 'completed'"
+    repaired_sql = "select count(*) from orders where status = 'complete'"
+    runtime, operation = await _runtime_and_operation("phase-one-stale-blocked-execute")
+    try:
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(
+                operation.id,
+                evidence_id="validation-old",
+                sql=old_sql,
+                task_id="validation-task-old",
+            )
+        )
+        old_compilation = await _compile_action_for_runtime(
+            runtime,
+            operation,
+            DbPlannerAction(
+                action_id="execute_repaired",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "phase_two",
+                    "plan_evidence_id": "validation-old",
+                },
+            ),
+        )
+        old_plan = await runtime.plan_task_specs(
+            operation,
+            old_compilation.task_specs,
+        )
+        old_execute = old_plan.tasks[0]
+        await runtime.kernel.block_task(old_execute.id, message="stale execution")
+        old_blocked = await runtime.store.load_task(old_execute.id)
+
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(
+                operation.id,
+                evidence_id="validation-repaired",
+                sql=repaired_sql,
+                task_id="validation-task-repaired",
+            )
+        )
+        repaired_compilation = await _compile_action_for_runtime(
+            runtime,
+            operation,
+            DbPlannerAction(
+                action_id="execute_repaired",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={
+                    "owner": "phase_two",
+                    "plan_evidence_id": "validation-repaired",
+                },
+            ),
+        )
+        repaired_plan = await runtime.plan_task_specs(
+            operation,
+            repaired_compilation.task_specs,
+        )
+        repaired_execute = repaired_plan.tasks[0]
+        repaired_readiness = await runtime.task_readiness(
+            repaired_execute,
+            operation,
+        )
+    finally:
+        await runtime.teardown()
+
+    assert old_execute.id != repaired_execute.id
+    assert old_blocked is not None
+    assert old_blocked.status.value == "blocked"
+    assert repaired_execute.status.value == "pending"
+    assert repaired_readiness["ready"] is True
+
+
+async def test_execute_read_readiness_requires_exact_sql_validation_evidence():
+    runtime, operation = await _runtime_and_operation(
+        "phase-one-exact-validation-readiness"
+    )
+    try:
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(
+                operation.id,
+                evidence_id="validation-other",
+                sql="select 2 as answer",
+                task_id="validation-task-other",
+            )
+        )
+        exact_dependency = TaskDependency(
+            kind="evidence",
+            evidence_kind="sql.validation",
+            evidence_id="validation-required",
+            evidence_owner="phase_two",
+            producer_task_id="validation-task-required",
+            evidence_accepted=True,
+            evidence_payload={"valid": True},
+            payload_fingerprint="fp-validation-required",
+            operation_id=operation.id,
+        )
+        plan = await runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.sql.execute_read",
+                    owner="phase_two",
+                    input={
+                        "sql_validation_evidence_id": "validation-required",
+                        "sql_validation_payload_fingerprint": (
+                            "fp-validation-required"
+                        ),
+                        "sql_fingerprint": "sql-fp-required",
+                        "params": [],
+                    },
+                    dependencies=(exact_dependency,),
+                    reason="phase_1_exact_validation_readiness",
+                    sequence=1,
+                ),
+            ),
+        )
+        task = plan.tasks[0]
+        readiness = await runtime.task_readiness(task, operation)
+
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(
+                operation.id,
+                evidence_id="validation-required",
+                sql="select 1 as answer",
+                task_id="validation-task-required",
+            )
+        )
+        repaired_readiness = await runtime.task_readiness(task, operation)
+    finally:
+        await runtime.teardown()
+
+    assert readiness["ready"] is False
+    assert readiness["unsatisfied_dependencies"][0]["evidence_id"] == (
+        "validation-required"
+    )
+    assert repaired_readiness["ready"] is True
+
+
+async def test_write_execute_ignores_invalid_matching_validation():
+    sql = "UPDATE orders SET status = 'approved' WHERE order_id = 101"
+    action = DbPlannerAction(
+        action_id="write",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_WRITE,
+        input={
+            "owner": "phase_two",
+            "sql": sql,
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-write-invalid-validation",
+        action,
+        sql_validation_evidence=(
+            {
+                "evidence_id": "validation-invalid",
+                "sql": sql,
+                "operation": "write",
+                "valid": False,
+            },
+        ),
+        explicit_mode="write.execute",
+        max_access="write",
+    )
+
+    assert compilation.task_specs == ()
+    assert (
+        compilation.rejected_action_summaries[0]["error"]
+        == "missing_valid_sql_validation"
+    )
+
+
+async def test_plan_evidence_with_context_validates_plan_before_sql():
+    sql = "select count(*) as count from orders"
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two", "plan_evidence_id": "plan-explicit"},
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-plan-validation",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-explicit", "sql": sql, "task_id": "plan-task"},
+        ),
+        planning_context=True,
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    assert [spec.capability_id for spec in compilation.task_specs] == [
+        "db.query.plan.validate",
+        "db.sql.validate",
+        "db.sql.execute_read",
+    ]
+    plan_validation, validation, read = compilation.task_specs
+    assert plan_validation.input == {
+        "plan_evidence_id": "plan-explicit",
+        "planning_context_evidence_id": "planning-context",
+    }
+    assert validation.input == {"sql": sql, "operation": "query"}
+    assert validation.dependencies[0].evidence_kind == "query.plan.validation"
+    assert validation.dependencies[0].producer_task_id == plan_validation.task_id
+    assert "sql_ref" not in read.input
+    assert read.input["plan_evidence_id"] == "plan-explicit"
+    assert read.input["sql_validation_task_id"] == validation.task_id
+    sql_dependency = next(
+        dependency
+        for dependency in read.dependencies
+        if dependency.evidence_kind == "sql.validation"
+    )
+    assert sql_dependency.producer_task_id == validation.task_id
+
+
+async def test_explicit_write_execute_mode_overrides_planner_data_query_intent():
+    action = DbPlannerAction(
+        action_id="write",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_WRITE,
+        input={"owner": "phase_two", "sql": "update orders set status = 'approved'"},
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-write-mode-contract",
+        action,
+        explicit_mode="write.execute",
+        max_access="write",
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    assert compilation.compiled_contract_snapshot["operation_type"] == "write.execute"
+    assert compilation.compiled_contract_snapshot["access"] == "write"
+    assert (
+        compilation.compiled_contract_snapshot["metadata"]["planner_intent"][
+            "operation_type"
+        ]
+        == "write.execute"
+    )
+    assert (
+        compilation.compiled_contract_snapshot["metadata"]["planner_raw_intent"][
+            "operation_type"
+        ]
+        == "data.query"
+    )
+
+
+async def test_approval_state_uses_requested_policy_id():
+    runtime, operation = await _runtime_and_operation("phase-two-approval-state")
+    approval = ApprovalRequest(
+        approval_id="approval-1",
+        operation_id=operation.id,
+        reason="Approve write execution.",
+        risk=RiskLevel.HIGH,
+        requested_by_policy_id="approval_required_for_writes",
+        proposed_action={"approval": "human"},
+        status=ApprovalStatus.PENDING,
+    )
+    await runtime.store.save_approval_request(approval)
+
+    state = await DbAgentLoop(runtime, FakePlanner())._approval_state(operation.id)
+
+    assert state["requests"] == [
+        {
+            "approval_id": "approval-1",
+            "status": "pending",
+            "policy_id": "approval_required_for_writes",
+            "task_id": None,
+        }
+    ]
+
+
+async def test_latest_accepted_query_plan_ref_ignores_rejected_plan_evidence():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-rejected-ignored",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-accepted", "sql": "select 1 as answer"},
+            {
+                "evidence_id": "plan-rejected",
+                "sql": "select 999 as answer",
+                "accepted": False,
+            },
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-accepted"
+
+
+async def test_latest_accepted_query_plan_ref_ignores_rejected_invalid_plan_evidence():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-invalid-plan-ignored",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-accepted", "sql": "select 1 as answer"},
+            {
+                "evidence_id": "plan-invalid",
+                "sql": "select 999 as answer",
+                "valid": False,
+                "accepted": False,
+            },
+            {
+                "evidence_id": "plan-rejected",
+                "sql": "select 888 as answer",
+                "accepted": False,
+            },
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-accepted"
+
+
+async def test_latest_accepted_query_plan_ref_ignores_rejected_plan_without_sql():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "query_plan_ref": "latest_accepted_query_plan",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-latest-plan-skips-nosql",
+        action,
+        plan_evidence=(
+            {"evidence_id": "plan-with-sql", "sql": "select 1 as answer"},
+            {"evidence_id": "plan-without-sql", "sql": None, "accepted": False},
+        ),
+    )
+
+    assert compilation.rejected_action_summaries == ()
+    validation = compilation.task_specs[0]
+    assert validation.input["sql"] == "select 1 as answer"
+    assert validation.dependencies[0].evidence_id == "plan-with-sql"
+
+
+async def test_rejected_plan_evidence_id_is_rejected_clearly():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two", "plan_evidence_id": "plan-rejected"},
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-rejected-explicit",
+        action,
+        plan_evidence=(
+            {
+                "evidence_id": "plan-rejected",
+                "sql": "select 999 as answer",
+                "accepted": False,
+            },
+        ),
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "rejected_plan_evidence:plan-rejected"
+    )
+
+
+async def test_ambiguous_sql_inputs_are_rejected_clearly():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "sql": "select 1 as answer",
+            "plan_evidence_id": "plan-explicit",
+        },
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-ambiguous-sql-input",
+        action,
+        plan_evidence=({"evidence_id": "plan-explicit", "sql": "select 2 as answer"},),
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == ("ambiguous_sql_input")
+
+
+async def test_ambiguous_plan_evidence_id_is_rejected_clearly():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two", "plan_evidence_id": "plan-ambiguous"},
+    )
+    runtime, operation = await _runtime_and_operation("phase-four-ambiguous-plan")
+    state = DbLoopState(
+        operation_id=operation.id,
+        normalized_user_request={"prompt": "phase four"},
+        safety_frame={"max_access": "read"},
+        available_action_kinds=tuple(DbPlannerActionKind),
+        accepted_evidence_summaries=(
+            {
+                "id": "plan-ambiguous",
+                "kind": "query.plan.proposal",
+                "owner": "phase_two",
+                "accepted": True,
+                "sql": "select 1 as answer",
+            },
+            {
+                "id": "plan-ambiguous",
+                "kind": "query.plan.proposal",
+                "owner": "phase_two",
+                "accepted": True,
+                "sql": "select 2 as answer",
+            },
+        ),
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=(action,),
+    )
+
+    compilation = DbAgentLoop(runtime, FakePlanner()).compile_actions(
+        decision,
+        state,
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "ambiguous_plan_evidence:plan-ambiguous"
+    )
+
+
+async def test_invalid_sql_reference_inputs_are_rejected_clearly():
+    cases = (
+        (
+            "missing-plan-id",
+            {"owner": "phase_two", "plan_evidence_id": ""},
+            (),
+            "missing_plan_evidence_id",
+        ),
+        (
+            "unsupported-ref",
+            {"owner": "phase_two", "query_plan_ref": "latest_sql"},
+            (),
+            "unsupported_query_plan_ref:latest_sql",
+        ),
+        (
+            "rejected-plan-without-sql",
+            {"owner": "phase_two", "plan_evidence_id": "plan-nosql"},
+            ({"evidence_id": "plan-nosql", "sql": None, "accepted": False},),
+            "rejected_plan_evidence:plan-nosql",
+        ),
+    )
+    for suffix, action_input, plan_evidence, expected_error in cases:
+        action = DbPlannerAction(
+            action_id="read",
+            kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+            input=action_input,
+        )
+
+        compilation, _, _ = await _compile_single_action(
+            f"phase-four-{suffix}",
+            action,
+            plan_evidence=plan_evidence,
+        )
+
+        assert compilation.task_specs == ()
+        assert compilation.rejected_action_summaries[0]["error"] == expected_error
+
+
+async def test_prior_turn_depends_on_with_unsupported_ref_remains_missing_dependency_error():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={
+            "owner": "phase_two",
+            "query_plan_ref": "latest_sql",
+        },
+        depends_on=("prior_turn_plan",),
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-prior-depends-on",
+        action,
+        plan_evidence=({"evidence_id": "plan-accepted", "sql": "select 1 as answer"},),
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "missing_dependency:prior_turn_plan"
+    )
+
+
+async def test_missing_sql_no_longer_falls_back_to_latest_plan_silently():
+    action = DbPlannerAction(
+        action_id="read",
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"owner": "phase_two"},
+    )
+
+    compilation, _, _ = await _compile_single_action(
+        "phase-four-missing-sql",
+        action,
+        plan_evidence=({"evidence_id": "plan-accepted", "sql": "select 1 as answer"},),
+    )
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == "missing_sql"
+
+
+async def test_validation_grounding_repair_targets_only_validation_column():
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+        ),
+        plugins=(catalog, sqlite),
+    )
+    await runtime.setup(agent_id="agent-phase-two")
+    try:
+        operation = await runtime.kernel.create_operation(
+            operation_type="data.query",
+            request={
+                "prompt": "Repair the draft SQL using validation facts.",
+                "source_scope": ["sqlite"],
+            },
+            metadata={"safety_frame": {"max_access": "read"}},
+            evaluate_governance=False,
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="schema-targeted-repair",
+                kind="schema.asset_profile",
+                owner="sqlite",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "database_type": "sqlite",
+                    "tables": [
+                        {
+                            "name": "orders",
+                            "columns": [
+                                {"name": "id", "data_type": "INTEGER"},
+                                {"name": "status", "data_type": "TEXT"},
+                                {"name": "channel", "data_type": "TEXT"},
+                            ],
+                        },
+                        {
+                            "name": "customers",
+                            "columns": [
+                                {"name": "id", "data_type": "INTEGER"},
+                                {"name": "status", "data_type": "TEXT"},
+                            ],
+                        },
+                    ],
+                },
+            )
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="validation-unobserved-status",
+                kind="sql.validation",
+                owner="sqlite",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "valid": False,
+                    "sql": (
+                        "SELECT COUNT(*) FROM orders "
+                        "WHERE orders.status = 'completed'"
+                    ),
+                    "operation": "query",
+                    "warnings": [
+                        {
+                            "kind": "unobserved_filter_literal",
+                            "table": "orders",
+                            "column": "status",
+                            "literal": "completed",
+                            "candidates": ["complete", "pending"],
+                        }
+                    ],
+                    "validation_facts": [
+                        {
+                            "kind": "unobserved_filter_literal",
+                            "table": "orders",
+                            "column": "status",
+                            "literal": "completed",
+                            "candidates": ["complete", "pending"],
+                        }
+                    ],
+                },
+            )
+        )
+        loop = DbAgentLoop(runtime, object())
+        state = await loop.build_loop_state(
+            operation,
+            safety_frame={"max_access": "read"},
+            turn=1,
+            remaining_turns=1,
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "data.query"},
+            actions=(
+                DbPlannerAction(
+                    action_id="context",
+                    kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+                    input={"source_owner": "sqlite"},
+                ),
+            ),
+        )
+
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    grounding_specs = [
+        spec
+        for spec in compilation.task_specs
+        if spec.capability_id
+        in {
+            "catalog.value_grounding.plan",
+            "catalog.column_value_hints.resolve",
+        }
+    ]
+    assert grounding_specs
+    targets = {
+        (target["table"], target["column"])
+        for spec in grounding_specs
+        for target in _phase0_value_grounding_targets(spec.input)
+    }
+    assert ("orders", "status") in targets
+    assert ("orders", "channel") not in targets
+    assert ("customers", "status") not in targets
+
+
+async def test_agent_loop_rejects_action_outside_contract_before_task_creation():
+    runtime, operation = await _runtime_and_operation("phase-two-reject")
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "db.run"},
+        actions=(
+            DbPlannerAction(
+                action_id="write",
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_WRITE,
+                input={
+                    "owner": "phase_two",
+                    "sql": "update orders set status = 'paid'",
+                },
+            ),
+        ),
+    )
+
+    result = await DbAgentLoop(runtime, FakePlanner(decision)).run(
+        operation,
+        safety_frame={"max_access": "read"},
+        max_turns=1,
+    )
+
+    assert result.status == "budget_exhausted"
+    assert await runtime.store.list_tasks(operation.id) == []
+    compilation = next(
+        item
+        for item in await runtime.store.list_evidence(operation.id)
+        if item.kind == "planner.compilation"
+    )
+    rejected = compilation.payload["compilation"]["rejected_action_summaries"]
+    assert rejected
+    assert rejected[0]["error"].startswith("access_outside_contract")
+    observation = next(
+        item
+        for item in await runtime.store.list_evidence(operation.id)
+        if item.kind == "planner.observation"
+    )
+    assert observation.payload["observation"]["diagnostics"]["status"] == (
+        "compilation_rejected"
+    )
+
+
+async def test_llm_agent_planner_emits_typed_decision_from_mocked_response():
+    content = json.dumps(_llm_planner_payload())
+    service = FakeLLMService(content)
+    state = _loop_state()
+
+    decision = await DbLLMAgentPlanner(service).plan(state)
+
+    assert decision.status is DbPlannerDecisionStatus.CONTINUE
+    assert decision.actions[0].kind is DbPlannerActionKind.EXECUTE_VALIDATED_READ
+    assert decision.metadata["planner"] == "fake"
+    assert decision.metadata["llm"]["model"] == "phase-two"
+    assert service.messages is not None
+    request_payload = json.loads(service.messages[-1]["content"])
+    assert request_payload["state"]["operation_id"] == "op-loop"
+
+
+async def test_llm_agent_planner_parses_fenced_json_at_boundary():
+    content = f"```json\n{json.dumps(_llm_planner_payload())}\n```"
+
+    decision = await DbLLMAgentPlanner(FakeLLMService(content)).plan(_loop_state())
+
+    assert decision.status is DbPlannerDecisionStatus.CONTINUE
+    diagnostics = decision.metadata["planner_json_normalization"]
+    assert any(
+        step["step"] == "json_fence_stripped"
+        for step in diagnostics["normalization_steps"]
+    )
+
+
+async def test_llm_agent_planner_unwraps_common_decision_envelopes():
+    for envelope_key in ("decision", "planner_decision", "DbPlannerDecision"):
+        content = json.dumps({envelope_key: _llm_planner_payload()})
+
+        decision = await DbLLMAgentPlanner(FakeLLMService(content)).plan(_loop_state())
+
+        assert decision.status is DbPlannerDecisionStatus.CONTINUE
+        diagnostics = decision.metadata["planner_json_normalization"]
+        assert diagnostics["unwrapped_envelope"] == envelope_key
+
+
+async def test_llm_agent_planner_normalizes_unknown_keys_and_tuple_fields():
+    payload = _llm_planner_payload(
+        stop_conditions={"name": "verified"},
+        unexpected_decision_key="drop me",
+    )
+    payload["actions"][0]["depends_on"] = [{"action_id": "schema"}]
+    payload["actions"][0]["unexpected_action_key"] = "drop me too"
+    content = json.dumps({"planner_decision": payload, "wrapper_note": "ignored"})
+
+    decision = await DbLLMAgentPlanner(FakeLLMService(content)).plan(_loop_state())
+
+    assert decision.status is DbPlannerDecisionStatus.CONTINUE
+    assert decision.actions[0].depends_on == ("schema",)
+    assert decision.stop_conditions == ("verified",)
+    assert decision.metadata["planner"] == "fake"
+
+    diagnostics = decision.metadata["planner_json_normalization"]
+    assert diagnostics["dropped_envelope_keys"] == ["wrapper_note"]
+    assert "unexpected_decision_key" in diagnostics["dropped_decision_keys"]
+    assert diagnostics["dropped_action_keys"] == [
+        {
+            "index": 0,
+            "action_id": "read",
+            "keys": ["unexpected_action_key"],
+        }
+    ]
+    assert {item["path"] for item in diagnostics["coerced_fields"]} == {
+        "actions[0].depends_on",
+        "stop_conditions",
+    }
+
+
+async def test_llm_agent_planner_rejects_invalid_action_kind_without_tasks():
+    content = json.dumps(
+        {
+            "status": "continue",
+            "intent": {"operation_type": "db.run"},
+            "actions": [
+                {
+                    "action_id": "bad",
+                    "kind": "made_up_action",
+                    "input": {"owner": "phase_two"},
+                    "depends_on": [],
+                    "rationale": "Invalid action should not compile.",
+                    "metadata": {},
+                }
+            ],
+            "stop_conditions": [],
+            "clarification_question": None,
+            "rationale": "Malformed planner action.",
+            "metadata": {},
+        }
+    )
+    planner = DbLLMAgentPlanner(FakeLLMService(content))
+
+    decision = await planner.plan(_loop_state())
+
+    assert decision.status is DbPlannerDecisionStatus.FAILED
+    assert decision.actions == ()
+    assert decision.metadata["failure"] == "planner_decision_invalid"
+
+    runtime, operation = await _runtime_and_operation("phase-two-invalid-action")
+    result = await DbAgentLoop(runtime, planner).run(operation, max_turns=1)
+
+    assert result.status == "failed"
+    assert await runtime.store.list_tasks(operation.id) == []
+    decision_evidence = next(
+        item
+        for item in await runtime.store.list_evidence(operation.id)
+        if item.kind == "planner.decision"
+    )
+    persisted = decision_evidence.payload["decision"]
+    assert persisted["actions"] == []
+    assert persisted["metadata"]["failure"] == "planner_decision_invalid"
+
+
+async def test_missing_db_llm_configuration_returns_no_planner_actions():
+    decision = await DbLLMAgentPlanner(DbLLMService(None)).plan(_loop_state())
+
+    assert decision.status is DbPlannerDecisionStatus.FAILED
+    assert decision.actions == ()
+    assert decision.metadata["configuration_required"] is True
+
+    runtime, operation = await _runtime_and_operation("phase-two-missing-llm")
+    result = await DbAgentLoop(runtime, DbLLMAgentPlanner(DbLLMService(None))).run(
+        operation,
+        max_turns=1,
+    )
+
+    assert result.status == "configuration_required"
+    assert await runtime.store.list_tasks(operation.id) == []
+    decision_evidence = next(
+        item
+        for item in await runtime.store.list_evidence(operation.id)
+        if item.kind == "planner.decision"
+    )
+    persisted = decision_evidence.payload["decision"]
+    assert persisted["actions"] == []
+    assert persisted["metadata"]["configuration_required"] is True
+
+
+async def _runtime_and_operation(
+    operation_id,
+    *,
+    mode=None,
+    db_llm_service=None,
+    required_evidence=frozenset(),
+):
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(plugins=(PhaseTwoPlugin(),)),
+        runtime_id="phase-two-runtime",
+        db_llm_service=db_llm_service,
+    )
+    await runtime.setup(agent_id="agent-phase-two")
+    operation = await runtime.kernel.create_operation(
+        operation_id=operation_id,
+        operation_type="db.run",
+        request={
+            "prompt": "phase two",
+            "source_scope": ["orders"],
+            **({"mode": mode} if mode else {}),
+        },
+        required_evidence=frozenset(required_evidence),
+        metadata=({"mode": mode} if mode else {}),
+        evaluate_governance=False,
+    )
+    return runtime, operation
+
+
+async def _catalog_runtime_and_operation(operation_id):
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "store:sqlite",
+                }
+            },
+            plugins=(CatalogPlugin(auto_persist=False), SQLitePlugin(path=":memory:")),
+        ),
+        runtime_id="phase-two-catalog-runtime",
+        db_llm_service=FakeLLMService(json.dumps({"operation": "read"})),
+    )
+    await runtime.setup(agent_id="agent-phase-two")
+    operation = await runtime.kernel.create_operation(
+        operation_id=operation_id,
+        operation_type="data.query",
+        request={
+            "prompt": "phase two catalog",
+            "source_scope": ["sqlite"],
+        },
+        required_evidence=frozenset(),
+        metadata={
+            "source_scope": ["sqlite"],
+            "safety_frame": {"max_access": "read"},
+        },
+        evaluate_governance=False,
+    )
+    return runtime, operation
+
+
+async def _repair_runtime_and_operation(
+    operation_id,
+    content,
+    *,
+    prior_sql=None,
+    failure_payload=None,
+):
+    prior_sql = prior_sql or "select 0 as answer"
+    runtime, operation = await _runtime_and_operation(
+        operation_id,
+        db_llm_service=FakeLLMService(content),
+    )
+    await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+    await runtime.store.save_evidence(
+        Evidence(
+            id="prior-plan",
+            kind="query.plan.proposal",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=True,
+            payload={
+                "valid": True,
+                "sql": prior_sql,
+                "structured_plan": {"selected_sql": prior_sql},
+            },
+        )
+    )
+    await runtime.store.save_evidence(
+        Evidence(
+            id="failure-validation",
+            kind="query.plan.validation",
+            owner="db_runtime",
+            operation_id=operation.id,
+            accepted=False,
+            payload=failure_payload
+            or {"valid": False, "errors": ["validation failed"]},
+        )
+    )
+    return runtime, operation
+
+
+def _llm_task(operation, *, capability_id, executor_id, task_input):
+    return Task(
+        id=f"task-{capability_id.replace('.', '-')}",
+        operation_id=operation.id,
+        capability_id=capability_id,
+        executor_id=executor_id,
+        input=task_input,
+    )
+
+
+def _planner_decision(*actions):
+    return DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=actions,
+    )
+
+
+def _same_turn_repair_execute_decision():
+    return _planner_decision(
+        DbPlannerAction(
+            action_id="repair_plan",
+            kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+            input={"owner": "db_runtime"},
+            depends_on=("failed_plan_validation",),
+        ),
+        DbPlannerAction(
+            action_id="execute_repair",
+            kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+            input={
+                "owner": "phase_two",
+                "query_plan_ref": "latest_accepted_query_plan",
+            },
+            depends_on=("repair_plan",),
+        ),
+    )
+
+
+async def _compile_single_action(
+    operation_id,
+    action,
+    *,
+    plan_evidence=(),
+    query_plan_validation_evidence=(),
+    sql_validation_evidence=(),
+    memory_proposal_evidence=(),
+    planning_context=False,
+    db_llm_service=None,
+    explicit_mode=None,
+    max_access="read",
+):
+    runtime, operation = await _runtime_and_operation(
+        operation_id,
+        mode=explicit_mode,
+        db_llm_service=db_llm_service,
+    )
+    for item in plan_evidence:
+        await runtime.store.save_evidence(
+            _query_plan_evidence(operation.id, **dict(item))
+        )
+    for item in query_plan_validation_evidence:
+        await runtime.store.save_evidence(
+            _query_plan_validation_evidence(operation.id, **dict(item))
+        )
+    for item in sql_validation_evidence:
+        await runtime.store.save_evidence(
+            _sql_validation_evidence(operation.id, **dict(item))
+        )
+    for item in memory_proposal_evidence:
+        await runtime.store.save_evidence(
+            _memory_proposal_evidence(operation.id, **dict(item))
+        )
+    if planning_context:
+        await runtime.store.save_evidence(_planning_context_evidence(operation.id))
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": max_access},
+        turn=1,
+        remaining_turns=1,
+    )
+    assert_no_invalid_accepted_query_plans(
+        await runtime.store.list_evidence(operation.id)
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=(action,),
+    )
+    return loop.compile_actions(decision, state), runtime, operation
+
+
+async def _compile_action_for_runtime(runtime, operation, action, *, max_access="read"):
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(
+        operation,
+        safety_frame={"max_access": max_access},
+        turn=1,
+        remaining_turns=1,
+    )
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=(action,),
+    )
+    compilation = loop.compile_actions(decision, state)
+    assert compilation.rejected_action_summaries == ()
+    return compilation
+
+
+def _query_plan_evidence(
+    operation_id,
+    *,
+    evidence_id,
+    sql,
+    accepted=True,
+    valid=None,
+    task_id=None,
+):
+    payload = {"valid": bool(sql) if valid is None else valid}
+    if sql is not None:
+        payload["sql"] = sql
+    return Evidence(
+        id=evidence_id,
+        kind="query.plan.proposal",
+        owner="phase_two",
+        operation_id=operation_id,
+        task_id=task_id or f"task-{evidence_id}",
+        accepted=accepted,
+        payload=payload,
+        metadata={"payload_fingerprint": f"fp-{evidence_id}"},
+    )
+
+
+def _query_plan_validation_evidence(
+    operation_id,
+    *,
+    evidence_id,
+    plan_evidence_id="plan-accepted",
+    valid=False,
+    accepted=False,
+    task_id=None,
+    validation_facts=True,
+):
+    payload = {
+        "valid": valid,
+        "plan_evidence_id": plan_evidence_id,
+    }
+    if validation_facts:
+        payload["errors"] = [
+            "filter_literal_requires_grounding:orders.status=completed"
+        ]
+        payload["validation_facts"] = [
+            {
+                "kind": "filter_literal_requires_grounding",
+                "table": "orders",
+                "column": "status",
+                "operator": "=",
+                "literal": "completed",
+                "source": "query.plan.validation",
+            }
+        ]
+    return Evidence(
+        id=evidence_id,
+        kind="query.plan.validation",
+        owner="db_runtime",
+        operation_id=operation_id,
+        task_id=task_id or f"task-{evidence_id}",
+        accepted=accepted,
+        payload=payload,
+        metadata={"payload_fingerprint": f"fp-{evidence_id}"},
+    )
+
+
+def _sql_validation_evidence(
+    operation_id,
+    *,
+    evidence_id,
+    sql,
+    operation="query",
+    valid=True,
+    accepted=True,
+    task_id=None,
+):
+    return Evidence(
+        id=evidence_id,
+        kind="sql.validation",
+        owner="phase_two",
+        operation_id=operation_id,
+        task_id=task_id or f"task-{evidence_id}",
+        accepted=accepted,
+        payload={"valid": valid, "sql": sql, "operation": operation},
+        metadata={"payload_fingerprint": f"fp-{evidence_id}"},
+    )
+
+
+def _memory_proposal_evidence(
+    operation_id,
+    *,
+    evidence_id,
+    accepted=True,
+    task_id=None,
+    proposal_fingerprint=None,
+):
+    proposal_fingerprint = proposal_fingerprint or f"proposal-fp-{evidence_id}"
+    return Evidence(
+        id=evidence_id,
+        kind="db.memory.proposal",
+        owner="db_runtime",
+        operation_id=operation_id,
+        task_id=task_id or f"task-{evidence_id}",
+        accepted=accepted,
+        payload={"proposal_fingerprint": proposal_fingerprint},
+        metadata={
+            "payload_fingerprint": f"payload-fp-{evidence_id}",
+            "proposal_fingerprint": proposal_fingerprint,
+        },
+    )
+
+
+def _memory_definition_evidence(
+    operation_id,
+    *,
+    evidence_id,
+    proposal_evidence_id,
+    proposal_fingerprint,
+):
+    return Evidence(
+        id=evidence_id,
+        kind="db.memory.definition",
+        owner="db_runtime",
+        operation_id=operation_id,
+        task_id=f"task-{evidence_id}",
+        accepted=True,
+        payload={
+            "proposal_evidence_id": proposal_evidence_id,
+            "proposal_fingerprint": proposal_fingerprint,
+            "committed": True,
+        },
+        metadata={
+            "proposal_evidence_id": proposal_evidence_id,
+            "proposal_fingerprint": proposal_fingerprint,
+        },
+    )
+
+
+def _planning_context_evidence(operation_id):
+    return Evidence(
+        id="planning-context",
+        kind="planning.context",
+        owner="db_runtime",
+        operation_id=operation_id,
+        accepted=True,
+        payload={
+            "schema": {
+                "database_type": "sqlite",
+                "tables": [{"name": "orders", "columns": [{"name": "status"}]}],
+            },
+            "column_value_hints": [],
+        },
+        metadata={"payload_fingerprint": "fp-planning-context"},
+    )
+
+
+def _phase0_value_grounding_targets(task_input):
+    targets = []
+    for key in ("targets", "profile_pairs"):
+        for item in task_input.get(key) or []:
+            if isinstance(item, dict) and item.get("table") and item.get("column"):
+                targets.append({"table": item["table"], "column": item["column"]})
+    for key in ("validation_facts", "warnings", "validation_warnings"):
+        for item in task_input.get(key) or []:
+            if isinstance(item, dict) and item.get("table") and item.get("column"):
+                targets.append({"table": item["table"], "column": item["column"]})
+    return targets
+
+
+def _loop_state():
+    return DbLoopState(
+        operation_id="op-loop",
+        normalized_user_request={"prompt": "show one row"},
+        safety_frame={"max_access": "read"},
+        available_action_kinds=tuple(DbPlannerActionKind),
+        capability_summaries=(
+            {
+                "id": "db.sql.execute_read",
+                "owner": "phase_two",
+                "access": "read",
+            },
+        ),
+        runtime_limits={"max_tasks": 3},
+        remaining_budget={"planner_turns": 1},
+    )
+
+
+def _llm_planner_payload(**overrides):
+    payload = {
+        "status": "continue",
+        "intent": {"operation_type": "db.run"},
+        "actions": [
+            {
+                "action_id": "read",
+                "kind": "execute_validated_read",
+                "input": {"owner": "phase_two", "sql": "select 1"},
+                "depends_on": [],
+                "rationale": "Need one row.",
+                "metadata": {"source": "test"},
+            }
+        ],
+        "stop_conditions": ["verified"],
+        "clarification_question": None,
+        "rationale": "Read from the database.",
+        "metadata": {"planner": "fake"},
+    }
+    payload.update(overrides)
+    return payload

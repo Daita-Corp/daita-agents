@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from .kernel import (
@@ -120,24 +120,24 @@ class WorkerRuntime:
             reason=reason,
             metadata=dict(metadata or {}),
         )
-        await self.store.append_event(
-            self._event(
-                RuntimeEventType.WORKER_HANDOFF,
-                operation=operation,
-                task=task,
-                capability=capability,
-                message=(
-                    f"Task {task.id} handed off to worker "
-                    f"{self.worker.owner}:{self.worker.id}."
-                ),
-                payload={
-                    "handoff": {
-                        "reason": handoff.reason,
-                        "metadata": handoff.metadata,
-                    },
-                    "worker": self.worker.to_dict(),
+        await self.kernel.append_event(
+            RuntimeEventType.WORKER_HANDOFF,
+            operation_id=operation.id,
+            task=task,
+            capability=capability,
+            message=(
+                f"Task {task.id} handed off to worker "
+                f"{self.worker.owner}:{self.worker.id}."
+            ),
+            payload={
+                "handoff": {
+                    "reason": handoff.reason,
+                    "metadata": handoff.metadata,
                 },
-            )
+                "worker": self.worker.to_dict(),
+            },
+            trace_id=_latest_trace_id(operation, task),
+            span_id=_latest_span_id(operation, task),
         )
         return handoff
 
@@ -164,9 +164,9 @@ class WorkerRuntime:
                 worker_id=self.worker.id,
                 worker_owner=self.worker.owner,
             )
-            claim_event = self._event(
+            claim_event = await self.kernel.append_event(
                 RuntimeEventType.WORKER_LEASE_CLAIMED,
-                operation=operation,
+                operation_id=operation.id,
                 task=task,
                 capability=capability,
                 message=(
@@ -179,8 +179,9 @@ class WorkerRuntime:
                     "lease_expires_at": lease.lease_expires_at,
                     "attempt_count": lease.attempt_count,
                 },
+                trace_id=_latest_trace_id(operation, task),
+                span_id=_latest_span_id(operation, task),
             )
-            await self.store.append_event(claim_event)
             execution = await self.kernel.execute_claimed_task(
                 lease,
                 context={
@@ -189,9 +190,9 @@ class WorkerRuntime:
                     **dict(context or {}),
                 },
             )
-            completed_event = self._event(
+            completed_event = await self.kernel.append_event(
                 RuntimeEventType.WORKER_COMPLETED,
-                operation=execution.operation,
+                operation_id=execution.operation.id,
                 task=execution.task,
                 capability=execution.capability,
                 message=(
@@ -204,8 +205,9 @@ class WorkerRuntime:
                         item.id for item in execution.evidence if item.id is not None
                     ],
                 },
+                trace_id=_latest_trace_id(execution.operation, execution.task),
+                span_id=_latest_span_id(execution.operation, execution.task),
             )
-            await self.store.append_event(completed_event)
             await reconcile_operation_status(self.kernel, execution.operation.id)
             return WorkerRunResult(
                 handoff=handoff,
@@ -225,9 +227,9 @@ class WorkerRuntime:
             current_task = result.task if result is not None else task
             current_operation = result.operation if result is not None else operation
             current_capability = result.capability if result is not None else capability
-            failed_event = self._event(
+            failed_event = await self.kernel.append_event(
                 _worker_failure_type(exc),
-                operation=current_operation,
+                operation_id=current_operation.id,
                 task=current_task,
                 capability=current_capability,
                 message=(
@@ -235,8 +237,9 @@ class WorkerRuntime:
                     f"complete task {task.id}."
                 ),
                 payload={"error": {"type": type(exc).__name__, "message": str(exc)}},
+                trace_id=_latest_trace_id(current_operation, current_task),
+                span_id=_latest_span_id(current_operation, current_task),
             )
-            await self.store.append_event(failed_event)
             return WorkerRunResult(
                 handoff=handoff,
                 execution=result,
@@ -257,21 +260,21 @@ class WorkerRuntime:
             else None
         )
         if task is not None and operation is not None:
-            await self.store.append_event(
-                self._event(
-                    RuntimeEventType.WORKER_HEARTBEAT,
-                    operation=operation,
-                    task=task,
-                    capability=self._capability_for_task(task),
-                    message=(
-                        f"Worker {self.worker.owner}:{self.worker.id} "
-                        f"heartbeat for task {task.id}."
-                    ),
-                    payload={
-                        "lease_id": updated.lease_id,
-                        "lease_expires_at": updated.lease_expires_at,
-                    },
-                )
+            await self.kernel.append_event(
+                RuntimeEventType.WORKER_HEARTBEAT,
+                operation_id=operation.id,
+                task=task,
+                capability=self._capability_for_task(task),
+                message=(
+                    f"Worker {self.worker.owner}:{self.worker.id} "
+                    f"heartbeat for task {task.id}."
+                ),
+                payload={
+                    "lease_id": updated.lease_id,
+                    "lease_expires_at": updated.lease_expires_at,
+                },
+                trace_id=_latest_trace_id(operation, task),
+                span_id=_latest_span_id(operation, task),
             )
         return updated
 
@@ -367,31 +370,6 @@ class WorkerRuntime:
             return
         for operation in await list_operations():
             await self.kernel.recover_expired_task_claims(operation.id)
-
-    def _event(
-        self,
-        type: RuntimeEventType,
-        *,
-        operation: Operation,
-        task: Task,
-        capability: Capability,
-        message: str,
-        payload: Mapping[str, Any] | None = None,
-    ) -> RuntimeEvent:
-        return RuntimeEvent(
-            type=type,
-            runtime_id=self.kernel.runtime_id,
-            runtime_kind=self.kernel.runtime_kind,
-            operation_id=operation.id,
-            task_id=task.id,
-            capability_id=capability.id,
-            executor_id=capability.executor,
-            plugin_id=capability.owner,
-            trace_id=_latest_trace_id(operation, task),
-            span_id=_latest_span_id(operation, task),
-            message=message,
-            payload=dict(payload or {}),
-        )
 
 
 def _worker_failure_type(exc: RuntimeKernelExecutionError) -> RuntimeEventType:

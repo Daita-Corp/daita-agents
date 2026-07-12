@@ -12,8 +12,7 @@ import logging
 import os
 import threading
 import urllib.request
-import urllib.error
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.sdk.trace import ReadableSpan
@@ -243,7 +242,7 @@ class DaitaSpanExporter(SpanExporter):
             or os.getenv("DAITA_ORG_ID")
         )
         api_key_id = self._api_key_id or os.getenv("DAITA_API_KEY_ID")
-        payload = {"spans": span_dicts}
+        payload: Dict[str, Any] = {"spans": span_dicts}
         if organization_id:
             payload["organization_id"] = organization_id
         if api_key_id:

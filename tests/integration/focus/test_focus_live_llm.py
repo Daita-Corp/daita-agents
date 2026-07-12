@@ -377,7 +377,7 @@ def _make_agent(tool: LocalTool, focus: str | None = None) -> Agent:
 @pytest.mark.requires_llm
 class TestFocusWithLiveOpenAI:
 
-    async def test_order_summary_without_focus(self, capsys):
+    async def test_order_summary_without_focus(self):
         """
         Baseline: agent receives full order records (emails, billing addresses,
         timestamps, etc.) and answers a revenue question.
@@ -403,7 +403,7 @@ class TestFocusWithLiveOpenAI:
         assert "647" in result["result"] or "647.00" in result["result"]
         assert "1" in result["result"] or "pending" in result["result"].lower()
 
-    async def test_order_summary_with_focus(self, capsys):
+    async def test_order_summary_with_focus(self):
         """
         Same question, same tool — but focus strips billing addresses, emails,
         timestamps, payment methods, and notes before the LLM sees the data.
@@ -431,7 +431,7 @@ class TestFocusWithLiveOpenAI:
         assert "647" in result["result"] or "647.00" in result["result"]
         assert "1" in result["result"] or "pending" in result["result"].lower()
 
-    async def test_focus_reduces_tokens(self, capsys):
+    async def test_focus_reduces_tokens(self):
         """
         Run both focused and unfocused versions and assert that focus
         measurably reduces the token count reported by the API.
@@ -478,7 +478,7 @@ class TestFocusWithLiveOpenAI:
             f"focused={tokens_focused}, unfocused={tokens_no_focus}"
         )
 
-    async def test_error_log_diagnosis(self, capsys):
+    async def test_error_log_diagnosis(self):
         """
         Agent is given noisy mixed-level logs. Focus strips INFO/WARN and
         irrelevant fields. The LLM should correctly identify 3 errors and
@@ -508,7 +508,7 @@ class TestFocusWithLiveOpenAI:
         assert "billing" in answer or "payment" in answer
         assert "search" in answer or "unavailable" in answer or "503" in answer
 
-    async def test_fraud_signal_extraction(self, capsys):
+    async def test_fraud_signal_extraction(self):
         """
         Agent reviews transaction data with focus filtering flagged=True records
         and stripping device fingerprints, IPs, and card_present fields.
@@ -537,7 +537,7 @@ class TestFocusWithLiveOpenAI:
         assert "ACC-100" in answer
         assert "9851" in answer or "9,851" in answer or "9850" in answer
 
-    async def test_focused_vs_unfocused_answer_quality(self, capsys):
+    async def test_focused_vs_unfocused_answer_quality(self):
         """
         Side-by-side comparison of answer quality.
         The focused version should identify the correct highest-revenue product

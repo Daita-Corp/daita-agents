@@ -4,7 +4,7 @@ Evidence-driven final answer synthesis for DB runtime operations.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from difflib import get_close_matches
 import json
 import re
@@ -13,6 +13,7 @@ from typing import Any, Literal
 from daita.runtime import Evidence, Operation, Task
 
 from .context import DbContextRenderer
+from .json_normalization import strip_json_fence
 from .models import (
     DbIntent,
     DbIntentKind,
@@ -20,7 +21,6 @@ from .models import (
     DbRequest,
     db_optional_int,
 )
-from .query_planning import DbQueryPlanner
 from .session_context import db_session_context_from_request
 from .verification import DbVerificationResult
 
@@ -102,6 +102,62 @@ class SchemaAnswerScope:
         }
 
 
+@dataclass(frozen=True)
+class DbAnswerScalarFact:
+    """Scalar fact derived from accepted query result evidence."""
+
+    label: str
+    value: Any
+    aggregate_kind: str | None
+    source_evidence_id: str | None
+    source_evidence_kind: str = "query.result"
+    confidence: str = "high"
+    redacted: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "value": self.value,
+            "aggregate_kind": self.aggregate_kind,
+            "source_evidence_id": self.source_evidence_id,
+            "source_evidence_kind": self.source_evidence_kind,
+            "confidence": self.confidence,
+            "redacted": self.redacted,
+        }
+
+
+@dataclass(frozen=True)
+class DbAnswerFacts:
+    """Typed facts that final answer synthesis must preserve."""
+
+    result_shape: Literal["empty", "scalar", "record", "table"]
+    row_count: int
+    sampled_row_count: int
+    columns: tuple[str, ...]
+    scalars: tuple[DbAnswerScalarFact, ...] = ()
+    primary_scalar: DbAnswerScalarFact | None = None
+    truncated: bool = False
+    source_evidence_id: str | None = None
+    source_evidence_kind: str | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "result_shape": self.result_shape,
+            "row_count": self.row_count,
+            "sampled_row_count": self.sampled_row_count,
+            "columns": list(self.columns),
+            "scalars": [fact.to_dict() for fact in self.scalars],
+            "primary_scalar": (
+                self.primary_scalar.to_dict() if self.primary_scalar else None
+            ),
+            "truncated": self.truncated,
+            "source_evidence_id": self.source_evidence_id,
+            "source_evidence_kind": self.source_evidence_kind,
+            "diagnostics": self.diagnostics,
+        }
+
+
 class DbSynthesizer:
     """Create final answers only from accepted, verified evidence."""
 
@@ -122,6 +178,7 @@ class DbSynthesizer:
                 "cannot synthesize final answer before verification passes"
             )
 
+        answer_facts: DbAnswerFacts | None = None
         if intent.kind is DbIntentKind.SCHEMA_QUERY:
             scope = _schema_answer_scope(request, contract, evidence)
             answer = _append_db_memory_annotation(
@@ -139,7 +196,18 @@ class DbSynthesizer:
             DbIntentKind.CATALOG_ASSISTED_DATA_QUERY,
         }:
             scope = None
-            answer = _data_answer(evidence)
+            answer_facts = derive_answer_facts(
+                request=request,
+                intent=intent,
+                contract=contract,
+                evidence=evidence,
+            )
+            answer = _data_answer_from_facts(answer_facts)
+        elif _has_monitor_evidence(evidence) or contract.operation_type.startswith(
+            "monitor."
+        ):
+            scope = None
+            answer = _monitor_answer(evidence)
         else:
             scope = None
             answer = "The DB operation completed with verified evidence."
@@ -155,6 +223,8 @@ class DbSynthesizer:
         }
         if scope is not None:
             diagnostics["schema_answer_scope"] = scope.to_dict()
+        if answer_facts is not None:
+            diagnostics["answer_facts"] = answer_facts.to_dict()
         return DbSynthesisResult(
             answer=answer,
             evidence_refs=verification.evidence_refs,
@@ -172,11 +242,16 @@ def _schema_answer(scope: SchemaAnswerScope) -> str:
             if len(scope.requested_assets) == 1
             else ""
         )
-        matches = tuple(scope.diagnostics.get("closest_matches") or ())
+        closest_matches = scope.diagnostics.get("closest_matches")
+        matches = (
+            tuple(str(item) for item in closest_matches)
+            if isinstance(closest_matches, (list, tuple))
+            else ()
+        )
         if matches:
             return (
                 f"I could not find an exact table{requested}. "
-                f"Closest matches: {', '.join(str(item) for item in matches)}."
+                f"Closest matches: {', '.join(matches)}."
             )
         return (
             f"I could not find an exact table{requested}. "
@@ -274,7 +349,11 @@ def _schema_answer_scope(
     if asset_tables:
         return SchemaAnswerScope(
             mode="asset",
-            requested_assets=tuple(table.get("name") for table, _ in asset_tables),
+            requested_assets=tuple(
+                str(name)
+                for table, _ in asset_tables
+                if (name := table.get("name")) is not None
+            ),
             selected_tables=tuple(table for table, _ in asset_tables),
             evidence_refs=tuple(
                 dict.fromkeys(ref for _, refs in asset_tables for ref in refs if ref)
@@ -293,7 +372,7 @@ def _schema_answer_scope(
 
 
 def _schema_relationship_answer(evidence: tuple[Evidence, ...]) -> str:
-    relationship = next(
+    relationship: dict[str, Any] = next(
         (item.payload for item in evidence if item.kind == "schema.relationship_path"),
         {},
     )
@@ -478,12 +557,7 @@ def _requested_assets_from_prompt(
     )
     if explicit:
         return explicit
-    schema = {"tables": [entry[0] for entry in _all_table_entries(inventory)]}
-    planned = DbQueryPlanner.best_table_for_prompt(prompt, schema)
-    resolved = _resolve_table_name(planned or "", table_names)
-    if not resolved:
-        return ()
-    return (resolved,)
+    return ()
 
 
 def _tables_for_names(
@@ -646,17 +720,505 @@ def _schema_scope(evidence: Evidence) -> str | None:
 
 
 def _data_answer(evidence: tuple[Evidence, ...]) -> str:
+    return _data_answer_from_facts(derive_answer_facts(evidence=evidence))
+
+
+def derive_answer_facts(
+    *,
+    evidence: tuple[Evidence, ...],
+    request: DbRequest | None = None,
+    intent: DbIntent | None = None,
+    contract: DbOperationContract | None = None,
+) -> DbAnswerFacts:
+    """Derive typed answer facts from accepted result evidence."""
+    del request, intent, contract
+    accepted = tuple(item for item in evidence if item.accepted)
     query_result = next(
-        (item.payload for item in evidence if item.kind == "query.result"), None
+        (item for item in reversed(accepted) if item.kind == "query.result"), None
     )
     if query_result is None:
+        return DbAnswerFacts(
+            result_shape="empty",
+            row_count=0,
+            sampled_row_count=0,
+            columns=(),
+            diagnostics={"reason": "query_result_missing"},
+        )
+
+    raw_rows = query_result.payload.get("rows") or []
+    row_dicts = _row_dicts(raw_rows if isinstance(raw_rows, list) else [])
+    row_count = _safe_int(query_result.payload.get("total_rows"), len(row_dicts))
+    sampled_row_count = len(row_dicts)
+    truncated = bool(query_result.payload.get("truncated"))
+    columns = tuple(dict.fromkeys(column for row in row_dicts for column in row.keys()))
+    source_id = query_result.id
+
+    if not row_dicts:
+        return DbAnswerFacts(
+            result_shape="empty",
+            row_count=row_count,
+            sampled_row_count=sampled_row_count,
+            columns=columns,
+            truncated=truncated,
+            source_evidence_id=source_id,
+            source_evidence_kind=query_result.kind,
+        )
+
+    if sampled_row_count == 1:
+        row = row_dicts[0]
+        aggregate_kinds = _aggregate_kinds_by_column(accepted, tuple(row.keys()))
+        scalars = tuple(
+            _scalar_fact(
+                label=label,
+                value=value,
+                aggregate_kind=aggregate_kinds.get(_normalize_answer_label(label)),
+                source_evidence_id=source_id,
+                source_evidence_kind=query_result.kind,
+            )
+            for label, value in row.items()
+        )
+        result_shape: Literal["scalar", "record"] = (
+            "scalar" if len(row) == 1 else "record"
+        )
+        return DbAnswerFacts(
+            result_shape=result_shape,
+            row_count=row_count,
+            sampled_row_count=sampled_row_count,
+            columns=tuple(row.keys()),
+            scalars=scalars,
+            primary_scalar=scalars[0] if result_shape == "scalar" and scalars else None,
+            truncated=truncated,
+            source_evidence_id=source_id,
+            source_evidence_kind=query_result.kind,
+        )
+
+    return DbAnswerFacts(
+        result_shape="table",
+        row_count=row_count,
+        sampled_row_count=sampled_row_count,
+        columns=columns,
+        truncated=truncated,
+        source_evidence_id=source_id,
+        source_evidence_kind=query_result.kind,
+    )
+
+
+def _row_dicts(rows: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            out.append({str(key): value for key, value in row.items()})
+        else:
+            out.append({"value": row})
+    return out
+
+
+def _safe_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _scalar_fact(
+    *,
+    label: str,
+    value: Any,
+    aggregate_kind: str | None,
+    source_evidence_id: str | None,
+    source_evidence_kind: str,
+) -> DbAnswerScalarFact:
+    if aggregate_kind == "count":
+        redacted = False
+        rendered = value
+        truncated = False
+    else:
+        redacted, rendered, truncated = _redact_value(label, value)
+    return DbAnswerScalarFact(
+        label=label,
+        value=rendered,
+        aggregate_kind=aggregate_kind,
+        source_evidence_id=source_evidence_id,
+        source_evidence_kind=source_evidence_kind,
+        confidence="high",
+        redacted=bool(redacted or truncated),
+    )
+
+
+def _data_answer_from_facts(facts: DbAnswerFacts) -> str:
+    if facts.diagnostics.get("reason") == "query_result_missing":
         return "No query result was produced."
-    rows = query_result.get("rows", []) or []
-    if len(rows) == 1 and "count" in rows[0]:
-        return f"The count is {rows[0]['count']}."
-    if not rows:
+    if facts.result_shape == "empty":
         return "The query returned no rows."
-    return f"Returned {len(rows)} row{'s' if len(rows) != 1 else ''}."
+    if facts.primary_scalar is not None:
+        return _scalar_answer(facts.primary_scalar)
+    if facts.scalars:
+        return "; ".join(_scalar_clause(fact) for fact in facts.scalars) + "."
+    count = facts.row_count or facts.sampled_row_count
+    if facts.truncated and facts.sampled_row_count and count > facts.sampled_row_count:
+        return (
+            f"Returned {facts.sampled_row_count} of {count} rows; "
+            "additional rows were truncated."
+        )
+    return f"Returned {count} row{'s' if count != 1 else ''}."
+
+
+def _scalar_answer(fact: DbAnswerScalarFact) -> str:
+    if (
+        fact.aggregate_kind == "count"
+        and _normalize_answer_label(fact.label) == "count"
+    ):
+        return f"The count is {_format_answer_value(fact.value)}."
+    return f"{fact.label} is {_format_answer_value(fact.value)}."
+
+
+def _scalar_clause(fact: DbAnswerScalarFact) -> str:
+    return f"{fact.label} is {_format_answer_value(fact.value)}"
+
+
+def _format_answer_value(value: Any) -> str:
+    return str(value)
+
+
+def _answer_facts_from_mapping(value: Any) -> DbAnswerFacts | None:
+    if not isinstance(value, dict):
+        return None
+    scalars = tuple(
+        _scalar_fact_from_mapping(item)
+        for item in value.get("scalars") or ()
+        if isinstance(item, dict)
+    )
+    primary = (
+        _scalar_fact_from_mapping(value.get("primary_scalar"))
+        if isinstance(value.get("primary_scalar"), dict)
+        else None
+    )
+    if primary is None and value.get("result_shape") == "scalar" and scalars:
+        primary = scalars[0]
+    raw_result_shape = value.get("result_shape")
+    if raw_result_shape == "scalar":
+        result_shape: Literal["empty", "scalar", "record", "table"] = "scalar"
+    elif raw_result_shape == "record":
+        result_shape = "record"
+    elif raw_result_shape == "table":
+        result_shape = "table"
+    else:
+        result_shape = "empty"
+    raw_diagnostics = value.get("diagnostics")
+    return DbAnswerFacts(
+        result_shape=result_shape,
+        row_count=_safe_int(value.get("row_count"), 0),
+        sampled_row_count=_safe_int(value.get("sampled_row_count"), 0),
+        columns=tuple(str(item) for item in value.get("columns") or ()),
+        scalars=scalars,
+        primary_scalar=primary,
+        truncated=bool(value.get("truncated")),
+        source_evidence_id=(
+            str(value["source_evidence_id"])
+            if value.get("source_evidence_id") is not None
+            else None
+        ),
+        source_evidence_kind=(
+            str(value["source_evidence_kind"])
+            if value.get("source_evidence_kind") is not None
+            else None
+        ),
+        diagnostics=(
+            {str(key): item for key, item in raw_diagnostics.items()}
+            if isinstance(raw_diagnostics, dict)
+            else {}
+        ),
+    )
+
+
+def _scalar_fact_from_mapping(value: Any) -> DbAnswerScalarFact:
+    payload = value if isinstance(value, dict) else {}
+    return DbAnswerScalarFact(
+        label=str(payload.get("label") or "value"),
+        value=payload.get("value"),
+        aggregate_kind=(
+            str(payload["aggregate_kind"])
+            if payload.get("aggregate_kind") is not None
+            else None
+        ),
+        source_evidence_id=(
+            str(payload["source_evidence_id"])
+            if payload.get("source_evidence_id") is not None
+            else None
+        ),
+        source_evidence_kind=str(payload.get("source_evidence_kind") or "query.result"),
+        confidence=str(payload.get("confidence") or "high"),
+        redacted=bool(payload.get("redacted")),
+    )
+
+
+def _aggregate_kinds_by_column(
+    evidence: tuple[Evidence, ...],
+    columns: tuple[str, ...],
+) -> dict[str, str]:
+    sql = _answer_sql_from_evidence(evidence)
+    if not sql:
+        return {}
+    by_label: dict[str, str] = {}
+    positional: list[str | None] = []
+    try:
+        from .sql_analysis import analyze_sql
+
+        analysis = analyze_sql(sql)
+    except Exception:
+        positional = _aggregate_kinds_from_sql_text(sql)
+    else:
+        for item in analysis.select_items:
+            kind = _aggregate_kind_from_expression(item.expression_sql)
+            if kind is None and item.is_count:
+                kind = "count"
+            positional.append(kind)
+            if item.alias and kind is not None:
+                by_label[_normalize_answer_label(item.alias)] = kind
+
+    if not positional:
+        positional = _aggregate_kinds_from_sql_text(sql)
+
+    out = dict(by_label)
+    for index, column in enumerate(columns):
+        normalized = _normalize_answer_label(column)
+        if normalized in out:
+            continue
+        if index < len(positional) and positional[index] is not None:
+            out[normalized] = str(positional[index])
+    if len(columns) == 1 and columns:
+        normalized = _normalize_answer_label(columns[0])
+        if normalized not in out and len(positional) == 1 and positional[0] is not None:
+            out[normalized] = str(positional[0])
+    return out
+
+
+def _answer_sql_from_evidence(evidence: tuple[Evidence, ...]) -> str:
+    for kind in (
+        "query.result",
+        "sql.validation",
+        "query.plan.validation",
+        "query.plan.proposal",
+    ):
+        for item in reversed(evidence):
+            if item.kind != kind or not item.accepted:
+                continue
+            sql = _sql_from_payload(item.payload)
+            if sql:
+                return sql
+    return ""
+
+
+def _sql_from_payload(payload: dict[str, Any]) -> str:
+    for key in ("sql", "accepted_sql", "selected_sql"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    structured = payload.get("structured_plan")
+    if isinstance(structured, dict):
+        for key in ("selected_sql", "sql"):
+            value = structured.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    candidates = payload.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            value = candidate.get("sql")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _aggregate_kinds_from_sql_text(sql: str) -> list[str | None]:
+    return [
+        match.group(1).lower()
+        for match in re.finditer(
+            r"\b(count|sum|avg|min|max)\s*\(",
+            sql or "",
+            flags=re.IGNORECASE,
+        )
+    ]
+
+
+def _aggregate_kind_from_expression(expression: str) -> str | None:
+    match = re.search(
+        r"\b(count|sum|avg|min|max)\s*\(",
+        expression or "",
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).lower() if match else None
+
+
+def _normalize_answer_label(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
+
+
+def _has_monitor_evidence(evidence: tuple[Evidence, ...]) -> bool:
+    return any(item.kind.startswith("monitor.") for item in evidence if item.accepted)
+
+
+def _monitor_answer(evidence: tuple[Evidence, ...]) -> str:
+    accepted = tuple(item for item in evidence if item.accepted)
+    for kind in (
+        "monitor.definition",
+        "monitor.deleted",
+        "monitor.disabled",
+        "monitor.paused",
+        "monitor.resumed",
+        "monitor.state_update",
+        "monitor.listing",
+        "monitor.inspection",
+        "monitor.run_summary",
+        "monitor.approval_state",
+        "monitor.approval_resolution",
+        "monitor.proposal",
+    ):
+        item = next(
+            (candidate for candidate in reversed(accepted) if candidate.kind == kind),
+            None,
+        )
+        if item is not None:
+            return _monitor_answer_from_evidence(item)
+    return "The monitor operation completed with verified evidence."
+
+
+def _monitor_answer_from_evidence(evidence: Evidence) -> str:
+    payload = evidence.payload
+    if evidence.kind == "monitor.listing":
+        monitors = [
+            item for item in payload.get("monitors") or () if isinstance(item, dict)
+        ]
+        if not monitors:
+            return "No monitors are currently defined."
+        lines = ["Monitors:"]
+        for monitor in monitors:
+            lines.append(
+                f"- {monitor.get('id')}: {monitor.get('name')} [{monitor.get('status')}]"
+            )
+        return "\n".join(lines)
+    if evidence.kind in {"monitor.inspection", "monitor.run_summary"}:
+        inspection = payload.get("inspection")
+        if not isinstance(inspection, dict):
+            return "The monitor could not be inspected from the accepted evidence."
+        monitor = dict(inspection.get("monitor") or {})
+        monitor_id = monitor.get("id")
+        name = monitor.get("name") or monitor_id
+        if evidence.kind == "monitor.run_summary":
+            runs = inspection.get("runs") or ()
+            if not runs:
+                return f"Monitor {name} ({monitor_id}) has no recorded runs yet."
+            last_run = dict(runs[-1])
+            return (
+                f"Monitor {name} ({monitor_id}) last run "
+                f"{last_run.get('status')}; operation {last_run.get('operation_id')}."
+            )
+        schedule = monitor.get("schedule")
+        schedule_text = ""
+        if isinstance(schedule, dict):
+            schedule_text = _monitor_schedule_text(schedule)
+        suffix = f", schedule {schedule_text}" if schedule_text else ""
+        return f"Monitor {name} ({monitor_id}) is {monitor.get('status')}{suffix}."
+    if evidence.kind == "monitor.approval_state":
+        approvals = [
+            item for item in payload.get("approvals") or () if isinstance(item, dict)
+        ]
+        if not approvals:
+            return "No pending monitor approvals were found."
+        lines = ["Pending monitor approvals:"]
+        for approval in approvals:
+            context = dict(approval.get("context") or {})
+            monitor_id = context.get("monitor_id") or payload.get("monitor_id")
+            lines.append(
+                f"- {approval.get('approval_id')}: {approval.get('status')}"
+                + (f" for {monitor_id}" if monitor_id else "")
+            )
+        return "\n".join(lines)
+    if evidence.kind == "monitor.approval_resolution":
+        status = str(payload.get("status") or "")
+        if status == "not_found":
+            return "No matching pending monitor approval was found."
+        if status == "ambiguous":
+            return "Multiple pending monitor approvals matched; specify an approval id."
+        action = str(payload.get("approval_action") or "approve").lower()
+        verb = {
+            "approve": "Approved",
+            "reject": "Rejected",
+            "cancel": "Cancelled",
+        }.get(action, "Updated")
+        return (
+            f"{verb} monitor approval {payload.get('approval_id')}; "
+            f"approval is {payload.get('approval_status')}."
+        )
+    if evidence.kind == "monitor.definition":
+        monitor = dict(payload.get("monitor") or {})
+        schedule = monitor.get("schedule")
+        suffix = ""
+        if isinstance(schedule, dict):
+            schedule_text = _monitor_schedule_text(schedule)
+            suffix = f" on {schedule_text}" if schedule_text else ""
+        return f"Created monitor {monitor.get('name')} ({monitor.get('id')}){suffix}."
+    if evidence.kind in {
+        "monitor.deleted",
+        "monitor.disabled",
+        "monitor.paused",
+        "monitor.resumed",
+        "monitor.state_update",
+    }:
+        action = str(payload.get("action") or evidence.kind.removeprefix("monitor."))
+        monitor = dict(
+            payload.get("monitor")
+            or payload.get("after")
+            or payload.get("before")
+            or {}
+        )
+        monitor_id = monitor.get("id") or payload.get("monitor_id")
+        name = monitor.get("name") or monitor_id
+        verb = {
+            "delete": "Deleted",
+            "deleted": "Deleted",
+            "disable": "Disabled",
+            "disabled": "Disabled",
+            "pause": "Paused",
+            "paused": "Paused",
+            "resume": "Resumed",
+            "resumed": "Resumed",
+            "update": "Updated",
+            "state_update": "Updated",
+        }.get(action, "Updated")
+        return f"{verb} monitor {name} ({monitor_id})."
+    if evidence.kind == "monitor.proposal":
+        validation = dict(payload.get("validation") or {})
+        if validation.get("accepted") is False:
+            missing = ", ".join(
+                str(item) for item in validation.get("missing_capabilities") or ()
+            )
+            if missing:
+                return (
+                    "Monitor was not created because required capabilities are missing: "
+                    f"{missing}."
+                )
+            return "Monitor was not created because its definition did not pass validation."
+        return f"Prepared monitor proposal {payload.get('name')} ({payload.get('monitor_id')})."
+    return "The monitor operation completed with verified evidence."
+
+
+def _monitor_schedule_text(schedule: dict[str, Any]) -> str:
+    interval_seconds = schedule.get("interval_seconds") or schedule.get("every_seconds")
+    if isinstance(interval_seconds, (int, float)) and interval_seconds > 0:
+        if interval_seconds % 3600 == 0:
+            hours = int(interval_seconds // 3600)
+            return "hourly" if hours == 1 else f"every {hours} hours"
+        if interval_seconds % 60 == 0:
+            minutes = int(interval_seconds // 60)
+            return "every minute" if minutes == 1 else f"every {minutes} minutes"
+        seconds = int(interval_seconds)
+        return "every second" if seconds == 1 else f"every {seconds} seconds"
+    expression = str(schedule.get("expression") or "").strip()
+    return expression
 
 
 def _tables_from_schema_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -726,6 +1288,7 @@ class DbAnswerSynthesisPayload:
     truncation: dict[str, bool]
     grounding: dict[str, bool]
     diagnostics: dict[str, Any]
+    answer_facts: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -742,6 +1305,7 @@ class DbAnswerSynthesisPayload:
             "confidence": self.confidence,
             "truncation": dict(self.truncation),
             "grounding": dict(self.grounding),
+            "answer_facts": dict(self.answer_facts),
             "diagnostics": self.diagnostics,
         }
 
@@ -890,6 +1454,12 @@ def build_synthesis_context(
         (item for item in accepted if item.kind == "query.result"), None
     )
     rows, row_metadata = _bounded_rows(query_result, row_budget=row_budget)
+    answer_facts = derive_answer_facts(
+        request=request,
+        intent=intent,
+        contract=contract,
+        evidence=accepted,
+    )
     schema_scope = (
         _schema_answer_scope(request, contract, accepted)
         if intent.kind is DbIntentKind.SCHEMA_QUERY
@@ -900,6 +1470,7 @@ def build_synthesis_context(
         "prompt": request.prompt,
         "intent_kind": intent.kind.value,
         "operation_type": contract.operation_type,
+        "answer_facts": answer_facts.to_dict(),
         "evidence": evidence_summaries,
         "query_result": {
             "evidence_id": query_result.id if query_result else None,
@@ -920,10 +1491,11 @@ def build_synthesis_context(
     payload["required_caveats"] = list(required_caveats)
     rendered = json.dumps(payload, sort_keys=True, default=str)
     context_chars_truncated = len(rendered) > char_budget
+    diagnostic_caveats: tuple[str, ...] = ()
     if context_chars_truncated:
         payload["rendered_context"] = rendered[:char_budget]
-        required_caveats = tuple((*required_caveats, "synthesis_context_truncated"))
-        payload["required_caveats"] = list(required_caveats)
+        diagnostic_caveats = ("synthesis_context_truncated",)
+        payload["diagnostic_caveats"] = list(diagnostic_caveats)
     else:
         payload["rendered_context"] = rendered
     truncation = {
@@ -939,6 +1511,8 @@ def build_synthesis_context(
         ],
         "accepted_evidence_ids": [item.id for item in accepted if item.id],
         "required_caveats": list(required_caveats),
+        "diagnostic_caveats": list(diagnostic_caveats),
+        "answer_facts": answer_facts.to_dict(),
         "truncation": truncation,
         "redaction": {
             "values_redacted": bool(row_metadata["redacted_value_count"]),
@@ -972,6 +1546,14 @@ def deterministic_synthesis_payload(
     result = (synthesizer or DbSynthesizer()).synthesize(
         request, intent, contract, evidence, verification
     )
+    answer_facts = _answer_facts_from_mapping(context_metadata.get("answer_facts"))
+    answer = (
+        _data_answer_from_facts(answer_facts)
+        if answer_facts is not None
+        and intent.kind
+        in {DbIntentKind.DATA_QUERY, DbIntentKind.CATALOG_ASSISTED_DATA_QUERY}
+        else result.answer
+    )
     citations = tuple(
         DbAnswerCitation(
             id=str(item["id"]),
@@ -983,9 +1565,12 @@ def deterministic_synthesis_payload(
     )
     caveats = tuple(str(item) for item in context_metadata.get("required_caveats", ()))
     truncation = dict(context_metadata.get("truncation") or {})
-    sufficiency = "partial" if any(truncation.values()) else "answered"
+    answer_critical_truncated = bool(
+        truncation.get("rows_truncated") or truncation.get("fields_truncated")
+    )
+    sufficiency = "partial" if answer_critical_truncated else "answered"
     return DbAnswerSynthesisPayload(
-        answer=result.answer,
+        answer=answer,
         reasoning_summary="Deterministic summary generated from verified evidence.",
         cited_evidence_refs=citations,
         assumptions=(),
@@ -1000,6 +1585,7 @@ def deterministic_synthesis_payload(
             "context_chars_truncated": bool(truncation.get("context_chars_truncated")),
         },
         grounding={"all_claims_from_evidence": True},
+        answer_facts=answer_facts.to_dict() if answer_facts is not None else {},
         diagnostics={
             "mode": "deterministic_fallback",
             "model": "deterministic",
@@ -1019,7 +1605,7 @@ def deterministic_synthesis_payload(
 
 
 def parse_synthesis_json(content: str) -> dict[str, Any]:
-    raw = _strip_json_fence(content)
+    raw = strip_json_fence(content)
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise ValueError("synthesis_json_not_object")
@@ -1058,6 +1644,8 @@ def validate_synthesis_payload(
     _validate_required_citations(citations, dependency_evidence)
     _validate_caveats_preserved(parsed, context_metadata)
     _validate_relationship_claims(answer, citations, accepted_by_id)
+    answer_facts = _answer_facts_from_mapping(context_metadata.get("answer_facts"))
+    _validate_answer_facts_preserved(answer, answer_facts)
     truncation = dict(parsed.get("truncation") or {})
     context_truncation = dict(context_metadata.get("truncation") or {})
     normalized_truncation = {
@@ -1073,6 +1661,11 @@ def validate_synthesis_payload(
             or context_truncation.get("context_chars_truncated")
         ),
     }
+    sufficiency = _normalized_sufficiency(
+        sufficiency,
+        answer_facts=answer_facts,
+        truncation=normalized_truncation,
+    )
     diagnostics = _diagnostics_from_llm(llm_diagnostics)
     diagnostics.update(
         {
@@ -1095,6 +1688,7 @@ def validate_synthesis_payload(
         confidence=float(confidence),
         truncation=normalized_truncation,
         grounding={"all_claims_from_evidence": True},
+        answer_facts=answer_facts.to_dict() if answer_facts is not None else {},
         diagnostics=diagnostics,
     )
 
@@ -1106,9 +1700,11 @@ async def _accepted_dependency_evidence(
 ) -> tuple[Evidence, ...]:
     evidence: list[Evidence] = []
     for dependency in task.dependencies:
-        if dependency.kind.value != "evidence":
+        if dependency.kind_value != "evidence":
             continue
-        item = await runtime._accepted_evidence_for_dependency(operation.id, dependency)
+        item = await runtime.tasks.accepted_evidence_for_dependency(
+            operation.id, dependency
+        )
         if item is not None and item.accepted and item.operation_id == operation.id:
             evidence.append(item)
     return tuple(evidence)
@@ -1159,6 +1755,10 @@ def _synthesis_messages(context_payload: dict[str, Any]) -> list[dict[str, str]]
                             "context_chars_truncated": "boolean",
                         },
                         "grounding": {"all_claims_from_evidence": True},
+                        "answer_facts": (
+                            "object copied from context.answer_facts; the answer "
+                            "must preserve scalar values from these facts"
+                        ),
                     },
                 },
                 sort_keys=True,
@@ -1300,8 +1900,11 @@ def _catalog_semantics(
             None,
         )
     payload = planning.payload if planning is not None else {}
-    schema = (
-        payload.get("schema") if isinstance(payload.get("schema"), dict) else payload
+    raw_schema = payload.get("schema")
+    schema: dict[str, Any] = (
+        {str(key): value for key, value in raw_schema.items()}
+        if isinstance(raw_schema, dict)
+        else payload
     )
     tables = []
     source_tables = (
@@ -1425,7 +2028,7 @@ def _required_caveats(
 
 
 def _parse_citations(
-    value: Any, accepted_by_id: dict[str | None, Evidence]
+    value: Any, accepted_by_id: dict[str, Evidence]
 ) -> list[DbAnswerCitation]:
     if not isinstance(value, list):
         raise ValueError("synthesis_citations_not_list")
@@ -1468,15 +2071,14 @@ def _validate_required_citations(
 def _validate_caveats_preserved(
     parsed: dict[str, Any], context_metadata: dict[str, Any]
 ) -> None:
-    required = tuple(context_metadata.get("required_caveats") or ())
+    required = _string_tuple(context_metadata.get("required_caveats"))
     if not required:
         return
     provided = " ".join(
-        str(item)
-        for item in (
-            *(parsed.get("limitations") or ()),
-            *(parsed.get("warnings") or ()),
-            *(parsed.get("assumptions") or ()),
+        (
+            *_string_tuple(parsed.get("limitations")),
+            *_string_tuple(parsed.get("warnings")),
+            *_string_tuple(parsed.get("assumptions")),
         )
     )
     for caveat in required:
@@ -1484,10 +2086,80 @@ def _validate_caveats_preserved(
             raise ValueError(f"synthesis_dropped_caveat:{caveat}")
 
 
+def _validate_answer_facts_preserved(
+    answer: str,
+    answer_facts: DbAnswerFacts | None,
+) -> None:
+    if answer_facts is None:
+        return
+    required = (
+        (answer_facts.primary_scalar,)
+        if answer_facts.primary_scalar is not None
+        else tuple(
+            fact
+            for fact in answer_facts.scalars
+            if fact.confidence == "high" and not fact.redacted
+        )
+    )
+    for fact in required:
+        if fact is None or fact.redacted:
+            continue
+        if not _answer_contains_value(answer, fact.value):
+            raise ValueError(f"synthesis_missing_answer_fact:{fact.label}")
+
+
+def _answer_contains_value(answer: str, value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return str(value).lower() in answer.lower()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _answer_contains_numeric_value(answer, float(value))
+    rendered = str(value).strip()
+    if not rendered:
+        return True
+    numeric = _numeric_value(rendered)
+    if numeric is not None:
+        return _answer_contains_numeric_value(answer, numeric)
+    return rendered.lower() in answer.lower()
+
+
+def _answer_contains_numeric_value(answer: str, expected: float) -> bool:
+    for match in re.finditer(r"[-+]?\d[\d,]*(?:\.\d+)?", answer):
+        numeric = _numeric_value(match.group(0))
+        if numeric is not None and abs(numeric - expected) < 1e-9:
+            return True
+    return False
+
+
+def _numeric_value(value: str) -> float | None:
+    try:
+        return float(value.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _normalized_sufficiency(
+    sufficiency: str,
+    *,
+    answer_facts: DbAnswerFacts | None,
+    truncation: dict[str, bool],
+) -> str:
+    if sufficiency != "partial":
+        return sufficiency
+    if answer_facts is None or answer_facts.primary_scalar is None:
+        return sufficiency
+    if truncation.get("rows_truncated") or truncation.get("fields_truncated"):
+        return sufficiency
+    if truncation.get("context_chars_truncated"):
+        return "answered"
+    return sufficiency
+
+
 def _validate_relationship_claims(
     answer: str,
     citations: list[DbAnswerCitation],
-    accepted_by_id: dict[str | None, Evidence],
+    accepted_by_id: dict[str, Evidence],
 ) -> None:
     lowered = answer.lower()
     if not any(
@@ -1521,8 +2193,11 @@ def _requests_db_work(parsed: dict[str, Any]) -> bool:
 
 
 def _diagnostics_from_llm(diagnostics: dict[str, Any]) -> dict[str, Any]:
-    tokens = (
-        diagnostics.get("tokens") if isinstance(diagnostics.get("tokens"), dict) else {}
+    raw_tokens = diagnostics.get("tokens")
+    tokens: dict[str, Any] = (
+        {str(key): value for key, value in raw_tokens.items()}
+        if isinstance(raw_tokens, dict)
+        else {}
     )
     input_tokens = db_optional_int(
         diagnostics.get("input_tokens")
@@ -1564,9 +2239,3 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     if isinstance(value, list):
         return tuple(str(item) for item in value)
     return (str(value),)
-
-
-def _strip_json_fence(content: str) -> str:
-    stripped = content.strip()
-    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, flags=re.DOTALL)
-    return match.group(1).strip() if match else stripped

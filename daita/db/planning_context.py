@@ -2,19 +2,32 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-import hashlib
-import json
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import Any, Iterable
 
 from daita.runtime import Evidence, Operation
 
 from .analysis import structural_schema_fingerprint
+from .context_projection import (
+    ProjectionContext,
+    ProjectionMode,
+    policy_summary_from_source,
+    project_catalog_hints,
+    project_memory_refs,
+    project_memory_semantics,
+    project_policy_summary,
+    project_session_context,
+)
+from .fingerprints import persisted_fingerprint
 from .memory import (
     db_memory_options_from_from_db_options,
     db_memory_refs_from_recall_evidence,
+    db_memory_selection_artifact_payload,
 )
-from .memory_contracts import project_db_memory_semantic_contracts
+from .memory_contracts import (
+    db_memory_contracts_artifact_payload,
+    project_db_memory_semantic_contracts,
+)
 from .models import DbIntent, DbRequest, DbRuntimeConfig
 from .session_context import db_session_context_from_request
 
@@ -32,13 +45,23 @@ class DbPlanningContext:
     schema_evidence_refs: tuple[str, ...] = ()
     catalog_evidence_refs: tuple[str, ...] = ()
     relationship_evidence_refs: tuple[str, ...] = ()
+    relationship_evidence_details: tuple[dict[str, Any], ...] = ()
     column_value_evidence_refs: tuple[str, ...] = ()
     column_value_hints: tuple[dict[str, Any], ...] = ()
     db_memory_refs: tuple[dict[str, Any], ...] = ()
     db_memory_semantics: tuple[dict[str, Any], ...] = ()
-    db_memory_evidence_refs: tuple[str, ...] = ()
-    db_memory_diagnostics: dict[str, Any] = field(default_factory=dict)
-    db_memory_contract_diagnostics: dict[str, Any] = field(default_factory=dict)
+    db_memory_selection_evidence_ref: dict[str, Any] = field(default_factory=dict)
+    db_memory_contracts_evidence_ref: dict[str, Any] = field(default_factory=dict)
+    db_memory_selection_artifact: dict[str, Any] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    db_memory_contracts_artifact: dict[str, Any] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
     source_evidence_refs: tuple[dict[str, Any], ...] = ()
     source_fingerprints: dict[str, str] = field(default_factory=dict)
     capability_summaries: tuple[dict[str, Any], ...] = ()
@@ -55,6 +78,12 @@ class DbPlanningContext:
     schema_fingerprint: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
+        db_memory_diagnostics = _db_memory_selection_diagnostics(
+            self.db_memory_selection_artifact
+        )
+        db_memory_contract_diagnostics = _db_memory_contract_diagnostics(
+            self.db_memory_contracts_artifact
+        )
         return {
             "operation_id": self.operation_id,
             "prompt": self.prompt,
@@ -65,13 +94,21 @@ class DbPlanningContext:
             "schema_evidence_refs": list(self.schema_evidence_refs),
             "catalog_evidence_refs": list(self.catalog_evidence_refs),
             "relationship_evidence_refs": list(self.relationship_evidence_refs),
+            "relationship_evidence_details": [
+                dict(item) for item in self.relationship_evidence_details
+            ],
             "column_value_evidence_refs": list(self.column_value_evidence_refs),
             "column_value_hints": [dict(item) for item in self.column_value_hints],
             "db_memory_refs": [dict(item) for item in self.db_memory_refs],
             "db_memory_semantics": [dict(item) for item in self.db_memory_semantics],
-            "db_memory_evidence_refs": list(self.db_memory_evidence_refs),
-            "db_memory_diagnostics": dict(self.db_memory_diagnostics),
-            "db_memory_contract_diagnostics": dict(self.db_memory_contract_diagnostics),
+            "db_memory_selection_evidence_ref": dict(
+                self.db_memory_selection_evidence_ref
+            ),
+            "db_memory_contracts_evidence_ref": dict(
+                self.db_memory_contracts_evidence_ref
+            ),
+            "db_memory_diagnostics": db_memory_diagnostics,
+            "db_memory_contract_diagnostics": db_memory_contract_diagnostics,
             "source_evidence_refs": [dict(item) for item in self.source_evidence_refs],
             "source_fingerprints": dict(self.source_fingerprints),
             "capability_summaries": [dict(item) for item in self.capability_summaries],
@@ -109,7 +146,20 @@ class DbPlanningContextBuilder:
         capability_summaries: tuple[dict[str, Any], ...] = (),
         source: Any = None,
     ) -> DbPlanningContext:
-        schema = dict(schema_evidence.payload) if schema_evidence is not None else {}
+        catalog_structural_evidence = _catalog_structural_evidence(
+            schema_evidence,
+            catalog_evidence,
+        )
+        relationship_details = _relationship_evidence_details(relationship_evidence)
+        schema = _schema_from_catalog_evidence(
+            catalog_structural_evidence,
+            relationship_evidence,
+        )
+        schema_source = "catalog" if schema else "connector"
+        if not schema:
+            schema = (
+                dict(schema_evidence.payload) if schema_evidence is not None else {}
+            )
         schema_fingerprint = structural_schema_fingerprint(schema)
         dialect = (
             str(
@@ -120,7 +170,7 @@ class DbPlanningContextBuilder:
             or None
         )
         options = _from_db_options(self.config.metadata)
-        source_evidence = tuple(
+        source_evidence = _dedupe_evidence(
             item
             for item in (schema_evidence, *catalog_evidence, *relationship_evidence)
             if item is not None and item.accepted
@@ -128,7 +178,8 @@ class DbPlanningContextBuilder:
         source_refs = tuple(_evidence_ref(item) for item in source_evidence)
         source_fingerprints = {
             str(item.id): str(
-                item.metadata.get("payload_fingerprint") or _fingerprint(item.payload)
+                item.metadata.get("payload_fingerprint")
+                or persisted_fingerprint(item.payload)
             )
             for item in source_evidence
             if item.id
@@ -138,14 +189,23 @@ class DbPlanningContextBuilder:
             included_sections.append("catalog")
         if relationship_evidence:
             included_sections.append("relationships")
-        column_value_hints = _column_value_hints(
-            catalog_evidence,
-            schema,
-            profiles_stale=bool(
-                schema_evidence is not None
-                and schema_evidence.metadata.get("schema_cache")
-                == "persistent_stale_fallback"
+        policy_summary = policy_summary_from_source(source)
+        projection = ProjectionContext(
+            mode=ProjectionMode.PLANNER,
+            operation_intent=intent.kind.value,
+            safety_frame=operation.metadata.get("safety_frame"),
+            policy_summary=policy_summary,
+            source_identity=None,
+            schema_fingerprint=schema_fingerprint,
+            session_id=request.session_id,
+            user_id=request.user_id,
+        )
+        column_value_hints = project_catalog_hints(
+            _column_value_hints(
+                catalog_evidence,
+                schema,
             ),
+            projection,
         )
         column_value_evidence = tuple(
             item
@@ -160,40 +220,86 @@ class DbPlanningContextBuilder:
         if column_value_hints:
             included_sections.append("column_value_hints")
         memory_options = db_memory_options_from_from_db_options(options)
-        db_memory_refs, db_memory_evidence_refs, db_memory_diagnostics = (
+        projection = ProjectionContext(
+            mode=ProjectionMode.PLANNER,
+            operation_intent=intent.kind.value,
+            safety_frame=operation.metadata.get("safety_frame"),
+            policy_summary=policy_summary,
+            source_identity=memory_options.get("source_identity"),
+            schema_fingerprint=schema_fingerprint,
+            session_id=request.session_id,
+            user_id=request.user_id,
+        )
+        memory_limit = int(memory_options.get("limit") or 3)
+        memory_char_budget = int(memory_options.get("char_budget") or 800)
+        memory_score_threshold = _float_option(
+            memory_options,
+            "score_threshold",
+            0.45,
+        )
+        accepted_memory_recall_evidence = tuple(
+            item for item in memory_recall_evidence if item.accepted
+        )
+        memory_recall_refs = _evidence_refs(accepted_memory_recall_evidence)
+        raw_db_memory_refs, db_memory_evidence_refs, selection_diagnostics = (
             db_memory_refs_from_recall_evidence(
-                tuple(item for item in memory_recall_evidence if item.accepted),
+                accepted_memory_recall_evidence,
                 prompt=request.prompt,
                 schema=schema,
                 source_identity=memory_options.get("source_identity"),
                 schema_fingerprint=schema_fingerprint,
-                limit=int(memory_options.get("limit") or 3),
-                char_budget=int(memory_options.get("char_budget") or 800),
-                score_threshold=_float_option(
-                    memory_options,
-                    "score_threshold",
-                    0.45,
-                ),
+                limit=memory_limit,
+                char_budget=memory_char_budget,
+                score_threshold=memory_score_threshold,
             )
         )
-        db_memory_diagnostics = {
-            **db_memory_diagnostics,
+        selection_diagnostics = {
+            **selection_diagnostics,
             **dict(memory_recall_diagnostics or {}),
         }
-        policy_summary = {
-            "read_only": getattr(source, "read_only", None),
-            "allowed_tables": sorted(getattr(source, "allowed_tables", set()) or []),
-            "blocked_tables": sorted(getattr(source, "blocked_tables", set()) or []),
-            "blocked_columns": sorted(getattr(source, "blocked_columns", set()) or []),
-        }
-        db_memory_semantics, db_memory_contract_diagnostics = (
+        db_memory_selection_artifact = (
+            db_memory_selection_artifact_payload(
+                source_identity=memory_options.get("source_identity"),
+                schema_fingerprint=schema_fingerprint,
+                recall_evidence_refs=memory_recall_refs,
+                memory_evidence_refs=db_memory_evidence_refs,
+                included_refs=raw_db_memory_refs,
+                diagnostics=selection_diagnostics,
+                limit=memory_limit,
+                char_budget=memory_char_budget,
+                score_threshold=memory_score_threshold,
+            )
+            if accepted_memory_recall_evidence or memory_recall_diagnostics
+            else {}
+        )
+        db_memory_refs = project_memory_refs(
+            db_memory_selection_artifact.get("included_refs") or raw_db_memory_refs,
+            projection,
+        )
+        raw_db_memory_semantics, contract_projection_diagnostics = (
             project_db_memory_semantic_contracts(
-                db_memory_refs,
+                db_memory_selection_artifact.get("included_refs") or raw_db_memory_refs,
                 prompt=request.prompt,
                 schema=schema,
                 policy_summary=policy_summary,
                 source_identity=memory_options.get("source_identity"),
             )
+        )
+        db_memory_contracts_artifact = (
+            db_memory_contracts_artifact_payload(
+                source_identity=memory_options.get("source_identity"),
+                schema_fingerprint=schema_fingerprint,
+                recall_evidence_refs=memory_recall_refs,
+                selection_evidence_ref=None,
+                contracts=raw_db_memory_semantics,
+                diagnostics=contract_projection_diagnostics,
+            )
+            if db_memory_selection_artifact
+            else {}
+        )
+        db_memory_semantics = project_memory_semantics(
+            db_memory_contracts_artifact.get("contracts") or raw_db_memory_semantics,
+            projection,
         )
         if db_memory_refs:
             included_sections.append("db_memory")
@@ -209,8 +315,16 @@ class DbPlanningContextBuilder:
             "column_value_hint_count": len(column_value_hints),
             "db_memory_ref_count": len(db_memory_refs),
             "db_memory_contract_count": len(db_memory_semantics),
+            "structural_schema_source": schema_source,
+            "catalog_structural_evidence_refs": [
+                item.id for item in catalog_structural_evidence if item.id
+            ],
+            "relationship_evidence_ref_count": len(relationship_details),
         }
-        session_context = _compact_session_context(request)
+        session_context = project_session_context(
+            _compact_session_context(request),
+            projection,
+        )
         if session_context:
             included_sections.append("session_context")
         context = DbPlanningContext(
@@ -223,13 +337,13 @@ class DbPlanningContextBuilder:
             schema_evidence_refs=_evidence_refs((schema_evidence,)),
             catalog_evidence_refs=_evidence_refs(catalog_evidence),
             relationship_evidence_refs=_evidence_refs(relationship_evidence),
+            relationship_evidence_details=relationship_details,
             column_value_evidence_refs=_evidence_refs(column_value_evidence),
             column_value_hints=column_value_hints,
             db_memory_refs=db_memory_refs,
             db_memory_semantics=db_memory_semantics,
-            db_memory_evidence_refs=db_memory_evidence_refs,
-            db_memory_diagnostics=db_memory_diagnostics,
-            db_memory_contract_diagnostics=db_memory_contract_diagnostics,
+            db_memory_selection_artifact=db_memory_selection_artifact,
+            db_memory_contracts_artifact=db_memory_contracts_artifact,
             source_evidence_refs=source_refs,
             source_fingerprints=source_fingerprints,
             capability_summaries=tuple(capability_summaries),
@@ -239,7 +353,7 @@ class DbPlanningContextBuilder:
                 "rendered_context_chars": 0,
                 "capability_summary_count": len(capability_summaries),
                 "source_evidence_count": len(source_evidence),
-                "db_memory_chars": int(db_memory_diagnostics.get("used_chars") or 0),
+                "db_memory_chars": int(selection_diagnostics.get("used_chars") or 0),
             },
             context_selection_diagnostics={
                 "mode": "runtime_bounded",
@@ -251,7 +365,7 @@ class DbPlanningContextBuilder:
                     }
                 ),
             },
-            policy_summary=policy_summary,
+            policy_summary=project_policy_summary(policy_summary, projection),
             limit_summary={
                 "max_rows": self.config.limits.max_rows,
                 "timeout_seconds": self.config.limits.timeout_seconds,
@@ -260,9 +374,9 @@ class DbPlanningContextBuilder:
                 "query_max_chars": getattr(source, "query_max_chars", None),
             },
             redaction_policy={
-                "redact_pii_columns": bool(options.get("redact_pii_columns", True)),
+                "redact_pii_columns": bool(getattr(source, "redact_pii_columns", True)),
                 "include_sample_values": bool(
-                    options.get("include_sample_values", False)
+                    getattr(source, "include_sample_values", True)
                 ),
             },
             session_context=session_context,
@@ -288,9 +402,473 @@ class DbPlanningContextBuilder:
             payload=context.to_payload(),
             metadata={
                 "schema_fingerprint": context.schema_fingerprint,
-                "payload_fingerprint": _fingerprint(context.to_payload()),
+                "payload_fingerprint": persisted_fingerprint(context.to_payload()),
             },
         )
+
+    def memory_selection_evidence_for(
+        self,
+        context: DbPlanningContext,
+        *,
+        task_id: str | None = None,
+    ) -> Evidence | None:
+        if not context.db_memory_selection_artifact:
+            return None
+        return _artifact_evidence(
+            kind="db.memory.selection",
+            operation_id=context.operation_id,
+            task_id=task_id,
+            payload=context.db_memory_selection_artifact,
+        )
+
+    def memory_contracts_evidence_for(
+        self,
+        context: DbPlanningContext,
+        *,
+        selection_evidence_ref: dict[str, Any] | None = None,
+        task_id: str | None = None,
+    ) -> Evidence | None:
+        if not context.db_memory_contracts_artifact:
+            return None
+        payload = {
+            **context.db_memory_contracts_artifact,
+            "selection_evidence_ref": dict(
+                selection_evidence_ref
+                or context.db_memory_contracts_artifact.get(
+                    "selection_evidence_ref",
+                    {},
+                )
+                or {}
+            ),
+        }
+        return _artifact_evidence(
+            kind="db.memory.contracts",
+            operation_id=context.operation_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    def with_memory_artifact_refs(
+        self,
+        context: DbPlanningContext,
+        *,
+        selection_evidence: Evidence | None,
+        contracts_evidence: Evidence | None,
+    ) -> DbPlanningContext:
+        return replace(
+            context,
+            db_memory_selection_evidence_ref=(
+                _evidence_ref(selection_evidence) if selection_evidence else {}
+            ),
+            db_memory_contracts_evidence_ref=(
+                _evidence_ref(contracts_evidence) if contracts_evidence else {}
+            ),
+        )
+
+
+def _db_memory_selection_diagnostics(artifact: dict[str, Any]) -> dict[str, Any]:
+    if not artifact:
+        return {}
+    budget = artifact.get("budget_usage")
+    budget_usage = dict(budget) if isinstance(budget, dict) else {}
+    return {
+        "candidate_count": int(
+            artifact.get("raw_candidate_count")
+            or budget_usage.get("raw_candidate_count")
+            or 0
+        ),
+        "included_count": int(
+            artifact.get("included_count") or budget_usage.get("included_count") or 0
+        ),
+        "used_chars": int(budget_usage.get("used_chars") or 0),
+        "char_budget": int(budget_usage.get("char_budget") or 0),
+        "limit": int(budget_usage.get("limit") or 0),
+        "score_threshold": float(budget_usage.get("score_threshold") or 0.0),
+        "omitted_reasons": {
+            str(reason): int(count)
+            for reason, count in dict(
+                artifact.get("omitted_counts_by_reason") or {}
+            ).items()
+        },
+    }
+
+
+def _db_memory_contract_diagnostics(artifact: dict[str, Any]) -> dict[str, Any]:
+    if not artifact:
+        return {}
+    applicability = artifact.get("source_schema_applicability")
+    applicability = dict(applicability) if isinstance(applicability, dict) else {}
+    enforced_count = (
+        applicability.get("enforced_count")
+        if "enforced_count" in applicability
+        else len(artifact.get("enforceable_contracts") or ())
+    )
+    advisory_count = (
+        applicability.get("advisory_count")
+        if "advisory_count" in applicability
+        else len(artifact.get("advisory_contracts") or ())
+    )
+    return {
+        "candidate_count": int(applicability.get("contract_candidate_count") or 0),
+        "enforced_count": int(enforced_count or 0),
+        "advisory_count": int(advisory_count or 0),
+        "omitted_count": int(applicability.get("omitted_count") or 0),
+        "omitted_reasons": {
+            str(reason): int(count)
+            for reason, count in dict(
+                artifact.get("contract_omission_reasons") or {}
+            ).items()
+        },
+    }
+
+
+def _catalog_structural_evidence(
+    schema_evidence: Evidence | None,
+    catalog_evidence: tuple[Evidence, ...],
+) -> tuple[Evidence, ...]:
+    evidence = []
+    for item in (schema_evidence, *catalog_evidence):
+        if item is None or not item.accepted:
+            continue
+        if item.owner != "catalog":
+            continue
+        if item.kind in {
+            "schema.asset_profile",
+            "schema.search_result",
+            "catalog.source_registered",
+            "catalog.profile",
+        }:
+            evidence.append(item)
+    return _dedupe_evidence(evidence)
+
+
+def _schema_from_catalog_evidence(
+    catalog_evidence: tuple[Evidence, ...],
+    relationship_evidence: tuple[Evidence, ...],
+) -> dict[str, Any]:
+    if not catalog_evidence:
+        return {}
+    tables: dict[str, dict[str, Any]] = {}
+    foreign_keys: list[dict[str, Any]] = []
+    database_type: str | None = None
+    database_name: str | None = None
+
+    for evidence in catalog_evidence:
+        payload = dict(evidence.payload)
+        database_type = database_type or _optional_string(payload.get("database_type"))
+        database_name = database_name or _optional_string(payload.get("database_name"))
+        schema = payload.get("schema")
+        if isinstance(schema, dict):
+            database_type = database_type or _optional_string(
+                schema.get("database_type")
+            )
+            database_name = database_name or _optional_string(
+                schema.get("database_name")
+            )
+            _merge_catalog_tables(tables, schema.get("tables"))
+            foreign_keys.extend(_foreign_keys_from_payload(schema))
+        if evidence.kind == "schema.asset_profile":
+            table = _table_from_asset_profile(payload)
+            if table is not None:
+                _merge_table(tables, table)
+            foreign_keys.extend(_foreign_keys_from_payload(payload))
+        elif evidence.kind == "schema.search_result":
+            _merge_catalog_tables(
+                tables, payload.get("tables") or payload.get("assets")
+            )
+        elif evidence.kind == "catalog.profile":
+            _merge_catalog_tables(
+                tables, payload.get("tables") or payload.get("assets")
+            )
+            foreign_keys.extend(_foreign_keys_from_payload(payload))
+
+    for evidence in relationship_evidence:
+        if evidence.accepted and evidence.owner == "catalog":
+            foreign_keys.extend(_foreign_keys_from_relationship_path(evidence))
+
+    if not tables and not foreign_keys:
+        return {}
+    for foreign_key in foreign_keys:
+        for table_name, column_name in (
+            (foreign_key.get("source_table"), foreign_key.get("source_column")),
+            (foreign_key.get("target_table"), foreign_key.get("target_column")),
+        ):
+            if not table_name:
+                continue
+            table = tables.setdefault(
+                str(table_name).lower(),
+                {"name": str(table_name), "columns": [], "metadata": {}},
+            )
+            if column_name:
+                _merge_column(table, {"name": column_name})
+    return {
+        "database_type": database_type,
+        "database_name": database_name,
+        "table_count": len(tables),
+        "tables": list(tables.values()),
+        "foreign_keys": _dedupe_foreign_keys(foreign_keys),
+        "metadata": {"structural_source": "catalog"},
+    }
+
+
+def _table_from_asset_profile(payload: dict[str, Any]) -> dict[str, Any] | None:
+    asset = payload.get("asset") if isinstance(payload.get("asset"), dict) else None
+    table = payload.get("table") if isinstance(payload.get("table"), dict) else None
+    source = table or asset
+    if source is None and payload.get("name"):
+        source = payload
+    if not isinstance(source, dict):
+        return None
+    name = _optional_string(
+        source.get("name")
+        or source.get("asset_ref")
+        or payload.get("table_name")
+        or payload.get("asset_ref")
+    )
+    if not name:
+        return None
+    columns = payload.get("fields") or payload.get("columns") or source.get("columns")
+    return {
+        "name": name,
+        "columns": [_column_from_catalog_field(item) for item in columns or ()],
+        "metadata": {
+            **dict(source.get("metadata") or {}),
+            "catalog_asset_ref": source.get("asset_ref") or name,
+        },
+    }
+
+
+def _merge_catalog_tables(
+    tables: dict[str, dict[str, Any]],
+    raw_tables: Any,
+) -> None:
+    if not isinstance(raw_tables, list):
+        return
+    for raw in raw_tables:
+        if not isinstance(raw, dict):
+            continue
+        name = _optional_string(raw.get("name") or raw.get("asset_ref"))
+        if not name:
+            continue
+        raw_columns = (
+            raw.get("columns") or raw.get("fields") or raw.get("matched_fields")
+        )
+        table = {
+            "name": name,
+            "columns": [_column_from_catalog_field(item) for item in raw_columns or ()],
+            "metadata": dict(raw.get("metadata") or {}),
+        }
+        _merge_table(tables, table)
+
+
+def _merge_table(
+    tables: dict[str, dict[str, Any]],
+    table: dict[str, Any],
+) -> None:
+    name = _optional_string(table.get("name"))
+    if not name:
+        return
+    key = name.lower()
+    existing = tables.setdefault(
+        key,
+        {"name": name, "columns": [], "metadata": {}},
+    )
+    existing["metadata"] = {
+        **dict(existing.get("metadata") or {}),
+        **dict(table.get("metadata") or {}),
+    }
+    for column in table.get("columns", []) or []:
+        _merge_column(existing, column)
+
+
+def _merge_column(table: dict[str, Any], column: dict[str, Any]) -> None:
+    name = _optional_string(column.get("name"))
+    if not name:
+        return
+    columns = table.setdefault("columns", [])
+    existing_names = {
+        str(item.get("name") or "").lower()
+        for item in columns
+        if isinstance(item, dict)
+    }
+    if name.lower() in existing_names:
+        return
+    columns.append(
+        {
+            "name": name,
+            "data_type": column.get("data_type") or column.get("type"),
+            "is_primary_key": column.get("is_primary_key"),
+        }
+    )
+
+
+def _column_from_catalog_field(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        "name": value.get("name"),
+        "data_type": value.get("data_type") or value.get("type"),
+        "is_primary_key": value.get("is_primary_key"),
+    }
+
+
+def _foreign_keys_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    foreign_keys = list(payload.get("foreign_keys", []) or [])
+    for relationship in payload.get("relationships", []) or []:
+        if not isinstance(relationship, dict):
+            continue
+        foreign_key = _foreign_key_from_relationship(relationship)
+        if foreign_key is not None:
+            foreign_keys.append(foreign_key)
+    return [
+        item
+        for item in (_compact_foreign_key(item) for item in foreign_keys)
+        if item is not None
+    ]
+
+
+def _foreign_keys_from_relationship_path(evidence: Evidence) -> list[dict[str, Any]]:
+    foreign_keys: list[dict[str, Any]] = []
+    for path in evidence.payload.get("paths", []) or []:
+        if not isinstance(path, dict):
+            continue
+        for join in path.get("joins", []) or path.get("relationships", []) or []:
+            if not isinstance(join, dict):
+                continue
+            foreign_key = _foreign_key_from_relationship(join)
+            if foreign_key is not None:
+                foreign_keys.append(
+                    {
+                        **foreign_key,
+                        "metadata": {
+                            "relationship_evidence_id": evidence.id,
+                            "relationship_evidence_owner": evidence.owner,
+                        },
+                    }
+                )
+    return foreign_keys
+
+
+def _foreign_key_from_relationship(value: dict[str, Any]) -> dict[str, Any] | None:
+    source_table = _optional_string(
+        value.get("source_table")
+        or value.get("source_asset")
+        or value.get("left_table")
+        or value.get("left_asset")
+    )
+    source_column = _optional_string(
+        value.get("source_column")
+        or value.get("source_field")
+        or value.get("left_column")
+        or value.get("left_field")
+    )
+    target_table = _optional_string(
+        value.get("target_table")
+        or value.get("target_asset")
+        or value.get("right_table")
+        or value.get("right_asset")
+    )
+    target_column = _optional_string(
+        value.get("target_column")
+        or value.get("target_field")
+        or value.get("right_column")
+        or value.get("right_field")
+    )
+    if not all((source_table, source_column, target_table, target_column)):
+        return None
+    return {
+        "source_table": source_table,
+        "source_column": source_column,
+        "target_table": target_table,
+        "target_column": target_column,
+    }
+
+
+def _compact_foreign_key(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    foreign_key = _foreign_key_from_relationship(value)
+    if foreign_key is None:
+        return None
+    if isinstance(value.get("metadata"), dict):
+        foreign_key["metadata"] = dict(value["metadata"])
+    return foreign_key
+
+
+def _dedupe_foreign_keys(values: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str, str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for value in values:
+        key = (
+            str(value.get("source_table") or "").lower(),
+            str(value.get("source_column") or "").lower(),
+            str(value.get("target_table") or "").lower(),
+            str(value.get("target_column") or "").lower(),
+        )
+        if not all(key) or key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
+
+
+def _relationship_evidence_details(
+    relationship_evidence: tuple[Evidence, ...],
+) -> tuple[dict[str, Any], ...]:
+    details = []
+    for evidence in relationship_evidence:
+        if not evidence.accepted or evidence.kind != "schema.relationship_path":
+            continue
+        details.append(
+            {
+                "id": evidence.id,
+                "kind": evidence.kind,
+                "owner": evidence.owner,
+                "task_id": evidence.task_id,
+                "accepted": evidence.accepted,
+                "payload_fingerprint": evidence.metadata.get("payload_fingerprint")
+                or persisted_fingerprint(evidence.payload),
+                "reachable": evidence.payload.get("reachable"),
+                "paths": [
+                    {
+                        "tables": list(path.get("tables") or path.get("assets") or []),
+                        "joins": [
+                            dict(join)
+                            for join in path.get("joins", []) or []
+                            if isinstance(join, dict)
+                        ],
+                    }
+                    for path in evidence.payload.get("paths", []) or []
+                    if isinstance(path, dict)
+                ],
+            }
+        )
+    return tuple(details)
+
+
+def _dedupe_evidence(values: Iterable[Evidence]) -> tuple[Evidence, ...]:
+    seen: set[str] = set()
+    out: list[Evidence] = []
+    for evidence in values:
+        key = evidence.id or persisted_fingerprint(
+            {
+                "kind": evidence.kind,
+                "owner": evidence.owner,
+                "payload": evidence.payload,
+            }
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(evidence)
+    return tuple(out)
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _compact_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -379,11 +957,46 @@ def _render_context_summary(context: DbPlanningContext) -> str:
             lines.append("Session monitor referents:")
             for monitor in monitors[:10]:
                 lines.append(f"- {monitor}")
+    query_scopes = context.session_context.get("query_scopes")
+    if isinstance(query_scopes, list) and query_scopes:
+        lines.append("Session query scopes:")
+        for scope in query_scopes[:4]:
+            if not isinstance(scope, dict):
+                continue
+            parts = []
+            tables = scope.get("tables") or []
+            if tables:
+                parts.append("tables " + ", ".join(str(item) for item in tables[:8]))
+            filter_text = _session_filter_text(scope.get("filters"))
+            if filter_text:
+                parts.append("filters " + filter_text)
+            row_count = scope.get("result_row_count")
+            if isinstance(row_count, int):
+                parts.append(f"result rows {row_count}")
+            if parts:
+                lines.append("- " + "; ".join(parts))
     return "\n".join(lines)
+
+
+def _session_filter_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    filters = []
+    for item in value[:12]:
+        if not isinstance(item, dict):
+            continue
+        column = str(item.get("column") or "").strip()
+        operator = str(item.get("operator") or "").strip()
+        values = item.get("values")
+        if not column or not operator or not isinstance(values, list) or not values:
+            continue
+        filters.append(f"{column} {operator} {', '.join(str(v) for v in values[:8])}")
+    return "; ".join(filters)
 
 
 def _compact_session_context(request: DbRequest) -> dict[str, Any]:
     session_context = db_session_context_from_request(request)
+    context: object
     if session_context is not None:
         context = session_context.to_request_dict()
     else:
@@ -394,6 +1007,7 @@ def _compact_session_context(request: DbRequest) -> dict[str, Any]:
         return {}
     referents = context.get("referents")
     recent_operations = context.get("recent_operations")
+    query_scopes = context.get("query_scopes")
     durable_ids = context.get("durable_ids")
     diagnostics = context.get("diagnostics")
     compact: dict[str, Any] = {}
@@ -412,6 +1026,10 @@ def _compact_session_context(request: DbRequest) -> dict[str, Any]:
         }
     if isinstance(recent_operations, list):
         compact["recent_operations"] = recent_operations[:8]
+    if isinstance(query_scopes, list):
+        compact["query_scopes"] = [
+            dict(item) for item in query_scopes[:4] if isinstance(item, dict)
+        ]
     if isinstance(durable_ids, dict):
         compact["durable_ids"] = dict(durable_ids)
     if isinstance(diagnostics, dict):
@@ -424,6 +1042,7 @@ def _compact_session_context(request: DbRequest) -> dict[str, Any]:
             "conversation_message_count",
             "recent_operation_count",
             "evidence_operation_count",
+            "query_scope_count",
         ):
             if key in diagnostics:
                 compact["diagnostics"][key] = diagnostics[key]
@@ -433,8 +1052,6 @@ def _compact_session_context(request: DbRequest) -> dict[str, Any]:
 def _column_value_hints(
     catalog_evidence: tuple[Evidence, ...],
     schema: dict[str, Any],
-    *,
-    profiles_stale: bool = False,
 ) -> tuple[dict[str, Any], ...]:
     hints: list[dict[str, Any]] = []
     for evidence in catalog_evidence:
@@ -442,57 +1059,25 @@ def _column_value_hints(
             for hint in evidence.payload.get("hints", []) or []:
                 if isinstance(hint, dict):
                     hints.append(_compact_column_value_hint(hint))
-        elif evidence.kind == "schema.column_value_profile":
-            for profile in evidence.payload.get("profiles", []) or []:
-                if isinstance(profile, dict):
-                    hints.append(_hint_from_profile(profile))
-        elif evidence.kind == "schema.column_value_search_result":
-            for profile in evidence.payload.get("profiles", []) or []:
-                if isinstance(profile, dict):
-                    hints.append(_hint_from_profile(profile))
-
-    if not hints:
-        metadata = schema.get("metadata") or {}
-        profiles = (
-            metadata.get("column_value_profiles") if isinstance(metadata, dict) else {}
-        )
-        if isinstance(profiles, dict):
-            for profile in profiles.values():
-                if isinstance(profile, dict):
-                    hints.append(_hint_from_profile(profile, stale=profiles_stale))
 
     deduped: dict[tuple[str, str], dict[str, Any]] = {}
     for hint in hints:
         key = (str(hint.get("table") or ""), str(hint.get("column") or ""))
-        if (
-            key[0]
-            and key[1]
-            and key not in deduped
-            and planner_eligible_column_value_hint(hint)
-        ):
+        if not key[0] or not key[1] or not planner_eligible_column_value_hint(hint):
+            continue
+        existing = deduped.get(key)
+        if existing is None or _prefer_column_value_hint(hint, existing):
             deduped[key] = hint
     return tuple(deduped.values())
 
 
-def _hint_from_profile(
-    profile: dict[str, Any], *, stale: bool = False
-) -> dict[str, Any]:
-    return _compact_column_value_hint(
-        {
-            "table": profile.get("table"),
-            "column": profile.get("column"),
-            "profile_ref": profile.get("profile_ref")
-            or f"{profile.get('table')}.{profile.get('column')}",
-            "distinct_count": profile.get("distinct_count"),
-            "observed_values": profile.get("top_values") or [],
-            "profile_status": "stale" if stale else profile.get("profile_status"),
-            "sampled": profile.get("sampled"),
-            "truncated": profile.get("truncated"),
-            "redacted": profile.get("redacted"),
-            "stale": stale,
-            "stale_reason": profile.get("stale_reason"),
-        }
-    )
+def _prefer_column_value_hint(
+    candidate: dict[str, Any],
+    existing: dict[str, Any],
+) -> bool:
+    if candidate.get("candidate_mapping") and not existing.get("candidate_mapping"):
+        return True
+    return False
 
 
 def _compact_column_value_hint(hint: dict[str, Any]) -> dict[str, Any]:
@@ -559,13 +1144,35 @@ def _evidence_ref(evidence: Evidence) -> dict[str, Any]:
         "owner": evidence.owner,
         "task_id": evidence.task_id,
         "payload_fingerprint": evidence.metadata.get("payload_fingerprint")
-        or _fingerprint(evidence.payload),
+        or persisted_fingerprint(evidence.payload),
     }
 
 
-def _fingerprint(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+def _artifact_evidence(
+    *,
+    kind: str,
+    operation_id: str,
+    task_id: str | None,
+    payload: dict[str, Any],
+) -> Evidence:
+    payload_fingerprint = persisted_fingerprint(payload)
+    evidence_id = persisted_fingerprint(
+        {
+            "operation_id": operation_id,
+            "task_id": task_id,
+            "kind": kind,
+            "payload": payload,
+        }
+    )
+    return Evidence(
+        id=f"evidence-{evidence_id}",
+        kind=kind,
+        owner="db_runtime",
+        operation_id=operation_id,
+        task_id=task_id,
+        payload=payload,
+        metadata={"payload_fingerprint": payload_fingerprint},
+    )
 
 
 def _from_db_options(metadata: dict[str, Any]) -> dict[str, Any]:

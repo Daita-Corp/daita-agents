@@ -46,6 +46,8 @@ async def handle_remember(
     from .auto_classify import infer_category, infer_importance
 
     backend = plugin.backend
+    if backend is None:
+        raise RuntimeError("MemoryPlugin must be set up before storing memory")
     _fact_extractor = plugin._fact_extractor
     _working_memory = plugin._working_memory
     _memory_graph = plugin._memory_graph
@@ -71,7 +73,7 @@ async def handle_remember(
             if item.get("importance", 0.5) == 0.5:
                 item["importance"] = infer_importance(item["content"], 0.5)
 
-        extra_metadata_list = None
+        extra_metadata_list: list[dict[str, bool] | None] | None = None
         if _fact_extractor is not None:
             extra_metadata_list = [{"_facts_extracted": False} for _ in items]
 
@@ -117,7 +119,7 @@ async def handle_remember(
             }
 
     # Build extra metadata flags
-    extra_metadata = {}
+    extra_metadata: dict[str, bool] = {}
     if _fact_extractor is not None:
         extra_metadata["_facts_extracted"] = False
     if importance >= 0.7 and _checker is not None:
@@ -199,6 +201,8 @@ async def handle_recall(
 ):
     """Search previously stored agent memories by meaning."""
     backend = plugin.backend
+    if backend is None:
+        raise RuntimeError("MemoryPlugin must be set up before recalling memory")
     _reranker = plugin._reranker
     _memory_graph = plugin._memory_graph
 
@@ -217,7 +221,10 @@ async def handle_recall(
     # Track access for usage-based pruning signals
     chunk_ids = [r["chunk_id"] for r in results if r.get("chunk_id")]
     if chunk_ids:
-        backend.search.track_access(chunk_ids)
+        search = backend.search
+        if search is None:
+            raise RuntimeError("Memory backend search is unavailable")
+        search.track_access(chunk_ids)
 
     # Graph expansion: pull in connected memories for high-confidence hits
     if _memory_graph and results:
@@ -250,7 +257,10 @@ async def handle_list_by_category(
     limit: int = 100,
 ):
     """Enumerate ALL stored memories in a category without semantic ranking."""
-    results = await plugin.backend.list_by_category(
+    backend = plugin.backend
+    if backend is None:
+        raise RuntimeError("MemoryPlugin must be set up before listing memory")
+    results = await backend.list_by_category(
         category=category, min_importance=min_importance, limit=limit
     )
     return serialize_results(results)
@@ -263,22 +273,30 @@ async def handle_update_memory(
     importance: float = 0.5,
 ):
     """Replace an existing memory with updated information."""
-    return await plugin.backend.update_memory(query, new_content, importance)
+    backend = plugin.backend
+    if backend is None:
+        raise RuntimeError("MemoryPlugin must be set up before updating memory")
+    return await backend.update_memory(query, new_content, importance)
 
 
 async def handle_read_memory(plugin: MemoryPlugin, file: str = "MEMORY.md"):
     """Read a memory file."""
+    backend = plugin.backend
+    if backend is None:
+        raise RuntimeError("MemoryPlugin must be set up before reading memory")
     if file == "MEMORY.md":
-        return await plugin.backend.read_memory_md()
+        return await backend.read_memory_md()
     elif file == "today":
-        return await plugin.backend.read_today_log()
+        return await backend.read_today_log()
     else:
-        return await plugin.backend.read_memory(file)
+        return await backend.read_memory(file)
 
 
 async def handle_list_memories(plugin: MemoryPlugin, include_stats: bool = False):
     """List available memory files and optionally show memory statistics."""
     backend = plugin.backend
+    if backend is None:
+        raise RuntimeError("MemoryPlugin must be set up before listing memory")
     today = date.today().isoformat()
     files = []
     try:
@@ -315,12 +333,14 @@ async def handle_query_facts(
 ):
     """Query structured facts extracted from memories."""
     backend = plugin.backend
+    if backend is None:
+        raise RuntimeError("MemoryPlugin must be set up before querying memory facts")
     _fact_extractor = plugin._fact_extractor
     _memory_graph = plugin._memory_graph
 
     # Lazy extraction: extract facts for chunks that need them (parallelized)
     unextracted = await backend.get_unextracted_chunks(limit=50)
-    if unextracted:
+    if unextracted and _fact_extractor is not None:
         from .fact_extractor import FactExtractor
 
         sem = asyncio.Semaphore(5)
@@ -357,7 +377,10 @@ async def handle_query_facts(
 
 async def handle_scratch(plugin: MemoryPlugin, content: str, key: Optional[str] = None):
     """Store temporary info in session working memory."""
-    assigned_key = plugin._working_memory.scratch(content, key)
+    working_memory = plugin._working_memory
+    if working_memory is None:
+        raise RuntimeError("Working memory is not enabled")
+    assigned_key = working_memory.scratch(content, key)
     return {
         "status": "stored",
         "key": assigned_key,
@@ -367,7 +390,10 @@ async def handle_scratch(plugin: MemoryPlugin, content: str, key: Optional[str] 
 
 async def handle_think(plugin: MemoryPlugin, query: str, limit: int = 5):
     """Search session working memory (scratch items only)."""
-    return plugin._working_memory.think(query, limit)
+    working_memory = plugin._working_memory
+    if working_memory is None:
+        raise RuntimeError("Working memory is not enabled")
+    return working_memory.think(query, limit)
 
 
 async def handle_reinforce(
@@ -389,6 +415,8 @@ async def handle_reinforce(
         memory_ids = [memory_ids]
 
     backend = plugin.backend
+    if backend is None:
+        raise RuntimeError("MemoryPlugin must be set up before reinforcing memory")
     reinforcement = {
         "outcome": outcome,
         "signal": signal_strength,
@@ -422,6 +450,9 @@ async def handle_reinforce(
 
 async def handle_traverse_memory(plugin: MemoryPlugin, entity: str, max_depth: int = 2):
     """Walk the memory knowledge graph to find all connected knowledge."""
-    return await plugin._memory_graph.traverse_entity(
+    memory_graph = plugin._memory_graph
+    if memory_graph is None:
+        raise RuntimeError("Memory graph is not enabled")
+    return await memory_graph.traverse_entity(
         entity, direction="both", max_depth=max_depth
     )

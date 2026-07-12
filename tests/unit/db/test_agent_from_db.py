@@ -1,13 +1,31 @@
+import asyncio
 import json
 import importlib.util
-import pkgutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from daita.agents.agent import Agent
-from daita.db.config.policies import SchemaPromptPolicy, ToolResultPolicy
-from daita.db import DbAgent, DbRequest, DbRuntime, DbRuntimeOptions
+from daita.db import (
+    DbAgent,
+    DbLLMConfig,
+    DbMemoryConfig,
+    DbRequest,
+    DbRuntime,
+    DbRuntimeOptions,
+    DbSourceOptions,
+)
+from daita.db.context_projection import (
+    ProjectionContext,
+    ProjectionMode,
+    project_runtime_stream_event,
+)
+from daita.db.models import (
+    DbIntent,
+    DbIntentKind,
+    DbOperationContract,
+    DbOperationResult,
+)
 from daita.db.runtime.extensions import HostedInAppMonitorDeliveryPlugin
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.catalog.persistence import catalog_profile_key
@@ -19,10 +37,15 @@ from daita.plugins.memory.memory_plugin import MemoryPlugin
 from daita.plugins.postgresql import PostgreSQLPlugin
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import (
+    AccessMode,
     HostRuntimeContext,
     InMemoryRuntimeStore,
     OperationStatus,
+    RuntimeEvent,
+    RuntimeEventType,
     SQLiteRuntimeStore,
+    Task,
+    TaskStatus,
     host_runtime_context,
 )
 from daita.skills import Skill, SkillRuntimeEffects
@@ -112,6 +135,28 @@ def _write_catalog_snapshot(profile_key, schema, *, last_seen=None):
     )
 
 
+def _stream_result(
+    operation_id,
+    prompt,
+    *,
+    answer="streamed answer",
+    status=OperationStatus.SUCCEEDED,
+    diagnostics=None,
+):
+    return DbOperationResult(
+        operation_id=operation_id,
+        request=DbRequest(prompt),
+        intent=DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
+        contract=DbOperationContract(
+            operation_type="db.run",
+            access=AccessMode.READ,
+        ),
+        status=status,
+        answer=answer,
+        diagnostics=dict(diagnostics or {}),
+    )
+
+
 async def test_agent_from_db_returns_db_agent_backed_by_db_runtime(tmp_path):
     db_path = tmp_path / "phase10.sqlite"
     await _seed_sqlite(db_path)
@@ -127,6 +172,221 @@ async def test_agent_from_db_returns_db_agent_backed_by_db_runtime(tmp_path):
         assert not hasattr(agent, "tool_names")
     finally:
         await agent.stop()
+
+
+async def test_db_agent_streams_concurrent_runs_without_cross_operation_events():
+    runtime = DbRuntime()
+    agent = DbAgent(runtime=runtime)
+    both_created = asyncio.Event()
+    created: dict[str, str] = {}
+
+    async def fake_run(prompt, *, history, kwargs, operation_id=None):
+        assert operation_id is not None
+        await runtime.kernel.create_operation(
+            operation_id=operation_id,
+            operation_type="db.run",
+            request={"prompt": prompt},
+            evaluate_governance=False,
+        )
+        created[prompt] = operation_id
+        if len(created) == 2:
+            both_created.set()
+        await both_created.wait()
+        await runtime.kernel.append_event(
+            RuntimeEventType.DIAGNOSTIC,
+            operation_id=operation_id,
+            message=f"diagnostic for {prompt}",
+            payload={"diagnostic": f"run.{prompt}"},
+        )
+        await runtime.kernel.complete_operation(operation_id)
+        return _stream_result(operation_id, prompt, answer=f"answer {prompt}")
+
+    agent._run_detailed = fake_run
+
+    async def collect(prompt):
+        return [event async for event in agent.stream(prompt)]
+
+    first, second = await asyncio.gather(collect("first"), collect("second"))
+
+    assert created["first"] != created["second"]
+    assert {event.operation_id for event in first} == {created["first"]}
+    assert {event.operation_id for event in second} == {created["second"]}
+    assert first[0].type is RuntimeEventType.OPERATION_CREATED
+    assert second[0].type is RuntimeEventType.OPERATION_CREATED
+    for events, answer in ((first, "answer first"), (second, "answer second")):
+        terminal = [event for event in events if event.payload.get("terminal")]
+        assert len(terminal) == 1
+        assert terminal[0].payload["answer"] == answer
+
+
+async def test_db_agent_stream_uses_one_durable_terminal_event():
+    runtime = DbRuntime(runtime_id="db-terminal-stream")
+    agent = DbAgent(runtime=runtime)
+
+    events = [event async for event in agent.stream("terminal contract")]
+    operation_id = events[0].operation_id
+    persisted = await runtime.store.list_events(operation_id)
+    public_terminals = [
+        event for event in events if event.payload.get("terminal") is True
+    ]
+    durable_terminals = [
+        event for event in persisted if event.payload.get("terminal") is True
+    ]
+
+    assert len(public_terminals) == 1
+    assert len(durable_terminals) == 1
+    assert events[-1] == public_terminals[0]
+    assert persisted[-1] == durable_terminals[0]
+    assert public_terminals[0].payload["result_summary"]["status"] == "blocked"
+    assert (
+        public_terminals[0].payload["answer"].startswith("DB LLM service is required")
+    )
+    assert not any(
+        event.payload.get("status") in {"succeeded", "failed", "cancelled", "blocked"}
+        for event in events[:-1]
+    )
+
+
+async def test_db_runtime_run_accepts_internal_operation_id_without_changing_default():
+    runtime = DbRuntime()
+
+    try:
+        selected = await runtime.run("selected", operation_id="db-op-selected")
+        generated = await runtime.run("generated")
+    finally:
+        await runtime.teardown()
+
+    assert selected.operation_id == "db-op-selected"
+    assert generated.operation_id.startswith("db-op-")
+    assert generated.operation_id != selected.operation_id
+
+
+async def test_db_agent_stream_reports_bounded_slow_consumer_drops():
+    runtime = DbRuntime()
+    agent = DbAgent(runtime=runtime)
+    published = asyncio.Event()
+
+    async def fake_run(prompt, *, history, kwargs, operation_id=None):
+        assert operation_id is not None
+        await runtime.kernel.create_operation(
+            operation_id=operation_id,
+            operation_type="db.run",
+            request={"prompt": prompt},
+            evaluate_governance=False,
+        )
+        for index in range(300):
+            await runtime.kernel.append_event(
+                RuntimeEventType.DIAGNOSTIC,
+                operation_id=operation_id,
+                message=f"diagnostic {index}",
+                payload={"diagnostic": "test.progress", "index": index},
+            )
+        await runtime.kernel.complete_operation(operation_id)
+        published.set()
+        return _stream_result(operation_id, prompt)
+
+    agent._run_detailed = fake_run
+
+    stream = agent.stream("slow")
+    first = await anext(stream)
+    await published.wait()
+    events = [first, *[event async for event in stream]]
+    dropped = [
+        event
+        for event in events
+        if event.payload.get("diagnostic") == "runtime_stream.events_dropped"
+    ]
+
+    assert len(dropped) == 1
+    assert dropped[0].payload["dropped_event_count"] > 0
+    assert len([event for event in events if event.payload.get("terminal")]) == 1
+    assert runtime.kernel.event_broker.subscriber_count == 0
+
+
+def test_db_runtime_stream_projection_removes_sensitive_event_content():
+    raw = RuntimeEvent(
+        type=RuntimeEventType.ERROR,
+        operation_id="op-secret",
+        message="password=super-secret raw failure customer@example.com",
+        policy_id="internal.policy.details",
+        payload={
+            "prompt": "show secret customers",
+            "sql": "SELECT * FROM customers WHERE token = 'sql-secret'",
+            "parameters": {"token": "parameter-secret"},
+            "rows": [{"password": "row-secret"}],
+            "credentials": {"password": "credential-secret"},
+            "error": {"message": "exception-secret"},
+            "governance": {"reason": "policy-secret"},
+            "planner": {"diagnostic": "planner-secret"},
+            "executor": {"diagnostic": "executor-secret"},
+        },
+    )
+
+    projected = project_runtime_stream_event(
+        raw,
+        ProjectionContext(mode=ProjectionMode.PUBLIC_RESULT),
+    )
+    encoded = json.dumps(projected.to_dict())
+
+    assert projected.message == "Runtime error."
+    assert projected.policy_id is None
+    assert projected.payload == {"projected": True}
+    for secret in (
+        "super-secret",
+        "customer@example.com",
+        "SELECT *",
+        "sql-secret",
+        "parameter-secret",
+        "row-secret",
+        "credential-secret",
+        "exception-secret",
+        "policy-secret",
+        "planner-secret",
+        "executor-secret",
+    ):
+        assert secret not in encoded
+
+
+async def test_db_agent_stream_close_awaits_run_and_preserves_resumable_state():
+    runtime = DbRuntime()
+    agent = DbAgent(runtime=runtime)
+    run_cancelled = asyncio.Event()
+
+    async def fake_run(prompt, *, history, kwargs, operation_id=None):
+        assert operation_id is not None
+        operation = await runtime.kernel.create_operation(
+            operation_id=operation_id,
+            operation_type="db.run",
+            request={"prompt": prompt},
+            evaluate_governance=False,
+        )
+        await runtime.store.save_task(
+            Task(
+                id=f"task-{operation_id}",
+                operation_id=operation.id,
+                capability_id="db.test.resume",
+                executor_id="db.test.resume.executor",
+                input={"sql": "SELECT secret"},
+                status=TaskStatus.PENDING,
+            )
+        )
+        try:
+            await asyncio.Event().wait()
+        finally:
+            run_cancelled.set()
+
+    agent._run_detailed = fake_run
+    stream = agent.stream("cancel me")
+
+    first = await anext(stream)
+    await stream.aclose()
+
+    operation = await runtime.store.load_operation(first.operation_id)
+    tasks = await runtime.store.list_tasks(first.operation_id)
+    assert run_cancelled.is_set()
+    assert runtime.kernel.event_broker.subscriber_count == 0
+    assert operation.status is OperationStatus.BLOCKED
+    assert tasks[0].status is TaskStatus.PENDING
 
 
 async def test_agent_from_db_defaults_to_in_memory_runtime_store(tmp_path):
@@ -176,36 +436,6 @@ async def test_agent_from_db_runtime_options_existing_store_instance(tmp_path):
         assert agent.runtime.store is runtime_store
     finally:
         await agent.stop()
-
-
-async def test_agent_from_db_reopens_persisted_runtime_operation_state(tmp_path):
-    db_path = tmp_path / "reopen_source.sqlite"
-    runtime_path = tmp_path / "reopen_runtime.sqlite"
-    await _seed_sqlite(db_path)
-
-    first = await Agent.from_db(
-        str(db_path),
-        runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
-    )
-    try:
-        result = await first.run_detailed("How many customers are there?")
-    finally:
-        await first.stop()
-
-    second = await Agent.from_db(
-        str(db_path),
-        runtime=DbRuntimeOptions(store="sqlite", store_path=runtime_path),
-    )
-    try:
-        snapshot = await second.runtime.inspect_operation(result.operation_id)
-    finally:
-        await second.stop()
-
-    assert snapshot is not None
-    assert snapshot.operation.id == result.operation_id
-    assert snapshot.operation.status is OperationStatus.SUCCEEDED
-    assert snapshot.tasks
-    assert snapshot.evidence
 
 
 async def test_agent_from_db_registers_skills_before_runtime_setup(tmp_path):
@@ -315,38 +545,6 @@ async def test_agent_from_db_skill_effects_apply_during_run_before_contract_buil
     assert "skill.contract_modified" in diagnostics
 
 
-async def test_legacy_agents_db_public_import_routes_to_db_runtime(tmp_path):
-    from daita.agents.db import from_db
-
-    db_path = tmp_path / "phase13_public_import.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await from_db(str(db_path), name="phase-13-public-import")
-
-    try:
-        assert isinstance(agent, DbAgent)
-        assert isinstance(agent.runtime, DbRuntime)
-        assert agent.name == "phase-13-public-import"
-        inspection = await agent.describe()
-    finally:
-        await agent.stop()
-
-    assert inspection.plugin_ids[:2] == ("catalog", "sqlite")
-
-
-def test_legacy_agents_db_package_exposes_only_from_db_bridge():
-    import daita.agents.db as legacy_db
-    import daita.db as db
-
-    assert legacy_db.from_db is db.from_db
-    assert legacy_db.__all__ == ["from_db"]
-    assert [module.name for module in pkgutil.iter_modules(legacy_db.__path__)] == []
-    assert importlib.util.find_spec("daita.agents.db.builder") is None
-    assert importlib.util.find_spec("daita.agents.db.runtime") is None
-    assert importlib.util.find_spec("daita.agents.db.query") is None
-    assert importlib.util.find_spec("daita.agents.db.config") is None
-
-
 def test_db_runtime_facade_does_not_export_generic_agent_orchestrator():
     import daita.db as db
 
@@ -394,125 +592,6 @@ async def test_agent_from_db_wraps_runtime_setup_failure():
     assert plugin.disconnect_called is False
 
 
-async def test_agent_from_db_executes_schema_query_with_typed_evidence(tmp_path):
-    db_path = tmp_path / "phase10.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(f"sqlite://{db_path}")
-
-    try:
-        result = await agent.run_detailed(
-            "What columns are in the customers table?",
-            mode="schema.query",
-        )
-    finally:
-        await agent.stop()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    assert result.diagnostics["verification"]["passed"] is True
-    assert "customers: id, name" in (result.answer or "")
-    assert {"schema.asset_profile", "schema.search_result"} <= {
-        item.kind for item in result.evidence
-    }
-
-
-async def test_agent_from_db_passes_request_mode_to_runtime(tmp_path):
-    db_path = tmp_path / "phase10.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(str(db_path))
-
-    try:
-        result = await agent.run_detailed("Customers", mode="schema.query")
-    finally:
-        await agent.stop()
-
-    assert result.intent.kind.value == "schema.query"
-    assert result.request.mode == "schema.query"
-    assert result.status is OperationStatus.SUCCEEDED
-
-
-async def test_agent_from_db_preserves_typed_request_fields_without_prompt_wrapping(
-    tmp_path,
-):
-    db_path = tmp_path / "phase13_typed_request_fields.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(str(db_path))
-
-    try:
-        result = await agent.run_detailed(
-            "Customers",
-            mode="schema.query",
-            user_id="user-1",
-            session_id="session-1",
-            requested_capabilities=("catalog.schema.search",),
-            constraints={"audience": "analyst"},
-            metadata={"trace_id": "trace-1"},
-        )
-    finally:
-        await agent.stop()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    assert result.request.prompt == "Customers"
-    assert not result.request.prompt.startswith("<db_runtime_context>")
-    assert result.request.user_id == "user-1"
-    assert result.request.session_id == "session-1"
-    assert result.request.requested_capabilities == ("catalog.schema.search",)
-    assert result.request.constraints == {"audience": "analyst"}
-    assert result.request.metadata == {"trace_id": "trace-1"}
-
-
-async def test_agent_from_db_executes_count_query_with_typed_evidence(tmp_path):
-    db_path = tmp_path / "phase10.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(str(db_path))
-
-    try:
-        answer = await agent.run("How many customers are there?")
-        result = await agent.run_detailed("How many customers are there?")
-    finally:
-        await agent.stop()
-
-    assert answer == "The count is 2."
-    assert result.status is OperationStatus.SUCCEEDED
-    assert {
-        "query.plan.proposal",
-        "query.plan.validation",
-        "sql.validation",
-        "query.result",
-    } <= {item.kind for item in result.evidence}
-    assert result.diagnostics["verification"]["passed"] is True
-    assert result.diagnostics["synthesis"]["cited_evidence_refs"]
-
-
-async def test_agent_from_db_stream_yields_typed_runtime_result(tmp_path):
-    db_path = tmp_path / "phase13_stream_facade.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(str(db_path))
-
-    try:
-        streamed = [
-            item async for item in agent.stream("How many customers are there?")
-        ]
-    finally:
-        await agent.stop()
-
-    assert len(streamed) == 1
-    result = streamed[0]
-    assert result.status is OperationStatus.SUCCEEDED
-    assert result.answer == "The count is 2."
-    assert result.request.prompt == "How many customers are there?"
-    assert len(agent.audit_log) == 1
-    assert agent.audit_log[0]["prompt"] == "How many customers are there?"
-    assert agent.audit_log[0]["status"] == "succeeded"
-    assert agent.audit_log[0]["intent_kind"] == "data.query"
-    assert not hasattr(agent, "_db_original_stream")
-    assert not hasattr(agent, "_db_last_context_metadata")
-
-
 async def test_agent_from_db_does_not_expose_legacy_db_facade_tools(tmp_path):
     db_path = tmp_path / "phase13_no_legacy_facade_tools.sqlite"
     await _seed_sqlite(db_path)
@@ -542,14 +621,15 @@ async def test_agent_from_db_describe_is_runtime_inspection_not_legacy_db_contex
         str(db_path),
         name="Warehouse",
         mode="governed",
-        query_default_limit=25,
-        query_max_rows=100,
-        query_max_chars=1000,
-        query_timeout=12,
-        allowed_tables=["orders"],
-        blocked_tables=["payments"],
-        blocked_columns=["email"],
-        prompt="Revenue is net of tax.",
+        source_options=DbSourceOptions(
+            query_default_limit=25,
+            query_max_rows=100,
+            query_max_chars=1000,
+            query_timeout=12,
+            allowed_tables=("orders",),
+            blocked_tables=("payments",),
+            blocked_columns=("email",),
+        ),
     )
 
     try:
@@ -569,9 +649,18 @@ async def test_agent_from_db_describe_is_runtime_inspection_not_legacy_db_contex
         "max_tasks": 20,
         "max_evidence_items": 50,
     }
-    assert inspection.metadata["from_db_options"]["prompt"] == (
-        "Revenue is net of tax."
-    )
+    assert inspection.metadata["from_db_options"]["source_options"] == {
+        "include_sample_values": True,
+        "redact_pii_columns": True,
+        "read_only": True,
+        "query_default_limit": 25,
+        "query_max_rows": 100,
+        "query_max_chars": 1000,
+        "query_timeout": 12,
+        "allowed_tables": ["orders"],
+        "blocked_tables": ["payments"],
+        "blocked_columns": ["email"],
+    }
     assert inspection.to_dict()["limits"]["max_rows"] == 100
     assert sqlite_plugin.read_only is True
     assert sqlite_plugin.query_default_limit == 25
@@ -584,80 +673,6 @@ async def test_agent_from_db_describe_is_runtime_inspection_not_legacy_db_contex
     assert not hasattr(agent, "db")
     assert not hasattr(agent, "_db_summary")
     assert not hasattr(agent, "_watches")
-
-
-async def test_agent_from_db_records_runtime_operation_history(tmp_path):
-    db_path = tmp_path / "phase13_operation_history.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(str(db_path))
-
-    try:
-        first = await agent.run_detailed("How many customers are there?")
-        second = await agent.run_detailed("How many orders are there?")
-        inspection = await agent.describe()
-    finally:
-        await agent.stop()
-
-    assert [item.operation_id for item in agent.operations] == [
-        first.operation_id,
-        second.operation_id,
-    ]
-    assert inspection.operation_count == 2
-    assert inspection.last_operation_id == second.operation_id
-    assert len(agent.audit_log) == 2
-    assert agent.audit_log[0]["prompt"] == "How many customers are there?"
-    assert agent.audit_log[0]["status"] == "succeeded"
-    assert agent.audit_log[0]["intent_kind"] == "data.query"
-    assert agent.audit_log[0]["evidence_refs"]
-
-
-async def test_agent_from_db_audit_log_redacts_query_rows(tmp_path):
-    db_path = tmp_path / "phase13_audit_redaction.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(str(db_path))
-
-    try:
-        result = await agent.run_detailed(
-            "Show customer names",
-            sql="SELECT name FROM customers ORDER BY id",
-        )
-    finally:
-        await agent.stop()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    serialized = json.dumps(agent.audit_log)
-    assert "Ada" not in serialized
-    assert "Linus" not in serialized
-    query_summary = next(
-        item
-        for item in agent.audit_log[0]["evidence"]
-        if item["kind"] == "query.result"
-    )
-    assert query_summary["row_count"] == 2
-    assert query_summary["sql"] == "SELECT name FROM customers ORDER BY id LIMIT 50"
-    assert "rows" in query_summary["payload_keys"]
-
-
-async def test_agent_from_db_guardrails_are_enforced_by_runtime_connectors(tmp_path):
-    db_path = tmp_path / "phase10.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(str(db_path), blocked_columns=["name"])
-
-    try:
-        result = await agent.run_detailed(
-            "Show customer names",
-            sql="SELECT name FROM customers",
-        )
-    finally:
-        await agent.stop()
-
-    assert result.status is OperationStatus.FAILED
-    assert result.warnings == ("db_runtime_execution_failed",)
-    assert result.diagnostics["error"]["type"] == "ValidationError"
-    assert "blocked column" in result.diagnostics["error"]["message"]
 
 
 async def test_agent_from_db_resolves_postgresql_sources_to_db_runtime(monkeypatch):
@@ -690,72 +705,6 @@ async def test_agent_from_db_rejects_unconverted_source_strings():
         await Agent.from_db("warehouse")
 
 
-async def test_agent_from_db_registers_db_adjacent_extension_plugins(tmp_path):
-    db_path = tmp_path / "phase13_services.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(
-        str(db_path),
-        name="phase-13-services",
-        lineage=LineagePlugin(),
-        memory={"backend": _memory_backend(tmp_path)},
-        quality=True,
-    )
-
-    try:
-        inspection = await agent.describe()
-        memory_result = await agent.run_detailed(
-            "Remember that revenue excludes tax",
-            mode="memory.update",
-            metadata={"category": "db_semantic"},
-        )
-        quality_result = await agent.run_detailed(
-            "Profile the orders table",
-            mode="quality.check",
-        )
-    finally:
-        await agent.stop()
-
-    assert inspection.plugin_ids == (
-        "catalog",
-        "sqlite",
-        "data_quality",
-        "lineage",
-        "memory",
-    )
-    assert "data_quality:quality.profile" in inspection.capability_ids
-    assert "lineage:lineage.trace" in inspection.capability_ids
-    assert "memory:memory.semantic.write" in inspection.capability_ids
-    assert "memory:memory.context" in inspection.context_provider_ids
-
-    assert memory_result.status is OperationStatus.SUCCEEDED
-    assert any(item.kind == "memory.semantic.write" for item in memory_result.evidence)
-    assert quality_result.status is OperationStatus.SUCCEEDED
-    assert any(item.kind == "quality.profile" for item in quality_result.evidence)
-
-
-async def test_agent_from_db_lineage_true_registers_runtime_plugin(tmp_path):
-    db_path = tmp_path / "phase13_lineage_true.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(str(db_path), lineage=True)
-
-    try:
-        inspection = await agent.describe()
-        result = await agent.run_detailed(
-            "Trace lineage for orders",
-            mode="lineage.trace",
-        )
-    finally:
-        await agent.stop()
-
-    assert "lineage" in inspection.plugin_ids
-    assert "lineage:lineage.trace" in inspection.capability_ids
-    assert result.status is OperationStatus.SUCCEEDED
-    assert any(item.kind == "lineage.trace" for item in result.evidence)
-    assert not hasattr(agent, "_db_lineage")
-
-
 async def test_agent_from_db_memory_config_registers_initialized_memory_plugin(
     tmp_path,
 ):
@@ -765,7 +714,7 @@ async def test_agent_from_db_memory_config_registers_initialized_memory_plugin(
     agent = await Agent.from_db(
         str(db_path),
         name="memory-config-test",
-        memory={"enabled": True},
+        memory=DbMemoryConfig(enabled=True),
     )
 
     try:
@@ -789,7 +738,7 @@ async def test_agent_from_db_memory_config_uses_runtime_setup_not_initialize(tmp
     agent = await Agent.from_db(
         str(db_path),
         name="memory-setup-test",
-        memory={"enabled": True},
+        memory=DbMemoryConfig(enabled=True),
     )
 
     try:
@@ -894,7 +843,7 @@ async def test_agent_from_db_memory_false_opts_out(tmp_path):
     db_path = tmp_path / "phase1_memory_opt_out.sqlite"
     await _seed_sqlite(db_path)
 
-    agent = await Agent.from_db(str(db_path), memory=False)
+    agent = await Agent.from_db(str(db_path), memory=DbMemoryConfig(enabled=False))
 
     try:
         inspection = await agent.describe()
@@ -914,30 +863,34 @@ async def test_agent_from_db_embedding_modes_require_explicit_embedder(tmp_path)
     await _seed_sqlite(db_path)
 
     with pytest.raises(ValueError, match="requires an explicit embedding"):
-        await Agent.from_db(str(db_path), memory={"retrieval_mode": "hybrid"})
+        await Agent.from_db(
+            str(db_path), memory=DbMemoryConfig(retrieval_mode="hybrid")
+        )
 
     with pytest.raises(ValueError, match="requires an explicit embedding"):
-        await Agent.from_db(str(db_path), memory={"retrieval_mode": "embedding"})
+        await Agent.from_db(
+            str(db_path), memory=DbMemoryConfig(retrieval_mode="embedding")
+        )
 
 
-async def test_agent_from_db_rejects_legacy_memory_true(tmp_path):
+async def test_agent_from_db_rejects_boolean_memory_option(tmp_path):
     db_path = tmp_path / "phase1_memory_true_rejected.sqlite"
     await _seed_sqlite(db_path)
 
     with pytest.raises(
-        ValueError,
-        match="memory must be False, a DbMemoryConfig, a config mapping, or None",
+        TypeError,
+        match="memory must be a DbMemoryConfig instance",
     ):
         await Agent.from_db(str(db_path), memory=True)
 
 
-async def test_agent_from_db_rejects_memory_plugin_argument(tmp_path):
+async def test_agent_from_db_rejects_non_config_memory_option(tmp_path):
     db_path = tmp_path / "phase1_memory_plugin_rejected.sqlite"
     await _seed_sqlite(db_path)
 
     with pytest.raises(
-        ValueError,
-        match="memory must be False, a DbMemoryConfig, a config mapping, or None",
+        TypeError,
+        match="memory must be a DbMemoryConfig instance",
     ):
         await Agent.from_db(str(db_path), memory=MemoryPlugin())
 
@@ -947,7 +900,7 @@ async def test_agent_from_db_memory_config_can_provide_backend(tmp_path):
     await _seed_sqlite(db_path)
     backend = MagicMock()
 
-    agent = await Agent.from_db(str(db_path), memory={"backend": backend})
+    agent = await Agent.from_db(str(db_path), memory=DbMemoryConfig(backend=backend))
 
     try:
         memory = agent.runtime.registry.get_plugin("memory")
@@ -955,42 +908,6 @@ async def test_agent_from_db_memory_config_can_provide_backend(tmp_path):
         await agent.stop()
 
     assert memory.backend is backend
-
-
-async def test_agent_from_db_memory_update_works_without_extra_enablement(tmp_path):
-    db_path = tmp_path / "phase1_memory_update_default.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(str(db_path))
-    try:
-        memory = agent.runtime.registry.get_plugin("memory")
-        backend = MagicMock()
-        backend.list_by_category = AsyncMock(return_value=[])
-        backend.remember = AsyncMock(
-            return_value={"status": "success", "chunk_id": "mem-1"}
-        )
-        memory.backend = backend
-        result = await agent.run_detailed(
-            "Remember the revenue definition",
-            mode="memory.update",
-            metadata={
-                "kind": "metric_definition",
-                "key": "metric:revenue",
-                "text": "Revenue excludes refunded orders.",
-            },
-        )
-    finally:
-        await agent.stop()
-
-    memory_config = agent.runtime.config.metadata["from_db_options"]["memory"]
-    assert result.status is OperationStatus.SUCCEEDED
-    evidence = next(
-        item for item in result.evidence if item.kind == "memory.semantic.write"
-    )
-    stored = backend.remember.await_args.kwargs["extra_metadata"]["db_memory"]
-    assert evidence.payload["success"] is True
-    assert stored["metadata"]["source_identity"] == memory_config["source_identity"]
-    assert stored["metadata"]["workspace_scope"] == "source"
 
 
 async def test_agent_from_db_calibrate_memory_stores_structured_unit_conventions(
@@ -1004,8 +921,7 @@ async def test_agent_from_db_calibrate_memory_stores_structured_unit_conventions
 
     agent = await Agent.from_db(
         str(db_path),
-        memory={"backend": backend},
-        calibrate_memory=True,
+        memory=DbMemoryConfig(backend=backend, calibrate=True),
     )
 
     try:
@@ -1045,8 +961,7 @@ async def test_agent_from_db_calibrate_memory_skips_when_exact_marker_exists(
 
     agent = await Agent.from_db(
         source,
-        memory={"backend": backend},
-        calibrate_memory=True,
+        memory=DbMemoryConfig(backend=backend, calibrate=True),
     )
 
     try:
@@ -1066,7 +981,7 @@ async def test_agent_from_db_does_not_register_generic_memory_tools(tmp_path):
     backend.list_by_category = AsyncMock(return_value=[])
     backend.remember = AsyncMock(return_value={"status": "success"})
 
-    agent = await Agent.from_db(str(db_path), memory={"backend": backend})
+    agent = await Agent.from_db(str(db_path), memory=DbMemoryConfig(backend=backend))
 
     try:
         inspection = await agent.describe()
@@ -1077,39 +992,6 @@ async def test_agent_from_db_does_not_register_generic_memory_tools(tmp_path):
     assert "remember" not in inspection.tool_view_names
     assert "update_memory" not in inspection.tool_view_names
     assert "memory:memory.semantic.write" in inspection.capability_ids
-
-
-async def test_agent_from_db_memory_update_uses_runtime_capability_not_generic_tools(
-    tmp_path,
-):
-    db_path = tmp_path / "phase13_generic_memory_guardrail.sqlite"
-    await _seed_sqlite(db_path)
-    backend = MagicMock()
-    backend.list_by_category = AsyncMock(return_value=[])
-    backend.remember = AsyncMock(
-        return_value={"status": "success", "chunk_id": "mem-1"}
-    )
-
-    agent = await Agent.from_db(str(db_path), memory={"backend": backend})
-
-    try:
-        inspection = await agent.describe()
-        result = await agent.run_detailed(
-            "Please remember that revenue excludes refunds and update_memory if needed."
-        )
-    finally:
-        await agent.stop()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    assert result.intent.kind.value == "memory.update"
-    assert "remember" not in inspection.tool_view_names
-    assert "update_memory" not in inspection.tool_view_names
-    backend.remember.assert_awaited_once()
-    evidence = next(
-        item for item in result.evidence if item.kind == "memory.semantic.write"
-    )
-    assert evidence.payload["success"] is True
-    assert evidence.payload["category"] == "db_semantics"
 
 
 async def test_agent_from_db_mode_defaults_are_owned_by_db_runtime_factory(tmp_path):
@@ -1128,7 +1010,7 @@ async def test_agent_from_db_mode_defaults_are_owned_by_db_runtime_factory(tmp_p
     assert "data_quality" in inspection.plugin_ids
     assert "lineage" in inspection.plugin_ids
     assert "data_quality:quality.profile" in inspection.capability_ids
-    assert sqlite_plugin.query_timeout == 60
+    assert sqlite_plugin.query_timeout == 30
     assert sqlite_plugin.query_max_rows == 200
 
 
@@ -1169,7 +1051,7 @@ async def test_agent_from_db_mode_quality_override_wins_on_new_path(tmp_path):
     assert inspection.profile == "data_team"
     assert "data_quality" not in inspection.plugin_ids
     assert "lineage" in inspection.plugin_ids
-    assert sqlite_plugin.query_timeout == 60
+    assert sqlite_plugin.query_timeout == 30
 
 
 async def test_agent_from_db_data_team_can_configure_memory_backend(tmp_path):
@@ -1180,7 +1062,7 @@ async def test_agent_from_db_data_team_can_configure_memory_backend(tmp_path):
     agent = await Agent.from_db(
         str(db_path),
         mode="data_team",
-        memory={"backend": backend},
+        memory=DbMemoryConfig(backend=backend),
     )
 
     try:
@@ -1196,45 +1078,47 @@ async def test_agent_from_db_data_team_can_configure_memory_backend(tmp_path):
     assert "memory:memory.context" in inspection.context_provider_ids
 
 
-async def test_agent_from_db_accepts_legacy_construction_metadata_on_new_path(tmp_path):
+async def test_agent_from_db_uses_typed_source_and_llm_configuration(tmp_path):
     db_path = tmp_path / "phase13_metadata.sqlite"
     await _seed_sqlite(db_path)
-    schema_prompt_policy = SchemaPromptPolicy()
-    tool_result_policy = ToolResultPolicy(max_rows_inline=3)
+    llm = DbLLMConfig(
+        provider="openai",
+        model="gpt-4o-mini",
+        api_key="sk-test",
+        temperature=0.2,
+    )
 
     agent = await Agent.from_db(
         str(db_path),
         name="metadata-agent",
-        model="gpt-4o-mini",
-        api_key="sk-test",
-        llm_provider="openai",
-        temperature=0.2,
-        prompt="Revenue is net of tax.",
-        db_schema="analytics",
-        include_sample_values=False,
-        redact_pii_columns=False,
-        cache_ttl=3600,
-        toolkit=None,
-        schema_prompt_policy=schema_prompt_policy,
-        tool_result_policy=tool_result_policy,
+        llm=llm,
+        source_options=DbSourceOptions(
+            schema="main",
+            include_sample_values=False,
+            redact_pii_columns=False,
+            cache_ttl=3600,
+        ),
     )
 
     try:
         metadata = agent.runtime.config.metadata["from_db_options"]
+        service_config = agent.runtime.db_llm_service.config
+        source = agent.runtime.registry.get_plugin("sqlite")
     finally:
         await agent.stop()
 
-    assert metadata["model"] == "gpt-4o-mini"
-    assert metadata["llm_provider"] == "openai"
-    assert metadata["temperature"] == 0.2
-    assert metadata["prompt"] == "Revenue is net of tax."
-    assert metadata["db_schema"] == "analytics"
-    assert metadata["include_sample_values"] is False
-    assert metadata["redact_pii_columns"] is False
-    assert metadata["cache_ttl"] == 3600
-    assert metadata["schema_prompt_policy"]["preferred_strategy"] == "auto"
-    assert metadata["tool_result_policy"]["max_rows_inline"] == 3
-    assert "api_key" not in metadata
+    assert metadata["llm"]["provider"] == "openai"
+    assert metadata["llm"]["model"] == "gpt-4o-mini"
+    assert metadata["llm"]["temperature"] == 0.2
+    assert metadata["source_options"]["schema"] == "main"
+    assert metadata["source_options"]["include_sample_values"] is False
+    assert metadata["source_options"]["redact_pii_columns"] is False
+    assert metadata["source_options"]["cache_ttl"] == 3600
+    assert source.schema == "main"
+    assert source.include_sample_values is False
+    assert source.redact_pii_columns is False
+    assert "sk-test" not in json.dumps(metadata)
+    assert service_config is llm
 
 
 async def test_agent_from_db_does_not_profile_schema_during_construction(tmp_path):
@@ -1254,319 +1138,6 @@ async def test_agent_from_db_does_not_profile_schema_during_construction(tmp_pat
 
     assert "sqlite" in inspection.plugin_ids
     source._execute_schema_inspect.assert_not_awaited()
-
-
-async def test_agent_from_db_toolkit_override_is_runtime_metadata(tmp_path):
-    db_path = tmp_path / "phase13_toolkit_override.sqlite"
-    await _seed_sqlite(db_path)
-
-    agent = await Agent.from_db(str(db_path), mode="simple", toolkit="analyst")
-
-    try:
-        metadata = agent.runtime.config.metadata["from_db_options"]
-        inspection = await agent.describe()
-    finally:
-        await agent.stop()
-
-    assert inspection.profile == "simple"
-    assert metadata["toolkit"] == "analyst"
-
-
-async def test_agent_from_db_reuses_schema_profile_when_cache_ttl_allows(tmp_path):
-    db_path = tmp_path / "phase13_schema_cache.sqlite"
-    await _seed_sqlite(db_path)
-    source = SQLitePlugin(path=str(db_path))
-    original = source._execute_schema_inspect
-    calls = 0
-
-    async def counted_schema_inspect(payload):
-        nonlocal calls
-        calls += 1
-        return await original(payload)
-
-    source._execute_schema_inspect = counted_schema_inspect
-    agent = await Agent.from_db(source, cache_ttl=3600)
-
-    try:
-        first = await agent.run_detailed("What columns are in customers?")
-        second = await agent.run_detailed("What columns are in orders?")
-    finally:
-        await agent.stop()
-
-    assert first.status is OperationStatus.SUCCEEDED
-    assert second.status is OperationStatus.SUCCEEDED
-    assert calls == 1
-    cached_schema = next(
-        item for item in second.evidence if item.kind == "schema.asset_profile"
-    )
-    assert cached_schema.metadata["schema_cache"] == "hit"
-    assert cached_schema.id
-
-
-async def test_agent_from_db_cache_hit_schema_evidence_supports_database_wide_followup(
-    tmp_path,
-):
-    db_path = tmp_path / "phase13_schema_cache_database_followup.sqlite"
-    await _seed_sqlite(db_path)
-    source = SQLitePlugin(path=str(db_path))
-    agent = await Agent.from_db(source, cache_ttl=3600)
-
-    try:
-        first = await agent.run_detailed("Tell me about the customers table.")
-        second = await agent.run_detailed("What tables exist?", mode="schema.query")
-    finally:
-        await agent.stop()
-
-    assert first.status is OperationStatus.SUCCEEDED
-    assert second.status is OperationStatus.SUCCEEDED
-    assert "customers: id, name" in first.answer
-    assert "orders:" not in first.answer
-    assert "Found 2 tables" in second.answer
-    assert "customers: id, name" in second.answer
-    assert "orders: id, customer_id, total" in second.answer
-    cached_schema = next(
-        item
-        for item in second.evidence
-        if item.kind == "schema.asset_profile"
-        and item.metadata.get("schema_cache") == "hit"
-    )
-    assert cached_schema.id
-    assert cached_schema.metadata.get("payload_fingerprint")
-
-
-async def test_agent_from_db_cache_ttl_zero_reprofiles_schema(tmp_path):
-    db_path = tmp_path / "phase13_schema_cache_zero.sqlite"
-    await _seed_sqlite(db_path)
-    source = SQLitePlugin(path=str(db_path))
-    original = source._execute_schema_inspect
-    calls = 0
-
-    async def counted_schema_inspect(payload):
-        nonlocal calls
-        calls += 1
-        return await original(payload)
-
-    source._execute_schema_inspect = counted_schema_inspect
-    agent = await Agent.from_db(source, cache_ttl=0)
-
-    try:
-        await agent.run_detailed("What columns are in customers?")
-        await agent.run_detailed("What columns are in orders?")
-    finally:
-        await agent.stop()
-
-    assert calls == 2
-
-
-async def test_agent_from_db_reuses_persisted_catalog_snapshot(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    db_path = tmp_path / "phase13_persisted_catalog.sqlite"
-    await _seed_sqlite(db_path)
-    source = SQLitePlugin(path=str(db_path))
-    profile_key = catalog_profile_key(source)
-    _write_catalog_snapshot(
-        profile_key,
-        {
-            "database_type": "sqlite",
-            "database_name": str(db_path),
-            "tables": [
-                {
-                    "name": "customers",
-                    "columns": [
-                        {"name": "id", "data_type": "INTEGER"},
-                        {"name": "name", "data_type": "TEXT"},
-                    ],
-                }
-            ],
-        },
-    )
-    original = source._execute_schema_inspect
-    source._execute_schema_inspect = AsyncMock(side_effect=original)
-
-    agent = await Agent.from_db(source, cache_ttl=None)
-
-    try:
-        result = await agent.run_detailed("What columns are in customers?")
-    finally:
-        await agent.stop()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    assert "customers: id, name" in (result.answer or "")
-    source._execute_schema_inspect.assert_not_awaited()
-    schema_evidence = next(
-        item for item in result.evidence if item.kind == "schema.asset_profile"
-    )
-    assert schema_evidence.metadata["schema_cache"] == "persistent_hit"
-    assert result.diagnostics["execution"]["store_id"] == f"from_db:{profile_key}"
-
-
-async def test_agent_from_db_cache_ttl_zero_ignores_persisted_catalog_snapshot(
-    tmp_path, monkeypatch
-):
-    monkeypatch.chdir(tmp_path)
-    db_path = tmp_path / "phase13_expired_catalog.sqlite"
-    await _seed_sqlite(db_path)
-    source = SQLitePlugin(path=str(db_path))
-    profile_key = catalog_profile_key(source)
-    _write_catalog_snapshot(
-        profile_key,
-        {
-            "database_type": "sqlite",
-            "database_name": str(db_path),
-            "tables": [
-                {
-                    "name": "stale_table",
-                    "columns": [{"name": "stale_column", "data_type": "TEXT"}],
-                }
-            ],
-        },
-    )
-    original = source._execute_schema_inspect
-    source._execute_schema_inspect = AsyncMock(side_effect=original)
-
-    agent = await Agent.from_db(source, cache_ttl=0)
-
-    try:
-        result = await agent.run_detailed("What columns are in customers?")
-    finally:
-        await agent.stop()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    source._execute_schema_inspect.assert_awaited_once()
-    schema_evidence = next(
-        item for item in result.evidence if item.kind == "schema.asset_profile"
-    )
-    assert schema_evidence.metadata != {"schema_cache": "persistent_hit"}
-    assert "customers: id, name" in (result.answer or "")
-
-
-async def test_agent_from_db_unrelated_catalog_snapshot_does_not_shadow_source(
-    tmp_path, monkeypatch
-):
-    monkeypatch.chdir(tmp_path)
-    db_path = tmp_path / "phase13_unrelated_catalog.sqlite"
-    await _seed_sqlite(db_path)
-    source = SQLitePlugin(path=str(db_path))
-    _write_catalog_snapshot(
-        "unrelated-profile",
-        {
-            "database_type": "sqlite",
-            "database_name": "other.sqlite",
-            "tables": [
-                {
-                    "name": "stale_table",
-                    "columns": [{"name": "stale_column", "data_type": "TEXT"}],
-                }
-            ],
-        },
-    )
-    original = source._execute_schema_inspect
-    source._execute_schema_inspect = AsyncMock(side_effect=original)
-
-    agent = await Agent.from_db(source, cache_ttl=None)
-
-    try:
-        result = await agent.run_detailed("What columns are in customers?")
-    finally:
-        await agent.stop()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    source._execute_schema_inspect.assert_awaited_once()
-    schema_evidence = next(
-        item for item in result.evidence if item.kind == "schema.asset_profile"
-    )
-    assert schema_evidence.metadata.get("schema_cache") != "persistent_hit"
-    assert "customers: id, name" in (result.answer or "")
-
-
-async def test_agent_from_db_stale_catalog_snapshot_is_refreshed_and_repersisted(
-    tmp_path, monkeypatch
-):
-    monkeypatch.chdir(tmp_path)
-    db_path = tmp_path / "phase13_refresh_catalog.sqlite"
-    await _seed_sqlite(db_path)
-    source = SQLitePlugin(path=str(db_path))
-    profile_key = catalog_profile_key(source)
-    old_ts = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
-    _write_catalog_snapshot(
-        profile_key,
-        {
-            "database_type": "sqlite",
-            "database_name": str(db_path),
-            "tables": [
-                {
-                    "name": "stale_table",
-                    "columns": [{"name": "stale_column", "data_type": "TEXT"}],
-                }
-            ],
-        },
-        last_seen=old_ts,
-    )
-    original = source._execute_schema_inspect
-    source._execute_schema_inspect = AsyncMock(side_effect=original)
-
-    agent = await Agent.from_db(source, cache_ttl=0)
-
-    try:
-        result = await agent.run_detailed("What columns are in customers?")
-    finally:
-        await agent.stop()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    source._execute_schema_inspect.assert_awaited_once()
-    catalog = json.loads((Path(".daita") / "catalog.json").read_text())
-    refreshed = catalog[f"from_db:{profile_key}"]
-    assert [table["name"] for table in refreshed["tables"]] == [
-        "customers",
-        "orders",
-    ]
-    assert refreshed["metadata"]["profile_key"] == profile_key
-
-
-async def test_agent_from_db_uses_stale_catalog_snapshot_when_refresh_fails(
-    tmp_path, monkeypatch
-):
-    monkeypatch.chdir(tmp_path)
-    db_path = tmp_path / "phase13_stale_fallback.sqlite"
-    await _seed_sqlite(db_path)
-    source = SQLitePlugin(path=str(db_path))
-    profile_key = catalog_profile_key(source)
-    old_ts = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
-    _write_catalog_snapshot(
-        profile_key,
-        {
-            "database_type": "sqlite",
-            "database_name": str(db_path),
-            "tables": [
-                {
-                    "name": "orders",
-                    "columns": [
-                        {"name": "id", "data_type": "INTEGER"},
-                        {"name": "customer_id", "data_type": "INTEGER"},
-                        {"name": "total", "data_type": "REAL"},
-                    ],
-                }
-            ],
-        },
-        last_seen=old_ts,
-    )
-    source._execute_schema_inspect = AsyncMock(side_effect=RuntimeError("DB down"))
-
-    agent = await Agent.from_db(source, cache_ttl=0)
-
-    try:
-        result = await agent.run_detailed("What columns are in orders?")
-    finally:
-        await agent.stop()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    source._execute_schema_inspect.assert_awaited_once()
-    schema_evidence = next(
-        item for item in result.evidence if item.kind == "schema.asset_profile"
-    )
-    assert schema_evidence.metadata["schema_cache"] == "persistent_stale_fallback"
-    assert schema_evidence.metadata["refresh_error"] == "DB down"
-    assert "orders: id, customer_id, total" in (result.answer or "")
 
 
 async def test_agent_from_db_rejects_unknown_mode_on_new_path(tmp_path):

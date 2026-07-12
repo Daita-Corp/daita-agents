@@ -44,6 +44,36 @@ def _planning_context():
     }
 
 
+def _session_scope_binding_context():
+    context = _planning_context()
+    context["session_scope_binding"] = {
+        "binding_status": "bound",
+        "source_scope_id": "scope-orders-complete",
+        "source_operation_id": "op-prior",
+        "required_filters": [
+            {
+                "column": "orders.status",
+                "operator": "=",
+                "values": ["complete"],
+            }
+        ],
+        "required_joins": [],
+    }
+    return context
+
+
+def _requires_grounding_fact(literal: str = "completed") -> dict[str, str]:
+    return {
+        "kind": "filter_literal_requires_grounding",
+        "table": "orders",
+        "column": "status",
+        "operator": "=",
+        "literal": literal,
+        "source": "query.plan.validation",
+        "reason": "proposed_sql_filter_literal_without_accepted_value_evidence",
+    }
+
+
 def _relationship_planning_context():
     context = _planning_context()
     context["schema"]["tables"] = [
@@ -62,6 +92,15 @@ def _relationship_planning_context():
                 {"name": "name", "data_type": "TEXT"},
             ],
         },
+    ]
+    context["relationship_evidence_details"] = [
+        _relationship_evidence_detail(
+            "relationship-customers-regions",
+            "customers",
+            "region_id",
+            "regions",
+            "id",
+        )
     ]
     return context
 
@@ -87,7 +126,46 @@ def _order_refund_planning_context():
             ],
         },
     ]
+    context["relationship_evidence_details"] = [
+        _relationship_evidence_detail(
+            "relationship-orders-refunds",
+            "refunds",
+            "order_id",
+            "orders",
+            "id",
+        )
+    ]
     return context
+
+
+def _relationship_evidence_detail(
+    evidence_id,
+    left_table,
+    left_column,
+    right_table,
+    right_column,
+):
+    return {
+        "id": evidence_id,
+        "kind": "schema.relationship_path",
+        "owner": "catalog",
+        "accepted": True,
+        "payload_fingerprint": f"fp-{evidence_id}",
+        "reachable": True,
+        "paths": [
+            {
+                "tables": [left_table, right_table],
+                "joins": [
+                    {
+                        "left_table": left_table,
+                        "left_column": left_column,
+                        "right_table": right_table,
+                        "right_column": right_column,
+                    }
+                ],
+            }
+        ],
+    }
 
 
 def _board_revenue_context():
@@ -180,6 +258,24 @@ def test_validator_rejects_unobserved_filter_literal_from_known_values():
         "unobserved_filter_literal:orders.status=completed;"
         "candidates=complete,pending"
     ) in validation.errors
+    assert validation.validation_facts == (
+        {
+            "kind": "unobserved_filter_literal",
+            "table": "orders",
+            "column": "status",
+            "literal": "completed",
+            "candidates": ["complete", "pending"],
+        },
+    )
+    assert validation.to_dict()["validation_facts"] == [
+        {
+            "kind": "unobserved_filter_literal",
+            "table": "orders",
+            "column": "status",
+            "literal": "completed",
+            "candidates": ["complete", "pending"],
+        }
+    ]
 
 
 def test_validator_accepts_observed_filter_literal_from_known_values():
@@ -257,6 +353,89 @@ def test_validator_accepts_declared_filters_present_in_sql():
 
     assert validation.valid is True
     assert validation.accepted_sql == plan.selected_sql
+
+
+def test_validator_rejects_follow_up_missing_required_scope_filter():
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql="SELECT SUM(total) AS total FROM orders LIMIT 10",
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(
+        plan,
+        _session_scope_binding_context(),
+    )
+
+    assert validation.valid is False
+    assert validation.accepted_sql is None
+    assert "missing_session_scope_filter:orders.status=complete" in validation.errors
+    assert {
+        "kind": "missing_session_scope_filter",
+        "column": "orders.status",
+        "operator": "=",
+        "values": ["complete"],
+        "source": "session.scope_binding",
+        "reason": "follow_up_sql_missing_bound_scope_filter",
+    } in validation.validation_facts
+    scope_validation = validation.metadata["session_scope_binding_validation"]
+    assert scope_validation["checked"] is True
+    assert scope_validation["passed"] is False
+    assert scope_validation["source_scope_id"] == "scope-orders-complete"
+
+
+def test_validator_accepts_follow_up_with_required_scope_filter():
+    sql = "SELECT SUM(total) AS total FROM orders WHERE status = 'complete' LIMIT 10"
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql=sql,
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(
+        plan,
+        _session_scope_binding_context(),
+    )
+
+    assert validation.valid is True
+    assert validation.accepted_sql == sql
+    scope_validation = validation.metadata["session_scope_binding_validation"]
+    assert scope_validation["checked"] is True
+    assert scope_validation["passed"] is True
+    assert scope_validation["required_filter_count"] == 1
+
+
+def test_validator_does_not_enforce_unbound_stateless_session_scope():
+    context = _planning_context()
+    context["session_context"] = {
+        "query_scopes": [
+            {
+                "operation_id": "op-prior",
+                "tables": ["orders"],
+                "filters": [
+                    {
+                        "column": "orders.status",
+                        "operator": "=",
+                        "values": ["complete"],
+                    }
+                ],
+            }
+        ]
+    }
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql="SELECT SUM(total) AS total FROM orders LIMIT 10",
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, context)
+
+    assert validation.valid is True
+    assert validation.accepted_sql == plan.selected_sql
+    assert validation.metadata["session_scope_binding_validation"]["checked"] is False
 
 
 def test_validator_matches_declared_filter_against_sql_alias():
@@ -375,6 +554,158 @@ def test_plan_mapping_accepts_llm_join_key_aliases():
     assert plan.joins[0].right_column == "order_id"
     assert validation.valid is True
     assert validation.accepted_sql == sql
+
+
+def test_join_sql_without_relationship_evidence_fails_query_plan_validation():
+    sql = (
+        "SELECT COUNT(DISTINCT r.order_id) AS refunded_orders, "
+        "COUNT(DISTINCT o.id) AS total_orders "
+        "FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"
+    )
+    plan = DbQueryPlan.from_mapping(
+        {
+            "operation": "read",
+            "selected_sql": sql,
+            "selected_tables": ["orders", "refunds"],
+            "joins": [
+                {
+                    "left_table": "orders",
+                    "right_table": "refunds",
+                    "left_key": "orders.id",
+                    "right_key": "refunds.order_id",
+                }
+            ],
+            "confidence": 0.96,
+        }
+    )
+    context = _order_refund_planning_context()
+    context["relationship_evidence_details"] = []
+
+    validation = DbQueryPlanValidator().validate(plan, context)
+
+    assert validation.valid is False
+    assert validation.accepted_sql is None
+    assert (
+        "missing_catalog_relationship_path:orders.id->refunds.order_id"
+        in validation.errors
+    )
+    assert validation.validation_facts[-1] == {
+        "kind": "missing_catalog_relationship_path",
+        "left_table": "orders",
+        "right_table": "refunds",
+        "source": "query_plan_join",
+        "reason": "joined_data_query_without_catalog_relationship_evidence",
+        "left_column": "id",
+        "right_column": "order_id",
+    }
+
+
+def test_accepted_relationship_evidence_allows_matching_join():
+    sql = (
+        "SELECT COUNT(DISTINCT r.order_id) AS refunded_orders, "
+        "COUNT(DISTINCT o.id) AS total_orders "
+        "FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"
+    )
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql=sql,
+        selected_tables=("orders", "refunds"),
+        confidence=0.96,
+    )
+
+    validation = DbQueryPlanValidator().validate(
+        plan,
+        _order_refund_planning_context(),
+    )
+
+    assert validation.valid is True
+    assert validation.accepted_sql == sql
+    relationship_validation = validation.metadata["catalog_relationship_validation"]
+    assert relationship_validation["checked"] is True
+    assert relationship_validation["passed"] is True
+    assert relationship_validation["relationship_evidence_refs"] == [
+        {
+            "id": "relationship-orders-refunds",
+            "kind": "schema.relationship_path",
+            "owner": "catalog",
+            "payload_fingerprint": "fp-relationship-orders-refunds",
+        }
+    ]
+
+
+def test_validator_rejects_follow_up_missing_required_scope_join():
+    context = _order_refund_planning_context()
+    context["session_scope_binding"] = {
+        "binding_status": "bound",
+        "source_scope_id": "scope-refunds",
+        "source_operation_id": "op-prior",
+        "required_filters": [],
+        "required_joins": [
+            {
+                "left_table": "refunds",
+                "left_column": "order_id",
+                "right_table": "orders",
+                "right_column": "id",
+            }
+        ],
+    }
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql="SELECT SUM(total) AS total FROM orders",
+        selected_tables=("orders",),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, context)
+
+    assert validation.valid is False
+    assert "missing_session_scope_join:refunds.order_id->orders.id" in validation.errors
+    assert {
+        "kind": "missing_session_scope_join",
+        "left_table": "refunds",
+        "right_table": "orders",
+        "source": "session.scope_binding",
+        "reason": "follow_up_sql_missing_bound_scope_join",
+        "left_column": "order_id",
+        "right_column": "id",
+    } in validation.validation_facts
+
+
+def test_validator_accepts_follow_up_with_required_scope_join():
+    context = _order_refund_planning_context()
+    context["session_scope_binding"] = {
+        "binding_status": "bound",
+        "source_scope_id": "scope-refunds",
+        "source_operation_id": "op-prior",
+        "required_filters": [],
+        "required_joins": [
+            {
+                "left_table": "refunds",
+                "left_column": "order_id",
+                "right_table": "orders",
+                "right_column": "id",
+            }
+        ],
+    }
+    sql = (
+        "SELECT SUM(o.total) - COALESCE(SUM(r.amount), 0) AS net_total "
+        "FROM orders o LEFT JOIN refunds r ON r.order_id = o.id"
+    )
+    plan = DbQueryPlan(
+        operation="read",
+        selected_sql=sql,
+        selected_tables=("orders", "refunds"),
+        confidence=0.9,
+    )
+
+    validation = DbQueryPlanValidator().validate(plan, context)
+
+    assert validation.valid is True
+    assert validation.accepted_sql == sql
+    scope_validation = validation.metadata["session_scope_binding_validation"]
+    assert scope_validation["checked"] is True
+    assert scope_validation["required_join_count"] == 1
+    assert scope_validation["passed"] is True
 
 
 def test_validator_rejects_board_revenue_missing_ref_filter_aggregation_and_shape():
@@ -601,17 +932,53 @@ def test_validator_does_not_enforce_stale_value_hints():
 
     validation = DbQueryPlanValidator().validate(plan, context)
 
-    assert validation.valid is True
-    assert validation.accepted_sql == plan.selected_sql
+    assert validation.valid is False
+    assert validation.accepted_sql is None
+    assert validation.validation_facts == (_requires_grounding_fact(),)
+    assert not any(
+        str(error).startswith("unobserved_filter_literal:")
+        for error in validation.errors
+    )
 
 
-def test_planning_context_and_validator_share_value_hint_eligibility():
-    unsafe_profiles = [
-        {"profile_status": "stale", "stale": True},
-        {"profile_status": "profiled", "redacted": True},
-        {"profile_status": "profiled", "sampled": True},
-        {"profile_status": "profiled", "truncated": True},
-    ]
+def test_planning_context_column_value_hints_only_use_hint_evidence():
+    profile = {
+        "table": "orders",
+        "column": "status",
+        "profile_status": "profiled",
+        "top_values": [
+            {"value": "complete", "count": 4},
+            {"value": "pending", "count": 1},
+        ],
+    }
+    schema_with_metadata_profiles = {
+        **_planning_context()["schema"],
+        "metadata": {"column_value_profiles": {"orders.status": profile}},
+    }
+    profile_evidence = Evidence(
+        kind="schema.column_value_profile",
+        owner="catalog",
+        payload={"profiles": [profile]},
+    )
+    search_evidence = Evidence(
+        kind="schema.column_value_search_result",
+        owner="catalog",
+        payload={"profiles": [profile]},
+    )
+    hint_evidence = Evidence(
+        kind="schema.column_value_hint",
+        owner="catalog",
+        payload={
+            "hints": [
+                {
+                    "table": "orders",
+                    "column": "status",
+                    "profile_status": "profiled",
+                    "observed_values": profile["top_values"],
+                }
+            ]
+        },
+    )
     plan = DbQueryPlan(
         operation="read",
         selected_sql="SELECT * FROM orders WHERE status = 'completed' LIMIT 10",
@@ -619,70 +986,33 @@ def test_planning_context_and_validator_share_value_hint_eligibility():
         confidence=0.9,
     )
 
-    for overrides in unsafe_profiles:
-        profile = {
+    assert _column_value_hints((profile_evidence,), _planning_context()["schema"]) == ()
+    assert _column_value_hints((search_evidence,), _planning_context()["schema"]) == ()
+    assert _column_value_hints((), schema_with_metadata_profiles) == ()
+
+    hint_hints = _column_value_hints((hint_evidence,), _planning_context()["schema"])
+    assert hint_hints == (
+        {
             "table": "orders",
             "column": "status",
-            "profile_status": "profiled",
-            "top_values": [
+            "profile_ref": "orders.status",
+            "distinct_count": None,
+            "observed_values": [
                 {"value": "complete", "count": 4},
                 {"value": "pending", "count": 1},
             ],
-            **overrides,
-        }
-        hints = _column_value_hints(
-            (
-                Evidence(
-                    kind="schema.column_value_search_result",
-                    owner="catalog",
-                    payload={"profiles": [profile]},
-                ),
-            ),
-            _planning_context()["schema"],
-        )
-        context = _planning_context()
-        context["column_value_hints"] = [
-            {
-                "table": "orders",
-                "column": "status",
-                "profile_status": profile["profile_status"],
-                "stale": bool(profile.get("stale", False)),
-                "redacted": bool(profile.get("redacted", False)),
-                "sampled": bool(profile.get("sampled", False)),
-                "truncated": bool(profile.get("truncated", False)),
-                "observed_values": profile["top_values"],
-            }
-        ]
-
-        assert hints == ()
-        validation = DbQueryPlanValidator().validate(plan, context)
-        assert validation.valid is True
-
-    eligible_hints = _column_value_hints(
-        (
-            Evidence(
-                kind="schema.column_value_search_result",
-                owner="catalog",
-                payload={
-                    "profiles": [
-                        {
-                            "table": "orders",
-                            "column": "status",
-                            "profile_status": "profiled",
-                            "top_values": [
-                                {"value": "complete", "count": 4},
-                                {"value": "pending", "count": 1},
-                            ],
-                        }
-                    ]
-                },
-            ),
-        ),
-        _planning_context()["schema"],
+            "profile_status": "profiled",
+            "sampled": False,
+            "truncated": False,
+            "redacted": False,
+            "stale": False,
+        },
     )
     context = _planning_context()
-    context["column_value_hints"] = list(eligible_hints)
-
-    assert eligible_hints
+    context["column_value_hints"] = list(hint_hints)
     validation = DbQueryPlanValidator().validate(plan, context)
     assert validation.valid is False
+    assert (
+        "unobserved_filter_literal:orders.status=completed;"
+        "candidates=complete,pending"
+    ) in validation.errors

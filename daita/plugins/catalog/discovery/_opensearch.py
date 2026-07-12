@@ -35,7 +35,10 @@ async def discover_opensearch(
     if profile_name:
         kwargs["profile_name"] = profile_name
     session = boto3.Session(**kwargs)
-    credentials = session.get_credentials().get_frozen_credentials()
+    session_credentials = session.get_credentials()
+    if session_credentials is None:
+        raise RuntimeError("AWS credentials are required for OpenSearch discovery")
+    credentials = session_credentials.get_frozen_credentials()
     auth = AWSV4SignerAuth(credentials, region, "es")
 
     client = OpenSearch(

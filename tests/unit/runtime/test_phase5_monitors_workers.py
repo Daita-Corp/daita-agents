@@ -121,6 +121,7 @@ def _kernel(*, delay: float = 0.0):
 async def test_monitor_creates_runtime_operation_and_task_without_direct_handler():
     kernel, store, plugin = _kernel()
     monitor = MonitorRuntime(kernel=kernel)
+    subscription = kernel.event_broker.subscribe("monitor-orders_backlog")
 
     result = await monitor.tick(
         MonitorSpec(
@@ -145,6 +146,8 @@ async def test_monitor_creates_runtime_operation_and_task_without_direct_handler
         RuntimeEventType.MONITOR_TRIGGERED,
         RuntimeEventType.TASK_CREATED,
     }.issubset({event.type for event in await store.list_events()})
+    monitor_events = await store.list_events("monitor-orders_backlog")
+    assert [subscription.get_nowait()] == monitor_events
 
 
 async def test_monitor_action_execution_completes_operation_status():
@@ -182,6 +185,8 @@ async def test_worker_handoff_claims_and_executes_through_kernel_events():
         owner="phase5",
         input={"value": "alpha"},
     )
+    baseline_event_count = len(await store.list_events(operation.id))
+    subscription = kernel.event_broker.subscribe(operation.id)
     worker = WorkerRuntime(
         kernel=kernel,
         options=WorkerRuntimeOptions(worker_id="phase5.worker", owner="phase5"),
@@ -208,6 +213,8 @@ async def test_worker_handoff_claims_and_executes_through_kernel_events():
     assert worker_event.runtime_id == "phase5-runtime"
     assert worker_event.task_id == task.id
     assert worker_event.capability_id == "phase5.worker.task"
+    delivered = [subscription.get_nowait() for _ in range(subscription.pending_count)]
+    assert delivered == list(snapshot.events[baseline_event_count:])
 
 
 async def test_worker_lease_fencing_prevents_duplicate_execution():
@@ -300,6 +307,8 @@ async def test_operation_scheduler_skips_completed_and_resumes_pending_tasks():
         input={"value": "pending"},
     )
     await kernel.execute_task(completed.id)
+    baseline_event_count = len(await store.list_events(operation.id))
+    subscription = kernel.event_broker.subscribe(operation.id)
 
     result = await OperationTaskScheduler(kernel=kernel).run_operation(operation.id)
 
@@ -309,6 +318,9 @@ async def test_operation_scheduler_skips_completed_and_resumes_pending_tasks():
     assert pending.id in result.executed_task_ids
     assert result.complete is True
     assert result.snapshot.operation.status.value == "succeeded"
+    delivered = [subscription.get_nowait() for _ in range(subscription.pending_count)]
+    persisted = await store.list_events(operation.id)
+    assert delivered == persisted[baseline_event_count:]
 
 
 def test_legacy_workflow_relay_scaling_modules_are_removed():

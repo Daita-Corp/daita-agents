@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from daita.runtime import Evidence, Operation
@@ -11,13 +11,29 @@ from ...analysis import (
     DbAnalysisPlan,
     analysis_metadata,
     evidence_ref,
-    stable_fingerprint,
 )
-from ..analysis import _payload_fingerprint
+from ...fingerprints import persisted_fingerprint
 from ..monitor_helpers import _monitor_action_budget_usage
+
+if TYPE_CHECKING:
+    from daita.runtime import RuntimeKernel, RuntimeStore
+
+    from ..tasks.runtime import DbTaskRuntime
 
 
 class DbRuntimeMonitorActionResultsMixin:
+    if TYPE_CHECKING:
+        tasks: DbTaskRuntime
+        store: RuntimeStore
+        kernel: RuntimeKernel
+
+        async def _latest_monitor_action_result(
+            self,
+            operation_id: str,
+            *,
+            action_plan_fingerprint: str,
+        ) -> Evidence | None: ...
+
     async def _persist_monitor_action_plan_evidence(
         self,
         operation: Operation,
@@ -29,7 +45,7 @@ class DbRuntimeMonitorActionResultsMixin:
         action_plan_fingerprint: str,
         tick_evidence_refs: tuple[dict[str, Any], ...],
     ) -> Evidence:
-        existing = await self._latest_evidence(
+        existing = await self.tasks.latest_evidence(
             operation.id,
             "monitor.action_plan",
             payload={"action_plan_fingerprint": action_plan_fingerprint},
@@ -58,7 +74,7 @@ class DbRuntimeMonitorActionResultsMixin:
                 "tick_operation_id": tick_operation_id,
                 "monitor_action_kind": action_plan.get("kind"),
                 "monitor_action_fingerprint": action_plan_fingerprint,
-                "payload_fingerprint": _payload_fingerprint(payload),
+                "payload_fingerprint": persisted_fingerprint(payload),
             },
         )
         await self.store.save_evidence(evidence)
@@ -75,8 +91,8 @@ class DbRuntimeMonitorActionResultsMixin:
         action_plan_fingerprint: str,
         tick_evidence_refs: tuple[dict[str, Any], ...],
     ) -> Evidence:
-        fingerprint = stable_fingerprint(analysis_plan.to_dict())
-        existing = await self._latest_accepted_evidence(
+        fingerprint = persisted_fingerprint(analysis_plan.to_dict())
+        existing = await self.tasks.latest_accepted_evidence(
             operation.id,
             "analysis.plan",
             payload={"analysis_id": analysis_plan.analysis_id},
@@ -108,7 +124,7 @@ class DbRuntimeMonitorActionResultsMixin:
                 "tick_operation_id": tick_operation_id,
                 "monitor_action_fingerprint": action_plan_fingerprint,
                 "cited_tick_evidence_refs": [dict(item) for item in tick_evidence_refs],
-                "payload_fingerprint": _payload_fingerprint(payload),
+                "payload_fingerprint": persisted_fingerprint(payload),
             },
         )
         await self.store.save_evidence(evidence)
@@ -192,7 +208,7 @@ class DbRuntimeMonitorActionResultsMixin:
                 "tick_operation_id": tick_operation_id,
                 "monitor_action_kind": action_kind,
                 "monitor_action_fingerprint": action_plan_fingerprint,
-                "payload_fingerprint": _payload_fingerprint(payload),
+                "payload_fingerprint": persisted_fingerprint(payload),
             },
         )
         await self.store.save_evidence(evidence)
@@ -210,7 +226,7 @@ class DbRuntimeMonitorActionResultsMixin:
         tick_evidence_refs: tuple[dict[str, Any], ...],
         produced_evidence: tuple[Evidence, ...],
     ) -> Evidence:
-        existing = await self._latest_evidence(
+        existing = await self.tasks.latest_evidence(
             operation.id,
             "monitor.report",
             payload={"action_plan_fingerprint": action_plan_fingerprint},
@@ -247,7 +263,7 @@ class DbRuntimeMonitorActionResultsMixin:
                 "tick_operation_id": tick_operation_id,
                 "monitor_action_kind": action_plan.get("kind") or "scheduled_report",
                 "monitor_action_fingerprint": action_plan_fingerprint,
-                "payload_fingerprint": _payload_fingerprint(payload),
+                "payload_fingerprint": persisted_fingerprint(payload),
             },
         )
         await self.store.save_evidence(evidence)
@@ -331,7 +347,7 @@ class DbRuntimeMonitorActionResultsMixin:
                 "tick_operation_id": tick_operation_id,
                 "monitor_action_kind": action_kind,
                 "monitor_action_fingerprint": action_plan_fingerprint,
-                "payload_fingerprint": _payload_fingerprint(payload),
+                "payload_fingerprint": persisted_fingerprint(payload),
             },
         )
         await self.store.save_evidence(evidence)

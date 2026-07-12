@@ -47,8 +47,9 @@ class SentenceTransformersEmbeddingProvider(BaseEmbeddingProvider):
                     "sentence-transformers is required for local embeddings. "
                     "Install with: pip install 'daita-agents[sentence-transformers]'"
                 )
-            self._model = SentenceTransformer(self.model)
-            self._dimensions = self._model.get_sentence_embedding_dimension()
+            model = SentenceTransformer(self.model)
+            self._model = model
+            self._dimensions = model.get_sentence_embedding_dimension()
             logger.debug(f"Loaded {self.model} ({self._dimensions} dimensions)")
         return self._model
 
@@ -57,6 +58,8 @@ class SentenceTransformersEmbeddingProvider(BaseEmbeddingProvider):
         if self._dimensions is None:
             # Trigger model load to discover dimensions
             _ = self._st_model
+        if self._dimensions is None:
+            raise ValueError("sentence-transformers model did not report dimensions")
         return self._dimensions
 
     async def _embed_text_impl(self, text: str) -> List[float]:

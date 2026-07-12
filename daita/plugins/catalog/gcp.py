@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Optional
 
 from .base_discoverer import BaseDiscoverer, DiscoveredStore
-from .discovery._gcp_common import _GCP_INSTALL_HINT, gcp_credentials
+from .discovery._gcp_common import gcp_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -210,10 +210,14 @@ class GCPDiscoverer(BaseDiscoverer):
             name = inst.get("name", "")
             region = inst.get("region")
             ip_addresses = inst.get("ipAddresses", [])
-            primary_ip = next(
-                (ip["ipAddress"] for ip in ip_addresses if ip.get("type") == "PRIMARY"),
-                "",
-            )
+            primary_ip = ""
+            for ip_mapping in ip_addresses:
+                if ip_mapping.get("type") != "PRIMARY":
+                    continue
+                candidate = ip_mapping.get("ipAddress")
+                if candidate:
+                    primary_ip = candidate
+                    break
 
             yield self._build_store(
                 store_type=store_type,

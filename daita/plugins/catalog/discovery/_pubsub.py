@@ -16,7 +16,7 @@ async def discover_pubsub_topic(
 ) -> dict[str, Any]:
     """Describe a Pub/Sub topic including its attached subscriptions."""
     try:
-        from google.cloud import pubsub_v1
+        from google import pubsub_v1
     except ImportError:
         raise ImportError(
             "google-cloud-pubsub is required. "
@@ -83,7 +83,7 @@ def _resolve_pubsub_schema(creds: Any, schema_name: str) -> Optional[dict[str, A
     intentionally quiet — discovery degrades gracefully to "no schema".
     """
     try:
-        from google.cloud import pubsub_v1
+        from google import pubsub_v1
         from google.pubsub_v1 import types as pstypes
     except ImportError:
         return None
@@ -112,7 +112,7 @@ async def discover_pubsub_subscription(
 ) -> dict[str, Any]:
     """Describe a Pub/Sub subscription."""
     try:
-        from google.cloud import pubsub_v1
+        from google import pubsub_v1
     except ImportError:
         raise ImportError(
             "google-cloud-pubsub is required. "

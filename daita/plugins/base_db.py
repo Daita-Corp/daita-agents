@@ -8,7 +8,7 @@ support for all database plugins in the Daita framework.
 import asyncio
 import logging
 from abc import abstractmethod
-from typing import Any, Dict
+from typing import Any, Dict, TYPE_CHECKING
 from ..core.exceptions import (
     PluginError,
     ConnectionError as DaitaConnectionError,
@@ -17,6 +17,10 @@ from ..core.exceptions import (
 from .base import ConnectorPlugin
 
 logger = logging.getLogger(__name__)
+
+
+def _normalized_identifiers(values: Any) -> set[str]:
+    return {str(value).strip().lower() for value in values or () if str(value).strip()}
 
 
 class BaseDatabasePlugin(ConnectorPlugin):
@@ -35,6 +39,12 @@ class BaseDatabasePlugin(ConnectorPlugin):
 
     # Subclasses set this to their dialect: "postgresql", "mysql", "snowflake", "sqlite"
     sql_dialect: str = "standard"
+
+    if TYPE_CHECKING:
+
+        async def query(self, sql: str, params: Any = None) -> list: ...
+
+        async def execute(self, sql: str, params: Any = None) -> int: ...
 
     def __init__(self, **kwargs):
         """
@@ -58,9 +68,13 @@ class BaseDatabasePlugin(ConnectorPlugin):
         self.query_max_rows = kwargs.get("query_max_rows", 200)
         self.query_max_chars = kwargs.get("query_max_chars", 50000)
         self.query_timeout = kwargs.get("query_timeout", self.timeout)
-        self.allowed_tables = set(kwargs.get("allowed_tables") or [])
-        self.blocked_tables = set(kwargs.get("blocked_tables") or [])
-        self.blocked_columns = set(kwargs.get("blocked_columns") or [])
+        self.schema = kwargs.get("schema")
+        self.include_sample_values = kwargs.get("include_sample_values", True)
+        self.redact_pii_columns = kwargs.get("redact_pii_columns", True)
+        self.allowed_tables = _normalized_identifiers(kwargs.get("allowed_tables"))
+        self._allowed_tables_restricted = kwargs.get("allowed_tables") is not None
+        self.blocked_tables = _normalized_identifiers(kwargs.get("blocked_tables"))
+        self.blocked_columns = _normalized_identifiers(kwargs.get("blocked_columns"))
 
         logger.debug(
             f"{self.__class__.__name__} initialized with config keys: {list(kwargs.keys())}"
@@ -214,7 +228,7 @@ class BaseDatabasePlugin(ConnectorPlugin):
                 f"SQL guardrail rejected blocked table(s): {', '.join(sorted(blocked))}",
                 field="sql",
             )
-        if allowed_tables:
+        if getattr(self, "_allowed_tables_restricted", bool(allowed_tables)):
             disallowed = {
                 table.short_key
                 for table in analysis.tables
@@ -229,7 +243,17 @@ class BaseDatabasePlugin(ConnectorPlugin):
                     field="sql",
                 )
 
-        referenced_columns = analysis.referenced_column_names
+        referenced_columns = set(analysis.referenced_column_names)
+        non_cte_tables = [table for table in analysis.tables if not table.is_cte]
+        for column in analysis.columns:
+            qualifier = column.qualifier_key
+            if qualifier:
+                referenced_columns.add(f"{qualifier}.{column.key}")
+                referenced_columns.add(f"{qualifier.split('.')[-1]}.{column.key}")
+            elif len(non_cte_tables) == 1:
+                table = non_cte_tables[0]
+                referenced_columns.add(f"{table.key}.{column.key}")
+                referenced_columns.add(f"{table.short_key}.{column.key}")
         blocked_columns = sorted(
             col
             for col in getattr(self, "blocked_columns", set())
@@ -285,12 +309,17 @@ class BaseDatabasePlugin(ConnectorPlugin):
 
     async def _tool_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
         sql = args.get("sql")
+        if not isinstance(sql, str):
+            raise ValidationError("SQL must be a string", field="sql")
         params = args.get("params") or []
         focus_dsl = args.get("focus")
         return await self._run_guarded_tool_query(sql, params, focus_dsl)
 
     async def _tool_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        sql = self._prepare_tool_execute_sql(args.get("sql"))
+        raw_sql = args.get("sql")
+        if not isinstance(raw_sql, str):
+            raise ValidationError("SQL must be a string", field="sql")
+        sql = self._prepare_tool_execute_sql(raw_sql)
         params = args.get("params")
         affected_rows = await self.execute(sql, params)
         return {"affected_rows": affected_rows}

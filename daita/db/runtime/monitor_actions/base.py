@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from daita.runtime import AccessMode, Operation, OperationStatus
 
-from ...analysis import stable_fingerprint
+from ...fingerprints import persisted_fingerprint
 from ...models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
 from ..monitor_helpers import _normalize_monitor_action_plan
 from ..resume import (
@@ -20,6 +20,9 @@ from .results import DbRuntimeMonitorActionResultsMixin
 from .resume import DbRuntimeMonitorActionResumeMixin
 from .writes import DbRuntimeMonitorActionWritesMixin
 
+if TYPE_CHECKING:
+    from ...models import DbRuntimeConfig
+
 
 class DbRuntimeMonitorActionsMixin(
     DbRuntimeMonitorActionResumeMixin,
@@ -27,6 +30,12 @@ class DbRuntimeMonitorActionsMixin(
     DbRuntimeMonitorActionWritesMixin,
     DbRuntimeMonitorActionResultsMixin,
 ):
+    if TYPE_CHECKING:
+        config: DbRuntimeConfig
+        _is_setup: bool
+
+        async def setup(self, *, agent_id: str | None = None) -> None: ...
+
     async def execute_monitor_action(
         self,
         operation_id: str,
@@ -50,7 +59,7 @@ class DbRuntimeMonitorActionsMixin(
             action_plan,
             operation_id=operation_id,
         )
-        fingerprint = stable_fingerprint(normalized)
+        fingerprint = persisted_fingerprint(normalized)
         operation = await self._prepare_monitor_action_operation(
             operation,
             monitor_id=monitor_id,

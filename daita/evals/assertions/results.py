@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from numbers import Number
+from decimal import Decimal
+from fractions import Fraction
 from typing import Any
 
 from ..analysis import RunEvidence
@@ -149,7 +150,8 @@ def _row_matches(expected: dict[str, Any], observed: dict[str, Any]) -> bool:
 
 
 def _value_matches(expected: Any, observed: Any) -> bool:
-    if isinstance(expected, Number) and isinstance(observed, Number):
+    numeric_types = (int, float, Decimal, Fraction)
+    if isinstance(expected, numeric_types) and isinstance(observed, numeric_types):
         return abs(float(expected) - float(observed)) <= 1e-9
     return str(expected) == str(observed)
 

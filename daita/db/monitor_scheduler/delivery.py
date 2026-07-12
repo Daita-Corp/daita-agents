@@ -91,7 +91,7 @@ class DbMonitorDeliveryRunner:
                 },
             }
         )
-        await self.monitor_store.commit_monitor_mutation(
+        await self.runtime.commit_monitor_mutation(
             DbMonitorMutation(
                 action="run",
                 operation=child_operation,

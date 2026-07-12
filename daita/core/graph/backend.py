@@ -72,7 +72,7 @@ class GraphBackend(Protocol):
         """Retrieve a single node by ID. Returns None if not found."""
         ...
 
-    async def iter_edges(
+    def iter_edges(
         self,
         from_node_id: Optional[str] = None,
         to_node_id: Optional[str] = None,
@@ -158,7 +158,11 @@ class GraphBackend(Protocol):
         """
         ...
 
-    async def iter_nodes(
+    async def flush(self) -> None:
+        """Persist pending graph mutations at a logical-unit boundary."""
+        ...
+
+    def iter_nodes(
         self,
         node_type: GraphNodeType,
         properties_match: Optional[dict[str, Any]] = None,

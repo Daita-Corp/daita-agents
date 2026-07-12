@@ -19,7 +19,7 @@ from .elasticsearch_extensions import (
 from ..core.exceptions import PluginError
 
 if TYPE_CHECKING:
-    from ..core.tools import LocalTool
+    from elasticsearch import AsyncElasticsearch
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +90,8 @@ class ElasticsearchPlugin(ConnectorPlugin):
 
         self.read_only = kwargs.get("read_only", False)
 
-        self._client = None
-        self._cluster_info = None
+        self._client: Optional["AsyncElasticsearch"] = None
+        self._cluster_info: Optional[Dict[str, object]] = None
         self._executor = ElasticsearchExecutor(self)
 
         logger.debug(f"Elasticsearch plugin configured for hosts: {self.hosts}")
@@ -136,6 +136,16 @@ class ElasticsearchPlugin(ConnectorPlugin):
     def is_connected(self) -> bool:
         return self._client is not None
 
+    @property
+    def client(self) -> "AsyncElasticsearch":
+        """Return the active Elasticsearch client owned by this plugin."""
+        if self._client is None:
+            raise PluginError(
+                "ElasticsearchPlugin is not connected",
+                plugin_name="Elasticsearch",
+            )
+        return self._client
+
     async def connect(self):
         """Initialize Elasticsearch client and test connection."""
         if self._client is not None:
@@ -148,37 +158,32 @@ class ElasticsearchPlugin(ConnectorPlugin):
                 AuthenticationException,
             )
 
-            # Prepare authentication
-            auth_config = {}
+            client_config = dict(self.config)
+            client_config.update(
+                {
+                    "hosts": self.hosts,
+                    "timeout": self.timeout,
+                    "max_retries": self.max_retries,
+                    "verify_certs": self.verify_certs,
+                }
+            )
 
             if self.auth_method == "basic" and self.username and self.password:
-                auth_config["basic_auth"] = (self.username, self.password)
+                client_config["basic_auth"] = (self.username, self.password)
             elif self.auth_method == "api_key" and self.api_key_id and self.api_key:
-                auth_config["api_key"] = (self.api_key_id, self.api_key)
+                client_config["api_key"] = (self.api_key_id, self.api_key)
             elif self.auth_method == "ssl" and self.ssl_fingerprint:
-                auth_config["ssl_assert_fingerprint"] = self.ssl_fingerprint
+                client_config["ssl_assert_fingerprint"] = self.ssl_fingerprint
 
-            # Prepare SSL config
-            ssl_config = {"verify_certs": self.verify_certs}
             if self.ca_certs:
-                ssl_config["ca_certs"] = self.ca_certs
+                client_config["ca_certs"] = self.ca_certs
 
-            # Create client
-            client_config = {
-                "hosts": self.hosts,
-                "timeout": self.timeout,
-                "max_retries": self.max_retries,
-                **auth_config,
-                **ssl_config,
-                **self.config,
-            }
-
-            self._client = AsyncElasticsearch(**client_config)
+            client = AsyncElasticsearch(**client_config)
 
             # Test connection
             try:
-                cluster_info = await self._client.info()
-                self._cluster_info = {
+                cluster_info = await client.info()
+                normalized_cluster_info = {
                     "cluster_name": cluster_info.get("cluster_name"),
                     "version": cluster_info.get("version", {}).get("number"),
                     "lucene_version": cluster_info.get("version", {}).get(
@@ -188,8 +193,8 @@ class ElasticsearchPlugin(ConnectorPlugin):
                 }
 
                 logger.info(
-                    f"Connected to Elasticsearch cluster '{self._cluster_info['cluster_name']}' "
-                    f"(version {self._cluster_info['version']})"
+                    f"Connected to Elasticsearch cluster '{normalized_cluster_info['cluster_name']}' "
+                    f"(version {normalized_cluster_info['version']})"
                 )
 
             except AuthenticationException:
@@ -204,11 +209,13 @@ class ElasticsearchPlugin(ConnectorPlugin):
                     plugin_name="Elasticsearch",
                 )
 
-        except ImportError:
+            self._client = client
+            self._cluster_info = normalized_cluster_info
+
+        except ImportError as exc:
             raise ImportError(
-                "elasticsearch is required for ElasticsearchPlugin. "
-                "Install with: pip install 'daita-agents[elasticsearch]'"
-            )
+                "elasticsearch is required. Install with: pip install 'daita-agents[elasticsearch]'"
+            ) from exc
         except PluginError:
             raise
         except Exception as e:
@@ -219,8 +226,9 @@ class ElasticsearchPlugin(ConnectorPlugin):
 
     async def disconnect(self):
         """Close Elasticsearch connection."""
-        if self._client:
-            await self._client.close()
+        client = self._client
+        if client is not None:
+            await client.close()
             self._client = None
             self._cluster_info = None
             logger.info("Disconnected from Elasticsearch")
@@ -262,6 +270,7 @@ class ElasticsearchPlugin(ConnectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
         try:
             # Default to match_all if no query provided
@@ -295,7 +304,7 @@ class ElasticsearchPlugin(ConnectorPlugin):
                 search_params["scroll"] = scroll
 
             # Execute search
-            response = await self._client.search(**search_params)
+            response = await client.search(**search_params)
 
             # Format response
             documents = [hit["_source"] for hit in response["hits"]["hits"]]
@@ -363,6 +372,7 @@ class ElasticsearchPlugin(ConnectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
         try:
             # Prepare index parameters
@@ -377,7 +387,7 @@ class ElasticsearchPlugin(ConnectorPlugin):
                 index_params["id"] = doc_id
 
             # Index document
-            response = await self._client.index(**index_params)
+            response = await client.index(**index_params)
 
             result = {
                 "id": response["_id"],
@@ -424,6 +434,7 @@ class ElasticsearchPlugin(ConnectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
         if not documents:
             return {"indexed": 0, "errors": 0, "took": 0}
@@ -441,7 +452,7 @@ class ElasticsearchPlugin(ConnectorPlugin):
 
             try:
                 success_count, failed_docs = await async_bulk(
-                    self._client,
+                    client,
                     doc_generator(),
                     chunk_size=batch_size,
                     refresh=refresh,
@@ -452,20 +463,26 @@ class ElasticsearchPlugin(ConnectorPlugin):
                 end_time = datetime.now()
                 duration_ms = (end_time - start_time).total_seconds() * 1000
 
+                failed_count = (
+                    failed_docs if isinstance(failed_docs, int) else len(failed_docs)
+                )
+                normalized_failed_docs = (
+                    [] if isinstance(failed_docs, int) else failed_docs
+                )
                 result = {
                     "indexed": success_count,
-                    "errors": len(failed_docs),
+                    "errors": failed_count,
                     "total": len(documents),
                     "took": int(duration_ms),
-                    "failed_docs": failed_docs if failed_docs else [],
+                    "failed_docs": normalized_failed_docs,
                 }
 
                 logger.info(
                     f"Bulk indexed {success_count}/{len(documents)} documents in {duration_ms:.1f}ms"
                 )
 
-                if failed_docs:
-                    logger.warning(f"Failed to index {len(failed_docs)} documents")
+                if failed_count:
+                    logger.warning(f"Failed to index {failed_count} documents")
 
                 return result
 
@@ -503,9 +520,10 @@ class ElasticsearchPlugin(ConnectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
         try:
-            response = await self._client.delete(
+            response = await client.delete(
                 index=index, id=doc_id, refresh=refresh, **kwargs
             )
 
@@ -553,6 +571,7 @@ class ElasticsearchPlugin(ConnectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
         try:
             # Prepare index body
@@ -563,7 +582,7 @@ class ElasticsearchPlugin(ConnectorPlugin):
                 body["settings"] = settings
 
             # Create index
-            response = await self._client.indices.create(
+            response = await client.indices.create(
                 index=index, body=body if body else None, **kwargs
             )
 
@@ -599,9 +618,10 @@ class ElasticsearchPlugin(ConnectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
         try:
-            response = await self._client.indices.get_mapping(index=index)
+            response = await client.indices.get_mapping(index=index)
 
             # Extract mapping for the index
             if index in response:
@@ -647,7 +667,7 @@ class ElasticsearchPlugin(ConnectorPlugin):
             logs = await es.search_agent_logs("agent_logs", agent_id="data_processor", status="error")
         """
         # Build query
-        must_clauses = []
+        must_clauses: List[object] = []
 
         if agent_id:
             must_clauses.append({"term": {"agent_id": agent_id}})
@@ -660,7 +680,7 @@ class ElasticsearchPlugin(ConnectorPlugin):
 
         # Default query if no filters
         if not must_clauses:
-            query = {"match_all": {}}
+            query: Dict[str, object] = {"match_all": {}}
         else:
             query = {"bool": {"must": must_clauses}}
 
@@ -735,7 +755,7 @@ class ElasticsearchPlugin(ConnectorPlugin):
             analytics = await es.analyze_performance("agent_metrics", group_by="agent_id")
         """
         # Build query
-        query = {"match_all": {}}
+        query: Dict[str, object] = {"match_all": {}}
         if time_range:
             query = {"bool": {"must": [{"range": {"timestamp": time_range}}]}}
 
@@ -776,9 +796,10 @@ class ElasticsearchPlugin(ConnectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
         try:
-            health = await self._client.cluster.health()
+            health = await client.cluster.health()
 
             result = {
                 "cluster_name": health["cluster_name"],
@@ -808,6 +829,8 @@ class ElasticsearchPlugin(ConnectorPlugin):
     async def _tool_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for es_search"""
         index = args.get("index")
+        if not isinstance(index, str) or not index:
+            raise PluginError("index is required", plugin_name="Elasticsearch")
         query = args.get("query")
         size = args.get("size", 50)
         from_ = args.get("from_", 0)
@@ -826,7 +849,11 @@ class ElasticsearchPlugin(ConnectorPlugin):
     async def _tool_index(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for es_index_document"""
         index = args.get("index")
+        if not isinstance(index, str) or not index:
+            raise PluginError("index is required", plugin_name="Elasticsearch")
         document = args.get("document")
+        if not isinstance(document, dict):
+            raise PluginError("document is required", plugin_name="Elasticsearch")
         doc_id = args.get("doc_id")
 
         result = await self.index_document(
@@ -842,13 +869,25 @@ class ElasticsearchPlugin(ConnectorPlugin):
     async def _tool_get_mapping(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for es_get_mapping"""
         index = args.get("index")
+        if not isinstance(index, str) or not index:
+            raise PluginError("index is required", plugin_name="Elasticsearch")
         mapping = await self.get_mapping(index)
         return {"index": index, "mapping": mapping}
 
     async def _tool_bulk_index(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for es_bulk_index"""
         index = args.get("index")
-        documents = args.get("documents")
+        if not isinstance(index, str) or not index:
+            raise PluginError("index is required", plugin_name="Elasticsearch")
+        raw_documents = args.get("documents")
+        if not isinstance(raw_documents, list) or not all(
+            isinstance(document, dict) for document in raw_documents
+        ):
+            raise PluginError(
+                "documents must be a list of objects",
+                plugin_name="Elasticsearch",
+            )
+        documents = [dict(document) for document in raw_documents]
         batch_size = args.get("batch_size", 1000)
 
         result = await self.bulk_index(
@@ -865,7 +904,11 @@ class ElasticsearchPlugin(ConnectorPlugin):
     async def _tool_delete_document(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for es_delete_document"""
         index = args.get("index")
+        if not isinstance(index, str) or not index:
+            raise PluginError("index is required", plugin_name="Elasticsearch")
         doc_id = args.get("doc_id")
+        if not isinstance(doc_id, str) or not doc_id:
+            raise PluginError("doc_id is required", plugin_name="Elasticsearch")
 
         result = await self.delete_document(index=index, doc_id=doc_id)
 
@@ -874,6 +917,8 @@ class ElasticsearchPlugin(ConnectorPlugin):
     async def _tool_create_index(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for es_create_index"""
         index = args.get("index")
+        if not isinstance(index, str) or not index:
+            raise PluginError("index is required", plugin_name="Elasticsearch")
         mapping = args.get("mapping")
         settings = args.get("settings")
 
@@ -889,6 +934,8 @@ class ElasticsearchPlugin(ConnectorPlugin):
     async def _tool_search_agent_logs(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler (kept for backward compat)"""
         index = args.get("index")
+        if not isinstance(index, str) or not index:
+            raise PluginError("index is required", plugin_name="Elasticsearch")
         agent_id = args.get("agent_id")
         status = args.get("status")
         size = args.get("size", 50)
@@ -906,6 +953,8 @@ class ElasticsearchPlugin(ConnectorPlugin):
     async def _tool_analyze_performance(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler (kept for backward compat)"""
         index = args.get("index")
+        if not isinstance(index, str) or not index:
+            raise PluginError("index is required", plugin_name="Elasticsearch")
         metric_field = args.get("metric_field", "duration_ms")
         group_by = args.get("group_by")
 

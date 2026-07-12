@@ -45,10 +45,12 @@ Getting Started:
     4. Use the plugin in your agents
 """
 
+from __future__ import annotations
+
 import os
 import logging
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Mapping, Optional
+from typing import List, Dict, Any, Mapping, Optional, TYPE_CHECKING
 
 from daita.runtime import (
     AccessMode,
@@ -63,6 +65,9 @@ from daita.runtime import (
 
 from .base import ConnectorPlugin
 from .manifest import PluginKind, PluginManifest
+
+if TYPE_CHECKING:
+    from exa_py import Exa
 from ..core.exceptions import (
     TransientError,
     RetryableError,
@@ -72,9 +77,15 @@ from ..core.exceptions import (
     ConnectionError as DaitaConnectionError,
     AuthenticationError,
 )
-from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
+
+
+def _required_string_arg(args: Dict[str, Any], field: str) -> str:
+    value = args.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
 
 
 VALID_SEARCH_TYPES = {"neural", "fast", "auto", "keyword"}
@@ -396,7 +407,7 @@ class ExaSearchPlugin(ConnectorPlugin):
         self._include_domains = include_domains
         self._exclude_domains = exclude_domains
 
-        self._client = None
+        self._client: Exa | None = None
         self._executor = _ExaSearchExecutor(self)
 
         logger.info(
@@ -481,9 +492,10 @@ class ExaSearchPlugin(ConnectorPlugin):
         try:
             from exa_py import Exa
 
-            self._client = Exa(api_key=self._api_key)
+            client = Exa(api_key=self._api_key)
             # Tag API calls so Exa can attribute usage to this integration.
-            self._client.headers["x-exa-integration"] = "daita-agents"
+            client.headers["x-exa-integration"] = "daita-agents"
+            self._client = client
             logger.info("Connected to Exa Search API")
         except ImportError as e:
             raise ImportError(
@@ -494,6 +506,12 @@ class ExaSearchPlugin(ConnectorPlugin):
         """Cleanup the Exa client."""
         self._client = None
         logger.info("Disconnected from Exa Search API")
+
+    @property
+    def client(self) -> Exa:
+        if self._client is None:
+            raise RuntimeError("Exa plugin is not connected")
+        return self._client
 
     async def __aenter__(self):
         await self.connect()
@@ -684,7 +702,7 @@ class ExaSearchPlugin(ConnectorPlugin):
     async def _call_search(self, kwargs: Dict[str, Any]) -> Any:
         import asyncio
 
-        return await asyncio.to_thread(self._client.search, **kwargs)
+        return await asyncio.to_thread(self.client.search, **kwargs)
 
     async def _call_search_with_contents(
         self, kwargs: Dict[str, Any], contents: Dict[str, Any]
@@ -692,14 +710,14 @@ class ExaSearchPlugin(ConnectorPlugin):
         import asyncio
 
         return await asyncio.to_thread(
-            self._client.search_and_contents, **kwargs, **contents
+            self.client.search_and_contents, **kwargs, **contents
         )
 
     async def _call_find_similar(self, url: str, num_results: int) -> Any:
         import asyncio
 
         return await asyncio.to_thread(
-            self._client.find_similar, url=url, num_results=num_results
+            self.client.find_similar, url=url, num_results=num_results
         )
 
     async def _call_find_similar_with_contents(
@@ -708,7 +726,7 @@ class ExaSearchPlugin(ConnectorPlugin):
         import asyncio
 
         return await asyncio.to_thread(
-            self._client.find_similar_and_contents,
+            self.client.find_similar_and_contents,
             url=url,
             num_results=num_results,
             **contents,
@@ -786,7 +804,7 @@ class ExaSearchPlugin(ConnectorPlugin):
     async def _tool_search_web(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for search_web."""
         return await self.search(
-            query=args.get("query"),
+            query=_required_string_arg(args, "query"),
             num_results=args.get("num_results"),
             search_type=args.get("search_type"),
             category=args.get("category"),
@@ -802,7 +820,7 @@ class ExaSearchPlugin(ConnectorPlugin):
     async def _tool_find_similar(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for find_similar."""
         return await self.find_similar(
-            url=args.get("url"),
+            url=_required_string_arg(args, "url"),
             num_results=args.get("num_results"),
             include_text=args.get("include_text"),
             include_highlights=args.get("include_highlights"),

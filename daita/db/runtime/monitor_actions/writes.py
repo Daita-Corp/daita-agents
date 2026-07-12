@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from daita.runtime import (
@@ -14,24 +14,101 @@ from daita.runtime import (
     OperationSnapshot,
     Task,
     TaskDependency,
+    TaskDependencyKind,
     TaskStatus,
 )
 
 from ...analysis import evidence_ref
+from ...fingerprints import persisted_fingerprint
 from ...sql_evidence import (
     blocked_scope_resources,
     effective_source_scope,
     sql_validation_facts_from_evidence,
 )
-from ..analysis import _payload_fingerprint, _stable_hash
 from ..governance import (
     _governance_policy_block_reason,
     _sql_validation_governance_facts,
 )
 from ..monitor_helpers import _terminal_monitor_approval_reason
+from ..tasks.models import DbTaskSpec
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from daita.plugins import ExtensionRegistry
+    from daita.runtime import Capability, RuntimeKernel, RuntimeStore
+
+    from ...models import DbOperationContract
+    from ..governance import _MonitorEffectGovernanceDecision
+    from ..tasks.models import DbTaskPlan
+    from ..tasks.runtime import DbTaskRuntime
 
 
 class DbRuntimeMonitorActionWritesMixin:
+    if TYPE_CHECKING:
+        registry: ExtensionRegistry
+        tasks: DbTaskRuntime
+        store: RuntimeStore
+        kernel: RuntimeKernel
+
+        async def _block_monitor_action(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_plan: dict[str, Any],
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            plan_evidence: Evidence,
+            reason: str,
+        ) -> dict[str, Any]: ...
+
+        async def _persist_monitor_action_result(
+            self,
+            operation: Operation,
+            *,
+            monitor_id: str,
+            monitor_run_id: str,
+            tick_operation_id: str,
+            action_kind: str,
+            action_plan_fingerprint: str,
+            tick_evidence_refs: tuple[dict[str, Any], ...],
+            plan_evidence: Evidence,
+            status: str,
+            block_reason: str | None = None,
+            extra_produced_evidence: tuple[Evidence, ...] = (),
+            supersede_approval_block: bool = False,
+        ) -> dict[str, Any]: ...
+
+        async def plan_task_specs(
+            self,
+            operation: Operation,
+            specs: Iterable[DbTaskSpec],
+            *,
+            contract: DbOperationContract | Mapping[str, Any] | None = None,
+        ) -> DbTaskPlan: ...
+
+        async def execute_task(
+            self,
+            task: Task,
+            operation: Operation,
+            context: dict[str, Any] | None = None,
+        ) -> tuple[Evidence, ...]: ...
+
+        async def evaluate_monitor_effect_governance(
+            self,
+            operation: Operation,
+            *,
+            capability: Capability,
+            task: Task | None = None,
+            intent: dict[str, Any],
+            phase: str,
+            mutate_approvals: bool = False,
+            operation_override: dict[str, Any] | None = None,
+        ) -> _MonitorEffectGovernanceDecision: ...
+
     async def _execute_monitor_write_proposal_action(
         self,
         operation: Operation,
@@ -64,7 +141,7 @@ class DbRuntimeMonitorActionWritesMixin:
                 "db.sql.execute_write",
                 owner=str(owner) if owner else None,
             )
-            validation_capability = self._validation_capability_for_sql_execute(
+            validation_capability = self.tasks.validation_capability_for_sql_execute(
                 write_capability
             )
             if validation_capability is None:
@@ -85,9 +162,9 @@ class DbRuntimeMonitorActionWritesMixin:
                     else "missing_write_capability"
                 ),
             )
-        validation_task = self._task_for_capability(
-            operation,
-            validation_capability,
+        validation_spec = DbTaskSpec(
+            capability_id=validation_capability.id,
+            owner=validation_capability.owner,
             input={"sql": sql, "operation": "write.execute"},
             reason="monitor_write_validation",
             sequence=500,
@@ -98,6 +175,11 @@ class DbRuntimeMonitorActionWritesMixin:
                 "monitor_action_role": "write_validation",
             },
         )
+        validation_plan = await self.plan_task_specs(
+            operation,
+            (validation_spec,),
+        )
+        validation_task = validation_plan.tasks[0]
         validation_evidence_items = await self.execute_task(
             validation_task,
             operation,
@@ -130,8 +212,10 @@ class DbRuntimeMonitorActionWritesMixin:
                 reason="write_validation_missing",
             )
         validation_facts = sql_validation_facts_from_evidence(validation_evidence)
-        sql_fingerprint = validation_facts.sql_fingerprint or _stable_hash({"sql": sql})
-        proposal_fingerprint = _stable_hash(
+        sql_fingerprint = validation_facts.sql_fingerprint or persisted_fingerprint(
+            {"sql": sql}
+        )
+        proposal_fingerprint = persisted_fingerprint(
             {
                 "action_plan_fingerprint": action_plan_fingerprint,
                 "sql_fingerprint": sql_fingerprint,
@@ -141,7 +225,7 @@ class DbRuntimeMonitorActionWritesMixin:
         )
         validation_payload_fingerprint = validation_evidence.metadata.get(
             "payload_fingerprint"
-        ) or _payload_fingerprint(validation_evidence.payload)
+        ) or persisted_fingerprint(validation_evidence.payload)
         proposal = await self._persist_monitor_write_proposal(
             operation,
             monitor_id=monitor_id,
@@ -155,9 +239,9 @@ class DbRuntimeMonitorActionWritesMixin:
             status="validating",
             approval_ids=(),
         )
-        write_task = self._task_for_capability(
-            operation,
-            write_capability,
+        write_spec = DbTaskSpec(
+            capability_id=write_capability.id,
+            owner=write_capability.owner,
             input={
                 "sql_ref": "sql.validation",
                 "params": list(action_plan.get("params") or ()),
@@ -167,7 +251,6 @@ class DbRuntimeMonitorActionWritesMixin:
             },
             reason="monitor_write_execution",
             sequence=510,
-            validation_task=validation_task,
             metadata={
                 "monitor_id": monitor_id,
                 "monitor_run_id": monitor_run_id,
@@ -181,6 +264,11 @@ class DbRuntimeMonitorActionWritesMixin:
                 "proposal_evidence_id": proposal.id,
             },
         )
+        write_plan = await self.plan_task_specs(
+            operation,
+            (validation_spec, write_spec),
+        )
+        write_task = write_plan.tasks[-1]
         authoritative = _sql_validation_governance_facts((validation_evidence,))
         operation_override = {
             "operation_type": "write.execute",
@@ -275,7 +363,7 @@ class DbRuntimeMonitorActionWritesMixin:
                 dependency
                 for dependency in write_task.dependencies
                 if not (
-                    dependency.kind.value == "approval"
+                    dependency.kind == TaskDependencyKind.APPROVAL
                     and dependency.approval_id is None
                     and dependency.approval_policy_id == "approval_required_for_writes"
                 )
@@ -299,7 +387,24 @@ class DbRuntimeMonitorActionWritesMixin:
                     ),
                 ),
             )
-        await self._plan_kernel_task(write_task)
+        write_plan = await self.plan_task_specs(
+            operation,
+            (
+                validation_spec,
+                replace(
+                    write_spec,
+                    dependencies=write_task.dependencies,
+                ),
+            ),
+        )
+        planned_write_task = write_plan.tasks[-1]
+        if planned_write_task.dependencies != write_task.dependencies:
+            planned_write_task = replace(
+                planned_write_task,
+                dependencies=write_task.dependencies,
+            )
+            await self.store.save_task(planned_write_task)
+        write_task = planned_write_task
         status = (
             "approval_required"
             if governance_decision.result.pending_approval or approval_requests
@@ -375,7 +480,7 @@ class DbRuntimeMonitorActionWritesMixin:
         block_reason: str | None = None,
         supersede: bool = False,
     ) -> Evidence:
-        existing = await self._latest_evidence(
+        existing = await self.tasks.latest_evidence(
             operation.id,
             "monitor.write_proposal",
             payload={"proposal_fingerprint": proposal_fingerprint},
@@ -394,7 +499,7 @@ class DbRuntimeMonitorActionWritesMixin:
             "validation_evidence_id": validation_evidence.id,
             "validation_payload_fingerprint": (
                 validation_evidence.metadata.get("payload_fingerprint")
-                or _payload_fingerprint(validation_evidence.payload)
+                or persisted_fingerprint(validation_evidence.payload)
             ),
             "source_evidence_refs": [dict(item) for item in source_evidence_refs],
             "status": status,
@@ -417,7 +522,7 @@ class DbRuntimeMonitorActionWritesMixin:
                 "monitor_action_fingerprint": action_plan_fingerprint,
                 "proposal_fingerprint": proposal_fingerprint,
                 "sql_fingerprint": sql_fingerprint,
-                "payload_fingerprint": _payload_fingerprint(payload),
+                "payload_fingerprint": persisted_fingerprint(payload),
             },
         )
         await self.store.save_evidence(evidence)
@@ -488,7 +593,7 @@ class DbRuntimeMonitorActionWritesMixin:
         status: str,
         block_reason: str | None = None,
     ) -> Evidence:
-        existing = await self._latest_evidence(
+        existing = await self.tasks.latest_evidence(
             operation.id,
             "monitor.write_execution",
             payload={
@@ -531,7 +636,7 @@ class DbRuntimeMonitorActionWritesMixin:
                 "monitor_action_kind": "write_proposal",
                 "monitor_action_fingerprint": action_plan_fingerprint,
                 "proposal_fingerprint": proposal.payload.get("proposal_fingerprint"),
-                "payload_fingerprint": _payload_fingerprint(payload),
+                "payload_fingerprint": persisted_fingerprint(payload),
             },
         )
         await self.store.save_evidence(evidence)
@@ -563,7 +668,7 @@ class DbRuntimeMonitorActionWritesMixin:
             else ""
         )
         proposal = (
-            await self._latest_evidence(
+            await self.tasks.latest_evidence(
                 snapshot.operation.id,
                 "monitor.write_proposal",
                 payload={"proposal_fingerprint": proposal_fingerprint},

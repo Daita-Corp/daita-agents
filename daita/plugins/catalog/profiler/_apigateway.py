@@ -14,13 +14,6 @@ class APIGatewayProfiler(BaseProfiler):
 
     async def profile(self, store: DiscoveredStore) -> NormalizedSchema:
         """Deep-profile an API Gateway API to extract endpoints and integrations."""
-        try:
-            import boto3
-        except ImportError:
-            raise ImportError(
-                "boto3 is required. Install with: pip install 'daita-agents[aws]'"
-            )
-
         from ..discovery import discover_apigateway
 
         conn_hint = store.connection_hint

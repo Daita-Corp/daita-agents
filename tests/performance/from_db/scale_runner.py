@@ -149,6 +149,7 @@ def operation_record(
         status_value = "unknown"
     error_payload = diagnostics.get("error") if isinstance(diagnostics, dict) else None
     success = status_value == OperationStatus.SUCCEEDED.value and not error_payload
+    planner = diagnostics.get("planner") if isinstance(diagnostics, dict) else None
     return {
         "index": index,
         "started_at": started_at,
@@ -171,10 +172,8 @@ def operation_record(
                 if isinstance(diagnostics.get("execution"), dict)
                 else None
             ),
-            "planner_strategy": (
-                diagnostics.get("execution", {}).get("planner_strategy")
-                if isinstance(diagnostics.get("execution"), dict)
-                else None
+            "planner_status": (
+                planner.get("status") if isinstance(planner, dict) else None
             ),
         },
     }
@@ -373,9 +372,9 @@ def llm_usage_from_result(result: Any) -> dict[str, Any]:
     diagnostics = _diagnostics(result)
     _merge_llm_usage(usage, diagnostics.get("llm"))
     _merge_llm_usage(usage, diagnostics.get("synthesis", {}).get("diagnostics"))
-    execution = diagnostics.get("execution")
-    if isinstance(execution, dict):
-        _merge_llm_usage(usage, execution.get("query_plan", {}).get("llm"))
+    planner = diagnostics.get("planner")
+    if isinstance(planner, dict):
+        _merge_llm_usage(usage, planner.get("diagnostics", {}).get("llm"))
     for evidence in getattr(result, "evidence", ()) or ():
         payload = getattr(evidence, "payload", {}) or {}
         if isinstance(payload, dict):

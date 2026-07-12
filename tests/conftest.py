@@ -6,6 +6,8 @@ network access required.
 """
 
 import asyncio
+import sys
+from types import ModuleType
 from typing import Any, Dict, List
 
 import pytest
@@ -13,6 +15,33 @@ import pytest
 from daita.agents.agent import Agent
 from daita.core.tools import LocalTool
 from daita.llm.mock import MockLLMProvider
+
+
+@pytest.fixture
+def module_stub(monkeypatch):
+    """Install importable module/package stubs for optional SDK unit tests."""
+
+    def install(name: str, **attributes: Any) -> ModuleType:
+        parts = name.split(".")
+        parent = None
+        module = None
+        for index in range(len(parts)):
+            module_name = ".".join(parts[: index + 1])
+            module = sys.modules.get(module_name)
+            if module is None:
+                module = ModuleType(module_name)
+                module.__path__ = []
+                monkeypatch.setitem(sys.modules, module_name, module)
+            if parent is not None:
+                monkeypatch.setattr(parent, parts[index], module, raising=False)
+            parent = module
+        assert module is not None
+        for attribute, value in attributes.items():
+            monkeypatch.setattr(module, attribute, value, raising=False)
+        return module
+
+    return install
+
 
 # ---------------------------------------------------------------------------
 # SequentialMockLLM

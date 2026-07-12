@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 from dataclasses import replace
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from daita.runtime import Evidence
 
+from ..fingerprints import persisted_fingerprint
 from .types import _SourcePreparationSnapshot
+
+if TYPE_CHECKING:
+    from ..models import DbRuntimeConfig
 
 
 class DbRuntimeCacheMixin:
+    if TYPE_CHECKING:
+        config: DbRuntimeConfig
+        _schema_profile_cache: dict[str, Any] | None
+        _catalog_source_cache: _SourcePreparationSnapshot | None
+
     def cached_schema_evidence(self, *, operation_id: str) -> Evidence | None:
         """Return cached schema profile evidence when the runtime cache is fresh."""
         cached = self._schema_profile_cache
@@ -171,15 +178,15 @@ class DbRuntimeCacheMixin:
 
 def _schema_cache_ttl(metadata: dict[str, Any]) -> float | None:
     options = _from_db_options(metadata)
-    if "cache_ttl" in options:
-        value = options.get("cache_ttl")
+    source_options = options.get("source_options")
+    if isinstance(source_options, dict) and "cache_ttl" in source_options:
+        value = source_options.get("cache_ttl")
         return None if value is None else float(value)
     return None
 
 
 def _source_schema_fingerprint(schema: dict[str, Any]) -> str:
-    encoded = json.dumps(schema, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return persisted_fingerprint(schema)
 
 
 def _from_db_options(metadata: dict[str, Any]) -> dict[str, Any]:

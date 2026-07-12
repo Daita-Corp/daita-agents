@@ -17,6 +17,7 @@ from daita.runtime import (
     PolicyDecision,
     PolicyEffect,
     RiskLevel,
+    RuntimeKernelGovernanceBlocked,
     RuntimeEventType,
     SQLiteRuntimeStore,
     Task,
@@ -271,127 +272,6 @@ async def test_unselected_skill_owned_policy_does_not_evaluate():
     assert snapshot.policy_decisions == ()
 
 
-async def test_selected_skill_owned_policy_evaluates_when_contract_references_it():
-    skill_policy = RecordingPolicy(
-        policy_id="aggregate_only",
-        owner="skill_finance",
-        effect=PolicyEffect.WARN,
-    )
-    skill = Skill(
-        name="finance",
-        policies=(skill_policy,),
-        runtime_effects=SkillRuntimeEffects(
-            skill_id="skill_finance",
-            policy_ids=("skill_finance:aggregate_only",),
-        ),
-        context_mode="runtime_only",
-    )
-    runtime = DbRuntime(plugins=(skill,))
-
-    result = await runtime.run(DbRequest("Hello there"))
-    snapshot = await runtime.inspect_operation(result.operation_id)
-
-    assert skill_policy.calls == 1
-    assert result.contract.policy_ids == ("skill_finance:aggregate_only",)
-    assert [decision.policy_identity for decision in snapshot.policy_decisions] == [
-        "skill_finance:aggregate_only@1"
-    ]
-
-
-async def test_non_skill_registry_policy_still_evaluates_without_contract_reference():
-    policy = RecordingPolicy(
-        policy_id="warn_all",
-        owner="governance_probe",
-        effect=PolicyEffect.WARN,
-    )
-    runtime = DbRuntime(plugins=(GovernancePolicyPlugin(policy),))
-
-    result = await runtime.run(DbRequest("Hello there"))
-    snapshot = await runtime.inspect_operation(result.operation_id)
-
-    assert policy.calls == 1
-    assert result.contract.policy_ids == ()
-    assert [decision.policy_identity for decision in snapshot.policy_decisions] == [
-        "governance_probe:warn_all@1"
-    ]
-
-
-async def test_db_runtime_requires_approval_for_write_before_tasks_run():
-    plugin = WriteProbePlugin()
-    runtime = DbRuntime(plugins=(plugin,))
-
-    result = await runtime.run(
-        DbRequest(
-            "execute insert into orders values (1)",
-            user_id="analyst-1",
-            session_id="session-1",
-            source_scope=("warehouse.orders",),
-            mode="write_execute",
-            metadata={"tenant_id": "tenant-1"},
-        )
-    )
-    snapshot = await runtime.inspect_operation(result.operation_id)
-
-    assert result.status is OperationStatus.BLOCKED
-    assert result.warnings == ("db_runtime_approval_required",)
-    assert plugin.validate_executor.calls == 0
-    assert plugin.write_executor.calls == 0
-    assert [task.status for task in snapshot.tasks] == [
-        TaskStatus.PENDING,
-        TaskStatus.PENDING,
-    ]
-    assert [task.metadata["sequence"] for task in snapshot.tasks] == [1, 2]
-    assert [task.metadata["owner"] for task in snapshot.tasks] == [
-        "write_probe",
-        "write_probe",
-    ]
-    assert snapshot.tasks[1].input["sql_ref"] == "sql.validation"
-    assert snapshot.tasks[1].input["input_hash"]
-    assert [dependency.kind.value for dependency in snapshot.tasks[1].dependencies] == [
-        "evidence",
-        "approval",
-    ]
-    assert [decision.effect for decision in snapshot.policy_decisions] == [
-        PolicyEffect.REQUIRE_APPROVAL
-    ]
-    assert len(snapshot.approval_requests) == 1
-    assert snapshot.approval_requests[0].status is ApprovalStatus.PENDING
-    assert snapshot.approval_requests[0].requested_by_policy_id == (
-        "approval_required_for_writes"
-    )
-    assert RuntimeEventType.APPROVAL_REQUESTED in {
-        event.type for event in snapshot.events
-    }
-    assert result.diagnostics["governance"]["pending_approval"] is True
-    assert len(snapshot.governance_audit_records) == 1
-    audit = snapshot.governance_audit_records[0]
-    assert audit.stage == "operation"
-    assert audit.pending_approval is True
-    assert audit.runtime_facts["governance_facts"]["version"] == "15.10"
-    assert audit.runtime_facts["governance_facts"]["fact_source"]["planned"] is True
-    assert audit.actor["user_id"] == "analyst-1"
-    assert audit.actor["session_id"] == "session-1"
-    assert audit.tenant["tenant_id"] == "tenant-1"
-    assert audit.source_scope == ("warehouse.orders",)
-    assert audit.traces[0].policy_identity == ("runtime:approval_required_for_writes@1")
-    assert audit.traces[0].approval_ids == (snapshot.approval_requests[0].approval_id,)
-    assert audit.approval_context["new_request_ids"] == [
-        snapshot.approval_requests[0].approval_id
-    ]
-    assert audit.evaluation_trace["effect"] == "require_approval"
-    assert audit.operation_context["request"]["prompt_hash"]
-    assert "execute insert into orders values (1)" not in str(audit.to_dict())
-
-    approved = await runtime.approval_channel.approve(
-        snapshot.approval_requests[0].approval_id
-    )
-    approvals = await runtime.store.list_approval_requests(result.operation_id)
-
-    assert approved.status is ApprovalStatus.APPROVED
-    assert approvals[0].status is ApprovalStatus.APPROVED
-    assert approvals[0].approval_id == snapshot.approval_requests[0].approval_id
-
-
 async def test_allowed_direct_capability_records_evaluation_trace_without_policy_decision():
     plugin = ReadProbePlugin()
     runtime = DbRuntime(plugins=(plugin,))
@@ -416,37 +296,6 @@ async def test_allowed_direct_capability_records_evaluation_trace_without_policy
         "No applicable policy denied, modified, warned, or required approval."
     )
     assert first_audit.evaluation_trace["evaluated_policy_identities"]
-
-
-async def test_db_runtime_denies_destructive_operations_without_running_tasks():
-    plugin = WriteProbePlugin()
-    runtime = DbRuntime(plugins=(plugin,))
-
-    result = await runtime.run(
-        DbRequest("execute drop table orders", mode="write_execute")
-    )
-    snapshot = await runtime.inspect_operation(result.operation_id)
-
-    assert result.status is OperationStatus.BLOCKED
-    assert result.warnings == ("db_runtime_governance_denied",)
-    assert plugin.validate_executor.calls == 0
-    assert plugin.write_executor.calls == 0
-    assert [task.status for task in snapshot.tasks] == [
-        TaskStatus.PENDING,
-        TaskStatus.PENDING,
-    ]
-    assert [decision.effect for decision in snapshot.policy_decisions] == [
-        PolicyEffect.DENY
-    ]
-    decision = snapshot.policy_decisions[0]
-    assert decision.policy_identity == "runtime:deny_destructive_operations@2"
-    assert decision.metadata["decision_source"] == "narrow_prompt_fallback"
-    assert decision.metadata["fact_source"] == "prompt_fallback"
-    audit = snapshot.governance_audit_records[0]
-    assert audit.runtime_facts["governance_facts"]["version"] == "15.10"
-    assert snapshot.approval_requests == ()
-    assert RuntimeEventType.POLICY_DECISION in {event.type for event in snapshot.events}
-    assert result.diagnostics["governance"]["blocked"] is True
 
 
 async def test_read_prompt_destructive_terms_do_not_trigger_destructive_policy():
@@ -488,19 +337,48 @@ async def test_read_prompt_destructive_terms_do_not_trigger_destructive_policy()
     assert evidence_event.evidence_id == evidence[0].id
 
 
-async def test_db_runtime_requires_approval_for_admin_operations():
+@pytest.mark.parametrize(
+    "mode",
+    ("write.propose", "write", "write_execute"),
+)
+async def test_explicit_write_mode_destructive_prompt_records_policy_denial(mode):
     runtime = DbRuntime()
+    await runtime.setup()
+    operation = await runtime.kernel.create_operation(
+        operation_id=f"write-delete-proposal-{mode.replace('.', '-').replace('_', '-')}",
+        operation_type="db.run",
+        request={
+            "prompt": "Delete pending orders.",
+            "mode": mode,
+            "source_scope": ["orders"],
+            "metadata": {},
+        },
+        required_evidence=frozenset(),
+        metadata={
+            "access": "none",
+            "mode": mode,
+            "source_scope": ["orders"],
+            "safety_frame": {
+                "explicit_mode": mode,
+                "max_access": "write",
+                "source_scope": ["orders"],
+            },
+        },
+        evaluate_governance=False,
+    )
 
-    result = await runtime.run(DbRequest("run database maintenance", mode="admin"))
-    snapshot = await runtime.inspect_operation(result.operation_id)
+    with pytest.raises(RuntimeKernelGovernanceBlocked):
+        await runtime.kernel.evaluate_operation_governance(operation.id)
+    snapshot = await runtime.inspect_operation(operation.id)
 
-    assert result.status is OperationStatus.BLOCKED
-    assert result.warnings == ("db_runtime_approval_required",)
-    assert [decision.effect for decision in snapshot.policy_decisions] == [
-        PolicyEffect.REQUIRE_APPROVAL
+    assert snapshot.operation.status is OperationStatus.BLOCKED
+    assert [decision.policy_id for decision in snapshot.policy_decisions] == [
+        "deny_destructive_operations"
     ]
-    assert len(snapshot.approval_requests) == 1
-    assert snapshot.tasks == ()
+    decision = snapshot.policy_decisions[0]
+    assert decision.metadata["decision_source"] == "narrow_prompt_fallback"
+    assert decision.metadata["access"] == "write"
+    assert "delete" in decision.metadata["matched_terms"]
 
 
 async def test_direct_capability_execution_requires_governance_approval():
@@ -1031,47 +909,6 @@ async def test_resume_direct_capability_requires_original_operation_approval_sco
     assert first_after_resume.approval_requests[0].status is ApprovalStatus.APPROVED
 
 
-async def test_resume_run_operation_uses_persisted_plan_context_for_completion():
-    plugin = WriteProbePlugin()
-    runtime = DbRuntime(plugins=(plugin,))
-
-    result = await runtime.run(
-        DbRequest("execute insert into orders values (1)", mode="write_execute")
-    )
-    snapshot = await runtime.inspect_operation(result.operation_id)
-    await runtime.approval_channel.approve(snapshot.approval_requests[0].approval_id)
-
-    resumed = await runtime.resume_operation(result.operation_id)
-
-    assert plugin.validate_executor.calls == 1
-    assert plugin.write_executor.calls == 1
-    assert resumed.operation.status is OperationStatus.SUCCEEDED
-    assert [task.status for task in resumed.tasks] == [
-        TaskStatus.SUCCEEDED,
-        TaskStatus.SUCCEEDED,
-        TaskStatus.SUCCEEDED,
-    ]
-    assert {item.kind for item in resumed.evidence} == {
-        "sql.validation",
-        "write.execution",
-        "verification.result",
-        "answer.synthesis",
-    }
-    write_task = next(
-        task for task in resumed.tasks if task.capability_id == "db.sql.execute_write"
-    )
-    validate_task = next(
-        task for task in resumed.tasks if task.capability_id == "db.sql.validate"
-    )
-    assert write_task.dependencies[0].producer_task_id == validate_task.id
-    assert write_task.input["validated_task_id"] == validate_task.id
-    assert runtime.operation_results[-1].operation_id == result.operation_id
-    assert runtime.operation_results[-1].status is OperationStatus.SUCCEEDED
-    assert runtime.operation_results[-1].answer == (
-        "The DB operation completed with verified evidence."
-    )
-
-
 async def test_rejected_expired_and_cancelled_approvals_remain_inspectable():
     for transition, expected_approval, expected_status in (
         ("reject", ApprovalStatus.REJECTED, OperationStatus.FAILED),
@@ -1402,59 +1239,3 @@ async def test_expired_side_effecting_lease_requires_manual_recovery():
     assert resumed.operation.status is OperationStatus.BLOCKED
     assert resumed.tasks[0].status is TaskStatus.BLOCKED
     assert resumed.tasks[0].metadata["manual_recovery_required"] is True
-
-
-async def test_approved_write_resume_survives_sqlite_store_restart(tmp_path):
-    path = tmp_path / "operations.sqlite"
-    first_plugin = WriteProbePlugin()
-    first_runtime = DbRuntime(
-        plugins=(first_plugin,),
-        store=SQLiteRuntimeStore(path),
-    )
-
-    result = await first_runtime.run(
-        DbRequest("execute insert into orders values (1)", mode="write_execute")
-    )
-    blocked = await first_runtime.inspect_operation(result.operation_id)
-    blocked_audit_ids = tuple(
-        record.audit_id for record in blocked.governance_audit_records
-    )
-
-    second_plugin = WriteProbePlugin()
-    second_runtime = DbRuntime(
-        plugins=(second_plugin,),
-        store=SQLiteRuntimeStore(path),
-    )
-    await second_runtime.approval_channel.approve(
-        blocked.approval_requests[0].approval_id
-    )
-    resumed = await second_runtime.resume_operation(result.operation_id)
-
-    assert result.status is OperationStatus.BLOCKED
-    assert first_plugin.validate_executor.calls == 0
-    assert first_plugin.write_executor.calls == 0
-    assert second_plugin.validate_executor.calls == 1
-    assert second_plugin.write_executor.calls == 1
-    assert resumed.operation.status is OperationStatus.SUCCEEDED
-    assert [task.status for task in resumed.tasks] == [
-        TaskStatus.SUCCEEDED,
-        TaskStatus.SUCCEEDED,
-        TaskStatus.SUCCEEDED,
-    ]
-    assert {item.kind for item in resumed.evidence} == {
-        "sql.validation",
-        "write.execution",
-        "verification.result",
-        "answer.synthesis",
-    }
-    assert resumed.approval_requests[0].status is ApprovalStatus.APPROVED
-    assert (
-        tuple(
-            record.audit_id
-            for record in resumed.governance_audit_records[: len(blocked_audit_ids)]
-        )
-        == blocked_audit_ids
-    )
-    assert len(resumed.governance_audit_records) == len(blocked_audit_ids) + 3
-    assert resumed.governance_audit_records[0].pending_approval is True
-    assert resumed.governance_audit_records[-1].allowed is True

@@ -28,13 +28,13 @@ class _FakeResult:
     diagnostics = {
         "execution": {
             "planned_sql": "SELECT COUNT(*) FROM customers",
-            "planner_strategy": "deterministic",
             "task_count": 2,
             "tasks": [
                 {"capability_id": "db.sql.validate"},
                 {"capability_id": "db.sql.execute_read"},
             ],
         },
+        "planner": {"status": "finished"},
         "synthesis": {"diagnostics": {"mode": "deterministic"}},
     }
 

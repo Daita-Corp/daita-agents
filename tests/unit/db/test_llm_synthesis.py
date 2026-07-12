@@ -1,12 +1,22 @@
 import json
 from uuid import uuid4
 
+import pytest
+
 from daita.agents.agent import Agent
-from daita.db import DbRequest, DbRuntime
+from daita.db import (
+    DbIntent,
+    DbIntentKind,
+    DbLLMConfig,
+    DbOperationContract,
+    DbRequest,
+    DbRuntime,
+)
 from daita.db.llm_service import DbLLMResponse
+from daita.db.synthesis import build_synthesis_context, validate_synthesis_payload
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import Evidence, OperationStatus, TaskStatus
+from daita.runtime import AccessMode, Evidence, OperationStatus, TaskStatus
 
 
 class FakeSynthesisLLMService:
@@ -82,6 +92,82 @@ def _citations(context, *kinds):
     return citations
 
 
+def _data_intent():
+    return DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ)
+
+
+def _data_contract():
+    return DbOperationContract(
+        operation_type="data.query",
+        required_evidence=("sql.validation", "query.result"),
+    )
+
+
+def _query_result(rows, *, sql="SELECT COUNT(*) AS customer_count FROM customers"):
+    return Evidence(
+        id="query-result-1",
+        kind="query.result",
+        accepted=True,
+        task_id="task-2",
+        payload={"rows": rows, "sql": sql, "truncated": False},
+    )
+
+
+def _verification_result():
+    return Evidence(
+        id="verification-1",
+        kind="verification.result",
+        accepted=True,
+        task_id="task-3",
+        payload={
+            "passed": True,
+            "warnings": [],
+            "evidence_details": [
+                {
+                    "id": "query-result-1",
+                    "kind": "query.result",
+                    "owner": None,
+                    "task_id": "task-2",
+                }
+            ],
+        },
+    )
+
+
+def _data_synthesis_context(*, char_budget=16000):
+    evidence = (
+        _query_result([{"customer_count": 4}]),
+        _verification_result(),
+    )
+    context = build_synthesis_context(
+        request=DbRequest("How many customers are there?"),
+        intent=_data_intent(),
+        contract=_data_contract(),
+        evidence=evidence,
+        char_budget=char_budget,
+    )
+    return context, evidence
+
+
+def _parsed_synthesis_response(context, answer, *, sufficiency="answered"):
+    return {
+        "answer": answer,
+        "reasoning_summary": "Used the verified query result.",
+        "cited_evidence_refs": _citations(
+            context, "query.result", "verification.result"
+        ),
+        "assumptions": [],
+        "limitations": [],
+        "warnings": [],
+        "follow_up_questions": [],
+        "sufficiency": sufficiency,
+        "confidence": 0.91,
+        "truncation": context["truncation"],
+        "grounding": {"all_claims_from_evidence": True},
+        "answer_facts": context["answer_facts"],
+    }
+
+
 def _valid_response(answer):
     def responder(messages):
         context = _context_from_messages(messages)
@@ -138,7 +224,9 @@ async def test_from_db_model_registers_answer_synthesis_capability(tmp_path):
     await sqlite.execute_script("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
     await sqlite.disconnect()
 
-    agent = await Agent.from_db(str(db_path), model="mock-model", llm_provider="mock")
+    agent = await Agent.from_db(
+        str(db_path), llm=DbLLMConfig(provider="mock", model="mock-model")
+    )
     try:
         inspection = await agent.describe()
     finally:
@@ -149,347 +237,39 @@ async def test_from_db_model_registers_answer_synthesis_capability(tmp_path):
     assert "db_runtime:verification.result" in inspection.evidence_schema_kinds
 
 
-async def test_verified_query_persists_synthesis_task_and_final_answer_from_evidence(
-    tmp_path,
-):
-    llm = FakeSynthesisLLMService(_valid_response("There are 3 orders."))
-    runtime, sqlite = await _runtime(tmp_path, llm)
-    calls = []
-    original = runtime.execute_task
+def test_llm_synthesis_validation_rejects_answer_missing_scalar_fact():
+    context, evidence = _data_synthesis_context()
+    parsed = _parsed_synthesis_response(context.payload, "Returned 1 row.")
 
-    async def spy(task, operation, context=None):
-        calls.append(task.capability_id)
-        return await original(task, operation, context)
+    with pytest.raises(
+        ValueError,
+        match="synthesis_missing_answer_fact:customer_count",
+    ):
+        validate_synthesis_payload(
+            parsed,
+            dependency_evidence=evidence,
+            context_metadata=context.metadata,
+            llm_diagnostics={"provider": "fake", "model": "synthesis-test"},
+        )
 
-    runtime.execute_task = spy
-    try:
-        result = await runtime.run("How many orders are there?")
-        snapshot = await runtime.inspect_operation(result.operation_id)
-    finally:
-        await sqlite.disconnect()
 
-    assert result.status is OperationStatus.SUCCEEDED
-    assert "db.answer.synthesize" in calls
-    assert result.answer == "There are 3 orders."
-    synthesis = next(
-        item for item in result.evidence if item.kind == "answer.synthesis"
+def test_llm_synthesis_validation_accepts_scalar_with_context_only_truncation():
+    context, evidence = _data_synthesis_context(char_budget=1)
+    parsed = _parsed_synthesis_response(
+        context.payload,
+        "customer_count is 4.",
+        sufficiency="partial",
     )
-    assert synthesis.accepted
-    assert result.answer == synthesis.payload["answer"]
-    assert snapshot is not None
-    task = next(
-        item for item in snapshot.tasks if item.capability_id == "db.answer.synthesize"
+
+    payload = validate_synthesis_payload(
+        parsed,
+        dependency_evidence=evidence,
+        context_metadata=context.metadata,
+        llm_diagnostics={"provider": "fake", "model": "synthesis-test"},
     )
-    assert task.status is TaskStatus.SUCCEEDED
 
-
-async def test_synthesis_task_depends_on_accepted_evidence_fingerprints(tmp_path):
-    llm = FakeSynthesisLLMService(_valid_response("There are 3 orders."))
-    runtime, sqlite = await _runtime(tmp_path, llm)
-    try:
-        result = await runtime.run("How many orders are there?")
-        snapshot = await runtime.inspect_operation(result.operation_id)
-    finally:
-        await sqlite.disconnect()
-
-    assert snapshot is not None
-    task = next(
-        item for item in snapshot.tasks if item.capability_id == "db.answer.synthesize"
-    )
-    dependencies = {
-        dependency.evidence_kind: dependency for dependency in task.dependencies
-    }
-    assert {
-        "query.result",
-        "query.plan.proposal",
-        "query.plan.validation",
-        "sql.validation",
-        "verification.result",
-    } <= set(dependencies)
-    evidence_by_id = {item.id: item for item in snapshot.evidence}
-    for dependency in dependencies.values():
-        evidence = evidence_by_id[dependency.evidence_id]
-        assert evidence.accepted
-        assert evidence.operation_id == result.operation_id
-        assert (
-            dependency.payload_fingerprint == evidence.metadata["payload_fingerprint"]
-        )
-
-
-async def test_llm_context_uses_accepted_dependency_evidence_only(tmp_path):
-    llm = FakeSynthesisLLMService(_valid_response("There are 3 orders."))
-    runtime, sqlite = await _runtime(tmp_path, llm)
-    original = runtime._execute_answer_synthesis
-
-    async def inject_noise(*, operation, intent, outcome_evidence):
-        await runtime.store.save_evidence(
-            Evidence(
-                id="rejected-noise",
-                kind="query.result",
-                owner="db_runtime",
-                operation_id=operation.id,
-                accepted=False,
-                payload={"rows": [{"count": 999}], "sql": "SELECT 999"},
-                metadata={"payload_fingerprint": "rejected"},
-            )
-        )
-        await runtime.store.save_evidence(
-            Evidence(
-                id="other-operation-noise",
-                kind="query.result",
-                owner="db_runtime",
-                operation_id="other-operation",
-                accepted=True,
-                payload={"rows": [{"count": 123}], "sql": "SELECT 123"},
-                metadata={"payload_fingerprint": "other"},
-            )
-        )
-        return await original(
-            operation=operation,
-            intent=intent,
-            outcome_evidence=outcome_evidence,
-        )
-
-    runtime._execute_answer_synthesis = inject_noise
-    try:
-        await runtime.run("How many orders are there?")
-    finally:
-        await sqlite.disconnect()
-
-    context = _context_from_messages(llm.calls[-1])
-    evidence_ids = {item["id"] for item in context["evidence"]}
-    assert "rejected-noise" not in evidence_ids
-    assert "other-operation-noise" not in evidence_ids
-    assert {item["operation_id"] for item in context["evidence"]} != {"other-operation"}
-
-
-async def test_llm_schema_context_scopes_single_table_prompts(tmp_path):
-    llm = FakeSynthesisLLMService(_valid_schema_response("Orders schema."))
-    runtime, sqlite = await _runtime(tmp_path, llm)
-    try:
-        result = await runtime.run(
-            DbRequest("Tell me about the orders table.", mode="schema.query")
-        )
-    finally:
-        await sqlite.disconnect()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    context = _context_from_messages(llm.calls[-1])
-    assert context["schema_answer_scope"]["mode"] == "asset"
-    assert context["schema_answer_scope"]["selected_table_names"] == ["orders"]
-    assert [table["name"] for table in context["semantics"]["tables"]] == ["orders"]
-
-
-async def test_llm_schema_context_keeps_database_wide_prompts_broad(tmp_path):
-    llm = FakeSynthesisLLMService(_valid_schema_response("Database schema."))
-    runtime, sqlite = await _runtime(tmp_path, llm)
-    try:
-        result = await runtime.run(DbRequest("What tables exist?", mode="schema.query"))
-    finally:
-        await sqlite.disconnect()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    context = _context_from_messages(llm.calls[-1])
-    assert context["schema_answer_scope"]["mode"] == "database"
-    table_names = {table["name"] for table in context["semantics"]["tables"]}
-    assert {"customers", "orders"} <= table_names
-
-
-async def test_no_llm_uses_deterministic_fallback_through_synthesis_evidence(tmp_path):
-    runtime, sqlite = await _runtime(tmp_path, None)
-    try:
-        result = await runtime.run("How many orders are there?")
-        snapshot = await runtime.inspect_operation(result.operation_id)
-    finally:
-        await sqlite.disconnect()
-
-    assert result.answer == "The count is 3."
-    synthesis = next(
-        item for item in result.evidence if item.kind == "answer.synthesis"
-    )
-    assert synthesis.payload["diagnostics"]["mode"] == "deterministic_fallback"
-    assert synthesis.payload["diagnostics"]["fallback_reason"] == (
-        "db_llm_service_unavailable"
-    )
-    assert snapshot is not None
-    assert any(task.capability_id == "db.answer.synthesize" for task in snapshot.tasks)
-
-
-async def test_invalid_llm_outputs_fallback_with_reason(tmp_path):
-    cases = [
-        ("not json", "JSONDecodeError"),
-        (
-            lambda messages: json.dumps(
-                {
-                    "answer": "Unknown citation.",
-                    "reasoning_summary": "",
-                    "cited_evidence_refs": [
-                        {"id": "missing", "kind": "query.result", "purpose": "bad"}
-                    ],
-                    "assumptions": [],
-                    "limitations": [],
-                    "warnings": [],
-                    "follow_up_questions": [],
-                    "sufficiency": "answered",
-                    "confidence": 0.5,
-                    "truncation": _context_from_messages(messages)["truncation"],
-                    "grounding": {"all_claims_from_evidence": True},
-                }
-            ),
-            "unknown_citation",
-        ),
-        (
-            lambda messages: json.dumps(
-                {
-                    "answer": "I need to execute SQL to answer this.",
-                    "reasoning_summary": "",
-                    "cited_evidence_refs": _citations(
-                        _context_from_messages(messages),
-                        "query.result",
-                        "verification.result",
-                    ),
-                    "assumptions": [],
-                    "limitations": [],
-                    "warnings": [],
-                    "follow_up_questions": [],
-                    "sufficiency": "answered",
-                    "confidence": 0.5,
-                    "truncation": _context_from_messages(messages)["truncation"],
-                    "grounding": {"all_claims_from_evidence": True},
-                }
-            ),
-            "requests_db_work",
-        ),
-        (
-            lambda messages: json.dumps(
-                {
-                    "answer": "Orders are joined through a customer relationship.",
-                    "reasoning_summary": "",
-                    "cited_evidence_refs": _citations(
-                        _context_from_messages(messages),
-                        "query.result",
-                        "verification.result",
-                    ),
-                    "assumptions": [],
-                    "limitations": [],
-                    "warnings": [],
-                    "follow_up_questions": [],
-                    "sufficiency": "answered",
-                    "confidence": 0.5,
-                    "truncation": _context_from_messages(messages)["truncation"],
-                    "grounding": {"all_claims_from_evidence": True},
-                }
-            ),
-            "ungrounded_relationship_claim",
-        ),
-    ]
-    for responder, expected_reason in cases:
-        llm = FakeSynthesisLLMService(
-            responder
-            if callable(responder)
-            else lambda messages, value=responder: value
-        )
-        runtime, sqlite = await _runtime(tmp_path, llm)
-        try:
-            result = await runtime.run("How many orders are there?")
-        finally:
-            await sqlite.disconnect()
-        synthesis = next(
-            item for item in result.evidence if item.kind == "answer.synthesis"
-        )
-        assert synthesis.payload["diagnostics"]["mode"] == "deterministic_fallback"
-        assert expected_reason in synthesis.payload["diagnostics"]["fallback_reason"]
-
-
-async def test_dropped_caveats_and_redaction_force_fallback(tmp_path):
-    def dropped_caveats(messages):
-        context = _context_from_messages(messages)
-        return json.dumps(
-            {
-                "answer": "Returned a sample of orders.",
-                "reasoning_summary": "Used rows.",
-                "cited_evidence_refs": _citations(
-                    context, "query.result", "verification.result"
-                ),
-                "assumptions": [],
-                "limitations": [],
-                "warnings": [],
-                "follow_up_questions": [],
-                "sufficiency": "answered",
-                "confidence": 0.7,
-                "truncation": context["truncation"],
-                "grounding": {"all_claims_from_evidence": True},
-            }
-        )
-
-    llm = FakeSynthesisLLMService(dropped_caveats)
-    runtime, sqlite = await _runtime(tmp_path, llm, query_max_rows=1)
-    try:
-        result = await runtime.run("List orders")
-    finally:
-        await sqlite.disconnect()
-
-    context = _context_from_messages(llm.calls[-1])
-    assert "query_result_truncated" in context["required_caveats"]
-    assert "sensitive_values_redacted" in context["required_caveats"]
-    assert "[REDACTED]" in json.dumps(context)
-    synthesis = next(
-        item for item in result.evidence if item.kind == "answer.synthesis"
-    )
-    assert synthesis.payload["diagnostics"]["mode"] == "deterministic_fallback"
-    assert "dropped_caveat" in synthesis.payload["diagnostics"]["fallback_reason"]
-
-
-async def test_simple_answers_stay_deterministic_for_empty_and_single_row(tmp_path):
-    runtime, sqlite = await _runtime(tmp_path, None)
-    try:
-        count = await runtime.run("How many orders are there?")
-        empty = await runtime.run("List orders where id > 99")
-        single = await runtime.run("List orders where id = 1")
-    finally:
-        await sqlite.disconnect()
-
-    assert count.answer == "The count is 3."
-    assert empty.answer == "The query returned no rows."
-    assert single.answer == "Returned 1 row."
-
-
-async def test_synthesis_diagnostics_and_resume_skip_completed_task(tmp_path):
-    llm = FakeSynthesisLLMService(_valid_response("There are 3 orders."))
-    runtime, sqlite = await _runtime(tmp_path, llm)
-    try:
-        result = await runtime.run("How many orders are there?")
-        snapshot = await runtime.inspect_operation(result.operation_id)
-        resumed = await runtime.resume_operation(result.operation_id)
-    finally:
-        await sqlite.disconnect()
-
-    synthesis = next(
-        item for item in result.evidence if item.kind == "answer.synthesis"
-    )
-    diagnostics = synthesis.payload["diagnostics"]
-    assert diagnostics["mode"] == "llm"
-    assert diagnostics["provider"] == "fake"
-    assert diagnostics["model"] == "synthesis-test"
-    assert diagnostics["input_tokens"] == 12
-    assert diagnostics["output_tokens"] == 8
-    assert diagnostics["estimated_cost"] == 0.002
-    assert diagnostics["latency_ms"] == 2.5
-    assert diagnostics["evidence_refs"]
-    assert diagnostics["context"]["context_budget"]["row_budget"] == 25
-    assert diagnostics["sufficiency"] == "answered"
-    assert diagnostics["fallback_reason"] is None
-    assert len(llm.calls) == 1
-    assert snapshot is not None
-    assert resumed.operation.status is OperationStatus.SUCCEEDED
-    before = [
-        task.id
-        for task in snapshot.tasks
-        if task.capability_id == "db.answer.synthesize"
-    ]
-    after = [
-        task.id
-        for task in resumed.tasks
-        if task.capability_id == "db.answer.synthesize"
-    ]
-    assert before == after
+    assert context.metadata["truncation"]["context_chars_truncated"] is True
+    assert payload.sufficiency == "answered"
+    assert payload.answer_facts["primary_scalar"]["value"] == 4
+    assert "synthesis_context_truncated" not in payload.limitations
+    assert "synthesis_context_truncated" not in payload.warnings

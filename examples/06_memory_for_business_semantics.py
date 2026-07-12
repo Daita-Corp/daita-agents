@@ -15,6 +15,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from daita.agents.agent import Agent
+from daita.db import DbLLMConfig, DbMemoryConfig, DbSourceOptions
 
 from local_sqlite_fixtures import seed_sales_sqlite
 
@@ -32,14 +33,16 @@ def llm_options(use_live_llm: bool) -> dict[str, Any]:
         print("OPENAI_API_KEY is not set; using deterministic DB runtime output.\n")
         return {}
     return {
-        "llm_provider": "openai",
-        "model": os.getenv("OPENAI_MODEL", "gpt-5.4-mini"),
-        "api_key": api_key,
-        "temperature": 0,
+        "llm": DbLLMConfig(
+            provider="openai",
+            model=os.getenv("OPENAI_MODEL", "gpt-5.4-mini"),
+            api_key=api_key,
+            temperature=0,
+        )
     }
 
 
-def memory_options(base_dir: Path) -> dict[str, Any]:
+def memory_options(base_dir: Path) -> DbMemoryConfig:
     """Keep example memory local to this temporary run."""
     from daita.plugins.memory import LocalMemoryBackend
 
@@ -48,14 +51,14 @@ def memory_options(base_dir: Path) -> dict[str, Any]:
         scope="project",
         base_dir=base_dir,
     )
-    return {
-        "backend": backend,
-        "recall": "auto",
-        "learning": "off",
-        "retrieval_mode": "structured",
-        "limit": 3,
-        "char_budget": 800,
-    }
+    return DbMemoryConfig(
+        backend=backend,
+        recall="auto",
+        learning="off",
+        retrieval_mode="structured",
+        limit=3,
+        char_budget=800,
+    )
 
 
 def evidence_kinds(result) -> list[str]:
@@ -158,7 +161,7 @@ async def main() -> None:
         agent = await Agent.from_db(
             str(db_path),
             name="MemoryForBusinessSemantics",
-            cache_ttl=0,
+            source_options=DbSourceOptions(cache_ttl=0),
             memory=memory_options(tmp_path / "memory"),
             **llm_options(args.live_llm),
         )

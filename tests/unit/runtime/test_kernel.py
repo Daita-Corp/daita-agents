@@ -10,6 +10,7 @@ from daita.runtime import (
     ApprovalStatus,
     Capability,
     Evidence,
+    InMemoryApprovalChannel,
     InMemoryRuntimeStore,
     Operation,
     OperationStatus,
@@ -256,6 +257,270 @@ async def test_append_event_correlates_runtime_task_and_capability():
     assert event.executor_id == capability.executor
     assert event.plugin_id == capability.owner
     assert (await store.inspect_operation(operation.id)).events[-1] == event
+
+
+async def test_subscribe_before_create_delivers_durable_events_once_in_order():
+    kernel, store, _ = _kernel()
+    subscription = kernel.event_broker.subscribe("op-stream")
+
+    operation = await kernel.create_operation(
+        operation_id="op-stream",
+        operation_type="kernel.echo",
+        request={"value": "alpha"},
+    )
+    await kernel.append_event(
+        RuntimeEventType.DIAGNOSTIC,
+        operation_id=operation.id,
+        message="second",
+    )
+
+    persisted = await store.list_events(operation.id)
+    delivered = [subscription.get_nowait(), subscription.get_nowait()]
+
+    assert delivered == persisted
+    assert delivered[0].type is RuntimeEventType.OPERATION_CREATED
+    assert subscription.pending_count == 0
+
+
+async def test_atomic_task_commits_publish_each_persisted_event_exactly_once():
+    kernel, store, _ = _kernel()
+    operation, task = await _persist_echo_task(store)
+    subscription = kernel.event_broker.subscribe(operation.id)
+
+    await kernel.execute_task(task.id)
+
+    persisted = await store.list_events(operation.id)
+    delivered = [subscription.get_nowait() for _ in range(subscription.pending_count)]
+
+    assert delivered == persisted
+    assert len(delivered) == len(persisted)
+
+
+async def test_failed_event_persistence_does_not_publish():
+    class FailingEventStore(InMemoryRuntimeStore):
+        async def append_event(self, event):
+            raise RuntimeError("event persistence failed")
+
+    plugin = KernelPlugin()
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    kernel = RuntimeKernel(
+        runtime_id="runtime-1",
+        runtime_kind="test",
+        extension_registry=registry,
+        runtime_store=FailingEventStore(),
+    )
+    subscription = kernel.event_broker.subscribe("op-failure")
+
+    with pytest.raises(RuntimeError, match="event persistence failed"):
+        await kernel.create_operation(
+            operation_id="op-failure",
+            operation_type="kernel.echo",
+            request={"value": "alpha"},
+            evaluate_governance=False,
+        )
+
+    assert subscription.pending_count == 0
+    assert subscription.dropped_count == 0
+
+
+async def test_cancelled_append_waits_for_commit_then_publishes_exactly_once():
+    append_started = asyncio.Event()
+    allow_commit = asyncio.Event()
+
+    class DelayedEventStore(InMemoryRuntimeStore):
+        async def append_event(self, event):
+            append_started.set()
+            await allow_commit.wait()
+            await super().append_event(event)
+
+    plugin = KernelPlugin()
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    store = DelayedEventStore()
+    kernel = RuntimeKernel(
+        runtime_id="runtime-1",
+        runtime_kind="test",
+        extension_registry=registry,
+        runtime_store=store,
+    )
+    subscription = kernel.event_broker.subscribe("op-cancelled-append")
+    append = asyncio.create_task(
+        kernel.append_event(
+            RuntimeEventType.DIAGNOSTIC,
+            operation_id="op-cancelled-append",
+            message="durable before cancellation",
+        )
+    )
+
+    await append_started.wait()
+    append.cancel()
+    allow_commit.set()
+    with pytest.raises(asyncio.CancelledError):
+        await append
+
+    persisted = await store.list_events("op-cancelled-append")
+    assert [subscription.get_nowait()] == persisted
+
+
+async def test_executor_cancellation_persists_resumable_task_and_operation_state():
+    started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    class BlockingExecutor(CountingExecutor):
+        async def execute(self, task, operation, context):
+            self.calls += 1
+            started.set()
+            await never_release.wait()
+            return []
+
+    plugin = KernelPlugin()
+    plugin.executor = BlockingExecutor()
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    store = InMemoryRuntimeStore()
+    kernel = RuntimeKernel(
+        runtime_id="runtime-1",
+        runtime_kind="test",
+        extension_registry=registry,
+        runtime_store=store,
+    )
+    operation, task = await _persist_echo_task(store)
+    subscription = kernel.event_broker.subscribe(operation.id)
+    execution = asyncio.create_task(kernel.execute_task(task.id))
+
+    await started.wait()
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    snapshot = await store.inspect_operation(operation.id)
+    delivered = [subscription.get_nowait() for _ in range(subscription.pending_count)]
+    assert snapshot.operation.status is OperationStatus.BLOCKED
+    assert snapshot.tasks[0].status is TaskStatus.BLOCKED
+    assert snapshot.tasks[0].metadata["cancelled_for_resume"] is True
+    assert "lease_id" not in snapshot.tasks[0].metadata
+    assert delivered == list(snapshot.events)
+
+
+async def test_cancellation_before_executor_start_clears_claim_for_resume():
+    executor_event_started = asyncio.Event()
+    allow_event_commit = asyncio.Event()
+
+    class DelayedExecutorEventStore(InMemoryRuntimeStore):
+        async def append_event(self, event):
+            if event.type is RuntimeEventType.EXECUTOR_STARTED:
+                executor_event_started.set()
+                await allow_event_commit.wait()
+            await super().append_event(event)
+
+    plugin = KernelPlugin()
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    store = DelayedExecutorEventStore()
+    kernel = RuntimeKernel(
+        runtime_id="runtime-1",
+        runtime_kind="test",
+        extension_registry=registry,
+        runtime_store=store,
+    )
+    operation, task = await _persist_echo_task(store)
+    subscription = kernel.event_broker.subscribe(operation.id)
+    execution = asyncio.create_task(kernel.execute_task(task.id))
+
+    await executor_event_started.wait()
+    execution.cancel()
+    allow_event_commit.set()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    snapshot = await store.inspect_operation(operation.id)
+    delivered = [subscription.get_nowait() for _ in range(subscription.pending_count)]
+    assert plugin.executor.calls == 0
+    assert snapshot.operation.status is OperationStatus.BLOCKED
+    assert snapshot.tasks[0].status is TaskStatus.BLOCKED
+    assert snapshot.tasks[0].metadata["cancelled_for_resume"] is True
+    assert "lease_id" not in snapshot.tasks[0].metadata
+    assert delivered == list(snapshot.events)
+
+
+async def test_cancellation_during_claim_clears_committed_lease_for_resume():
+    claim_started = asyncio.Event()
+    allow_claim = asyncio.Event()
+
+    class DelayedClaimStore(InMemoryRuntimeStore):
+        async def claim_task(self, task_id, **kwargs):
+            claim_started.set()
+            await allow_claim.wait()
+            return await super().claim_task(task_id, **kwargs)
+
+    plugin = KernelPlugin()
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    store = DelayedClaimStore()
+    kernel = RuntimeKernel(
+        runtime_id="runtime-1",
+        runtime_kind="test",
+        extension_registry=registry,
+        runtime_store=store,
+    )
+    operation, task = await _persist_echo_task(store)
+    subscription = kernel.event_broker.subscribe(operation.id)
+    execution = asyncio.create_task(kernel.execute_task(task.id))
+
+    await claim_started.wait()
+    execution.cancel()
+    allow_claim.set()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    snapshot = await store.inspect_operation(operation.id)
+    delivered = [subscription.get_nowait() for _ in range(subscription.pending_count)]
+    assert plugin.executor.calls == 0
+    assert snapshot.operation.status is OperationStatus.BLOCKED
+    assert snapshot.tasks[0].status is TaskStatus.BLOCKED
+    assert snapshot.tasks[0].metadata["cancelled_for_resume"] is True
+    assert "lease_id" not in snapshot.tasks[0].metadata
+    assert delivered == list(snapshot.events)
+
+
+async def test_kernel_bound_approval_updates_persist_and_publish_once():
+    plugin = KernelPlugin()
+    registry = ExtensionRegistry()
+    registry.register(plugin)
+    store = InMemoryRuntimeStore()
+    approval_channel = InMemoryApprovalChannel(store)
+    kernel = RuntimeKernel(
+        runtime_id="runtime-1",
+        runtime_kind="test",
+        extension_registry=registry,
+        runtime_store=store,
+        approval_channel=approval_channel,
+    )
+    operation = Operation(
+        id="op-approval-publication",
+        operation_type="kernel.echo",
+        status=OperationStatus.BLOCKED,
+        metadata={"runtime_id": "runtime-1", "runtime_kind": "test"},
+    )
+    approval = ApprovalRequest(
+        approval_id="approval-publication",
+        operation_id=operation.id,
+        reason="Approval required.",
+        proposed_action={"approval": "human"},
+        risk=RiskLevel.MEDIUM,
+    )
+    await store.save_operation(operation)
+    await store.save_approval_request(approval)
+    subscription = kernel.event_broker.subscribe(operation.id)
+
+    await approval_channel.approve(approval.approval_id)
+
+    persisted = await store.list_events(operation.id)
+    delivered = [subscription.get_nowait() for _ in range(subscription.pending_count)]
+    assert len(persisted) == 1
+    assert persisted[0].type is RuntimeEventType.APPROVAL_UPDATED
+    assert delivered == persisted
 
 
 async def test_apply_terminal_approval_state_updates_operation():

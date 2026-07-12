@@ -263,7 +263,7 @@ class NormalizedSchema:
             columns = [
                 NormalizedColumn(
                     name=str(column.get("name", "")),
-                    type=str(column.get("type", "")),
+                    type=str(column.get("type") or column.get("data_type") or ""),
                     nullable=bool(column.get("nullable", True)),
                     is_primary_key=bool(column.get("is_primary_key", False)),
                     comment=column.get("column_comment") or column.get("comment"),

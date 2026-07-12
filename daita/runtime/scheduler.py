@@ -11,7 +11,6 @@ from .kernel import (
     RuntimeKernelGovernanceBlocked,
     RuntimeKernelTaskAlreadyTerminal,
     RuntimeKernelTaskNotRunnable,
-    TaskExecutionResult,
 )
 from .primitives import RuntimeEventType, TaskStatus
 from .status import TERMINAL_TASK_STATUSES, reconcile_operation_status
@@ -71,15 +70,13 @@ class OperationTaskScheduler:
                 if task.status in _TERMINAL_TASK_STATUSES:
                     if task.id not in skipped:
                         skipped.append(task.id)
-                        await self.store.append_event(
-                            self.kernel._event(
-                                RuntimeEventType.TASK_SKIPPED,
-                                operation=snapshot.operation,
-                                task=task,
-                                message=(
-                                    f"Task {task.id} already terminal; not re-running."
-                                ),
-                            )
+                        await self.kernel.append_event(
+                            RuntimeEventType.TASK_SKIPPED,
+                            operation_id=snapshot.operation.id,
+                            task=task,
+                            message=(
+                                f"Task {task.id} already terminal; not re-running."
+                            ),
                         )
                     continue
                 if task.status not in {TaskStatus.PENDING, TaskStatus.BLOCKED}:

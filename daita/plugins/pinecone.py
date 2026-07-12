@@ -19,7 +19,7 @@ from .pinecone_extensions import (
 )
 
 if TYPE_CHECKING:
-    from ..core.tools import LocalTool
+    from pinecone import GrpcIndex, Index, Pinecone
 
 logger = logging.getLogger(__name__)
 
@@ -58,15 +58,40 @@ class PineconePlugin(BaseVectorPlugin):
         self.index_name = index
         self.namespace = namespace
         self.host = host
-        self._index = None
+        self._index: Optional["Index | GrpcIndex"] = None
         self._embedding_fn = embedding_fn
         self._executor = PineconeExecutor(self)
 
         super().__init__(
             api_key=api_key, index=index, namespace=namespace, host=host, **kwargs
         )
+        self._client: Optional["Pinecone"] = None
 
         logger.debug(f"Pinecone plugin configured for index '{index}'")
+
+    @property
+    def client(self) -> "Pinecone":
+        """Return the active Pinecone control-plane client."""
+        if self._client is None:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError(
+                "PineconePlugin is not connected",
+                field="connection_state",
+            )
+        return self._client
+
+    @property
+    def pinecone_index(self) -> "Index | GrpcIndex":
+        """Return the active Pinecone data-plane index."""
+        if self._index is None:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError(
+                "PineconePlugin is not connected",
+                field="connection_state",
+            )
+        return self._index
 
     async def setup(self, context: PluginContext) -> None:
         """Set up the Pinecone connector for a runtime."""
@@ -112,16 +137,18 @@ class PineconePlugin(BaseVectorPlugin):
         try:
             from pinecone import Pinecone
 
-            self._client = Pinecone(api_key=self.api_key)
+            client = Pinecone(api_key=self.api_key)
             # Get index - new API automatically resolves host
-            self._index = self._client.Index(self.index_name)
+            index = client.Index(self.index_name)
+
+            self._client = client
+            self._index = index
 
             logger.info(f"Connected to Pinecone index '{self.index_name}'")
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
-                "pinecone is required for PineconePlugin. "
-                "Install with: pip install 'daita-agents[pinecone]'"
-            )
+                "pinecone is required. Install with: pip install 'daita-agents[pinecone]'"
+            ) from exc
         except Exception as e:
             self._handle_connection_error(e, "connection")
 
@@ -152,19 +179,20 @@ class PineconePlugin(BaseVectorPlugin):
         """
         if self._index is None:
             await self.connect()
+        index = self.pinecone_index
 
         namespace = namespace or self.namespace
 
         # Build upsert data
         upsert_data = []
         for idx, (id, vector) in enumerate(zip(ids, vectors)):
-            item = {"id": id, "values": vector}
+            item: Dict[str, object] = {"id": id, "values": vector}
             if metadata and idx < len(metadata):
                 item["metadata"] = metadata[idx]
             upsert_data.append(item)
 
         # Upsert vectors
-        result = self._index.upsert(vectors=upsert_data, namespace=namespace)
+        result = index.upsert(vectors=upsert_data, namespace=namespace)
 
         return {
             "upserted_count": result.get("upserted_count", len(ids)),
@@ -196,10 +224,11 @@ class PineconePlugin(BaseVectorPlugin):
         """
         if self._index is None:
             await self.connect()
+        index = self.pinecone_index
 
         namespace = namespace or self.namespace
 
-        result = self._index.query(
+        result = index.query(
             vector=vector,
             top_k=top_k,
             filter=filter,
@@ -241,17 +270,18 @@ class PineconePlugin(BaseVectorPlugin):
         """
         if self._index is None:
             await self.connect()
+        index = self.pinecone_index
 
         namespace = namespace or self.namespace
 
         if delete_all:
-            self._index.delete(delete_all=True, namespace=namespace)
+            index.delete(delete_all=True, namespace=namespace)
             return {"success": True, "deleted": "all", "namespace": namespace}
         elif ids:
-            self._index.delete(ids=ids, namespace=namespace)
+            index.delete(ids=ids, namespace=namespace)
             return {"success": True, "deleted_count": len(ids), "namespace": namespace}
         elif filter:
-            self._index.delete(filter=filter, namespace=namespace)
+            index.delete(filter=filter, namespace=namespace)
             return {"success": True, "deleted": "by_filter", "namespace": namespace}
         else:
             return {
@@ -274,10 +304,11 @@ class PineconePlugin(BaseVectorPlugin):
         """
         if self._index is None:
             await self.connect()
+        index = self.pinecone_index
 
         namespace = namespace or self.namespace
 
-        result = self._index.fetch(ids=ids, namespace=namespace)
+        result = index.fetch(ids=ids, namespace=namespace)
 
         # Convert to list of dicts
         vectors = []
@@ -301,8 +332,9 @@ class PineconePlugin(BaseVectorPlugin):
         """
         if self._index is None:
             await self.connect()
+        index = self.pinecone_index
 
-        stats = self._index.describe_index_stats()
+        stats = index.describe_index_stats()
         return {
             "dimension": stats.get("dimension"),
             "index_fullness": stats.get("index_fullness"),
@@ -326,8 +358,17 @@ class PineconePlugin(BaseVectorPlugin):
             result = self._embedding_fn(text)
             vector = await result if asyncio.iscoroutine(result) else result
 
+        if not isinstance(vector, list) or not all(
+            isinstance(value, (int, float)) for value in vector
+        ):
+            raise ValueError("vector must be a list of numbers")
+        normalized_vector = [float(value) for value in vector]
+
         matches = await self.query(
-            vector=vector, top_k=top_k, filter=filter, namespace=namespace
+            vector=normalized_vector,
+            top_k=top_k,
+            filter=filter,
+            namespace=namespace,
         )
 
         return {"success": True, "matches": matches, "count": len(matches)}
@@ -335,12 +376,29 @@ class PineconePlugin(BaseVectorPlugin):
     async def _tool_upsert(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for pinecone_upsert"""
         ids = args.get("ids")
-        vectors = args.get("vectors")
+        if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+            raise ValueError("ids must be a list of strings")
+        normalized_ids = [item for item in ids if isinstance(item, str)]
+        raw_vectors = args.get("vectors")
+        if not isinstance(raw_vectors, list) or not all(
+            isinstance(vector, list)
+            and all(isinstance(value, (int, float)) for value in vector)
+            for vector in raw_vectors
+        ):
+            raise ValueError("vectors must be a list of numeric vectors")
+        vectors = [
+            [float(value) for value in vector]
+            for vector in raw_vectors
+            if isinstance(vector, list)
+        ]
         metadata = args.get("metadata")
         namespace = args.get("namespace")
 
         result = await self.upsert(
-            ids=ids, vectors=vectors, metadata=metadata, namespace=namespace
+            ids=normalized_ids,
+            vectors=vectors,
+            metadata=metadata,
+            namespace=namespace,
         )
 
         return {

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import ast as pyast
 import re
-from typing import Dict, Tuple
+from typing import Dict
 
 from .ast import FocusQuery
 from ..exceptions import FocusDSLError

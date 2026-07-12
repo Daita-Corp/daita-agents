@@ -6,6 +6,25 @@ from dataclasses import dataclass, field
 import time
 from typing import Any
 
+_TOKEN_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "total_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "cached_input_tokens",
+        "reasoning_tokens",
+    }
+)
+_PRICING_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "pricing_provider",
+        "pricing_model",
+        "pricing_source",
+        "pricing_confidence",
+        "pricing_warning",
+    }
+)
+
 
 @dataclass(frozen=True)
 class DbLLMConfig:
@@ -13,10 +32,16 @@ class DbLLMConfig:
 
     provider: str
     model: str
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     temperature: float | None = None
-    agent_id: str | None = None
-    options: dict[str, Any] = field(default_factory=dict)
+    options: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.provider:
+            raise ValueError("llm.provider is required")
+        if not self.model:
+            raise ValueError("llm.model is required")
+        object.__setattr__(self, "options", dict(self.options))
 
     def safe_metadata(self) -> dict[str, Any]:
         return {
@@ -38,8 +63,11 @@ class DbLLMResponse:
 class DbLLMService:
     """Lazy boundary around LLM providers used by DB runtime executors."""
 
-    def __init__(self, config: DbLLMConfig | None) -> None:
+    def __init__(
+        self, config: DbLLMConfig | None, *, agent_id: str | None = None
+    ) -> None:
         self.config = config
+        self.agent_id = agent_id
         self._provider = None
 
     @property
@@ -71,7 +99,7 @@ class DbLLMService:
                 self.config.provider,
                 self.config.model,
                 api_key=self.config.api_key,
-                agent_id=self.config.agent_id,
+                agent_id=self.agent_id,
                 **options,
             )
         return self._provider
@@ -87,15 +115,30 @@ class DbLLMService:
             **self.safe_metadata,
             "latency_ms": latency_ms,
         }
-        usage = getattr(self.provider, "_get_last_token_usage", lambda: {})()
+        credential_values = _credential_values(self.config)
+        raw_usage: dict[str, Any] = getattr(
+            self.provider, "_get_last_token_usage", lambda: {}
+        )()
+        usage = _safe_diagnostics_mapping(
+            raw_usage,
+            _TOKEN_DIAGNOSTIC_KEYS,
+            credential_values=credential_values,
+        )
         if usage:
-            diagnostics["tokens"] = dict(usage)
+            diagnostics["tokens"] = usage
         estimate = getattr(self.provider, "_estimate_cost", lambda usage: None)(usage)
-        if estimate is not None:
+        if isinstance(estimate, (int, float)) and not isinstance(estimate, bool):
             diagnostics["estimated_cost_usd"] = estimate
-        pricing = getattr(self.provider, "get_pricing_metadata", lambda: {})()
+        raw_pricing: dict[str, Any] = getattr(
+            self.provider, "get_pricing_metadata", lambda: {}
+        )()
+        pricing = _safe_diagnostics_mapping(
+            raw_pricing,
+            _PRICING_DIAGNOSTIC_KEYS,
+            credential_values=credential_values,
+        )
         if pricing:
-            diagnostics["pricing"] = dict(pricing)
+            diagnostics["pricing"] = pricing
         return DbLLMResponse(content=content, diagnostics=diagnostics)
 
     async def generate_synthesis_json(
@@ -106,45 +149,13 @@ class DbLLMService:
 
 
 def db_llm_service_from_config(
+    config: DbLLMConfig | None,
     *,
-    model: str | None,
-    llm_provider: str | None,
-    api_key: str | None = None,
-    temperature: float | None = None,
     agent_id: str | None = None,
-    options: dict[str, Any] | None = None,
 ) -> DbLLMService:
-    if not model and not llm_provider:
-        return DbLLMService(None)
-    provider = llm_provider or "openai"
-    if not model:
-        return DbLLMService(None)
-    return DbLLMService(
-        DbLLMConfig(
-            provider=provider,
-            model=model,
-            api_key=api_key,
-            temperature=temperature,
-            agent_id=agent_id,
-            options=dict(options or {}),
-        )
-    )
-
-
-def db_llm_service_from_metadata(metadata: dict[str, Any]) -> DbLLMService:
-    options = metadata.get("from_db_options")
-    if not isinstance(options, dict):
-        return DbLLMService(None)
-    return db_llm_service_from_config(
-        model=options.get("model"),
-        llm_provider=options.get("llm_provider"),
-        temperature=options.get("temperature"),
-        options={
-            key: value
-            for key, value in options.items()
-            if key.startswith("planner_") or key.startswith("llm_")
-        },
-    )
+    if config is not None and not isinstance(config, DbLLMConfig):
+        raise TypeError("llm must be a DbLLMConfig instance")
+    return DbLLMService(config, agent_id=agent_id)
 
 
 def _content_from_result(result: Any) -> str:
@@ -155,3 +166,47 @@ def _content_from_result(result: Any) -> str:
         if isinstance(content, str):
             return content
     return str(result)
+
+
+def _safe_diagnostics_mapping(
+    values: Any,
+    allowed_keys: frozenset[str],
+    *,
+    credential_values: frozenset[str],
+) -> dict[str, Any]:
+    if not isinstance(values, dict):
+        return {}
+    return {
+        key: value
+        for key, value in values.items()
+        if key in allowed_keys
+        and isinstance(value, (str, int, float, bool, type(None)))
+        and not (
+            isinstance(value, str)
+            and any(secret in value for secret in credential_values)
+        )
+    }
+
+
+def _credential_values(config: DbLLMConfig | None) -> frozenset[str]:
+    if config is None:
+        return frozenset()
+    values = {config.api_key} if config.api_key else set()
+    values.update(_nested_string_values(config.options))
+    return frozenset(value for value in values if value)
+
+
+def _nested_string_values(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, dict):
+        values: set[str] = set()
+        for nested in value.values():
+            values.update(_nested_string_values(nested))
+        return values
+    if isinstance(value, (list, tuple, set, frozenset)):
+        values = set()
+        for nested in value:
+            values.update(_nested_string_values(nested))
+        return values
+    return set()

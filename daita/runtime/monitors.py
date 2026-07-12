@@ -7,9 +7,8 @@ import time
 from typing import Any, Mapping
 from uuid import uuid4
 
-from .kernel import RuntimeKernel, RuntimeKernelExecutionError, TaskExecutionResult
+from .kernel import RuntimeKernel, RuntimeKernelExecutionError
 from .primitives import (
-    Capability,
     ContextAudience,
     Operation,
     RuntimeEvent,
@@ -112,16 +111,13 @@ class MonitorRuntime:
         now = time.time()
         state.status = "running"
         state.last_tick_at = now
-        events: list[RuntimeEvent] = [
-            self._event(
-                RuntimeEventType.MONITOR_TICKED,
-                spec=spec,
-                operation_id=f"monitor-{spec.id}",
-                message=f"Monitor {spec.id} ticked.",
-                payload={"monitor": _monitor_payload(spec)},
-            )
-        ]
-        await self.store.append_event(events[-1])
+        ticked = await self.kernel.append_event(
+            RuntimeEventType.MONITOR_TICKED,
+            operation_id=f"monitor-{spec.id}",
+            message=f"Monitor {spec.id} ticked.",
+            payload={"monitor": _monitor_payload(spec)},
+        )
+        events: list[RuntimeEvent] = [ticked]
 
         try:
             observed_value = await self._observe_value(
@@ -131,9 +127,8 @@ class MonitorRuntime:
             )
             state.last_value_summary = summarize_monitor_value(observed_value)
             if state.cooldown_until is not None and state.cooldown_until > now:
-                skipped = self._event(
+                skipped = await self.kernel.append_event(
                     RuntimeEventType.MONITOR_SKIPPED,
-                    spec=spec,
                     operation_id=f"monitor-{spec.id}",
                     message=f"Monitor {spec.id} skipped due to cooldown.",
                     payload={
@@ -141,19 +136,16 @@ class MonitorRuntime:
                         "value_summary": state.last_value_summary,
                     },
                 )
-                await self.store.append_event(skipped)
                 events.append(skipped)
                 return MonitorTickResult(spec.id, False, events=tuple(events))
 
             if not monitor_trigger_matches(observed_value, spec.trigger):
-                skipped = self._event(
+                skipped = await self.kernel.append_event(
                     RuntimeEventType.MONITOR_SKIPPED,
-                    spec=spec,
                     operation_id=f"monitor-{spec.id}",
                     message=f"Monitor {spec.id} did not trigger.",
                     payload={"value_summary": state.last_value_summary},
                 )
-                await self.store.append_event(skipped)
                 events.append(skipped)
                 return MonitorTickResult(spec.id, False, events=tuple(events))
 
@@ -168,9 +160,8 @@ class MonitorRuntime:
             state.last_triggered_at = now
             if spec.cooldown_seconds:
                 state.cooldown_until = now + spec.cooldown_seconds
-            triggered = self._event(
+            triggered = await self.kernel.append_event(
                 RuntimeEventType.MONITOR_TRIGGERED,
-                spec=spec,
                 operation_id=operation.id,
                 message=f"Monitor {spec.id} triggered operation {operation.id}.",
                 payload={
@@ -179,7 +170,6 @@ class MonitorRuntime:
                     "task_ids": [task.id for task in tasks],
                 },
             )
-            await self.store.append_event(triggered)
             events.append(triggered)
             events.extend(execution_events)
             state.consecutive_failures = 0
@@ -195,14 +185,12 @@ class MonitorRuntime:
             state.status = "error"
             state.consecutive_failures += 1
             state.last_error = f"{type(exc).__name__}: {exc}"
-            error_event = self._event(
+            error_event = await self.kernel.append_event(
                 RuntimeEventType.ERROR,
-                spec=spec,
                 operation_id=f"monitor-{spec.id}",
                 message=f"Monitor {spec.id} failed.",
                 payload={"error": {"type": type(exc).__name__, "message": str(exc)}},
             )
-            await self.store.append_event(error_event)
             events.append(error_event)
             raise
 
@@ -314,24 +302,6 @@ class MonitorRuntime:
             if raise_action_errors:
                 raise
             return operation, (task,), exc.result.events if exc.result else ()
-
-    def _event(
-        self,
-        type: RuntimeEventType,
-        *,
-        spec: MonitorSpec,
-        operation_id: str,
-        message: str,
-        payload: Mapping[str, Any] | None = None,
-    ) -> RuntimeEvent:
-        return RuntimeEvent(
-            type=type,
-            runtime_id=self.kernel.runtime_id,
-            runtime_kind=self.kernel.runtime_kind,
-            operation_id=operation_id,
-            message=message,
-            payload=dict(payload or {}),
-        )
 
 
 def monitor_trigger_matches(value: Any, trigger: Mapping[str, Any]) -> bool:

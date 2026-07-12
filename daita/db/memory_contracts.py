@@ -32,16 +32,10 @@ def normalize_db_memory_semantic_contract(value: Any) -> dict[str, Any] | None:
     contract_kind = str(value.get("contract_kind") or "").strip()
     if contract_kind not in DB_MEMORY_CONTRACT_KINDS:
         raise ValueError(f"unsupported semantic_contract kind {contract_kind!r}")
-    subject = value.get("subject") if isinstance(value.get("subject"), dict) else {}
-    requirements = (
-        value.get("requirements") if isinstance(value.get("requirements"), dict) else {}
-    )
-    grounding = (
-        value.get("grounding") if isinstance(value.get("grounding"), dict) else {}
-    )
-    enforcement = (
-        value.get("enforcement") if isinstance(value.get("enforcement"), dict) else {}
-    )
+    subject = _dict_value(value.get("subject"))
+    requirements = _dict_value(value.get("requirements"))
+    grounding = _dict_value(value.get("grounding"))
+    enforcement = _dict_value(value.get("enforcement"))
     normalized = {
         "version": version,
         "contract_kind": contract_kind,
@@ -55,16 +49,8 @@ def normalize_db_memory_semantic_contract(value: Any) -> dict[str, Any] | None:
             "relationships": _dict_list(requirements.get("relationships")),
             "filters": _dict_list(requirements.get("filters")),
             "aggregations": _dict_list(requirements.get("aggregations")),
-            "result_shape": (
-                dict(requirements.get("result_shape"))
-                if isinstance(requirements.get("result_shape"), dict)
-                else {}
-            ),
-            "unit_conversion": (
-                dict(requirements.get("unit_conversion"))
-                if isinstance(requirements.get("unit_conversion"), dict)
-                else {}
-            ),
+            "result_shape": _dict_value(requirements.get("result_shape")),
+            "unit_conversion": _dict_value(requirements.get("unit_conversion")),
         },
         "grounding": {
             "source_identity": grounding.get("source_identity"),
@@ -74,7 +60,7 @@ def normalize_db_memory_semantic_contract(value: Any) -> dict[str, Any] | None:
         },
         "enforcement": {
             "mode": str(enforcement.get("mode") or "required_when_recalled").strip(),
-            "min_confidence": _confidence_value(
+            "min_confidence": confidence_value(
                 enforcement.get("min_confidence"), default=0.8
             ),
         },
@@ -189,13 +175,68 @@ def project_db_memory_semantic_contracts(
         if omit_reason:
             _bump_omitted(diagnostics, omit_reason)
             projected.append(
-                _compact_semantic_contract(ref, contract, enforceable=False)
+                _compact_semantic_contract(
+                    ref,
+                    contract,
+                    enforceable=False,
+                    omission_reason=omit_reason,
+                )
             )
             diagnostics["advisory_count"] += 1
             continue
         projected.append(_compact_semantic_contract(ref, contract, enforceable=True))
         diagnostics["enforced_count"] += 1
     return tuple(projected), diagnostics
+
+
+def db_memory_contracts_artifact_payload(
+    *,
+    source_identity: str | None,
+    schema_fingerprint: str | None,
+    recall_evidence_refs: tuple[str, ...] | list[str],
+    selection_evidence_ref: dict[str, Any] | None,
+    contracts: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    """Return first-class evidence payload for DB memory contracts."""
+
+    projected_contracts = [dict(contract) for contract in contracts]
+    omitted_counts = {
+        str(reason): int(count)
+        for reason, count in dict(diagnostics.get("omitted_reasons") or {}).items()
+    }
+    enforceable = [
+        dict(contract)
+        for contract in projected_contracts
+        if contract.get("enforceable") is True
+    ]
+    advisory = [
+        dict(contract)
+        for contract in projected_contracts
+        if contract.get("enforceable") is not True
+    ]
+    return {
+        "artifact_kind": "db.memory.contracts",
+        "source_identity": source_identity,
+        "schema_fingerprint": schema_fingerprint,
+        "recall_evidence_refs": [
+            str(ref) for ref in recall_evidence_refs if str(ref).strip()
+        ],
+        "selection_evidence_ref": dict(selection_evidence_ref or {}),
+        "contracts": projected_contracts,
+        "enforceable_contracts": enforceable,
+        "advisory_contracts": advisory,
+        "contract_omission_reasons": omitted_counts,
+        "source_schema_applicability": {
+            "source_identity": source_identity,
+            "schema_fingerprint": schema_fingerprint,
+            "contract_candidate_count": int(diagnostics.get("candidate_count") or 0),
+            "enforced_count": int(diagnostics.get("enforced_count") or 0),
+            "advisory_count": int(diagnostics.get("advisory_count") or 0),
+            "omitted_count": int(diagnostics.get("omitted_count") or 0),
+        },
+        "safe_diagnostic_summaries": safe_omission_summaries(omitted_counts),
+    }
 
 
 def _metric_definition_contract(
@@ -215,7 +256,7 @@ def _metric_definition_contract(
     refs = db_memory_contract_refs({"requirements": requirements})
     if not refs:
         return None
-    if schema.get("tables") and not _schema_refs_known_schema(refs, schema):
+    if schema.get("tables") and not schema_refs_known_schema(refs, schema):
         return None
     if not schema.get("tables") and not _metadata_schema_refs_cover(metadata, refs):
         return None
@@ -269,7 +310,7 @@ def _unit_convention_contract(
     if not table or not column or not unit:
         return None
     refs = ({"table": table, "column": column},)
-    if schema.get("tables") and not _schema_refs_known_schema(refs, schema):
+    if schema.get("tables") and not schema_refs_known_schema(refs, schema):
         return None
     if not schema.get("tables") and not _metadata_schema_refs_cover(metadata, refs):
         return None
@@ -340,16 +381,8 @@ def _requirements_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "relationships": _normalize_relationships(requirements.get("relationships")),
         "filters": _dict_list(requirements.get("filters")),
         "aggregations": _dict_list(requirements.get("aggregations")),
-        "result_shape": (
-            dict(requirements.get("result_shape"))
-            if isinstance(requirements.get("result_shape"), dict)
-            else {}
-        ),
-        "unit_conversion": (
-            dict(requirements.get("unit_conversion"))
-            if isinstance(requirements.get("unit_conversion"), dict)
-            else {}
-        ),
+        "result_shape": _dict_value(requirements.get("result_shape")),
+        "unit_conversion": _dict_value(requirements.get("unit_conversion")),
     }
 
 
@@ -425,14 +458,10 @@ def _grounding(
 
 
 def _enforcement(metadata: dict[str, Any], *, min_confidence: float) -> dict[str, Any]:
-    enforcement = (
-        dict(metadata.get("enforcement"))
-        if isinstance(metadata.get("enforcement"), dict)
-        else {}
-    )
+    enforcement = _dict_value(metadata.get("enforcement"))
     return {
         "mode": str(enforcement.get("mode") or "required_when_recalled").strip(),
-        "min_confidence": _confidence_value(
+        "min_confidence": confidence_value(
             enforcement.get("min_confidence"), default=min_confidence
         ),
     }
@@ -443,6 +472,7 @@ def _compact_semantic_contract(
     contract: dict[str, Any],
     *,
     enforceable: bool,
+    omission_reason: str | None = None,
 ) -> dict[str, Any]:
     requirements = contract.get("requirements") or {}
     subject = contract.get("subject") or {}
@@ -454,7 +484,7 @@ def _compact_semantic_contract(
             relationships.append(f"{item.get('from')} -> {item.get('to')}")
     evidence_refs = list(ref.get("evidence_refs") or [])
     evidence_refs.extend(grounding.get("evidence_refs") or [])
-    return {
+    compact = {
         "key": subject.get("key") or ref.get("key"),
         "memory_key": ref.get("key"),
         "kind": ref.get("kind"),
@@ -483,6 +513,9 @@ def _compact_semantic_contract(
         "enforcement_mode": enforcement.get("mode") or "required_when_recalled",
         "enforceable": bool(enforceable),
     }
+    if omission_reason:
+        compact["omission_reason"] = omission_reason
+    return compact
 
 
 def _contract_omit_reason(
@@ -511,8 +544,8 @@ def _contract_omit_reason(
         "required_when_relevant",
     }:
         return "advisory_mode"
-    confidence = _confidence_value(ref.get("confidence"), default=0.0)
-    min_confidence = _confidence_value(enforcement.get("min_confidence"), default=0.8)
+    confidence = confidence_value(ref.get("confidence"), default=0.0)
+    min_confidence = confidence_value(enforcement.get("min_confidence"), default=0.8)
     if confidence < min_confidence:
         return "low_confidence"
     if not _contract_refs_known_schema(contract, schema):
@@ -532,7 +565,7 @@ def _contract_refs_known_schema(
         return True
     if not schema.get("tables"):
         return False
-    return _schema_refs_known_schema(refs, schema)
+    return schema_refs_known_schema(refs, schema)
 
 
 def _contract_blocked_by_policy(
@@ -572,12 +605,12 @@ def _contract_relevant_to_prompt(
         subject.get("key"),
         *(subject.get("aliases") or []),
     ]
-    prompt_tokens = set(_meaningful_tokens(prompt))
-    contract_tokens = set(_meaningful_tokens(" ".join(str(term) for term in terms)))
+    prompt_tokens = set(meaningful_tokens(prompt))
+    contract_tokens = set(meaningful_tokens(" ".join(str(term) for term in terms)))
     return not prompt_tokens or bool(prompt_tokens & contract_tokens)
 
 
-def _schema_refs_known_schema(
+def schema_refs_known_schema(
     refs: tuple[dict[str, Any], ...] | list[dict[str, Any]],
     schema: dict[str, Any],
 ) -> bool:
@@ -661,7 +694,7 @@ def _dedupe_schema_refs(refs: list[dict[str, str]]) -> list[dict[str, str]]:
     return deduped
 
 
-def _confidence_value(value: Any, *, default: float) -> float:
+def confidence_value(value: Any, *, default: float) -> float:
     if value is None:
         return default
     if isinstance(value, str):
@@ -692,11 +725,17 @@ def _dict_list(value: Any) -> list[dict[str, Any]]:
     return [dict(item) for item in value if isinstance(item, dict)]
 
 
+def _dict_value(value: object) -> dict[object, object]:
+    if not isinstance(value, dict):
+        return {}
+    return dict(value)
+
+
 def _short_ref_key(value: Any) -> str:
     return str(value or "").split(".")[-1].strip().lower()
 
 
-def _meaningful_tokens(text: Any) -> list[str]:
+def meaningful_tokens(text: Any) -> list[str]:
     stop = {
         "about",
         "after",
@@ -730,3 +769,13 @@ def _bump_omitted(diagnostics: dict[str, Any], reason: str) -> None:
     diagnostics["omitted_count"] = int(diagnostics.get("omitted_count") or 0) + 1
     omitted = diagnostics.setdefault("omitted_reasons", {})
     omitted[reason] = int(omitted.get(reason) or 0) + 1
+
+
+def safe_omission_summaries(
+    omitted_counts: dict[str, int],
+) -> list[dict[str, Any]]:
+    return [
+        {"reason": reason, "count": int(count)}
+        for reason, count in sorted(omitted_counts.items())
+        if int(count) > 0
+    ]

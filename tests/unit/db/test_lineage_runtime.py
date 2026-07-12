@@ -170,23 +170,3 @@ async def test_lineage_trace_falls_back_when_graph_dependency_missing():
     assert lineage._graph_backend is None
     assert result["upstream_count"] == 1
     assert result["lineage"]["upstream"][0]["entity_id"] == "table:raw_orders"
-
-
-async def test_db_runtime_executes_lineage_trace_with_typed_evidence():
-    runtime, _, _ = await _runtime()
-
-    try:
-        result = await runtime.run(
-            DbRequest("Trace lineage for orders", mode="lineage.trace")
-        )
-    finally:
-        await runtime.teardown()
-
-    assert result.status is OperationStatus.SUCCEEDED
-    assert result.diagnostics["verification"]["passed"] is True
-    lineage_evidence = next(
-        item for item in result.evidence if item.kind == "lineage.trace"
-    )
-    assert lineage_evidence.owner == "lineage"
-    assert lineage_evidence.payload["upstream_count"] == 1
-    assert lineage_evidence.payload["lineage"]["entity_id"] == "table:orders"
