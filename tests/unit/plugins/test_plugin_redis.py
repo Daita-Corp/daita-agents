@@ -99,9 +99,7 @@ def test_redis_client_access_requires_connection():
         _ = plugin.client
 
 
-async def test_redis_client_access_tracks_connection_lifecycle(monkeypatch):
-    import redis.asyncio as aioredis
-
+async def test_redis_client_access_tracks_connection_lifecycle(module_stub):
     class FakeClient:
         def __init__(self):
             self.closed = False
@@ -110,7 +108,10 @@ async def test_redis_client_access_tracks_connection_lifecycle(monkeypatch):
             self.closed = True
 
     client = FakeClient()
-    monkeypatch.setattr(aioredis.Redis, "from_url", lambda *args, **kwargs: client)
+    redis_class = type(
+        "Redis", (), {"from_url": staticmethod(lambda *args, **kwargs: client)}
+    )
+    module_stub("redis.asyncio", Redis=redis_class)
     plugin = RedisPlugin(url="redis://localhost:6379/9")
 
     await plugin.connect()

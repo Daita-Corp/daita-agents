@@ -335,14 +335,12 @@ def test_service_requires_a_connected_plugin():
         _ = plugin.service
 
 
-async def test_connect_verifies_service_before_publishing(monkeypatch):
-    from googleapiclient import discovery
-
+async def test_connect_verifies_service_before_publishing(module_stub):
     plugin = GoogleDrivePlugin(credentials=object())
     service = MagicMock()
     service.files.return_value.list.return_value.execute.return_value = {"files": []}
     build = MagicMock(return_value=service)
-    monkeypatch.setattr(discovery, "build", build)
+    module_stub("googleapiclient.discovery", build=build)
 
     await plugin.connect()
 
@@ -357,15 +355,13 @@ async def test_connect_verifies_service_before_publishing(monkeypatch):
         _ = plugin.service
 
 
-async def test_connect_does_not_publish_service_when_verification_fails(monkeypatch):
-    from googleapiclient import discovery
-
+async def test_connect_does_not_publish_service_when_verification_fails(module_stub):
     plugin = GoogleDrivePlugin(credentials=object())
     service = MagicMock()
     service.files.return_value.list.return_value.execute.side_effect = RuntimeError(
         "unavailable"
     )
-    monkeypatch.setattr(discovery, "build", MagicMock(return_value=service))
+    module_stub("googleapiclient.discovery", build=MagicMock(return_value=service))
 
     with pytest.raises(PluginError, match="connect"):
         await plugin.connect()
@@ -390,16 +386,19 @@ async def test_connect_reports_missing_google_sdk(monkeypatch):
     assert plugin.is_connected is False
 
 
-async def test_resolve_credentials_reports_missing_adc(monkeypatch):
-    import google.auth
-    from google.auth.exceptions import DefaultCredentialsError
+async def test_resolve_credentials_reports_missing_adc(module_stub):
+    class DefaultCredentialsError(Exception):
+        pass
 
     plugin = GoogleDrivePlugin()
 
     def no_default_credentials(*, scopes):
         raise DefaultCredentialsError("missing")
 
-    monkeypatch.setattr(google.auth, "default", no_default_credentials)
+    module_stub(
+        "google.auth.exceptions", DefaultCredentialsError=DefaultCredentialsError
+    )
+    module_stub("google.auth", default=no_default_credentials)
 
     with pytest.raises(AuthenticationError, match="credentials were not found"):
         await plugin._resolve_credentials()

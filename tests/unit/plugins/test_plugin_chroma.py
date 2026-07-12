@@ -48,13 +48,11 @@ def test_chroma_access_requires_connection():
         _ = plugin.collection
 
 
-async def test_chroma_access_tracks_connection_lifecycle(monkeypatch):
-    import chromadb
-
+async def test_chroma_access_tracks_connection_lifecycle(module_stub):
     collection = MagicMock()
     client = MagicMock()
     client.get_or_create_collection.return_value = collection
-    monkeypatch.setattr(chromadb, "Client", lambda: client)
+    module_stub("chromadb", Client=lambda: client)
     plugin = ChromaPlugin(collection="test_col")
 
     await plugin.connect()

@@ -48,13 +48,11 @@ def test_pinecone_access_requires_connection():
         _ = plugin.pinecone_index
 
 
-async def test_pinecone_access_tracks_connection_lifecycle(monkeypatch):
-    import pinecone
-
+async def test_pinecone_access_tracks_connection_lifecycle(module_stub):
     index = MagicMock()
     client = MagicMock()
     client.Index.return_value = index
-    monkeypatch.setattr(pinecone, "Pinecone", lambda **kwargs: client)
+    module_stub("pinecone", Pinecone=lambda **kwargs: client)
     plugin = PineconePlugin(api_key="test-key", index="test-index")
 
     await plugin.connect()

@@ -65,9 +65,7 @@ def test_qdrant_client_access_requires_connection():
         _ = plugin.client
 
 
-async def test_qdrant_client_access_tracks_connection_lifecycle(monkeypatch):
-    import qdrant_client
-
+async def test_qdrant_client_access_tracks_connection_lifecycle(module_stub):
     class FakeClient:
         def __init__(self):
             self.closed = False
@@ -79,7 +77,7 @@ async def test_qdrant_client_access_tracks_connection_lifecycle(monkeypatch):
             self.closed = True
 
     client = FakeClient()
-    monkeypatch.setattr(qdrant_client, "QdrantClient", lambda **kwargs: client)
+    module_stub("qdrant_client", QdrantClient=lambda **kwargs: client)
     plugin = QdrantPlugin(collection="test_col", url="http://localhost:6333")
 
     await plugin.connect()
@@ -368,9 +366,10 @@ async def test_empty_payload_handled():
     assert "payload" not in results[0]
 
 
-async def test_upsert_preserves_absent_operation_id():
+async def test_upsert_preserves_absent_operation_id(module_stub):
     plugin = make_plugin()
     plugin._client.upsert = MagicMock(return_value=MagicMock(operation_id=None))
+    module_stub("qdrant_client.models", PointStruct=MagicMock())
 
     result = await plugin.upsert(["doc-1"], [[0.1, 0.2]])
 

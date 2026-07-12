@@ -1,9 +1,12 @@
+import pytest
+
 from daita.core.graph.local_backend import LocalGraphBackend
 from daita.core.graph.models import AgentGraphEdge, AgentGraphNode, EdgeType, NodeType
 from daita.core.graph.tools import build_graph_tools
 
 
 async def test_graph_tools_project_subgraph_and_shortest_path(tmp_path):
+    pytest.importorskip("networkx")
     backend = LocalGraphBackend(graph_type="tool_projection", storage_dir=tmp_path)
     orders = AgentGraphNode(
         node_id="table:orders",

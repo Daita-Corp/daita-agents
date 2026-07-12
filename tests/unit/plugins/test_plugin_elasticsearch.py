@@ -55,9 +55,7 @@ def test_elasticsearch_client_access_requires_connection():
         _ = plugin.client
 
 
-async def test_elasticsearch_client_access_tracks_connection_lifecycle(monkeypatch):
-    import elasticsearch
-
+async def test_elasticsearch_client_access_tracks_connection_lifecycle(module_stub):
     class FakeClient:
         def __init__(self):
             self.closed = False
@@ -73,7 +71,12 @@ async def test_elasticsearch_client_access_tracks_connection_lifecycle(monkeypat
             self.closed = True
 
     client = FakeClient()
-    monkeypatch.setattr(elasticsearch, "AsyncElasticsearch", lambda **kwargs: client)
+    module_stub(
+        "elasticsearch.exceptions",
+        ConnectionError=OSError,
+        AuthenticationException=PermissionError,
+    )
+    module_stub("elasticsearch", AsyncElasticsearch=lambda **kwargs: client)
     plugin = ElasticsearchPlugin(hosts="localhost:9200")
 
     await plugin.connect()

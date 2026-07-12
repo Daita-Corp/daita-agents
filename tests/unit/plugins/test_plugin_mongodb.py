@@ -72,9 +72,7 @@ def test_mongodb_access_requires_connection():
         _ = plugin.database
 
 
-async def test_mongodb_access_tracks_connection_lifecycle(monkeypatch):
-    import motor.motor_asyncio
-
+async def test_mongodb_access_tracks_connection_lifecycle(module_stub):
     class FakeAdmin:
         async def command(self, command):
             assert command == "ping"
@@ -93,10 +91,8 @@ async def test_mongodb_access_tracks_connection_lifecycle(monkeypatch):
             self.closed = True
 
     client = FakeClient()
-    monkeypatch.setattr(
-        motor.motor_asyncio.AsyncIOMotorClient,
-        "__new__",
-        lambda cls, *args, **kwargs: client,
+    module_stub(
+        "motor.motor_asyncio", AsyncIOMotorClient=lambda *args, **kwargs: client
     )
     plugin = MongoDBPlugin(host="localhost", database="testdb")
 

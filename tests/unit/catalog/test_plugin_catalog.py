@@ -82,10 +82,8 @@ async def test_aws_s3_discovery_skips_bucket_without_name():
 
 
 async def test_gcp_cloudsql_discovery_handles_primary_mapping_without_ip(
-    monkeypatch,
+    module_stub,
 ):
-    from googleapiclient import discovery
-
     discoverer = GCPDiscoverer(projects=["project-1"], services=["cloudsql"])
     discoverer._credentials = object()
     service = MagicMock()
@@ -99,7 +97,7 @@ async def test_gcp_cloudsql_discovery_handles_primary_mapping_without_ip(
             }
         ]
     }
-    monkeypatch.setattr(discovery, "build", MagicMock(return_value=service))
+    module_stub("googleapiclient.discovery", build=MagicMock(return_value=service))
 
     stores = [store async for store in discoverer._enumerate_cloudsql("project-1")]
 

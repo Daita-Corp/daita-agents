@@ -17,6 +17,17 @@ def make_plugin() -> SlackPlugin:
     return SlackPlugin(token="xoxb-test-token", default_channel="#alerts")
 
 
+class FakeSlackApiError(Exception):
+    def __init__(self, message, response):
+        super().__init__(message)
+        self.response = response
+
+
+def _stub_slack_sdk(module_stub, constructor):
+    module_stub("slack_sdk.errors", SlackApiError=FakeSlackApiError)
+    module_stub("slack_sdk.web.async_client", AsyncWebClient=constructor)
+
+
 def test_slack_plugin_declares_extension_first_contract():
     plugin = make_plugin()
     registry = ExtensionRegistry()
@@ -104,9 +115,7 @@ def test_slack_client_requires_authenticated_connection():
         _ = plugin.client
 
 
-async def test_slack_connect_publishes_client_and_identity_after_auth(monkeypatch):
-    from slack_sdk.web import async_client
-
+async def test_slack_connect_publishes_client_and_identity_after_auth(module_stub):
     plugin = make_plugin()
     client = MagicMock()
     client.auth_test = AsyncMock(
@@ -119,7 +128,7 @@ async def test_slack_connect_publishes_client_and_identity_after_auth(monkeypatc
         }
     )
     constructor = MagicMock(return_value=client)
-    monkeypatch.setattr(async_client, "AsyncWebClient", constructor)
+    _stub_slack_sdk(module_stub, constructor)
 
     await plugin.connect()
 
@@ -139,13 +148,11 @@ async def test_slack_connect_publishes_client_and_identity_after_auth(monkeypatc
     assert plugin._user_info is None
 
 
-async def test_slack_connect_does_not_publish_client_when_auth_fails(monkeypatch):
-    from slack_sdk.web import async_client
-
+async def test_slack_connect_does_not_publish_client_when_auth_fails(module_stub):
     plugin = make_plugin()
     client = MagicMock()
     client.auth_test = AsyncMock(side_effect=RuntimeError("unavailable"))
-    monkeypatch.setattr(async_client, "AsyncWebClient", MagicMock(return_value=client))
+    _stub_slack_sdk(module_stub, MagicMock(return_value=client))
 
     with pytest.raises(PluginError, match="Failed to connect"):
         await plugin.connect()
@@ -154,18 +161,15 @@ async def test_slack_connect_does_not_publish_client_when_auth_fails(monkeypatch
     assert plugin._user_info is None
 
 
-async def test_slack_connect_maps_invalid_auth(monkeypatch):
-    from slack_sdk.errors import SlackApiError
-    from slack_sdk.web import async_client
-
+async def test_slack_connect_maps_invalid_auth(module_stub):
     plugin = make_plugin()
     response = MagicMock()
     response.get.return_value = "invalid_auth"
     client = MagicMock()
     client.auth_test = AsyncMock(
-        side_effect=SlackApiError("invalid token", response=response)
+        side_effect=FakeSlackApiError("invalid token", response=response)
     )
-    monkeypatch.setattr(async_client, "AsyncWebClient", MagicMock(return_value=client))
+    _stub_slack_sdk(module_stub, MagicMock(return_value=client))
 
     with pytest.raises(AuthenticationError, match="Invalid Slack token"):
         await plugin.connect()
