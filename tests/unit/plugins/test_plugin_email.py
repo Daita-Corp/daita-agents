@@ -21,6 +21,50 @@ def make_plugin():
     )
 
 
+def test_email_connection_access_requires_connect():
+    plugin = make_plugin()
+
+    with pytest.raises(RuntimeError, match="IMAP connection"):
+        _ = plugin.imap
+    with pytest.raises(RuntimeError, match="SMTP connection"):
+        _ = plugin.smtp
+
+
+async def test_email_connection_access_tracks_lifecycle(monkeypatch):
+    import imaplib
+    import smtplib
+    from unittest.mock import MagicMock
+
+    imap = MagicMock()
+    smtp = MagicMock()
+    monkeypatch.setattr(imaplib, "IMAP4_SSL", lambda *args: imap)
+    monkeypatch.setattr(smtplib, "SMTP", lambda *args: smtp)
+    plugin = make_plugin()
+
+    await plugin.connect()
+    assert plugin.imap is imap
+    assert plugin.smtp is smtp
+
+    await plugin.disconnect()
+    imap.logout.assert_called_once()
+    smtp.quit.assert_called_once()
+    with pytest.raises(RuntimeError, match="IMAP connection"):
+        _ = plugin.imap
+
+
+async def test_list_emails_skips_malformed_fetch_result():
+    from unittest.mock import MagicMock
+
+    plugin = make_plugin()
+    imap = MagicMock()
+    imap.search.return_value = ("OK", [b"1"])
+    imap.fetch.return_value = ("OK", [b"malformed"])
+    plugin._imap = imap
+    plugin._smtp = MagicMock()
+
+    assert await plugin.list_emails() == []
+
+
 def test_email_plugin_declares_extension_first_contract():
     plugin = make_plugin()
     registry = ExtensionRegistry()
@@ -70,7 +114,7 @@ async def test_email_executor_returns_typed_operation_evidence(monkeypatch):
         assert unread_only is True
         return [{"id": "1", "subject": "Hello"}]
 
-    plugin.list_emails = fake_list_emails
+    monkeypatch.setattr(plugin, "list_emails", fake_list_emails)
     registry = ExtensionRegistry()
     registry.register(plugin)
 
@@ -163,7 +207,7 @@ async def test_tool_send_email_splits_comma_separated_to(monkeypatch):
         captured["cc"] = cc
         return {"message_id": "123"}
 
-    plugin.send_email = fake_send
+    monkeypatch.setattr(plugin, "send_email", fake_send)
 
     await plugin._tool_send_email(
         {
@@ -185,7 +229,7 @@ async def test_tool_send_email_splits_comma_separated_cc(monkeypatch):
         captured["cc"] = cc
         return {"message_id": "456"}
 
-    plugin.send_email = fake_send
+    monkeypatch.setattr(plugin, "send_email", fake_send)
 
     await plugin._tool_send_email(
         {
@@ -199,7 +243,7 @@ async def test_tool_send_email_splits_comma_separated_cc(monkeypatch):
     assert captured["cc"] == ["carol@x.com", "dave@x.com"]
 
 
-async def test_tool_send_email_list_to_passthrough():
+async def test_tool_send_email_list_to_passthrough(monkeypatch):
     plugin = make_plugin()
 
     captured = {}
@@ -208,7 +252,7 @@ async def test_tool_send_email_list_to_passthrough():
         captured["to"] = to
         return {"message_id": "789"}
 
-    plugin.send_email = fake_send
+    monkeypatch.setattr(plugin, "send_email", fake_send)
 
     await plugin._tool_send_email(
         {
@@ -221,7 +265,7 @@ async def test_tool_send_email_list_to_passthrough():
     assert captured["to"] == ["alice@x.com", "bob@x.com"]
 
 
-async def test_tool_send_email_empty_cc_becomes_none():
+async def test_tool_send_email_empty_cc_becomes_none(monkeypatch):
     plugin = make_plugin()
 
     captured = {}
@@ -230,7 +274,7 @@ async def test_tool_send_email_empty_cc_becomes_none():
         captured["cc"] = cc
         return {"message_id": "000"}
 
-    plugin.send_email = fake_send
+    monkeypatch.setattr(plugin, "send_email", fake_send)
 
     await plugin._tool_send_email(
         {

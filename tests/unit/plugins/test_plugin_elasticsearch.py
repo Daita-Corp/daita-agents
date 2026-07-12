@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from daita.core.exceptions import PluginError
 from daita.plugins import ExtensionRegistry
 from daita.plugins.elasticsearch import ElasticsearchPlugin
 from daita.runtime import AccessMode, Operation, RiskLevel, Task
@@ -45,6 +46,43 @@ def _mock_search(plugin, documents):
             "timed_out": False,
         }
     )
+
+
+def test_elasticsearch_client_access_requires_connection():
+    plugin = ElasticsearchPlugin(hosts="localhost:9200")
+
+    with pytest.raises(PluginError, match="not connected"):
+        _ = plugin.client
+
+
+async def test_elasticsearch_client_access_tracks_connection_lifecycle(monkeypatch):
+    import elasticsearch
+
+    class FakeClient:
+        def __init__(self):
+            self.closed = False
+
+        async def info(self):
+            return {
+                "cluster_name": "test-cluster",
+                "version": {"number": "9.0", "lucene_version": "10.0"},
+                "tagline": "test",
+            }
+
+        async def close(self):
+            self.closed = True
+
+    client = FakeClient()
+    monkeypatch.setattr(elasticsearch, "AsyncElasticsearch", lambda **kwargs: client)
+    plugin = ElasticsearchPlugin(hosts="localhost:9200")
+
+    await plugin.connect()
+    assert plugin.client is client
+
+    await plugin.disconnect()
+    assert client.closed is True
+    with pytest.raises(PluginError, match="not connected"):
+        _ = plugin.client
 
 
 def test_elasticsearch_plugin_declares_extension_first_contract():
@@ -170,20 +208,22 @@ async def test_elasticsearch_write_executor_uses_existing_tool_handler():
     }
 
 
-async def test_elasticsearch_registry_setup_and_teardown_use_connector_lifecycle():
+async def test_elasticsearch_registry_setup_and_teardown_use_connector_lifecycle(
+    monkeypatch,
+):
     plugin = ElasticsearchPlugin(hosts="localhost:9200")
     calls = []
 
     async def fake_connect():
         calls.append("connect")
-        plugin._client = object()
+        plugin._client = MagicMock()
 
     async def fake_disconnect():
         calls.append("disconnect")
         plugin._client = None
 
-    plugin.connect = fake_connect
-    plugin.disconnect = fake_disconnect
+    monkeypatch.setattr(plugin, "connect", fake_connect)
+    monkeypatch.setattr(plugin, "disconnect", fake_disconnect)
     registry = ExtensionRegistry()
     registry.register(plugin)
 
@@ -248,3 +288,30 @@ async def test_search_shapes_documents_and_totals():
     ]
     assert result["hits"]["total"] == {"value": 2}
     assert result["took"] == 7
+
+
+async def test_search_normalizes_empty_hits():
+    plugin = make_plugin()
+    _mock_search(plugin, [])
+
+    result = await plugin.search("logs")
+
+    assert result["hits"]["documents"] == []
+    assert result["hits"]["total"] == {"value": 0}
+
+
+async def test_index_document_reports_non_created_result():
+    plugin = make_plugin()
+    plugin._client.index = AsyncMock(
+        return_value={
+            "_id": "doc-1",
+            "_index": "logs",
+            "_version": 2,
+            "result": "updated",
+        }
+    )
+
+    result = await plugin.index_document("logs", {"message": "updated"})
+
+    assert result["result"] == "updated"
+    assert result["created"] is False

@@ -7,6 +7,7 @@ without a real Qdrant connection.
 
 import pytest
 from unittest.mock import MagicMock
+from daita.core.exceptions import ValidationError
 from daita.plugins import ExtensionRegistry
 from daita.plugins.qdrant import QdrantPlugin
 from daita.runtime import AccessMode, Operation, RiskLevel, Task
@@ -55,6 +56,39 @@ def _operation_and_task(capability, input_payload):
         required_evidence=capability.output_evidence,
     )
     return operation, task
+
+
+def test_qdrant_client_access_requires_connection():
+    plugin = QdrantPlugin(collection="test_col", url="http://localhost:6333")
+
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.client
+
+
+async def test_qdrant_client_access_tracks_connection_lifecycle(monkeypatch):
+    import qdrant_client
+
+    class FakeClient:
+        def __init__(self):
+            self.closed = False
+
+        def get_collection(self, name):
+            return MagicMock()
+
+        def close(self):
+            self.closed = True
+
+    client = FakeClient()
+    monkeypatch.setattr(qdrant_client, "QdrantClient", lambda **kwargs: client)
+    plugin = QdrantPlugin(collection="test_col", url="http://localhost:6333")
+
+    await plugin.connect()
+    assert plugin.client is client
+
+    await plugin.disconnect()
+    assert client.closed is True
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.client
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +193,7 @@ async def test_qdrant_write_executor_uses_existing_tool_handler():
     }
 
 
-async def test_qdrant_registry_setup_and_teardown_use_connector_lifecycle():
+async def test_qdrant_registry_setup_and_teardown_use_connector_lifecycle(monkeypatch):
     plugin = QdrantPlugin(collection="test_col", url="http://localhost:6333")
     calls = []
 
@@ -171,8 +205,8 @@ async def test_qdrant_registry_setup_and_teardown_use_connector_lifecycle():
         calls.append("disconnect")
         plugin._client = None
 
-    plugin.connect = fake_connect
-    plugin.disconnect = fake_disconnect
+    monkeypatch.setattr(plugin, "connect", fake_connect)
+    monkeypatch.setattr(plugin, "disconnect", fake_disconnect)
     registry = ExtensionRegistry()
     registry.register(plugin)
 
@@ -332,3 +366,13 @@ async def test_empty_payload_handled():
     # Empty payload {} is falsy, so the plugin skips adding it — no KeyError
     assert results[0]["id"] == "x"
     assert "payload" not in results[0]
+
+
+async def test_upsert_preserves_absent_operation_id():
+    plugin = make_plugin()
+    plugin._client.upsert = MagicMock(return_value=MagicMock(operation_id=None))
+
+    result = await plugin.upsert(["doc-1"], [[0.1, 0.2]])
+
+    assert result["upserted_count"] == 1
+    assert result["operation_id"] is None

@@ -19,6 +19,10 @@ from .chroma_extensions import (
 )
 
 if TYPE_CHECKING:
+    from chromadb.api import ClientAPI
+    from chromadb.api.models.Collection import Collection
+    from chromadb.api.types import Include, Metadata, PyEmbedding
+
     from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
@@ -61,7 +65,7 @@ class ChromaPlugin(BaseVectorPlugin):
         self.host = host
         self.port = port
         self.collection_name = collection
-        self._collection = None
+        self._collection: Optional["Collection"] = None
         self._embedding_fn = embedding_fn
 
         # Determine mode
@@ -79,11 +83,36 @@ class ChromaPlugin(BaseVectorPlugin):
             collection=collection,
             **kwargs,  # embedding_fn is not forwarded
         )
+        self._client: Optional["ClientAPI"] = None
         self._executor = ChromaExecutor(self)
 
         logger.debug(
             f"ChromaDB plugin configured in {self.mode} mode, collection '{collection}'"
         )
+
+    @property
+    def client(self) -> "ClientAPI":
+        """Return the active Chroma client owned by this plugin."""
+        if self._client is None:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError(
+                "ChromaPlugin is not connected",
+                field="connection_state",
+            )
+        return self._client
+
+    @property
+    def collection(self) -> "Collection":
+        """Return the active Chroma collection owned by this plugin."""
+        if self._collection is None:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError(
+                "ChromaPlugin is not connected",
+                field="connection_state",
+            )
+        return self._collection
 
     async def setup(self, context: PluginContext) -> None:
         """Set up the Chroma connector for a runtime."""
@@ -131,23 +160,29 @@ class ChromaPlugin(BaseVectorPlugin):
 
             # Create client based on mode
             if self.mode == "persistent":
-                self._client = chromadb.PersistentClient(path=self.path)
+                path = self.path
+                if path is None:
+                    raise RuntimeError("persistent Chroma mode requires path")
+                client = chromadb.PersistentClient(path=path)
             elif self.mode == "client":
-                self._client = chromadb.HttpClient(host=self.host, port=self.port)
+                host = self.host
+                if host is None:
+                    raise RuntimeError("client Chroma mode requires host")
+                client = chromadb.HttpClient(host=host, port=self.port)
             else:
-                self._client = chromadb.Client()
+                client = chromadb.Client()
 
             # Get or create collection
-            self._collection = self._client.get_or_create_collection(
-                name=self.collection_name
-            )
+            collection = client.get_or_create_collection(name=self.collection_name)
+
+            self._client = client
+            self._collection = collection
 
             logger.info(f"Connected to ChromaDB in {self.mode} mode")
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
-                "chromadb is required for ChromaPlugin. "
-                "Install with: pip install 'daita-agents[chromadb]'"
-            )
+                "chromadb is required. Install with: pip install 'daita-agents[chromadb]'"
+            ) from exc
         except Exception as e:
             self._handle_connection_error(e, "connection")
 
@@ -178,16 +213,19 @@ class ChromaPlugin(BaseVectorPlugin):
         """
         if self._collection is None:
             await self.connect()
+        collection = self.collection
+        embeddings: "List[PyEmbedding]" = [tuple(vector) for vector in vectors]
+        metadatas: "List[Metadata] | None" = (
+            [dict(item) for item in metadata] if metadata else None
+        )
 
         # ChromaDB's add method handles both insert and update
-        kwargs = {"ids": ids, "embeddings": vectors}
-
-        if metadata:
-            kwargs["metadatas"] = metadata
-        if documents:
-            kwargs["documents"] = documents
-
-        self._collection.add(**kwargs)
+        collection.add(
+            ids=ids,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            documents=documents,
+        )
 
         return {
             "success": True,
@@ -200,7 +238,7 @@ class ChromaPlugin(BaseVectorPlugin):
         vector: List[float],
         top_k: int = 10,
         filter: Optional[Dict] = None,
-        include: Optional[List[str]] = None,
+        include: Optional["Include"] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search for similar vectors in ChromaDB.
@@ -216,27 +254,32 @@ class ChromaPlugin(BaseVectorPlugin):
         """
         if self._collection is None:
             await self.connect()
+        collection = self.collection
 
         # Default include fields
         if include is None:
             include = ["metadatas", "documents", "distances"]
 
-        result = self._collection.query(
+        result = collection.query(
             query_embeddings=[vector], n_results=top_k, where=filter, include=include
         )
 
         # Convert to list of dicts
         matches = []
-        ids = result.get("ids", [[]])[0]
-        distances = result.get("distances", [[]])[0]
-        metadatas = result.get("metadatas", [[]])[0]
-        documents = result.get("documents", [[]])[0]
+        ids = result["ids"][0] if result["ids"] else []
+        distance_groups = result.get("distances") or []
+        distances = distance_groups[0] if distance_groups else []
+        metadata_groups = result.get("metadatas") or []
+        metadatas = metadata_groups[0] if metadata_groups else []
+        document_groups = result.get("documents") or []
+        documents = document_groups[0] if document_groups else []
+        embedding_groups = result.get("embeddings") or []
         embeddings = (
-            result.get("embeddings", [[]])[0] if "embeddings" in include else None
+            embedding_groups[0] if "embeddings" in include and embedding_groups else []
         )
 
         for idx, id in enumerate(ids):
-            match = {
+            match: Dict[str, object] = {
                 "id": id,
                 "distance": distances[idx] if idx < len(distances) else None,
                 "score": 1 / (1 + distances[idx]) if idx < len(distances) else None,
@@ -268,16 +311,17 @@ class ChromaPlugin(BaseVectorPlugin):
         """
         if self._collection is None:
             await self.connect()
+        collection = self.collection
 
         if ids:
-            self._collection.delete(ids=ids)
+            collection.delete(ids=ids)
             return {
                 "success": True,
                 "deleted_count": len(ids),
                 "collection": self.collection_name,
             }
         elif filter:
-            self._collection.delete(where=filter)
+            collection.delete(where=filter)
             return {
                 "success": True,
                 "deleted": "by_filter",
@@ -287,7 +331,7 @@ class ChromaPlugin(BaseVectorPlugin):
             return {"success": False, "error": "Must provide ids or filter"}
 
     async def fetch(
-        self, ids: List[str], include: Optional[List[str]] = None
+        self, ids: List[str], include: Optional["Include"] = None
     ) -> List[Dict[str, Any]]:
         """
         Fetch vectors by ID from ChromaDB.
@@ -301,22 +345,23 @@ class ChromaPlugin(BaseVectorPlugin):
         """
         if self._collection is None:
             await self.connect()
+        collection = self.collection
 
         # Default include fields
         if include is None:
             include = ["metadatas", "documents", "embeddings"]
 
-        result = self._collection.get(ids=ids, include=include)
+        result = collection.get(ids=ids, include=include)
 
         # Convert to list of dicts
         vectors = []
         ids_result = result.get("ids", [])
-        metadatas = result.get("metadatas", [])
-        documents = result.get("documents", [])
-        embeddings = result.get("embeddings", []) if "embeddings" in include else []
+        metadatas = result.get("metadatas") or []
+        documents = result.get("documents") or []
+        embeddings = (result.get("embeddings") or []) if "embeddings" in include else []
 
         for idx, id in enumerate(ids_result):
-            vector = {"id": id}
+            vector: Dict[str, object] = {"id": id}
 
             if len(metadatas) > 0 and idx < len(metadatas):
                 vector["metadata"] = metadatas[idx]
@@ -338,8 +383,9 @@ class ChromaPlugin(BaseVectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
-        collections = self._client.list_collections()
+        collections = client.list_collections()
         return [col.name for col in collections]
 
     async def _tool_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -357,19 +403,42 @@ class ChromaPlugin(BaseVectorPlugin):
             result = self._embedding_fn(text)
             vector = await result if asyncio.iscoroutine(result) else result
 
-        matches = await self.query(vector=vector, top_k=top_k, filter=filter)
+        if not isinstance(vector, list) or not all(
+            isinstance(value, (int, float)) for value in vector
+        ):
+            raise ValueError("vector must be a list of numbers")
+        normalized_vector = [float(value) for value in vector]
+
+        matches = await self.query(vector=normalized_vector, top_k=top_k, filter=filter)
 
         return {"success": True, "matches": matches, "count": len(matches)}
 
     async def _tool_upsert(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for chroma_upsert"""
         ids = args.get("ids")
-        vectors = args.get("vectors")
+        if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+            raise ValueError("ids must be a list of strings")
+        normalized_ids = [item for item in ids if isinstance(item, str)]
+        raw_vectors = args.get("vectors")
+        if not isinstance(raw_vectors, list) or not all(
+            isinstance(vector, list)
+            and all(isinstance(value, (int, float)) for value in vector)
+            for vector in raw_vectors
+        ):
+            raise ValueError("vectors must be a list of numeric vectors")
+        vectors = [
+            [float(value) for value in vector]
+            for vector in raw_vectors
+            if isinstance(vector, list)
+        ]
         metadata = args.get("metadata")
         documents = args.get("documents")
 
         result = await self.upsert(
-            ids=ids, vectors=vectors, metadata=metadata, documents=documents
+            ids=normalized_ids,
+            vectors=vectors,
+            metadata=metadata,
+            documents=documents,
         )
 
         return result

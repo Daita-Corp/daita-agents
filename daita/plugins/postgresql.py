@@ -9,7 +9,7 @@ from datetime import date, datetime, time
 from decimal import Decimal
 import logging
 import re
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Protocol, TYPE_CHECKING
 from urllib.parse import quote
 from uuid import UUID
 
@@ -26,7 +26,43 @@ from .sql_params import coerce_sql_params, param_specs_from_payload
 from ..core.exceptions import PluginError, ValidationError
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping, Sequence
+    from types import TracebackType
+
     from ..core.tools import LocalTool
+
+    class _PostgreSQLConnection(Protocol):
+        async def fetch(
+            self, query: str, *args: object
+        ) -> Sequence[Mapping[str, object]]: ...
+
+        async def execute(self, command: str, *args: object) -> str: ...
+
+        async def executemany(
+            self, command: str, args: Iterable[Sequence[object]]
+        ) -> None: ...
+
+        async def fetchrow(
+            self, query: str, *args: object
+        ) -> Mapping[str, object] | None: ...
+
+    class _PostgreSQLPoolAcquireContext(Protocol):
+        async def __aenter__(self) -> _PostgreSQLConnection: ...
+
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None: ...
+
+    class _PostgreSQLPool(Protocol):
+        def acquire(
+            self, *, timeout: float | None = None
+        ) -> _PostgreSQLPoolAcquireContext: ...
+
+        async def close(self) -> None: ...
+
 
 logger = logging.getLogger(__name__)
 
@@ -105,10 +141,21 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             connection_string=connection_string,
             **kwargs,
         )
+        self._pool: Optional["_PostgreSQLPool"] = None
         self.schema = _validate_postgresql_identifier(str(self.schema or "public"))
         self.config["schema"] = self.schema
 
         logger.debug(f"PostgreSQL plugin configured for {host}:{port}/{database}")
+
+    @property
+    def pool(self) -> "_PostgreSQLPool":
+        """Return the active connection pool owned by this plugin."""
+        if self._pool is None:
+            raise ValidationError(
+                "PostgreSQLPlugin is not connected to database",
+                field="connection_state",
+            )
+        return self._pool
 
     async def setup(self, context: PluginContext) -> None:
         """Set up the PostgreSQL connector for a runtime."""
@@ -475,22 +522,20 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             return  # Already connected
 
         try:
-            import asyncpg
+            from importlib import import_module
+
+            asyncpg = import_module("asyncpg")
 
             logger.debug(
                 f"Connecting to PostgreSQL with connection string (password masked)"
             )
-            self._pool = await asyncpg.create_pool(
-                self.connection_string, **self.pool_config
-            )
+            create_pool = getattr(asyncpg, "create_pool")
+            self._pool = await create_pool(self.connection_string, **self.pool_config)
             logger.info("Connected to PostgreSQL")
-        except ImportError:
-            self._handle_connection_error(
-                ImportError(
-                    "asyncpg not installed. Install with: pip install 'daita-agents[postgresql]'"
-                ),
-                "connection",
-            )
+        except ImportError as exc:
+            raise ImportError(
+                "asyncpg is required. Install with: pip install 'daita-agents[postgresql]'"
+            ) from exc
         except Exception as e:
             # Enhance error message with troubleshooting tips
             error_msg = str(e)
@@ -559,7 +604,8 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         if self._pool is None:
             await self.connect()
 
-        async with self._pool.acquire() as conn:
+        pool = self.pool
+        async with pool.acquire() as conn:
             if params:
                 rows = await conn.fetch(sql, *params)
             else:
@@ -583,7 +629,8 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         if self._pool is None:
             await self.connect()
 
-        async with self._pool.acquire() as conn:
+        pool = self.pool
+        async with pool.acquire() as conn:
             if params:
                 result = await conn.execute(sql, *params)
             else:
@@ -626,7 +673,8 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         # Convert to list of tuples for executemany
         rows = [[row[col] for col in columns] for row in data]
 
-        async with self._pool.acquire() as conn:
+        pool = self.pool
+        async with pool.acquire() as conn:
             await conn.executemany(sql, rows)
 
         return len(data)
@@ -825,7 +873,8 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         RETURNING {id_column}
         """
 
-        async with self._pool.acquire() as conn:
+        pool = self.pool
+        async with pool.acquire() as conn:
             result = await conn.fetchrow(sql, *params)
             if result:
                 return {"id": str(result[id_column]), "upserted": True}
@@ -904,6 +953,8 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
     async def _tool_get_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_get_schema (kept for backward compat, not in get_tools)"""
         table_name = args.get("table_name")
+        if not isinstance(table_name, str) or not table_name:
+            raise ValidationError("table_name is required", field="table_name")
         columns = await self.describe(table_name)
 
         return {
@@ -939,6 +990,8 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
     async def _tool_count(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_count"""
         table = args.get("table")
+        if not isinstance(table, str) or not table:
+            raise ValidationError("table is required", field="table")
         filter_clause = args.get("filter")
         count = await self.count_rows(table, filter_clause)
         return {"table": table, "count": count}
@@ -946,6 +999,8 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
     async def _tool_sample(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_sample"""
         table = args.get("table")
+        if not isinstance(table, str) or not table:
+            raise ValidationError("table is required", field="table")
         n = args.get("n", 5)
         rows = await self.sample_rows(table, n)
         return {"table": table, "rows": rows}
@@ -953,8 +1008,19 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
     async def _tool_vector_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_vector_search"""
         table = args.get("table")
+        if not isinstance(table, str) or not table:
+            raise ValidationError("table is required", field="table")
         vector_column = args.get("vector_column")
-        query_vector = args.get("query_vector")
+        if not isinstance(vector_column, str) or not vector_column:
+            raise ValidationError("vector_column is required", field="vector_column")
+        raw_query_vector = args.get("query_vector")
+        if not isinstance(raw_query_vector, list) or not all(
+            isinstance(value, (int, float)) for value in raw_query_vector
+        ):
+            raise ValidationError(
+                "query_vector must be a list of numbers", field="query_vector"
+            )
+        query_vector = [float(value) for value in raw_query_vector]
         top_k = args.get("top_k", 10)
         filter = args.get("filter")
         distance_type = args.get("distance_type", "cosine")
@@ -973,17 +1039,30 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
     async def _tool_vector_upsert(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for postgres_vector_upsert"""
         table = args.get("table")
+        if not isinstance(table, str) or not table:
+            raise ValidationError("table is required", field="table")
         id_column = args.get("id_column")
+        if not isinstance(id_column, str) or not id_column:
+            raise ValidationError("id_column is required", field="id_column")
         vector_column = args.get("vector_column")
-        id = args.get("id")
-        vector = args.get("vector")
+        if not isinstance(vector_column, str) or not vector_column:
+            raise ValidationError("vector_column is required", field="vector_column")
+        row_id = args.get("id")
+        if not isinstance(row_id, str) or not row_id:
+            raise ValidationError("id is required", field="id")
+        raw_vector = args.get("vector")
+        if not isinstance(raw_vector, list) or not all(
+            isinstance(value, (int, float)) for value in raw_vector
+        ):
+            raise ValidationError("vector must be a list of numbers", field="vector")
+        vector = [float(value) for value in raw_vector]
         extra_columns = args.get("extra_columns")
 
         result = await self.vector_upsert(
             table=table,
             id_column=id_column,
             vector_column=vector_column,
-            id=id,
+            id=row_id,
             vector=vector,
             extra_columns=extra_columns,
         )

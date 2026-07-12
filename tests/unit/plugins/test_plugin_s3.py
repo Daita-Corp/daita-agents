@@ -8,13 +8,14 @@ focus exposure, and pagination — without real AWS calls.
 
 import json
 import io
+import builtins
 import pytest
 from unittest.mock import MagicMock, patch
 
 botocore_exceptions = pytest.importorskip(
     "botocore.exceptions", reason="botocore (boto3) not installed"
 )
-ClientError = botocore_exceptions.ClientError
+from botocore.exceptions import ClientError
 
 from daita.plugins.s3 import S3Plugin
 from daita.plugins import ExtensionRegistry
@@ -90,6 +91,13 @@ def _operation_and_task(capability, input_payload):
         required_evidence=capability.output_evidence,
     )
     return operation, task
+
+
+def test_s3_client_access_requires_connection():
+    plugin = S3Plugin(bucket="test-bucket")
+
+    with pytest.raises(PluginError, match="not connected"):
+        _ = plugin.client
 
 
 # ---------------------------------------------------------------------------
@@ -182,21 +190,21 @@ async def test_s3_write_executor_uses_existing_tool_handler():
     }
 
 
-async def test_s3_registry_setup_and_teardown_use_connector_lifecycle():
+async def test_s3_registry_setup_and_teardown_use_connector_lifecycle(monkeypatch):
     plugin = make_plugin()
     calls = []
 
     async def fake_connect():
         calls.append("connect")
-        plugin._client = object()
+        plugin._client = MagicMock()
 
     async def fake_disconnect():
         calls.append("disconnect")
         plugin._client = None
 
     plugin._client = None
-    plugin.connect = fake_connect
-    plugin.disconnect = fake_disconnect
+    monkeypatch.setattr(plugin, "connect", fake_connect)
+    monkeypatch.setattr(plugin, "disconnect", fake_disconnect)
     registry = ExtensionRegistry()
     registry.register(plugin)
 
@@ -441,6 +449,34 @@ async def test_connect_creates_client():
         await plugin.connect()
 
     assert plugin._client is mock_client
+
+
+async def test_connect_rejects_missing_credentials_before_client_publication():
+    plugin = S3Plugin(bucket="my-bucket")
+
+    with patch("boto3.Session") as mock_session_cls:
+        mock_session_cls.return_value.get_credentials.return_value = None
+
+        with pytest.raises(AuthenticationError, match="credentials"):
+            await plugin.connect()
+
+    assert plugin._client is None
+    assert plugin._session is None
+
+
+async def test_connect_missing_boto3_raises_import_error_with_extra_hint(monkeypatch):
+    real_import = builtins.__import__
+
+    def mock_import(name, *args, **kwargs):
+        if name == "boto3":
+            raise ImportError("boto3 not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+    plugin = S3Plugin(bucket="my-bucket")
+
+    with pytest.raises(ImportError, match="pip install 'daita-agents\\[aws\\]'"):
+        await plugin.connect()
 
 
 # ---------------------------------------------------------------------------

@@ -61,6 +61,28 @@ async def test_double_connect_is_idempotent():
         assert db.is_connected
 
 
+def test_db_access_requires_connection():
+    from daita.core.exceptions import ValidationError
+
+    plugin = SQLitePlugin(path=":memory:")
+
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.db
+
+
+async def test_db_access_tracks_connection_lifecycle():
+    plugin = SQLitePlugin(path=":memory:")
+
+    await plugin.connect()
+    assert plugin.db is plugin._db
+
+    await plugin.disconnect()
+    from daita.core.exceptions import ValidationError
+
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.db
+
+
 # ---------------------------------------------------------------------------
 # execute_script
 # ---------------------------------------------------------------------------
@@ -331,7 +353,5 @@ async def test_missing_aiosqlite_raises_import_error(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", mock_import)
 
     plugin = SQLitePlugin(path=":memory:")
-    from daita.core.exceptions import PluginError
-
-    with pytest.raises(PluginError):
+    with pytest.raises(ImportError, match="pip install 'daita-agents\\[sqlite\\]'"):
         await plugin.connect()

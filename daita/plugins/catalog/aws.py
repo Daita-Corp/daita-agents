@@ -253,7 +253,11 @@ class AWSDiscoverer(BaseDiscoverer):
 
         try:
             for bucket in client.list_buckets().get("Buckets", []):
-                bucket_name = bucket["Name"]
+                bucket_name = bucket.get("Name")
+                if not bucket_name:
+                    logger.warning("Skipping S3 bucket response without a name")
+                    continue
+                bucket_region: str
                 try:
                     loc = client.get_bucket_location(Bucket=bucket_name)
                     bucket_region = loc.get("LocationConstraint") or "us-east-1"

@@ -19,6 +19,8 @@ from .qdrant_extensions import (
 )
 
 if TYPE_CHECKING:
+    from qdrant_client import QdrantClient
+
     from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
@@ -64,9 +66,22 @@ class QdrantPlugin(BaseVectorPlugin):
             collection=collection,
             **kwargs,  # embedding_fn is not forwarded
         )
+        self._client: Optional["QdrantClient"] = None
         self._executor = QdrantExecutor(self)
 
         logger.debug(f"Qdrant plugin configured for {url}, collection '{collection}'")
+
+    @property
+    def client(self) -> "QdrantClient":
+        """Return the active Qdrant client owned by this plugin."""
+        if self._client is None:
+            from ..core.exceptions import ValidationError
+
+            raise ValidationError(
+                "QdrantPlugin is not connected",
+                field="connection_state",
+            )
+        return self._client
 
     async def setup(self, context: PluginContext) -> None:
         """Set up the Qdrant connector for a runtime."""
@@ -112,29 +127,31 @@ class QdrantPlugin(BaseVectorPlugin):
         try:
             from qdrant_client import QdrantClient
 
-            self._client = QdrantClient(url=self.url, api_key=self.api_key)
+            client = QdrantClient(url=self.url, api_key=self.api_key)
 
             # Verify collection exists
             try:
-                self._client.get_collection(self.collection_name)
+                client.get_collection(self.collection_name)
                 logger.info(f"Connected to Qdrant collection '{self.collection_name}'")
             except Exception:
                 logger.warning(
                     f"Collection '{self.collection_name}' does not exist. Create it with create_collection()"
                 )
 
-        except ImportError:
+            self._client = client
+
+        except ImportError as exc:
             raise ImportError(
-                "qdrant-client is required for QdrantPlugin. "
-                "Install with: pip install 'daita-agents[qdrant]'"
-            )
+                "qdrant-client is required. Install with: pip install 'daita-agents[qdrant]'"
+            ) from exc
         except Exception as e:
             self._handle_connection_error(e, "connection")
 
     async def disconnect(self):
         """Disconnect from Qdrant."""
-        if self._client:
-            self._client.close()
+        client = self._client
+        if client is not None:
+            client.close()
         self._client = None
         logger.info("Disconnected from Qdrant")
 
@@ -177,6 +194,7 @@ class QdrantPlugin(BaseVectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
         from qdrant_client.models import PointStruct
         import uuid
@@ -193,9 +211,7 @@ class QdrantPlugin(BaseVectorPlugin):
             points.append(PointStruct(id=id_uuid, vector=vector, payload=payload))
 
         # Upsert points
-        result = self._client.upsert(
-            collection_name=self.collection_name, points=points
-        )
+        result = client.upsert(collection_name=self.collection_name, points=points)
 
         return {
             "upserted_count": len(ids),
@@ -228,11 +244,12 @@ class QdrantPlugin(BaseVectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
         # Convert simple dict filter to Qdrant Filter
         qdrant_filter = self._dict_to_filter(filter) if filter else None
 
-        results = self._client.query_points(
+        results = client.query_points(
             collection_name=self.collection_name,
             query=vector,
             limit=top_k,
@@ -279,15 +296,20 @@ class QdrantPlugin(BaseVectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
         if ids:
             import uuid
+            from qdrant_client.models import ExtendedPointId, PointIdsList
 
             # Convert string IDs to UUIDs
-            id_uuids = [str(uuid.uuid5(uuid.NAMESPACE_DNS, id)) for id in ids]
+            id_uuids: List[ExtendedPointId] = [
+                str(uuid.uuid5(uuid.NAMESPACE_DNS, id)) for id in ids
+            ]
 
-            result = self._client.delete(
-                collection_name=self.collection_name, points_selector=id_uuids
+            result = client.delete(
+                collection_name=self.collection_name,
+                points_selector=PointIdsList(points=id_uuids),
             )
             return {
                 "deleted_count": len(ids),
@@ -298,7 +320,7 @@ class QdrantPlugin(BaseVectorPlugin):
             }
         elif filter:
             qdrant_filter = self._dict_to_filter(filter)
-            result = self._client.delete(
+            result = client.delete(
                 collection_name=self.collection_name, points_selector=qdrant_filter
             )
             return {
@@ -329,13 +351,14 @@ class QdrantPlugin(BaseVectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
         import uuid
 
         # Convert string IDs to UUIDs
         id_uuids = [str(uuid.uuid5(uuid.NAMESPACE_DNS, id)) for id in ids]
 
-        results = self._client.retrieve(
+        results = client.retrieve(
             collection_name=self.collection_name,
             ids=id_uuids,
             with_payload=with_payload,
@@ -381,6 +404,7 @@ class QdrantPlugin(BaseVectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
         from qdrant_client.models import VectorParams, Distance
 
@@ -393,7 +417,7 @@ class QdrantPlugin(BaseVectorPlugin):
 
         distance_metric = distance_map.get(distance, Distance.COSINE)
 
-        self._client.create_collection(
+        client.create_collection(
             collection_name=name,
             vectors_config=VectorParams(size=vector_size, distance=distance_metric),
         )
@@ -412,8 +436,9 @@ class QdrantPlugin(BaseVectorPlugin):
         """
         if self._client is None:
             await self.connect()
+        client = self.client
 
-        collections = self._client.get_collections()
+        collections = client.get_collections()
         return [col.name for col in collections.collections]
 
     async def _tool_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -431,17 +456,39 @@ class QdrantPlugin(BaseVectorPlugin):
             result = self._embedding_fn(text)
             vector = await result if asyncio.iscoroutine(result) else result
 
-        matches = await self.query(vector=vector, top_k=top_k, filter=filter)
+        if not isinstance(vector, list) or not all(
+            isinstance(value, (int, float)) for value in vector
+        ):
+            raise ValueError("vector must be a list of numbers")
+        normalized_vector = [float(value) for value in vector]
+
+        matches = await self.query(vector=normalized_vector, top_k=top_k, filter=filter)
 
         return {"matches": matches, "count": len(matches)}
 
     async def _tool_upsert(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for qdrant_upsert"""
         ids = args.get("ids")
-        vectors = args.get("vectors")
+        if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+            raise ValueError("ids must be a list of strings")
+        normalized_ids = [item for item in ids if isinstance(item, str)]
+        raw_vectors = args.get("vectors")
+        if not isinstance(raw_vectors, list) or not all(
+            isinstance(vector, list)
+            and all(isinstance(value, (int, float)) for value in vector)
+            for vector in raw_vectors
+        ):
+            raise ValueError("vectors must be a list of numeric vectors")
+        vectors = [
+            [float(value) for value in vector]
+            for vector in raw_vectors
+            if isinstance(vector, list)
+        ]
         metadata = args.get("metadata")
 
-        result = await self.upsert(ids=ids, vectors=vectors, metadata=metadata)
+        result = await self.upsert(
+            ids=normalized_ids, vectors=vectors, metadata=metadata
+        )
 
         return result
 
@@ -456,7 +503,11 @@ class QdrantPlugin(BaseVectorPlugin):
     async def _tool_create_collection(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for qdrant_create_collection"""
         name = args.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("name is required")
         vector_size = args.get("vector_size")
+        if not isinstance(vector_size, int) or vector_size <= 0:
+            raise ValueError("vector_size must be a positive integer")
         distance = args.get("distance", "Cosine")
 
         result = await self.create_collection(

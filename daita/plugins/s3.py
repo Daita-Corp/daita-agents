@@ -29,6 +29,18 @@ from ..core.exceptions import (
 )
 
 if TYPE_CHECKING:
+    from boto3.session import Session
+    from mypy_boto3_s3.client import S3Client
+    from mypy_boto3_s3.type_defs import (
+        CopyObjectOutputTypeDef,
+        CopySourceTypeDef,
+        DeleteObjectOutputTypeDef,
+        HeadObjectOutputTypeDef,
+        ListObjectsV2OutputTypeDef,
+        PutObjectRequestTypeDef,
+        PutObjectOutputTypeDef,
+    )
+
     from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
@@ -78,8 +90,8 @@ class S3Plugin(ConnectorPlugin):
         # Store additional config
         self.config = kwargs
 
-        self._client = None
-        self._session = None
+        self._client: Optional["S3Client"] = None
+        self._session: Optional["Session"] = None
         self._executor = S3Executor(self)
         self._connect_lock = asyncio.Lock()
 
@@ -88,6 +100,13 @@ class S3Plugin(ConnectorPlugin):
     @property
     def is_connected(self) -> bool:
         return self._client is not None
+
+    @property
+    def client(self) -> "S3Client":
+        """Return the active S3 client owned by this plugin."""
+        if self._client is None:
+            raise PluginError("S3Plugin is not connected", plugin_name="S3")
+        return self._client
 
     async def setup(self, context: PluginContext) -> None:
         """Set up the S3 connector for a runtime."""
@@ -140,7 +159,8 @@ class S3Plugin(ConnectorPlugin):
             from botocore.exceptions import ClientError
 
             if isinstance(error, ClientError):
-                code = error.response["Error"]["Code"]
+                error_payload = error.response.get("Error") or {}
+                code = str(error_payload.get("Code") or "")
                 if code in ("404", "NoSuchKey", "NoSuchBucket"):
                     return NotFoundError(
                         f"S3 resource not found during {operation}",
@@ -189,30 +209,27 @@ class S3Plugin(ConnectorPlugin):
                 from botocore.exceptions import ClientError
 
                 def _create_client():
-                    session_kwargs = {"region_name": self.region}
-                    if self.aws_access_key_id:
-                        session_kwargs["aws_access_key_id"] = self.aws_access_key_id
-                    if self.aws_secret_access_key:
-                        session_kwargs["aws_secret_access_key"] = (
-                            self.aws_secret_access_key
+                    session = boto3.Session(
+                        aws_access_key_id=self.aws_access_key_id,
+                        aws_secret_access_key=self.aws_secret_access_key,
+                        aws_session_token=self.aws_session_token,
+                        region_name=self.region,
+                    )
+                    if session.get_credentials() is None:
+                        raise AuthenticationError(
+                            "AWS credentials are required for S3Plugin",
+                            provider="AWS S3",
                         )
-                    if self.aws_session_token:
-                        session_kwargs["aws_session_token"] = self.aws_session_token
-
-                    session = boto3.Session(**session_kwargs)
-                    client_kwargs = {}
-                    if self.endpoint_url:
-                        client_kwargs["endpoint_url"] = self.endpoint_url
-                    client = session.client("s3", **client_kwargs)
+                    client = session.client("s3", endpoint_url=self.endpoint_url)
                     # list_objects_v2 is more reliable than head_bucket across boto3 versions
                     client.list_objects_v2(Bucket=self.bucket, MaxKeys=1)
                     return session, client
 
                 loop = asyncio.get_running_loop()
                 try:
-                    self._session, self._client = await loop.run_in_executor(
-                        None, _create_client
-                    )
+                    session, client = await loop.run_in_executor(None, _create_client)
+                    self._session = session
+                    self._client = client
                     logger.info(f"Connected to S3 bucket: {self.bucket}")
                 except ClientError as e:
                     raise self._map_s3_error(e, "connect") from e
@@ -247,7 +264,7 @@ class S3Plugin(ConnectorPlugin):
 
     def _sync_list_objects(
         self, prefix: str, max_keys: int, continuation_token: Optional[str]
-    ) -> dict:
+    ) -> "ListObjectsV2OutputTypeDef":
         kwargs: Dict[str, Any] = {
             "Bucket": self.bucket,
             "Prefix": prefix,
@@ -255,31 +272,35 @@ class S3Plugin(ConnectorPlugin):
         }
         if continuation_token:
             kwargs["ContinuationToken"] = continuation_token
-        return self._client.list_objects_v2(**kwargs)
+        return self.client.list_objects_v2(**kwargs)
 
     def _sync_get_object(self, key: str) -> bytes:
-        response = self._client.get_object(Bucket=self.bucket, Key=key)
+        response = self.client.get_object(Bucket=self.bucket, Key=key)
         return response["Body"].read()
 
-    def _sync_put_object(self, put_args: dict) -> dict:
-        return self._client.put_object(**put_args)
+    def _sync_put_object(
+        self, put_args: "PutObjectRequestTypeDef"
+    ) -> "PutObjectOutputTypeDef":
+        return self.client.put_object(**put_args)
 
-    def _sync_head_object(self, key: str) -> dict:
-        return self._client.head_object(Bucket=self.bucket, Key=key)
+    def _sync_head_object(self, key: str) -> "HeadObjectOutputTypeDef":
+        return self.client.head_object(Bucket=self.bucket, Key=key)
 
-    def _sync_delete_object(self, key: str) -> dict:
-        return self._client.delete_object(Bucket=self.bucket, Key=key)
+    def _sync_delete_object(self, key: str) -> "DeleteObjectOutputTypeDef":
+        return self.client.delete_object(Bucket=self.bucket, Key=key)
 
-    def _sync_copy_object(self, copy_source: dict, dest_key: str) -> dict:
-        return self._client.copy_object(
+    def _sync_copy_object(
+        self, copy_source: "CopySourceTypeDef", dest_key: str
+    ) -> "CopyObjectOutputTypeDef":
+        return self.client.copy_object(
             CopySource=copy_source, Bucket=self.bucket, Key=dest_key
         )
 
     def _sync_download_file(self, key: str, local_path: str) -> None:
-        self._client.download_file(self.bucket, key, local_path)
+        self.client.download_file(self.bucket, key, local_path)
 
     def _sync_upload_file(self, local_path: str, key: str, content_type: str) -> None:
-        self._client.upload_file(
+        self.client.upload_file(
             local_path, self.bucket, key, ExtraArgs={"ContentType": content_type}
         )
 
@@ -320,7 +341,7 @@ class S3Plugin(ConnectorPlugin):
                     self._sync_list_objects, prefix, max_keys, continuation_token
                 ),
             )
-            objects = response.get("Contents", [])
+            objects = [dict(item) for item in response.get("Contents") or []]
             is_truncated = response.get("IsTruncated", False)
 
             if focus:
@@ -374,6 +395,7 @@ class S3Plugin(ConnectorPlugin):
                 format = self._detect_format(key)
 
             # Process based on format — all branches assign to `data`
+            data: object
             if format == "bytes":
                 return content  # focus not applicable to raw bytes
             elif format == "text":
@@ -454,14 +476,16 @@ class S3Plugin(ConnectorPlugin):
 
         try:
             # Process data based on type
-            if hasattr(data, "to_csv"):  # pandas DataFrame
+            to_csv = getattr(data, "to_csv", None)
+            to_json = getattr(data, "to_json", None)
+            if callable(to_csv):  # pandas-compatible DataFrame
                 buffer = io.StringIO()
-                data.to_csv(buffer, index=False)
+                to_csv(buffer, index=False)
                 body = buffer.getvalue().encode("utf-8")
                 content_type = content_type or "text/csv"
-            elif hasattr(data, "to_json"):  # pandas DataFrame to JSON
+            elif callable(to_json):  # dataframe-like JSON boundary
                 buffer = io.StringIO()
-                data.to_json(buffer, orient="records", indent=2)
+                to_json(buffer, orient="records", indent=2)
                 body = buffer.getvalue().encode("utf-8")
                 content_type = content_type or "application/json"
             elif isinstance(data, list):
@@ -498,7 +522,7 @@ class S3Plugin(ConnectorPlugin):
                 content_type = self._detect_content_type(key)
 
             # Prepare put_object arguments
-            put_args = {
+            put_args: "PutObjectRequestTypeDef" = {
                 "Bucket": self.bucket,
                 "Key": key,
                 "Body": body,
@@ -562,19 +586,19 @@ class S3Plugin(ConnectorPlugin):
 
         try:
             if format == "csv":
-                buffer = io.StringIO()
-                df.to_csv(buffer, index=False, **kwargs)
-                body = buffer.getvalue().encode("utf-8")
+                csv_buffer = io.StringIO()
+                df.to_csv(csv_buffer, index=False, **kwargs)
+                body = csv_buffer.getvalue().encode("utf-8")
                 content_type = "text/csv"
             elif format == "json":
-                buffer = io.StringIO()
-                df.to_json(buffer, orient="records", indent=2, **kwargs)
-                body = buffer.getvalue().encode("utf-8")
+                json_buffer = io.StringIO()
+                df.to_json(json_buffer, orient="records", indent=2, **kwargs)
+                body = json_buffer.getvalue().encode("utf-8")
                 content_type = "application/json"
             elif format == "parquet":
-                buffer = io.BytesIO()
-                df.to_parquet(buffer, **kwargs)
-                body = buffer.getvalue()
+                parquet_buffer = io.BytesIO()
+                df.to_parquet(parquet_buffer, **kwargs)
+                body = parquet_buffer.getvalue()
                 content_type = "application/octet-stream"
             else:
                 raise ValueError(f"Unsupported format: {format}")
@@ -763,7 +787,10 @@ class S3Plugin(ConnectorPlugin):
 
         try:
             source_bucket = source_bucket or self.bucket
-            copy_source = {"Bucket": source_bucket, "Key": source_key}
+            copy_source: "CopySourceTypeDef" = {
+                "Bucket": source_bucket,
+                "Key": source_key,
+            }
 
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
@@ -771,12 +798,13 @@ class S3Plugin(ConnectorPlugin):
                 functools.partial(self._sync_copy_object, copy_source, dest_key),
             )
 
+            copy_result = response.get("CopyObjectResult") or {}
             result = {
                 "source_key": source_key,
                 "dest_key": dest_key,
                 "source_bucket": source_bucket,
                 "dest_bucket": self.bucket,
-                "etag": response["CopyObjectResult"]["ETag"],
+                "etag": copy_result.get("ETag"),
             }
 
             logger.info(f"Copied S3 object {source_key} to {dest_key}")
@@ -844,6 +872,8 @@ class S3Plugin(ConnectorPlugin):
     async def _tool_read_file(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for read_s3_file"""
         key = args.get("key")
+        if not isinstance(key, str) or not key:
+            raise PluginError("key is required", plugin_name="S3")
         format_hint = args.get("format", "auto")
         focus = args.get("focus")
         detected_format = self._detect_format(key)
@@ -906,6 +936,8 @@ class S3Plugin(ConnectorPlugin):
     async def _tool_write_file(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for write_s3_file"""
         key = args.get("key")
+        if not isinstance(key, str) or not key:
+            raise PluginError("key is required", plugin_name="S3")
         data = args.get("data")
 
         result = await self.put_object(key, data)
@@ -961,6 +993,8 @@ class S3Plugin(ConnectorPlugin):
     async def _tool_delete_file(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for delete_s3_file"""
         key = args.get("key")
+        if not isinstance(key, str) or not key:
+            raise PluginError("key is required", plugin_name="S3")
 
         result = await self.delete_object(key)
 
@@ -973,6 +1007,8 @@ class S3Plugin(ConnectorPlugin):
     async def _tool_head_object(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Tool handler for head_s3_object"""
         key = args.get("key")
+        if not isinstance(key, str) or not key:
+            raise PluginError("key is required", plugin_name="S3")
 
         if self._client is None:
             await self.connect()

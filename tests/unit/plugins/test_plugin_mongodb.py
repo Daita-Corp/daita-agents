@@ -8,6 +8,7 @@ without a real MongoDB connection.
 
 import pytest
 from unittest.mock import MagicMock, AsyncMock
+from daita.core.exceptions import ValidationError
 from daita.plugins import ExtensionRegistry
 from daita.plugins.mongodb import MongoDBPlugin
 from daita.runtime import AccessMode, Operation, RiskLevel, Task
@@ -60,6 +61,70 @@ def _operation_and_task(capability, input_payload):
         required_evidence=capability.output_evidence,
     )
     return operation, task
+
+
+def test_mongodb_access_requires_connection():
+    plugin = MongoDBPlugin(host="localhost", database="testdb")
+
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.client
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.database
+
+
+async def test_mongodb_access_tracks_connection_lifecycle(monkeypatch):
+    import motor.motor_asyncio
+
+    class FakeAdmin:
+        async def command(self, command):
+            assert command == "ping"
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.admin = FakeAdmin()
+            self.database = MagicMock()
+            self.closed = False
+
+        def __getitem__(self, name):
+            assert name == "testdb"
+            return self.database
+
+        def close(self):
+            self.closed = True
+
+    client = FakeClient()
+    monkeypatch.setattr(
+        motor.motor_asyncio.AsyncIOMotorClient,
+        "__new__",
+        lambda cls, *args, **kwargs: client,
+    )
+    plugin = MongoDBPlugin(host="localhost", database="testdb")
+
+    await plugin.connect()
+    assert plugin.client is client
+    assert plugin.database is client.database
+
+    await plugin.disconnect()
+    assert client.closed is True
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.database
+
+
+async def test_mongodb_missing_sdk_raises_import_error_with_extra_hint(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def mock_import(name, *args, **kwargs):
+        if name == "motor.motor_asyncio":
+            raise ImportError("motor not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+    plugin = MongoDBPlugin(host="localhost", database="testdb")
+
+    with pytest.raises(ImportError, match="pip install 'daita-agents\\[mongodb\\]'"):
+        await plugin.connect()
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +249,8 @@ async def test_mongodb_registry_setup_and_teardown_use_connector_lifecycle():
 
     async def fake_connect():
         calls.append("connect")
-        plugin._client = object()
-        plugin._db = object()
+        plugin._client = MagicMock()
+        plugin._db = MagicMock()
 
     async def fake_disconnect():
         calls.append("disconnect")

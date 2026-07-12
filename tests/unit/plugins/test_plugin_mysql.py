@@ -5,6 +5,13 @@ These tests avoid live MySQL dependencies by using a small subclass that
 overrides the direct query/execute methods while preserving plugin contracts.
 """
 
+import importlib
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from daita.core.exceptions import ValidationError
 from daita.plugins import ExtensionRegistry
 from daita.plugins.mysql import MySQLPlugin
 from daita.runtime import Operation, Task
@@ -26,11 +33,11 @@ class MockMySQLPlugin(MySQLPlugin):
 
     async def connect(self):
         self.connected = True
-        self._pool = object()
+        self._connection = object()
 
     async def disconnect(self):
         self.connected = False
-        self._pool = None
+        self._connection = None
 
     async def query(self, sql, params=None):
         self.queries.append((sql, params))
@@ -83,6 +90,60 @@ def _operation_and_task(capability, input_payload):
         required_evidence=capability.output_evidence,
     )
     return operation, task
+
+
+def test_mysql_pool_access_requires_connection():
+    plugin = MySQLPlugin(host="localhost", database="testdb")
+
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.pool
+
+
+async def test_mysql_pool_access_tracks_connection_lifecycle(monkeypatch):
+    class FakePool:
+        def __init__(self):
+            self.closed = False
+            self.waited = False
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            self.waited = True
+
+    pool = FakePool()
+
+    async def fake_create_pool(**kwargs):
+        return pool
+
+    monkeypatch.setitem(
+        sys.modules, "aiomysql", SimpleNamespace(create_pool=fake_create_pool)
+    )
+    plugin = MySQLPlugin(host="localhost", database="testdb")
+
+    await plugin.connect()
+    assert plugin.pool is pool
+
+    await plugin.disconnect()
+    assert pool.closed is True
+    assert pool.waited is True
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.pool
+
+
+async def test_mysql_missing_sdk_raises_import_error_with_extra_hint(monkeypatch):
+    real_import_module = importlib.import_module
+
+    def mock_import_module(name, *args, **kwargs):
+        if name == "aiomysql":
+            raise ImportError("aiomysql not installed")
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", mock_import_module)
+    plugin = MySQLPlugin(host="localhost", database="testdb")
+
+    with pytest.raises(ImportError, match="pip install 'daita-agents\\[mysql\\]'"):
+        await plugin.connect()
 
 
 def test_mysql_plugin_declares_extension_first_contract():

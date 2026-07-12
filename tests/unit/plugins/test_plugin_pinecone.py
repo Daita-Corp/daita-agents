@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import MagicMock
 
+from daita.core.exceptions import ValidationError
 from daita.plugins import ExtensionRegistry
 from daita.plugins.pinecone import PineconePlugin
 from daita.runtime import AccessMode, Operation, RiskLevel, Task
@@ -36,6 +37,33 @@ def _operation_and_task(capability, input_payload):
 
 def _mock_query(plugin, matches):
     plugin._index.query = MagicMock(return_value={"matches": matches})
+
+
+def test_pinecone_access_requires_connection():
+    plugin = PineconePlugin(api_key="test-key", index="test-index")
+
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.client
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.pinecone_index
+
+
+async def test_pinecone_access_tracks_connection_lifecycle(monkeypatch):
+    import pinecone
+
+    index = MagicMock()
+    client = MagicMock()
+    client.Index.return_value = index
+    monkeypatch.setattr(pinecone, "Pinecone", lambda **kwargs: client)
+    plugin = PineconePlugin(api_key="test-key", index="test-index")
+
+    await plugin.connect()
+    assert plugin.client is client
+    assert plugin.pinecone_index is index
+
+    await plugin.disconnect()
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.pinecone_index
 
 
 def test_pinecone_plugin_declares_extension_first_contract():
@@ -142,22 +170,24 @@ async def test_pinecone_write_executor_uses_existing_tool_handler():
     }
 
 
-async def test_pinecone_registry_setup_and_teardown_use_connector_lifecycle():
+async def test_pinecone_registry_setup_and_teardown_use_connector_lifecycle(
+    monkeypatch,
+):
     plugin = PineconePlugin(api_key="test-key", index="test-index")
     calls = []
 
     async def fake_connect():
         calls.append("connect")
-        plugin._client = object()
-        plugin._index = object()
+        plugin._client = MagicMock()
+        plugin._index = MagicMock()
 
     async def fake_disconnect():
         calls.append("disconnect")
         plugin._client = None
         plugin._index = None
 
-    plugin.connect = fake_connect
-    plugin.disconnect = fake_disconnect
+    monkeypatch.setattr(plugin, "connect", fake_connect)
+    monkeypatch.setattr(plugin, "disconnect", fake_disconnect)
     registry = ExtensionRegistry()
     registry.register(plugin)
 
@@ -221,3 +251,19 @@ async def test_query_includes_metadata_and_values_when_requested():
             "values": [0.1, 0.2],
         }
     ]
+
+
+async def test_query_normalizes_empty_matches():
+    plugin = make_plugin()
+    _mock_query(plugin, [])
+
+    assert await plugin.query([0.1] * 4) == []
+
+
+async def test_upsert_defaults_absent_count_to_input_size():
+    plugin = make_plugin()
+    plugin._index.upsert = MagicMock(return_value={})
+
+    result = await plugin.upsert(["doc-1"], [[0.1, 0.2]])
+
+    assert result["upserted_count"] == 1

@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import MagicMock
 
+from daita.core.exceptions import ValidationError
 from daita.plugins import ExtensionRegistry
 from daita.plugins.chroma import ChromaPlugin
 from daita.runtime import AccessMode, Operation, RiskLevel, Task
@@ -36,6 +37,33 @@ def _operation_and_task(capability, input_payload):
 
 def _mock_query(plugin, result):
     plugin._collection.query = MagicMock(return_value=result)
+
+
+def test_chroma_access_requires_connection():
+    plugin = ChromaPlugin(collection="test_col")
+
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.client
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.collection
+
+
+async def test_chroma_access_tracks_connection_lifecycle(monkeypatch):
+    import chromadb
+
+    collection = MagicMock()
+    client = MagicMock()
+    client.get_or_create_collection.return_value = collection
+    monkeypatch.setattr(chromadb, "Client", lambda: client)
+    plugin = ChromaPlugin(collection="test_col")
+
+    await plugin.connect()
+    assert plugin.client is client
+    assert plugin.collection is collection
+
+    await plugin.disconnect()
+    with pytest.raises(ValidationError, match="not connected"):
+        _ = plugin.collection
 
 
 def test_chroma_plugin_declares_extension_first_contract():
@@ -140,22 +168,22 @@ async def test_chroma_write_executor_uses_existing_tool_handler():
     }
 
 
-async def test_chroma_registry_setup_and_teardown_use_connector_lifecycle():
+async def test_chroma_registry_setup_and_teardown_use_connector_lifecycle(monkeypatch):
     plugin = ChromaPlugin(collection="test_col")
     calls = []
 
     async def fake_connect():
         calls.append("connect")
-        plugin._client = object()
-        plugin._collection = object()
+        plugin._client = MagicMock()
+        plugin._collection = MagicMock()
 
     async def fake_disconnect():
         calls.append("disconnect")
         plugin._client = None
         plugin._collection = None
 
-    plugin.connect = fake_connect
-    plugin.disconnect = fake_disconnect
+    monkeypatch.setattr(plugin, "connect", fake_connect)
+    monkeypatch.setattr(plugin, "disconnect", fake_disconnect)
     registry = ExtensionRegistry()
     registry.register(plugin)
 
@@ -218,3 +246,17 @@ async def test_query_includes_document_and_metadata():
             "document": "hello",
         }
     ]
+
+
+async def test_query_normalizes_absent_optional_result_fields():
+    plugin = make_plugin()
+    _mock_query(plugin, {"ids": [[]]})
+
+    assert await plugin.query([0.1] * 4) == []
+
+
+async def test_fetch_normalizes_absent_optional_result_fields():
+    plugin = make_plugin()
+    plugin._collection.get = MagicMock(return_value={"ids": ["doc-1"]})
+
+    assert await plugin.fetch(["doc-1"]) == [{"id": "doc-1"}]

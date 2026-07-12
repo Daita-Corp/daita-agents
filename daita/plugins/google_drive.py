@@ -7,13 +7,25 @@ Read, search, and organize files across Google Drive with automatic format detec
 import asyncio
 import csv
 import functools
+import importlib
 import io
 import json
 import logging
 import mimetypes
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    TYPE_CHECKING,
+    TypeGuard,
+    TypedDict,
+    TypeVar,
+)
 
 from .base import ConnectorPlugin, PluginContext
 from .google_drive_extensions import (
@@ -33,6 +45,8 @@ from ..core.exceptions import (
 )
 
 if TYPE_CHECKING:
+    from googleapiclient.http import HttpRequest
+
     from ..core.tools import LocalTool
 
 logger = logging.getLogger(__name__)
@@ -75,6 +89,89 @@ _EXPORT_MAP = {
         ".pptx",
     ),
 }
+
+
+class _DriveUser(TypedDict, total=False):
+    displayName: str
+    emailAddress: str
+
+
+class _DriveFile(TypedDict, total=False):
+    id: str
+    name: str
+    mimeType: str
+    size: str
+    modifiedTime: str
+    createdTime: str
+    parents: List[str]
+    owners: List[_DriveUser]
+    webViewLink: str
+    description: str
+    starred: bool
+    trashed: bool
+    lastModifyingUser: _DriveUser
+
+
+class _DriveFileList(TypedDict, total=False):
+    files: List[_DriveFile]
+    nextPageToken: str
+
+
+_ResponseT = TypeVar("_ResponseT", covariant=True)
+
+
+class _DriveRequest(Protocol[_ResponseT]):
+    def execute(self) -> _ResponseT: ...
+
+
+class _DriveFilesResource(Protocol):
+    def list(
+        self,
+        *,
+        q: str,
+        pageSize: int,
+        fields: str,
+        pageToken: Optional[str] = None,
+    ) -> _DriveRequest[_DriveFileList]: ...
+
+    def get(self, *, fileId: str, fields: str) -> _DriveRequest[_DriveFile]: ...
+
+    def export(self, *, fileId: str, mimeType: str) -> _DriveRequest[bytes]: ...
+
+    def get_media(self, *, fileId: str) -> "HttpRequest": ...
+
+    def create(
+        self,
+        *,
+        body: _DriveFile,
+        media_body: object,
+        fields: str,
+    ) -> _DriveRequest[_DriveFile]: ...
+
+    def update(
+        self,
+        *,
+        fileId: str,
+        body: _DriveFile,
+        addParents: str,
+        removeParents: str,
+        fields: str,
+    ) -> _DriveRequest[_DriveFile]: ...
+
+    def copy(
+        self, *, fileId: str, body: _DriveFile, fields: str
+    ) -> _DriveRequest[_DriveFile]: ...
+
+    def delete(self, *, fileId: str) -> _DriveRequest[object]: ...
+
+
+class _DriveService(Protocol):
+    def files(self) -> _DriveFilesResource: ...
+
+
+def _is_drive_service(value: object) -> TypeGuard[_DriveService]:
+    """Verify the one dynamic method exposed by Google's generated service."""
+    return callable(getattr(value, "files", None))
 
 
 class GoogleDrivePlugin(ConnectorPlugin):
@@ -130,7 +227,7 @@ class GoogleDrivePlugin(ConnectorPlugin):
         else:
             self.scopes = _DEFAULT_SCOPES if read_only else _WRITE_SCOPES
 
-        self._service = None
+        self._service: Optional[object] = None
         self._executor = GoogleDriveExecutor(self)
         self._connect_lock = asyncio.Lock()
 
@@ -139,6 +236,21 @@ class GoogleDrivePlugin(ConnectorPlugin):
     @property
     def is_connected(self) -> bool:
         return self._service is not None
+
+    @property
+    def service(self) -> _DriveService:
+        """Return the connected Drive service."""
+        service = self._service
+        if service is None:
+            raise PluginError(
+                "Google Drive is not connected", plugin_name="GoogleDrive"
+            )
+        if not _is_drive_service(service):
+            raise PluginError(
+                "Google Drive client has an invalid service interface",
+                plugin_name="GoogleDrive",
+            )
+        return service
 
     async def setup(self, context: PluginContext) -> None:
         """Set up the Google Drive connector for a runtime."""
@@ -238,18 +350,17 @@ class GoogleDrivePlugin(ConnectorPlugin):
                 from googleapiclient.discovery import build
 
                 creds = await self._resolve_credentials()
-                self._service = build(
-                    "drive", "v3", credentials=creds, cache_discovery=False
-                )
+                service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
                 # Verify connectivity with a minimal API call
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None,
-                    lambda: self._service.files()
+                    lambda: service.files()
                     .list(pageSize=1, fields="files(id)")
                     .execute(),
                 )
+                self._service = service
                 logger.info("Connected to Google Drive")
 
             except ImportError as e:
@@ -287,15 +398,31 @@ class GoogleDrivePlugin(ConnectorPlugin):
 
         # Application Default Credentials
         from google.auth import default as gauth_default
+        from google.auth.exceptions import DefaultCredentialsError
 
-        creds, _ = gauth_default(scopes=self.scopes)
-        return creds
+        try:
+            creds, _ = gauth_default(scopes=self.scopes)
+            return creds
+        except DefaultCredentialsError as error:
+            raise AuthenticationError(
+                "Google Drive credentials were not found. Configure Application "
+                "Default Credentials, credentials_path, or credentials.",
+                provider="Google Drive",
+            ) from error
 
     async def _oauth_flow(self) -> Any:
         """Run OAuth installed app flow or load cached token."""
         from google.oauth2.credentials import Credentials as OAuthCredentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
         from google.auth.transport.requests import Request
+
+        flow_module = importlib.import_module("google_auth_oauthlib.flow")
+        flow_class: object = getattr(flow_module, "InstalledAppFlow", None)
+        from_client_secrets_file = getattr(flow_class, "from_client_secrets_file", None)
+        if not callable(from_client_secrets_file):
+            raise ImportError(
+                "google-auth-oauthlib is required. Install with: "
+                "pip install 'daita-agents[google-drive]'"
+            )
 
         creds = None
         if os.path.exists(self.token_path):
@@ -307,14 +434,36 @@ class GoogleDrivePlugin(ConnectorPlugin):
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
             else:
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    self.credentials_path, self.scopes
-                )
-                creds = flow.run_local_server(port=0)
+                credentials_path = self.credentials_path
+                if not credentials_path:
+                    raise AuthenticationError(
+                        "Google Drive OAuth requires credentials_path",
+                        provider="Google Drive",
+                    )
+                flow = from_client_secrets_file(credentials_path, self.scopes)
+                run_local_server = getattr(flow, "run_local_server", None)
+                if not callable(run_local_server):
+                    raise PluginError(
+                        "Google OAuth flow has an invalid interface",
+                        plugin_name="GoogleDrive",
+                    )
+                creds = run_local_server(port=0)
 
             os.makedirs(os.path.dirname(self.token_path), exist_ok=True)
+            to_json = getattr(creds, "to_json", None)
+            if not callable(to_json):
+                raise PluginError(
+                    "Google OAuth credentials have an invalid interface",
+                    plugin_name="GoogleDrive",
+                )
+            token_json = to_json()
+            if not isinstance(token_json, str):
+                raise PluginError(
+                    "Google OAuth credentials returned an invalid token payload",
+                    plugin_name="GoogleDrive",
+                )
             with open(self.token_path, "w") as f:
-                f.write(creds.to_json())
+                f.write(token_json)
 
         return creds
 
@@ -330,24 +479,28 @@ class GoogleDrivePlugin(ConnectorPlugin):
 
     def _sync_files_list(
         self, query: str, page_size: int, fields: str, page_token: Optional[str]
-    ) -> dict:
-        kwargs: Dict[str, Any] = {"q": query, "pageSize": page_size, "fields": fields}
-        if page_token:
-            kwargs["pageToken"] = page_token
-        return self._service.files().list(**kwargs).execute()
+    ) -> _DriveFileList:
+        return (
+            self.service.files()
+            .list(
+                q=query,
+                pageSize=page_size,
+                fields=fields,
+                pageToken=page_token,
+            )
+            .execute()
+        )
 
-    def _sync_files_get(self, file_id: str, fields: str) -> dict:
-        return self._service.files().get(fileId=file_id, fields=fields).execute()
+    def _sync_files_get(self, file_id: str, fields: str) -> _DriveFile:
+        return self.service.files().get(fileId=file_id, fields=fields).execute()
 
     def _sync_files_export(self, file_id: str, mime_type: str) -> bytes:
-        return (
-            self._service.files().export(fileId=file_id, mimeType=mime_type).execute()
-        )
+        return self.service.files().export(fileId=file_id, mimeType=mime_type).execute()
 
     def _sync_files_download(self, file_id: str) -> bytes:
         from googleapiclient.http import MediaIoBaseDownload
 
-        request = self._service.files().get_media(fileId=file_id)
+        request = self.service.files().get_media(fileId=file_id)
         buf = io.BytesIO()
         downloader = MediaIoBaseDownload(buf, request)
         done = False
@@ -355,18 +508,24 @@ class GoogleDrivePlugin(ConnectorPlugin):
             _, done = downloader.next_chunk()
         return buf.getvalue()
 
-    def _sync_files_create(self, metadata: dict, media_body: Any) -> dict:
+    def _sync_files_create(
+        self, metadata: _DriveFile, media_body: object
+    ) -> _DriveFile:
         return (
-            self._service.files()
+            self.service.files()
             .create(body=metadata, media_body=media_body, fields=_FILE_FIELDS)
             .execute()
         )
 
     def _sync_files_update(
-        self, file_id: str, metadata: dict, add_parents: str, remove_parents: str
-    ) -> dict:
+        self,
+        file_id: str,
+        metadata: _DriveFile,
+        add_parents: str,
+        remove_parents: str,
+    ) -> _DriveFile:
         return (
-            self._service.files()
+            self.service.files()
             .update(
                 fileId=file_id,
                 body=metadata,
@@ -377,15 +536,15 @@ class GoogleDrivePlugin(ConnectorPlugin):
             .execute()
         )
 
-    def _sync_files_copy(self, file_id: str, metadata: dict) -> dict:
+    def _sync_files_copy(self, file_id: str, metadata: _DriveFile) -> _DriveFile:
         return (
-            self._service.files()
+            self.service.files()
             .copy(fileId=file_id, body=metadata, fields=_FILE_FIELDS)
             .execute()
         )
 
     def _sync_files_delete(self, file_id: str) -> None:
-        self._service.files().delete(fileId=file_id).execute()
+        self.service.files().delete(fileId=file_id).execute()
 
     # ---------------------------------------------------------------------------
     # Core operations
@@ -602,7 +761,7 @@ class GoogleDrivePlugin(ConnectorPlugin):
             from googleapiclient.http import MediaFileUpload
 
             file_name = name or Path(local_path).name
-            metadata: Dict[str, Any] = {"name": file_name}
+            metadata: _DriveFile = {"name": file_name}
             if folder_id:
                 metadata["parents"] = [folder_id]
 
@@ -649,7 +808,7 @@ class GoogleDrivePlugin(ConnectorPlugin):
             loop = asyncio.get_running_loop()
 
             if action == "copy":
-                metadata: Dict[str, Any] = {}
+                metadata: _DriveFile = {}
                 if new_name:
                     metadata["name"] = new_name
                 if dest_folder_id:
@@ -844,6 +1003,9 @@ class GoogleDrivePlugin(ConnectorPlugin):
         wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
         ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
 
+        if ws is None:
+            return self._wrap_rows([], name, "xlsx")
+
         rows = []
         headers: Optional[List[str]] = None
         for row in ws.iter_rows(values_only=True):
@@ -906,7 +1068,7 @@ class GoogleDrivePlugin(ConnectorPlugin):
     # Formatting helpers
     # ---------------------------------------------------------------------------
 
-    def _format_file(self, f: dict) -> Dict[str, Any]:
+    def _format_file(self, f: _DriveFile) -> Dict[str, Any]:
         """Full metadata for single-file results (upload, organize)."""
         return {
             "id": f.get("id"),
@@ -919,7 +1081,7 @@ class GoogleDrivePlugin(ConnectorPlugin):
             "web_link": f.get("webViewLink"),
         }
 
-    def _format_file_slim(self, f: dict) -> Dict[str, Any]:
+    def _format_file_slim(self, f: _DriveFile) -> Dict[str, Any]:
         """Minimal fields for list/search results — keeps token cost low."""
         return {
             "id": f.get("id"),
@@ -928,7 +1090,7 @@ class GoogleDrivePlugin(ConnectorPlugin):
             "modified": f.get("modifiedTime"),
         }
 
-    def _format_file_list(self, files: List[dict]) -> List[Dict[str, Any]]:
+    def _format_file_list(self, files: Sequence[_DriveFile]) -> List[Dict[str, Any]]:
         return [self._format_file_slim(f) for f in files]
 
     def _friendly_type(self, mime_type: str) -> str:
