@@ -169,13 +169,6 @@ async def _handle_graph_shortest_path(
 # ---------------------------------------------------------------------------
 
 
-_GRAPH_TOOL_DEFAULTS = {
-    "category": "graph",
-    "source": "core",
-    "plugin_name": "GraphQuery",
-}
-
-
 def build_graph_tools(
     backend: "GraphBackend",
     default_edge_types: Optional[Iterable[EdgeType]] = None,
@@ -235,7 +228,9 @@ def build_graph_tools(
                 b, d, args
             ),
             timeout_seconds=60,
-            **_GRAPH_TOOL_DEFAULTS,
+            category="graph",
+            source="core",
+            plugin_name="GraphQuery",
         ),
         LocalTool(
             name="graph_shortest_path",
@@ -274,7 +269,9 @@ def build_graph_tools(
                 b, d, args
             ),
             timeout_seconds=60,
-            **_GRAPH_TOOL_DEFAULTS,
+            category="graph",
+            source="core",
+            plugin_name="GraphQuery",
         ),
     ]
 

@@ -9,6 +9,7 @@ implementation.
 
 from __future__ import annotations
 
+from inspect import isawaitable
 from os import PathLike
 from typing import TYPE_CHECKING, Iterable, Optional, Protocol
 
@@ -17,6 +18,8 @@ from .graph_models import MemoryEdgeType, MemoryGraphEdge, MemoryGraphNode
 
 if TYPE_CHECKING:
     import networkx as nx
+
+    from ...core.graph.backend import GraphBackend
 
 
 class MemoryGraphStore(Protocol):
@@ -42,7 +45,7 @@ class GraphBackendMemoryGraphStore:
 
     def __init__(
         self,
-        backend: object | None = None,
+        backend: "GraphBackend | None" = None,
         storage_dir: str | PathLike[str] | None = None,
         graph_type: str = "memory",
     ):
@@ -58,6 +61,8 @@ class GraphBackendMemoryGraphStore:
                     graph_type=graph_type,
                     storage_dir=storage_dir,
                 )
+        if backend is None:
+            raise RuntimeError("Memory graph backend configuration failed")
         self.backend = backend
 
     async def add_node(self, node: MemoryGraphNode) -> None:
@@ -70,7 +75,7 @@ class GraphBackendMemoryGraphStore:
         raw_node = await self.backend.get_node(node_id)
         if raw_node is None:
             return None
-        raw = raw_node.model_dump() if hasattr(raw_node, "model_dump") else raw_node
+        raw = raw_node.model_dump()
         if not raw or not raw.get("node_type"):
             return None
         return MemoryGraphNode(**raw)
@@ -90,5 +95,8 @@ class GraphBackendMemoryGraphStore:
         )
 
     async def flush(self) -> None:
-        if hasattr(self.backend, "flush"):
-            await self.backend.flush()
+        flush = getattr(self.backend, "flush", None)
+        if callable(flush):
+            result = flush()
+            if isawaitable(result):
+                await result

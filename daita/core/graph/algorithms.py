@@ -29,7 +29,7 @@ from typing import (
 if TYPE_CHECKING:
     import networkx as nx
 
-    from .backend import GraphBackend
+    from .backend import GraphBackend, GraphEdgeType
     from .models import AgentGraphEdge, AgentGraphNode
 
 from .models import EdgeType
@@ -86,7 +86,7 @@ def _filter_by_edge_types(
         edge_type = data.get("data", {}).get("edge_type")
         if edge_type in wanted:
             keep.append((u, v, key))
-    return graph.edge_subgraph(keep)
+    return getattr(graph, "edge_subgraph")(keep)
 
 
 def traverse(
@@ -358,7 +358,7 @@ async def default_subgraph(
     backend: "GraphBackend",
     root: str,
     direction: str = "both",
-    edge_types: Optional[Iterable[EdgeType | str]] = None,
+    edge_types: Optional[Iterable["GraphEdgeType"]] = None,
     max_depth: int = 5,
 ) -> "nx.MultiDiGraph":
     """
@@ -371,7 +371,7 @@ async def default_subgraph(
     """
     import networkx as nx
 
-    g = nx.MultiDiGraph()
+    g: nx.MultiDiGraph = nx.MultiDiGraph()
     frontier: Set[str] = {root}
     visited: Set[str] = set()
 

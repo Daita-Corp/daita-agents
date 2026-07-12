@@ -71,7 +71,7 @@ def validate_openapi_url(url: str) -> Optional[str]:
 
     for addr_info in addr_infos:
         # Strip IPv6 zone ID (e.g. "fe80::1%eth0" -> "fe80::1")
-        ip_str = addr_info[4][0].split("%")[0]
+        ip_str = str(addr_info[4][0]).split("%")[0]
         try:
             ip = ipaddress.ip_address(ip_str)
         except ValueError:

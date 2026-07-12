@@ -490,7 +490,7 @@ class CatalogPlugin(DomainServicePlugin):
 
         all_stores: List[DiscoveredStore] = []
         for item in raw_results:
-            if isinstance(item, Exception):
+            if isinstance(item, BaseException):
                 result.errors.append(
                     DiscoveryError(
                         discoverer_name="unknown",
@@ -895,6 +895,9 @@ class CatalogPlugin(DomainServicePlugin):
         )
 
         if errors or not sources or not targets:
+            error_payload: list[object] = list(errors)
+            if not error_payload:
+                error_payload.append("from_assets and to_assets are required")
             return {
                 "success": False,
                 "store_id": store_id,
@@ -903,14 +906,16 @@ class CatalogPlugin(DomainServicePlugin):
                 "max_hops": max_hops,
                 "path_count": 0,
                 "reachable": False,
-                "errors": errors or ["from_assets and to_assets are required"],
+                "errors": error_payload,
             }
 
         adjacency = _relationship_adjacency(schema, relationship_types)
         target_set = set(targets)
-        paths = []
+        paths: List[Dict[str, object]] = []
         for source in sources:
-            queue = deque([(source, [source], [])])
+            queue: deque[tuple[str, List[str], List[Dict[str, object]]]] = deque(
+                [(source, [source], [])]
+            )
             while queue and len(paths) < max_paths:
                 current, assets, relationships = queue.popleft()
                 if current in target_set and relationships:
@@ -1007,7 +1012,7 @@ class CatalogPlugin(DomainServicePlugin):
         table_filter = {str(item).lower() for item in tables or []}
         column_filter = {str(item).lower() for item in columns or []}
 
-        matches = []
+        matches: List[Dict[str, object]] = []
         for ref, profile in _column_value_profiles(schema).items():
             profile = _profile_with_freshness(
                 profile,
@@ -1053,7 +1058,9 @@ class CatalogPlugin(DomainServicePlugin):
                 }
             )
 
-        matches.sort(key=lambda item: (-item["score"], item["profile_ref"]))
+        matches.sort(
+            key=lambda item: (-float(str(item["score"])), str(item["profile_ref"]))
+        )
         return {
             "success": True,
             "store_id": store_id,
@@ -1459,7 +1466,7 @@ class CatalogPlugin(DomainServicePlugin):
         schema = self.get_schema(store_id)
         if schema is None:
             return None
-        return schema.to_dict() if hasattr(schema, "to_dict") else dict(schema)
+        return schema.to_dict()
 
     @staticmethod
     def _missing_schema_response(store_id: str) -> Dict[str, Any]:
@@ -1717,7 +1724,8 @@ def _profile_with_freshness(
         if isinstance(metadata, dict) and metadata.get("profile_key")
         else None
     )
-    policy = profile.get("policy") if isinstance(profile.get("policy"), dict) else {}
+    raw_policy = profile.get("policy")
+    policy = raw_policy if isinstance(raw_policy, dict) else {}
     profile_key = str(policy.get("profile_key")) if policy.get("profile_key") else None
     if schema_profile_key and profile_key and profile_key != schema_profile_key:
         return {
@@ -2554,15 +2562,17 @@ def _matches_field_pattern(field: Dict[str, Any], pattern: Optional[str]) -> boo
 
 def _query_tokens(query: str) -> List[str]:
     raw_tokens = re.findall(r"[a-zA-Z0-9_]+", (query or "").lower())
-    tokens = []
+    tokens: List[str] = []
     for raw in raw_tokens:
         tokens.extend(_split_identifier(raw))
-    seen = set()
-    return [
-        token
-        for token in tokens
-        if len(token) > 1 and token not in seen and not seen.add(token)
-    ]
+    seen: set[str] = set()
+    unique: List[str] = []
+    for token in tokens:
+        if len(token) <= 1 or token in seen:
+            continue
+        seen.add(token)
+        unique.append(token)
+    return unique
 
 
 def _split_identifier(value: str) -> List[str]:
@@ -2574,8 +2584,14 @@ def _short_name(value: str) -> str:
 
 
 def _unique_preserving_order(values: Iterable[str]) -> List[str]:
-    seen = set()
-    return [value for value in values if value not in seen and not seen.add(value)]
+    seen: set[str] = set()
+    unique: List[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
 
 
 def _clamp_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:

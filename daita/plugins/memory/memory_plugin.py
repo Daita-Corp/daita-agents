@@ -23,6 +23,7 @@ from .extensions import (
 if TYPE_CHECKING:
     from ...embeddings.base import BaseEmbeddingProvider
     from .graph_store import MemoryGraphStore
+    from .local_backend import LocalMemoryBackend
 
 logger = logging.getLogger(__name__)
 
@@ -121,12 +122,14 @@ def _db_semantic_result_allowed(
     *,
     source_identity: str | None,
 ) -> bool:
-    metadata = result.get("metadata") or {}
+    raw_metadata = result.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     record = metadata.get("db_memory")
     if not isinstance(record, dict):
         return False
+    raw_record_metadata = record.get("metadata")
     record_metadata = (
-        record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        raw_record_metadata if isinstance(raw_record_metadata, dict) else {}
     )
     record_source = record.get("source_identity") or record_metadata.get(
         "source_identity"
@@ -304,10 +307,10 @@ class MemoryPlugin(DomainServicePlugin):
         self.db_memory_mode = bool(db_memory_mode)
         self.db_memory_retrieval_mode = str(db_memory_retrieval_mode or "structured")
 
-        self._agent_id = None
-        self.backend = None
+        self._agent_id: str | None = None
+        self.backend: LocalMemoryBackend | None = None
         self.curator = None
-        self.environment = None
+        self.environment: str | None = None
         self._curation_llm = None
         self._reranker = None
         self._fact_extractor = None
@@ -464,6 +467,10 @@ class MemoryPlugin(DomainServicePlugin):
             )
             self.environment = "local"
 
+        backend = self.backend
+        if backend is None:
+            raise RuntimeError("Memory backend configuration did not produce a backend")
+
         curator_module = os.getenv("DAITA_MEMORY_CURATOR_MODULE")
         curator_class_name = os.getenv("DAITA_MEMORY_CURATOR_CLASS")
         if curator_module and curator_class_name:
@@ -472,7 +479,7 @@ class MemoryPlugin(DomainServicePlugin):
             mod = importlib.import_module(curator_module)
             CuratorClass = getattr(mod, curator_class_name)
             self.curator = CuratorClass(
-                backend=self.backend,
+                backend=backend,
                 agent_id=agent_id,
                 llm_provider=self.curation_provider,
                 llm_model=self.curation_model,
@@ -485,7 +492,7 @@ class MemoryPlugin(DomainServicePlugin):
             scope_label = f"{self.scope}-scoped"
             workspace_label = "shared" if self.workspace else "isolated"
             print(f"Memory: {scope_label}, {workspace_label} workspace='{workspace}'")
-            print(f"  Location: {self.backend.workspace_dir}")
+            print(f"  Location: {backend.workspace_dir}")
 
         if self.auto_curate != "manual" and self.curator is not None:
             print(
@@ -524,12 +531,12 @@ class MemoryPlugin(DomainServicePlugin):
         # Contradiction checking belongs to the generic vector lane. The
         # structured DB lane validates DB records before storage and should not
         # construct an LLM solely to support unused generic memory behavior.
-        if getattr(self.backend, "embedding_available", True):
+        if getattr(backend, "embedding_available", True):
             from .contradiction import ContradictionChecker
 
             self._checker = ContradictionChecker(
                 llm=self._ensure_curation_llm(),
-                recall_fn=self.backend.recall,
+                recall_fn=backend.recall,
                 importance_threshold=0.7,
             )
         else:
@@ -541,9 +548,14 @@ class MemoryPlugin(DomainServicePlugin):
 
         graph_storage_dir = None
         graph_type = self._memory_graph_type or "memory"
+        backend = self.backend
 
-        if self.environment == "local" and hasattr(self.backend, "workspace_dir"):
-            graph_storage_dir = self.backend.workspace_dir / "graph"
+        if (
+            self.environment == "local"
+            and backend is not None
+            and hasattr(backend, "workspace_dir")
+        ):
+            graph_storage_dir = backend.workspace_dir / "graph"
         elif self.environment == "cloud" and self._memory_graph_type is None:
             graph_type = _memory_graph_type(
                 self.scope,
@@ -601,16 +613,20 @@ class MemoryPlugin(DomainServicePlugin):
                 },
             }
 
+        backend = self.backend
+        if backend is None:
+            raise RuntimeError("MemoryPlugin must be set up before recall")
+
         limit = int(args.get("limit") or 5)
         score_threshold = float(args.get("score_threshold", 0.45))
         source_identity = args.get("source_identity") or (
             self.workspace if self.db_memory_mode else None
         )
         diagnostics = {
-            "backend": _backend_name(self.backend, self.environment),
+            "backend": _backend_name(backend, self.environment),
             "retrieval_mode": retrieval_mode,
             "embedding_available": self.embedding_available,
-            "structured_index": _declared_attr(self.backend, "structured_index", None),
+            "structured_index": _declared_attr(backend, "structured_index", None),
             "structured_candidate_count": 0,
             "embedding_candidate_count": 0,
             "fallback": None,
@@ -618,7 +634,7 @@ class MemoryPlugin(DomainServicePlugin):
 
         structured_results = []
         if retrieval_mode in {"structured", "hybrid"}:
-            recall_db_records = _declared_method(self.backend, "recall_db_records")
+            recall_db_records = _declared_method(backend, "recall_db_records")
             if recall_db_records is not None:
                 structured_results = await recall_db_records(
                     query,
@@ -644,7 +660,7 @@ class MemoryPlugin(DomainServicePlugin):
                     }
             else:
                 try:
-                    embedding_results = await self.backend.recall(
+                    embedding_results = await backend.recall(
                         query=query,
                         limit=limit,
                         score_threshold=score_threshold,
@@ -734,24 +750,25 @@ class MemoryPlugin(DomainServicePlugin):
 
     async def _render_relevant_context(self, prompt: str) -> Optional[str]:
         """Render relevant memories for runtime context providers."""
-        if self.backend is None:
+        backend = self.backend
+        if backend is None:
             return None
 
         # Prune expired memories at session start
-        if hasattr(self.backend, "prune"):
+        if hasattr(backend, "prune"):
             try:
-                await self.backend.prune()
+                await backend.prune()
             except Exception:
                 pass
 
         try:
-            results = await self.backend.recall(
+            results = await backend.recall(
                 prompt, limit=10, score_threshold=0.55, reranker=self._reranker
             )
 
             # Fallback: no semantic matches — inject top-3 by importance
             if not results:
-                all_results = await self.backend.recall(
+                all_results = await backend.recall(
                     prompt, limit=10, score_threshold=0.0
                 )
                 results = sorted(
@@ -763,7 +780,7 @@ class MemoryPlugin(DomainServicePlugin):
                 # Always surface top-3 high-importance facts (importance >= 0.8),
                 # deduplicated against the semantic results already in the list.
                 seen = {r["chunk_id"] for r in results if r.get("chunk_id")}
-                top_important = await self.backend.recall(
+                top_important = await backend.recall(
                     prompt, limit=10, score_threshold=0.0, min_importance=0.8
                 )
                 for r in sorted(
@@ -784,7 +801,7 @@ class MemoryPlugin(DomainServicePlugin):
             # facts that must be visible regardless of semantic similarity.
             seen = {r.get("chunk_id") for r in results if r.get("chunk_id")}
             try:
-                pinned = await self.backend.get_pinned_memories()
+                pinned = await backend.get_pinned_memories()
                 for p in pinned:
                     if p.get("chunk_id") not in seen:
                         results.append(p)
@@ -795,7 +812,10 @@ class MemoryPlugin(DomainServicePlugin):
             # Track access for these auto-injected memories
             chunk_ids = [r["chunk_id"] for r in results if r.get("chunk_id")]
             if chunk_ids:
-                self.backend.search.track_access(chunk_ids)
+                search = backend.search
+                if search is None:
+                    raise AttributeError("memory backend search is unavailable")
+                search.track_access(chunk_ids)
 
             lines = []
             if results:
@@ -844,14 +864,19 @@ class MemoryPlugin(DomainServicePlugin):
         """
         import asyncio
 
+        checker = self._checker
+        backend = self.backend
+        if checker is None or backend is None:
+            return
+
         sem = asyncio.Semaphore(3)
 
         async def _check_one(chunk_id: str, content: str, importance: float):
             async with sem:
                 try:
-                    conflict = await self._checker.check(content, importance)
+                    conflict = await checker.check(content, importance)
                     if conflict.status == "contradiction":
-                        await self.backend.update_chunk_metadata(
+                        await backend.update_chunk_metadata(
                             chunk_id,
                             {
                                 "_contradiction_checked": True,
@@ -866,14 +891,12 @@ class MemoryPlugin(DomainServicePlugin):
                         # deletions of unrelated memories that happen to share
                         # similar embeddings (e.g. template-identical schemas).
                         if conflict.conflicting_chunk_id:
-                            await self.backend.delete_chunks(
-                                [conflict.conflicting_chunk_id]
-                            )
-                        await self.backend.update_chunk_metadata(
+                            await backend.delete_chunks([conflict.conflicting_chunk_id])
+                        await backend.update_chunk_metadata(
                             chunk_id, {"_contradiction_checked": True}
                         )
                     else:
-                        await self.backend.update_chunk_metadata(
+                        await backend.update_chunk_metadata(
                             chunk_id, {"_contradiction_checked": True}
                         )
                 except Exception:
@@ -917,13 +940,16 @@ class MemoryPlugin(DomainServicePlugin):
             except Exception:
                 pass
 
-        if hasattr(self.backend, "flush"):
-            await _maybe_await(self.backend.flush())
+        backend = self.backend
+        flush = _declared_method(backend, "flush")
+        if flush is not None:
+            await _maybe_await(flush())
 
         # Prune expired and over-limit memories
-        if hasattr(self.backend, "prune"):
+        prune = _declared_method(backend, "prune")
+        if prune is not None:
             try:
-                await _maybe_await(self.backend.prune())
+                await _maybe_await(prune())
             except Exception:
                 pass
 
@@ -940,16 +966,22 @@ class MemoryPlugin(DomainServicePlugin):
                         msg += f" ({result.existing_memories} stored by agent)"
                     msg += f", ${result.cost_usd:.4f}"
                     print(msg)
-            elif hasattr(self.backend, "regenerate_memory_md"):
-                path = await _maybe_await(self.backend.regenerate_memory_md())
+            else:
+                regenerate_memory_md = _declared_method(backend, "regenerate_memory_md")
+                path = (
+                    await _maybe_await(regenerate_memory_md())
+                    if regenerate_memory_md is not None
+                    else None
+                )
                 if path is not None:
                     print(f"Memory summary written to: {path}")
 
     def get_pending_metrics(self) -> dict:
         if self.backend is None:
             return {"memory_count_delta": 0, "memory_retrieval_count": 0}
-        if hasattr(self.backend, "get_pending_metrics"):
-            return self.backend.get_pending_metrics()
+        get_pending_metrics = _declared_method(self.backend, "get_pending_metrics")
+        if get_pending_metrics is not None:
+            return get_pending_metrics()
         return {
             "memory_count_delta": 0,
             "memory_retrieval_count": getattr(self.backend, "_retrieval_count", 0),
@@ -962,7 +994,10 @@ class MemoryPlugin(DomainServicePlugin):
         if not 0.0 <= importance <= 1.0:
             raise ValueError(f"Importance must be 0.0-1.0, got {importance}")
 
-        matches = await self.backend.recall(query, limit=100, score_threshold=0.7)
+        backend = self.backend
+        if backend is None:
+            raise RuntimeError("MemoryPlugin must be set up before updating memory")
+        matches = await backend.recall(query, limit=100, score_threshold=0.7)
         if not matches:
             return {
                 "status": "success",
@@ -974,7 +1009,7 @@ class MemoryPlugin(DomainServicePlugin):
         for match in matches:
             chunk_id = match.get("chunk_id")
             if chunk_id:
-                await self.backend.update_chunk_metadata(
+                await backend.update_chunk_metadata(
                     chunk_id,
                     {
                         "importance": importance,
@@ -995,7 +1030,10 @@ class MemoryPlugin(DomainServicePlugin):
 
     async def forget(self, query: str) -> dict:
         """Delete memories matching query."""
-        matches = await self.backend.recall(query, limit=100, score_threshold=0.7)
+        backend = self.backend
+        if backend is None:
+            raise RuntimeError("MemoryPlugin must be set up before deleting memory")
+        matches = await backend.recall(query, limit=100, score_threshold=0.7)
         if not matches:
             return {
                 "status": "success",
@@ -1004,7 +1042,7 @@ class MemoryPlugin(DomainServicePlugin):
             }
 
         chunk_ids = [m["chunk_id"] for m in matches if m.get("chunk_id")]
-        await self.backend.delete_chunks(chunk_ids)
+        await backend.delete_chunks(chunk_ids)
 
         return {
             "status": "success",

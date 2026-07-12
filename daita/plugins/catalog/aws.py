@@ -9,12 +9,15 @@ DocumentDB clusters, and Kinesis streams across configured AWS regions using bot
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional
 
 from .base_discoverer import BaseDiscoverer, DiscoveredStore
 from .discovery._apigateway import _build_invoke_url
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from boto3.session import Session
 
 _RDS_ENGINES_TO_STORE_TYPE = {
     "postgres": "postgresql",
@@ -67,8 +70,14 @@ class AWSDiscoverer(BaseDiscoverer):
         self._role_arn = role_arn
         self._profile_name = profile_name
         self._services = services or list(self._SERVICE_METHODS)
-        self._session = None
+        self._session: Optional["Session"] = None
         self._account_id: Optional[str] = None
+
+    @property
+    def session(self) -> "Session":
+        if self._session is None:
+            raise RuntimeError("AWSDiscoverer must authenticate before enumeration")
+        return self._session
 
     async def authenticate(self) -> None:
         """Set up boto3 session and resolve account ID."""
@@ -86,7 +95,7 @@ class AWSDiscoverer(BaseDiscoverer):
         self._session = boto3.Session(**kwargs)
 
         if self._role_arn:
-            sts = self._session.client("sts")
+            sts = self.session.client("sts")
             creds = sts.assume_role(
                 RoleArn=self._role_arn,
                 RoleSessionName="daita-catalog-discovery",
@@ -98,7 +107,7 @@ class AWSDiscoverer(BaseDiscoverer):
             )
 
         try:
-            sts = self._session.client("sts")
+            sts = self.session.client("sts")
             self._account_id = sts.get_caller_identity()["Account"]
         except Exception:
             self._account_id = "unknown"
@@ -165,14 +174,14 @@ class AWSDiscoverer(BaseDiscoverer):
     # ------------------------------------------------------------------
 
     async def _enumerate_rds(self, region: str) -> AsyncIterator[DiscoveredStore]:
-        client = self._session.client("rds", region_name=region)
+        client = self.session.client("rds", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
         try:
             paginator = client.get_paginator("describe_db_instances")
             for page in paginator.paginate():
                 for db in page["DBInstances"]:
-                    engine = db.get("Engine", "unknown")
+                    engine = str(db.get("Engine") or "unknown")
                     identifier = db["DBInstanceIdentifier"]
                     yield self._build_store(
                         store_type=_RDS_ENGINES_TO_STORE_TYPE.get(engine, engine),
@@ -202,7 +211,7 @@ class AWSDiscoverer(BaseDiscoverer):
             logger.warning("RDS enumeration failed in %s: %s", region, exc)
 
     async def _enumerate_dynamodb(self, region: str) -> AsyncIterator[DiscoveredStore]:
-        client = self._session.client("dynamodb", region_name=region)
+        client = self.session.client("dynamodb", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -239,7 +248,7 @@ class AWSDiscoverer(BaseDiscoverer):
         if region != self._regions[0]:
             return  # S3 is global, only enumerate once
 
-        client = self._session.client("s3", region_name=region)
+        client = self.session.client("s3", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -269,7 +278,7 @@ class AWSDiscoverer(BaseDiscoverer):
     async def _enumerate_elasticache(
         self, region: str
     ) -> AsyncIterator[DiscoveredStore]:
-        client = self._session.client("elasticache", region_name=region)
+        client = self.session.client("elasticache", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -302,7 +311,7 @@ class AWSDiscoverer(BaseDiscoverer):
             logger.warning("ElastiCache enumeration failed in %s: %s", region, exc)
 
     async def _enumerate_redshift(self, region: str) -> AsyncIterator[DiscoveredStore]:
-        client = self._session.client("redshift", region_name=region)
+        client = self.session.client("redshift", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -340,7 +349,7 @@ class AWSDiscoverer(BaseDiscoverer):
 
         # --- REST APIs (apigateway v1) ---
         try:
-            client = self._session.client("apigateway", region_name=region)
+            client = self.session.client("apigateway", region_name=region)
             paginator = client.get_paginator("get_rest_apis")
             for page in paginator.paginate():
                 for api in page.get("items", []):
@@ -392,7 +401,7 @@ class AWSDiscoverer(BaseDiscoverer):
 
         # --- HTTP APIs (apigatewayv2) ---
         try:
-            v2_client = self._session.client("apigatewayv2", region_name=region)
+            v2_client = self.session.client("apigatewayv2", region_name=region)
             paginator = v2_client.get_paginator("get_apis")
             for page in paginator.paginate():
                 for api in page.get("Items", []):
@@ -443,7 +452,7 @@ class AWSDiscoverer(BaseDiscoverer):
             logger.warning("API Gateway HTTP enumeration failed in %s: %s", region, exc)
 
     async def _enumerate_sqs(self, region: str) -> AsyncIterator[DiscoveredStore]:
-        client = self._session.client("sqs", region_name=region)
+        client = self.session.client("sqs", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -489,7 +498,7 @@ class AWSDiscoverer(BaseDiscoverer):
             logger.warning("SQS enumeration failed in %s: %s", region, exc)
 
     async def _enumerate_sns(self, region: str) -> AsyncIterator[DiscoveredStore]:
-        client = self._session.client("sns", region_name=region)
+        client = self.session.client("sns", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -531,7 +540,7 @@ class AWSDiscoverer(BaseDiscoverer):
     async def _enumerate_opensearch(
         self, region: str
     ) -> AsyncIterator[DiscoveredStore]:
-        client = self._session.client("opensearch", region_name=region)
+        client = self.session.client("opensearch", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -584,7 +593,7 @@ class AWSDiscoverer(BaseDiscoverer):
     async def _enumerate_documentdb(
         self, region: str
     ) -> AsyncIterator[DiscoveredStore]:
-        client = self._session.client("docdb", region_name=region)
+        client = self.session.client("docdb", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -618,7 +627,7 @@ class AWSDiscoverer(BaseDiscoverer):
             logger.warning("DocumentDB enumeration failed in %s: %s", region, exc)
 
     async def _enumerate_kinesis(self, region: str) -> AsyncIterator[DiscoveredStore]:
-        client = self._session.client("kinesis", region_name=region)
+        client = self.session.client("kinesis", region_name=region)
         now = datetime.now(timezone.utc).isoformat()
 
         try:

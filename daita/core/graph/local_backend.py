@@ -286,9 +286,10 @@ class LocalGraphBackend:
                 return
 
             disk_graph = self._read_from_disk()
+            graph = self._load()
 
             # Merge in-memory nodes into the disk state
-            for node_id, node_data in self._graph.nodes(data=True):
+            for node_id, node_data in graph.nodes(data=True):
                 if node_id in disk_graph:
                     existing = disk_graph.nodes[node_id].get("data", {})
                     incoming = dict(node_data.get("data", {}))
@@ -305,7 +306,7 @@ class LocalGraphBackend:
                     disk_graph.add_node(node_id, **node_data)
 
             # Merge in-memory edges into the disk state
-            for u, v, key, edge_data in self._graph.edges(keys=True, data=True):
+            for u, v, key, edge_data in graph.edges(keys=True, data=True):
                 if disk_graph.has_edge(u, v, key=key):
                     existing = disk_graph.edges[u, v, key].get("data", {})
                     incoming = dict(edge_data.get("data", {}))
@@ -418,7 +419,7 @@ class LocalGraphBackend:
                 graph.out_edges(old_id, keys=True, data=True)
             ):
                 raw = dict(edata.get("data", {}))
-                old_edge_id = raw.get("edge_id", key)
+                old_edge_id = str(raw.get("edge_id") or key)
                 new_edge_id = old_edge_id.replace(old_id, new_id, 1)
                 raw["edge_id"] = new_edge_id
                 raw["from_node_id"] = new_id
@@ -431,7 +432,7 @@ class LocalGraphBackend:
             # Rewrite inbound edges (X -> old_id) onto (X -> new_id).
             for u, _v, key, edata in list(graph.in_edges(old_id, keys=True, data=True)):
                 raw = dict(edata.get("data", {}))
-                old_edge_id = raw.get("edge_id", key)
+                old_edge_id = str(raw.get("edge_id") or key)
                 new_edge_id = old_edge_id.replace(old_id, new_id, 1)
                 raw["edge_id"] = new_edge_id
                 raw["to_node_id"] = new_id

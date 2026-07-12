@@ -32,16 +32,10 @@ def normalize_db_memory_semantic_contract(value: Any) -> dict[str, Any] | None:
     contract_kind = str(value.get("contract_kind") or "").strip()
     if contract_kind not in DB_MEMORY_CONTRACT_KINDS:
         raise ValueError(f"unsupported semantic_contract kind {contract_kind!r}")
-    subject = value.get("subject") if isinstance(value.get("subject"), dict) else {}
-    requirements = (
-        value.get("requirements") if isinstance(value.get("requirements"), dict) else {}
-    )
-    grounding = (
-        value.get("grounding") if isinstance(value.get("grounding"), dict) else {}
-    )
-    enforcement = (
-        value.get("enforcement") if isinstance(value.get("enforcement"), dict) else {}
-    )
+    subject = _dict_value(value.get("subject"))
+    requirements = _dict_value(value.get("requirements"))
+    grounding = _dict_value(value.get("grounding"))
+    enforcement = _dict_value(value.get("enforcement"))
     normalized = {
         "version": version,
         "contract_kind": contract_kind,
@@ -55,16 +49,8 @@ def normalize_db_memory_semantic_contract(value: Any) -> dict[str, Any] | None:
             "relationships": _dict_list(requirements.get("relationships")),
             "filters": _dict_list(requirements.get("filters")),
             "aggregations": _dict_list(requirements.get("aggregations")),
-            "result_shape": (
-                dict(requirements.get("result_shape"))
-                if isinstance(requirements.get("result_shape"), dict)
-                else {}
-            ),
-            "unit_conversion": (
-                dict(requirements.get("unit_conversion"))
-                if isinstance(requirements.get("unit_conversion"), dict)
-                else {}
-            ),
+            "result_shape": _dict_value(requirements.get("result_shape")),
+            "unit_conversion": _dict_value(requirements.get("unit_conversion")),
         },
         "grounding": {
             "source_identity": grounding.get("source_identity"),
@@ -395,16 +381,8 @@ def _requirements_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "relationships": _normalize_relationships(requirements.get("relationships")),
         "filters": _dict_list(requirements.get("filters")),
         "aggregations": _dict_list(requirements.get("aggregations")),
-        "result_shape": (
-            dict(requirements.get("result_shape"))
-            if isinstance(requirements.get("result_shape"), dict)
-            else {}
-        ),
-        "unit_conversion": (
-            dict(requirements.get("unit_conversion"))
-            if isinstance(requirements.get("unit_conversion"), dict)
-            else {}
-        ),
+        "result_shape": _dict_value(requirements.get("result_shape")),
+        "unit_conversion": _dict_value(requirements.get("unit_conversion")),
     }
 
 
@@ -480,11 +458,7 @@ def _grounding(
 
 
 def _enforcement(metadata: dict[str, Any], *, min_confidence: float) -> dict[str, Any]:
-    enforcement = (
-        dict(metadata.get("enforcement"))
-        if isinstance(metadata.get("enforcement"), dict)
-        else {}
-    )
+    enforcement = _dict_value(metadata.get("enforcement"))
     return {
         "mode": str(enforcement.get("mode") or "required_when_recalled").strip(),
         "min_confidence": confidence_value(
@@ -749,6 +723,12 @@ def _dict_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, (list, tuple)):
         return []
     return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _dict_value(value: object) -> dict[object, object]:
+    if not isinstance(value, dict):
+        return {}
+    return dict(value)
 
 
 def _short_ref_key(value: Any) -> str:

@@ -24,7 +24,7 @@ async def discover_openapi(
 
     url_error = validate_openapi_url(spec_url)
     if url_error:
-        from ...core.exceptions import ValidationError
+        from ....core.exceptions import ValidationError
 
         raise ValidationError(url_error)
 

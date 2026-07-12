@@ -498,9 +498,8 @@ def db_memory_refs_from_recall_evidence(
         if used_chars + len(line) > max(0, int(char_budget)):
             _bump_omitted(diagnostics, "budget")
             continue
-        metadata = (
-            record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-        )
+        raw_metadata = record.get("metadata")
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         ref_evidence = _memory_evidence_ref_ids(metadata)
         if getattr(evidence, "id", None):
             evidence_refs.append(evidence.id)
@@ -1493,9 +1492,8 @@ def _planner_memory_omit_reason(
     kind = str(record.get("kind") or "")
     key = str(record.get("key") or "")
     text = str(record.get("text") or "")
-    metadata = (
-        record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    )
+    raw_metadata = record.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     if kind not in DB_PLANNING_MEMORY_KINDS:
         return "unsupported_kind"
     if not key or not text:
@@ -1623,9 +1621,8 @@ def _memory_relevant_to_prompt(prompt: str, record: dict[str, Any]) -> bool:
     prompt_tokens = set(meaningful_tokens(prompt))
     if not prompt_tokens:
         return True
-    metadata = (
-        record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    )
+    raw_metadata = record.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     record_text = " ".join(
         str(value)
         for value in (

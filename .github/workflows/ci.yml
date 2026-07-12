@@ -82,7 +82,7 @@ jobs:
           node-version: "22"
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,aws,azure,gcp,memory,mongodb,mysql,opensearch,postgresql]"
 
       - name: Type-check with Pyright
         # Expand this gate as the existing repository-wide Pyright backlog is resolved.
@@ -90,6 +90,7 @@ jobs:
           npx --yes pyright@1.1.411 \
             daita/core/exceptions.py \
             daita/core/tools.py \
+            daita/core/graph \
             daita/runtime/primitives.py \
             daita/runtime/kernel.py \
             daita/runtime/approvals.py \
@@ -97,7 +98,11 @@ jobs:
             daita/runtime/sqlite_store.py \
             daita/db/loop/execution.py \
             daita/db/monitor_scheduler \
+            daita/db/memory_contracts.py \
+            daita/db/memory.py \
             daita/db/runtime \
+            daita/plugins/memory \
+            daita/plugins/catalog \
             daita/agents/agent.py \
             daita/agents/chat
 
