@@ -154,6 +154,37 @@ def _board_revenue_metric_metadata() -> dict[str, Any]:
     }
 
 
+def _persistent_revenue_metric_metadata() -> dict[str, Any]:
+    return {
+        "aliases": ["persistent revenue"],
+        "schema_refs": ["orders.total", "orders.status"],
+        "subject": {
+            "type": "metric",
+            "key": "metric:persistent_revenue",
+            "aliases": ["persistent revenue"],
+        },
+        "requirements": {
+            "refs": [
+                {"kind": "column", "ref": "orders.total", "role": "measure"},
+                {"kind": "column", "ref": "orders.status", "role": "filter"},
+            ],
+            "filters": [
+                {
+                    "ref": "orders.status",
+                    "operator": "semantic_equals",
+                    "value": "complete",
+                    "value_source": "literal_or_catalog_value",
+                }
+            ],
+            "aggregations": [
+                {"function": "sum", "ref": "orders.total", "role": "measure"}
+            ],
+            "result_shape": {"grain": "single_aggregate"},
+        },
+        "enforcement": {"mode": "required_when_recalled", "min_confidence": 0.8},
+    }
+
+
 def _memory_backend(tmp_path: Path, workspace: str) -> LocalMemoryBackend:
     return LocalMemoryBackend(
         workspace=workspace,
@@ -1096,13 +1127,10 @@ async def test_live_golden_structured_memory_persists_after_restart(tmp_path):
     try:
         await _write_memory(
             first,
-            kind="business_rule",
-            key="business_rule:persistent_revenue",
+            kind="metric_definition",
+            key="metric:persistent_revenue",
             text="Persistent revenue uses complete orders only.",
-            metadata={
-                "aliases": ["persistent revenue"],
-                "schema_refs": ["orders.total", "orders.status"],
-            },
+            metadata=_persistent_revenue_metric_metadata(),
         )
     finally:
         await first.stop()
@@ -1125,12 +1153,18 @@ async def test_live_golden_structured_memory_persists_after_restart(tmp_path):
     )
 
     try:
-        result = await _run_live(second, "How should persistent revenue be calculated?")
+        result = await _run_live(
+            second,
+            "Calculate persistent revenue as one total from the database.",
+        )
         snapshot = await second.runtime.inspect_operation(result.operation_id)
     finally:
         await second.stop()
 
     assert result.status is OperationStatus.SUCCEEDED
     assert snapshot is not None
-    assert "business_rule:persistent_revenue" in _db_memory_keys(snapshot)
-    assert "complete" in _sql(snapshot).lower()
+    assert "metric:persistent_revenue" in _db_memory_keys(snapshot)
+    sql = _sql(snapshot).lower()
+    assert "complete" in sql
+    assert "sum" in sql
+    assert _rows(snapshot)

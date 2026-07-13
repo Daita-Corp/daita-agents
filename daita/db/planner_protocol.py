@@ -6,7 +6,7 @@ from abc import abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 import json
-from typing import Any, Mapping, Protocol
+from typing import Any, Iterable, Mapping, Protocol
 
 
 class DbPlannerDecisionStatus(str, Enum):
@@ -49,6 +49,34 @@ class DbPlannerActionKind(str, Enum):
     SYNTHESIZE = "synthesize"
     CLARIFY = "clarify"
     FINISH = "finish"
+
+
+_LEGACY_TERMINAL_ACTION_KINDS = frozenset(
+    {DbPlannerActionKind.CLARIFY, DbPlannerActionKind.FINISH}
+)
+_TERMINAL_DECISION_STATUSES = frozenset(
+    {
+        DbPlannerDecisionStatus.FINISH,
+        DbPlannerDecisionStatus.CLARIFY,
+        DbPlannerDecisionStatus.BLOCKED,
+        DbPlannerDecisionStatus.FAILED,
+    }
+)
+
+
+class DbPlannerDecisionShapeError(ValueError):
+    """Typed failure for one invalid planner status/action discriminator."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "type": type(self).__name__,
+            "code": self.code,
+            "message": str(self),
+        }
 
 
 @dataclass(frozen=True)
@@ -131,6 +159,233 @@ class DbPlannerDecision:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DbPlannerDecision":
         return cls(**dict(data))
+
+    @classmethod
+    def from_persisted_dict(cls, data: Mapping[str, Any]) -> "DbPlannerDecision":
+        """Read an older persisted decision and normalize terminal actions."""
+        return normalize_legacy_persisted_planner_decision(cls.from_dict(data))
+
+
+def validate_planner_decision_shape(
+    decision: DbPlannerDecision,
+) -> DbPlannerDecision:
+    """Validate the discriminated status/action contract for new decisions."""
+    terminal_actions = tuple(
+        action
+        for action in decision.actions
+        if action.kind in _LEGACY_TERMINAL_ACTION_KINDS
+    )
+    executable_actions = tuple(
+        action
+        for action in decision.actions
+        if action.kind not in _LEGACY_TERMINAL_ACTION_KINDS
+    )
+    if terminal_actions and executable_actions:
+        raise DbPlannerDecisionShapeError(
+            "terminal_action_mixed_with_executable_actions",
+            "Legacy terminal action kinds cannot be mixed with executable actions.",
+        )
+    if terminal_actions:
+        raise DbPlannerDecisionShapeError(
+            "terminal_action_kind_not_allowed",
+            "New planner output must express finish or clarify through status, not an action kind.",
+        )
+    if decision.status in _TERMINAL_DECISION_STATUSES and executable_actions:
+        raise DbPlannerDecisionShapeError(
+            "terminal_status_mixed_with_executable_actions",
+            "Executable actions require status='continue'; terminal statuses require actions=[].",
+        )
+    if (
+        decision.status is DbPlannerDecisionStatus.CLARIFY
+        and not str(decision.clarification_question or "").strip()
+    ):
+        raise DbPlannerDecisionShapeError(
+            "clarification_question_required",
+            "status='clarify' requires a non-empty clarification_question.",
+        )
+    return decision
+
+
+def normalize_legacy_persisted_planner_decision(
+    decision: DbPlannerDecision,
+) -> DbPlannerDecision:
+    """Normalize the terminal action representation used by persisted records."""
+    terminal_actions = tuple(
+        action
+        for action in decision.actions
+        if action.kind in _LEGACY_TERMINAL_ACTION_KINDS
+    )
+    executable_actions = tuple(
+        action
+        for action in decision.actions
+        if action.kind not in _LEGACY_TERMINAL_ACTION_KINDS
+    )
+    if not terminal_actions:
+        return validate_planner_decision_shape(decision)
+    if len(terminal_actions) != 1 or executable_actions:
+        raise DbPlannerDecisionShapeError(
+            "terminal_action_mixed_with_executable_actions",
+            "A persisted terminal action must be the decision's only action.",
+        )
+    terminal_status = DbPlannerDecisionStatus(terminal_actions[0].kind.value)
+    if decision.status not in {DbPlannerDecisionStatus.CONTINUE, terminal_status}:
+        raise DbPlannerDecisionShapeError(
+            "terminal_action_conflicts_with_decision_status",
+            "The persisted terminal action conflicts with the decision status.",
+        )
+    normalized = DbPlannerDecision(
+        status=terminal_status,
+        intent=decision.intent,
+        actions=(),
+        stop_conditions=decision.stop_conditions,
+        clarification_question=decision.clarification_question,
+        rationale=decision.rationale,
+        metadata=decision.metadata,
+    )
+    return validate_planner_decision_shape(normalized)
+
+
+def planner_decision_json_schema(
+    action_kinds: Iterable[DbPlannerActionKind] | None = None,
+) -> dict[str, Any]:
+    """Return the provider/fallback schema for new discriminated decisions."""
+    kinds = tuple(
+        DbPlannerActionKind(kind)
+        for kind in (
+            action_kinds
+            if action_kinds is not None
+            else (
+                kind
+                for kind in DbPlannerActionKind
+                if kind not in _LEGACY_TERMINAL_ACTION_KINDS
+            )
+        )
+    )
+    if any(kind in _LEGACY_TERMINAL_ACTION_KINDS for kind in kinds):
+        raise ValueError("New planner schemas cannot include terminal action kinds")
+    action_schema = {
+        "type": "object",
+        "description": (
+            "One executable action. Its presence requires decision status='continue'."
+        ),
+        "properties": {
+            "action_id": {
+                "type": "string",
+                "description": "A non-empty stable id unique within this decision.",
+            },
+            "kind": {"type": "string", "enum": [kind.value for kind in kinds]},
+            "input": {"type": "object"},
+            "depends_on": {"type": "array", "items": {"type": "string"}},
+            "rationale": {"type": ["string", "null"]},
+            "metadata": {"type": "object"},
+        },
+        "required": ["action_id", "kind"],
+        "additionalProperties": False,
+    }
+    decision_properties = {
+        "status": {
+            "type": "string",
+            "enum": [status.value for status in DbPlannerDecisionStatus],
+        },
+        "intent": {"type": "object"},
+        "actions": {"type": "array", "items": action_schema},
+        "stop_conditions": {"type": "array", "items": {"type": "string"}},
+        "clarification_question": {"type": ["string", "null"]},
+        "rationale": {"type": ["string", "null"]},
+        "metadata": {"type": "object"},
+    }
+    return {
+        "title": "DbPlannerDecision",
+        "description": (
+            "Discriminated DB planner decision. Executable actions require "
+            "status='continue'. finish, clarify, blocked, and failed require "
+            "actions=[]. clarify also requires a non-empty clarification_question."
+        ),
+        "type": "object",
+        "properties": {
+            "decision": {
+                "description": (
+                    "The decision discriminator. New output must use this object; "
+                    "the runtime also accepts an unwrapped object as a validated "
+                    "cross-provider fallback."
+                ),
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "description": (
+                            "Continuation decision. This is the only branch that "
+                            "permits executable actions."
+                        ),
+                        "properties": {
+                            **decision_properties,
+                            "status": {
+                                "type": "string",
+                                "enum": [DbPlannerDecisionStatus.CONTINUE.value],
+                            },
+                        },
+                        "required": ["status", "actions"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "description": (
+                            "Terminal finish, blocked, or failed decision; actions "
+                            "must be an empty array."
+                        ),
+                        "properties": {
+                            **decision_properties,
+                            "status": {
+                                "type": "string",
+                                "enum": [
+                                    DbPlannerDecisionStatus.FINISH.value,
+                                    DbPlannerDecisionStatus.BLOCKED.value,
+                                    DbPlannerDecisionStatus.FAILED.value,
+                                ],
+                            },
+                            "actions": {
+                                "type": "array",
+                                "items": action_schema,
+                                "maxItems": 0,
+                            },
+                        },
+                        "required": ["status", "actions"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "description": (
+                            "Clarification decision; actions must be empty and "
+                            "clarification_question must be a non-empty string."
+                        ),
+                        "properties": {
+                            **decision_properties,
+                            "status": {
+                                "type": "string",
+                                "enum": [DbPlannerDecisionStatus.CLARIFY.value],
+                            },
+                            "actions": {
+                                "type": "array",
+                                "items": action_schema,
+                                "maxItems": 0,
+                            },
+                            "clarification_question": {
+                                "type": "string",
+                                "description": "A required non-empty question.",
+                            },
+                        },
+                        "required": [
+                            "status",
+                            "actions",
+                            "clarification_question",
+                        ],
+                        "additionalProperties": False,
+                    },
+                ],
+            }
+        },
+        "required": ["decision"],
+        "additionalProperties": False,
+    }
 
 
 @dataclass(frozen=True)

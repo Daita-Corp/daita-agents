@@ -24,8 +24,10 @@ from ..planner_protocol import (
     DbLoopState,
     DbPlannerActionKind,
     DbPlannerDecision,
+    DbPlannerDecisionShapeError,
     DbPlannerDecisionStatus,
     DbPlannerObservation,
+    validate_planner_decision_shape,
 )
 from ..verification import db_run_finalization_check
 
@@ -163,6 +165,20 @@ class DbAgentLoop:
                     metadata={
                         "runtime_continuation": True,
                         "continuation": "memory.update.commit",
+                    },
+                )
+            try:
+                validate_planner_decision_shape(decision)
+            except DbPlannerDecisionShapeError as exc:
+                decision = DbPlannerDecision(
+                    status=DbPlannerDecisionStatus.FAILED,
+                    intent=decision.intent,
+                    stop_conditions=(exc.code,),
+                    rationale="DB planner returned an invalid decision shape.",
+                    metadata={
+                        "failure": "planner_decision_shape_invalid",
+                        "error": exc.code,
+                        "validation_error": exc.to_dict(),
                     },
                 )
             await self._persist_planner_decision(operation, decision, turn=turn)

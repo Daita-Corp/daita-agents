@@ -107,6 +107,15 @@ class BaseLLMProvider(LLMProvider, ABC):
             if getattr(self, "_client", None) is client:
                 self._client = None
 
+    def structured_output_options(
+        self,
+        schema: Dict[str, Any],
+        *,
+        name: str,
+    ) -> Dict[str, Any]:
+        """Return provider-native JSON-schema options when supported."""
+        return {}
+
     async def generate(
         self,
         messages,

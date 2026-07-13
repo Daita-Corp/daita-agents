@@ -6,14 +6,17 @@ import json
 from typing import Any
 
 from .json_normalization import strip_json_fence
-from .llm_service import DbLLMService
+from .llm_service import DbLLMService, redact_db_llm_private_diagnostic
 from .planner_protocol import (
     DbAgentPlanner,
     DbLoopState,
     DbPlannerAction,
     DbPlannerActionKind,
     DbPlannerDecision,
+    DbPlannerDecisionShapeError,
     DbPlannerDecisionStatus,
+    planner_decision_json_schema,
+    validate_planner_decision_shape,
 )
 
 _PLANNER_DECISION_KEYS = frozenset(DbPlannerDecision.__dataclass_fields__)
@@ -49,68 +52,157 @@ class DbLLMAgentPlanner(DbAgentPlanner):
                     "configuration_required": True,
                 },
             )
-        try:
-            response = await self.service.generate_json(_planner_messages(state))
-        except Exception as exc:
-            return DbPlannerDecision(
-                status=DbPlannerDecisionStatus.FAILED,
-                stop_conditions=("planner_llm_failed",),
-                rationale="DB LLM planner request failed.",
-                metadata={"failure": "planner_llm_failed", "error": str(exc)},
+        schema = _decision_schema_hint()
+        messages = _planner_messages(state)
+        attempts: list[dict[str, Any]] = []
+        for attempt_number in (1, 2):
+            try:
+                response = await self.service.generate_json(
+                    messages,
+                    response_schema=schema,
+                    schema_name="db_planner_decision",
+                )
+            except Exception as exc:
+                return DbPlannerDecision(
+                    status=DbPlannerDecisionStatus.FAILED,
+                    stop_conditions=("planner_llm_failed",),
+                    rationale="DB LLM planner request failed.",
+                    metadata={
+                        "failure": "planner_llm_failed",
+                        "error": self._redact(str(exc), max_chars=1024),
+                        "planner_private_diagnostics": self._private_diagnostics(
+                            attempts
+                        ),
+                    },
+                )
+
+            parsed, pre_normalization, diagnostics = _parse_planner_json(
+                response.content
             )
-        parsed, diagnostics = _parse_planner_json(response.content)
-        if parsed is None:
+            attempt = {
+                "attempt": attempt_number,
+                "correction_requested": attempt_number > 1,
+                "raw_model_response": self._redact(response.content, max_chars=3072),
+                "parsed_pre_normalization": (
+                    self._redact(pre_normalization, max_chars=3072)
+                    if pre_normalization is not None
+                    else None
+                ),
+                "normalization_diagnostics": self._redact(diagnostics, max_chars=2048),
+                "validation_error": None,
+            }
+            safe_normalization = self._redact(diagnostics, max_chars=2048)
+            if parsed is None:
+                attempt["validation_error"] = self._redact(
+                    {
+                        "type": "PlannerJsonValidationError",
+                        "code": diagnostics.get("error") or "planner_json_invalid",
+                        "message": diagnostics.get("message")
+                        or "Planner response was not a JSON object.",
+                    },
+                    max_chars=1024,
+                )
+                attempts.append(attempt)
+                return DbPlannerDecision(
+                    status=DbPlannerDecisionStatus.FAILED,
+                    stop_conditions=("planner_json_invalid",),
+                    rationale="DB LLM planner returned invalid structured JSON.",
+                    metadata={
+                        "failure": "planner_json_invalid",
+                        "diagnostics": safe_normalization,
+                        "llm": response.diagnostics,
+                        "planner_private_diagnostics": self._private_diagnostics(
+                            attempts
+                        ),
+                    },
+                )
+            try:
+                _validate_model_decision_payload_shape(parsed)
+                decision = DbPlannerDecision.from_dict(parsed)
+                validate_planner_decision_shape(decision)
+            except DbPlannerDecisionShapeError as exc:
+                attempt["validation_error"] = exc.to_dict()
+                attempts.append(attempt)
+                if attempt_number == 1:
+                    messages = _planner_correction_messages(
+                        messages,
+                        response.content,
+                        exc,
+                    )
+                    continue
+                return DbPlannerDecision(
+                    status=DbPlannerDecisionStatus.FAILED,
+                    stop_conditions=(exc.code,),
+                    rationale=(
+                        "DB LLM planner repeated an invalid decision shape after "
+                        "one correction request."
+                    ),
+                    metadata={
+                        "failure": "planner_decision_shape_invalid",
+                        "error": exc.code,
+                        "validation_error": exc.to_dict(),
+                        "planner_json_normalization": safe_normalization,
+                        "llm": response.diagnostics,
+                        "planner_private_diagnostics": self._private_diagnostics(
+                            attempts
+                        ),
+                    },
+                )
+            except Exception as exc:
+                error = {
+                    "type": type(exc).__name__,
+                    "code": "planner_decision_invalid",
+                    "message": str(exc),
+                }
+                attempt["validation_error"] = self._redact(error, max_chars=1024)
+                attempts.append(attempt)
+                return DbPlannerDecision(
+                    status=DbPlannerDecisionStatus.FAILED,
+                    stop_conditions=("planner_decision_invalid",),
+                    rationale="DB LLM planner returned an invalid decision shape.",
+                    metadata={
+                        "failure": "planner_decision_invalid",
+                        "error": self._redact(str(exc), max_chars=1024),
+                        "planner_json_normalization": safe_normalization,
+                        "llm": response.diagnostics,
+                        "planner_private_diagnostics": self._private_diagnostics(
+                            attempts
+                        ),
+                    },
+                )
+            attempts.append(attempt)
+            metadata = {
+                **decision.metadata,
+                "llm": response.diagnostics,
+                "planner_json_normalization": safe_normalization,
+                "planner_private_diagnostics": self._private_diagnostics(attempts),
+            }
             return DbPlannerDecision(
-                status=DbPlannerDecisionStatus.FAILED,
-                stop_conditions=("planner_json_invalid",),
-                rationale="DB LLM planner returned invalid structured JSON.",
-                metadata={
-                    "failure": "planner_json_invalid",
-                    "diagnostics": diagnostics,
-                    "llm": response.diagnostics,
-                },
-            )
-        try:
-            decision = DbPlannerDecision.from_dict(parsed)
-        except Exception as exc:
-            return DbPlannerDecision(
-                status=DbPlannerDecisionStatus.FAILED,
-                stop_conditions=("planner_decision_invalid",),
-                rationale="DB LLM planner returned an invalid decision shape.",
-                metadata={
-                    "failure": "planner_decision_invalid",
-                    "error": str(exc),
-                    "planner_json_normalization": diagnostics,
-                    "llm": response.diagnostics,
-                },
-            )
-        decision, terminal_error = _normalize_terminal_decision(decision)
-        if terminal_error is not None:
-            return DbPlannerDecision(
-                status=DbPlannerDecisionStatus.FAILED,
+                status=decision.status,
                 intent=decision.intent,
-                stop_conditions=(terminal_error,),
-                rationale="DB LLM planner returned an invalid terminal decision.",
-                metadata={
-                    "failure": "planner_decision_invalid",
-                    "error": terminal_error,
-                    "planner_json_normalization": diagnostics,
-                    "llm": response.diagnostics,
-                },
+                actions=decision.actions,
+                stop_conditions=decision.stop_conditions,
+                clarification_question=decision.clarification_question,
+                rationale=decision.rationale,
+                metadata=metadata,
             )
-        metadata = {
-            **decision.metadata,
-            "llm": response.diagnostics,
-            "planner_json_normalization": diagnostics,
-        }
-        return DbPlannerDecision(
-            status=decision.status,
-            intent=decision.intent,
-            actions=decision.actions,
-            stop_conditions=decision.stop_conditions,
-            clarification_question=decision.clarification_question,
-            rationale=decision.rationale,
-            metadata=metadata,
+        raise AssertionError("planner correction attempts must be bounded")
+
+    def _redact(self, value: Any, *, max_chars: int) -> Any:
+        return redact_db_llm_private_diagnostic(
+            value,
+            config=getattr(self.service, "config", None),
+            max_chars=max_chars,
+        )
+
+    def _private_diagnostics(self, attempts: list[dict[str, Any]]) -> Any:
+        return self._redact(
+            {
+                "attempt_count": len(attempts),
+                "correction_attempted": len(attempts) > 1,
+                "attempts": attempts,
+            },
+            max_chars=8192,
         )
 
 
@@ -128,7 +220,12 @@ def _planner_messages(state: DbLoopState) -> list[dict[str, str]]:
                 "You are the Daita from_db outer planner. Return only strict JSON "
                 "for a DbPlannerDecision. You choose semantic intent and typed "
                 "planner actions; you never execute database work. Use only the "
-                "provided action vocabulary. SQL execution actions must depend on "
+                "provided action vocabulary. "
+                "Executable actions require status='continue'. finish, clarify, "
+                "blocked, and failed require actions=[]. clarify requires a "
+                "non-empty clarification_question. Never emit finish or clarify "
+                "as action kinds. "
+                "SQL execution actions must depend on "
                 "runtime validation and must not bypass governance. For user "
                 "requests that ask for rows, counts, aggregates, metrics, or "
                 "other database values, set intent.operation_type to "
@@ -163,6 +260,7 @@ def _planner_messages(state: DbLoopState) -> list[dict[str, str]]:
             "content": json.dumps(
                 {
                     "decision_schema": _decision_schema_hint(),
+                    "action_input_hints": _action_input_hints(),
                     "available_action_kinds": [
                         kind.value for kind in _LLM_ACTION_KINDS
                     ],
@@ -176,6 +274,72 @@ def _planner_messages(state: DbLoopState) -> list[dict[str, str]]:
 
 
 def _decision_schema_hint() -> dict[str, Any]:
+    return planner_decision_json_schema(_LLM_ACTION_KINDS)
+
+
+def _planner_correction_messages(
+    messages: list[dict[str, str]],
+    invalid_response: str,
+    error: DbPlannerDecisionShapeError,
+) -> list[dict[str, str]]:
+    """Request one shape-only correction while retaining the same loop state."""
+    return [
+        *messages,
+        {"role": "assistant", "content": invalid_response},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "correction": "decision_shape_only",
+                    "validation_error": error.to_dict(),
+                    "instructions": (
+                        "Return one corrected DbPlannerDecision for the exact same "
+                        "loop state. Do not add a new planning turn or change the "
+                        "semantic intent merely to evade the validation error."
+                    ),
+                },
+                sort_keys=True,
+            ),
+        },
+    ]
+
+
+def _validate_model_decision_payload_shape(payload: dict[str, Any]) -> None:
+    """Classify model-only structural failures for the bounded correction path."""
+    if "status" not in payload:
+        raise DbPlannerDecisionShapeError(
+            "decision_status_required",
+            "Planner decision payload requires a status discriminator.",
+        )
+    if "actions" not in payload:
+        raise DbPlannerDecisionShapeError(
+            "decision_actions_required",
+            "Planner decision payload requires an actions array.",
+        )
+    actions = payload["actions"]
+    if not isinstance(actions, list):
+        raise DbPlannerDecisionShapeError(
+            "decision_actions_not_array",
+            "Planner decision actions must be a JSON array.",
+        )
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            raise DbPlannerDecisionShapeError(
+                "planner_action_not_object",
+                f"Planner decision actions[{index}] must be a JSON object.",
+            )
+        missing = [key for key in ("action_id", "kind") if key not in action]
+        if missing:
+            raise DbPlannerDecisionShapeError(
+                "planner_action_required_fields_missing",
+                (
+                    f"Planner decision actions[{index}] is missing required "
+                    f"fields: {', '.join(missing)}."
+                ),
+            )
+
+
+def _action_input_hints() -> dict[str, Any]:
     return {
         "status": "continue | finish | clarify | blocked | failed",
         "intent": {"operation_type": "semantic operation label, if known"},
@@ -267,7 +431,9 @@ def _decision_schema_hint() -> dict[str, Any]:
     }
 
 
-def _parse_planner_json(content: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+def _parse_planner_json(
+    content: str,
+) -> tuple[dict[str, Any] | None, Any | None, dict[str, Any]]:
     diagnostics: dict[str, Any] = {"normalization_steps": []}
     raw = strip_json_fence(content)
     if raw != content.strip():
@@ -276,11 +442,12 @@ def _parse_planner_json(content: str) -> tuple[dict[str, Any] | None, dict[str, 
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
         diagnostics.update({"error": "planner_json_decode_error", "message": str(exc)})
-        return None, diagnostics
+        return None, None, diagnostics
     if not isinstance(parsed, dict):
         diagnostics["error"] = "planner_json_not_object"
-        return None, diagnostics
-    return _normalize_planner_decision_payload(parsed, diagnostics)
+        return None, parsed, diagnostics
+    normalized, diagnostics = _normalize_planner_decision_payload(parsed, diagnostics)
+    return normalized, parsed, diagnostics
 
 
 def _normalize_planner_decision_payload(
@@ -369,60 +536,6 @@ def _normalize_planner_action_payload(
             path=f"actions[{index}].depends_on",
         )
     return normalized
-
-
-def _normalize_terminal_decision(
-    decision: DbPlannerDecision,
-) -> tuple[DbPlannerDecision, str | None]:
-    terminal_actions = tuple(
-        action for action in decision.actions if action.kind in _TERMINAL_ACTION_KINDS
-    )
-    executable_actions = tuple(
-        action
-        for action in decision.actions
-        if action.kind not in _TERMINAL_ACTION_KINDS
-    )
-    if terminal_actions and (len(terminal_actions) != 1 or executable_actions):
-        return decision, "terminal_action_mixed_with_executable_actions"
-
-    status = decision.status
-    actions = decision.actions
-    if terminal_actions:
-        terminal_status = DbPlannerDecisionStatus(terminal_actions[0].kind.value)
-        if status not in {DbPlannerDecisionStatus.CONTINUE, terminal_status}:
-            return decision, "terminal_action_conflicts_with_decision_status"
-        status = terminal_status
-        actions = ()
-    elif (
-        status
-        in {
-            DbPlannerDecisionStatus.FINISH,
-            DbPlannerDecisionStatus.CLARIFY,
-        }
-        and executable_actions
-    ):
-        return decision, "terminal_status_mixed_with_executable_actions"
-
-    if (
-        status is DbPlannerDecisionStatus.CLARIFY
-        and not str(decision.clarification_question or "").strip()
-    ):
-        return decision, "clarification_question_required"
-
-    if status is decision.status and actions == decision.actions:
-        return decision, None
-    return (
-        DbPlannerDecision(
-            status=status,
-            intent=decision.intent,
-            actions=actions,
-            stop_conditions=decision.stop_conditions,
-            clarification_question=decision.clarification_question,
-            rationale=decision.rationale,
-            metadata=decision.metadata,
-        ),
-        None,
-    )
 
 
 def _coerce_boundary_string_list(

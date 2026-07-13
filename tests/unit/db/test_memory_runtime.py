@@ -778,6 +778,61 @@ async def test_agent_loop_build_planning_context_adds_memory_recall_prerequisite
     assert context.input["memory_recall_diagnostics"]["queried"] is True
 
 
+async def test_explicit_db_recall_action_uses_structured_memory_input(tmp_path):
+    source_identity = "sqlite:from_db:explicit-structured-recall"
+    memory = _memory(tmp_path)
+    runtime = DbRuntime(plugins=(memory,))
+    await runtime.setup()
+    try:
+        state = DbLoopState(
+            operation_id="op-explicit-structured-recall",
+            normalized_user_request={
+                "prompt": "Remember the board revenue metric definition",
+                "mode": "memory.update",
+            },
+            available_action_kinds=tuple(DbPlannerActionKind),
+            memory_context={
+                "enabled": True,
+                "source_identity": source_identity,
+                "retrieval_mode": "structured",
+                "limit": 3,
+                "score_threshold": 0.0,
+                "recall_decision": {
+                    "recall": False,
+                    "reason": "intent_not_semantic_query",
+                },
+            },
+        )
+        decision = DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CONTINUE,
+            intent={"operation_type": "memory.update"},
+            actions=(
+                DbPlannerAction(
+                    action_id="recall_existing_definition",
+                    kind=DbPlannerActionKind.RECALL_MEMORY,
+                    input={"prompt": "model supplied generic recall input"},
+                ),
+            ),
+        )
+
+        compilation = DbAgentLoop(runtime, object()).compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.rejected_action_summaries == ()
+    assert len(compilation.task_specs) == 1
+    recall = compilation.task_specs[0]
+    assert recall.capability_id == "memory.semantic.recall"
+    assert recall.input == {
+        "query": "Remember the board revenue metric definition",
+        "category": "db_semantics",
+        "limit": 9,
+        "score_threshold": 0.0,
+        "retrieval_mode": "structured",
+        "source_identity": source_identity,
+    }
+
+
 async def test_required_memory_recall_runs_before_planner_can_clarify(tmp_path):
     source_identity = "sqlite:from_db:phase-zero-recall"
     memory = _memory(tmp_path)
@@ -892,7 +947,9 @@ async def test_required_memory_recall_is_in_first_planner_state_and_reused(tmp_p
         for summary in planner.states[0].accepted_evidence_summaries
         if summary["kind"] == "planning.context"
     )
-    assert planning_context["db_memory_refs"][0]["key"] == ("metric:recognized_revenue")
+    recalled_ref = planning_context["db_memory_refs"][0]
+    assert recalled_ref["key"] == "metric:recognized_revenue"
+    assert recalled_ref["source_identity"] == source_identity
     assert len(resumed_planner.states) == 1
     assert backend.recall_db_records.await_count == 1
     assert sum(task.capability_id == "memory.semantic.recall" for task in tasks) == 1
@@ -1908,6 +1965,79 @@ async def test_structured_db_memory_filters_before_scoring(tmp_path):
     assert [item["metadata"]["db_memory"]["key"] for item in results] == [
         "metric:active"
     ]
+
+
+async def test_structured_db_memory_survives_local_backend_reconstruction(tmp_path):
+    source_identity = "sqlite:from_db:restart-persistence"
+    workspace = "restart-persistence"
+    base_dir = tmp_path / "memory"
+    first_backend = LocalMemoryBackend(
+        workspace=workspace,
+        agent_id=workspace,
+        scope="project",
+        base_dir=base_dir,
+        embedder=None,
+        default_source_identity=source_identity,
+    )
+    first_memory = MemoryPlugin()
+    first_memory.backend = first_backend
+
+    written = await write_db_memory_record(
+        first_memory,
+        DBMemoryRecord(
+            kind="business_rule",
+            key="business_rule:persistent_revenue",
+            text="Persistent revenue uses complete orders only.",
+            metadata={
+                "source_identity": source_identity,
+                "workspace_scope": "source",
+                "active": True,
+                "stale": False,
+                "confidence": 0.95,
+                "aliases": ["persistent revenue"],
+                "schema_refs": ["orders.total", "orders.status"],
+            },
+            importance=0.9,
+        ),
+    )
+    assert written["success"] is True
+    written_record_id = written["result"]["record_id"]
+
+    # Local structured calls own short-lived SQLite connections, so rebuilding
+    # the backend is the close/reopen boundary exercised by production restart.
+    del first_memory
+    del first_backend
+    reopened = LocalMemoryBackend(
+        workspace=workspace,
+        agent_id=workspace,
+        scope="project",
+        base_dir=base_dir,
+        embedder=None,
+        default_source_identity=source_identity,
+    )
+
+    listed = await reopened.list_db_records(
+        key="business_rule:persistent_revenue",
+        source_identity=source_identity,
+        limit=10,
+    )
+    recalled = await reopened.recall_db_records(
+        "How should persistent revenue be calculated?",
+        source_identity=source_identity,
+        kinds=["business_rule"],
+        score_threshold=0.0,
+        limit=10,
+    )
+
+    assert len(listed) == 1
+    assert len(recalled) == 1
+    for record in (listed[0], recalled[0]):
+        assert record["record_id"] == written_record_id
+        db_memory = record["metadata"]["db_memory"]
+        assert db_memory["key"] == "business_rule:persistent_revenue"
+        assert db_memory["metadata"]["source_identity"] == source_identity
+        assert db_memory["text"] == ("Persistent revenue uses complete orders only.")
+        assert "semantic_contract" not in db_memory["metadata"]
 
 
 async def test_structured_db_memory_upsert_refreshes_only_one_record_index(tmp_path):

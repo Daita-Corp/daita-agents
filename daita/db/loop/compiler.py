@@ -138,6 +138,8 @@ class DbActionCompiler:
             in {
                 DbPlannerDecisionStatus.FINISH,
                 DbPlannerDecisionStatus.CLARIFY,
+                DbPlannerDecisionStatus.BLOCKED,
+                DbPlannerDecisionStatus.FAILED,
             }
             and actions
         ):
@@ -1678,7 +1680,12 @@ class DbActionCompiler:
         if access_errors:
             return [], [], access_errors
         specs: list[DbTaskSpec] = []
-        task_input = _task_input_for_action(action)
+        task_input = (
+            _memory_recall_task_input(state)
+            if action.kind is DbPlannerActionKind.RECALL_MEMORY
+            and state.memory_context.get("enabled") is True
+            else _task_input_for_action(action)
+        )
         task_dependencies: tuple[TaskDependency, ...] = ()
         if action.kind is DbPlannerActionKind.REPAIR_QUERY_PLAN:
             (

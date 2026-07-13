@@ -91,6 +91,47 @@ def test_planner_session_projection_redacts_blocked_query_scope_values():
     assert projected["diagnostics"]["projection"]["mode"] == "planner"
 
 
+def test_public_planner_evidence_omits_private_response_diagnostics():
+    private_value = "private-planner-response-canary"
+    evidence = Evidence(
+        id="planner-private-diagnostics",
+        kind="planner.decision",
+        owner="db_runtime",
+        operation_id="op-private-planner",
+        accepted=True,
+        payload={
+            "turn": 1,
+            "decision": {
+                "status": "failed",
+                "actions": [],
+                "metadata": {
+                    "planner_private_diagnostics": {
+                        "attempt_count": 2,
+                        "attempts": [
+                            {
+                                "raw_model_response": private_value,
+                                "parsed_pre_normalization": {
+                                    "rationale": private_value
+                                },
+                            }
+                        ],
+                    }
+                },
+            },
+        },
+    )
+
+    projected = project_operation_evidence(
+        (evidence,),
+        _projection(ProjectionMode.PUBLIC_RESULT),
+    )
+
+    dumped = json.dumps(projected[0].to_dict(), sort_keys=True)
+    assert private_value not in dumped
+    assert "raw_model_response" not in dumped
+    assert projected[0].payload["redacted"] is True
+
+
 def test_planner_memory_projection_redacts_blocked_refs_and_values():
     semantic_contract = {
         "version": 1,

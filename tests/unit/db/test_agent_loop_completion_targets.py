@@ -1094,11 +1094,15 @@ async def test_agent_loop_rejects_finish_decision_when_actions_present():
     assert plugin.read.calls == []
     assert "db.sql.validate" not in {task.capability_id for task in tasks}
     assert "query.result" not in {item.kind for item in evidence}
-    compilation = next(
-        item for item in reversed(evidence) if item.kind == "planner.compilation"
+    planner_decision = next(
+        item for item in reversed(evidence) if item.kind == "planner.decision"
     )
-    rejected = compilation.payload["compilation"]["rejected_action_summaries"]
-    assert rejected[0]["error"] == "terminal_status_must_not_include_actions"
+    persisted = planner_decision.payload["decision"]
+    assert persisted["status"] == "failed"
+    assert persisted["actions"] == []
+    assert persisted["metadata"]["error"] == (
+        "terminal_status_mixed_with_executable_actions"
+    )
 
 
 async def test_planner_dag_dependencies_become_durable_task_dependencies():

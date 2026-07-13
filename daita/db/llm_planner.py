@@ -168,10 +168,15 @@ class DbLLMRepairExecutor:
                 task=task,
                 diagnostics=required_inputs,
             )
+        context_changed = _repair_failure_context_changed(
+            failure.payload,
+            planning_context=planning_context,
+        )
         messages = _repair_messages(
             planning_context.payload,
             prior_plan.payload,
             failure.payload,
+            context_changed=context_changed,
         )
         response = await service.generate_json(messages)
         parsed, diagnostics = _parse_plan_response(response.content)
@@ -197,10 +202,6 @@ class DbLLMRepairExecutor:
             return [repair]
         plan = DbQueryPlan.from_mapping(parsed)
         prior_sql = _sql_from_plan_payload(prior_plan.payload)
-        context_changed = _repair_failure_context_changed(
-            failure.payload,
-            planning_context=planning_context,
-        )
         repeated = _same_sql(plan.selected_sql, prior_sql)
         repeated_blocked = repeated and not context_changed
         non_executable_reason = _repair_non_executable_reason(plan)
@@ -317,6 +318,8 @@ def _repair_messages(
     context_payload: dict[str, Any],
     prior_plan_payload: dict[str, Any],
     failure_payload: dict[str, Any],
+    *,
+    context_changed: bool,
 ) -> list[dict[str, str]]:
     return [
         {
@@ -329,7 +332,13 @@ def _repair_messages(
                 "describe the executable SQL. Do not return analysis, "
                 "write_propose, schema, revised_plan, or meta-plan JSON. Do "
                 "not repeat the same SQL unless the failure facts show the "
-                "planning context changed."
+                "planning context changed. The failure describes the prior plan "
+                "and its prior context. When repair_context_changed is true, the "
+                "supplied planning_context is the current source of truth. If "
+                "that refreshed context now contains an observed value matching "
+                "a failed filter literal, preserve or repair the filter with that "
+                "observed value. Do not drop a metric, unit, or filter constraint "
+                "merely to evade the stale validation failure."
             ),
         },
         {
@@ -339,6 +348,7 @@ def _repair_messages(
                     "planning_context": context_payload,
                     "prior_plan": prior_plan_payload,
                     "failure": failure_payload,
+                    "repair_context_changed": context_changed,
                 },
                 sort_keys=True,
                 default=str,

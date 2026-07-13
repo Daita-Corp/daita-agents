@@ -13,7 +13,9 @@ from daita.db.planner_protocol import (
     DbPlannerAction,
     DbPlannerActionKind,
     DbPlannerDecision,
+    DbPlannerDecisionShapeError,
     DbPlannerDecisionStatus,
+    validate_planner_decision_shape,
 )
 from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
@@ -245,13 +247,26 @@ class FakeLLMService:
     safe_metadata = {"provider": "fake", "model": "phase-two"}
 
     def __init__(self, content):
-        self.content = content
+        self.contents = (
+            list(content) if isinstance(content, (list, tuple)) else [content]
+        )
         self.messages = None
+        self.calls = []
+        self.response_schemas = []
 
-    async def generate_json(self, messages):
+    async def generate_json(
+        self,
+        messages,
+        *,
+        response_schema=None,
+        schema_name="db_json_response",
+    ):
         self.messages = messages
+        self.calls.append(messages)
+        self.response_schemas.append((response_schema, schema_name))
+        index = min(len(self.calls) - 1, len(self.contents) - 1)
         return DbLLMResponse(
-            content=self.content,
+            content=self.contents[index],
             diagnostics={"provider": "fake", "model": "phase-two"},
         )
 
@@ -532,6 +547,7 @@ async def test_llm_repair_repeated_sql_allowed_when_failure_context_changed():
             operation,
             {},
         )
+        repair_messages = runtime.db_llm_service.messages
     finally:
         await runtime.teardown()
 
@@ -543,6 +559,9 @@ async def test_llm_repair_repeated_sql_allowed_when_failure_context_changed():
     assert proposal.accepted is True
     assert proposal.payload["repair_context_changed"] is True
     assert proposal.payload["repeated_sql_allowed_context_changed"] is True
+    assert "current source of truth" in repair_messages[0]["content"]
+    repair_request = json.loads(repair_messages[1]["content"])
+    assert repair_request["repair_context_changed"] is True
 
 
 async def test_llm_repair_missing_input_ids_produces_rejected_diagnostics():
@@ -2937,6 +2956,21 @@ async def test_llm_agent_planner_emits_typed_decision_from_mocked_response():
     assert "clarify" not in request_payload["available_action_kinds"]
     assert "finish" not in request_payload["state"]["available_action_kinds"]
     assert "clarify" not in request_payload["state"]["available_action_kinds"]
+    schema = request_payload["decision_schema"]
+    assert "Executable actions require status='continue'" in schema["description"]
+    branches = schema["properties"]["decision"]["anyOf"]
+    assert len(branches) == 3
+    action_kind_schema = branches[0]["properties"]["actions"]["items"]["properties"][
+        "kind"
+    ]
+    assert "finish" not in action_kind_schema["enum"]
+    assert "clarify" not in action_kind_schema["enum"]
+    assert (
+        "Executable actions require status='continue'" in service.messages[0]["content"]
+    )
+    native_schema, schema_name = service.response_schemas[0]
+    assert native_schema == schema
+    assert schema_name == "db_planner_decision"
 
 
 async def test_llm_agent_planner_parses_fenced_json_at_boundary():
@@ -2995,43 +3029,65 @@ async def test_llm_agent_planner_normalizes_unknown_keys_and_tuple_fields():
     }
 
 
-@pytest.mark.parametrize(
-    ("status", "action_kind", "expected_status"),
-    [
-        ("finish", "finish", DbPlannerDecisionStatus.FINISH),
-        ("continue", "finish", DbPlannerDecisionStatus.FINISH),
-        ("clarify", "clarify", DbPlannerDecisionStatus.CLARIFY),
-        ("continue", "clarify", DbPlannerDecisionStatus.CLARIFY),
-    ],
-)
-async def test_llm_agent_planner_normalizes_legacy_terminal_actions_to_status(
-    status,
-    action_kind,
-    expected_status,
-):
-    payload = _llm_planner_payload(
-        status=status,
-        actions=[
-            {
-                "action_id": "terminal",
-                "kind": action_kind,
-                "input": {},
-                "depends_on": [],
-                "rationale": "The model requested a terminal transition.",
-                "metadata": {},
-            }
-        ],
-        clarification_question=(
-            "Which customer segment?" if action_kind == "clarify" else None
-        ),
+def test_planner_decision_shape_accepts_continue_with_executable_action():
+    decision = DbPlannerDecision.from_dict(_llm_planner_payload())
+
+    assert validate_planner_decision_shape(decision) is decision
+
+
+@pytest.mark.parametrize("status", ["finish", "clarify", "blocked", "failed"])
+def test_planner_decision_shape_rejects_terminal_status_with_actions(status):
+    decision = DbPlannerDecision.from_dict(
+        _llm_planner_payload(
+            status=status,
+            clarification_question=("Which segment?" if status == "clarify" else None),
+        )
     )
 
-    decision = await DbLLMAgentPlanner(FakeLLMService(json.dumps(payload))).plan(
-        _loop_state()
+    with pytest.raises(DbPlannerDecisionShapeError) as raised:
+        validate_planner_decision_shape(decision)
+
+    assert raised.value.code == "terminal_status_mixed_with_executable_actions"
+
+
+@pytest.mark.parametrize("status", ["finish", "clarify", "blocked", "failed"])
+def test_planner_decision_shape_accepts_terminal_status_without_actions(status):
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus(status),
+        actions=(),
+        clarification_question=("Which segment?" if status == "clarify" else None),
     )
 
-    assert decision.status is expected_status
-    assert decision.actions == ()
+    assert validate_planner_decision_shape(decision) is decision
+
+
+def test_persisted_legacy_terminal_actions_normalize_compatibly():
+    for status, action_kind in (
+        ("finish", "finish"),
+        ("continue", "finish"),
+        ("clarify", "clarify"),
+        ("continue", "clarify"),
+    ):
+        payload = _llm_planner_payload(
+            status=status,
+            actions=[
+                {
+                    "action_id": "terminal",
+                    "kind": action_kind,
+                    "input": {},
+                    "depends_on": [],
+                    "metadata": {},
+                }
+            ],
+            clarification_question=(
+                "Which customer segment?" if action_kind == "clarify" else None
+            ),
+        )
+
+        decision = DbPlannerDecision.from_persisted_dict(payload)
+
+        assert decision.status.value == action_kind
+        assert decision.actions == ()
 
 
 @pytest.mark.parametrize(
@@ -3062,14 +3118,14 @@ async def test_llm_agent_planner_rejects_mixed_terminal_and_executable_actions(
                 },
             ]
         )
-    decision = await DbLLMAgentPlanner(FakeLLMService(json.dumps(payload))).plan(
-        _loop_state()
-    )
+    service = FakeLLMService(json.dumps(payload))
+    decision = await DbLLMAgentPlanner(service).plan(_loop_state())
 
     assert decision.status is DbPlannerDecisionStatus.FAILED
     assert decision.actions == ()
-    assert decision.metadata["failure"] == "planner_decision_invalid"
+    assert decision.metadata["failure"] == "planner_decision_shape_invalid"
     assert "terminal" in decision.metadata["error"]
+    assert len(service.calls) == 2
 
 
 async def test_llm_agent_planner_rejects_empty_clarification_question():
@@ -3079,12 +3135,119 @@ async def test_llm_agent_planner_rejects_empty_clarification_question():
         clarification_question="  ",
     )
 
-    decision = await DbLLMAgentPlanner(FakeLLMService(json.dumps(payload))).plan(
-        _loop_state()
-    )
+    service = FakeLLMService(json.dumps(payload))
+    decision = await DbLLMAgentPlanner(service).plan(_loop_state())
 
     assert decision.status is DbPlannerDecisionStatus.FAILED
     assert decision.metadata["error"] == "clarification_question_required"
+    assert len(service.calls) == 2
+
+
+async def test_llm_agent_planner_corrects_one_invalid_shape_with_same_state():
+    invalid = _llm_planner_payload(status="finish")
+    valid = _llm_planner_payload(status="continue")
+    service = FakeLLMService([json.dumps(invalid), json.dumps(valid)])
+
+    decision = await DbLLMAgentPlanner(service).plan(_loop_state())
+
+    assert decision.status is DbPlannerDecisionStatus.CONTINUE
+    assert len(decision.actions) == 1
+    assert len(service.calls) == 2
+    assert (
+        json.loads(service.calls[0][-1]["content"])["state"]
+        == json.loads(service.calls[1][1]["content"])["state"]
+    )
+    correction = json.loads(service.calls[1][-1]["content"])
+    assert correction["validation_error"]["code"] == (
+        "terminal_status_mixed_with_executable_actions"
+    )
+    diagnostics = decision.metadata["planner_private_diagnostics"]
+    assert diagnostics["attempt_count"] == 2
+    assert [item["correction_requested"] for item in diagnostics["attempts"]] == [
+        False,
+        True,
+    ]
+
+
+async def test_llm_agent_planner_corrects_non_object_action_array_item():
+    invalid = _llm_planner_payload()
+    invalid["actions"].extend(["rationale", "metadata"])
+    valid = _llm_planner_payload()
+    service = FakeLLMService([json.dumps(invalid), json.dumps(valid)])
+
+    decision = await DbLLMAgentPlanner(service).plan(_loop_state())
+
+    assert decision.status is DbPlannerDecisionStatus.CONTINUE
+    assert len(service.calls) == 2
+    correction = json.loads(service.calls[1][-1]["content"])
+    assert correction["validation_error"]["code"] == "planner_action_not_object"
+    diagnostics = decision.metadata["planner_private_diagnostics"]
+    assert diagnostics["attempt_count"] == 2
+    assert diagnostics["attempts"][0]["validation_error"]["code"] == (
+        "planner_action_not_object"
+    )
+
+
+async def test_planner_shape_correction_has_no_tasks_or_extra_loop_turn():
+    invalid = _llm_planner_payload(status="failed")
+    valid = _llm_planner_payload(
+        status="clarify",
+        actions=[],
+        clarification_question="Which customer segment?",
+    )
+    service = FakeLLMService([json.dumps(invalid), json.dumps(valid)])
+    planner = DbLLMAgentPlanner(service)
+    runtime, operation = await _runtime_and_operation(
+        "phase-five-shape-correction",
+    )
+    try:
+        result = await DbAgentLoop(runtime, planner).run(operation, max_turns=1)
+        tasks = await runtime.store.list_tasks(operation.id)
+        decisions = [
+            item
+            for item in await runtime.store.list_evidence(operation.id)
+            if item.kind == "planner.decision"
+        ]
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "clarification_required"
+    assert tasks == []
+    assert len(service.calls) == 2
+    assert len(decisions) == 1
+    assert decisions[0].payload["turn"] == 1
+
+
+async def test_planner_private_attempt_diagnostics_are_redacted_and_persisted():
+    secret = "sk-test-secret-123456"
+    invalid = _llm_planner_payload(
+        status="blocked",
+        rationale=f"Contact ada@example.com using {secret}",
+    )
+    service = FakeLLMService(json.dumps(invalid))
+    planner = DbLLMAgentPlanner(service)
+    runtime, operation = await _runtime_and_operation(
+        "phase-five-private-planner-diagnostics"
+    )
+    try:
+        result = await DbAgentLoop(runtime, planner).run(operation, max_turns=1)
+        persisted = next(
+            item
+            for item in await runtime.store.list_evidence(operation.id)
+            if item.kind == "planner.decision"
+        )
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "failed"
+    dumped = json.dumps(persisted.payload, sort_keys=True)
+    assert secret not in dumped
+    assert "ada@example.com" not in dumped
+    assert "[REDACTED_API_KEY]" in dumped
+    assert "[REDACTED_EMAIL]" in dumped
+    private = persisted.payload["decision"]["metadata"]["planner_private_diagnostics"]
+    assert private["attempt_count"] == 2
+    assert private["attempts"][0]["parsed_pre_normalization"] is not None
 
 
 async def test_compiler_rejects_compatibility_terminal_action():

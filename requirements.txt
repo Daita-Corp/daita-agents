@@ -17,7 +17,7 @@ openai==1.77.0
 anthropic>=0.25.0
 
 # Google Gemini (new package)
-google-genai>=0.3.0
+google-genai>=1.21.0
 
 # === HTTP AND NETWORKING ===
 aiohttp==3.11.18
