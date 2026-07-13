@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,37 @@ PLANNER_ARTIFACTS = {
     "planner.decision": "planner_decisions.json",
     "planner.compilation": "planner_compilations.json",
 }
+VALIDATION_EVIDENCE_KINDS = frozenset(
+    {
+        "query.plan.validation",
+        "sql.validation",
+        "query.validation",
+        "validation.fact",
+    }
+)
+_SENSITIVE_MAPPING_KEYS = frozenset(
+    {"api_key", "authorization", "credential", "password", "secret"}
+)
+_PII_MAPPING_KEYS = frozenset(
+    {
+        "address",
+        "customer",
+        "customer_name",
+        "date_of_birth",
+        "email",
+        "first_name",
+        "full_name",
+        "last_name",
+        "phone",
+        "social_security_number",
+        "ssn",
+        "user_name",
+        "username",
+    }
+)
+_EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+_PHONE_PATTERN = re.compile(r"\+\d[\d\s().-]{7,}\d")
+_API_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 RICH_POSTGRES_SEED_SQL = """
 DROP TABLE IF EXISTS monitor_actions;
 DROP TABLE IF EXISTS audit_logs;
@@ -219,6 +251,100 @@ INSERT INTO audit_logs (audit_id, actor_id, event_type, created_at) VALUES
 INSERT INTO monitor_actions (id, status, note) VALUES
     (1, 'pending', 'fixture row for approval and resume tests');
 """
+
+
+@dataclass(frozen=True)
+class LiveGatePreflight:
+    """Classified availability result for the live Bucket 3 gate."""
+
+    status: str
+    detail: str
+
+    @property
+    def ready(self) -> bool:
+        return self.status == "ready"
+
+
+def classify_live_gate_failure(error: BaseException | str) -> str:
+    """Classify live-gate infrastructure separately from model behavior."""
+    text = str(error).lower()
+    if any(
+        marker in text
+        for marker in (
+            "openai_api_key not set",
+            "api key is required",
+            "invalid api key",
+            "incorrect api key",
+            "authenticationerror",
+            "status code: 401",
+        )
+    ):
+        return "missing_credentials"
+    if any(
+        marker in text
+        for marker in (
+            "insufficient_quota",
+            "insufficient quota",
+            "quota exceeded",
+            "billing hard limit",
+        )
+    ):
+        return "insufficient_quota"
+    if any(
+        marker in text
+        for marker in (
+            "model_not_found",
+            "model not found",
+            "model is unavailable",
+            "does not exist or you do not have access",
+        )
+    ):
+        return "model_unavailable"
+    if any(
+        marker in text
+        for marker in (
+            "connection error",
+            "connectionerror",
+            "connecterror",
+            "network is unreachable",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "timed out",
+            "timeout",
+        )
+    ):
+        return "network_failure"
+    return "behavioral_failure"
+
+
+async def run_live_gate_preflight() -> LiveGatePreflight:
+    """Perform one minimal model call and close its owned provider explicitly."""
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return LiveGatePreflight(
+            status="missing_credentials",
+            detail="OPENAI_API_KEY not set",
+        )
+    config = DbLLMConfig(
+        provider="openai",
+        model=os.environ.get("OPENAI_TEST_MODEL", DEFAULT_LIVE_OPENAI_MODEL),
+        api_key=api_key,
+        temperature=0,
+        options={"max_tokens": 8},
+    )
+    service = db_llm_service_from_config(config, agent_id="bucket3-preflight")
+    try:
+        await service.generate_json(
+            [{"role": "user", "content": "Reply with the single word ready."}]
+        )
+    except Exception as exc:  # noqa: BLE001
+        return LiveGatePreflight(
+            status=classify_live_gate_failure(exc),
+            detail=str(exc),
+        )
+    finally:
+        await service.aclose()
+    return LiveGatePreflight(status="ready", detail="model call succeeded")
 
 
 def require_live_openai_kwargs() -> dict[str, object]:
@@ -495,6 +621,7 @@ async def _create_writable_sqlite_runtime_agent(
         ),
         store=SQLiteRuntimeStore(runtime_path),
         db_llm_service=db_llm_service_from_config(llm, agent_id=name),
+        owns_db_llm_service=True,
     )
     await runtime.setup(agent_id=name)
     return DbAgent(runtime=runtime, name=name)
@@ -844,8 +971,16 @@ def write_failure_artifacts(
                 source,
                 kind,
             )
+        validation_facts = [
+            item.to_dict()
+            for item in _evidence_items(source)
+            if item.kind in VALIDATION_EVIDENCE_KINDS
+            or item.kind.endswith(".validation")
+        ]
+        if validation_facts:
+            _write_json(artifact_dir / "validation_facts.json", validation_facts)
         (artifact_dir / "sql.txt").write_text(
-            sql_from_result(source) + "\n",
+            str(_redact_artifact_payload(sql_from_result(source))) + "\n",
             encoding="utf-8",
         )
     return artifact_dir
@@ -1029,8 +1164,58 @@ def _write_evidence_artifact(path: Path, result_or_snapshot: Any, kind: str) -> 
 
 def _write_json(path: Path, payload: Any) -> None:
     path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, default=_json_default) + "\n",
+        json.dumps(
+            _redact_artifact_payload(payload),
+            indent=2,
+            sort_keys=True,
+            default=_json_default,
+        )
+        + "\n",
         encoding="utf-8",
+    )
+
+
+def _redact_artifact_payload(value: Any) -> Any:
+    """Redact credentials and common direct PII while retaining diagnostics."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                "[REDACTED]"
+                if _is_sensitive_artifact_key(key)
+                else _redact_artifact_payload(nested)
+            )
+            for key, nested in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_artifact_payload(item) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    redacted = value
+    for secret in _artifact_secret_values():
+        redacted = redacted.replace(secret, "[REDACTED]")
+    redacted = _API_KEY_PATTERN.sub("[REDACTED_API_KEY]", redacted)
+    redacted = _EMAIL_PATTERN.sub("[REDACTED_EMAIL]", redacted)
+    return _PHONE_PATTERN.sub("[REDACTED_PHONE]", redacted)
+
+
+def _is_sensitive_artifact_key(key: Any) -> bool:
+    normalized = str(key).lower()
+    if normalized in _SENSITIVE_MAPPING_KEYS or normalized in _PII_MAPPING_KEYS:
+        return True
+    return normalized.endswith(
+        ("_api_key", "_authorization", "_credential", "_password", "_secret")
+    )
+
+
+def _artifact_secret_values() -> tuple[str, ...]:
+    secret_markers = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+    return tuple(
+        value
+        for key, value in os.environ.items()
+        if value
+        and len(value) >= 8
+        and any(marker in key.upper() for marker in secret_markers)
     )
 
 

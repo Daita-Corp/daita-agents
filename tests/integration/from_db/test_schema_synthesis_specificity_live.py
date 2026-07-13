@@ -103,6 +103,7 @@ async def _runtime_for_specificity_schema(tmp_path, model: str) -> DbRuntime:
                 temperature=0,
             )
         ),
+        owns_db_llm_service=True,
     )
 
 

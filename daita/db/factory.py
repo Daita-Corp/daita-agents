@@ -194,6 +194,7 @@ async def from_db(
         config=runtime_config,
         store=runtime_store,
         db_llm_service=db_llm_service if db_llm_service.available else None,
+        owns_db_llm_service=True,
         host_services=host_services,
     )
     try:

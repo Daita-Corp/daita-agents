@@ -32,6 +32,7 @@ from tests.integration.from_db.live_production_helpers import (
     assert_synthesized_answer,
     assert_sql_is_read_only,
     query_rows,
+    classify_live_gate_failure,
     latest_evidence,
     row_values,
     sql_from_result,
@@ -366,14 +367,66 @@ def test_failure_artifacts_split_planner_decisions_and_compilations(tmp_path):
             payload={"sql": "select count(*) from customers"},
             id="ev-plan",
         ),
+        FakeEvidence(
+            kind="query.plan.validation",
+            payload={"valid": True},
+            id="ev-validation",
+        ),
     )
 
     artifact_dir = write_failure_artifacts(tmp_path, snapshot=snapshot)
 
     decisions = json.loads((artifact_dir / "planner_decisions.json").read_text())
     compilations = json.loads((artifact_dir / "planner_compilations.json").read_text())
+    validations = json.loads((artifact_dir / "validation_facts.json").read_text())
     assert decisions[0]["id"] == "ev-decision"
     assert compilations[0]["id"] == "ev-compilation"
+    assert validations[0]["id"] == "ev-validation"
     assert (artifact_dir / "sql.txt").read_text().strip() == (
         "select count(*) from customers"
     )
+
+
+def test_failure_artifacts_redact_credentials_and_direct_pii(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret-123456")
+    snapshot = _snapshot(
+        FakeEvidence(
+            kind="query.result",
+            payload={
+                "sql": "select * from customers where email = 'ada@example.com'",
+                "rows": [
+                    {
+                        "email": "ada@example.com",
+                        "phone": "+1-555-0101",
+                        "full_name": "Ada Lovelace",
+                        "secret": "sk-test-secret-123456",
+                    }
+                ],
+            },
+        )
+    )
+
+    artifact_dir = write_failure_artifacts(tmp_path, snapshot=snapshot)
+    dumped = "\n".join(
+        path.read_text() for path in artifact_dir.iterdir() if path.is_file()
+    )
+
+    assert "ada@example.com" not in dumped
+    assert "+1-555-0101" not in dumped
+    assert "Ada Lovelace" not in dumped
+    assert "sk-test-secret-123456" not in dumped
+    assert "[REDACTED_EMAIL]" in dumped
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    (
+        ("OPENAI_API_KEY not set", "missing_credentials"),
+        ("Error code: insufficient_quota", "insufficient_quota"),
+        ("model_not_found", "model_unavailable"),
+        ("ConnectError: network is unreachable", "network_failure"),
+        ("assert result.status is SUCCEEDED", "behavioral_failure"),
+    ),
+)
+def test_live_gate_failure_classification(message, expected):
+    assert classify_live_gate_failure(message) == expected

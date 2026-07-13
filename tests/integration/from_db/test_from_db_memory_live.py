@@ -266,12 +266,7 @@ def _db_memory_keys(result_or_snapshot) -> list[str]:
 
 
 async def _run_live(agent, prompt: str):
-    result = None
-    for _ in range(2):
-        result = await agent.run_detailed(prompt)
-        if "Connection error" not in str(result.answer):
-            return result
-    return result
+    return await agent.run_detailed(prompt)
 
 
 async def _recall_memory(

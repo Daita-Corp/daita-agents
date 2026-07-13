@@ -436,8 +436,10 @@ def test_public_planning_context_projection_exposes_safe_memory_provenance():
     assert payload["db_memory_semantics"][0]["memory_key"] == (
         "metric:recognized_revenue"
     )
-    assert payload["db_memory_diagnostics"]["included_count"] == 1
-    assert payload["db_memory_diagnostics"]["used_chars"] == 42
+    assert "included_count" not in payload["db_memory_diagnostics"]
+    assert "used_chars" not in payload["db_memory_diagnostics"]
+    assert raw.payload["db_memory_diagnostics"]["included_count"] == 1
+    assert raw.payload["db_memory_diagnostics"]["used_chars"] == 42
     assert payload["db_memory_contract_diagnostics"]["enforced_count"] == 1
 
 

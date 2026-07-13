@@ -1167,8 +1167,6 @@ def _project_memory_diagnostics(value: Any) -> dict[str, Any]:
         key: value[key]
         for key in (
             "candidate_count",
-            "included_count",
-            "used_chars",
             "char_budget",
             "limit",
             "score_threshold",

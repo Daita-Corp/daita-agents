@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import inspect
 import time
 from typing import Any
 
@@ -103,6 +104,23 @@ class DbLLMService:
                 **options,
             )
         return self._provider
+
+    async def aclose(self) -> None:
+        """Close the already-created provider while preserving lazy setup."""
+        provider = self._provider
+        if provider is None:
+            return
+        try:
+            close = getattr(provider, "aclose", None)
+            if close is None:
+                close = getattr(provider, "close", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        finally:
+            if self._provider is provider:
+                self._provider = None
 
     async def generate_json(self, messages: list[dict[str, str]]) -> DbLLMResponse:
         if not self.available:
